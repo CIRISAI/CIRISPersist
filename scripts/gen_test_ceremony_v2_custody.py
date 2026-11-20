@@ -53,6 +53,18 @@ OID_FW, OID_TOUCH, OID_FIPS = (
     "1.3.6.1.4.1.41482.3.8",
     "1.3.6.1.4.1.41482.3.10",
 )
+# v62.0.0 (C4-fix2; CC 4.2.3 "One device per holder") — the token serial, a
+# bare DER INTEGER as a real YubiKey leaf carries it. The tables above carry
+# none (Verify's vector PKI); SERIAL_CHAINS carries one per holder.
+OID_SERIAL = "1.3.6.1.4.1.41482.3.7"
+# Holder n's serial in SERIAL_CHAINS; SHARED_SERIAL gives holder 2 holder 1's.
+SERIAL_HOLDERS = [1, 2, 3]
+SERIAL_BASE = 1000
+
+
+def der_uint(n):
+    body = n.to_bytes((n.bit_length() + 8) // 8, "big")
+    return bytes([0x02, len(body)]) + body
 
 
 def sha(b):
@@ -95,7 +107,7 @@ def ed_pub(n):
     return k.public_key().public_bytes(ser.Encoding.Raw, ser.PublicFormat.Raw)
 
 
-def yubikey_chain(ed_pub_bytes, n, ca=ROOT, fips=True, touch=2):
+def yubikey_chain(ed_pub_bytes, n, ca=ROOT, fips=True, touch=2, serial=None):
     f9k = Ed25519PrivateKey.from_private_bytes(sha(b"f9" + bytes([n]) + ca.cn.encode()))
     f9cn = "YubiKey PIV Attestation f9 (MOCK %d)" % n
     f9 = cert(f9cn, ca.cn, f9k.public_key(), ca.key, 100 + n, [(OID_FIPS, b"")] if fips else [])
@@ -105,7 +117,8 @@ def yubikey_chain(ed_pub_bytes, n, ca=ROOT, fips=True, touch=2):
         Ed25519PublicKey.from_public_bytes(ed_pub_bytes),
         f9k,
         200 + n,
-        [(OID_FW, b"\x04\x03\x05\x07\x04"), (OID_TOUCH, b"\x04\x02\x01" + bytes([touch]))],
+        [(OID_FW, b"\x04\x03\x05\x07\x04"), (OID_TOUCH, b"\x04\x02\x01" + bytes([touch]))]
+        + ([] if serial is None else [(OID_SERIAL, der_uint(serial))]),
     )
     return [leaf, f9]
 
@@ -125,6 +138,8 @@ def main():
     recovered = {n: yubikey_chain(ed_pub(n + RECOVERED_OFFSET), n) for n in HOLDERS}
     recovery = {n: yubikey_chain(ed_pub(n + RECOVERY_KEY_OFFSET), n) for n in HOLDERS}
     second = {n: yubikey_chain(ed_pub(n + SECOND_RECOVERED_OFFSET), n) for n in HOLDERS}
+    serials = {n: yubikey_chain(ed_pub(n), n, serial=SERIAL_BASE + n) for n in SERIAL_HOLDERS}
+    shared = yubikey_chain(ed_pub(2), 2, serial=SERIAL_BASE + 1)
     if a.check_verify:
         d = pathlib.Path(a.check_verify)
         case = json.loads((d / "genesis_bundles_v2.json").read_text())
@@ -210,7 +225,38 @@ def main():
     for n in HOLDERS:
         leaf, f9 = second[n]
         out += chain_entry(n, leaf, f9)
-    out += ["];", ""]
+    out += [
+        "];",
+        "",
+        "/// v62.0.0 (C4-fix2; CC 4.2.3) — holder `n`'s serial in",
+        "/// [`SERIAL_CHAINS_HEX`]: `%d + n`." % SERIAL_BASE,
+        "pub const SERIAL_BASE: u64 = %d;" % SERIAL_BASE,
+        "",
+        "/// v62.0.0 (C4-fix2; CC 4.2.3 \"One device per holder\") — `(holder seed,",
+        "/// [leaf hex, f9 hex])`: holder `n`'s chain whose leaf also names the token",
+        "/// serial `SERIAL_BASE + n` (`1.3.6.1.4.1.41482.3.7`, a bare DER INTEGER as",
+        "/// a real YubiKey leaf carries it). Same f9 as [`HOLDER_CHAINS_HEX`].",
+        "pub const SERIAL_CHAINS_HEX: [(u8, [&str; 2]); %d] = [" % len(SERIAL_HOLDERS),
+    ]
+    for n in SERIAL_HOLDERS:
+        leaf, f9 = serials[n]
+        out += chain_entry(n, leaf, f9)
+    leaf, f9 = shared
+    out += [
+        "];",
+        "",
+        "/// v62.0.0 (C4-fix2; CC 4.2.3) — holder 2's chain whose leaf names holder",
+        "/// 1's serial (`SERIAL_BASE + 1`): a distinct leaf, the same device.",
+        "pub const SHARED_SERIAL_CHAIN_HEX: [&str; 2] = [",
+        "    concat!(",
+        rust_bytes(leaf, " " * 8),
+        "    ),",
+        "    concat!(",
+        rust_bytes(f9, " " * 8),
+        "    ),",
+        "];",
+        "",
+    ]
     pathlib.Path(a.out).write_text("\n".join(out))
 
 

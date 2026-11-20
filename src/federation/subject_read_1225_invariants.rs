@@ -57,7 +57,7 @@ pub(crate) mod bodies {
     /// instant distinct.
     fn naming(a: &str, subjects: &[&str], dim: &str, when: DateTime<Utc>, n: &str) -> Attestation {
         let env = serde_json::json!({ "dimension": dim, "n": n });
-        let mut r = e2::with_earlier_form(|| ts::bare_attestation(n, a, a, &env));
+        let mut r = ts::bare_attestation(n, a, a, &env);
         r.attestation_type = attestation_type::SCORES.into();
         r.weight = None;
         r.asserted_at = when;

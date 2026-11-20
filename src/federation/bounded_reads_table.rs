@@ -180,6 +180,15 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         "list_open_self_roster_proposals",
         Bound::Open("every open roster proposal of one self, or of every self for the sweep: a refused one stays open until the roster lets it land"),
     ),
+    // v62.0.0 (wave O1) — the edition-2 self-roster receipts (`ceg_roster_proposals`).
+    (
+        "list_open_edition2_roster_proposals",
+        Bound::Open("every open edition-2 roster proposal of one self, or of every self for the sweep: one receipt per offered roster row, closed when it settles"),
+    ),
+    (
+        "list_settled_edition2_roster_proposals",
+        Bound::Open("every settled edition-2 roster proposal of one self: grows with each roster row the self lands"),
+    ),
     // v61.3.0 (CIRISPersist#1252, V214) — the cosign ledgers.
     (
         "list_open_cosign_receipts",

@@ -69,8 +69,6 @@ pub(crate) struct ErasedTraces {
     pub(crate) trace_events: u64,
     /// `trace_llm_calls` rows deleted.
     pub(crate) trace_llm_calls: u64,
-    /// Pre-v57 silo detections tombstoned in place.
-    pub(crate) legacy_tombstoned: u64,
     /// Row-backed detections hard-deleted under their `withdraws`.
     pub(crate) detection_rows_erased: u64,
     /// `federation_keys` rows deleted (one-key scope only).
@@ -119,7 +117,7 @@ impl PlannedTraceErasure {
             },
             trace_events: erased.trace_events,
             trace_llm_calls: erased.trace_llm_calls,
-            detection_events_tombstoned: erased.legacy_tombstoned + erased.detection_rows_erased,
+            detection_events_tombstoned: erased.detection_rows_erased,
             detection_rows_erased: erased.detection_rows_erased,
             detection_rows_refused: self.plan.refused.len() as u64,
             federation_keys: erased.federation_keys,
@@ -191,9 +189,10 @@ pub(crate) trait BackendStore: AttestationStore {
 }
 
 /// The plan both erasure doors share: the attester gate (a node that cannot
-/// attest its audit row erases nothing, CIRISPersist#988), the pre-v57
-/// detection rehome (so a reached detection is erased the row way), and the
-/// row-backed detections the erasure reaches (#1094 item 2).
+/// attest its audit row erases nothing, CIRISPersist#988) and the
+/// row-backed detections the erasure reaches (#1094 item 2). (v62.0.0: the
+/// pre-v57 detection rehome it ran first is deleted; a V300 store holds no
+/// earlier row.)
 async fn plan_trace_erasure<D: BackendStore>(
     dir: &D,
     agent_id_hash: &str,
@@ -203,9 +202,6 @@ async fn plan_trace_erasure<D: BackendStore>(
     let attester = attestation_admit::hard_case_attester(dir)
         .await
         .map_err(Error::from_hard_case_attester)?;
-    dir.rehome_legacy_detection_events(received_at)
-        .await
-        .map_err(|e| Error::Backend(format!("rehome before erasure: {e}")))?;
     let key = match &scope {
         TraceErasureScope::OneKey {
             signature_key_id, ..
@@ -260,7 +256,7 @@ pub(crate) async fn delete_traces_for_agent_id_hash_planned<D: BackendStore>(
     Ok(ErasureSummary {
         trace_events: erased.trace_events,
         trace_llm_calls: erased.trace_llm_calls,
-        detection_events_tombstoned: erased.legacy_tombstoned + erased.detection_rows_erased,
+        detection_events_tombstoned: erased.detection_rows_erased,
         detection_rows_refused: planned.plan.refused,
         erased_at,
     })
@@ -299,11 +295,8 @@ pub(crate) async fn put_fountain_content_planned<D: BackendStore>(
     manifest: &FountainManifestV1,
     symbols: &[FountainSymbolV1],
 ) -> Result<(), Error> {
-    crate::fountain::check_admission_via_envelope(
-        manifest,
-        symbols,
-        &crate::verify::PythonJsonDumpsCanonicalizer,
-    )?;
+    // v62.0.0 (F0-cp6d) — node-local: only this node's own fountain coding.
+    crate::fountain::check_admission(manifest, symbols, dir.node_key_id().as_deref())?;
     let planned = plan_fountain_content(manifest, symbols, None)?;
     dir.store_planned_fountain_content(planned).await
 }
@@ -320,11 +313,8 @@ pub(crate) async fn put_aggregated_tier_planned<D: BackendStore>(
     agg: &AggregationMetaV1,
     aggregated_at_unix_ms: i64,
 ) -> Result<(), Error> {
-    crate::fountain::check_admission_via_envelope(
-        manifest,
-        symbols,
-        &crate::verify::PythonJsonDumpsCanonicalizer,
-    )?;
+    // v62.0.0 (F0-cp6d) — node-local: only this node's own fountain coding.
+    crate::fountain::check_admission(manifest, symbols, dir.node_key_id().as_deref())?;
     agg.verify_for_admission(manifest)?;
     let aggregation = PlannedAggregation {
         agg,

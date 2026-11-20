@@ -64,6 +64,19 @@ pub struct HybridSignature {
     pub signed_at: DateTime<Utc>,
 }
 
+/// v62.0.0 (F0-cp5; RULINGS "composite signatures only") — ONE composite
+/// (ML-DSA-65-Ed25519) signature, base64-standard, by the signer's edition-2
+/// key. What a [`PromotionAttestation`] carries; persist verifies it under the
+/// signer's LIVE key, read from the directory by its identity-ref.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompositeSignature {
+    /// Base64-encoded composite signature (3373 bytes raw).
+    pub composite: String,
+    /// Wall-clock at signing time (not signed; the envelope's own
+    /// timestamp carries the asserted-at time).
+    pub signed_at: DateTime<Utc>,
+}
+
 /// One witness inside a [`WitnessSet`] — `CIRISNodeCore/SCHEMA.md` §6.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Witness {
@@ -168,17 +181,18 @@ pub struct PromotionAttestation {
     /// The target rows' `attestation_id`s. Every one must be held on the
     /// target kind's family.
     pub target_ids: Vec<String>,
-    /// Identity (Ed25519 pubkey, base64) of the consensus crate
-    /// instance that signed this attestation. Per SCHEMA.md §2.2,
-    /// the identity IS the pubkey — verify is self-signed.
+    /// v62.0.0 (F0-cp5) — the edition-2 identity-ref
+    /// (`urn:ietf:params:oauth:ckt:sha-256:…`) of the consensus crate
+    /// instance that signed this attestation. Its LIVE key is read from the
+    /// directory; a pubkey literal is refused (`verify_not_identity_ref`).
     pub attested_by: String,
     /// Threshold-crossing details the consensus crate used to
     /// decide promotion (vote tallies, witness counts, time
     /// windows, etc.). Free-form per-policy.
     pub aggregate_evidence: serde_json::Value,
-    /// Hybrid Ed25519 + ML-DSA-65 signature over the canonical
-    /// envelope (signature field stripped).
-    pub signature: HybridSignature,
+    /// ONE composite signature over the canonical envelope (signature
+    /// field stripped).
+    pub signature: CompositeSignature,
     /// Caller-asserted wall-clock at signing time.
     pub attested_at: DateTime<Utc>,
 }

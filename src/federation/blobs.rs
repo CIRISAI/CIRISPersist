@@ -1703,12 +1703,15 @@ pub trait BlobStorage: Send + Sync {
     /// [`DEFAULT_INLINE_BYTES_CAP`].
     fn inline_bytes_cap(&self) -> usize;
 
-    /// Write a blob, with hash-on-write validation and auto-emission
-    /// of the holding claim — the commons form: `federation` / plaintext, so
-    /// the claim is the holder-directory row (`custody:ack:v1` `here` at
-    /// `federation`, v55.0.0 CIRISPersist#989). The caller signed
-    /// [`holding_claim_row`](crate::federation::holding_claim::holding_claim_row)
-    /// over the same inputs; persist rebuilds and checks it.
+    /// Write a blob, with hash-on-write validation, and admit its holding
+    /// claim — the commons form: `federation` / plaintext. v62.0.0 (T2-fix11;
+    /// CC 6.1.3) — `claim` is the holder's edition-2 `custody:{kind}` `here`
+    /// statement (one composite signature; the twin is
+    /// `edition2::fixture_switch::custody_statement`), naming this blob, its
+    /// size and `federation`; it goes through the statement door after the
+    /// bytes are stored, and a refused claim reaps the bytes this call stored
+    /// (`blob_admit::put_blob_planned`). The earlier `PutBlobAttestation` is
+    /// deleted (ruling 4).
     ///
     /// # Validation
     ///
@@ -1732,32 +1735,8 @@ pub trait BlobStorage: Send + Sync {
         sha256: &[u8; 32],
         body: BlobBody,
         media_type: Option<&str>,
-        attestation: PutBlobAttestation,
-    ) -> impl Future<Output = Result<(), BlobError>> + Send;
-
-    /// v62.0.0 (wave T2) — [`Self::put_blob`] with an EDITION-2 holding
-    /// claim: `claim` is the holder's `custody:{kind}` statement (`here`, at
-    /// `federation`, naming this blob and its size; the twin is
-    /// `edition2::fixture_switch::custody_statement`). The bytes are checked
-    /// and stored as `put_blob` stores them, then the claim goes through the
-    /// statement door (`edition2::ingest::put_statement`), so the holder
-    /// directory reads it as any custody report. The default refuses; the
-    /// sqlite and postgres backends override
-    /// (`blob_admit::put_blob_edition2_planned`).
-    fn put_blob_edition2(
-        &self,
-        sha256: &[u8; 32],
-        body: BlobBody,
-        media_type: Option<&str>,
         claim: &[u8],
-    ) -> impl Future<Output = Result<(), BlobError>> + Send {
-        let _ = (sha256, body, media_type, claim);
-        async {
-            Err(BlobError::InvalidArgument(
-                "put_blob_edition2: this backend has no edition-2 blob door".into(),
-            ))
-        }
-    }
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
     /// v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob
     /// bytes **without** emitting a holding claim.
@@ -1928,7 +1907,6 @@ pub trait BlobStorage: Send + Sync {
         floor: StorageFloor,
         binding: Option<EpochBinding>,
         group_key_id: Option<&str>,
-        announce: Option<PutBlobAttestation>,
     ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
 
     /// #846 (§6.2, I50) — **the adopt floor's chunk twin.** The same row and
@@ -2025,6 +2003,9 @@ pub trait BlobStorage: Send + Sync {
     /// v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.1) — [`put_blob`](Self::put_blob)
     /// with the row's `cohort_scope` and resolved `crypto_tier` recorded.
     /// `put_blob` itself is the commons form (`federation`, plaintext).
+    /// v62.0.0 (T2-fix11; CC 6.1.3) — `claim` is the holder's edition-2
+    /// `custody:{kind}` `here` statement at the content's scope; a sealed
+    /// floor announces a row a cascade already stored (it never stores).
     #[allow(clippy::too_many_arguments)]
     fn put_blob_with_scope(
         &self,
@@ -2032,30 +2013,10 @@ pub trait BlobStorage: Send + Sync {
         sha256: &[u8; 32],
         body: BlobBody,
         media_type: Option<&str>,
-        attestation: PutBlobAttestation,
+        claim: &[u8],
         cohort_scope: &str,
         floor: StorageFloor,
         group_key_id: Option<&str>,
-    ) -> impl Future<Output = Result<(), BlobError>> + Send;
-
-    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3) — **announce this node's
-    /// holding claim for a row it ALREADY stores**: the floor
-    /// [`emit_holding_claim`](crate::federation::holding_claim::emit_holding_claim)
-    /// ends at. Rebuilds the claim from `claim` and `scope`
-    /// ([`prepare_holding_claim_row`](crate::federation::holding_claim::prepare_holding_claim_row)
-    /// — the caller's hash must cover the rebuilt bytes), refuses a `scope`
-    /// that is not the stored content's
-    /// ([`content_claim_scope`](crate::federation::holding_claim::content_claim_scope),
-    /// `custody_ack_scope_mismatch`), a `size` that is not the stored length,
-    /// and a holder outside the cohort; then, in ONE transaction, checks the
-    /// row is still held ([`BlobError::NotHeld`] otherwise — an announcement
-    /// never stores) and inserts the claim. Indexed for the wire like every
-    /// federation-plane row.
-    fn put_holding_claim(
-        &self,
-        sha256: &[u8; 32],
-        claim: PutBlobAttestation,
-        scope: &crate::federation::holding_claim::ClaimScope,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
     /// v43.0.0 (§11.1) — the `cohort_scope` recorded when the blob was
@@ -2710,11 +2671,11 @@ pub trait BlobStorage: Send + Sync {
     ///
     /// # Why this method exists
     ///
-    /// `put_blob(PutBlobAttestation)` is the lower-level surface —
-    /// callers with a specific envelope already signed (re-emit of a
+    /// [`put_blob`](BlobStorage::put_blob) is the lower-level surface —
+    /// callers with a holding-claim statement already signed (re-emit of a
     /// remote announcement, HSM-batched signing latencies, replay /
     /// backfill with caller-determined timestamps) need full control
-    /// of the envelope bytes. The cost of that flexibility is that
+    /// of the claim bytes (v62.0.0: a composite edition-2 statement). The cost of that flexibility is that
     /// every consumer that just wants to write bytes-they-already-have
     /// reimplements seven steps of canonicalize + sign + assemble
     /// plumbing. CIRISPersist#121 names the trap: persist's production
@@ -4033,66 +3994,6 @@ pub struct EvictActorReport {
     pub withdraws_failed: usize,
 }
 
-/// Caller-supplied signed components of the holding claim a blob door
-/// stores: [`BlobStorage::put_blob`], `put_blob_with_scope`,
-/// `adopt_sealed_blob_at` and [`BlobStorage::put_holding_claim`].
-///
-/// v55.0.0 (CIRISPersist#989) — the claim is `custody:ack:v1` `here`
-/// ([`holding_claim_row`](crate::federation::holding_claim::holding_claim_row)),
-/// placed at the content's scope, which the door derives from the content it
-/// stores; the caller signs the row that builder produces for the same inputs
-/// ([`sign_holding_claim`](crate::federation::holding_claim::sign_holding_claim)
-/// does it for a `LocalSigner`), and the door rebuilds it and checks the
-/// caller's hash covers it.
-#[derive(Debug, Clone)]
-pub struct PutBlobAttestation {
-    /// `attesting_key_id` for the holder attestation. The
-    /// federation_keys row referenced MUST exist (FK constraint on
-    /// federation_attestations).
-    pub attesting_key_id: String,
-    /// Pre-computed UUID v4 for the attestation row's PK.
-    pub attestation_id: String,
-    /// v45.0.0 (CIRISPersist#871, CC 5.3.2.5 / 3.3.13) — the byte length the
-    /// holder claims, BOUND into the signed envelope (`size`). A puller caps
-    /// its read at this number before it hashes (AV-88); the door that stores
-    /// the bytes refuses a claim whose size is not the length it stored
-    /// (AV-89). Required: a claim without a size is not a claim a peer can
-    /// budget for.
-    pub size: u64,
-    /// SHA-256 of the canonical attestation envelope — the
-    /// `original_content_hash` column. Hex-encoded.
-    pub original_content_hash_hex: String,
-    /// Caller's Ed25519 scrub signature over the canonical envelope.
-    /// Base64-encoded.
-    pub scrub_signature_classical: String,
-    /// Optional ML-DSA-65 PQC signature; populated by the cold-path
-    /// sweep if `None` at write time.
-    pub scrub_signature_pqc: Option<String>,
-    /// `scrub_key_id` — the federation_keys row that signed the
-    /// envelope.
-    pub scrub_key_id: String,
-    /// Timestamp on the scrub signature.
-    pub scrub_timestamp: chrono::DateTime<chrono::Utc>,
-    /// v31.0.0 (CIRISPersist#652) — **when the HOLDER CLAIM is asserted**, and
-    /// now a field of its own.
-    ///
-    /// Both backends used to populate the `asserted_at` COLUMN from
-    /// [`Self::scrub_timestamp`]: *when the signature was made* standing in for
-    /// *when the claim was asserted*. Two different facts sharing one value is
-    /// survivable while nothing reads it; `asserted_at` is what every fold
-    /// orders on and what CIRISPersist#598 binds into the signed envelope, so
-    /// it is not survivable now. It is also the caller's to state, not
-    /// persist's to infer — a holder announcing bytes it has held for a week
-    /// is making a claim about the week, not about the moment it reached for
-    /// its key.
-    ///
-    /// Truncated to the substrate resolution when the envelope is stamped (see
-    /// [`holding_claim_row`](crate::federation::holding_claim::holding_claim_row)),
-    /// so a caller passing `Utc::now()` verbatim is correct rather than
-    /// refused.
-    pub asserted_at: chrono::DateTime<chrono::Utc>,
-}
-
 /// CIRISPersist#1271 — one stranded `federation_community_blob_epoch` row,
 /// as [`BlobStorage::list_stranded_blob_epochs`] returns it:
 /// `(at_rest_sha256, recorded_minter_key_id, author_key_id)`. The author is
@@ -4669,151 +4570,6 @@ impl BlobError {
     }
 }
 
-/// v31.0.0 (CIRISPersist#656) — **the `put_blob` door's admission gate**, run
-/// on the holding-claim row
-/// [`prepare_holding_claim_row`](crate::federation::holding_claim::prepare_holding_claim_row)
-/// just rebuilt (v55.0.0, CIRISPersist#989; the `holds_bytes` row before
-/// it), before anything is written.
-///
-/// # What #652 left open
-///
-/// #652 fixed the row SHAPE — the builder above stamps the #598 instants and
-/// the #643 mirror — but it wired no GATES. That was enough for the two
-/// bindings, which hold by construction, and not enough for anything else,
-/// because **the skew arm of [`check_instant_binding`] is not a binding
-/// property**. It compares `asserted_at` against wall-clock `now`, and
-/// [`PutBlobAttestation::asserted_at`] is caller-supplied and unbounded — so
-/// this door minted a FEDERATION-tier row (served and replicated; see the
-/// builder's `tier` note) whose consent-fold ordering key sat arbitrarily far
-/// in the future. Construction cannot satisfy a bound it does not know about,
-/// which is the general reason a deterministic builder is not a substitute for
-/// a gate.
-///
-/// Two arms:
-///
-/// 1. **[`check_instant_binding`]**, the same call every other door makes,
-///    which is where the skew bound lives.
-/// 2. **THE CALLER'S HASH MUST COVER THE BYTES PERSIST REBUILT.** The door
-///    writes the caller's `original_content_hash` and `scrub_signature_*` over
-///    an envelope it reconstructed itself, and nothing checked that the two
-///    describe the same thing. The reconstruction being deterministic is
-///    exactly what makes the cross-check possible — it is the property
-///    [`holding_claim_row`](crate::federation::holding_claim::holding_claim_row)'s
-///    doc rests its *"the party that MINTS
-///    the bytes stamps, the party that RECEIVES them checks"* claim on — so it
-///    is used here rather than assumed. A signature over a different envelope
-///    than the one stored is the #649 divergence with the halves swapped.
-///
-/// `now` is a parameter so the skew bound is testable without sleeping.
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
-pub(crate) fn check_put_blob_admission(
-    row: &crate::federation::Attestation,
-    declared_content_hash_hex: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<(), BlobError> {
-    use sha2::{Digest, Sha256};
-
-    crate::federation::admission::check_instant_binding(
-        row,
-        now,
-        crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
-    )
-    .map_err(|e| BlobError::InvalidArgument(format!("holder attestation: {e}")))?;
-
-    let canonical = crate::verify::canonical::ceg_produce_canonicalize(&row.attestation_envelope)
-        .map_err(|e| {
-        BlobError::Backend(format!(
-            "holder attestation canonicalize: {e} (CIRISPersist#656)"
-        ))
-    })?;
-    let rebuilt = hex::encode(Sha256::digest(&canonical));
-    if rebuilt != declared_content_hash_hex {
-        return Err(BlobError::InvalidArgument(format!(
-            "holder attestation {}: the declared original_content_hash {declared_content_hash_hex} \
-             does not cover the envelope persist stores — these bytes canonicalize to {rebuilt}. \
-             `put_blob` REBUILDS the holder envelope rather than storing the caller's, so a \
-             signature made over anything else covers an envelope that does not exist \
-             (CIRISPersist#656/#652)",
-            row.attestation_id,
-        )));
-    }
-    Ok(())
-}
-
-/// v55.0.0 (CIRISPersist#989) — the holding-claim envelope `put_blob` (the
-/// commons door) rebuilds for these inputs: the test twin of the retired
-/// `holds_bytes_attestation_envelope`, through the one builder.
-#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
-pub(crate) fn commons_claim_envelope(
-    sha256: &[u8; 32],
-    holder: &str,
-    attestation_id: &str,
-    asserted_at: chrono::DateTime<chrono::Utc>,
-    size: u64,
-) -> serde_json::Value {
-    let scope = crate::federation::holding_claim::ClaimScope::of_content(
-        crate::federation::types::cohort_scope::CryptoTier::Plaintext,
-        crate::federation::types::cohort_scope::FEDERATION,
-        None,
-    )
-    .expect("the commons claim scope");
-    crate::federation::holding_claim::holding_claim_row(
-        sha256,
-        holder,
-        attestation_id,
-        asserted_at,
-        size,
-        &scope,
-    )
-    .expect("a sized holding claim")
-    .attestation_envelope
-}
-
-/// v31.0.0 (CIRISPersist#656) — **a `PutBlobAttestation` whose declared
-/// content hash actually covers the envelope `put_blob` will rebuild.**
-///
-/// Every backend's blob fixtures used to hard-code `original_content_hash_hex`
-/// to a placeholder (`"abcdef01"` / `"deadbeef"` — four bytes, where the column
-/// is a 32-byte digest). That is what let the missing
-/// [`check_put_blob_admission`] cross-check go unnoticed for a whole release:
-/// the fixtures asserted the door's behaviour on rows whose declared hash
-/// covered nothing, so no test could tell a correct hash from an absent one.
-/// This mints the hash the way [`BlobStorage::put_blob_signing`] does — from
-/// [`holding_claim_row`](crate::federation::holding_claim::holding_claim_row)
-/// over the same inputs, at the commons claim scope `put_blob` derives — so
-/// the fixtures exercise the shape production actually produces.
-///
-/// The signature stays a placeholder: `put_blob` does not verify signatures
-/// (see [`check_put_blob_admission`] for what it does check), and pretending
-/// otherwise in a fixture would be the same defect one field over.
-#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
-pub(crate) fn sealed_put_blob_attestation(
-    sha256: &[u8; 32],
-    attesting_key_id: &str,
-    scrub_key_id: &str,
-    attestation_id: &str,
-    asserted_at: chrono::DateTime<chrono::Utc>,
-    scrub_timestamp: chrono::DateTime<chrono::Utc>,
-    size: u64,
-) -> PutBlobAttestation {
-    use sha2::{Digest, Sha256};
-    let envelope =
-        commons_claim_envelope(sha256, attesting_key_id, attestation_id, asserted_at, size);
-    let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
-        .expect("the holding claim envelope canonicalizes");
-    PutBlobAttestation {
-        attesting_key_id: attesting_key_id.to_owned(),
-        attestation_id: attestation_id.to_owned(),
-        size,
-        original_content_hash_hex: hex::encode(Sha256::digest(&canonical)),
-        scrub_signature_classical: "c2ln".to_owned(),
-        scrub_signature_pqc: None,
-        scrub_key_id: scrub_key_id.to_owned(),
-        scrub_timestamp,
-        asserted_at,
-    }
-}
-
 /// v31.0.0 (CIRISPersist#656) — **the `put_blob` admission witness**, shared by
 /// the sqlite and postgres legs.
 ///
@@ -4857,7 +4613,7 @@ pub(crate) async fn exercise_put_blob_admission_for_host<B>(backend: &B, host: &
 where
     B: BlobStorage + crate::federation::FederationDirectory,
 {
-    // v62.0.0 (JSON cut, critical path, E5) — the door is `put_blob_edition2`
+    // v62.0.0 (JSON cut, critical path, E5) — the door is `put_blob`
     // (T2.api §5): the holder's claim is an edition-2 `custody:{kind}`
     // statement (`typed_fixtures::custody_statement`) by the holder's own
     // `key:record` (a `user` key: from 0, no end), named by its identity-ref.
@@ -4889,7 +4645,7 @@ where
         e2::ms(far_future),
     );
     backend
-        .put_blob_edition2(&sha, BlobBody::Inline(bytes.clone()), None, &skewed)
+        .put_blob(&sha, BlobBody::Inline(bytes.clone()), None, &skewed)
         .await
         .expect_err("put_blob must apply the future-skew bound (#656)");
     assert!(
@@ -4915,7 +4671,7 @@ where
         e2::ms(now),
     );
     backend
-        .put_blob_edition2(&sha, BlobBody::Inline(bytes.clone()), None, &wrong_size)
+        .put_blob(&sha, BlobBody::Inline(bytes.clone()), None, &wrong_size)
         .await
         .expect_err("put_blob must refuse a claim for another size (#656, I3171)");
     assert!(!backend.has_blob(&sha).await.expect("has_blob"));
@@ -4924,7 +4680,7 @@ where
     //        the PAST (two days back: a custody report is live for 72 h).
     let honest = tf::custody_statement(&holder, &sha, Some(len), "federation", None, e2::ms(now));
     backend
-        .put_blob_edition2(&sha, BlobBody::Inline(bytes.clone()), None, &honest)
+        .put_blob(&sha, BlobBody::Inline(bytes.clone()), None, &honest)
         .await
         .expect("an honest holder claim still lands — legs 1 and 2 gate the door, not close it");
     let past_at = ms_instant(now - chrono::Duration::days(2));
@@ -4937,7 +4693,7 @@ where
         e2::ms(past_at),
     );
     backend
-        .put_blob_edition2(&sha, BlobBody::Inline(bytes), None, &past)
+        .put_blob(&sha, BlobBody::Inline(bytes), None, &past)
         .await
         .expect(
             "a holder announcing bytes it has held for days is making a claim about those days",
@@ -5810,7 +5566,7 @@ mod put_blob_binding_tests {
     /// a receiver would accept.
     #[tokio::test]
     async fn put_blob_mints_a_row_that_satisfies_both_binding_gates_652() {
-        // v62.0.0 (JSON cut, critical path, E5) — through `put_blob_edition2`
+        // v62.0.0 (JSON cut, critical path, E5) — through `put_blob`
         // (T2.api §5). The two binding gates `put_blob` used to skip
         // (`check_instant_binding`, `check_row_column_binding`) read the JSON
         // `row` mirror and signed instants of the earlier envelope; an
@@ -5844,7 +5600,7 @@ mod put_blob_binding_tests {
             None,
             e2::ms(asserted_at),
         );
-        sq.put_blob_edition2(
+        sq.put_blob(
             &sha,
             crate::federation::BlobBody::Inline(payload.clone()),
             None,
@@ -5923,7 +5679,7 @@ pub(crate) async fn exercise_put_blob_states_its_cohort_scope<B>(be: &B, tag: &s
 where
     B: BlobStorage + crate::federation::FederationDirectory,
 {
-    // v62.0.0 (JSON cut, critical path, E5) — through `put_blob_edition2`
+    // v62.0.0 (JSON cut, critical path, E5) — through `put_blob`
     // (T2.api §5). The #643 column binding (`check_row_column_binding`) read
     // the JSON `row` mirror, which an edition-2 row does not carry: the stored
     // row IS the door's projection of the signed statement, so the property
@@ -5942,7 +5698,7 @@ where
         None,
         e2::ms(chrono::Utc::now()),
     );
-    be.put_blob_edition2(&sha, BlobBody::Inline(payload), None, &claim)
+    be.put_blob(&sha, BlobBody::Inline(payload), None, &claim)
         .await
         .unwrap_or_else(|e| panic!("[{tag}] put_blob must admit an ordinary inline body: {e:?}"));
     let stored =

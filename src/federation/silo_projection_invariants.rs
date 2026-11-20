@@ -10,8 +10,10 @@
 //!   ([`check_projection_rebuild`](crate::federation::silo_projection::check_projection_rebuild)).
 //!   The row is unpurgeable (the accountability-record family). (v60.0.0:
 //!   it replicates; I1165 witnesses the crossing and the peer's copy.)
-//! - **I961 (`detection_events`)** — `put_detection_event` (twice, plus an
-//!   idempotent re-put and a conflicting one), then the DSAR erasure of one
+//! - **I961 (`detection_events`)** — two detections stated by a conferred
+//!   detector (v62: `detection_row::state_detection`; the earlier
+//!   `put_detection_event` door is deleted), an idempotent re-statement and an
+//!   unconferred one held, then the DSAR erasure of one
 //!   detection's trace: its signed row is hard-deleted under a tombstone
 //!   citing the producer's `withdraws` (never rewritten), and the rebuild is
 //!   byte-equal again.
@@ -22,13 +24,14 @@
 //!   `hard_case::refusal::ATTESTER_UNAVAILABLE`) and NOTHING moves; with the
 //!   node key held the same erasure SUCCEEDS, records its
 //!   `hard_case:trace_erasure:v1` row, and the projection is its rebuild.
-//! - **I963 (the legacy rehome, lead ruling 4)** — pre-v57 silo rows (no
-//!   backing row) are moved onto the plane by the first emitter after the
-//!   upgrade; each rehomed row's `asserted_at` is the silo row's own
-//!   recorded instant (never the rehome's clock), a second rehome adds
-//!   nothing, and the projection is its rebuild after it. On sqlite and
-//!   postgres; memory holds no pre-v57 rows and its rehome is a declared
-//!   no-op (`store::parity`), asserted here.
+//! - **I963 (the legacy rehome)** — DELETED in v62.0.0 (P8-fix7): it
+//!   seeded pre-v57 silo rows (no backing row, a v56 node's writes) and
+//!   witnessed their rehome onto the plane. A v62 node reads nothing from an
+//!   earlier store (CC 1.0-rc20 "nothing carries, clean mesh"; V300 refuses
+//!   any history below 300 and `store::edition_upgrade` deletes such a
+//!   store), so no v62 store can hold the rows it rehomes, and a rehomed row
+//!   is an earlier-form row (attested by a hybrid key, no statement) the
+//!   edition-2 doors refuse.
 //!
 //! - **I964 (the DSAR erasure of a detection, lead ruling on the DSAR
 //!   path)** — on both DSAR doors, the erased trace's signed detection row
@@ -43,6 +46,17 @@
 //!
 //! Each runner then TAMPERS with the live table (one column of one row) and
 //! asserts the gate goes red: a witness that cannot fail is a report.
+//!
+//! v62.0.0 (v62 P8-fix7, CP2) — I961 and I964 are EDITION 2 on sqlite and
+//! postgres, no earlier-form scope: each detection is its detector's own
+//! `detection:{detector}` statement (`detection_row::state_detection`), the
+//! detector an `agent` key holding `infra:detect` conferred by a root this
+//! node accepts (E7's `subject_erasure_invariants` fixtures), the row id
+//! node-computed; the DSAR erasure cites the producer's own `withdraws`
+//! statement. The earlier-form properties are gone with the door that had
+//! them: a detection id is no longer the row id, so "different bytes under a
+//! held detection_id conflict" has no edition-2 statement (different bytes
+//! are a different row), and a pre-v57 detection rides no erasure (I963).
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -155,86 +169,204 @@ pub(crate) mod bodies {
         rebuild.live.len()
     }
 
-    fn detection(trace: &str, signer: &str) -> crate::derived::DetectionEvent {
-        crate::derived::DetectionEvent {
-            detection_id: uuid::Uuid::new_v4(),
-            trace_id: trace.to_owned(),
-            body_sha256: vec![7u8; 32],
-            detector: "cohort_declared_inferred_mismatch".into(),
-            severity: crate::derived::DetectionSeverity::Warning,
-            cohort_cell: serde_json::json!({"agent_role": "x", "deployment_region": "eu"}),
-            conformity_variant: crate::derived::ConformityVariant::Numeric,
-            conformity_payload: serde_json::json!({"score": 0.25}),
-            lens_core_version: "1.0.0".into(),
-            ratchet_calibration_version: 3,
-            canonical_bytes: format!("{{\"trace\":\"{trace}\"}}").into_bytes(),
-            ed25519_sig: vec![1u8; 64],
-            ml_dsa_65_sig: vec![2u8; 3309],
-            signing_key_id: signer.to_owned(),
-            // Microsecond-clean: postgres stores `ts` at microsecond precision,
-            // and the read-back compares the event whole.
-            ts: crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now()),
+    /// v62.0.0 (P8-fix7) — the conferred detector of `tag` (E7's
+    /// `detector_seed`, an `agent` key holding `infra:detect` from `tag`'s
+    /// root, which this node accepts: the runner set the node key first).
+    /// Returns its seed.
+    pub(crate) async fn conferred_detector<B>(b: &B, tag: &str) -> String
+    where
+        B: FederationDirectory,
+    {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::subject_erasure_invariants::bodies as sub;
+        let det = sub::detector_seed(tag);
+        e2::put_key(b, &det, &[identity_type::AGENT]).await;
+        sub::confer_detect(b, tag, &det).await;
+        det
+    }
+
+    /// v62.0.0 (P8-fix7) — a held trace of `agent` on `trace`, and `det`'s
+    /// detection of it, stated on edition 2: the event and its node-computed
+    /// row id.
+    pub(crate) async fn stated<B>(
+        b: &B,
+        det: &str,
+        agent: &str,
+        trace: &str,
+    ) -> (crate::derived::DetectionEvent, String)
+    where
+        B: AttestationStore + crate::store::Backend,
+    {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::subject_erasure_invariants::bodies as sub;
+        b.insert_trace_events_batch(&[trace_row(trace, agent)])
+            .await
+            .unwrap();
+        let mut ev = sub::detection(trace, &e2::kid(det));
+        ev.ts = crate::federation::admission::truncate_to_substrate_resolution(
+            chrono::Utc::now() - chrono::Duration::minutes(2),
+        );
+        let id = crate::derived::detection_row::state_detection(b, &ts::local_signer(det), &ev)
+            .await
+            .unwrap_or_else(|e| panic!("the conferred detector states its detection: {e}"));
+        (ev, id)
+    }
+
+    /// v62.0.0 (P8-fix8) — the statement a held row carries (its signed
+    /// bytes), read BEFORE an erasure deletes the row.
+    pub(crate) async fn statement_of<B>(b: &B, row_id: &str) -> Vec<u8>
+    where
+        B: FederationDirectory,
+    {
+        let row = b
+            .get_attestation(row_id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("row {row_id} is held"));
+        crate::federation::edition2::emit::carried_statement(&row)
+            .unwrap_or_else(|| panic!("row {row_id} carries its statement"))
+    }
+
+    /// v62.0.0 (P8-fix8) — **the tombstone refuses the row's re-admission**:
+    /// the erased row's OWN statement, re-offered byte for byte through the
+    /// statement door (the same row id: what a replica would bring back), is
+    /// refused `purge_tombstoned` (`steward_purge::token::TOMBSTONED`, the
+    /// attestation plan's `refuse_if_tombstoned_attestation`), and the row
+    /// stays gone. Pinned to the token, never `is_err`: a broken fixture
+    /// must not pass for a tombstone.
+    async fn assert_reoffer_tombstoned<B>(b: &B, statement: &[u8], row_id: &str, what: &str)
+    where
+        B: FederationDirectory,
+    {
+        use crate::federation::steward_purge::token::TOMBSTONED;
+        let again = crate::federation::edition2::ingest::put_statement(
+            b,
+            statement,
+            None,
+            crate::federation::edition2::ingest::INGEST_TIER,
+        )
+        .await;
+        match &again {
+            Err(crate::federation::Error::PurgeRefused { token, .. }) if *token == TOMBSTONED => {}
+            other => panic!(
+                "{what}: the erased row's statement re-offered is refused {TOMBSTONED}: {other:?}"
+            ),
         }
+        assert!(
+            b.get_attestation(row_id).await.unwrap().is_none(),
+            "{what}: nothing was re-admitted"
+        );
+    }
+
+    /// The live projection of `ev` (its trace's events), by detection id.
+    async fn projected<B>(b: &B, ev: &crate::derived::DetectionEvent) -> Vec<uuid::Uuid>
+    where
+        B: crate::derived::DerivedSchema,
+    {
+        b.get_detection_events(crate::derived::EventFilter {
+            trace_id: Some(ev.trace_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("read the projection")
+        .into_iter()
+        .map(|e| e.detection_id)
+        .collect()
     }
 
     /// I961 — the writers (no erasure), then the gate. Returns the two
-    /// detections the runner erases one of.
+    /// detections (event, row id) the runner erases the first of, and the
+    /// detector's seed (the producer that states the erasure's withdraws).
+    ///
+    /// v62.0.0 (P8-fix7) — edition 2: an identical re-statement is the same
+    /// row (idempotent); a detector with no `infra:detect` conferral is
+    /// refused (standing is the conferral plane's, never the key's type).
+    #[allow(clippy::type_complexity)]
     pub(crate) async fn i961_detection<B>(
         b: &B,
         tag: &str,
     ) -> (
-        crate::derived::DetectionEvent,
-        crate::derived::DetectionEvent,
+        (crate::derived::DetectionEvent, String),
+        (crate::derived::DetectionEvent, String),
+        String,
     )
     where
         B: AttestationStore + crate::derived::DerivedSchema + crate::store::Backend,
     {
-        let detector = format!("{tag}-lens");
-        ts::register_hybrid_key_as(b, &detector, &detector, identity_type::LENSCORE_DETECTOR).await;
-        // v58.0.0 (#1094 item 2) — the traces first, so each row names its
-        // subject (the agent whose trace it scored).
-        b.insert_trace_events_batch(&[
-            trace_row(&format!("{tag}-trace-a"), &format!("{tag}-agent-h")),
-            trace_row(&format!("{tag}-trace-c"), &format!("{tag}-agent-c")),
-        ])
+        use crate::federation::edition2::fixture_switch as e2;
+        let det = conferred_detector(b, tag).await;
+        let (a, a_row) = stated(
+            b,
+            &det,
+            &format!("{tag}-agent-h"),
+            &format!("{tag}-trace-a"),
+        )
+        .await;
+        let (c, c_row) = stated(
+            b,
+            &det,
+            &format!("{tag}-agent-c"),
+            &format!("{tag}-trace-c"),
+        )
+        .await;
+        assert_ne!(a_row, c_row, "I961: two detections, two rows");
+        let again = crate::derived::detection_row::state_detection(b, &ts::local_signer(&det), &a)
+            .await
+            .expect("I961: an identical re-statement is admitted");
+        assert_eq!(again, a_row, "I961: the same statement is the same row");
+        // A detector that is not one: an agent key with no conferral.
+        let rogue = format!("{tag}-rogue");
+        e2::put_key(b, &rogue, &[identity_type::AGENT]).await;
+        b.insert_trace_events_batch(&[trace_row(
+            &format!("{tag}-trace-x"),
+            &format!("{tag}-agent-x"),
+        )])
         .await
         .unwrap();
-        let a = detection(&format!("{tag}-trace-a"), &detector);
-        let c = detection(&format!("{tag}-trace-c"), &detector);
-        b.put_detection_event(a.clone()).await.expect("I961: a");
-        b.put_detection_event(c.clone()).await.expect("I961: c");
-        b.put_detection_event(a.clone())
-            .await
-            .expect("I961: an identical re-put is a no-op");
-        let mut moved = a.clone();
-        moved.canonical_bytes = b"{\"other\":1}".to_vec();
-        assert!(
-            matches!(
-                b.put_detection_event(moved).await,
-                Err(crate::derived::Error::Conflict(_))
-            ),
-            "I961: different bytes under a held detection_id conflict"
+        let mut x = crate::federation::subject_erasure_invariants::bodies::detection(
+            &format!("{tag}-trace-x"),
+            &e2::kid(&rogue),
         );
-        // A detector that is not one: the reserved family refuses it.
-        let agent = format!("{tag}-agent");
-        ts::register_hybrid_key_as(b, &agent, &agent, identity_type::AGENT).await;
+        x.ts = a.ts;
+        // v62.0.0 (P8-fix8) — an unconferred emitter of a reserved family is
+        // a FOLD condition (CC 2.7.3: G0/GC1 hold it, they never refuse it):
+        // the statement is kept and the row HELD under
+        // `reserved_prefix_emitter_mismatch`, so it is neither seated nor
+        // projected. Pinned to the reason, never `is_err`.
+        let x_row =
+            crate::derived::detection_row::state_detection(b, &ts::local_signer(&rogue), &x)
+                .await
+                .expect("I961: an unconferred detection is held, not an error");
         assert!(
-            matches!(
-                b.put_detection_event(detection(&format!("{tag}-trace-x"), &agent))
-                    .await,
-                Err(crate::derived::Error::InvalidArgument(_))
+            b.get_attestation(&x_row).await.unwrap().is_none(),
+            "I961: only a conferred detector's detection is seated"
+        );
+        let held = crate::federation::edition2::fold::why_held(
+            b,
+            &crate::federation::edition2::names::RowId(
+                <[u8; 32]>::try_from(hex::decode(&x_row).unwrap().as_slice()).unwrap(),
             ),
-            "I961: only a lenscore_detector emits detection:*"
+        )
+        .await
+        .unwrap()
+        .expect("I961: the unconferred detection is held");
+        assert_eq!(
+            held.reason,
+            crate::federation::edition2::fold::reason::gc1::RESERVED_PREFIX_EMITTER_MISMATCH,
+            "I961: held for the missing infra:detect conferral: {held:?}"
+        );
+        assert!(
+            projected(b, &x).await.is_empty(),
+            "I961: the held detection projects nothing"
         );
         let row = b
-            .get_attestation(&crate::derived::detection_row::detection_attestation_id(
-                &a.detection_id,
-            ))
+            .get_attestation(&a_row)
             .await
             .expect("I961: get")
             .expect("I961: the detection is a row");
         assert_eq!(
-            row.attesting_key_id, detector,
+            row.attesting_key_id,
+            e2::kid(&det),
             "I961: attester = the detector"
         );
         // The gate first, so a writer that moved a column is caught by it
@@ -242,67 +374,50 @@ pub(crate) mod bodies {
         check_projection_rebuild(b, SiloProjection::DetectionEvents)
             .await
             .expect("I961: detection_events is its rows' rebuild");
-        let read = b
-            .get_detection_events(crate::derived::EventFilter {
-                trace_id: Some(a.trace_id.clone()),
-                ..Default::default()
-            })
-            .await
-            .expect("I961: read");
         assert_eq!(
-            read,
-            vec![a.clone()],
+            projected(b, &a).await,
+            vec![a.detection_id],
             "I961: the projection reads back the event"
         );
-        (a, c)
+        ((a, a_row), (c, c_row), det)
     }
 
-    /// I961, after the runner ran the DSAR erasure of `erased`'s trace (lead
-    /// ruling on S1 item 5): the erased detection's signed row was
-    /// HARD-DELETED in the erasure's transaction (never rewritten), its
-    /// projection row left with it, and a purge tombstone under the
-    /// erasure's own `hard_case:trace_erasure:v1` row
-    /// (`steward_purge::ART17_ERASURE_BASIS`) refuses its re-admission and is
-    /// never served as a purge bundle. The other detection is untouched and
-    /// the table is its rows' rebuild.
+    /// I961, after the runner ran the DSAR erasure of `erased`'s trace (its
+    /// producer's `withdraws` stated first): the erased detection's signed
+    /// row was HARD-DELETED in the erasure's transaction (never rewritten),
+    /// its projection row left with it, and a purge tombstone whose header
+    /// cites the producer's `withdraws` refuses its re-admission. The other
+    /// detection is untouched and the table is its rows' rebuild.
     pub(crate) async fn i961_after_erasure<B>(
         b: &B,
-        erased: &crate::derived::DetectionEvent,
-        kept: &crate::derived::DetectionEvent,
+        det: &str,
+        erased: &(crate::derived::DetectionEvent, String),
+        erased_statement: &[u8],
+        kept: &(crate::derived::DetectionEvent, String),
     ) where
         B: AttestationStore + crate::derived::DerivedSchema,
     {
-        let erased_row =
-            crate::derived::detection_row::detection_attestation_id(&erased.detection_id);
+        use crate::federation::edition2::fixture_switch as e2;
+        let (erased, erased_row) = (&erased.0, &erased.1);
         assert!(
-            b.get_attestation(&erased_row).await.unwrap().is_none(),
+            b.get_attestation(erased_row).await.unwrap().is_none(),
             "I961: the erased detection's signed row is hard-deleted, not rewritten"
         );
         assert!(
-            b.get_detection_events(crate::derived::EventFilter {
-                trace_id: Some(erased.trace_id.clone()),
-                ..Default::default()
-            })
-            .await
-            .expect("I961: read")
-            .is_empty(),
+            projected(b, erased).await.is_empty(),
             "I961: the erased detection is not returned"
         );
         assert_eq!(
-            b.get_detection_events(crate::derived::EventFilter {
-                trace_id: Some(kept.trace_id.clone()),
-                ..Default::default()
-            })
-            .await
-            .expect("I961: read"),
-            vec![kept.clone()],
+            projected(b, &kept.0).await,
+            vec![kept.0.detection_id],
             "I961: the other detection is untouched"
         );
-        // v58.0.0 (#1094 item 2) — the tombstone: under a header citing the
-        // producer's rule-1 `withdraws` (never the erasure's own row), SERVED, and it
-        // refuses the row's re-admission.
+        assert!(
+            b.get_attestation(&kept.1).await.unwrap().is_some(),
+            "I961: the other detection's row is held"
+        );
         let notice = b
-            .purge_tombstoned("attestation", &erased_row)
+            .purge_tombstoned("attestation", erased_row)
             .await
             .unwrap()
             .expect("I961: the erased row is tombstoned");
@@ -328,22 +443,18 @@ pub(crate) mod bodies {
             &serde_json::from_str(&header.notice_jcs).unwrap(),
         )
         .expect("I961: the header cites the subject's withdraws");
-        assert_eq!(cited.target_attestation_id, erased_row);
+        assert_eq!(&cited.target_attestation_id, erased_row);
         let withdraws = b
             .get_attestation(&cited.withdraws_attestation_id)
             .await
             .unwrap()
             .expect("I961: the cited withdraws is held");
         assert_eq!(
-            withdraws.attesting_key_id, erased.signing_key_id,
+            withdraws.attesting_key_id,
+            e2::kid(det),
             "I961: the producer"
         );
-        let again = b.put_detection_event(erased.clone()).await;
-        assert!(
-            matches!(&again, Err(crate::derived::Error::InvalidArgument(m))
-                if m.starts_with(crate::federation::steward_purge::token::TOMBSTONED)),
-            "I961: the tombstone refuses the row's re-admission: {again:?}"
-        );
+        assert_reoffer_tombstoned(b, erased_statement, erased_row, "I961").await;
         check_projection_rebuild(b, SiloProjection::DetectionEvents)
             .await
             .expect("I961: after the erasure, detection_events is its rows' rebuild");
@@ -439,134 +550,31 @@ pub(crate) mod bodies {
             .expect("I962: hard_case_events is its rows' rebuild");
     }
 
-    /// I963 — after the runner seeded pre-v57 silo rows (`legacy_event_id`
-    /// emitted at `legacy_at`, a detection `legacy_detection` at
-    /// `legacy_detection_ts`), the first emitters rehome them.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    pub(crate) async fn i963_the_rehome<B>(
-        b: &B,
-        node: &str,
-        tag: &str,
-        legacy_event_id: &str,
-        legacy_at: chrono::DateTime<chrono::Utc>,
-        legacy_detection: Option<(uuid::Uuid, chrono::DateTime<chrono::Utc>, &str)>,
-    ) where
-        B: AttestationStore + crate::derived::DerivedSchema,
-    {
-        let trunc = crate::federation::admission::truncate_to_substrate_resolution;
-        // The first hard_case emitter rehomes the legacy hard_case row.
-        b.record_hard_case(event(
-            &format!("{tag}-new"),
-            hard_case::kind::CONSENT_SLA_BREACH,
-            serde_json::json!({}),
-        ))
-        .await
-        .expect("I963: the first emitter after the upgrade");
-        let row = b
-            .get_attestation(&hard_case::hard_case_attestation_id(legacy_event_id))
-            .await
-            .unwrap()
-            .expect("I963: the legacy event is a row now");
-        assert_eq!(row.attesting_key_id, node);
-        assert_eq!(
-            row.asserted_at,
-            trunc(legacy_at),
-            "I963: the rehomed row is asserted at the silo row's own instant, never the boot clock"
-        );
-        check_projection_rebuild(b, SiloProjection::HardCaseEvents)
-            .await
-            .expect("I963: after the rehome, hard_case_events is its rows' rebuild");
-        if let Some((detection_id, ts, detector)) = legacy_detection {
-            // The first detection put rehomes the legacy detection row.
-            let mut fresh = detection(&format!("{tag}-trace-new"), detector);
-            fresh.ts = trunc(chrono::Utc::now());
-            b.put_detection_event(fresh)
-                .await
-                .expect("I963: a detection put");
-            let row = b
-                .get_attestation(&crate::derived::detection_row::detection_attestation_id(
-                    &detection_id,
-                ))
-                .await
-                .unwrap()
-                .expect("I963: the legacy detection is a row now");
-            assert_eq!(row.attesting_key_id, detector);
-            assert_eq!(
-                row.asserted_at,
-                trunc(ts),
-                "I963: asserted at the detection's ts"
-            );
-            check_projection_rebuild(b, SiloProjection::DetectionEvents)
-                .await
-                .expect("I963: after the rehome, detection_events is its rows' rebuild");
-        }
-        // Idempotent: a second rehome (a second boot) adds nothing.
-        let attester = crate::federation::attestation_admit::HardCaseAttester {
-            key_id: node.to_owned(),
-            identity_type: identity_type::NODE.to_owned(),
-        };
-        let before = b
-            .list_hard_case_events(hard_case::HardCaseFilter::default())
-            .await
-            .unwrap();
-        b.rehome_legacy_hard_case_events(&attester, chrono::Utc::now())
-            .await
-            .unwrap();
-        b.rehome_legacy_detection_events(chrono::Utc::now())
-            .await
-            .unwrap();
-        assert_eq!(
-            b.list_hard_case_events(hard_case::HardCaseFilter::default())
-                .await
-                .unwrap(),
-            before,
-            "I963: a second rehome adds nothing"
-        );
-        check_projection_rebuild(b, SiloProjection::HardCaseEvents)
-            .await
-            .expect("I963: still its rows' rebuild");
-        check_projection_rebuild(b, SiloProjection::DetectionEvents)
-            .await
-            .expect("I963: still its rows' rebuild");
-    }
-
-    /// I964 — the DSAR erasure of a trace with a row-backed detection (and,
-    /// when the runner seeded `legacy`, a pre-v57 detection of the same
-    /// trace): `expected` is the counter the erasure must report. Then the
-    /// key-scoped door (`delete_traces_for_agent`) on a second trace.
-    pub(crate) async fn i964_the_dsar_erasure<B>(
-        b: &B,
-        tag: &str,
-        legacy: Option<uuid::Uuid>,
-        expected: u64,
-    ) where
+    /// I964 — the DSAR erasure of a trace with a row-backed detection,
+    /// then the key-scoped door (`delete_traces_for_agent`) on a second
+    /// trace. v62.0.0 (P8-fix7) — edition 2: each detection is its conferred
+    /// detector's statement, and each erasure cites the producer's own
+    /// `withdraws` (stated first, CC 4.5.3). No pre-v57 detection rides it
+    /// (I963's deletion).
+    pub(crate) async fn i964_the_dsar_erasure<B>(b: &B, tag: &str)
+    where
         B: AttestationStore + crate::derived::DerivedSchema + crate::store::Backend + Sync,
     {
-        use crate::derived::detection_row as dr;
-        let lens = format!("{tag}-lens");
-        crate::federation::hard_case::test_support_hold(b, &lens).await;
+        use crate::federation::subject_erasure_invariants::bodies as sub;
+        let det = conferred_detector(b, tag).await;
         let agent = format!("{tag}-agent-h");
         let trace = format!("{tag}-trace");
-        b.insert_trace_events_batch(&[trace_row(&trace, &agent)])
-            .await
-            .unwrap();
-        let original = detection(&trace, &lens);
-        b.put_detection_event(original.clone()).await.unwrap();
-        let row_id = dr::detection_attestation_id(&original.detection_id);
+        let (original, row_id) = stated(b, &det, &agent, &trace).await;
+        let original_statement = statement_of(b, &row_id).await;
+        sub::state_producer_withdraws(b, &det, &agent, None).await;
 
         let summary = b.delete_traces_for_agent_id_hash(&agent).await.unwrap();
-        assert_eq!(
-            summary.detection_events_tombstoned, expected,
-            "I964: the counter"
-        );
+        assert_eq!(summary.detection_events_tombstoned, 1, "I964: the counter");
         assert!(
             b.get_attestation(&row_id).await.unwrap().is_none(),
             "I964: the signed row is hard-deleted"
         );
-        let gone: Vec<uuid::Uuid> = std::iter::once(original.detection_id)
-            .chain(legacy)
-            .collect();
-        i964_no_projection_row(b, &gone).await;
+        i964_no_projection_row(b, &[original.detection_id]).await;
         let notice = b
             .purge_tombstoned("attestation", &row_id)
             .await
@@ -594,12 +602,7 @@ pub(crate) mod bodies {
                 .any(|e| e.notice_id == notice),
             "I964: the erasure's header is served"
         );
-        let again = b.put_detection_event(original.clone()).await;
-        assert!(
-            matches!(&again, Err(crate::derived::Error::InvalidArgument(m))
-                if m.starts_with(crate::federation::steward_purge::token::TOMBSTONED)),
-            "I964: a re-put is refused TOMBSTONED: {again:?}"
-        );
+        assert_reoffer_tombstoned(b, &original_statement, &row_id, "I964").await;
         check_projection_rebuild(b, SiloProjection::DetectionEvents)
             .await
             .expect("I964: detection_events is its rows' rebuild after the erasure");
@@ -616,13 +619,10 @@ pub(crate) mod bodies {
         // The key-scoped door erases the same way.
         let agent2 = format!("{tag}-agent-k");
         let trace2 = format!("{tag}-trace-k");
-        b.insert_trace_events_batch(&[trace_row(&trace2, &agent2)])
-            .await
-            .unwrap();
-        let second = detection(&trace2, &lens);
-        b.put_detection_event(second.clone()).await.unwrap();
-        let row2 = dr::detection_attestation_id(&second.detection_id);
-        b.delete_traces_for_agent(&agent2, &format!("{agent2}-signer"), false)
+        let (second, row2) = stated(b, &det, &agent2, &trace2).await;
+        let signer_key = format!("{agent2}-signer");
+        sub::state_producer_withdraws(b, &det, &agent2, Some(&signer_key)).await;
+        b.delete_traces_for_agent(&agent2, &signer_key, false)
             .await
             .unwrap();
         assert!(
@@ -640,6 +640,45 @@ pub(crate) mod bodies {
         check_projection_rebuild(b, SiloProjection::DetectionEvents)
             .await
             .expect("I964: the rebuild after the key-scoped door");
+
+        // v62.0.0 (P8-fix8; lead ruling: NO re-put gate after a DSAR
+        // erasure) — the detector may state the same detection event again:
+        // its trace is gone, so the subject resolves to nothing and the
+        // re-statement is a NEW, subject-less row (another row id), the
+        // detector's own new act. The tombstone protects the erased ROW (its
+        // own bytes stay refused, above), never the detection id. Witnessed:
+        // the new row names nobody the erasure was for.
+        let subject = crate::federation::subject_erasure::agent_subject(&agent).unwrap();
+        let restated =
+            crate::derived::detection_row::state_detection(b, &ts::local_signer(&det), &original)
+                .await
+                .expect("I964: the detector's own new statement is admitted");
+        assert_ne!(
+            restated, row_id,
+            "I964: a subject-less re-statement is another row"
+        );
+        let new_row = b
+            .get_attestation(&restated)
+            .await
+            .unwrap()
+            .expect("I964: the new row is seated");
+        assert!(
+            new_row.subject_key_ids.is_empty(),
+            "I964: the new row names no subject: {:?}",
+            new_row.subject_key_ids
+        );
+        let stored = serde_json::to_string(&new_row.attestation_envelope).unwrap();
+        assert!(
+            !stored.contains(&subject) && !stored.contains(&agent),
+            "I964: nothing about the erased subject is stored: {stored}"
+        );
+        assert!(
+            b.get_attestation(&row_id).await.unwrap().is_none(),
+            "I964: the erased row stays gone"
+        );
+        check_projection_rebuild(b, SiloProjection::DetectionEvents)
+            .await
+            .expect("I964: the rebuild after the re-statement");
     }
 
     /// No live `detection_events` row (tombstoned or not) names any of `ids`.
@@ -788,9 +827,13 @@ mod run {
     async fn i961_sqlite() {
         let b = sqlite().await;
         let t = tag("i961s");
-        let (a, c) = bodies::i961_detection(&b, &t).await;
+        // The node key first: the detector's conferral is from a root this
+        // node accepts.
         let node = sub::signing_node(&b, &t).await;
         b.set_node_key_id(&node.id);
+        let (a, c, det) = bodies::i961_detection(&b, &t).await;
+        let a_statement = bodies::statement_of(&b, &a.1).await;
+        sub::state_producer_withdraws(&b, &det, &format!("{t}-agent-h"), None).await;
         let summary = b
             .delete_traces_for_agent_id_hash(&format!("{t}-agent-h"))
             .await
@@ -799,11 +842,10 @@ mod run {
             summary.detection_events_tombstoned, 1,
             "I961 sqlite: the row is erased"
         );
-        bodies::i961_after_erasure(&b, &a, &c).await;
-        // RED: a projection row whose row is gone is not a rebuild.
+        bodies::i961_after_erasure(&b, &det, &a, &a_statement, &c).await;
+        // RED: one column of one live projection row moved.
         b.test_execute(
-            "UPDATE cirislens_derived_detection_events SET severity = 'critical' \
-             WHERE erased_at IS NULL",
+            "UPDATE cirislens_derived_detection_events SET severity = 'critical' WHERE erased_at IS NULL",
         )
         .await;
         assert!(
@@ -830,78 +872,31 @@ mod run {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn i963_sqlite() {
-        let b = sqlite().await;
-        let t = tag("i963s");
-        let legacy_at: chrono::DateTime<chrono::Utc> =
-            "2026-01-02T03:04:05.123456789Z".parse().unwrap();
-        let detection_id = uuid::Uuid::new_v4();
-        let ts: chrono::DateTime<chrono::Utc> = "2026-02-03T04:05:06.654321Z".parse().unwrap();
-        let lens = format!("{t}-lens");
-        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
-            &b,
-            &lens,
-            &lens,
-            crate::federation::types::identity_type::LENSCORE_DETECTOR,
-        )
-        .await;
-        // Pre-v57 silo rows, as a v56 node wrote them (no backing row).
-        b.test_execute(&format!(
-            "INSERT INTO hard_case_events \
-                (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
-             VALUES ('{t}-legacy', 'consent_sla_breach', 'tgt', NULL, '{{\"sla_days\":3}}', \
-                     '{}'); \
-             INSERT INTO cirislens_derived_detection_events \
-                (detection_id, trace_id, body_sha256, detector, severity, cohort_cell, \
-                 conformity_variant, conformity_payload, lens_core_version, \
-                 ratchet_calibration_version, canonical_bytes, ed25519_sig, ml_dsa_65_sig, \
-                 signing_key_id, ts) \
-             VALUES ('{detection_id}', '{t}-trace-old', zeroblob(32), \
-                     'manifold_conformity_outlier', 'info', '{{}}', 'numeric', '{{}}', '1', 1, \
-                     x'7b7d', zeroblob(64), zeroblob(3309), '{lens}', '{}')",
-            legacy_at.to_rfc3339(),
-            ts.to_rfc3339(),
-        ))
-        .await;
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        // v62.0.0 (K1) — the node key is held under its edition-2 id.
-        let node = crate::federation::hard_case::test_support::node_key_id_of(&node);
-        b.set_node_key_id(&node);
-        bodies::i963_the_rehome(
-            &b,
-            &node,
-            &t,
-            &format!("{t}-legacy"),
-            legacy_at,
-            Some((detection_id, ts, &lens)),
-        )
-        .await;
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test(flavor = "multi_thread")]
     async fn i964_sqlite() {
         let b = sqlite().await;
         let t = tag("i964s");
         let node = sub::signing_node(&b, &t).await;
         b.set_node_key_id(&node.id);
-        let lens = format!("{t}-lens");
-        crate::federation::hard_case::test_support_hold(&b, &lens).await;
-        // A pre-v57 detection of the same trace, as a v56 node wrote it.
-        let legacy = uuid::Uuid::new_v4();
-        b.test_execute(&format!(
-            "INSERT INTO cirislens_derived_detection_events \
-                (detection_id, trace_id, body_sha256, detector, severity, cohort_cell, \
-                 conformity_variant, conformity_payload, lens_core_version, \
-                 ratchet_calibration_version, canonical_bytes, ed25519_sig, ml_dsa_65_sig, \
-                 signing_key_id, ts) \
-             VALUES ('{legacy}', '{t}-trace', zeroblob(32), 'manifold_conformity_outlier', 'info', \
-                     '{{}}', 'numeric', '{{}}', '1', 1, x'7b7d', zeroblob(64), \
-                     zeroblob(3309), '{lens}', '2026-02-03T04:05:06.654321+00:00')"
-        ))
+        bodies::i964_the_dsar_erasure(&b, &t).await;
+        // RED: both erased detections are gone, so state a live one and
+        // move one column of its projection row.
+        bodies::stated(
+            &b,
+            &crate::federation::subject_erasure_invariants::bodies::detector_seed(&t),
+            &format!("{t}-agent-r"),
+            &format!("{t}-trace-r"),
+        )
         .await;
-        bodies::i964_the_dsar_erasure(&b, &t, Some(legacy), 2).await;
+        b.test_execute(
+            "UPDATE cirislens_derived_detection_events SET severity = 'critical' WHERE erased_at IS NULL",
+        )
+        .await;
+        assert!(
+            check_projection_rebuild(&b, SiloProjection::DetectionEvents)
+                .await
+                .is_err(),
+            "I964 sqlite: a moved column is red"
+        );
     }
 
     #[cfg(feature = "postgres")]
@@ -947,9 +942,13 @@ mod run {
     async fn i961_postgres() {
         let Some(b) = postgres().await else { return };
         let t = tag("i961p");
-        let (a, c) = bodies::i961_detection(&b, &t).await;
+        // The node key first: the detector's conferral is from a root this
+        // node accepts.
         let node = sub::signing_node(&b, &t).await;
         b.set_node_key_id(&node.id);
+        let (a, c, det) = bodies::i961_detection(&b, &t).await;
+        let a_statement = bodies::statement_of(&b, &a.1).await;
+        sub::state_producer_withdraws(&b, &det, &format!("{t}-agent-h"), None).await;
         let summary = b
             .delete_traces_for_agent_id_hash(&format!("{t}-agent-h"))
             .await
@@ -958,10 +957,10 @@ mod run {
             summary.detection_events_tombstoned, 1,
             "I961 postgres: the row is erased"
         );
-        bodies::i961_after_erasure(&b, &a, &c).await;
+        bodies::i961_after_erasure(&b, &det, &a, &a_statement, &c).await;
+        // RED: one column of one live projection row moved.
         b.test_execute(
-            "UPDATE cirislens_derived.detection_events SET severity = 'critical' \
-             WHERE erased_at IS NULL",
+            "UPDATE cirislens_derived.detection_events SET severity = 'critical' WHERE erased_at IS NULL",
         )
         .await;
         assert!(
@@ -990,81 +989,31 @@ mod run {
 
     #[cfg(feature = "postgres")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn i963_postgres() {
-        let Some(b) = postgres().await else { return };
-        let t = tag("i963p");
-        let legacy_at: chrono::DateTime<chrono::Utc> =
-            "2026-01-02T03:04:05.123456Z".parse().unwrap();
-        let detection_id = uuid::Uuid::new_v4();
-        let ts: chrono::DateTime<chrono::Utc> = "2026-02-03T04:05:06.654321Z".parse().unwrap();
-        let lens = format!("{t}-lens");
-        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
-            &b,
-            &lens,
-            &lens,
-            crate::federation::types::identity_type::LENSCORE_DETECTOR,
-        )
-        .await;
-        b.test_execute(&format!(
-            "INSERT INTO cirislens.hard_case_events \
-                (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
-             VALUES ('{t}-legacy', 'consent_sla_breach', 'tgt', NULL, \
-                     '{{\"sla_days\":3}}'::jsonb, '{}'); \
-             INSERT INTO cirislens_derived.detection_events \
-                (detection_id, trace_id, body_sha256, detector, severity, cohort_cell, \
-                 conformity_variant, conformity_payload, lens_core_version, \
-                 ratchet_calibration_version, canonical_bytes, ed25519_sig, ml_dsa_65_sig, \
-                 signing_key_id, ts) \
-             VALUES ('{detection_id}', '{t}-trace-old', decode(repeat('00', 32), 'hex'), \
-                     'manifold_conformity_outlier', 'info', '{{}}'::jsonb, 'numeric', \
-                     '{{}}'::jsonb, '1', 1, decode('7b7d', 'hex'), \
-                     decode(repeat('00', 64), 'hex'), decode(repeat('00', 3309), 'hex'), \
-                     '{lens}', '{}')",
-            legacy_at.to_rfc3339(),
-            ts.to_rfc3339(),
-        ))
-        .await;
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        // v62.0.0 (K1) — the node key is held under its edition-2 id.
-        let node = crate::federation::hard_case::test_support::node_key_id_of(&node);
-        b.set_node_key_id(&node);
-        bodies::i963_the_rehome(
-            &b,
-            &node,
-            &t,
-            &format!("{t}-legacy"),
-            legacy_at,
-            Some((detection_id, ts, &lens)),
-        )
-        .await;
-        eprintln!("i963_postgres: RAN");
-    }
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test(flavor = "multi_thread")]
     async fn i964_postgres() {
         let Some(b) = postgres().await else { return };
         let t = tag("i964p");
         let node = sub::signing_node(&b, &t).await;
         b.set_node_key_id(&node.id);
-        let lens = format!("{t}-lens");
-        crate::federation::hard_case::test_support_hold(&b, &lens).await;
-        let legacy = uuid::Uuid::new_v4();
-        b.test_execute(&format!(
-            "INSERT INTO cirislens_derived.detection_events \
-                (detection_id, trace_id, body_sha256, detector, severity, cohort_cell, \
-                 conformity_variant, conformity_payload, lens_core_version, \
-                 ratchet_calibration_version, canonical_bytes, ed25519_sig, ml_dsa_65_sig, \
-                 signing_key_id, ts) \
-             VALUES ('{legacy}', '{t}-trace', decode(repeat('00', 32), 'hex'), \
-                     'manifold_conformity_outlier', 'info', '{{}}'::jsonb, 'numeric', \
-                     '{{}}'::jsonb, '1', 1, decode('7b7d', 'hex'), \
-                     decode(repeat('00', 64), 'hex'), decode(repeat('00', 3309), 'hex'), \
-                     '{lens}', '2026-02-03T04:05:06.654321+00:00')"
-        ))
+        bodies::i964_the_dsar_erasure(&b, &t).await;
+        // RED: both erased detections are gone, so state a live one and
+        // move one column of its projection row.
+        bodies::stated(
+            &b,
+            &crate::federation::subject_erasure_invariants::bodies::detector_seed(&t),
+            &format!("{t}-agent-r"),
+            &format!("{t}-trace-r"),
+        )
         .await;
-        bodies::i964_the_dsar_erasure(&b, &t, Some(legacy), 2).await;
+        b.test_execute(
+            "UPDATE cirislens_derived.detection_events SET severity = 'critical' WHERE erased_at IS NULL",
+        )
+        .await;
+        assert!(
+            check_projection_rebuild(&b, SiloProjection::DetectionEvents)
+                .await
+                .is_err(),
+            "I964 postgres: a moved column is red"
+        );
         eprintln!("i964_postgres: RAN");
     }
 }

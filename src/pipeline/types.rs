@@ -34,20 +34,16 @@ use crate::schema::BatchEnvelope;
 #[cfg(feature = "secrets")]
 use crate::secrets::types::EncryptedSecretRecord;
 
-/// Hybrid Ed25519 + ML-DSA-65 signature block as carried on the
-/// pipeline wire. Mirrors the FSD §4.3 shape; defined locally
-/// (rather than reusing `cirisnode::HybridSignature`) to keep the
-/// pipeline track decoupled from the federation-consensus track.
+/// v62.0.0 (JSON-cut slice F, F0-cp5) — the edge's signature block on the
+/// pipeline wire: ONE composite (ML-DSA-65-Ed25519) signature, base64
+/// (standard). RULINGS: composite signatures only; the earlier
+/// `{ed25519, ml_dsa_65}` pair is refused by name at the route
+/// (`verify_component_signature`). Defined locally to keep the pipeline
+/// track decoupled from the federation-consensus track.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HybridSignatureBlock {
-    /// Base64 (standard) Ed25519 signature over canonical bytes.
-    pub ed25519: String,
-    /// Optional base64 (standard) ML-DSA-65 signature. None during
-    /// hybrid-pending windows where the signer hasn't yet rolled
-    /// its PQC half. Persist's verify policy decides acceptance per
-    /// `HybridPolicy` (v0.4.1 surface).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ml_dsa_65: Option<String>,
+pub struct CompositeSignatureBlock {
+    /// Base64 (standard) composite signature over the canonical bytes.
+    pub composite: String,
     /// Caller-asserted wall-clock at signing time.
     pub signed_at: DateTime<Utc>,
 }
@@ -59,8 +55,9 @@ pub struct HybridSignatureBlock {
 /// FSD §4.3 invariants enforced on `receive_pipeline_envelope()`:
 ///
 /// 1. `pipeline_schema_version` is a known version (`"1.0"`).
-/// 2. `edge_signature` verifies via `verify_hybrid_via_directory`
-///    against `edge_key_id` in `federation_keys`.
+/// 2. `edge_signature` (one composite) verifies via
+///    `verify_composite_via_directory` under `edge_key_id`'s live
+///    edition-2 key.
 /// 3. The inner agent `BatchEnvelope` signature ALSO verifies
 ///    (defense-in-depth — edge could be compromised; the agent's
 ///    signature is the ground truth for content authenticity).
@@ -86,20 +83,14 @@ pub struct PipelineEnvelope {
     /// Typed pipeline outputs.
     pub sidecar: PipelineSidecar,
 
-    /// Edge's hybrid signature over canonical(envelope || sidecar).
-    /// Persist verifies via the v0.4.1 `verify_hybrid_via_directory`
-    /// surface.
-    pub edge_signature: HybridSignatureBlock,
+    /// Edge's composite signature over canonical(envelope || sidecar).
+    /// Persist verifies via `verify_composite_via_directory`.
+    pub edge_signature: CompositeSignatureBlock,
 
-    /// Edge identity — looked up in `cirislens.federation_keys` for
-    /// verify. Must carry the `cirislens_secrets_writer` role tag
-    /// (or `cirislens_pipeline_writer` once §5 lands) for the ingest
-    /// route to accept.
+    /// v62.0.0 (F0-cp5) — the edge's edition-2 identity-ref
+    /// (`urn:ietf:params:oauth:ckt:sha-256:…`); its live `key:record` is
+    /// read from the directory. A label is refused (`verify_not_identity_ref`).
     pub edge_key_id: String,
-
-    /// Optional ML-DSA-65 key id. None during hybrid-pending windows.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub edge_pqc_key_id: Option<String>,
 }
 
 impl PipelineEnvelope {
@@ -201,29 +192,14 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_signature_block_serde_round_trip() {
-        let sig = HybridSignatureBlock {
-            ed25519: "AAAA".to_string(),
-            ml_dsa_65: Some("BBBB".to_string()),
+    fn composite_signature_block_serde_round_trip() {
+        let sig = CompositeSignatureBlock {
+            composite: "AAAA".to_string(),
             signed_at: chrono::Utc::now(),
         };
         let s = serde_json::to_string(&sig).unwrap();
-        let back: HybridSignatureBlock = serde_json::from_str(&s).unwrap();
+        let back: CompositeSignatureBlock = serde_json::from_str(&s).unwrap();
         assert_eq!(sig, back);
-    }
-
-    #[test]
-    fn hybrid_signature_block_omits_none_ml_dsa() {
-        let sig = HybridSignatureBlock {
-            ed25519: "AAAA".to_string(),
-            ml_dsa_65: None,
-            signed_at: chrono::Utc::now(),
-        };
-        let s = serde_json::to_string(&sig).unwrap();
-        assert!(
-            !s.contains("ml_dsa_65"),
-            "None ml_dsa_65 should be skipped on the wire: {s}"
-        );
     }
 
     #[test]

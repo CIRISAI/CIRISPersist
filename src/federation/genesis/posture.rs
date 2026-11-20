@@ -60,48 +60,22 @@
 use super::super::{Error, FederationDirectory};
 use serde::{Deserialize, Serialize};
 
-/// v31.0.0 (CIRISPersist#648) — WHICH leg of the constitutional seed a fault is
-/// about. Three legs, in the order the retired bundle/1 seed
-/// (`seed_family_and_canonical`) established them, because a later leg cannot be judged before an earlier one
-/// holds.
+/// v31.0.0 (CIRISPersist#648) — WHICH leg of the constitutional root a fault
+/// is about. v62.0.0: the root is the `ceg-genesis-bundle/2` in force, so two
+/// legs, in the order they are judged: its holders (the roster, with the
+/// charter that is its threshold), then its seats. The bundle/1 legs
+/// `family`, `delegation` and `community` are gone: the bundle carries its
+/// charter, and nothing else is seeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GenesisLeg {
-    /// The A1/B1/C1 accord-holder rooting-anchor `federation_keys` rows — the
-    /// ROSTER every accord m-of-n is tallied against.
+    /// The accord's roster: the holders of the genesis bundle in force (CC
+    /// 2.6.1.11), each at its placed key, with the bundle's charter.
     Anchor,
-    /// The keyless `humanity-accord` `federation_families` row — the
-    /// THRESHOLD (`quorum:2/3`, entrenched) those tallies are measured by.
-    Family,
-    /// The baked 2-of-3 canonical serve node(s). Reported, but deliberately
-    /// **not** required by [`require_constitutional_root`]: the ceremony
-    /// installs the canonical THROUGH the accord-conferral gate, so demanding
-    /// it as a precondition of that gate would make the ceremony unable to
-    /// establish the very leg it is establishing.
+    /// The canonical serve nodes: the seats (`serve_nodes`) of the bundle in
+    /// force (ruling C). Reported, but deliberately **not** required by
+    /// [`require_constitutional_root`].
     Canonical,
-    /// v31.0.0 (CIRISPersist#648) — the baked DELEGATION PLANE: the
-    /// `genesis-charter` / `genesis-grant:…` / `genesis-lifecycle`
-    /// `federation_attestations` rows. The roster says WHO, the family says HOW
-    /// MANY, the canonical says WHERE — and this leg is the only one that says
-    /// WHAT THE ROOT ACTUALLY CONFERS.
-    ///
-    /// Reported for the same reason `Canonical` is, and excluded from
-    /// [`require_constitutional_root`] for the same reason it is: the ceremony
-    /// installs these rows THROUGH the conferral gates, so demanding them as a
-    /// precondition of those gates would stop the ceremony establishing the
-    /// very leg it exists to establish.
-    Delegation,
-    /// CIRISPersist#973 — the baked `ciris-canonical` COMMUNITY birth record:
-    /// the roster the root's lineage starts from. Seeded after the delegation
-    /// plane through the signed `put_community` door, and only once a ceremony
-    /// has baked the asset (the retired `canonical_community_asset`); until then
-    /// this leg is not evaluated at all.
-    ///
-    /// Reported, and excluded from [`require_constitutional_root`] for the
-    /// reason `Canonical` and `Delegation` are. Its fault is only ever
-    /// `Absent` or `Unreadable`: a birth the door refuses is a node awaiting
-    /// its ceremony, never a tampered root, so this leg can never stop a boot.
-    Community,
 }
 
 impl GenesisLeg {
@@ -110,79 +84,18 @@ impl GenesisLeg {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Anchor => "anchor",
-            Self::Family => "family",
             Self::Canonical => "canonical",
-            Self::Delegation => "delegation",
-            Self::Community => "community",
         }
     }
 
-    /// Every leg, in establishment order — the closed set.
-    pub const ALL: &'static [Self] = &[
-        Self::Anchor,
-        Self::Family,
-        Self::Canonical,
-        Self::Delegation,
-        Self::Community,
-    ];
+    /// Every leg, in judging order — the closed set.
+    pub const ALL: &'static [Self] = &[Self::Anchor, Self::Canonical];
 }
 
 impl std::fmt::Display for GenesisLeg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
-}
-
-/// CIRISPersist#973 — **why a leg is `Absent`**, typed, so a host never has to
-/// read the `detail` sentence to tell a node awaiting its ceremony from a node
-/// that holds a root and did not adopt this binary's newer one.
-///
-/// Serialized inside [`GenesisPosture::PreGenesis`] as `reason`, tagged by
-/// `kind`: `{"kind":"not_seeded"}` or
-/// `{"kind":"bake_not_adopted","why":{…},"held_root_in_force":true}`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AbsentReason {
-    /// The leg is simply not installed: a node before its ceremony, a row
-    /// under a pre-ceremony envelope, a directory that cannot hold it. Also
-    /// what a posture serialized before this field existed reads as.
-    #[default]
-    NotSeeded,
-    /// This binary carries a root (the compiled-in bake) that the node did
-    /// NOT adopt.
-    BakeNotAdopted {
-        /// Why it was not adopted.
-        why: BakeNotAdoptedReason,
-        /// **Is an older root still in force on this leg?** True when the row
-        /// the node holds is a verified accord-holder statement — the previous
-        /// ceremony's row, still standing. False when nothing verified is held
-        /// (the bake was refused on a node with no row, or the predecessor was
-        /// already removed).
-        held_root_in_force: bool,
-    },
-}
-
-/// CIRISPersist#973 — the cause inside [`AbsentReason::BakeNotAdopted`].
-/// Serialized tagged by `cause`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "cause", rename_all = "snake_case")]
-pub enum BakeNotAdoptedReason {
-    /// The boot seed offered the bake and a door refused it. `refusal` is the
-    /// refusing error's stable token
-    /// ([`Error::kind`](crate::federation::Error::kind)). Reported by the BOOT
-    /// SEED, which is the only place that sees the refusal.
-    Refused {
-        /// The door's stable refusal token.
-        refusal: String,
-    },
-    /// The held row is a verified holder statement OLDER than the bake, and
-    /// the bake is not installed. What the READ path
-    /// ([`genesis_posture`]) reports: it cannot see why the seed did not
-    /// install it (refused at the door, or not yet run), only that it has not.
-    StoredOlder,
-    /// The held row is a verified holder statement of the SAME vintage as the
-    /// bake with different content: a tie, which neither side wins.
-    EqualVintage,
 }
 
 /// v31.0.0 (CIRISPersist#648) — a constitutional-seed fault, classified by
@@ -201,8 +114,6 @@ pub enum GenesisFault {
         leg: GenesisLeg,
         /// The specific finding, for an operator.
         detail: String,
-        /// CIRISPersist#973 — the typed cause. Read this, not `detail`.
-        reason: AbsentReason,
     },
     /// **Installed and WRONG.** A pinned holder `key_id` present with a
     /// different pubkey (anchor squatting), a family whose entrenchment or
@@ -267,41 +178,11 @@ impl GenesisFault {
         }
     }
 
-    /// Build an [`Self::Absent`] for a leg that is simply not installed
-    /// ([`AbsentReason::NotSeeded`]).
+    /// Build an [`Self::Absent`]: a leg that is simply not installed.
     pub(crate) fn absent(leg: GenesisLeg, detail: impl Into<String>) -> Self {
         Self::Absent {
             leg,
             detail: detail.into(),
-            reason: AbsentReason::NotSeeded,
-        }
-    }
-
-    /// CIRISPersist#973 — build an [`Self::Absent`] for a compiled-in bake the
-    /// node did not adopt ([`AbsentReason::BakeNotAdopted`]).
-    pub(crate) fn bake_not_adopted(
-        leg: GenesisLeg,
-        detail: impl Into<String>,
-        why: BakeNotAdoptedReason,
-        held_root_in_force: bool,
-    ) -> Self {
-        Self::Absent {
-            leg,
-            detail: detail.into(),
-            reason: AbsentReason::BakeNotAdopted {
-                why,
-                held_root_in_force,
-            },
-        }
-    }
-
-    /// CIRISPersist#973 — the typed cause of an [`Self::Absent`]; `None` on
-    /// the other classes.
-    #[must_use]
-    pub const fn absent_reason(&self) -> Option<&AbsentReason> {
-        match self {
-            Self::Absent { reason, .. } => Some(reason),
-            Self::Divergent { .. } | Self::Unreadable { .. } => None,
         }
     }
 
@@ -377,7 +258,7 @@ pub enum GenesisPosture {
     /// Both the SEED and the READ path now compare the stored row to the baked
     /// artifact WHOLE. The seed restores the compiled-in bytes when only the
     /// unsigned material around a byte-identical signed envelope has been
-    /// altered; `verify_delegation_plane_seeded` (bundle/1, retired)
+    /// altered; `verify_delegation_plane_seeded` (deleted, v62.0.0)
     /// — which is what every LIVE query answers from, since
     /// [`genesis_posture`](super::posture::genesis_posture) never calls the
     /// seed — reports divergence when it has not been. Asking only on the seed
@@ -413,13 +294,6 @@ pub enum GenesisPosture {
         leg: GenesisLeg,
         /// The specific finding.
         detail: String,
-        /// CIRISPersist#973 — the typed cause. `not_seeded` for a node awaiting
-        /// its ceremony; `bake_not_adopted` when this binary's root was not
-        /// adopted, with `held_root_in_force` saying whether an older root
-        /// still stands. Absent in a posture serialized before this field
-        /// existed, which reads as `not_seeded`.
-        #[serde(default)]
-        reason: AbsentReason,
     },
     /// **TAMPERED** — a constitutional row is present and wrong. Never produced
     /// by a booted Engine (boot refuses on this arm); reachable from
@@ -442,15 +316,7 @@ pub enum GenesisPosture {
 impl From<GenesisFault> for GenesisPosture {
     fn from(f: GenesisFault) -> Self {
         match f {
-            GenesisFault::Absent {
-                leg,
-                detail,
-                reason,
-            } => Self::PreGenesis {
-                leg,
-                detail,
-                reason,
-            },
+            GenesisFault::Absent { leg, detail } => Self::PreGenesis { leg, detail },
             GenesisFault::Divergent { leg, detail } => Self::Divergent { leg, detail },
             GenesisFault::Unreadable { leg, detail } => Self::Unreadable { leg, detail },
         }
@@ -481,33 +347,6 @@ impl GenesisPosture {
         matches!(self, Self::Entrenched)
     }
 
-    /// CIRISPersist#973 — the typed cause of a [`Self::PreGenesis`]; `None`
-    /// on every other arm.
-    #[must_use]
-    pub const fn absent_reason(&self) -> Option<&AbsentReason> {
-        match self {
-            Self::PreGenesis { reason, .. } => Some(reason),
-            Self::Entrenched | Self::Divergent { .. } | Self::Unreadable { .. } => None,
-        }
-    }
-
-    /// CIRISPersist#973 — **does an older root still stand while this
-    /// binary's was not adopted?** The one question a host asks before
-    /// telling an operator "no trust root configured".
-    #[must_use]
-    pub const fn held_root_in_force(&self) -> bool {
-        matches!(
-            self,
-            Self::PreGenesis {
-                reason: AbsentReason::BakeNotAdopted {
-                    held_root_in_force: true,
-                    ..
-                },
-                ..
-            }
-        )
-    }
-
     /// Which leg, when there is a fault.
     #[must_use]
     pub const fn leg(&self) -> Option<GenesisLeg> {
@@ -529,23 +368,6 @@ impl GenesisPosture {
     pub fn banner(&self) -> Option<String> {
         match self {
             Self::Entrenched => None,
-            // CIRISPersist#973 — an older root is still in force and this
-            // binary's was not adopted: saying "holds no trust root" here
-            // would send an operator to re-import a root the node has.
-            Self::PreGenesis {
-                leg,
-                detail,
-                reason:
-                    AbsentReason::BakeNotAdopted {
-                        held_root_in_force: true,
-                        ..
-                    },
-            } => Some(format!(
-                "ROOT NOT ADOPTED: this node still holds its previous constitutional \
-                 trust root, and the newer root this binary carries was not adopted \
-                 ({leg} leg: {detail}). The previous root stays in force; adoption is \
-                 retried at the next boot."
-            )),
             Self::PreGenesis { leg, detail, .. } => Some(format!(
                 "PRE-GENESIS: this node holds no constitutional trust root \
                  ({leg} leg: {detail}). It can host a genesis ceremony; until one \
@@ -834,8 +656,18 @@ where
     // reading is a fold condition (held, re-folded when a bundle lands); an
     // unreadable store stays a refusal. A bundle's re-fold touches its
     // holders' keys: those are the read set.
-    for kid in crate::federation::admission::accord_holder_roster_key_ids() {
-        crate::federation::edition2::fold::reads(crate::federation::edition2::fold::Dep::key(&kid));
+    // v62.0.0 (C5-fix1): the roster is the ingested genesis's holders; the
+    // baked earlier roster is deleted.
+    let roster = crate::federation::admission::accord_holder_roster(dir)
+        .await
+        .map_err(|e| Error::NoConstitutionalRootYet {
+            operation,
+            leg: GenesisLeg::Anchor,
+            fault_kind: "unreadable",
+            detail: format!("reading the genesis in force: {e}"),
+        })?;
+    for kid in &roster {
+        crate::federation::edition2::fold::reads(crate::federation::edition2::fold::Dep::key(kid));
     }
     match accord_roster_seated(dir).await {
         Ok(()) => return Ok(()),
@@ -860,14 +692,10 @@ where
         }
         Err(GenesisFault::Absent { .. }) => {}
     }
-    // TODO(json-cut): the earlier-form roster, until the JSON doors shut and
-    // the baked JSON genesis is deleted (slice F / C5). Both empty refuses.
-    require_seated_accord_roster(
-        dir,
-        operation,
-        &crate::federation::admission::accord_holder_roster_key_ids(),
-    )
-    .await
+    // v62.0.0 (C5-fix1): the earlier-form fallback roster is deleted; the
+    // roster read above is the genesis's own, so an absent genesis refuses
+    // `absent` here (an empty roster) — fail closed.
+    require_seated_accord_roster(dir, operation, &roster).await
 }
 
 /// v31.0.0 (CIRISPersist#648) — **the anti-fail-open witness, on every
@@ -976,10 +804,18 @@ pub(crate) async fn exercise_seedless_gate_refusals(dir: &dyn FederationDirector
         weight: None,
         asserted_at: ts,
         expires_at: None,
+        // v62.0.0 (wave GC6; CC 2.7) — well-formed by its OWN bytes (the
+        // pre-rotation commitment, a holder's recovery commitment), so the
+        // door's own-bytes rules pass and what refuses it is the pre-genesis
+        // chokepoint this witness is about, not a malformed charter.
         attestation_envelope: serde_json::json!({
             "id": format!("rogue-charter-{tag}"),
             "dimension": crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
             "scope": ["infra:serve", "infra:attest"],
+            crate::federation::envelope::paths::PRE_ROTATION_COMMITMENT: "ab".repeat(32),
+            crate::federation::envelope::paths::RECOVERY_COMMITMENTS: {
+                rogue.clone(): "cd".repeat(32),
+            },
         }),
         original_content_hash: String::new(),
         scrub_signature_classical: String::new(),

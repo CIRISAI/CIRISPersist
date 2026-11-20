@@ -1631,7 +1631,7 @@ pub(crate) mod bodies {
         let (fx_user, fx_subject) = (&u1, &s1);
         let users = [&u1, &u2, &u3, &s1];
         let roots = [&ra.root, &rb.root, &rc.root, &u1];
-        let roster = admission::accord_holder_roster_key_ids();
+        let roster = admission::accord_holder_roster(d).await.expect("roster");
         let now = chrono::Utc::now();
         let _ = read_probe::take();
         macro_rules! same {

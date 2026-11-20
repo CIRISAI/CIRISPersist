@@ -56,9 +56,9 @@
 //! record, an operator-added peer key with no registration signature, a
 //! scrub that does not verify — is still HELD as a key (the directory
 //! resolves it), but it has no row: its projection row's `attestation_id` is
-//! NULL, and the rebuild gate ([`super::silo_projection`]) names it. A held
-//! legacy record that verifies is rehomed by the first key-plane write after
-//! the upgrade.
+//! NULL, and the rebuild gate ([`super::silo_projection`]) names it.
+//! (v62.0.0: there is no rehome. A V300 store carries no earlier-form record;
+//! `edition_upgrade` deletes an earlier store.)
 //!
 //! # The order rule
 //!
@@ -89,48 +89,6 @@ pub const REVOCATION_MEMBER: &str = "revocation";
 /// The envelope member an `identity:occurrence:v1` row carries its signed
 /// occurrence under.
 pub const IDENTITY_OCCURRENCE_MEMBER: &str = "identity_occurrence";
-
-/// v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — what the
-/// one-way rehome at first open found: every v57-shape object it could give a
-/// row now has one; these are what it could not. Logged at open, one line,
-/// counted.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct KeyPlaneRehomeReport {
-    /// Keys held without a `key:record:v1` row (verify under neither rule).
-    pub keys_without_row: u64,
-    /// Key revocations held without a `key:revocation:v1` row.
-    pub revocations_without_row: u64,
-    /// Signed occurrences held without an `identity:occurrence:v1` row.
-    pub occurrences_without_row: u64,
-    /// Framed occurrence revocations kept as legacy projection rows (V200):
-    /// still revoking, never re-signed, never un-revoked.
-    pub legacy_framed_occurrence_revocations: u64,
-    /// v59.0.0 (CIRISPersist#1104) — what the carrier migration did with
-    /// them: minted carriers, and the user-self revocations without a roster
-    /// quorum (named, for their owners to re-propose through the door).
-    pub carriers: super::occurrence_revocation_carrier::CarrierMigration,
-}
-
-impl KeyPlaneRehomeReport {
-    /// The counted log line.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    pub(crate) fn log(&self, backend: &'static str) {
-        tracing::info!(
-            backend,
-            keys_without_row = self.keys_without_row,
-            revocations_without_row = self.revocations_without_row,
-            occurrences_without_row = self.occurrences_without_row,
-            legacy_framed_occurrence_revocations = self.legacy_framed_occurrence_revocations,
-            occurrence_revocation_carriers = self.carriers.minted,
-            carriers_without_roster_quorum = ?self.carriers.without_quorum,
-            carriers_not_carried = ?self.carriers.not_carried,
-            "key-plane rehome at open (v59.0.0): every verifiable v57-shape record has its row; \
-             the counted rest is held without one; a user self's legacy occurrence revocation \
-             without a roster quorum stays local — its owner re-proposes it through the two-path \
-             door (CIRISPersist#1104)"
-        );
-    }
-}
 
 /// The three families of the key plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -973,22 +931,6 @@ pub fn revocation_projection_rebuild(
     }
 }
 
-/// The `key:revocation:v1` row of a held legacy revocation, for the rehome:
-/// `None` (held without a row; the gate names it) when it is not hybrid.
-#[must_use]
-pub fn revocation_row_if_hybrid(revocation: &super::types::Revocation) -> Option<Attestation> {
-    revocation.scrub_signature_pqc.as_ref()?;
-    revocation_row(revocation)
-        .map_err(|e| {
-            tracing::debug!(
-                revocation_id = %revocation.revocation_id,
-                refusal = e.kind(),
-                "revocation held without a key:revocation:v1 row: {e}"
-            );
-        })
-        .ok()
-}
-
 /// A planned revocation: the projection row and its `key:revocation:v1` row,
 /// stored by the executor in one step.
 #[derive(Debug, Clone)]
@@ -1199,13 +1141,6 @@ pub(crate) enum KeyRecordWrite {
         /// gates (CC rc20 3.4.7.1), so the write names no door.
         record: KeyRecord,
     },
-    /// The genesis seed of one baked accord-holder record (CIRISPersist#347):
-    /// every insert invariant but the fresh-nonce hardware gate; a held
-    /// `key_id` is kept.
-    SeedGenesis {
-        /// The baked record.
-        record: KeyRecord,
-    },
     /// The self-signed → anchor-scrubbed upgrade (CIRISPersist#351).
     ScrubUpgrade {
         /// The anchor-scrubbed record.
@@ -1246,8 +1181,8 @@ pub(crate) enum OnHeld {
     /// The held row must be byte-identical (same `persist_row_hash`); a
     /// differing one is [`Error::Conflict`].
     Conflict,
-    /// The held row stays as it is (the genesis seed's `DO NOTHING`).
-    Keep,
+    // v62.0.0 (C5-fix1): `Keep` (the baked genesis seed's `DO NOTHING`) is
+    // deleted with the seed.
 }
 
 /// What an in-place rewrite re-asserts about the held row, atomically, at
@@ -1354,8 +1289,8 @@ impl PlannedKeyRecord {
     }
 
     /// An [`Self::Insert`] that found its `key_id` held at write time:
-    /// `Ok(())` when the held row may stand (byte-identical, or
-    /// [`OnHeld::Keep`]), else the conflict.
+    /// `Ok(())` when the held row may stand (byte-identical), else the
+    /// conflict.
     pub(crate) fn insert_held(&self, held_hash: Option<&str>) -> Result<(), Error> {
         match self {
             Self::Insert {
@@ -1491,21 +1426,6 @@ async fn plan_key_put(
             on_held: OnHeld::Conflict,
         }))),
     }
-}
-
-/// The genesis seed's decision (CIRISPersist#347): every insert invariant
-/// but the accord-holder fresh-nonce hardware gate — the pinned ceremony
-/// bake IS the trust root, stale by design — and a held `key_id` is kept.
-fn plan_key_seed(mut row: KeyRecord) -> Result<KeyRecordPlan, Error> {
-    super::register::validate_registration_pubkey(&row)?;
-    super::register::check_node_identity_exclusive(&row)?;
-    check_key_record_columns(&row, "genesis seed ")?;
-    admit_consent_role(&mut row)?;
-    row.persist_row_hash = super::types::compute_persist_row_hash(&row)?;
-    Ok(KeyRecordPlan::Write(Box::new(PlannedKeyRecord::Insert {
-        record: row,
-        on_held: OnHeld::Keep,
-    })))
 }
 
 /// The scrub upgrade's decision (CIRISPersist#351): the incoming record is
@@ -1687,7 +1607,6 @@ pub(crate) async fn plan_key_record_write(
     Ok(match write {
         // v62.0.0 (#1274) — both insert doors plan alike.
         KeyRecordWrite::Put { record } => plan_key_put(dir, record, received_at).await?,
-        KeyRecordWrite::SeedGenesis { record } => plan_key_seed(record)?,
         KeyRecordWrite::ScrubUpgrade { record } => {
             plan_key_scrub_upgrade(dir, record, received_at).await?
         }
@@ -1732,27 +1651,6 @@ where
             Ok(KeyRecordWritten::Written)
         }
     }
-}
-
-/// The genesis seed of the HUMANITY_ACCORD holder rows (CIRISPersist#347),
-/// one planned insert per baked record, each in its own write.
-pub(crate) async fn seed_genesis_accord_holders_planned<D>(
-    dir: &D,
-    records: &[super::SignedKeyRecord],
-) -> Result<(), Error>
-where
-    D: KeyPlaneStore,
-{
-    for sr in records {
-        key_record_write_planned(
-            dir,
-            KeyRecordWrite::SeedGenesis {
-                record: sr.record.clone(),
-            },
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 /// v60.0.0 (CIRISPersist#934 step 3; v13.0.0 CIRISPersist#371) — **the

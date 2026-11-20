@@ -188,16 +188,30 @@ pub(crate) mod bodies {
         record: GroupRecord,
         signers: &[&str],
     ) -> Result<StatementOutcome, Error> {
+        let _group = match &record {
+            GroupRecord::Family(f) => f.family_key_id.clone(),
+            GroupRecord::Community(c) => c.community_key_id.clone(),
+        };
+        let k = keys_of(signers);
+        let refs: Vec<&CompositeSigningKey> = k.iter().collect();
+        next_version_by(d, record, &refs).await
+    }
+
+    /// [`next_version`] voiced by `keys` (W1-fix4: a trust-root room's
+    /// founders are the genesis bundle's holders, `fixture_genesis` keys).
+    pub(crate) async fn next_version_by(
+        d: &dyn FederationDirectory,
+        record: GroupRecord,
+        keys: &[&CompositeSigningKey],
+    ) -> Result<StatementOutcome, Error> {
         let group = match &record {
             GroupRecord::Family(f) => f.family_key_id.clone(),
             GroupRecord::Community(c) => c.community_key_id.clone(),
         };
         let (h, v) = held(d, &group).await;
-        let k = keys_of(signers);
-        let refs: Vec<&CompositeSigningKey> = k.iter().collect();
         e2::put_voices(
             d,
-            &e2::roster_voices(&record, v + 1, Some(&h), e2::ms(chrono::Utc::now()), &refs),
+            &e2::roster_voices(&record, v + 1, Some(&h), e2::ms(chrono::Utc::now()), keys),
         )
         .await
     }
@@ -745,7 +759,7 @@ pub(crate) mod bodies {
 pub(crate) mod backdated {
     use ciris_crypto::composite::CompositeSigningKey;
 
-    use super::bodies::{landed, next_version};
+    use super::bodies::{landed, next_version_by};
     use crate::federation::canonical_community as cc;
     use crate::federation::canonical_community_invariants::bodies::{
         rooted_infrastructure_room_e2, SetNodeKey,
@@ -763,10 +777,16 @@ pub(crate) mod backdated {
     const ROOM_SEED: &str = "bd-infra-room";
     const TAG: &str = "bd";
 
-    /// The founders `rooted_infrastructure_room_e2` seats (`{tag}-infra-f{i}`)
-    /// who voice every version and the revocation (the room's `quorum:2/3`).
-    fn founders() -> [String; 2] {
-        [format!("{TAG}-infra-f0"), format!("{TAG}-infra-f1")]
+    /// Two founders `rooted_infrastructure_room_e2` seats, who voice every
+    /// version and the revocation (the room's `quorum:2/3`). W1-fix4 (after
+    /// C5-fix1): a trust-root room's founders are the genesis bundle's holders
+    /// (holder seeds 1 and 2, their placed keys).
+    fn founder_keys() -> [CompositeSigningKey; 2] {
+        use crate::federation::edition2::fixture_genesis as fg;
+        [
+            fg::test_key(fg::HOLDER_SEEDS[0]),
+            fg::test_key(fg::HOLDER_SEEDS[1]),
+        ]
     }
 
     fn with_member(held: &Community, key: &str, role: &str) -> Community {
@@ -791,13 +811,8 @@ pub(crate) mod backdated {
         d: &dyn FederationDirectory,
         record: Community,
     ) -> Result<StatementOutcome, Error> {
-        let [f0, f1] = founders();
-        next_version(
-            d,
-            GroupRecord::Community(record),
-            &[f0.as_str(), f1.as_str()],
-        )
-        .await
+        let [k0, k1] = founder_keys();
+        next_version_by(d, GroupRecord::Community(record), &[&k0, &k1]).await
     }
 
     /// An edition-2 trust-root-grade (`infrastructure`) room with a serve
@@ -839,8 +854,7 @@ pub(crate) mod backdated {
             witness_set: vec![],
             persist_row_hash: String::new(),
         });
-        let [f0, f1] = founders();
-        let keys: Vec<CompositeSigningKey> = [f0, f1].iter().map(|s| e2::signing_key(s)).collect();
+        let keys = founder_keys();
         let refs: Vec<&CompositeSigningKey> = keys.iter().collect();
         landed(
             e2::put_voices(d, &e2::membership_voices(&r, Some(&head), &refs)).await,

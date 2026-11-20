@@ -1831,7 +1831,14 @@ mod tests {
         // CLM-bundle-seeds-transit-pairs at the seat's X-Wing binding (1),
         // CLM-planes-as-rows at key liveness (2), CLM-identity-set at the set
         // reader CC's register cites (1).
-        const EXPECTED: usize = 402;
+        // v62.0.0 (kernel pass 2): -1, CLM-self-edge-not-cycle at
+        // `check_delegation_cycle_admission` (the cycle gate is deleted; the
+        // claim keeps its row at `is_trust_plane_edge`).
+        // v62.0.0 (C2-fix3): -1, CLM-planes-as-rows at the group-plane rehome
+        // (deleted, ruling 4: a V300 store holds no v60 typed row); and -1 to
+        // match the registry as it stood: 401 src/ rows at f46eaab7 against a
+        // pin of 402 (counted from the file by the predicate below).
+        const EXPECTED: usize = 400;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

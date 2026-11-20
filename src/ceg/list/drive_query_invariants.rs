@@ -237,14 +237,14 @@ pub mod bodies {
     ) -> crate::federation::Attestation {
         // The cohort TARGET rides `attested_key_id` on this plane (V114 admits
         // a keyless family there) — it is the column the §4.3 gate compares.
-        let mut row = e2::with_earlier_form(|| {
+        let mut row = {
             ts::bare_attestation(
                 id,
                 attester,
                 attester,
                 &serde_json::json!({ "id": id, "dimension": dim, "cohort_scope": scope }),
             )
-        });
+        };
         // AV-84 (#592): the row is attested to its own PRODUCER, and names
         // its ROOM in the signed envelope's cohort-target member. Both gates
         // read the envelope member — the write gate (AV-45) directly, the

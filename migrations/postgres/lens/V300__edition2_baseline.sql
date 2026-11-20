@@ -2035,17 +2035,14 @@ CREATE TABLE cirisnode.federation_delivery_attestations (
     announcement_id text NOT NULL,
     announcement_canonical_hash bytea NOT NULL,
     peer_key_id text NOT NULL,
-    peer_pubkey_ed25519_base64 text NOT NULL,
     received_at timestamp with time zone NOT NULL,
     transport_id text NOT NULL,
-    signature_classical bytea NOT NULL,
-    signature_pqc bytea,
+    signature_composite bytea NOT NULL,
     inserted_at timestamp with time zone DEFAULT now() NOT NULL,
     signature_verified boolean DEFAULT false NOT NULL,
     persist_row_hash text NOT NULL,
     CONSTRAINT federation_delivery_attestati_announcement_canonical_hash_check CHECK ((octet_length(announcement_canonical_hash) = 32)),
-    CONSTRAINT federation_delivery_attestations_signature_classical_check CHECK ((octet_length(signature_classical) = 64)),
-    CONSTRAINT federation_delivery_attestations_signature_pqc_check CHECK (((signature_pqc IS NULL) OR (octet_length(signature_pqc) = 3309))),
+    CONSTRAINT federation_delivery_attestations_signature_composite_check CHECK ((octet_length(signature_composite) = 3373)),
     CONSTRAINT federation_delivery_attestations_transport_id_check CHECK ((transport_id = ANY (ARRAY['reticulum'::text, 'tcp_tls'::text, 'http_over_tls'::text, 'other'::text])))
 );
 

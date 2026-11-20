@@ -754,6 +754,9 @@ class Engine:
         bundle it is counted over.
         """
 
+    def verify_composite_via_directory(self, message: bytes, composite_sig: bytes, identity_ref: str) -> str:
+        """v62.0.0 (F0-cp5) — verify ONE composite signature over message under identity_ref's live edition-2 key; returns the signer's identity-ref, or raises ValueError led by the refusal token."""
+
     def put_edition2_statement(self, statement: bytes, offered_row_id: str | None = None) -> str:
         """v62.0.0 (CC 2.6.1, 2.6.1.12) — the edition-2 statement door, local
         or replicated: one ``COSE_Sign1`` (tag 18) statement as received.
@@ -1144,9 +1147,6 @@ class Engine:
     def open_sealed_manifest_page_json(self, at_rest_sha256_hex: str, child_index: int, viewer_key_id: str, caller_aad_b64: str | None = None) -> str:
         """(derived) deontic — v52.0.0 (CIRISPersist#954) — one page of a v3 manifest: the chunks child child_index lists, opened as viewer_key_id (authorized on the root as read..."""
 
-    def pin_trust_from_bundle_response_json(self, response_json: str) -> str:
-        """(derived) deontic — v50.0.0 (CIRISPersist#926) — the consumer half of CC 4.4 / 5.3.4: pin ciris-canonical from ONE TrustRootBundleResponse JSON (the bundle's quorum ve..."""
-
     def promote_adopted_manifest_to_dag_json(self, at_rest_sha256_hex: str, viewer_key_id: str, disposition: str, caller_aad_b64: str | None = None) -> str:
         """(derived) deontic — v51.3.0 (CIRISPersist#947) — finish a sealed DAG adopt. adopt_sealed_blob_json stores a received sealed manifest as an inline envelope; until this..."""
 
@@ -1158,15 +1158,6 @@ class Engine:
 
     def purge_rows_json(self, selection_json: str, notice_json: str) -> str:
         """(derived) deontic — v54.1.0 (CIRISPersist#1046, CIRISConstitution#165) — execute a steward purge. notice_json is {"envelope": {…takedown_notice…}, "cosignatures": [Thr..."""
-
-    def put_accord_decision_json(self, payload_json: str) -> None:
-        """(derived) deontic — #302 — record the server's frozen-L decision. payload_json = { "decision": <AccordDecision> }. Immutable (M2). v53.0.0 (CC 4.2.6 rc7): a non-null s..."""
-
-    def put_accord_participation_json(self, payload_json: str) -> None:
-        """(derived) deontic — #302 — admit an accord_participation. payload_json = { "participation": <AccordParticipation>, "standing_roster": [<ThresholdMember>...] }. Verify-..."""
-
-    def put_accord_proposal_json(self, payload_json: str) -> None:
-        """(derived) deontic — #302 — admit an accord_proposal. payload_json = { "proposal": <AccordProposal>, "authority_signature": <obj|null> }. v54.1.0 (CIRISPersist#1047) —..."""
 
     def put_attestation(self, signed_attestation_json: str) -> None:
         """Admit a ``SignedAttestation`` into ``federation_attestations``.
@@ -1826,77 +1817,6 @@ class Engine:
     def verify_corpus_want_v1(self, wire_json: str, ed25519_pubkey_base64: str, ml_dsa_65_pubkey_base64: str) -> bool:
         """(derived) deontic — #356 — verify a signed CorpusWantV1 wire JSON at ingest. Same contract as [Self::verify_storage_budget_v1_py]."""
 
-    def verify_hybrid(
-        self,
-        canonical_bytes: bytes,
-        ed25519_sig_b64: str,
-        ml_dsa_65_sig_b64: str | None,
-        ed25519_pubkey_b64: str,
-        ml_dsa_65_pubkey_b64: str | None,
-        policy: str,
-        soft_freshness_window_seconds: float | None = None,
-        row_age_seconds: float | None = None,
-    ) -> dict[str, Any]:
-        """Verify a hybrid (Ed25519 + ML-DSA-65) signature over
-        ``canonical_bytes`` against caller-supplied pubkeys. Both halves
-        are required.
-
-        ``policy`` accepts only ``"strict"`` (v61.1.0, CIRISPersist#1233,
-        CC 5.3.2.4.3.1: a verifier's hybrid-required check is always-on,
-        never an operator toggle). Any other value, including the former
-        ``"ed25519_fallback"`` and ``"soft_freshness"``, raises
-        ``ValueError("verify_policy_violation")`` before any decode or
-        crypto runs. The argument is removed in v62;
-        ``soft_freshness_window_seconds`` and ``row_age_seconds`` are
-        ignored.
-
-        Returns ``{"outcome": "hybrid_verified", "row_age_seconds": None}``.
-
-        Raises:
-            ValueError: ``verify_policy_violation`` /
-                ``verify_hybrid_pending_rejected`` (no PQC half) /
-                ``verify_hybrid_pqc_fields_mismatch`` /
-                ``verify_hybrid_base64`` / ``verify_hybrid_invalid_length`` /
-                ``verify_hybrid_crypto``.
-        """
-
-    def verify_hybrid_via_directory(
-        self,
-        canonical_bytes: bytes,
-        signature_key_id: str,
-        ed25519_sig_b64: str,
-        ml_dsa_65_sig_b64: str | None,
-        policy: str,
-        soft_freshness_window_seconds: float | None = None,
-        row_age_seconds: float | None = None,
-    ) -> dict[str, Any]:
-        """Hybrid verify against the pubkeys ``signature_key_id`` resolves to
-        in ``federation_keys``.
-
-        ``policy`` accepts only ``"strict"`` (v61.1.0, CIRISPersist#1233,
-        CC 5.3.2.4.3.1). Any other value raises
-        ``ValueError("verify_policy_violation")`` before the directory
-        lookup or any crypto runs. The argument is removed in v62. The
-        same rule applies to ``verify_signed_key_record``,
-        ``verify_signed_attestation`` and ``verify_signed_revocation``,
-        which route through this method.
-
-        Returns ``{"outcome": "hybrid_verified", "row_age_seconds": None}``.
-
-        Raises:
-            ValueError: ``verify_policy_violation`` / ``verify_unknown_key``
-                / the ``verify_hybrid_*`` tokens of ``verify_hybrid``.
-        """
-
-    def verify_signed_attestation(self, signed_attestation_json: str, policy: str, soft_freshness_window_seconds: float | None = None, row_age_seconds: float | None = None) -> dict[str, Any]:
-        """(derived) deontic — v0.4.0 — Verify a SignedAttestation envelope. Same shape as verify_signed_key_record; canonical bytes come from attestation_envelope."""
-
-    def verify_signed_key_record(self, signed_key_record_json: str, policy: str, soft_freshness_window_seconds: float | None = None, row_age_seconds: float | None = None) -> dict[str, Any]:
-        """(derived) deontic — v0.4.0 — Verify a SignedKeyRecord envelope's scrub signature. Looks up the scrub_key_id's pubkeys, recomputes canonical bytes from registration_env..."""
-
-    def verify_signed_revocation(self, signed_revocation_json: str, policy: str, soft_freshness_window_seconds: float | None = None, row_age_seconds: float | None = None) -> dict[str, Any]:
-        """(derived) deontic — v0.4.0 — Verify a SignedRevocation envelope. Same shape as verify_signed_attestation; canonical bytes come from revocation_envelope."""
-
     def verify_skill_import_manifest_b64(
         self,
         manifest_bytes_b64: str,
@@ -2275,9 +2195,6 @@ class Engine:
 
     def local_sign(self, message: bytes) -> bytes:
         """(derived) ontological — v1.4.0 (CIRISPersist#51) — Sign arbitrary bytes with the local Ed25519 signing key. Returns the 64-byte raw signature."""
-
-    def local_sign_hybrid(self, message: bytes) -> dict[str, Any]:
-        """(derived) ontological — v17.7.0 (CIRISPersist#470) — the SINGLE hybrid-sign verb across the Engine PyO3 boundary. Delegates to [LocalSigner::sign_hybrid] so the canonical..."""
 
     def lookup_identity_for_occurrence_json(self, occurrence_key_id: str) -> str | None:
         """(derived) ontological — v3.12.0 — reverse lookup: which identity does this occurrence_key_id speak for? Returns JSON IdentityOccurrence object or None (null) if the key is..."""
@@ -3458,7 +3375,7 @@ class Engine:
     def put_blob_chunks_json(self, payload_json: str) -> None:
         """(derived) empirical — v4.1 (CIRISPersist#142, Cut B) — atomic chunked-blob upload."""
 
-    def put_blob_edition2(
+    def put_blob(
         self,
         sha256_hex: str,
         body_inline_b64: str | None,
@@ -3466,56 +3383,23 @@ class Engine:
         media_type: str | None,
         claim_hex: str,
     ) -> None:
-        """v62.0.0 (v62 P8) — Blob ingest with an EXTERNAL edition-2
-        holding claim: ``claim_hex`` is the holder's ``custody:{kind}``
-        statement (``here``, at ``federation``, naming this blob and its
-        size), signed outside persist. The bytes are checked and stored,
-        then the claim goes through the statement door; a refused claim
-        leaves no bytes this call stored. Replaces ``put_blob_json``'s
-        ``PutBlobAttestation`` (signed over its JCS image) on the clean mesh.
+        """v62.0.0 (T2-fix11; CC 6.1.3) — Blob ingest with the holder's
+        edition-2 holding claim: ``claim_hex`` is the holder's
+        ``custody:{kind}`` statement (``here``, at ``federation``, naming
+        this blob and its size; ONE composite signature), signed outside
+        persist. The bytes are checked and stored, then the claim goes
+        through the statement door; a refused claim leaves no bytes this
+        call stored. CLEAN BREAK: replaces ``put_blob_json`` (whose
+        ``PutBlobAttestation`` bound-hybrid claim is deleted) and the interim
+        name ``put_blob_edition2``.
 
         ``body_inline_b64`` XOR ``external_ref_json`` — exactly one.
         Raises ``ValueError`` for a malformed claim or body, and the blob
         error's type for a refusal (the proxy decision runs on the claim's
         holder)."""
 
-    def put_blob_json(self, payload_json: str) -> None:
-        """v2.3.0 (#103) — Lower-level blob ingest accepting a fully
-        pre-signed ``PutBlobAttestation`` envelope. Use only when you
-        have an already-signed envelope (re-emit of remote announcement,
-        HSM-batched signing, replay with caller-determined timestamps).
-        Most callers want :meth:`put_blob_signing` — it owns
-        canonicalization + signing end-to-end.
-
-        Payload JSON shape::
-
-            {
-                "sha256_hex": str,
-                "body": {"Inline": <base64-bytes>} | {"External": {...}},
-                "media_type": str | None,
-                "attestation": {
-                    "attesting_key_id": str,
-                    "attestation_id": str,            # UUID
-                    "original_content_hash_hex": str,  # sha256 of the canonical envelope
-                    "scrub_signature_classical": str,  # base64 Ed25519
-                    "scrub_signature_pqc": str | None,
-                    "scrub_key_id": str,
-                    "scrub_timestamp": str             # RFC 3339
-                }
-            }
-
-        Raises:
-            ValueError: ``blob_hash_mismatch`` / ``blob_inline_size_exceeded``
-                / ``blob_attestation_emission_failed`` /
-                ``blob_trust_below_threshold``.
-            RuntimeError: backend / IO error.
-        """
-
     def put_calibration_bundle(self, bundle_json: str) -> None:
         """(derived) empirical — Lens-derived: write a calibration bundle."""
-
-    def put_detection_event(self, event_json: str) -> None:
-        """(derived) empirical — Lens-derived: write a detection event."""
 
     def revocations_for(self, revoked_key_id: str) -> str:
         """(derived) empirical — Federation directory: list revocations targeting revoked_key_id."""
@@ -3806,7 +3690,7 @@ class Engine:
         """
 
     def trust_root_bundle_response_json(self) -> str:
-        """(derived) empirical — v50.0.0 (CIRISPersist#926) — the CC 5.3.4 body (GET /v1/trust-root/bundle): the compiled-in GenesisBundle with this node's rooted ciris-canonical r..."""
+        """(derived) empirical — v50.0.0 (CIRISPersist#926) — the CC 5.3.4 body (GET /v1/trust-root/bundle), as JSON {"statements": [hex, …]}: the held named rows and voices of each ceg-genesis-bundle/2 in force, in lineage order — the same body t..."""
 
     def tsdb_count_edges_by_relationship_in_window(
         self,
@@ -3963,9 +3847,6 @@ class Engine:
     def cirisnode_read_vote_weight(self, contributor_id: str, domain: str, language: str, subject: str) -> str | None:
         """(derived) axiotic — v0.7.0 — Credits × expertise_multiplier × active_tier_multiplier per SCHEMA.md §5.2, from the projections. JSON VoteWeight or None. [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
-    def cirisnode_rehome_goals(self) -> str:
-        """(derived) axiotic — v60.0.0 — Move every pre-V204 typed goal off the goals table: this node's own are re-signed as rows, any other declarer's removed. Returns JSON {"r..."""
-
     def cirisnode_rehome_ledgers(self) -> int:
         """(derived) axiotic — v60.0.0 — re-emit every pre-V203 ledger balance as this node's row (the rehome). Returns how many moved. [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
@@ -4017,6 +3898,9 @@ class Engine:
 
     def claim_pending_outbound(self, batch_size: int, claim_duration_seconds: int, claimed_by: str) -> list[Any]:
         """(derived) procedural — v0.4.0 — Atomic claim of up to batch_size pending rows. Returns a list of dicts (one per claimed row)."""
+
+    def detection_draft(self, event_json: str, subject: str | None = None) -> str:
+        """(derived) procedural — v62.0.0 (v62 P8-fix10; CC 3.4.8) — a detection drafted for its detector's pen (Lens, an external detector): the detection:{detector} statement's pa..."""
 
     def enqueue_outbound(self, sender_key_id: str, destination_key_id: str, message_type: str, edge_schema_version: str, envelope_bytes: bytes, body_sha256: bytes, body_size_bytes: int, requires_ack: bool, max_attempts: int, ttl_seconds: int, initial_next_attempt_after_rfc3339: str, ack_timeout_seconds: int | None = None) -> str:
         """(derived) procedural — v0.4.0 (CIRISPersist#16) — Enqueue an outbound row in pending state. Returns the server-generated queue_id the caller stores in its DurableHandle."""
@@ -4252,6 +4136,9 @@ class Engine:
 
     def settle_instant_forms_json(self) -> str:
         """(derived) procedural — v61 (CC 2.6.2) — run the open-time instant-form pass now and return its counts as JSON: {scanned, violations, healed, already_healed, heal_refused,..."""
+
+    def sign_draft(self, draft_json: str) -> bytes:
+        """(derived) procedural — v62.0.0 (v62 P8-fix10) — sign a drafted statement with this engine's composite key (ML-DSA-65 + Ed25519): draft_json is a draft as detection_draft..."""
 
     def sweep_ack_timeouts(self) -> int:
         """(derived) procedural — v0.4.0 — Sweep ACK timeouts. Returns the count of rows touched (retried or abandoned)."""

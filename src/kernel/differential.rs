@@ -14,6 +14,7 @@
 //! | [`Class::NodeCosign`] | CC 3.2 *The first binding (MUST)*: counts "only when the node's own key cosigned it" | `owner_of` |
 //! | [`Class::ForkAsTip`] | CC 2.7.8 "Two versions of one head wait as tips" | `held_head_verdict` (switched in kernel pass 2: persist's side is its former refusal, the reference) |
 //! | [`Class::KeyEndHalfOpen`] | CC 2.6.2's freshness row: "the attestation has not yet reached its `valid_until`" | `HeldKeys::liveness` (kernel pass 2) |
+//! | [`Class::KeyRecordOwnVoice`] | CC 2.4.1.1: "Each key's own holder signs its record of this form" | `HeldKeys::liveness` (K1, triage round 3) |
 //!
 //! v62.0.0 (kernel pass 2): `CycleVisitedOnce` (the delegation cycle gate,
 //! CC 4.4.3.34) is no longer a class: the gate is deleted, so there is no
@@ -46,6 +47,12 @@ pub enum Class {
     /// the record has ended (the kernel's `[from, until)`); persist's
     /// former reading covered it.
     KeyEndHalfOpen,
+    /// v62.0.0 (K1, triage round 3) — a key record no voice of its own key
+    /// signed makes the key live nowhere (CC 2.4.1.1: "Each key's own holder
+    /// signs its record of this form, so the genesis ends no key and gives no
+    /// key a power over another"; the kernel's `key_end::well_formed`);
+    /// persist's former reading counted any verified voice.
+    KeyRecordOwnVoice,
     /// None of the above: a disagreement no CC sentence explains.
     Unexplained,
 }
@@ -60,6 +67,7 @@ impl Class {
             Class::NodeCosign => "node_cosign",
             Class::ForkAsTip => "fork_as_tip",
             Class::KeyEndHalfOpen => "key_end_half_open",
+            Class::KeyRecordOwnVoice => "key_record_own_voice",
             Class::Unexplained => "UNEXPLAINED",
         }
     }
@@ -267,11 +275,23 @@ pub fn held_head(
 /// key-end conclusion, after the revocations (which are persist's, and
 /// read before either). `at_an_end`: some valid record states exactly `at`
 /// as its `valid_until`.
-pub fn key_end(key: &str, at: u64, persist_covers: bool, kernel_live: bool, at_an_end: bool) {
+///
+/// v62.0.0 (K1, triage round 3) — `at_an_end_or_unvoiced`: every such record
+/// ends exactly at `at`, or carries no voice of the key it records.
+pub fn key_end(
+    key: &str,
+    at: u64,
+    persist_covers: bool,
+    kernel_live: bool,
+    at_an_end: bool,
+    at_an_end_or_unvoiced: bool,
+) {
     let class = if persist_covers == kernel_live {
         Class::Agree
     } else if persist_covers && !kernel_live && at_an_end {
         Class::KeyEndHalfOpen
+    } else if persist_covers && !kernel_live && at_an_end_or_unvoiced {
+        Class::KeyRecordOwnVoice
     } else {
         Class::Unexplained
     };

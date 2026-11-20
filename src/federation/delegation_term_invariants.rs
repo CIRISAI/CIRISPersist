@@ -721,11 +721,11 @@ mod lens {
 
     fn edge(envelope: serde_json::Value) -> crate::federation::Attestation {
         // An unsigned in-memory row for a pure lens: the skeleton only.
-        let mut row = crate::federation::edition2::fixture_switch::with_earlier_form(|| {
+        let mut row = {
             crate::federation::tier_ingest::test_support::bare_attestation(
                 "i1230", "a", "b", &envelope,
             )
-        });
+        };
         row.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
         // Signed after the rules took effect (the grandfather arms set their
         // own instant).

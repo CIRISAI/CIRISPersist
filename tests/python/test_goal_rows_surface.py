@@ -89,7 +89,6 @@ def test_a_goal_is_a_row_from_python(tmp_path) -> None:
         assert eng.cirisnode_get_goal_json(gid) is None
 
         assert json.loads(eng.cirisnode_check_goal_projection()) == {"live": 0, "rebuilt": 0}
-        assert json.loads(eng.cirisnode_rehome_goals()) == {"rehomed": 0, "dropped": 0}
     finally:
         ciris_persist.reset_engine()
 

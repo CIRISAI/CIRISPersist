@@ -810,7 +810,7 @@ pub mod test_support {
     /// `infra:attest` needs. **`infra:serve` is stricter**: its admission runs
     /// the m-of-n with `require_fips_custody = true` (CIRISPersist#513), and the
     /// roster resolves from
-    /// [`accord_holder_roster_key_ids`](crate::federation::admission) —
+    /// [`accord_holder_roster`](crate::federation::admission::accord_holder_roster) —
     /// the GENESIS holders — **never from the holders this helper mints**. So a
     /// software-signed `infra:serve` conferral only verifies under test-anchor
     /// **Mode A** (`CIRIS_TESTING_MODE=true` + `CIRIS_TEST_TRUST_ROOT*`
@@ -852,73 +852,32 @@ pub mod test_support {
         Ok(roster)
     }
 
-    /// v22.0.0 (CIRISPersist#543) — register the **GENESIS accord roster**
-    /// (`A1`/`B1`/`C1`, or the synthesized test-anchor holders when that mode
-    /// is armed) as directory rows carrying DETERMINISTIC test keypairs, and
-    /// return those identities so a fixture can co-scrub with them.
+    /// The accord holders of the INGESTED genesis, as test identities named
+    /// by their identity-refs (v62.0.0, C5-fix1; ceremony gap 1).
     ///
-    /// # Why this exists alongside [`confer_roles`]
-    ///
-    /// `confer_roles` mints its OWN `{family_tag}-h*` holders and hands the
-    /// caller their roster, which is exactly right for the READ side
-    /// ([`has_accord_conferred_role_over_roster`](crate::federation::admission)) — the
-    /// caller passes the roster back in. The WRITE-side gates that run inside
-    /// `put_public_key` take no roster argument: `check_canonical_role_admission`
-    /// / `check_infra_attest_role_admission` /
-    /// `check_privileged_identity_type_admission` all resolve the roster from
-    /// `accord_holder_roster_key_ids()`, i.e. the GENESIS holder `key_id`s. So a
-    /// record that must survive a chokepoint gate has to be co-scrubbed by keys
-    /// sitting at *those* `key_id`s, and a bare test backend has none — the
-    /// quorum resolves to 0 members and every conferral fails
-    /// "accord quorum unreachable".
-    ///
-    /// This helper stands the trust root up in the test directory: the roster
-    /// ids are the real genesis ones, and the KEY MATERIAL under them is
-    /// test-held (nobody has the #268 ceremony's private halves). That is the
-    /// only injectable seam, and it is fixture setup — the gate itself is
-    /// untouched and runs for real: roster resolution, per-scrub hybrid
-    /// signature verification, and the m-of-n quorum policy all execute against
-    /// these rows exactly as they do in production. Same shape as the
-    /// long-standing `adopt_scrub_upgrade_gate_sqlite` fixture, which seeds
-    /// `A1`/`B1` directly "mirrors the real seed where A1/B1 are genesis rows".
-    ///
-    /// Holders register as `node` (not `accord_holder`) — the quorum core only
-    /// needs their PINNED directory pubkeys, and `node` skips the #513
-    /// hardware-attestation gate on sqlite/postgres. Deterministic and
-    /// idempotent (see [`register_accord_holder`]'s pinned timestamps), so a
-    /// fixture conferring several keys may call it once per key.
-    ///
-    /// # HARD LIMIT: only works on a directory with NO genesis seed
-    ///
-    /// This writes the genesis `key_id`s with TEST key material, so it requires
-    /// that those rows do not already exist. On a **genesis-seeded** directory
-    /// they do — carrying the REAL #268 ceremony pubkeys — and `put_public_key`
-    /// correctly refuses to replace them
-    /// (`Conflict("key_id A1 already exists with different content")`). That is
-    /// the substrate protecting its trust root and MUST NOT be worked around:
-    /// on such a directory nobody can produce the co-scrub, because the genesis
-    /// private halves live in hardware.
-    ///
-    /// So this helper serves fixtures on a **bare** backend
-    /// (`SqliteBackend::open_in_memory` + `run_migrations`, `test_backend()`,
-    /// a fresh unseeded pg schema) — NOT `Engine::with_signer`, which seeds
-    /// genesis, and NOT a shared pg test database that any engine test has
-    /// touched. A fixture needing an accord-conferred `identity_type` against a
-    /// genesis-seeded directory has to move the whole roster instead, via the
-    /// `test-anchor` seam (CIRISPersist#449/#451): with that feature compiled
-    /// and `CIRIS_TESTING_MODE` + `CIRIS_TEST_TRUST_ROOT*` armed,
-    /// `effective_accord_holder_records` returns `test-accord-holder-{i}` and
-    /// this helper follows it automatically — no code change here.
+    /// Until v62.0 this registered TEST key material under the baked A1/B1/C1
+    /// `key_id`s (or the test-anchor block's `test-accord-holder-{i}`), so an
+    /// earlier-form (JSON) co-scrub by them met the write-side role gates. The
+    /// baked roster is deleted: the roster is the holders of the
+    /// `ceg-genesis-bundle/2` in force
+    /// ([`accord_holder_roster`](crate::federation::admission::accord_holder_roster)),
+    /// edition-2 composite keys whose private halves no `Identity` holds. So
+    /// this registers NOTHING, returns the empty list on a directory with no
+    /// genesis, and an earlier-form co-scrub by the identities it returns never
+    /// verifies (`earlier_form_signer_is_edition2`). Every caller asserts
+    /// earlier-form conferral behaviour.
+    // TODO(json-cut C5): delete with its callers at the E flip (edition-2
+    // conferral fixtures: `edition2::fixture_genesis`).
     pub async fn register_genesis_accord_roster(
         directory: &dyn crate::federation::FederationDirectory,
     ) -> Result<Vec<Identity>, crate::federation::Error> {
-        let mut holders = Vec::new();
-        for rec in crate::federation::genesis::effective_accord_holder_records().iter() {
-            let holder = Identity::new(&rec.record.key_id);
-            register_accord_holder(directory, &holder).await?;
-            holders.push(holder);
-        }
-        Ok(holders)
+        Ok(
+            crate::federation::admission::accord_holder_roster(directory)
+                .await?
+                .iter()
+                .map(|identity_ref| Identity::new(identity_ref.as_str()))
+                .collect(),
+        )
     }
 
     /// v22.0.0 (CIRISPersist#543) — turn a self-scrubbed fixture `KeyRecord`
@@ -2405,9 +2364,8 @@ pub mod test_support {
     /// `holders` seated as founders under `consensus_protocol`, on any backend.
     ///
     /// Written through `put_family_local` because a family has no key and
-    /// therefore cannot sign its own declaration — the same door
-    /// [`crate::federation::genesis::seed_accord_family`] uses for
-    /// `humanity-accord`. The holders must already be registered.
+    /// therefore cannot sign its own declaration — the same door the deleted
+    /// baked accord-family seed used for `humanity-accord`. The holders must already be registered.
     pub async fn seed_test_family(
         directory: &dyn crate::federation::FederationDirectory,
         family_key_id: &str,

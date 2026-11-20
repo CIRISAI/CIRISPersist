@@ -13,11 +13,11 @@
 pub(crate) mod bodies {
     use crate::federation::key_grant::SignedKeyGrantRow;
     use crate::federation::key_grant_invariants::two_node::{
-        introduce, seed_community_everywhere, Node,
+        introduce_as, seed_community_everywhere, Node,
     };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
-    use crate::federation::types::identity_type::USER;
+    use crate::federation::types::identity_type::{NODE, USER};
     use crate::federation::{
         AdoptDisposition, BlobBody, BlobError, BlobProvenance, BlobStorage, EncryptionPubkeys,
         FederationDirectory,
@@ -56,10 +56,17 @@ pub(crate) mod bodies {
         let engine_b = Engine::with_signer_pre_genesis(ts::local_signer(&alias_b), dsn_b)
             .await
             .unwrap();
-        for (e, _alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
-            e.register_self_federation_key(USER, None, None)
-                .await
-                .expect("register the engine's own key");
+        for (e, alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
+            // v62 (E4-fix5; CC 2.4.1.1, CC rc21 3.3.6): the engine's key is a
+            // MACHINE key, live as the fixture's edition-2 `node` `key:record`
+            // of its alias (E0's default node window; `introduce_as(.., NODE)`
+            // gives the peers the same record), NOT
+            // `register_self_federation_key`, which dates the record at the
+            // wall clock: every row dated inside the key's window before that
+            // instant (the owner binding `place_device` lands, dated from the
+            // key window by K2's builder) read `AttesterKeyUnknown` on the
+            // node's OWN backend.
+            ts::register_hybrid_key_as(pick(e).as_ref(), alias, alias, NODE).await;
         }
         let (sa, sb) = (pick(&engine_a), pick(&engine_b));
         let kem =
@@ -81,7 +88,7 @@ pub(crate) mod bodies {
             key: ts::local_signer(&alias_b).federation_id().await,
             kem: kem(sb.load_or_init_content_kem_identity().await.unwrap()),
         };
-        introduce(&[&a, &b], &[&alias_a, &alias_b]).await;
+        introduce_as(&[&a, &b], &[&alias_a, &alias_b], NODE).await;
         let comm = crate::federation::edition2::fixture_switch::kid(&format!("em-comm-{run}")); // v62 (E4): the typed row is keyed by identity-ref
                                                                                                 // v62 (E4): members are named by identity-ref (`e2::kid`); every
                                                                                                 // seed-taking fixture accepts it back.
@@ -1241,11 +1248,11 @@ pub(crate) mod room_1271 {
     use super::bodies::Pick;
     use crate::federation::key_grant::SignedKeyGrantRow;
     use crate::federation::key_grant_invariants::two_node::{
-        introduce, seed_community_everywhere, Node,
+        introduce_as, seed_community_everywhere, Node,
     };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
-    use crate::federation::types::identity_type::USER;
+    use crate::federation::types::identity_type::{NODE, USER};
     use crate::federation::{
         AdoptDisposition, BlobBody, BlobError, BlobProvenance, BlobStorage, EncryptionPubkeys,
         FederationDirectory,
@@ -1298,9 +1305,16 @@ pub(crate) mod room_1271 {
             let e = Engine::with_signer_pre_genesis(ts::local_signer(alias), dsn)
                 .await
                 .unwrap();
-            e.register_self_federation_key(USER, None, None)
-                .await
-                .expect("register the engine's own key");
+            // v62 (E4-fix5; CC 2.4.1.1, CC rc21 3.3.6): the engine's key is a
+            // MACHINE key, live as the fixture's edition-2 `node` `key:record`
+            // of its alias (E0's default node window; `introduce_as(.., NODE)`
+            // gives the peers the same record), NOT
+            // `register_self_federation_key`, which dates the record at the
+            // wall clock: every row dated inside the key's window before that
+            // instant (the owner binding `place_device` lands, dated from the
+            // key window by K2's builder) read `AttesterKeyUnknown` on the
+            // node's OWN backend.
+            ts::register_hybrid_key_as(pick(&e).as_ref(), alias, alias, NODE).await;
             engines.push(e);
         }
         let carol_engine = engines.pop().unwrap();
@@ -1330,7 +1344,7 @@ pub(crate) mod room_1271 {
         }
         let refs: Vec<&Node<'_, B>> = nodes.iter().collect();
         let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
-        introduce(&refs, &alias_refs).await;
+        introduce_as(&refs, &alias_refs, NODE).await;
         let comm = crate::federation::edition2::fixture_switch::kid(&format!("r1271-comm-{run}")); // v62 (E4): the typed row is keyed by identity-ref
         let (alice, bob, carol) = (
             format!("r1271-alice-{run}"),

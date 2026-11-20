@@ -2073,10 +2073,8 @@ pub mod lifecycle_support {
     }
 
     /// As [`seed_community`], with control over the community key's
-    /// identity type and its policy blob. v62.0.0: `SUBSTRATE_PERSIST` with an
-    /// `infrastructure` policy asks for an AUTHORIZED infrastructure community,
-    /// which is stood up as a rooted trust-root room (the key type itself
-    /// confers nothing).
+    /// identity type and its policy blob. The key type confers nothing; an
+    /// authorized infrastructure room is `rooted_infrastructure_room_e2`.
     pub async fn seed_community_with<B>(
         backend: &B,
         community_key_id: &str,
@@ -2088,35 +2086,12 @@ pub mod lifecycle_support {
     {
         use crate::federation::tier_ingest::test_support as ts;
 
-        // v62.0.0 (CC rc20 3.4.7.1 / 3.2, #1274) — an AUTHORIZED
-        // infrastructure community is a conformant record rooted in this
-        // node's trust set; a self-claimed `substrate_persist` key no longer
-        // makes one. An infrastructure-labelled fixture is therefore stood up
-        // as a rooted trust-root room with `members` seated.
-        // (Unit-test builds only: the rooted fixture is test code; a
-        // `test-anchor` simulation build keeps the v61 shape and gets the
-        // stricter non-infrastructure path.)
-        #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-        if policy_blob
-            .as_ref()
-            .and_then(|b| b.get("cohort_subkind"))
-            .and_then(|v| v.as_str())
-            == Some("infrastructure")
-            && community_identity_type == crate::federation::types::identity_type::SUBSTRATE_PERSIST
-        {
-            for (ident, occ) in members {
-                seed_member(backend, ident, occ).await;
-            }
-            let idents: Vec<&str> = members.iter().map(|(i, _)| *i).collect();
-            crate::federation::canonical_community_invariants::bodies::rooted_infrastructure_room(
-                backend as &dyn FederationDirectory,
-                community_key_id,
-                &idents,
-                community_key_id,
-            )
-            .await;
-            return;
-        }
+        // v62.0.0 (W1-fix4, after C5-fix1) — the earlier-form "rooted
+        // trust-root room" branch for a `SUBSTRATE_PERSIST` + `infrastructure`
+        // community is deleted: it stood up the earlier accord roster, which
+        // C5 removed, and no caller asked for it (the one caller passes
+        // `USER`, `None`). An authorized infrastructure room is
+        // `canonical_community_invariants::bodies::rooted_infrastructure_room_e2`.
         ts::register_hybrid_key_as(
             backend,
             community_key_id,

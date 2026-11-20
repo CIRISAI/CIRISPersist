@@ -159,6 +159,10 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 /// Deterministic producer Ed25519 + ML-DSA-65 keys.
+/// v62.0.0 (F0-cp6d) — this node's identity: every local composite names it
+/// as producer (`pqc_key_id`).
+const NODE_ID: &str = "agg-mldsa";
+
 fn producer_pubkeys() -> (SigningKey, String, MlDsa65SoftwareSigner) {
     let ed_sk = SigningKey::from_bytes(&[0x33; 32]);
     let ed_pk_b64 = BASE64.encode(ed_sk.verifying_key().to_bytes());
@@ -318,18 +322,22 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
         "(a) opaque aggregation_meta round-trips byte-for-byte"
     );
 
-    // ── (b) classical-only composite manifest → REJECTED (the composite
-    //        still goes through the #225 hard cut), zero rows written.
-    let bad_cid = format!("agg-classical-{suffix}");
-    let (m_bad, s_bad) = build_manifest_and_symbols(
+    // ── (b) v62.0.0 (F0-cp6d) — a composite produced by ANOTHER node →
+    //        REJECTED by name (fountain coding is node-local; the fountain
+    //        is not a CC object), zero rows written. The earlier
+    //        classical-only hard-cut leg asserted a manifest signature form
+    //        the node-local door no longer reads.
+    let bad_cid = format!("agg-peer-{suffix}");
+    let (mut m_bad, s_bad) = build_manifest_and_symbols(
         &bad_cid,
         &composite_corpus,
         n_source,
         k_repair,
         symbol_size,
-        false, // classical-only
+        true,
     )
     .await;
+    m_bad.pqc_key_id = "a-peer-node".to_owned();
     let (verif_b, commitment_b) = signed_verify_inputs(&member_ids, false, false).await;
     let agg_bad = AggregationMetaV1 {
         aggregate_content_id: bad_cid.clone(),
@@ -343,15 +351,15 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
     let err = backend
         .put_aggregated_tier(&m_bad, &s_bad, &agg_bad, 2_000)
         .await
-        .expect_err("(b) classical-only composite MUST be rejected (#225 hard cut)");
+        .expect_err("(b) a peer's composite MUST be refused (node-local)");
     assert!(
         matches!(err, StoreError::FountainAdmit(_)),
         "(b) reject is a FountainAdmit error, got {err:?}"
     );
     assert_eq!(
         err.kind(),
-        "fountain_admit_hybrid_required",
-        "(b) hard-cut token"
+        "fountain_manifest_not_cc_object",
+        "(b) the node-local token"
     );
     // verify-before-mutation: NOTHING written — neither composite nor row.
     assert!(
@@ -1119,6 +1127,8 @@ async fn i1152_member_commitment_unique_sqlite() {
         .await
         .expect("open sqlite");
     backend.run_migrations().await.expect("sqlite migrations");
+    // v62.0.0 (F0-cp6d) — node-local: the composites' producer is this node.
+    backend.set_node_key_id(NODE_ID);
     i1152_member_commitment_unique(&backend, "sqlite").await;
 }
 
@@ -1133,6 +1143,8 @@ async fn i1152_member_commitment_unique_postgres() {
         .expect("connect postgres");
     backend.run_migrations().await.expect("pg migrations");
     let suffix = uuid::Uuid::new_v4().simple().to_string();
+    // v62.0.0 (F0-cp6d) — node-local: the composites' producer is this node.
+    backend.set_node_key_id(NODE_ID);
     i1152_member_commitment_unique(&backend, &suffix).await;
     eprintln!("i1152_member_commitment_unique_postgres: RAN");
 }
@@ -1146,6 +1158,8 @@ async fn sqlite_aggregation_tier() {
         .run_migrations()
         .await
         .expect("sqlite migrations (incl. V086)");
+    // v62.0.0 (F0-cp6d) — node-local: the composites' producer is this node.
+    backend.set_node_key_id(NODE_ID);
     run_aggregation_assertions(&backend, "sqlite").await;
 }
 
@@ -1163,5 +1177,7 @@ async fn postgres_aggregation_tier() {
         .await
         .expect("pg migrations (incl. V086)");
     let suffix = uuid::Uuid::new_v4().simple().to_string();
+    // v62.0.0 (F0-cp6d) — node-local: the composites' producer is this node.
+    backend.set_node_key_id(NODE_ID);
     run_aggregation_assertions(&backend, &suffix).await;
 }

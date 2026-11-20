@@ -1338,7 +1338,29 @@ pub fn check_by_id(family_id: &str, row_type: &str, payload: &Value) -> Result<(
         // envelope's typed members (CC 2.6.1.3, `attestation-envelope`):
         // a malformed common member is refused here, at the door, never read
         // as something else later. Its other members pass as before.
-        None => check_common(payload).map_err(|e| refuse(format!("{family_id}: {e}"))),
+        None => {
+            check_common(payload).map_err(|e| refuse(format!("{family_id}: {e}")))?;
+            // v62.0.0 (CC rc21 397100e, CC 3.3.11) — on a family with no list
+            // the `refs` roles are open (a chat reply names its message under
+            // `answers`), but the `also` roles stay closed (ack | cites): CC
+            // 2.6.1.3's `also-role` is a closed registry, as on every listed
+            // family and every composer. A REFUSAL, not a hold: it reads the
+            // statement's own bytes only (the CC27 door line). Witnessed at the
+            // door, sqlite and postgres, by `payloads_invariants`
+            // `i4002_a_chat_answer_passes_the_door_{sqlite,postgres}`.
+            let names: Vec<Name> =
+                names_of(payload).map_err(|e| refuse(format!("{family_id}: refs: {e:?}")))?;
+            if let Some(n) = names
+                .iter()
+                .find(|n| n.role.starts_with("also:") && !ALSO_ROLES.contains(&n.role.as_str()))
+            {
+                return Err(refuse(format!(
+                    "{family_id}: refs `{}` is not an also role (ack | cites)",
+                    n.role
+                )));
+            }
+            Ok(())
+        }
     }
 }
 

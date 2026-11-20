@@ -1829,7 +1829,20 @@ pub mod test_support {
         // node voice is a further statement (`fixture_switch::voice_of`), never
         // a co-scrub.
         if crate::federation::edition2::fixture_switch::emit_edition2() {
-            *row = crate::federation::edition2::fixture_switch::row_of(row, signing_key_id);
+            // v62.0.0 (E0 fix 8) — a composer is sealed once it names its
+            // target. The suite's pattern "set the type, reseal, THEN write the
+            // envelope naming the target, re-sign" sealed a `withdraws` with no
+            // target, which the door refuses (`refs.target is required`). Such
+            // a premature seal is a no-op; the re-sign after the target is set
+            // seals it (and a composer never given a target is still refused at
+            // the put: it carries no statement).
+            if crate::federation::edition2::fixture_switch::is_untargeted_composer(row) {
+                return;
+            }
+            // v62.0.0 (E0 fix 9) — a statement the door refuses is carried,
+            // unadmitted, to the put door (`fixture_switch::seal`): the
+            // witness reads the refusal there.
+            *row = crate::federation::edition2::fixture_switch::seal(row, signing_key_id);
             return;
         }
         // v31.0.0 (CIRISPersist#598) — the INSTANTS are part of the seal, not a
@@ -2398,23 +2411,17 @@ pub mod test_support {
         dir: &dyn crate::federation::FederationDirectory,
         suffix: &str,
     ) {
-        // v62.0.0 (E0 fix 5; lead's ruling (a)) — HELD in the earlier form.
-        // The community is seeded through the TYPED plane
-        // (`seed_two_member_community` → `put_community`, members named by
-        // label), which has no edition-2 projection on this base, so an
-        // edition-2 row (signed as `kid(author)`) was asked to prove
-        // membership in a roster that names `author`: "caller's identity is
-        // not a member of any community". Every builder and register helper
-        // polled inside takes the earlier form.
-        Box::pin(
-            crate::federation::edition2::fixture_switch::with_earlier_form_async(
-                owner_signed_community_row_held(dir, suffix),
-            ),
-        )
-        .await;
+        // v62.0.0 (E0 fix 7; CP2) — edition 2 end to end: the communities
+        // land through T1's group statement door (`seed_two_member_community`
+        // → `fixture_switch::put_community_any`, keyed by identity-refs), the
+        // rows are statements (the codec states `community_id` /
+        // `community_key_id` as the group's identity-ref), the device is an
+        // `identity:occurrence` bind (`e2::put_bind`) withdrawn by a
+        // `withdraws` (`occurrence_withdrawal`).
+        Box::pin(owner_signed_community_row_body(dir, suffix)).await;
     }
 
-    async fn owner_signed_community_row_held(
+    async fn owner_signed_community_row_body(
         dir: &dyn crate::federation::FederationDirectory,
         suffix: &str,
     ) {
@@ -2476,6 +2483,8 @@ pub mod test_support {
 
         // (1) THE UNBLOCK — a member's own community row, signed by the
         // author, admitted at the door that preserves that signature.
+        let e2 = crate::federation::edition2::fixture_switch::emit_edition2();
+        let id = crate::federation::edition2::fixture_switch::stored_id;
         let mine = row(&author, Some(&cid));
         let signed_author = mine.scrub_key_id.clone();
         dir.put_attestation(crate::federation::SignedAttestation { attestation: mine })
@@ -2487,7 +2496,8 @@ pub mod test_support {
                 )
             });
         assert_eq!(
-            signed_author, author,
+            signed_author,
+            id(&author),
             "({suffix}) the row carries the AUTHOR's scrub key, not the node's"
         );
 
@@ -2498,7 +2508,13 @@ pub mod test_support {
         let mut third_party = row(&author, Some(&cid));
         third_party.attested_key_id = stranger.clone();
         third_party.subject_key_ids = vec![stranger.clone()];
-        stamp_mirror(&mut third_party);
+        // Edition 2: the mutated row re-signed (the gate under test is AV-84,
+        // not the projection check); the earlier form re-stamps its mirror.
+        if e2 {
+            reseal(&mut third_party);
+        } else {
+            stamp_mirror(&mut third_party);
+        }
         let probe = dir
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: third_party,
@@ -2553,12 +2569,13 @@ pub mod test_support {
         // forever, the exact failure the removal primitive exists to prevent.
         // v49.0.0 (#908): signed as the room's protocol requires — the room
         // key alone no longer has standing.
-        dir.put_community_membership_revocation(
+        crate::federation::edition2::fixture_switch::put_community_membership_revocation_any(
+            dir,
             sign_revocation_by_consensus(
                 dir,
                 crate::federation::types::CommunityMembershipRevocation {
-                    community_key_id: cid.clone(),
-                    removed_identity_key_id: author.clone(),
+                    community_key_id: id(&cid),
+                    removed_identity_key_id: id(&author),
                     removed_at: crate::host::clock::now(),
                     effective_at: crate::host::clock::now(),
                     reason: None,
@@ -2618,7 +2635,11 @@ pub mod test_support {
         local.tier = attestation_tier::LOCAL.to_owned();
         local.scrub_signature_classical = "c2ln".to_owned();
         local.scrub_signature_pqc = None;
-        stamp_mirror(&mut local);
+        // Edition 2: the tier is a column, not signed; the statement stays the
+        // proof. The earlier form re-stamps its mirror.
+        if !e2 {
+            stamp_mirror(&mut local);
+        }
         let err = dir
             .put_attestation(crate::federation::SignedAttestation { attestation: local })
             .await
@@ -2641,20 +2662,50 @@ pub mod test_support {
         // refused this as `AttestedParty`, which would have made
         // owner-attributed device chat unwriteable.
         let device = format!("device-757-{suffix}");
-        register_user_role_key(dir, &device).await;
-        dir.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-            identity_key_id: bob_observer.clone(),
-            occurrence_key_id: device.clone(),
-            device_class: crate::federation::types::device_class::SERVER.into(),
-            hardware_attestation: None,
-            asserted_at: crate::host::clock::now(),
-            valid_until: None,
-            encryption_pubkeys: None,
-            transport_binding: None,
-            persist_row_hash: String::new(),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("({suffix}) bind device occurrence: {e}"));
+        if e2 {
+            // A person's device occurrence is a MACHINE key (P1's rule), bound
+            // by an `identity:occurrence` row: the device's own voice and the
+            // identity's (`e2::put_bind`, naming the identity's roster head).
+            register_hybrid_key_as(
+                dir,
+                &device,
+                &device,
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let out = crate::federation::edition2::fixture_switch::put_bind(
+                dir,
+                &bob_observer,
+                &bob_observer,
+                &device,
+                crate::federation::types::device_class::SERVER,
+                &crate::federation::edition2::fixture_switch::BindOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) bind device occurrence: {e}"));
+            assert!(
+                matches!(
+                    out,
+                    crate::federation::edition2::ingest::StatementOutcome::Row { .. }
+                ),
+                "({suffix}) the device bind lands: {out:?}"
+            );
+        } else {
+            register_user_role_key(dir, &device).await;
+            dir.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: bob_observer.clone(),
+                occurrence_key_id: device.clone(),
+                device_class: crate::federation::types::device_class::SERVER.into(),
+                hardware_attestation: None,
+                asserted_at: crate::host::clock::now(),
+                valid_until: None,
+                encryption_pubkeys: None,
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) bind device occurrence: {e}"));
+        }
         let mut via_device = row(&device, Some(&cid2));
         via_device.attested_key_id = bob_observer.clone();
         via_device.subject_key_ids = vec![bob_observer.clone()];
@@ -2678,7 +2729,9 @@ pub mod test_support {
         // backend-shared, so all three answer alike.
         let mut bogus = row(&bob_observer, Some(&cid2));
         bogus.tier = "bogus".to_owned();
-        stamp_mirror(&mut bogus);
+        if !e2 {
+            stamp_mirror(&mut bogus);
+        }
         let err = dir
             .put_attestation(crate::federation::SignedAttestation { attestation: bogus })
             .await
@@ -2719,7 +2772,7 @@ pub mod test_support {
             dir,
             &stored_local,
             crate::federation::Audience::Community {
-                community_key_id: cid2.clone(),
+                community_key_id: id(&cid2),
             },
             &[],
         )
@@ -2745,19 +2798,34 @@ pub mod test_support {
         // revocation exists to sever. Resolution now rides the ACTIVE fold;
         // the revoked device falls back to its singleton identity, which is
         // not a member.
-        dir.put_identity_occurrence_revocation_local(
-            crate::federation::types::IdentityOccurrenceRevocation {
-                identity_key_id: bob_observer.clone(),
-                occurrence_key_id: device.clone(),
-                revoked_at: crate::host::clock::now(),
-                effective_at: crate::host::clock::now(),
-                reason: None,
-                witness_set: vec![],
-                persist_row_hash: String::new(),
-            },
-        )
-        .await
-        .unwrap_or_else(|e| panic!("({suffix}) revoke device binding: {e}"));
+        if e2 {
+            // The identity withdraws the held bind (CC 3.3.6, #991's shape).
+            let w = occurrence_withdrawal(
+                dir,
+                &bob_observer,
+                &id(&bob_observer),
+                &id(&device),
+                crate::host::clock::now(),
+            )
+            .await;
+            crate::federation::edition2::fixture_switch::put_signed(dir, &w.attestation)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) revoke device binding: {e}"));
+        } else {
+            dir.put_identity_occurrence_revocation_local(
+                crate::federation::types::IdentityOccurrenceRevocation {
+                    identity_key_id: bob_observer.clone(),
+                    occurrence_key_id: device.clone(),
+                    revoked_at: crate::host::clock::now(),
+                    effective_at: crate::host::clock::now(),
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) revoke device binding: {e}"));
+        }
         let mut via_revoked = row(&device, Some(&cid2));
         via_revoked.attested_key_id = bob_observer.clone();
         via_revoked.subject_key_ids = vec![bob_observer.clone()];
@@ -3052,28 +3120,33 @@ pub mod test_support {
              consumer cannot count it as routine non-progress"
         );
 
-        // (3) A DIFFERENT row under the same id is still refused.
-        let mut impostor = row.clone();
-        impostor.attestation_envelope["dimension"] =
-            serde_json::Value::String("scores:dental:v1".into());
-        seal_row_in_place(&a, &mut impostor);
-        let err = dir
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: impostor,
-            })
-            .await
-            .err()
-            .unwrap_or_else(|| {
-                panic!(
-                    "({suffix}) #771: a DIFFERENT row under an occupied id is two rows \
-                     claiming one identity — quieting duplicates must not become \
-                     accepting anything"
-                )
-            });
-        assert!(
-            matches!(err, crate::federation::Error::Conflict(_)),
-            "({suffix}) #771: and the disagreement is TYPED, not a backend error: {err}"
-        );
+        // (3) A DIFFERENT row under the same id is still refused. v62.0.0 (E0
+        // fix 9) — earlier-form only (ruling 4): an edition-2 row's id is
+        // computed over its payload, so a different payload IS a different
+        // id. "Two rows claiming one id" has no edition-2 form.
+        if !crate::federation::edition2::fixture_switch::emit_edition2() {
+            let mut impostor = row.clone();
+            impostor.attestation_envelope["dimension"] =
+                serde_json::Value::String("scores:dental:v1".into());
+            seal_row_in_place(&a, &mut impostor);
+            let err = dir
+                .put_attestation(crate::federation::SignedAttestation {
+                    attestation: impostor,
+                })
+                .await
+                .err()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "({suffix}) #771: a DIFFERENT row under an occupied id is two rows \
+                         claiming one identity — quieting duplicates must not become \
+                         accepting anything"
+                    )
+                });
+            assert!(
+                matches!(err, crate::federation::Error::Conflict(_)),
+                "({suffix}) #771: and the disagreement is TYPED, not a backend error: {err}"
+            );
+        }
     }
 
     /// CIRISPersist#788 — the serve-tier ladder, on a real directory.
@@ -3859,20 +3932,26 @@ pub mod test_support {
         if member_b != member_a {
             members.push(member(member_b));
         }
-        dir.put_community(sign_community(
-            member_a,
-            crate::federation::types::Community {
-                prev_head_digest: String::new(),
-                charter_digest: String::new(),
-                community_key_id: community_key_id.to_owned(),
-                community_name: "chat-pair".to_owned(),
-                members,
-                founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                consensus_protocol: crate::federation::types::consensus_protocol::UNANIMOUS.into(),
-                policy_blob,
-                persist_row_hash: String::new(),
-            },
-        ))
+        // v62.0.0 (E0 fix 7) — through T1's group statement door under the
+        // switch (the roster's voices), `put_community` in a held test.
+        crate::federation::edition2::fixture_switch::put_community_any(
+            dir,
+            sign_community(
+                member_a,
+                crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
+                    community_key_id: community_key_id.to_owned(),
+                    community_name: "chat-pair".to_owned(),
+                    members,
+                    founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::UNANIMOUS
+                        .into(),
+                    policy_blob,
+                    persist_row_hash: String::new(),
+                },
+            ),
+        )
         .await
         .expect("seed community");
     }
@@ -4321,10 +4400,18 @@ pub mod test_support {
         verb: &str,
     ) -> Result<(), crate::federation::Error> {
         let id = uuid::Uuid::new_v4().to_string();
-        let envelope = serde_json::json!({
-            "id": id,
-            "references_attestation_id": target_id,
-        });
+        // v62.0.0 (red round 3, X1) — under the switch a composer's payload is
+        // the common members and `refs.target` only
+        // (`payloads::check_composer`): the earlier envelope's free `id` is
+        // not a member of it, so the edition-2 composer states none.
+        let envelope = if crate::federation::edition2::fixture_switch::emit_edition2() {
+            serde_json::json!({ "references_attestation_id": target_id })
+        } else {
+            serde_json::json!({
+                "id": id,
+                "references_attestation_id": target_id,
+            })
+        };
         let mut row = bare_attestation(&id, granter, grantee, &envelope);
         row.attestation_type = verb.to_owned();
         seal_row_in_place(granter, &mut row);
@@ -4470,6 +4557,8 @@ pub mod test_support {
         // pending; `edition2::gc5_fold_invariants`), so under the switch the
         // label had no earlier key ("signer subj-… is not a registered
         // federation key"). Every helper polled inside takes the earlier form.
+        // CP2 held: its runners are ignored: location_proof:v1 card pending (CC next edition).
+        // runners: location_proof_authority_is_the_subject_sqlite_734, location_proof_authority_is_the_subject_pg_734.
         crate::federation::edition2::fixture_switch::with_earlier_form_async(
             location_proof_authority_held(dir, tag),
         )
@@ -5265,10 +5354,19 @@ pub mod test_support {
         // keeps its fixed date.
         let ts: chrono::DateTime<chrono::Utc> =
             if crate::federation::edition2::fixture_switch::emit_edition2() {
-                let from_ms =
-                    crate::federation::edition2::fixture_switch::key_window_start_ms(node);
-                let at_ms = i64::try_from(from_ms).expect("a key window start fits i64")
-                    + OWNER_BINDING_OFFSET_DAYS * 86_400_000;
+                // v62.0.0 (E0 fix 9) — a node put with an EXPLICIT window
+                // (a witness that back-dates its binding and re-seals it)
+                // has no default start: dated an hour ago, the caller's own
+                // re-dating is what counts.
+                let at_ms =
+                    match crate::federation::edition2::fixture_switch::try_key_window_start_ms(node)
+                    {
+                        Some(from_ms) => {
+                            i64::try_from(from_ms).expect("a key window start fits i64")
+                                + OWNER_BINDING_OFFSET_DAYS * 86_400_000
+                        }
+                        None => crate::host::clock::now().timestamp_millis() - 3_600_000,
+                    };
                 chrono::TimeZone::timestamp_millis_opt(&chrono::Utc, at_ms)
                     .single()
                     .expect("an instant inside the key's window")
@@ -5340,7 +5438,7 @@ mod tests {
     /// edition-2 statement's mapped row. `id` is the earlier-form id the
     /// codec drops; the row id is node-computed.
     fn att(attester: &str, id: &str) -> Attestation {
-        let mut a = e2::with_earlier_form(|| {
+        let mut a = {
             super::test_support::bare_attestation(
                 id,
                 attester,
@@ -5351,7 +5449,7 @@ mod tests {
                     "confidence": 0.9,
                 }),
             )
-        });
+        };
         a.attestation_type = attestation_type::SCORES.to_owned();
         a.tier = attestation_tier::FEDERATION.to_owned();
         a

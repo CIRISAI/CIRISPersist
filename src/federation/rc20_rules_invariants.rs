@@ -47,6 +47,7 @@ mod pure {
     /// edition-2 builder admits its record and a mixed set never admits; the
     /// rule reads only `identity_type`.
     fn rule_input(set: &str) -> crate::federation::KeyRecord {
+        // CP2 skeleton: a pure rule's input struct; it reaches no door.
         crate::federation::edition2::fixture_switch::with_earlier_form(|| {
             ts::replicated_key_record("i1870-k", set, "i1870-k", "i1870-k", "n")
         })

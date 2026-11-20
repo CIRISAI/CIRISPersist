@@ -37,6 +37,10 @@ use ciris_persist::fountain::{
 use ciris_persist::store::{Backend, Error as StoreError};
 use ciris_persist::verify::PythonJsonDumpsCanonicalizer;
 
+/// v62.0.0 (F0-cp6d) — this node's identity, and the producer every local
+/// manifest names (`pqc_key_id`): fountain coding is node-local.
+const NODE_ID: &str = "fountain-mldsa";
+
 /// Deterministic producer Ed25519 + ML-DSA-65 keys (b64 pubkeys).
 fn producer_pubkeys() -> (SigningKey, String, MlDsa65SoftwareSigner) {
     let ed_sk = SigningKey::from_bytes(&[0x11; 32]);
@@ -207,30 +211,34 @@ async fn run_fountain_assertions<B: Backend>(backend: &B, suffix: &str) {
     }
     assert_eq!(content.present(), total);
 
-    // (b) classical-only manifest (no ML-DSA-65) → REJECTED, zero rows.
-    let cid_classical = format!("c-classical-{suffix}");
-    let (m_classical, s_classical) =
-        build_manifest_and_symbols(&cid_classical, n_source, k_repair, symbol_size, false).await;
+    // (b) v62.0.0 (F0-cp6d) — a manifest produced by ANOTHER node →
+    //     refused by name, zero rows (fountain coding is node-local; the
+    //     fountain is not a CC object). The earlier classical-only hard-cut
+    //     leg asserted a signature form the node-local door no longer reads.
+    let cid_peer = format!("c-peer-{suffix}");
+    let (mut m_peer, s_peer) =
+        build_manifest_and_symbols(&cid_peer, n_source, k_repair, symbol_size, true).await;
+    m_peer.pqc_key_id = "a-peer-node".to_owned();
     let err = backend
-        .put_fountain_content(&m_classical, &s_classical)
+        .put_fountain_content(&m_peer, &s_peer)
         .await
-        .expect_err("(b) classical-only MUST be rejected (the #225 hard cut)");
+        .expect_err("(b) a peer's manifest MUST be refused");
     assert!(
         matches!(err, StoreError::FountainAdmit(_)),
         "(b) reject is a FountainAdmit error, got {err:?}"
     );
     assert_eq!(
         err.kind(),
-        "fountain_admit_hybrid_required",
-        "(b) the hard-cut token"
+        "fountain_manifest_not_cc_object",
+        "(b) the node-local token"
     );
     assert!(
         backend
-            .get_fountain_content(&cid_classical, corpus)
+            .get_fountain_content(&cid_peer, corpus)
             .await
             .unwrap()
             .is_none(),
-        "(b) rejected classical-only manifest wrote ZERO rows"
+        "(b) the refused peer manifest wrote ZERO rows"
     );
 
     // (c) a symbol whose bytes don't match symbol_hashes → REJECTED,
@@ -583,6 +591,9 @@ async fn sqlite_fountain_content() {
         .run_migrations()
         .await
         .expect("sqlite migrations (incl. V084)");
+    // v62.0.0 (F0-cp6d) — fountain coding is node-local: the manifests'
+    // producer (`pqc_key_id`) is this node.
+    backend.set_node_key_id(NODE_ID);
     run_fountain_assertions(&backend, "sqlite").await;
 }
 
@@ -600,6 +611,9 @@ async fn postgres_fountain_content() {
         .await
         .expect("pg migrations (incl. V084)");
     let suffix = uuid::Uuid::new_v4().simple().to_string();
+    // v62.0.0 (F0-cp6d) — fountain coding is node-local: the manifests'
+    // producer (`pqc_key_id`) is this node.
+    backend.set_node_key_id(NODE_ID);
     run_fountain_assertions(&backend, &suffix).await;
 }
 
@@ -847,6 +861,9 @@ async fn sqlite_consent_decay() {
         .run_migrations()
         .await
         .expect("sqlite migrations (incl. V084)");
+    // v62.0.0 (F0-cp6d) — fountain coding is node-local: the manifests'
+    // producer (`pqc_key_id`) is this node.
+    backend.set_node_key_id(NODE_ID);
     run_consent_decay_assertions(&backend, "sqlite").await;
 }
 
@@ -864,6 +881,9 @@ async fn postgres_consent_decay() {
         .await
         .expect("pg migrations (incl. V084)");
     let suffix = uuid::Uuid::new_v4().simple().to_string();
+    // v62.0.0 (F0-cp6d) — fountain coding is node-local: the manifests'
+    // producer (`pqc_key_id`) is this node.
+    backend.set_node_key_id(NODE_ID);
     run_consent_decay_assertions(&backend, &suffix).await;
 }
 
@@ -902,6 +922,16 @@ async fn engine_sweep_consent_decay_once_sqlite() {
     .await;
     let (m_none, s_none) =
         build_manifest_with_envelope("c-eng-none", n, k, size, serde_json::json!({})).await;
+    // v62.0.0 (F0-cp6d) — node-local: the manifests name this engine's node.
+    let node = {
+        engine
+            .federation_directory()
+            .node_key_id()
+            .expect("the engine names its node")
+    };
+    let (mut m_temp, mut m_none) = (m_temp, m_none);
+    m_temp.pqc_key_id = node.clone();
+    m_none.pqc_key_id = node;
     let t0 = chrono::Utc::now();
     engine
         .put_fountain_content(&m_temp, &s_temp)

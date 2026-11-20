@@ -1,8 +1,8 @@
 //! v62.0.0 (v62 P8) — **I3530: the external holding claim is an edition-2
 //! statement a SECOND node admits.** sqlite and postgres.
 //!
-//! - **I3530** — the door Python's `put_blob_edition2` calls
-//!   (`BlobStorage::put_blob_edition2`): node A stores a blob under a
+//! - **I3530** — the door Python's `put_blob` calls
+//!   (`BlobStorage::put_blob`): node A stores a blob under a
 //!   holder's `custody:ack` statement signed outside persist (no
 //!   `PutBlobAttestation`, nothing signed over a JCS image). A keeps the
 //!   statement and lists the holder; node B, holding the holder's key,
@@ -40,7 +40,7 @@ where
         None,
         e2::ms(crate::host::clock::now()),
     );
-    a.put_blob_edition2(
+    a.put_blob(
         &sha,
         crate::federation::BlobBody::Inline(bytes.clone()),
         Some("text/plain"),

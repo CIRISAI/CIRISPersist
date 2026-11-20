@@ -227,7 +227,7 @@ pub(crate) mod bodies {
                 d,
                 &a,
                 &a,
-                "evidence:i900s:a:c:p:v1",
+                "evidence:safety_battery:interpret:sa:c:v1",
                 -48,
                 Some((community, Some(&comm1))),
             )
@@ -238,7 +238,7 @@ pub(crate) mod bodies {
                 d,
                 &a,
                 &a,
-                "evidence:i900s:b:c:p:v1",
+                "evidence:safety_battery:interpret:sb:c:v1",
                 -12,
                 Some((community, Some(&comm2))),
             )
@@ -253,7 +253,7 @@ pub(crate) mod bodies {
                 d,
                 &b,
                 &b,
-                "evidence:i900s:c:c:p:v1",
+                "evidence:safety_battery:interpret:sc:c:v1",
                 -8,
                 Some((community, Some(&comm1))),
             )
@@ -264,7 +264,7 @@ pub(crate) mod bodies {
                 d,
                 &a,
                 &b,
-                "evidence:i900s:d:c:p:v1",
+                "evidence:safety_battery:interpret:sd:c:v1",
                 -22,
                 Some((species, None)),
             )
@@ -569,14 +569,14 @@ pub(crate) mod bodies {
             out.push((
                 "by A, prefix i900s: + scope community comm2",
                 o(AttestationQuery::by(a, lim)
-                    .dimension_prefix("evidence:i900s:")
+                    .dimension_prefix("evidence:safety_battery:interpret:s")
                     .scope(community, Some(c2))),
                 expect(
                     corpus,
                     |r| {
                         fed(r)
                             && r.by == a
-                            && dim(r, "evidence:i900s:")
+                            && dim(r, "evidence:safety_battery:interpret:s")
                             && r.scope == community
                             && r.target.as_deref() == Some(c2)
                     },

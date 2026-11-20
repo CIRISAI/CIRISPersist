@@ -1,5 +1,8 @@
 # I14 (blob_surface_gates.rs::i14_the_storage_floor_has_no_door): no production
-# caller of the storage floor outside the three cascades. A commons door may
+# caller of the storage floor outside the three cascades and the trace blob's
+# floor (src/federation/trace_blob_floor.rs, v62: a trace blob is stored as the
+# row names it; the floor is chosen from the bytes and check_scope refuses
+# plaintext under self/family before the write). A commons door may
 # reach it only by naming a commons cohort scope literally in the call. blobs.rs
 # (the trait's own wrappers) is rule i14-storage-floor-blobs. Expected 0.
 id: i14-storage-floor
@@ -30,4 +33,5 @@ ignores:
   - src/federation/at_rest_cascade.rs
   - src/federation/community_dek.rs
   - src/federation/chunk_dag_cascade.rs
+  - src/federation/trace_blob_floor.rs
   - src/federation/blobs.rs

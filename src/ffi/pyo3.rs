@@ -1652,8 +1652,8 @@ mod half_identity_620 {
     ///
     /// The sync verbs `local_sign` / `local_pqc_sign` silently seal NOTHING once
     /// the classical key is sealed. persist's own tree must not reach for them;
-    /// `local_sign_hybrid` is the one verb, and it keeps the classical/PQC
-    /// binding rule to a single implementation.
+    /// persist signs a row with its own composite producers (v62.0.0: the
+    /// bound-hybrid `local_sign_hybrid` verb is removed with the earlier form).
     #[test]
     fn no_sync_signing_verb_is_called_from_persists_own_tree() {
         let mut offenders = Vec::new();
@@ -1681,7 +1681,7 @@ mod half_identity_620 {
         assert!(
             offenders.is_empty(),
             "persist calls a SYNC signing verb, which seals nothing once the classical key is \
-             sealed (CIRISPersist#620): {offenders:?}. Use local_sign_hybrid."
+             sealed (CIRISPersist#620): {offenders:?}. Sign through persist's composite producers."
         );
     }
 
@@ -4948,11 +4948,10 @@ impl PyEngine {
                 if signer.is_hardware_backed() {
                     PyRuntimeError::new_err(format!(
                         "local_sign cannot sign with a SEALED classical key — this is permanent, \
-                         not transient, and the signature was NOT produced. Use \
-                         local_sign_hybrid, which dispatches the classical half through the \
-                         sealed signer and composes the bound preimage in one place. An \
-                         Ed25519-only wire format takes its [\"classical_sig\"] — identical \
-                         bytes, no migration. (underlying: {e})"
+                         not transient, and the signature was NOT produced. A CEG row is \
+                         signed by persist's own composite producers (v62.0.0: the \
+                         bound-hybrid verb local_sign_hybrid is removed with the earlier \
+                         form). (underlying: {e})"
                     ))
                 } else {
                     local_signer_err_to_py(e)
@@ -5399,46 +5398,6 @@ impl PyEngine {
                 .detach(|| runtime.block_on(async move { signer.sign_ml_dsa_65(&msg).await }))
                 .map_err(local_signer_err_to_py)?;
             Ok(PyBytes::new(py, &sig_bytes).unbind())
-        })
-    }
-
-    /// v17.7.0 (CIRISPersist#470) — the SINGLE hybrid-sign verb across the
-    /// Engine PyO3 boundary. Delegates to [`LocalSigner::sign_hybrid`] so the
-    /// canonical bound-signature rule — `pqc = Sign_PQC(message ‖ ed25519_sig)`
-    /// — lives in exactly ONE place. The crypto-DRY assessment found that rule
-    /// hand-recomposed across ~7 sites (one of them, the KMP signer, WRONG:
-    /// ML-DSA over the raw body → signatures persist's `HybridPolicy::Strict`
-    /// rejects). PyO3 consumers (e.g. lens-core's agent-embedded fold) call this
-    /// instead of pairing [`Self::local_sign`] + [`Self::local_pqc_sign`] and
-    /// re-deriving `message ‖ ed25519_sig` themselves.
-    ///
-    /// Returns `{"classical_sig": bytes, "pqc_sig": bytes}` — the Ed25519 half
-    /// over `message`, the ML-DSA-65 half over the bound input. Byte-identical to
-    /// the RLib `LocalSigner::sign_hybrid`; a differential test
-    /// (`local_sign_hybrid_matches_rlib_sign_hybrid`) locks the two surfaces.
-    fn local_sign_hybrid<'py>(
-        &self,
-        py: Python<'py>,
-        message: &Bound<'py, PyBytes>,
-    ) -> PyResult<Py<PyDict>> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let signer = self.local_signer.clone().ok_or_else(|| {
-                PyValueError::new_err(
-                    "no local signer configured (Engine needs local_key_id + \
-                 local_key_path; for the PQC half also local_pqc_key_id + \
-                 local_pqc_key_path)",
-                )
-            })?;
-            let runtime = self.runtime.clone();
-            let msg = message.as_bytes().to_vec();
-            let sig = py
-                .detach(|| runtime.block_on(async move { signer.sign_hybrid(&msg).await }))
-                .map_err(local_signer_err_to_py)?;
-            let out = PyDict::new(py);
-            out.set_item("classical_sig", PyBytes::new(py, &sig.classical.signature))?;
-            out.set_item("pqc_sig", PyBytes::new(py, &sig.pqc.signature))?;
-            Ok(out.unbind())
         })
     }
 
@@ -6451,6 +6410,100 @@ impl PyEngine {
         })
     }
 
+    /// v62.0.0 (v62 P8-fix10; CC 3.4.8) — **a detection drafted for its
+    /// detector's pen** (Lens, an external detector): the `detection:{detector}`
+    /// statement's parts ([`crate::derived::detection_row::draft_detection`]),
+    /// as JSON `{"protected", "payload", "sig_structure"}` (lowercase hex).
+    /// The detector signs `sig_structure` with its composite key (this
+    /// engine's, through `sign_draft`) and submits the assembled statement
+    /// through `put_edition2_statement`. `event_json` is a `DetectionEvent`
+    /// (its `signing_key_id` the detector's identity-ref; the two earlier
+    /// signature members are ignored: the statement's composite signature is
+    /// the detector's). `subject` is the scored agent's canonical subject,
+    /// named (`subject_key_ids`), when the host knows it.
+    ///
+    /// Raises `ValueError` for an event that does not decode or is no valid
+    /// detection (`edition2_payload_invalid: …`, the V008 shape refusals) and
+    /// for a detector that is not an identity-ref.
+    #[pyo3(signature = (event_json, subject = None))]
+    fn detection_draft(&self, event_json: &str, subject: Option<&str>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let event: crate::derived::DetectionEvent = serde_json::from_str(event_json)
+                .map_err(|e| PyValueError::new_err(format!("DetectionEvent JSON decode: {e}")))?;
+            let draft = crate::derived::detection_row::draft_detection(&event, subject)
+                .map_err(federation_err_to_py)?;
+            Ok(draft.to_json().to_string())
+        })
+    }
+
+    /// v62.0.0 (v62 P8-fix10) — **sign a drafted statement** with this
+    /// engine's composite key (ML-DSA-65 + Ed25519): `draft_json` is a draft
+    /// as `detection_draft` (or any edition-2 draft surface) returns it,
+    /// `{"protected", "payload", ...}` hex. Persist recomputes the
+    /// `Sig_structure` from `protected` and `payload` (a `sig_structure`
+    /// member that disagrees is refused, never signed) and returns the
+    /// assembled `COSE_Sign1` statement's bytes, for `put_edition2_statement`.
+    /// The draft must name this engine's key; a draft for another key yields
+    /// a statement the door refuses (`kid_not_of_iss`).
+    ///
+    /// Raises `ValueError` for a malformed draft or a mismatched
+    /// `sig_structure`, and `ValueError(composite_signing_unavailable: …)`
+    /// when the engine has no composite signer.
+    fn sign_draft<'py>(&self, py: Python<'py>, draft_json: &str) -> PyResult<Py<PyBytes>> {
+        self.ensure_usable()?;
+        let v: serde_json::Value = serde_json::from_str(draft_json)
+            .map_err(|e| PyValueError::new_err(format!("sign_draft: draft JSON decode: {e}")))?;
+        let member = |name: &str| -> PyResult<Vec<u8>> {
+            let h = v
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!("sign_draft: the draft has no `{name}` (hex)"))
+                })?;
+            hex::decode(h)
+                .map_err(|e| PyValueError::new_err(format!("sign_draft: `{name}` is not hex: {e}")))
+        };
+        let protected = member("protected")?;
+        let payload = member("payload")?;
+        let sig_structure = ciris_verify_core::edition2::sig_structure(&protected, &payload);
+        if v.get("sig_structure").is_some() && member("sig_structure")? != sig_structure {
+            return Err(PyValueError::new_err(
+                "sign_draft: `sig_structure` is not the Sig_structure of `protected` and `payload`",
+            ));
+        }
+        let draft = crate::federation::edition2::emit::Draft {
+            protected,
+            payload,
+            sig_structure,
+        };
+        catch_panic(|| {
+            let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let runtime = self.runtime.clone();
+            let statement = py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine.sign_draft(&draft).await.map_err(|e| {
+                        federation_err_to_py(
+                            crate::federation::edition2::emit::composite_signing_unavailable(
+                                "sign_draft",
+                                &e.to_string(),
+                            ),
+                        )
+                    })
+                })
+            })?;
+            Ok(PyBytes::new(py, &statement).unbind())
+        })
+    }
+
     /// v62.0.0 (wave P7; CC 3.1.5) — scrub a trace with persist's own scrubber and seal the scrubbed bytes as its `trace:complete:v1` row.
     /// FFI mirror of [`crate::Engine::seal_trace`].
     ///
@@ -6731,6 +6784,54 @@ impl PyEngine {
                     })
                 })
                 .to_string())
+        })
+    }
+    /// v62.0.0 (F0-cp5; RULINGS "composite signatures only") — verify ONE
+    /// composite (ML-DSA-65-Ed25519) signature over `message` under the LIVE
+    /// edition-2 key of `identity_ref`, now. Returns the signer's
+    /// identity-ref. A refusal raises `ValueError` whose text leads with its
+    /// token (`verify_component_signature` for a lone half,
+    /// `verify_not_identity_ref`, `verify_unknown_key`,
+    /// `verify_signer_revoked`, `verify_signer_not_covered`,
+    /// `verify_signer_waiting`, `verify_composite_invalid`); a directory read
+    /// failure raises as the other federation reads. Replaces the removed
+    /// `verify_hybrid_via_directory`.
+    fn verify_composite_via_directory(
+        &self,
+        py: Python<'_>,
+        message: &[u8],
+        composite_sig: &[u8],
+        identity_ref: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use crate::federation::edition2::composite_verify::{
+                now_ms, verify_composite_via_directory, CompositeVerifyError,
+            };
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let (message, sig, who) = (
+                message.to_vec(),
+                composite_sig.to_vec(),
+                identity_ref.to_owned(),
+            );
+            py.detach(move || {
+                runtime.block_on(async move {
+                    match verify_composite_via_directory(
+                        dir.as_ref(),
+                        &message,
+                        &who,
+                        &sig,
+                        now_ms(),
+                    )
+                    .await
+                    {
+                        Ok(signer) => Ok(signer.identity_ref),
+                        Err(CompositeVerifyError::Directory(e)) => Err(federation_err_to_py(e)),
+                        Err(e) => Err(PyValueError::new_err(e.to_string())),
+                    }
+                })
+            })
         })
     }
 
@@ -9959,92 +10060,22 @@ impl PyEngine {
     // through `blob_err_to_py` — a sibling to `federation_err_to_py`
     // that maps the blob-error kind() vocabulary to typed PyErr.
 
-    /// Federation blob storage: write a blob with hash-on-write +
-    /// holder-attestation emission.
-    ///
-    /// `payload_json` shape:
-    ///
-    /// ```json
-    /// {
-    ///   "sha256": "<64-hex>",
-    ///   "body": {"inline": "<base64>"} | {"external": {"uri": "...",
-    ///     "size_bytes": N, "media_type": "...|null"}},
-    ///   "media_type": "...|null",
-    ///   "attestation": {
-    ///     "attesting_key_id": "...",
-    ///     "attestation_id": "<uuid-v4>",
-    ///     "original_content_hash_hex": "<hex>",
-    ///     "scrub_signature_classical": "<base64>",
-    ///     "scrub_signature_pqc": "<base64>|null",
-    ///     "scrub_key_id": "...",
-    ///     "scrub_timestamp": "RFC3339"
-    ///   }
-    /// }
-    /// ```
-    fn put_blob_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let payload = parse_put_blob_payload(payload_json)?;
-            // #846 (I46) — the WILL decision, through the one door. Same
-            // rule as `put_blob_signing`: a proxy write is refused at the
-            // stop tier; local + family writes proceed.
-            let attester = payload.attestation.attesting_key_id.clone();
-            py.detach(move || {
-                self.runtime
-                    .block_on(self.would_hold_commons_async(&attester))
-            })?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::BlobStorage;
-                        backend
-                            .put_blob(
-                                &payload.sha256,
-                                payload.body,
-                                payload.media_type.as_deref(),
-                                payload.attestation,
-                            )
-                            .await
-                            .map_err(blob_err_to_py)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::BlobStorage;
-                        backend
-                            .put_blob(
-                                &payload.sha256,
-                                payload.body,
-                                payload.media_type.as_deref(),
-                                payload.attestation,
-                            )
-                            .await
-                            .map_err(blob_err_to_py)
-                    })
-                }
-            })
-        })
-    }
-
-    /// v62.0.0 (v62 P8) — **a blob with an EXTERNAL edition-2 holding
-    /// claim**: the commons form of `put_blob_json` whose claim is the
-    /// holder's `custody:{kind}` statement (`here`, at `federation`, naming
-    /// this blob and its size), signed outside persist, instead of a
-    /// `PutBlobAttestation` signed over its JCS image. The bytes are checked
-    /// and stored, then the claim goes through the statement door
-    /// (`BlobStorage::put_blob_edition2`, `blob_admit::put_blob_edition2_planned`);
-    /// a refused claim leaves no bytes this call stored.
+    /// v62.0.0 (v62 P8; T2-fix11, CC 6.1.3) — **write a blob with its
+    /// holder's edition-2 holding claim**: the commons form (`federation`,
+    /// plaintext) whose claim is the holder's `custody:{kind}` statement
+    /// (`here`, at `federation`, naming this blob and its size; ONE composite
+    /// signature), signed outside persist. The bytes are checked and stored,
+    /// then the claim goes through the statement door (`BlobStorage::put_blob`,
+    /// `blob_admit::put_blob_planned`); a refused claim leaves no bytes this
+    /// call stored. CLEAN BREAK: this replaces both `put_blob_json` (whose
+    /// payload carried the earlier bound-hybrid `PutBlobAttestation`, deleted)
+    /// and the interim name `put_blob_edition2`.
     ///
     /// Exactly one of `body_inline_b64` / `external_ref_json` (as
     /// `put_blob_signing`). `claim_hex` is the statement's bytes, lowercase
     /// hex. The #149 proxy decision (`would_hold`) runs on the claim's holder.
     #[pyo3(signature = (sha256_hex, body_inline_b64, external_ref_json, media_type, claim_hex))]
-    fn put_blob_edition2(
+    fn put_blob(
         &self,
         py: Python<'_>,
         sha256_hex: &str,
@@ -10060,41 +10091,36 @@ impl PyEngine {
             let body = match (body_inline_b64, external_ref_json) {
                 (Some(_), Some(_)) => {
                     return Err(PyValueError::new_err(
-                        "put_blob_edition2: pass either body_inline_b64 or external_ref_json, \
+                        "put_blob: pass either body_inline_b64 or external_ref_json, \
                          not both",
                     ));
                 }
                 (None, None) => {
                     return Err(PyValueError::new_err(
-                        "put_blob_edition2: one of body_inline_b64 / external_ref_json required",
+                        "put_blob: one of body_inline_b64 / external_ref_json required",
                     ));
                 }
                 (Some(b64), None) => {
                     use base64::engine::general_purpose::STANDARD as B64;
                     use base64::Engine as _;
                     let bytes = B64.decode(b64).map_err(|e| {
-                        PyValueError::new_err(format!(
-                            "put_blob_edition2 inline base64 decode: {e}"
-                        ))
+                        PyValueError::new_err(format!("put_blob inline base64 decode: {e}"))
                     })?;
                     crate::federation::BlobBody::Inline(bytes)
                 }
                 (None, Some(json)) => {
                     let ext: crate::federation::ExternalRef =
                         serde_json::from_str(json).map_err(|e| {
-                            PyValueError::new_err(format!(
-                                "put_blob_edition2 external_ref_json decode: {e}"
-                            ))
+                            PyValueError::new_err(format!("put_blob external_ref_json decode: {e}"))
                         })?;
                     crate::federation::BlobBody::External(ext)
                 }
             };
-            let claim = hex::decode(claim_hex).map_err(|e| {
-                PyValueError::new_err(format!("put_blob_edition2 claim_hex decode: {e}"))
-            })?;
+            let claim = hex::decode(claim_hex)
+                .map_err(|e| PyValueError::new_err(format!("put_blob claim_hex decode: {e}")))?;
             // The holder the claim names (pure read; the door re-reads it).
             let holder = crate::federation::edition2::typed::holding_claim_of(&claim)
-                .map_err(|e| PyValueError::new_err(format!("put_blob_edition2: {e}")))?
+                .map_err(|e| PyValueError::new_err(format!("put_blob: {e}")))?
                 .holder;
             // #846 (I46) — the WILL decision, through the one door: a proxy
             // write is refused at the stop tier; local + family proceed.
@@ -10110,7 +10136,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
                         backend
-                            .put_blob_edition2(&sha, body, media_type_owned.as_deref(), &claim)
+                            .put_blob(&sha, body, media_type_owned.as_deref(), &claim)
                             .await
                             .map_err(blob_err_to_py)
                     })
@@ -10121,7 +10147,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
                         backend
-                            .put_blob_edition2(&sha, body, media_type_owned.as_deref(), &claim)
+                            .put_blob(&sha, body, media_type_owned.as_deref(), &claim)
                             .await
                             .map_err(blob_err_to_py)
                     })
@@ -11061,10 +11087,6 @@ impl PyEngine {
         leaves_b64_json: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
-        // before it is decoded once the switch is on (inert until slice F).
-        crate::federation::edition2::door::refuse_earlier_form("wholeness_witness")
-            .map_err(federation_err_to_py)?;
         if !legacy_positional.is_empty() {
             return Err(pyo3::exceptions::PyTypeError::new_err(
                 PUT_WHOLENESS_WITNESS_LEGACY_SHAPE,
@@ -11661,51 +11683,6 @@ impl PyEngine {
         })
     }
 
-    // ── #302 (FSD-004) accord live-quorum write-through (CIRISServer#122) ──
-    //
-    // CIRISServer's Phase-3 runtime writes the verify-core wire objects +
-    // anti-replay state through these. JSON in/out; persist verifies +
-    // dedups + holds state (see `crate::federation::accord_quorum`).
-
-    /// #302 — admit an `accord_proposal`. `payload_json` =
-    /// `{ "proposal": <AccordProposal>, "authority_signature": <obj|null> }`.
-    /// v54.1.0 (CIRISPersist#1047) — the nonce is the proposer's; a different
-    /// proposal reusing a nonce already used in its family is refused
-    /// (`federation_conflict`, ValueError).
-    fn put_accord_proposal_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
-        self.ensure_usable()?;
-        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
-        // before it is decoded once the switch is on (inert until slice F).
-        crate::federation::edition2::door::refuse_earlier_form("accord_quorum")
-            .map_err(federation_err_to_py)?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let v: serde_json::Value = serde_json::from_str(payload_json)
-                .map_err(|e| PyValueError::new_err(format!("accord proposal decode: {e}")))?;
-            let proposal: ciris_verify_core::accord_live_quorum::AccordProposal =
-                serde_json::from_value(
-                    v.get("proposal")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                )
-                .map_err(|e| PyValueError::new_err(format!("proposal decode: {e}")))?;
-            let authority_signature = v
-                .get("authority_signature")
-                .cloned()
-                .filter(|x| !x.is_null());
-            py.detach(move || {
-                accord_dispatch!(
-                    self,
-                    runtime,
-                    b,
-                    b.put_accord_proposal(proposal, authority_signature)
-                        .await
-                        .map_err(federation_err_to_py)
-                )
-            })
-        })
-    }
-
     /// #302 — the stored proposal as JSON, or `None`.
     fn get_accord_proposal_json(
         &self,
@@ -11757,46 +11734,6 @@ impl PyEngine {
         })
     }
 
-    /// #302 — admit an `accord_participation`. `payload_json` =
-    /// `{ "participation": <AccordParticipation>, "standing_roster":
-    /// [<ThresholdMember>...] }`. Verify-before-mutation + M6 dedup.
-    fn put_accord_participation_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
-        self.ensure_usable()?;
-        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
-        // before it is decoded once the switch is on (inert until slice F).
-        crate::federation::edition2::door::refuse_earlier_form("accord_quorum")
-            .map_err(federation_err_to_py)?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let v: serde_json::Value = serde_json::from_str(payload_json)
-                .map_err(|e| PyValueError::new_err(format!("accord participation decode: {e}")))?;
-            let participation: ciris_verify_core::accord_live_quorum::AccordParticipation =
-                serde_json::from_value(
-                    v.get("participation")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                )
-                .map_err(|e| PyValueError::new_err(format!("participation decode: {e}")))?;
-            let standing_roster: Vec<ciris_verify_core::threshold::ThresholdMember> =
-                serde_json::from_value(
-                    v.get("standing_roster")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                )
-                .map_err(|e| PyValueError::new_err(format!("standing_roster decode: {e}")))?;
-            py.detach(move || {
-                accord_dispatch!(
-                    self,
-                    runtime,
-                    b,
-                    b.put_accord_participation(participation, &standing_roster)
-                        .await
-                        .map_err(federation_err_to_py)
-                )
-            })
-        })
-    }
-
     /// #302 — all participations for a proposal as a JSON array.
     fn list_accord_participations_json(
         &self,
@@ -11817,47 +11754,6 @@ impl PyEngine {
                         .map_err(federation_err_to_py)
                 )?;
                 accord_vec_json(rows)
-            })
-        })
-    }
-
-    /// #302 — record the server's frozen-L decision. `payload_json` =
-    /// `{ "decision": <AccordDecision> }`. Immutable (M2). v53.0.0 (CC 4.2.6
-    /// rc7): a non-null `steward_signatures` is refused — the steward backstop
-    /// it carried is removed, and dropping it silently would hide that.
-    fn put_accord_decision_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
-        self.ensure_usable()?;
-        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
-        // before it is decoded once the switch is on (inert until slice F).
-        crate::federation::edition2::door::refuse_earlier_form("accord_quorum")
-            .map_err(federation_err_to_py)?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let v: serde_json::Value = serde_json::from_str(payload_json)
-                .map_err(|e| PyValueError::new_err(format!("accord decision decode: {e}")))?;
-            let decision: ciris_verify_core::accord_live_quorum::AccordDecision =
-                serde_json::from_value(
-                    v.get("decision")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                )
-                .map_err(|e| PyValueError::new_err(format!("decision decode: {e}")))?;
-            if v.get("steward_signatures").is_some_and(|x| !x.is_null()) {
-                return Err(PyValueError::new_err(
-                    "steward_signatures: the regional-steward backstop is removed (CC 4.2.6 \
-                     rc7, CIRISConstitution#139); a roster change is counted against the \
-                     standing roster and an accord decision carries no steward signatures",
-                ));
-            }
-            py.detach(move || {
-                accord_dispatch!(
-                    self,
-                    runtime,
-                    b,
-                    b.put_accord_decision(decision)
-                        .await
-                        .map_err(federation_err_to_py)
-                )
             })
         })
     }
@@ -12149,98 +12045,46 @@ impl PyEngine {
     }
 
     /// v50.0.0 (CIRISPersist#926) — the CC 5.3.4 body (`GET
-    /// /v1/trust-root/bundle`): the compiled-in GenesisBundle with this node's
-    /// rooted `ciris-canonical` row beside it, as JSON
-    /// `TrustRootBundleResponse`. Wraps
-    /// [`crate::federation::canonical_community::trust_root_bundle_response`].
+    /// /v1/trust-root/bundle`), as JSON `{"statements": [hex, …]}`: the held
+    /// named rows and voices of each `ceg-genesis-bundle/2` in force, in
+    /// lineage order — the same body the HTTP route serves. A node that holds
+    /// no genesis answers `{"statements": []}`.
+    ///
+    /// v62.0.0 (C5-fix1; ceremony gap 1): the bundle/1 body (the compiled-in
+    /// v4 GenesisBundle) is deleted with the baked genesis; this method no
+    /// longer depends on the earlier-form switch. The bundle/1 consumer,
+    /// `pin_trust_from_bundle_response_json`, is deleted (a genesis is
+    /// imported through `put_genesis_bundle`).
     fn trust_root_bundle_response_json(&self, py: Python<'_>) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
 
             py.detach(move || {
-                let out = match &self.backend {
+                let held: Vec<Vec<u8>> = match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
-                            crate::federation::canonical_community::trust_root_bundle_response(
-                                &*backend,
-                                crate::federation::genesis::canonical_genesis_bundle(),
-                            )
-                            .await
-                            .map_err(federation_err_to_py)
+                            crate::federation::edition2::genesis::genesis_statements(&*backend)
+                                .await
+                                .map_err(federation_err_to_py)
                         })?
                     }
                     #[cfg(feature = "sqlite")]
                     BackendDispatch::Sqlite(sq) => {
                         let backend = sq.clone();
                         runtime.block_on(async move {
-                            crate::federation::canonical_community::trust_root_bundle_response(
-                                &*backend,
-                                crate::federation::genesis::canonical_genesis_bundle(),
-                            )
-                            .await
-                            .map_err(federation_err_to_py)
+                            crate::federation::edition2::genesis::genesis_statements(&*backend)
+                                .await
+                                .map_err(federation_err_to_py)
                         })?
                     }
                 };
-                serde_json::to_string(&out).map_err(|e| {
-                    PyValueError::new_err(format!("trust-root response serialize: {e}"))
-                })
-            })
-        })
-    }
-
-    /// v50.0.0 (CIRISPersist#926) — the consumer half of CC 4.4 / 5.3.4: pin
-    /// `ciris-canonical` from ONE `TrustRootBundleResponse` JSON (the bundle's
-    /// quorum verified against this node's own roster, the key records and the
-    /// community admitted through the ordinary doors). Returns JSON
-    /// `PinnedTrust`. Wraps
-    /// [`crate::federation::canonical_community::pin_trust_from_bundle_response`].
-    fn pin_trust_from_bundle_response_json(
-        &self,
-        py: Python<'_>,
-        response_json: &str,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
-        // before it is decoded once the switch is on (inert until slice F).
-        crate::federation::edition2::door::refuse_earlier_form("genesis_bundle")
-            .map_err(federation_err_to_py)?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let response: crate::federation::canonical_community::TrustRootBundleResponse =
-                serde_json::from_str(response_json).map_err(|e| {
-                    PyValueError::new_err(format!("trust-root response decode: {e}"))
-                })?;
-            py.detach(move || {
-                let out = match &self.backend {
-                    #[cfg(feature = "postgres")]
-                    BackendDispatch::Postgres(pg) => {
-                        let backend = pg.clone();
-                        runtime.block_on(async move {
-                            crate::federation::canonical_community::pin_trust_from_bundle_response(
-                                &*backend, &response,
-                            )
-                            .await
-                            .map_err(federation_err_to_py)
-                        })?
-                    }
-                    #[cfg(feature = "sqlite")]
-                    BackendDispatch::Sqlite(sq) => {
-                        let backend = sq.clone();
-                        runtime.block_on(async move {
-                            crate::federation::canonical_community::pin_trust_from_bundle_response(
-                                &*backend, &response,
-                            )
-                            .await
-                            .map_err(federation_err_to_py)
-                        })?
-                    }
-                };
-                serde_json::to_string(&out)
-                    .map_err(|e| PyValueError::new_err(format!("pinned trust serialize: {e}")))
+                let statements: Vec<String> = held.iter().map(hex::encode).collect();
+                serde_json::to_string(&serde_json::json!({ "statements": statements })).map_err(
+                    |e| PyValueError::new_err(format!("trust-root response serialize: {e}")),
+                )
             })
         })
     }
@@ -16699,16 +16543,6 @@ impl PyEngine {
         })
     }
 
-    /// v60.0.0 — Move every pre-V204 typed goal off the `goals` table:
-    /// this node's own are re-signed as rows, any other declarer's removed.
-    /// Returns JSON `{"rehomed": n, "dropped": n}`.
-    fn cirisnode_rehome_goals(&self, py: Python<'_>) -> PyResult<String> {
-        self.ensure_usable()?;
-        self.purge_engine_call(py, move |engine| async move {
-            engine.rehome_legacy_goals().await
-        })
-    }
-
     /// v60.0.0 — the goals projection's from-rows rebuild check. Returns
     /// JSON `{"live": n, "rebuilt": n}` when byte-equal; raises naming the
     /// first row that differs (CLM-silo-projection-rebuildable).
@@ -17036,13 +16870,11 @@ impl PyEngine {
     /// `FountainSymbolV1` (`symbol_bytes` is a JSON array of byte values,
     /// the serde default for `Vec<u8>`).
     ///
-    /// Verify-before-mutation: the #225 hybrid verify on the manifest +
-    /// per-symbol SHA-256 auth run first; on any failure NOTHING is
-    /// written and a `ValueError` carrying the stable error token is
-    /// raised (`fountain_admit_hybrid_required` for the classical-only
-    /// hard cut, etc.). The producer Ed25519 + ML-DSA-65 pubkeys are
-    /// asserted on the manifest envelope (`pubkey_ed25519` /
-    /// `pubkey_ml_dsa_65`), bound into the hybrid verify.
+    /// v62.0.0 (F0-cp6d) — NODE-LOCAL: the manifest must be this node's own
+    /// fountain coding (`pqc_key_id` = this node's identity); a peer's is
+    /// refused `ValueError` `fountain_manifest_not_cc_object` (the fountain is
+    /// not a CC object). Then the structure and per-symbol SHA-256 auth; on
+    /// any failure NOTHING is written.
     fn put_fountain_content(
         &self,
         py: Python<'_>,
@@ -17567,154 +17399,21 @@ impl PyEngine {
         })
     }
 
-    /// v0.3.6 (CIRISPersist#14) — Hybrid Ed25519 + ML-DSA-65 verify
-    /// for arbitrary canonical bytes. CIRISEdge OQ-11 day-1 posture
-    /// unblocker.
-    ///
-    /// **`policy` accepts only `"strict"`** (v61.1.0, CIRISPersist#1233,
-    /// CC 5.3.2.4.3.1: a verifier's hybrid-required check is always-on, never
-    /// an operator toggle). Every other value, including the former
-    /// `"ed25519_fallback"` and `"soft_freshness"`, raises `ValueError`
-    /// `verify_policy_violation` before any decode or crypto runs. The
-    /// argument stays in the signature until v62 removes it;
-    /// `soft_freshness_window_seconds` and `row_age_seconds` are ignored.
-    ///
-    /// `ml_dsa_65_sig_b64` and `ml_dsa_65_pubkey_b64` are paired and both
-    /// required: both `None` (a hybrid-pending row) is refused as
-    /// `verify_hybrid_pending_rejected`, one without the other as
-    /// `verify_hybrid_pqc_fields_mismatch`.
-    ///
-    /// Returns a dict:
-    ///
-    /// ```text
-    /// {
-    ///   "outcome": "hybrid_verified",
-    ///   "row_age_seconds": None,
-    /// }
-    /// ```
-    ///
-    /// On refusal raises `ValueError` with the persist error-token
-    /// (`verify_policy_violation`, `verify_hybrid_pending_rejected`,
-    /// `verify_hybrid_pqc_fields_mismatch`, `verify_hybrid_base64`,
-    /// `verify_hybrid_invalid_length`, `verify_hybrid_crypto`).
-    ///
-    /// Same error-token discipline as the rest of persist's PyO3
-    /// surface — structured detail in tracing logs, stable token in
-    /// the Python exception message for HTTP layer mapping.
-    #[pyo3(signature = (
-        canonical_bytes,
-        ed25519_sig_b64,
-        ml_dsa_65_sig_b64,
-        ed25519_pubkey_b64,
-        ml_dsa_65_pubkey_b64,
-        policy,
-        soft_freshness_window_seconds=None,
-        row_age_seconds=None,
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    fn verify_hybrid<'py>(
-        &self,
-        py: Python<'py>,
-        canonical_bytes: &[u8],
-        ed25519_sig_b64: &str,
-        ml_dsa_65_sig_b64: Option<&str>,
-        ed25519_pubkey_b64: &str,
-        ml_dsa_65_pubkey_b64: Option<&str>,
-        policy: &str,
-        soft_freshness_window_seconds: Option<f64>,
-        row_age_seconds: Option<f64>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            use crate::verify::VerifyOutcome;
-            let parsed_policy = parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
-
-            let row_age = row_age_seconds.and_then(|s| {
-                if s.is_finite() && s >= 0.0 {
-                    Some(std::time::Duration::from_secs_f64(s))
-                } else {
-                    None
-                }
-            });
-
-            let outcome = crate::verify::verify_hybrid(
-                canonical_bytes,
-                ed25519_sig_b64,
-                ml_dsa_65_sig_b64,
-                ed25519_pubkey_b64,
-                ml_dsa_65_pubkey_b64,
-                parsed_policy,
-                row_age,
-            )
-            .map_err(|e| {
-                // Stable token → ValueError per persist's FFI discipline.
-                // Verbose Display goes to tracing logs only.
-                tracing::warn!(error = %e, kind = e.kind(), "verify_hybrid rejected");
-                PyValueError::new_err(e.kind())
-            })?;
-
-            let dict = PyDict::new(py);
-            match outcome {
-                VerifyOutcome::HybridVerified => {
-                    dict.set_item("outcome", "hybrid_verified")?;
-                    dict.set_item("row_age_seconds", py.None())?;
-                }
-                VerifyOutcome::Ed25519VerifiedHybridPending { row_age } => {
-                    dict.set_item("outcome", "ed25519_hybrid_pending")?;
-                    let secs = row_age.map(|d| d.as_secs_f64());
-                    match secs {
-                        Some(s) => dict.set_item("row_age_seconds", s)?,
-                        None => dict.set_item("row_age_seconds", py.None())?,
-                    }
-                }
-                VerifyOutcome::Ed25519VerifiedFallback => {
-                    dict.set_item("outcome", "ed25519_fallback")?;
-                    dict.set_item("row_age_seconds", py.None())?;
-                }
-            }
-            Ok(dict)
-        })
-    }
-
     // ─── Verify surface for federation peer cutover (v0.4.0) ────
 
     /// v0.4.0 — Verify a CompleteTrace envelope end-to-end, WITHOUT storing
     /// it (dry-run validation, pre-storage check, audit replay).
     ///
-    /// **v61.1.0 (CIRISPersist#1239, CC 5.3.2.4.3.1) — this runs ingest's
-    /// verify step, the same function.** `receive_and_persist` verifies each
-    /// trace through
-    /// [`crate::ingest::verify_trace_for_admission`] before anything is
-    /// written, and this method calls exactly that function and nothing else:
-    /// the Ed25519 key resolved by `signature_key_id`, the canonicalizer chosen
-    /// by the trace's signed `trace_schema_version` (major ≥ 3 ⇒ RFC 8785 JCS,
-    /// else Python-compat), the ML-DSA-65 key resolved from the federation
-    /// directory by `pqc_key_id`, and both halves verified under
-    /// `HybridPolicy::Strict`. Until v61.1.0 this called
-    /// `verify_trace_via_directory`, which checked the Ed25519 half only, so it
-    /// accepted a trace with no PQC half, or a bad one, that ingest refuses.
-    ///
-    /// **v62.0.0 (wave P7) — this is the dry run of the EARLIER form.** A v62
-    /// trace is a `trace:complete:v1` row (`seal_trace_statement`) over its
-    /// blob, admitted
-    /// by the edition-2 statement door; a trace given here without one raises
-    /// `ValueError(("earlier_form_object", ..))` once the earlier-form doors
-    /// are shut, and `("earlier_form_signer_is_edition2", ..)` when a
-    /// component is named by an edition-2 key.
-    ///
-    /// Returns `{"verified": True, "schema_version": "2.7.0"|"2.7.9"|"3.0.0"}`
-    /// on success. On failure raises the exception `receive_and_persist`
-    /// raises for the same cause, with the same stable token in `args[0]`:
-    /// `ValueError` with `verify_unknown_key` (signer or PQC key not in the
-    /// directory), `verify_hybrid_required` (no PQC half: the #225 hard cut),
-    /// `verify_hybrid_failed` (either half does not verify, or a malformed PQC
-    /// field, or a failed read of the PQC key); `RuntimeError` with a
-    /// `store_*` token if the signer-key read itself fails. A `CompleteTrace`
-    /// JSON that does not decode is a
-    /// `ValueError` (`CompleteTrace JSON decode: ...`).
-    ///
-    /// Stores nothing: the function it runs only reads the key directory.
-    /// The GIL is released for the whole verify.
+    /// **v62.0.0 (F0-cp5b) — the dry run of the EARLIER form, which no v62
+    /// door admits.** A v62 trace is a `trace:complete:v1` row
+    /// (`seal_trace_statement`) over its blob, admitted by the edition-2
+    /// statement door. A `CompleteTrace` given here is refused
+    /// `ValueError(("earlier_form_object", ..))`: the same answer
+    /// `receive_and_persist` gives a statement-less trace under full verify
+    /// (`crate::ingest::refuse_earlier_form_trace`, one function for both).
+    /// The bound-hybrid verify it used to run is deleted. A JSON that does not
+    /// decode is a `ValueError` (`CompleteTrace JSON decode: ...`). Stores
+    /// nothing, reads nothing.
     fn verify_trace<'py>(
         &self,
         py: Python<'py>,
@@ -17723,184 +17422,16 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             use crate::schema::CompleteTrace;
-            use sha2::Digest as _;
             let trace: CompleteTrace = serde_json::from_str(complete_trace_json)
                 .map_err(|e| PyValueError::new_err(format!("CompleteTrace JSON decode: {e}")))?;
-            let runtime = self.runtime.clone();
-            // Read off the one field the response needs BEFORE the trace moves
-            // into the detached closure.
             let schema_version = trace.trace_schema_version.as_str().to_owned();
-            // Ingest's refusal breadcrumbs join on the sha256 of the body they
-            // were handed; here that body is the trace JSON.
-            let body_sha256 = hex::encode(sha2::Sha256::digest(complete_trace_json.as_bytes()));
-            // v25.x (CIRISPersist#580) — the whole verify runs with the GIL
-            // RELEASED. The key-directory reads block on the runtime, and a
-            // blocking wait under the GIL wedges the entire interpreter, not
-            // one thread, with no Rust-side error, and no watchdog can fire
-            // through it. The canonicalizers are pure-Rust byte writers (see
-            // [`crate::ingest::trace_canonicalizer`]), so nothing inside needs
-            // the GIL.
-            let verified = py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        crate::ingest::verify_trace_for_admission(
-                            &*backend,
-                            &trace,
-                            &body_sha256,
-                            &PythonJsonDumpsCanonicalizer,
-                        )
-                        .await
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        crate::ingest::verify_trace_for_admission(
-                            &*backend,
-                            &trace,
-                            &body_sha256,
-                            &PythonJsonDumpsCanonicalizer,
-                        )
-                        .await
-                    })
-                }
-            });
-            // Error mapping stays OUTSIDE the detach: building a `PyErr` is
-            // CPython work. It is `receive_and_persist`'s mapping.
-            verified.map_err(|e| ingest_err_to_py(e, "verify_trace"))?;
+            // v62.0.0 (F0-cp5b) — ingest's verdict for a statement-less trace:
+            // the earlier-form refusal, before any read.
+            crate::ingest::refuse_earlier_form_trace()
+                .map_err(|e| ingest_err_to_py(e, "verify_trace"))?;
             let dict = PyDict::new(py);
             dict.set_item("verified", true)?;
             dict.set_item("schema_version", schema_version)?;
-            Ok(dict)
-        })
-    }
-
-    /// v0.4.0 / v0.4.1 — Hybrid verify with internal directory
-    /// lookup. v0.4.1 backs onto the Rust free function
-    /// `crate::verify::verify_hybrid_via_directory` so the PyO3
-    /// surface and Rust API surface share one implementation
-    /// (CIRISEdge ask 1; CIRISPersist#7 single-source-of-truth
-    /// pattern).
-    ///
-    /// Saves the caller from doing a separate `lookup_public_key`
-    /// call before each verify. Same `policy` rule as `verify_hybrid`:
-    /// **only `"strict"` is accepted** (v61.1.0, CIRISPersist#1233,
-    /// CC 5.3.2.4.3.1); any other value raises `ValueError`
-    /// `verify_policy_violation` before the directory lookup or any
-    /// crypto runs. The argument stays until v62 removes it. Same return
-    /// shape (`{"outcome": "hybrid_verified", "row_age_seconds": None}`).
-    ///
-    /// Raises `ValueError` with `verify_policy_violation` for a non-strict
-    /// policy, `verify_unknown_key` if `signature_key_id` doesn't resolve
-    /// in federation_keys, or the standard `verify_hybrid_*` tokens for
-    /// crypto failures.
-    #[pyo3(signature = (
-        canonical_bytes,
-        signature_key_id,
-        ed25519_sig_b64,
-        ml_dsa_65_sig_b64,
-        policy,
-        soft_freshness_window_seconds=None,
-        row_age_seconds=None,
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    fn verify_hybrid_via_directory<'py>(
-        &self,
-        py: Python<'py>,
-        canonical_bytes: &[u8],
-        signature_key_id: &str,
-        ed25519_sig_b64: &str,
-        ml_dsa_65_sig_b64: Option<&str>,
-        policy: &str,
-        soft_freshness_window_seconds: Option<f64>,
-        row_age_seconds: Option<f64>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            use crate::verify::{HybridPolicy, VerifyOutcome};
-            let parsed_policy = parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
-            let row_age = row_age_seconds.and_then(|s| {
-                if s.is_finite() && s >= 0.0 {
-                    Some(std::time::Duration::from_secs_f64(s))
-                } else {
-                    None
-                }
-            });
-
-            let canonical_owned = canonical_bytes.to_vec();
-            let key_id_owned = signature_key_id.to_owned();
-            let ed25519_owned = ed25519_sig_b64.to_owned();
-            let pqc_owned = ml_dsa_65_sig_b64.map(str::to_owned);
-            let runtime = self.runtime.clone();
-
-            let outcome = py
-            .detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        crate::verify::verify_hybrid_via_directory(
-                            &*backend,
-                            &canonical_owned,
-                            &key_id_owned,
-                            &ed25519_owned,
-                            pqc_owned.as_deref(),
-                            parsed_policy,
-                            row_age,
-                        )
-                        .await
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        crate::verify::verify_hybrid_via_directory(
-                            &*backend,
-                            &canonical_owned,
-                            &key_id_owned,
-                            &ed25519_owned,
-                            pqc_owned.as_deref(),
-                            parsed_policy,
-                            row_age,
-                        )
-                        .await
-                    })
-                }
-            })
-            .map_err(|e| {
-                let s = e.to_string();
-                tracing::warn!(error = %e, kind = e.kind(), "verify_hybrid_via_directory rejected");
-                if s.contains("verify_unknown_key") {
-                    PyValueError::new_err("verify_unknown_key")
-                } else {
-                    PyValueError::new_err(e.kind())
-                }
-            })?;
-
-            let _ = HybridPolicy::Strict; // keep import live across feature combos
-            let dict = PyDict::new(py);
-            match outcome {
-                VerifyOutcome::HybridVerified => {
-                    dict.set_item("outcome", "hybrid_verified")?;
-                    dict.set_item("row_age_seconds", py.None())?;
-                }
-                VerifyOutcome::Ed25519VerifiedHybridPending { row_age } => {
-                    dict.set_item("outcome", "ed25519_hybrid_pending")?;
-                    let secs = row_age.map(|d| d.as_secs_f64());
-                    match secs {
-                        Some(s) => dict.set_item("row_age_seconds", s)?,
-                        None => dict.set_item("row_age_seconds", py.None())?,
-                    }
-                }
-                VerifyOutcome::Ed25519VerifiedFallback => {
-                    dict.set_item("outcome", "ed25519_fallback")?;
-                    dict.set_item("row_age_seconds", py.None())?;
-                }
-            }
             Ok(dict)
         })
     }
@@ -17944,139 +17475,6 @@ impl PyEngine {
             hasher.update(body_bytes);
             let digest: [u8; 32] = hasher.finalize().into();
             Ok(PyBytes::new(py, &digest).unbind())
-        })
-    }
-
-    /// v0.4.0 — Verify a `SignedKeyRecord` envelope's scrub
-    /// signature. Looks up the scrub_key_id's pubkeys, recomputes
-    /// canonical bytes from `registration_envelope`, runs
-    /// hybrid-verify with the supplied policy.
-    ///
-    /// Used by federation peers consuming key registrations from
-    /// other peers (gossip / direct) to verify-before-store. The
-    /// federation directory's `put_public_key` does its own write-
-    /// path verification; this primitive lets a peer verify-without-
-    /// storing for dry-runs or trust-graph audits.
-    ///
-    /// v61.1.0 (CIRISPersist#1233) — `policy` accepts only `"strict"`, as
-    /// for `verify_hybrid_via_directory`; any other value raises
-    /// `ValueError` `verify_policy_violation` before the envelope is
-    /// decoded. The same holds for `verify_signed_attestation` and
-    /// `verify_signed_revocation`.
-    #[pyo3(signature = (
-        signed_key_record_json,
-        policy,
-        soft_freshness_window_seconds=None,
-        row_age_seconds=None,
-    ))]
-    fn verify_signed_key_record<'py>(
-        &self,
-        py: Python<'py>,
-        signed_key_record_json: &str,
-        policy: &str,
-        soft_freshness_window_seconds: Option<f64>,
-        row_age_seconds: Option<f64>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            // v61.1.0 (CIRISPersist#1233) — the policy refusal comes first,
-            // before the envelope is even decoded.
-            parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
-            let signed: crate::federation::SignedKeyRecord =
-                serde_json::from_str(signed_key_record_json).map_err(|e| {
-                    PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}"))
-                })?;
-            let canonical = canonicalize_envelope_value(&signed.record.registration_envelope)?;
-            self.verify_hybrid_via_directory(
-                py,
-                &canonical,
-                &signed.record.scrub_key_id,
-                &signed.record.scrub_signature_classical,
-                signed.record.scrub_signature_pqc.as_deref(),
-                policy,
-                soft_freshness_window_seconds,
-                row_age_seconds,
-            )
-        })
-    }
-
-    /// v0.4.0 — Verify a `SignedAttestation` envelope. Same shape
-    /// as `verify_signed_key_record`; canonical bytes come from
-    /// `attestation_envelope`.
-    #[pyo3(signature = (
-        signed_attestation_json,
-        policy,
-        soft_freshness_window_seconds=None,
-        row_age_seconds=None,
-    ))]
-    fn verify_signed_attestation<'py>(
-        &self,
-        py: Python<'py>,
-        signed_attestation_json: &str,
-        policy: &str,
-        soft_freshness_window_seconds: Option<f64>,
-        row_age_seconds: Option<f64>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            // v61.1.0 (CIRISPersist#1233) — the policy refusal comes first,
-            // before the envelope is even decoded.
-            parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
-            let signed: crate::federation::SignedAttestation =
-                serde_json::from_str(signed_attestation_json).map_err(|e| {
-                    PyValueError::new_err(format!("SignedAttestation JSON decode: {e}"))
-                })?;
-            let canonical = canonicalize_envelope_value(&signed.attestation.attestation_envelope)?;
-            self.verify_hybrid_via_directory(
-                py,
-                &canonical,
-                &signed.attestation.scrub_key_id,
-                &signed.attestation.scrub_signature_classical,
-                signed.attestation.scrub_signature_pqc.as_deref(),
-                policy,
-                soft_freshness_window_seconds,
-                row_age_seconds,
-            )
-        })
-    }
-
-    /// v0.4.0 — Verify a `SignedRevocation` envelope. Same shape
-    /// as `verify_signed_attestation`; canonical bytes come from
-    /// `revocation_envelope`.
-    #[pyo3(signature = (
-        signed_revocation_json,
-        policy,
-        soft_freshness_window_seconds=None,
-        row_age_seconds=None,
-    ))]
-    fn verify_signed_revocation<'py>(
-        &self,
-        py: Python<'py>,
-        signed_revocation_json: &str,
-        policy: &str,
-        soft_freshness_window_seconds: Option<f64>,
-        row_age_seconds: Option<f64>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            // v61.1.0 (CIRISPersist#1233) — the policy refusal comes first,
-            // before the envelope is even decoded.
-            parse_hybrid_policy(policy, soft_freshness_window_seconds)?;
-            let signed: crate::federation::SignedRevocation =
-                serde_json::from_str(signed_revocation_json).map_err(|e| {
-                    PyValueError::new_err(format!("SignedRevocation JSON decode: {e}"))
-                })?;
-            let canonical = canonicalize_envelope_value(&signed.revocation.revocation_envelope)?;
-            self.verify_hybrid_via_directory(
-                py,
-                &canonical,
-                &signed.revocation.scrub_key_id,
-                &signed.revocation.scrub_signature_classical,
-                signed.revocation.scrub_signature_pqc.as_deref(),
-                policy,
-                soft_freshness_window_seconds,
-                row_age_seconds,
-            )
         })
     }
 
@@ -18756,117 +18154,13 @@ impl PyEngine {
     // put_attestation). Lens-core / RATCHET call json.dumps before
     // passing in, json.loads on receiving back.
     //
-    // Both put paths verify the hybrid (Ed25519 + ML-DSA-65) signature
-    // via crate::verify::verify_hybrid_via_directory under
-    // HybridPolicy::Strict BEFORE calling the backend write. Both
-    // signatures must verify; no fallback. Federation evidence is
-    // hybrid-mandatory (same principle as the build-manifest hybrid
-    // signing edge + persist already use).
+    // v62.0.0 (F0-cp5) — the detection put is gone (a statement now); the
+    // calibration put verifies its signature before the backend write.
 
-    /// Lens-derived: write a detection event.
-    ///
-    /// `event_json` is a JSON string of `DetectionEvent` (see
-    /// `crate::derived::types::DetectionEvent`). Persist verifies the
-    /// hybrid signature on `canonical_bytes` against
-    /// `signing_key_id` in `federation_keys` under
-    /// `HybridPolicy::Strict`. On verify failure raises `ValueError`
-    /// with the standard `verify_*` token. On verify success, the
-    /// row is inserted (idempotent on `detection_id`).
-    fn put_detection_event(&self, py: Python<'_>, event_json: &str) -> PyResult<()> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let event: crate::derived::DetectionEvent = serde_json::from_str(event_json)
-                .map_err(|e| PyValueError::new_err(format!("DetectionEvent JSON decode: {e}")))?;
-
-            // Hybrid verify under Strict — both signatures required.
-            // canonical_bytes carries the original signed shape; persist
-            // does NOT recanonicalize (CIRISPersist#7 single-source-of-
-            // truth: the canonicalizer ran ONCE upstream; persist verifies
-            // the bytes the signer signed).
-            let canonical_for_verify = event.canonical_bytes.clone();
-            let signing_key_id = event.signing_key_id.clone();
-            let ed25519_b64 = base64_encode(&event.ed25519_sig);
-            let ml_dsa_b64 = base64_encode(&event.ml_dsa_65_sig);
-
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        let outcome = crate::verify::verify_hybrid_via_directory(
-                            &*backend,
-                            &canonical_for_verify,
-                            &signing_key_id,
-                            &ed25519_b64,
-                            Some(&ml_dsa_b64),
-                            crate::verify::HybridPolicy::Strict,
-                            None,
-                        )
-                        .await
-                        .map_err(|e| {
-                            let s = e.to_string();
-                            tracing::warn!(
-                                error = %e, kind = e.kind(),
-                                "put_detection_event: hybrid verify rejected"
-                            );
-                            if s.contains("verify_unknown_key") {
-                                PyValueError::new_err("verify_unknown_key")
-                            } else {
-                                PyValueError::new_err(e.kind())
-                            }
-                        })?;
-                        if !matches!(outcome, crate::verify::VerifyOutcome::HybridVerified) {
-                            return Err(PyValueError::new_err("hybrid_verify_strict_required"));
-                        }
-
-                        use crate::derived::DerivedSchema;
-                        backend
-                            .put_detection_event(event)
-                            .await
-                            .map_err(derived_err_to_py)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        let outcome = crate::verify::verify_hybrid_via_directory(
-                            &*backend,
-                            &canonical_for_verify,
-                            &signing_key_id,
-                            &ed25519_b64,
-                            Some(&ml_dsa_b64),
-                            crate::verify::HybridPolicy::Strict,
-                            None,
-                        )
-                        .await
-                        .map_err(|e| {
-                            let s = e.to_string();
-                            tracing::warn!(
-                                error = %e, kind = e.kind(),
-                                "put_detection_event: hybrid verify rejected"
-                            );
-                            if s.contains("verify_unknown_key") {
-                                PyValueError::new_err("verify_unknown_key")
-                            } else {
-                                PyValueError::new_err(e.kind())
-                            }
-                        })?;
-                        if !matches!(outcome, crate::verify::VerifyOutcome::HybridVerified) {
-                            return Err(PyValueError::new_err("hybrid_verify_strict_required"));
-                        }
-
-                        use crate::derived::DerivedSchema;
-                        backend
-                            .put_detection_event(event)
-                            .await
-                            .map_err(derived_err_to_py)
-                    })
-                }
-            })
-        })
-    }
+    // v62.0.0 (F0-cp5; RULINGS "composite signatures only") — the PyO3
+    // `put_detection_event` (a detector's bound-hybrid Ed25519 + ML-DSA-65
+    // pair, verified by `verify_hybrid_via_directory`) is DELETED: a
+    // detection is an edition-2 statement through the statement door (P8).
 
     /// v3.1.1 (CIRISPersist#118) — admission for
     /// `cirislens.edge_detection_events` (V020). Unblocks edge#39
@@ -19072,43 +18366,31 @@ impl PyEngine {
                 .map_err(|e| {
                     PyValueError::new_err(format!("CalibrationBundle JSON decode: {e}"))
                 })?;
-
-            let canonical_for_verify = bundle.canonical_bytes.clone();
-            let signing_key_id = bundle.signing_key_id.clone();
-            let ed25519_b64 = base64_encode(&bundle.ed25519_sig);
-            let ml_dsa_b64 = base64_encode(&bundle.ml_dsa_65_sig);
-
+            // v62.0.0 (F0-cp6b; CC 6.1.3) — the signature in the substrate
+            // predicate's form for the calibration plane (its bytes cross
+            // nodes: ONE composite), one function for both backends.
+            let refused = |e: crate::derived::calibration_admit::CalibrationSignatureError| {
+                use crate::derived::calibration_admit::CalibrationSignatureError as C;
+                tracing::warn!(error = %e, "put_calibration_bundle: signature refused");
+                match e {
+                    C::Composite(
+                        crate::federation::edition2::composite_verify::CompositeVerifyError::Directory(
+                            inner,
+                        ),
+                    ) => federation_err_to_py(inner),
+                    other => PyValueError::new_err(other.to_string()),
+                }
+            };
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
-                        let outcome = crate::verify::verify_hybrid_via_directory(
-                            &*backend,
-                            &canonical_for_verify,
-                            &signing_key_id,
-                            &ed25519_b64,
-                            Some(&ml_dsa_b64),
-                            crate::verify::HybridPolicy::Strict,
-                            None,
+                        crate::derived::calibration_admit::verify_calibration_bundle(
+                            &*backend, &bundle,
                         )
                         .await
-                        .map_err(|e| {
-                            let s = e.to_string();
-                            tracing::warn!(
-                                error = %e, kind = e.kind(),
-                                "put_calibration_bundle: hybrid verify rejected"
-                            );
-                            if s.contains("verify_unknown_key") {
-                                PyValueError::new_err("verify_unknown_key")
-                            } else {
-                                PyValueError::new_err(e.kind())
-                            }
-                        })?;
-                        if !matches!(outcome, crate::verify::VerifyOutcome::HybridVerified) {
-                            return Err(PyValueError::new_err("hybrid_verify_strict_required"));
-                        }
-
+                        .map_err(refused)?;
                         use crate::derived::DerivedSchema;
                         backend
                             .put_calibration_bundle(bundle)
@@ -19120,32 +18402,11 @@ impl PyEngine {
                 BackendDispatch::Sqlite(sq) => {
                     let backend = sq.clone();
                     runtime.block_on(async move {
-                        let outcome = crate::verify::verify_hybrid_via_directory(
-                            &*backend,
-                            &canonical_for_verify,
-                            &signing_key_id,
-                            &ed25519_b64,
-                            Some(&ml_dsa_b64),
-                            crate::verify::HybridPolicy::Strict,
-                            None,
+                        crate::derived::calibration_admit::verify_calibration_bundle(
+                            &*backend, &bundle,
                         )
                         .await
-                        .map_err(|e| {
-                            let s = e.to_string();
-                            tracing::warn!(
-                                error = %e, kind = e.kind(),
-                                "put_calibration_bundle: hybrid verify rejected"
-                            );
-                            if s.contains("verify_unknown_key") {
-                                PyValueError::new_err("verify_unknown_key")
-                            } else {
-                                PyValueError::new_err(e.kind())
-                            }
-                        })?;
-                        if !matches!(outcome, crate::verify::VerifyOutcome::HybridVerified) {
-                            return Err(PyValueError::new_err("hybrid_verify_strict_required"));
-                        }
-
+                        .map_err(refused)?;
                         use crate::derived::DerivedSchema;
                         backend
                             .put_calibration_bundle(bundle)
@@ -22356,7 +21617,9 @@ impl PyEngine {
     /// v0.7.2 (CIRISPersist#32) → v60.0.0 — record a
     /// [`PromotionAttestation`](crate::cirisnode::PromotionAttestation): its
     /// `target_ids` are the `attestation_id`s of rows held here on the target
-    /// kind's family (all or none). Local bookkeeping.
+    /// kind's family (all or none). Local bookkeeping. v62.0.0 (F0-cp5) —
+    /// `attested_by` is an identity-ref and `signature` ONE composite,
+    /// verified under its live edition-2 key.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_promotion_attestation(&self, py: Python<'_>, att_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
@@ -22557,8 +21820,9 @@ impl PyEngine {
 
     /// v2.1 (CIRISPersist#101) — Verify-and-insert a
     /// [`DeliveryAttestation`](crate::cirisnode::DeliveryAttestation).
-    /// Idempotent on `(announcement_id, peer_key_id)`; hybrid signature
-    /// verified against `federation_keys[peer_key_id]` (Strict). v60.0.0 —
+    /// Idempotent on `(announcement_id, peer_key_id)`; v62.0.0 (F0-cp5) — ONE
+    /// composite signature verified under `peer_key_id`'s live edition-2 key
+    /// (an identity-ref). v60.0.0 —
     /// `announcement_id` names a held `contribution:federation_announcement`
     /// row.
     #[cfg(feature = "cirisnode")]
@@ -33026,45 +32290,6 @@ fn outbound_rows_to_pylist<'py>(
     Ok(list)
 }
 
-/// v0.4.1 — Parse the policy string into a `HybridPolicy`. Shared by
-/// `Engine.verify_hybrid` and `Engine.verify_hybrid_via_directory` (and so by
-/// the three `verify_signed_*` methods that route through the latter) so the
-/// rule is declared in one place.
-///
-/// v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — **`"strict"` is the only
-/// policy.** Every other value — `"ed25519_fallback"`, `"soft_freshness"`, an
-/// unknown string, the empty string — is refused with
-/// [`VERIFY_POLICY_VIOLATION`](crate::verify::hybrid::VERIFY_POLICY_VIOLATION)
-/// as a `ValueError`, and the callers run this BEFORE any decode, directory
-/// lookup or crypto. `soft_freshness_window_seconds` is no longer read: the
-/// argument stays in the signature until v62 drops `policy` and both windows
-/// together.
-///
-/// The string is first DECODED to the [`HybridPolicy`](crate::verify::HybridPolicy)
-/// it names (an unknown name is a malformed policy, refused with the same
-/// token), and the decoded policy is then asked
-/// [`require_strict_policy`](crate::verify::hybrid::require_strict_policy) —
-/// the one hybrid-required check the Rust API and the capsule ask too.
-fn parse_hybrid_policy(
-    policy: &str,
-    soft_freshness_window_seconds: Option<f64>,
-) -> PyResult<crate::verify::HybridPolicy> {
-    use crate::verify::hybrid::{require_strict_policy, VERIFY_POLICY_VIOLATION};
-    use crate::verify::HybridPolicy;
-    let _ = soft_freshness_window_seconds; // v62 removes it with `policy`
-    let named = match policy {
-        "strict" => HybridPolicy::Strict,
-        "ed25519_fallback" => HybridPolicy::Ed25519Fallback,
-        // The window is never read: the policy is refused below.
-        "soft_freshness" => HybridPolicy::SoftFreshness {
-            window: std::time::Duration::ZERO,
-        },
-        _ => return Err(PyValueError::new_err(VERIFY_POLICY_VIOLATION)),
-    };
-    require_strict_policy(&named).map_err(|e| PyValueError::new_err(e.kind()))?;
-    Ok(named)
-}
-
 /// v1.3.0 (CIRISPersist#46 + #47) — Wire shape for the `TrustFilter`
 /// JSON dict that `federation_list_trusted_keys` accepts from Python.
 /// All fields optional; `include_expired` defaults to false via
@@ -33106,37 +32331,6 @@ fn goal_row_id(json: String) -> PyResult<String> {
         .map_err(|e| PyRuntimeError::new_err(format!("goal row id decode: {e}")))
 }
 
-/// v0.4.0 — Canonicalize a federation envelope value (registration_
-/// envelope / attestation_envelope / revocation_envelope) **through the
-/// produce gate** ([`crate::verify::canonical::ceg_produce_canonicalize`]).
-/// Used by the `verify_signed_*` methods to produce the bytes the scrub
-/// signature was computed over.
-///
-/// # v37.0.0 (CIRISPersist#735) — routed through the gate
-///
-/// From v4.15.0 (the JCS produce flip) to v36.x this hand-built
-/// [`crate::verify::PythonJsonDumpsCanonicalizer`], while every Rust twin
-/// of these three verifies rebuilds the same preimage with
-/// `ceg_produce_canonicalize` — `register::verify_key_registration`
-/// (`src/federation/register.rs`), the accord-family quorum in
-/// `src/federation/admission.rs`, and `operational.rs`'s scrub verifies.
-/// On ASCII-only input the two rules agree byte-for-byte, which is why it
-/// survived; on any envelope carrying a non-ASCII character (`family_name`,
-/// `reason` and `policy_blob` all reach these bytes) or a non-ES float token
-/// the FFI verify said VERIFIED about bytes no admission gate would ever
-/// rebuild — a false green in front of a door that refuses.
-///
-/// Note the deliberate ABSENCE of a signature strip: these three envelopes
-/// carry their signature in ROW COLUMNS (`scrub_signature_classical` /
-/// `scrub_signature_pqc`), not inside the envelope, so the Rust twins
-/// canonicalize the envelope whole. This is
-/// [`crate::verify::canonicalize_envelope_for_signing`] WITHOUT the strip,
-/// not a different rule.
-fn canonicalize_envelope_value(envelope: &serde_json::Value) -> PyResult<Vec<u8>> {
-    crate::verify::canonical::ceg_produce_canonicalize(envelope)
-        .map_err(|e| PyRuntimeError::new_err(format!("canonicalize_envelope_value: {e}")))
-}
-
 /// v0.3.5 — TraceLevel → wire-format string. Same shape as the
 /// trace_level_str helper in `src/store/postgres.rs` but free-standing
 /// for use from this FFI module without re-exposing storage internals.
@@ -33153,7 +32347,7 @@ fn trace_level_str(t: crate::schema::TraceLevel) -> &'static str {
 /// v61.1.0 (CIRISPersist#1239) — one mapping for the two surfaces that run
 /// ingest's code: `Engine.receive_and_persist` and `Engine.verify_trace`, the
 /// dry-run, which runs ingest's verify step
-/// ([`crate::ingest::verify_trace_for_admission`]). So the same cause raises
+/// ([`crate::ingest::refuse_earlier_form_trace`]). So the same cause raises
 /// the same exception type with the same token from both.
 ///
 /// Verbose `Display` (which may include attacker-supplied content) goes to
@@ -33244,14 +32438,6 @@ fn derived_err_to_py(e: crate::derived::Error) -> PyErr {
         crate::derived::Error::Backend(_) => PyRuntimeError::new_err(kind),
         crate::derived::Error::NotImplemented(_) => PyRuntimeError::new_err(kind),
     }
-}
-
-/// v0.4.3 (CIRISPersist#18) — Encode raw bytes to base64 STANDARD
-/// for the verify_hybrid_via_directory call (which takes &str).
-fn base64_encode(bytes: &[u8]) -> String {
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine as _;
-    B64.encode(bytes)
 }
 
 /// v21.0.0 (CIRISPersist#502 E4) — extract the additive `authority_key_id` /
@@ -34722,16 +33908,6 @@ struct AddPeerRecordPayload {
     transport_identity: Option<String>,
 }
 
-/// v2.3 (CIRISPersist#103) — decoded `put_blob_json` payload (Rust-side
-/// representation). The PyO3 wrapper deserializes the wire shape into
-/// this struct and hands it to the backend's `put_blob`.
-struct PutBlobPayload {
-    sha256: [u8; 32],
-    body: crate::federation::BlobBody,
-    media_type: Option<String>,
-    attestation: crate::federation::PutBlobAttestation,
-}
-
 /// v2.3 (CIRISPersist#103) — Wire-shape representation for `put_blob_json`.
 /// Inline bytes ride as base64 standard-alphabet strings.
 #[derive(serde::Deserialize)]
@@ -34744,43 +33920,6 @@ enum PutBlobWireBody {
     External(crate::federation::ExternalRef),
 }
 
-#[derive(serde::Deserialize)]
-struct PutBlobAttestationWire {
-    attesting_key_id: String,
-    attestation_id: String,
-    /// v45.0.0 (#871) — REQUIRED: the byte length the signer bound into the
-    /// claim. The door refuses a claim whose size is not the length it stores.
-    size: u64,
-    original_content_hash_hex: String,
-    scrub_signature_classical: String,
-    #[serde(default)]
-    scrub_signature_pqc: Option<String>,
-    scrub_key_id: String,
-    scrub_timestamp: chrono::DateTime<chrono::Utc>,
-    /// v31.0.0 (CIRISPersist#652) — when the HOLDER CLAIM is asserted, which
-    /// is not the same fact as when the signature was made.
-    ///
-    /// `#[serde(default)]` and NOT required: a caller that omits it keeps the
-    /// pre-#652 behaviour of the two instants coinciding, which is correct for
-    /// the common "announce what I just stored" case and is what every
-    /// existing Python caller means. The field exists so a holder announcing
-    /// bytes it has held for a week can say so — that is a claim about the
-    /// week, not about the moment it reached for its key.
-    #[serde(default)]
-    asserted_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-#[derive(serde::Deserialize)]
-struct PutBlobJsonWire {
-    sha256: String,
-    body: PutBlobWireBody,
-    #[serde(default)]
-    media_type: Option<String>,
-    attestation: PutBlobAttestationWire,
-}
-
-/// v2.3 (CIRISPersist#103) — Decode the `put_blob_json` payload into
-/// the trait-call argument shape.
 /// #846 — the provenance half of the adopt / would-hold wire.
 #[derive(serde::Deserialize)]
 struct ProvenanceWire {
@@ -34872,43 +34011,6 @@ struct AdoptSealedChunksItemWire {
     seq: u64,
     envelope_b64: String,
     plaintext_size: u64,
-}
-
-fn parse_put_blob_payload(json: &str) -> PyResult<PutBlobPayload> {
-    let wire: PutBlobJsonWire = serde_json::from_str(json)
-        .map_err(|e| PyValueError::new_err(format!("put_blob_json decode: {e}")))?;
-    let sha = parse_sha256_hex(&wire.sha256)?;
-    let body = match wire.body {
-        PutBlobWireBody::Inline(b64) => {
-            use base64::engine::general_purpose::STANDARD as B64;
-            use base64::Engine as _;
-            let bytes = B64.decode(&b64).map_err(|e| {
-                PyValueError::new_err(format!("put_blob_json inline base64 decode: {e}"))
-            })?;
-            crate::federation::BlobBody::Inline(bytes)
-        }
-        PutBlobWireBody::External(e) => crate::federation::BlobBody::External(e),
-    };
-    let attestation = crate::federation::PutBlobAttestation {
-        attesting_key_id: wire.attestation.attesting_key_id,
-        attestation_id: wire.attestation.attestation_id,
-        size: wire.attestation.size,
-        original_content_hash_hex: wire.attestation.original_content_hash_hex,
-        scrub_signature_classical: wire.attestation.scrub_signature_classical,
-        scrub_signature_pqc: wire.attestation.scrub_signature_pqc,
-        scrub_key_id: wire.attestation.scrub_key_id,
-        scrub_timestamp: wire.attestation.scrub_timestamp,
-        asserted_at: wire
-            .attestation
-            .asserted_at
-            .unwrap_or(wire.attestation.scrub_timestamp),
-    };
-    Ok(PutBlobPayload {
-        sha256: sha,
-        body,
-        media_type: wire.media_type,
-        attestation,
-    })
 }
 
 /// v3.9.2 (CIRISPersist#153 Ask 5) — wire shape for
@@ -39034,260 +38136,6 @@ fn install_panic_logger() -> bool {
     crate::debug::install_panic_logger()
 }
 
-// ─── CIRISPersist#735 — the FFI canonicalization parity witness ─────────
-
-// v62.0.0 (JSON cut, E7) — `mod canonicalizer_parity_735` is deleted: its
-// one parity test pinned the FFI verify side of the earlier-form signed
-// objects (`verify_signed_key_record` / `_attestation` / `_revocation`) to the
-// JCS produce gate, and its corpus pin existed only to keep that test honest.
-
-// ─── the #714 / #716 / #735 class, instance FIVE — the verify_trace gate ────
-
-/// v37.0.0 — **`Engine.verify_trace` and `receive_and_persist` must return the
-/// SAME answer about the same trace.**
-///
-/// The FIFTH instance of the class documented on `canonicalizer_parity_735`
-/// (#714 → #716 → #735 → `Engine::register_self_federation_key` →
-/// here). Instances 1–4 were *produce*-side: bytes minted under one rule and
-/// rebuilt under another. This one is *verify*-side and worse in a specific
-/// way — it does not corrupt a row, it makes **one library give two answers**.
-/// [`super::PyEngine::verify_trace`] hard-coded
-/// [`PythonJsonDumpsCanonicalizer`] while ingest's verify step (since
-/// v61.1.0 `crate::ingest::verify_trace_for_admission`) resolves the
-/// canonicalizer from the trace's own signed
-/// `trace_schema_version` (`src/ingest.rs`, *"signed-bytes-bound, not
-/// caller-selectable"*). `"3.0.0"` is a supported schema
-/// ([`crate::schema::version::SUPPORTED_VERSIONS`]) and IS the JCS cutover
-/// epoch, so a 3.0.0 trace with a non-ASCII payload was **stored by
-/// `receive_and_persist` and rejected by `Engine.verify_trace`** — and
-/// `verify_trace` is precisely the primitive a peer runs BEFORE storing.
-///
-/// # Why the corpus must be non-ASCII, and why both epochs are exercised
-///
-/// The two rules agree byte-for-byte on ASCII, so an ASCII trace verifies
-/// under either and proves nothing (feedback: a check that cannot fail is a
-/// report). [`the_trace_corpus_actually_diverges`] pins the divergence.
-///
-/// And the fix is a GATE, not a flip: the 2.7.0 leg below asserts a pre-cutover
-/// Python-signed trace still verifies. A "fix" that hard-coded JCS instead
-/// would pass every 3.0.0 assertion here and red that one.
-///
-/// v61.1.0 (CIRISPersist#1239) — the dry-run no longer chooses a
-/// canonicalizer: it runs ingest's verify step, which calls
-/// `crate::ingest::trace_canonicalizer`. These tests pin that one rule on the
-/// classical half; the hybrid verdict parity is `verify_trace_1239_tests`
-/// (I1569).
-#[cfg(test)]
-mod verify_trace_canon_parity_class {
-    use crate::schema::{
-        CompleteTrace, ComponentType, ReasoningEventType, SchemaVersion, TraceComponent, TraceLevel,
-    };
-    use crate::verify::canonical::{canonicalizer_for, Canonicalizer, JcsCanonicalizer};
-    use crate::verify::ed25519::{
-        canon_version_for_trace_schema, canonical_payload_value_v279, verify_trace_via_directory,
-        PublicKeyDirectory,
-    };
-    use crate::verify::PythonJsonDumpsCanonicalizer;
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine as _;
-    use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
-    use std::collections::HashMap;
-
-    /// In-memory [`PublicKeyDirectory`] for the classical-half checks below.
-    struct MemKeys(HashMap<String, VerifyingKey>);
-    impl PublicKeyDirectory for MemKeys {
-        fn lookup(
-            &self,
-            key_id: &str,
-        ) -> Result<Option<VerifyingKey>, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(self.0.get(key_id).copied())
-        }
-    }
-
-    const KEY_ID: &str = "ciris-agent-key:verify-trace-parity";
-
-    /// A trace whose component payload carries the two divergence axes: raw
-    /// UTF-8 vs `\uXXXX` escapes, and a wire float token vs ECMAScript number
-    /// serialization. `rationale` / `thought_content` are exactly the fields
-    /// CIRISAgent#174 measured as the multilingual breaking set.
-    fn unsigned_trace(schema: &str) -> CompleteTrace {
-        let data: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
-            r#"{
-                "rationale": "用户推理 — conscience passed",
-                "note": "⚠️ héllo",
-                "latency_seconds": 1e-05,
-                "cost_usd": 0.0031992000000000006
-            }"#,
-        )
-        .expect("component data fixture parses");
-        CompleteTrace {
-            trace_id: "trace-verify-parity-1".into(),
-            thought_id: "th-1".into(),
-            task_id: None,
-            agent_id_hash: "7c3f8e2b1d9a4f60".into(),
-            started_at: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
-            completed_at: "2026-04-30T00:16:12.789012+00:00".parse().unwrap(),
-            trace_level: TraceLevel::Generic,
-            trace_schema_version: SchemaVersion::parse(schema).expect("supported schema"),
-            components: vec![TraceComponent {
-                component_type: ComponentType::Conscience,
-                event_type: ReasoningEventType::ConscienceResult,
-                timestamp: "2026-04-30T00:15:53.123456+00:00".parse().unwrap(),
-                data,
-                agent_id_hash: Some("7c3f8e2b1d9a4f60".into()),
-            }],
-            deployment_profile: None,
-            cohort_scope: "federation".into(),
-            cohort_target_id: None,
-            signature: String::new(),
-            signature_key_id: KEY_ID.into(),
-            signature_ml_dsa_65: None,
-            pubkey_ml_dsa_65: None,
-            pqc_key_id: None,
-            run_kind: None,
-        }
-    }
-
-    /// Sign a trace the way a producer at that epoch signs it: Python-compat
-    /// below 3.x, JCS at 3.x — i.e. under `canonicalizer_for(canon_version_
-    /// for_trace_schema(schema))`, the producer side of the same gate.
-    fn signed_trace(schema: &str, sk: &SigningKey) -> (CompleteTrace, MemKeys) {
-        let unsigned = unsigned_trace(schema);
-        let payload = canonical_payload_value_v279(&unsigned);
-        let bytes = canonicalizer_for(canon_version_for_trace_schema(schema))
-            .canonicalize_value(&payload)
-            .expect("producer canonicalize");
-        let trace = CompleteTrace {
-            signature: B64.encode(sk.sign(&bytes).to_bytes()),
-            ..unsigned
-        };
-        let mut keys = HashMap::new();
-        keys.insert(KEY_ID.to_owned(), sk.verifying_key());
-        (trace, MemKeys(keys))
-    }
-
-    fn fixed_key() -> SigningKey {
-        SigningKey::from_bytes(&[0x51; 32])
-    }
-
-    /// **The anti-vacuity pin.** On an ASCII, ES-float-clean payload the two
-    /// rules emit identical bytes, every assertion in this module passes
-    /// against the UNFIXED code, and the module becomes a report. This asserts
-    /// the fixture genuinely exercises the divergence, so trimming it to ASCII
-    /// reds HERE.
-    #[test]
-    fn the_trace_corpus_actually_diverges() {
-        let payload = canonical_payload_value_v279(&unsigned_trace("3.0.0"));
-        let v1 = PythonJsonDumpsCanonicalizer
-            .canonicalize_value(&payload)
-            .expect("v1");
-        let jcs = JcsCanonicalizer.canonicalize_value(&payload).expect("jcs");
-        assert_ne!(
-            v1, jcs,
-            "the trace fixture must exercise the V1/V2 divergence — an all-ASCII \
-             payload makes every assertion in this module vacuous"
-        );
-    }
-
-    /// **The FFI's rule IS ingest's rule, spelled from the same expression.**
-    ///
-    /// `src/ingest.rs` resolves the canonicalizer as
-    /// `canonicalizer_for(canon_version_for_trace_schema(trace.trace_schema_version))`.
-    /// Asserted over EVERY supported schema version — including the ones where
-    /// the two rules agree — because the defect is a missing gate, not a wrong
-    /// branch: pinning only 3.0.0 would let a future "optimization" that
-    /// short-circuits 2.7.x back onto a hard-coded rule survive.
-    #[test]
-    fn verify_trace_and_ingest_agree_on_the_canon_gate() {
-        let payload = canonical_payload_value_v279(&unsigned_trace("3.0.0"));
-        for schema in crate::schema::version::SUPPORTED_VERSIONS {
-            let ffi = crate::ingest::trace_canonicalizer(schema)
-                .canonicalize_value(&payload)
-                .expect("ffi canonicalize");
-            let ingest = canonicalizer_for(canon_version_for_trace_schema(schema))
-                .canonicalize_value(&payload)
-                .expect("ingest canonicalize");
-            assert_eq!(
-                String::from_utf8_lossy(&ffi),
-                String::from_utf8_lossy(&ingest),
-                "the FFI verify surface must resolve the canonicalizer exactly as \
-                 src/ingest.rs does, at schema {schema}"
-            );
-        }
-    }
-
-    /// **The bug, tested directly: one trace, two answers.**
-    ///
-    /// A 3.0.0 JCS-signed non-ASCII trace — the shape `receive_and_persist`
-    /// ADMITS — must verify through the canonicalizer
-    /// [`super::PyEngine::verify_trace`] now selects, and must NOT verify under
-    /// the hard-coded V1 rule it used until v36.x. The second assertion is the
-    /// defect stated as a fact: it is what the shipped FFI did.
-    #[test]
-    fn a_3_0_0_non_ascii_trace_verifies_through_the_ffi_gate_and_not_under_v1() {
-        let sk = fixed_key();
-        let (trace, keys) = signed_trace("3.0.0", &sk);
-
-        assert_eq!(
-            canon_version_for_trace_schema("3.0.0"),
-            crate::verify::canonical::CanonVersion::V2Jcs,
-            "3.0.0 is the JCS cutover epoch"
-        );
-
-        // The ingest path's verdict — what `receive_and_persist` decides.
-        let ingest_canon = canonicalizer_for(canon_version_for_trace_schema(
-            trace.trace_schema_version.as_str(),
-        ));
-        verify_trace_via_directory(&trace, ingest_canon, &keys)
-            .expect("the ingest path ADMITS this trace");
-
-        // The FFI's verdict — what `Engine.verify_trace` reports. Same answer.
-        verify_trace_via_directory(
-            &trace,
-            crate::ingest::trace_canonicalizer(trace.trace_schema_version.as_str()),
-            &keys,
-        )
-        .expect(
-            "Engine.verify_trace must return the SAME answer as receive_and_persist \
-             for the same trace — the #714/#716/#735 class, instance 5",
-        );
-
-        // And the rule that WAS hard-coded here refuses it — so the assertion
-        // above is discriminating, not a tautology over two agreeing rules.
-        assert!(
-            verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &keys).is_err(),
-            "the hard-coded V1 rule REJECTS a trace the ingest path stores — that \
-             disagreement is the defect"
-        );
-    }
-
-    /// **The fix is a GATE, not a flip to JCS.**
-    ///
-    /// Pre-cutover 2.7.x traces are signed under Python-compat and must keep
-    /// verifying — the whole reason `canon_version_for_trace_schema` reads a
-    /// per-row signed epoch instead of a global constant. A "fix" that replaced
-    /// the hard-coded V1 rule with a hard-coded JCS rule passes every 3.0.0
-    /// assertion above and reds here.
-    #[test]
-    fn a_2_7_9_non_ascii_trace_still_verifies_under_the_pre_cutover_rule() {
-        let sk = fixed_key();
-        let (trace, keys) = signed_trace("2.7.9", &sk);
-
-        verify_trace_via_directory(
-            &trace,
-            crate::ingest::trace_canonicalizer(trace.trace_schema_version.as_str()),
-            &keys,
-        )
-        .expect("a pre-cutover 2.7.9 trace MUST keep verifying under Python-compat");
-
-        assert!(
-            verify_trace_via_directory(&trace, &JcsCanonicalizer, &keys).is_err(),
-            "and JCS must REFUSE it — otherwise this leg cannot detect a blanket \
-             flip and the epoch gate is not being exercised"
-        );
-    }
-}
-
 /// v61 (CC 2.6.2) — I-IFP-10: the Python open settles stored instant forms.
 #[cfg(test)]
 mod instant_form_open_tests;
@@ -39296,17 +38144,6 @@ mod instant_form_open_tests;
 /// type it had.
 #[cfg(test)]
 mod wait_taxonomy_tests;
-
-/// v61.1.0 (CIRISPersist#1233) — I1560, I1561, I1567: the Python verify doors
-/// accept only `"strict"`; `audit_chain_proof` does not serve a refused head.
-#[cfg(test)]
-mod hybrid_policy_1233_tests;
-
-/// v61.1.0 (CIRISPersist#1239) — I1569: `Engine.verify_trace`, the dry-run,
-/// gives ingest's verdict (it runs ingest's verify step) on sqlite and
-/// postgres.
-#[cfg(test)]
-mod verify_trace_1239_tests;
 
 /// v61.2.0 (CIRISPersist#1242) — I1703: every raw-layout capsule `PyEngine`
 /// hands out is named `ciris_persist::<base>@<CARGO_PKG_VERSION>`, on sqlite

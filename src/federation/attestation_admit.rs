@@ -275,17 +275,6 @@ pub(crate) trait AttestationStore:
     /// transaction.
     async fn store_planned_hard_case(&self, planned: PlannedHardCase) -> Result<(), Error>;
 
-    /// v57.0.0 (CIRISPersist#988 item 2) — move every pre-v57
-    /// `hard_case_events` row that has no backing row onto the plane: plan
-    /// each as `attester`'s row ([`plan_hard_case_row`] at `received_at`),
-    /// store it, and replace the legacy row with the row's projection, in one
-    /// transaction. A no-op when there are none (memory never holds any).
-    async fn rehome_legacy_hard_case_events(
-        &self,
-        attester: &HardCaseAttester,
-        received_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Error>;
-
     /// v57.0.0 (CIRISPersist#988; CLM-silo-projection-rebuildable) — the
     /// projection's live rows and its from-rows rebuild through the same
     /// writer, rendered for a byte comparison
@@ -311,23 +300,6 @@ pub(crate) trait AttestationStore:
         agent_id_hash: &str,
         signing_key_id: Option<&str>,
     ) -> Result<Vec<String>, Error>;
-
-    /// v57.0.0 (CIRISPersist#988 item 3) — store a planned detection row and,
-    /// when it landed, its `detection_events` projection, in one transaction.
-    /// `false` (nothing written) when the row's id is already held.
-    async fn store_planned_detection(&self, planned: PlannedDetection) -> Result<bool, Error>;
-
-    /// v57.0.0 (CIRISPersist#988 item 3) — move every pre-v57
-    /// `detection_events` row with no backing row onto the plane: plan each as
-    /// its detector's row ([`plan_detection_row`] at `received_at`), store it
-    /// and replace the legacy row with the row's projection. A legacy row
-    /// whose detector key this node does not hold, or whose key the
-    /// `detection:` reserved rule refuses, stays as it is (and the rebuild
-    /// gate reports it). A no-op when there are none.
-    async fn rehome_legacy_detection_events(
-        &self,
-        received_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Error>;
 }
 
 tokio::task_local! {
@@ -465,10 +437,6 @@ where
         .then(|| attestation.attestation.clone());
     // v59.0.0 (CIRISPersist#1099) — a proposal or an answer to one, executed
     // after it is stored.
-    // v59.0.0 (CIRISPersist#1106) — a quorum re-bind, applied after it is
-    // stored.
-    let rebind_row = super::transport_rebind::is_rebind_row(&attestation.attestation)
-        .then(|| attestation.attestation.clone());
     // v61 (CIRISPersist#991) — a `withdraws` that may retract a roster event,
     // acted on once the store holds it.
     let withdraws_row = (attestation.attestation.attestation_type
@@ -539,11 +507,6 @@ where
     // `withdraws` of a pending row) executes the hold it concerns.
     if let (Ok(AttestationOutcome::Inserted), Some(row)) = (&outcome, &cosign_row) {
         super::cosign::after_admission(dir, row).await;
-    }
-    if let (Ok(AttestationOutcome::Inserted | AttestationOutcome::AlreadyHeld), Some(row)) =
-        (&outcome, &rebind_row)
-    {
-        super::transport_rebind::after_admission(dir, row).await?;
     }
     // v58.0.0 (CIRISPersist#991, CC 3.3.6) — an admitted `withdraws` against an
     // `identity:occurrence:v1` row feeds the occurrence-revocation projection
@@ -726,7 +689,6 @@ where
     // unmatchable revocation authority the emit path refuses.
     // v60.0.0 (CIRISPersist#854) — one gate, the emit gate's rule.
     crate::federation::validate_subject_key_ids(&row.subject_key_ids)?;
-    crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
     // v57.0.0 (CIRISPersist#988 item 3) — a `detection:*` row that carries a
     // detection body carries one the projection can read. Pure.
     crate::derived::detection_row::check_detection_body(&row)?;
@@ -1069,6 +1031,26 @@ where
                 policy.check(&row.attestation_type, dim, &attesting_identity_type)?;
             }
         }
+    }
+    // v62.0.0 (P7-fix6; CC 3.1.5, key_roles R4) — a trace row is AUTHORED
+    // by its agent: its signer's identity set (resolved above, from the live
+    // edition-2 `key:record` for a statement-carrying row) names `agent` and
+    // no person.
+    // Every door that admits a row runs this (local, replicated, tier ingest,
+    // G0's re-fold), so a refused signer kind is refused by name wherever
+    // it arrives.
+    // Only a row carrying its statement (`Conferred`): an unsigned trace kept
+    // LOCAL (`TrustPreVerified`, the relay's attribution) is no authored row
+    // and never crosses (`trace_unsigned_local_only`).
+    if standing == crate::federation::admission::EmitterStanding::Conferred {
+        crate::ingest::check_trace_signer_kind(
+            crate::federation::admission::trace_family_token(
+                &row.attestation_type,
+                crate::federation::admission::envelope_dimension(&row.attestation_envelope),
+            ),
+            &row.attesting_key_id,
+            &attesting_identity_type,
+        )?;
     }
 
     // v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — a `revoked`
@@ -1448,8 +1430,9 @@ where
     )
     .await?;
     // v59.0.0 (CIRISPersist#1106, CC 5.3.4) — a serve node's transit-pair
-    // re-bind is a holder-quorum act.
-    crate::federation::transport_rebind::check_rebind_admission(dir, &row).await?;
+    // re-bind is a holder-quorum act; v62.0.0 (C5-fix1): an earlier-form one
+    // is refused by name (no earlier genesis seats a serve node).
+    crate::federation::transport_rebind::check_rebind_admission(&row)?;
     // CC 3.1.3.3 — `custody:ack:v1` is a holder self-report, placed within
     // the blob's own cohort (v53.0.0, CIRISPersist#942 part 2).
     crate::federation::custody_ack::check_custody_ack_admission(dir, &row).await?;
@@ -1911,11 +1894,6 @@ where
         }
         None => input.into_local_row(attestation_id.clone(), now),
     };
-    // v31.0.0 (CIRISPersist#660) — THE BAKED GENESIS IDS ARE RESERVED AT
-    // THIS DOOR TOO. See the memory backend's local door for why this one
-    // cannot defer to the promote gate the way `check_reserved_prefix_admission`
-    // does: the harm is the PRIMARY KEY, and a local-tier row already holds it.
-    crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
     // v61.1.0 (CIRISPersist#1174 item 3, as ruled) — the CC 3.4.3 substrate
     // self-report attester, enforced for this node's own write.
     crate::federation::admission::check_substrate_self_report_attester_at(
@@ -2064,29 +2042,6 @@ where
     Ok(gone)
 }
 
-/// v56.0.0 (CIRISPersist#934 step 1, door 6) — `purge_genesis_delegation_row_v31`,
-/// decided once: the re-bake gate (the id must be one the compiled-in bundle
-/// carries, under the caller's authority), then a compare-and-delete on
-/// `expected_persist_row_hash`.
-pub(crate) async fn purge_genesis_delegation_row_planned<D>(
-    dir: &D,
-    attestation_id: &str,
-    expected_persist_row_hash: &str,
-    authority: &crate::federation::genesis::bundle::GenesisPurgeAuthority<'_>,
-) -> Result<bool, Error>
-where
-    D: AttestationStore,
-{
-    crate::federation::genesis::check_genesis_rebake_purge_admission_under(
-        attestation_id,
-        authority,
-    )?;
-    let gone = dir
-        .delete_attestation(attestation_id, Some(expected_persist_row_hash))
-        .await?;
-    Ok(gone)
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 //  v57.0.0 (CIRISPersist#988 item 2, CC 3.1.9.4) — the hard_case door
 // ─────────────────────────────────────────────────────────────────────────
@@ -2114,10 +2069,8 @@ pub(crate) struct HardCaseAttester {
 /// hold, refuses with [`Error::HardCaseAttesterUnavailable`] (named
 /// [`super::hard_case::refusal::ATTESTER_UNAVAILABLE`]).
 ///
-/// It also rehomes any pre-v57 `hard_case_events` row that has no backing
-/// row yet ([`AttestationStore::rehome_legacy_hard_case_events`]): the first
-/// emitter after an upgrade, with the node's key in hand, moves the silo onto
-/// the plane.
+/// v62.0.0 (JSON-cut slice F, ruling 4) — the pre-v57 `hard_case_events`
+/// rehome it ran is deleted: a V300 store holds no earlier row to rehome.
 pub(crate) async fn hard_case_attester<D>(dir: &D) -> Result<HardCaseAttester, Error>
 where
     D: AttestationStore,
@@ -2138,8 +2091,6 @@ where
         key_id,
         identity_type,
     };
-    dir.rehome_legacy_hard_case_events(&attester, crate::host::clock::now())
-        .await?;
     Ok(attester)
 }
 
@@ -2250,7 +2201,6 @@ pub(crate) fn plan_hard_case_row(
     // instant"): the receipt clock at a live door, the silo row's own
     // recorded instant when a pre-v57 row is rehomed (never the boot clock).
     let mut row = input.into_local_row(attestation_id, instants.fold_at);
-    crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
     crate::federation::envelope::RowMirror::stamp_local_row(&mut row, false)?;
     crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
     crate::federation::admission::check_instant_binding(
@@ -2318,132 +2268,14 @@ where
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-//  v57.0.0 (CIRISPersist#988 item 3, CC 3.4.8) — the detection door
+//  v57.0.0 (CIRISPersist#988 item 3, CC 3.4.8) — the detection door.
+//  v62.0.0 (P8-fix11) — the earlier-form door (`put_detection_planned`,
+//  `plan_detection_row`, `detection_reput_verdict`, `PlannedDetection`,
+//  `AttestationStore::store_planned_detection`) is deleted: it refused at its
+//  first line once the earlier form was shut. A detection is its detector's
+//  own statement (`derived::detection_row::state_detection`); the subject
+//  reader below is that producer's.
 // ─────────────────────────────────────────────────────────────────────────
-
-/// A planned `detection:{detector}:v1` row and the `detection_events` row it
-/// projects to.
-#[derive(Debug, Clone)]
-pub(crate) struct PlannedDetection {
-    /// The local-tier row, exactly as stored.
-    pub(crate) row: Attestation,
-    /// [`crate::derived::detection_row::project_detection_row`] of `row`.
-    pub(crate) projection: crate::derived::detection_row::DetectionProjection,
-}
-
-/// v57.0.0 (CIRISPersist#988 item 3, CC 3.4.8) — **the detection door's
-/// decision**, once for all three backends, and pure. The row: `scores`,
-/// dimension `detection:{detector}:v1`, attester = the detector's key
-/// (`signing_key_id`, whose `identity_type` is `attester_identity_type`),
-/// `cohort_scope = self`, local tier, the detection whole under the
-/// `detection` member, id derived from `detection_id`. Its own signature is
-/// deferred (the detector's hybrid signature over `canonical_bytes` rides in
-/// the body, verified by the caller); the detector signs the row as the actor
-/// at the crossing.
-///
-/// The gates: V008's shape (the three signature/digest lengths, the
-/// canonical-bytes bound, a live body or a whole tombstone), the envelope
-/// size, the dimension gate (the `detection:` reserved family:
-/// `lenscore_detector` only, CC 3.4.8), the reserved genesis ids, the mirror
-/// and instant stamp, the size as stored, the instant binding at
-/// `received_at`.
-///
-/// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — `subject` is the scored
-/// agent's CC 2.3.2.1 canonical hash
-/// ([`subject_erasure::agent_subject`](super::subject_erasure::agent_subject)
-/// of the trace's `agent_id_hash`, [`detection_subject`]), written into
-/// `subject_key_ids`: a detection is a row ABOUT that subject, and naming it
-/// makes the rows about a subject discoverable (DSAR export, the erasure
-/// door's lookup). It is not an authority path: a detection is adverse, and
-/// is erased only by its producer's rule-1 `withdraws` (CC 4.5.3, the 2.4.1.1
-/// carve-out). `None` when the door cannot tell whose trace it scored (the
-/// trace is not held here): the door never guesses a subject.
-pub(crate) fn plan_detection_row(
-    body: &crate::derived::detection_row::DetectionProjection,
-    attester_identity_type: &str,
-    subject: Option<&str>,
-    instants: PlanInstants,
-) -> Result<PlannedDetection, Error> {
-    use crate::derived::detection_row as dr;
-    use crate::federation::types::{attestation_type, cohort_scope, LocalAttestationInput};
-    if let Some(reason) = dr::detection_shape_refusal(body) {
-        return Err(Error::InvalidArgument(reason));
-    }
-    let envelope = dr::detection_envelope(body)
-        .map_err(|e| Error::Backend(format!("detection envelope: {e}")))?;
-    crate::federation::admission::check_envelope_size_admission(&envelope)?;
-    let dimension = dr::detection_dimension(&body.detector);
-    crate::federation::admission::DimensionAdmissionPolicy::default().check(
-        attestation_type::SCORES,
-        Some(&dimension),
-        attester_identity_type,
-    )?;
-    let attestation_id = dr::detection_attestation_id(&body.detection_id);
-    let input = LocalAttestationInput {
-        attestation_id: Some(attestation_id.clone()),
-        attesting_key_id: body.signing_key_id.clone(),
-        attested_key_id: None,
-        attestation_type: attestation_type::SCORES.to_owned(),
-        weight: None,
-        expires_at: None,
-        attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(envelope)?,
-        subject_key_ids: subject.map(str::to_owned).into_iter().collect(),
-        cohort_scope: cohort_scope::SELF.to_owned(),
-        scrub_signature_classical: None,
-        scrub_signature_pqc: None,
-    };
-    // The row's signed instant is `fold_at` (PlanInstants: "the row's signed
-    // instant"): the receipt clock at a live door, the silo row's own
-    // recorded instant when a pre-v57 row is rehomed (never the boot clock).
-    let mut row = input.into_local_row(attestation_id, instants.fold_at);
-    crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
-    crate::federation::envelope::RowMirror::stamp_local_row(&mut row, false)?;
-    crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
-    crate::federation::admission::check_instant_binding(
-        &row,
-        instants.received_at,
-        crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
-    )?;
-    row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-    let projection = dr::project_detection_row(&row).ok_or_else(|| {
-        Error::Backend(format!(
-            "detection row {} does not project: the door built a row its own projection \
-             cannot read",
-            row.attestation_id
-        ))
-    })?;
-    Ok(PlannedDetection { row, projection })
-}
-
-/// v57.0.0 (CIRISPersist#988 item 3) — a re-put of a detection whose row is
-/// held: V008's verdict, over the ROW (never the projection): the same
-/// `canonical_bytes` is an idempotent no-op, different bytes are a conflict,
-/// and an erased detection is not re-attached (no-op, as V080's NULL bytes
-/// were). A held row under the id that is not this detection's is a conflict.
-pub(crate) fn detection_reput_verdict(
-    held: &Attestation,
-    offered: &crate::derived::detection_row::DetectionProjection,
-) -> Result<(), Error> {
-    let Some(stored) = crate::derived::detection_row::project_detection_row(held) else {
-        return Err(Error::Conflict(format!(
-            "row {} is held and is not a detection",
-            held.attestation_id
-        )));
-    };
-    if stored.detection_id != offered.detection_id {
-        return Err(Error::Conflict(format!(
-            "row {} holds detection {}, not {}",
-            held.attestation_id, stored.detection_id, offered.detection_id
-        )));
-    }
-    match (&stored.canonical_bytes, &offered.canonical_bytes) {
-        (Some(a), Some(b)) if a != b => Err(Error::Conflict(format!(
-            "detection_id {} already exists with different canonical_bytes",
-            offered.detection_id
-        ))),
-        _ => Ok(()),
-    }
-}
 
 /// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — **whose detection this
 /// is**: the canonical subject
@@ -2470,54 +2302,6 @@ where
         .trace_agent_id_hash(trace_id)
         .await?
         .and_then(|agent| super::subject_erasure::agent_subject(&agent).ok()))
-}
-
-/// v57.0.0 (CIRISPersist#988 item 3) — the door: every backend's
-/// `put_detection_event` is this call. The detector's hybrid signature over
-/// `canonical_bytes` is the caller's to verify (the `DerivedSchema` verify
-/// boundary, unchanged); this decides and stores the row.
-pub(crate) async fn put_detection_planned<D>(
-    dir: &D,
-    event: &crate::derived::DetectionEvent,
-) -> Result<(), Error>
-where
-    D: AttestationStore,
-{
-    // v62.0.0 (v62 P8) — the earlier form (a detection hybrid-signed over its
-    // `canonical_bytes`, written local) exists only behind the switch; the
-    // edition-2 producer is `derived::detection_row::state_detection`.
-    super::edition2::door::refuse_earlier_form("detection")?;
-    let received_at = crate::host::clock::now();
-    dir.rehome_legacy_detection_events(received_at).await?;
-    let body = crate::derived::detection_row::DetectionProjection::from(event);
-    let identity_type = dir
-        .attesting_identity_type(&event.signing_key_id)
-        .await?
-        .ok_or_else(|| Error::AttesterKeyUnknown {
-            attesting_key_id: event.signing_key_id.clone(),
-            plane: "detection",
-        })?;
-    let subject = detection_subject(dir, body.trace_id.as_deref()).await?;
-    let planned = plan_detection_row(
-        &body,
-        &identity_type,
-        subject.as_deref(),
-        PlanInstants {
-            fold_at: received_at,
-            received_at,
-        },
-    )?;
-    // A detection row a purge or an Art. 17 erasure tombstoned is not
-    // re-admitted: the tombstone outlives the row (the purge door's TOMBSTONED
-    // gate, the one the put door asks).
-    crate::federation::steward_purge::refuse_if_tombstoned_attestation(dir, &planned.row).await?;
-    let id = planned.row.attestation_id.clone();
-    if !dir.store_planned_detection(planned).await? {
-        if let Some(held) = dir.get_attestation(&id).await? {
-            detection_reput_verdict(&held, &body)?;
-        }
-    }
-    Ok(())
 }
 
 /// v62.0.0 (wave GC2; CC 2.7.3) — I3710–I3713: the attestation door's fold

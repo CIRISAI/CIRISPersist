@@ -849,6 +849,9 @@ pub(crate) async fn supersede_family_signed<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (JSON-cut slice F) — the one shared earlier-form refusal,
+    // before any parse or verify (CC 2.6.1.12).
+    super::edition2::door::refuse_earlier_form("family")?;
     super::admission::check_family_consensus_protocol_form(&new.family.consensus_protocol)?;
     // v62.0.0 (wave GC5) — the held head and its roster planes are inputs.
     fold::reads(Dep::key(&new.family.family_key_id));
@@ -916,6 +919,9 @@ pub(crate) async fn supersede_community_signed<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (JSON-cut slice F) — the one shared earlier-form refusal,
+    // before any parse or verify (CC 2.6.1.12).
+    super::edition2::door::refuse_earlier_form("community")?;
     super::check_consensus_protocol_form(&new.community.consensus_protocol)?;
     // v62.0.0 (wave GC5) — the held head and its roster planes are inputs.
     fold::reads(Dep::key(&new.community.community_key_id));

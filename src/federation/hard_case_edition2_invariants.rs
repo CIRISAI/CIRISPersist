@@ -63,7 +63,7 @@ mod unit {
 
     /// The earlier-shaped literal of `seed`'s hard_case row about itself.
     fn literal(seed: &str, envelope: &serde_json::Value) -> Attestation {
-        let mut a = e2::with_earlier_form(|| ts::bare_attestation("unused", seed, seed, envelope));
+        let mut a = ts::bare_attestation("unused", seed, seed, envelope);
         a.attestation_type = attestation_type::SCORES.to_owned();
         let at = now_ms();
         a.asserted_at = at;
@@ -182,7 +182,7 @@ mod unit {
         );
 
         // The earlier-form fence is unchanged: an id the body does not name.
-        e2::with_earlier_form(|| {
+        {
             let envelope = hard_case::hard_case_envelope(&ev).expect("envelope");
             let earlier = |id: &str| {
                 let mut r = ts::bare_attestation(id, "i3051-node", "", &envelope);
@@ -201,7 +201,7 @@ mod unit {
                 None,
                 "I3051: the earlier-form fence still refuses an id its body does not name"
             );
-        });
+        };
     }
 
     /// **I3052** — an `emitted_at` carried as POSIX ms projects as that
@@ -250,8 +250,7 @@ pub(crate) mod bodies {
     /// edition-2 statement.
     fn statement(seed: &str, ev: &HardCaseEvent, at: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
         let envelope = hard_case::hard_case_envelope(ev).expect("envelope");
-        let mut a: Attestation =
-            e2::with_earlier_form(|| ts::bare_attestation("unused", seed, seed, &envelope));
+        let mut a: Attestation = ts::bare_attestation("unused", seed, seed, &envelope);
         a.attestation_type = attestation_type::SCORES.to_owned();
         a.asserted_at = at;
         a.scrub_timestamp = at;

@@ -1336,6 +1336,18 @@ fn door_cases() -> Vec<(&'static str, Value, Value, &'static str)> {
             with(&deferral_request(), vec![], &["reason_digest"]),
             "a missing required member",
         ),
+        // v62.0.0 (red round 3, X1) — the canonical seat's X-Wing re-bind
+        // (counted by the accord's holders, `refs.head` the bundle in force).
+        (
+            "transport:canonical_rebind",
+            canonical_rebind(),
+            with(
+                &canonical_rebind(),
+                vec![("transit_xwing_pubkey", txt("not bytes"))],
+                &[],
+            ),
+            "a wrong type",
+        ),
         // v62.0.0 (wave P7, foreign hunk) — the trace row: the inline form is
         // gone (CC: the manifest form is the only form).
         (
@@ -2562,6 +2574,17 @@ fn i3997_a_deferral_routes_by_community_id() {
 }
 
 /// A `location_proof:v1` payload.
+/// A valid `transport:canonical_rebind` payload: counted (no author), the
+/// seat's new transit X-Wing key (1216 bytes), and the genesis bundle in force
+/// it is counted over as `refs.head`.
+fn canonical_rebind() -> Value {
+    map(vec![
+        ("asserted_at", ms(1_000)),
+        ("transit_xwing_pubkey", Value::Bytes(vec![0x5a; 1216])),
+        ("refs", refs(vec![("head", ref2(&[0x5b; 32]))])),
+    ])
+}
+
 fn location_proof() -> Value {
     map(vec![
         ("asserted_at", ms(1_000)),

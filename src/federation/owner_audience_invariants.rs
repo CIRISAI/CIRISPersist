@@ -274,7 +274,7 @@ pub(crate) mod bodies {
             })
             .await
             .is_ok();
-        crate::federation::edition2::door::with_earlier_form_doors_shut(async {
+        async {
             assert!(
                 !occurrence_counts(d, &alice, &node).await.unwrap(),
                 "I3120: a node under a person never counts"
@@ -316,7 +316,7 @@ pub(crate) mod bodies {
                 !principals_of(d, &node).await.unwrap().contains(&alice),
                 "I3120"
             );
-        })
+        }
         .await;
         if planted {
             // Control: while the earlier form is open the earlier path is
@@ -467,14 +467,14 @@ pub(crate) mod bodies {
         // its list says: one it authored, one about it. Control: alice's own
         // `self` row about herself does not.
         let self_row = |author: &str, about: &str| -> crate::federation::types::Attestation {
-            let mut r = e2::with_earlier_form(|| {
+            let mut r = {
                 ts::bare_attestation(
                     &uuid::Uuid::new_v4().to_string(),
                     author,
                     about,
                     &serde_json::json!({ "dimension": "identity_binding:v1" }),
                 )
-            });
+            };
             r.cohort_scope = cohort_scope::SELF.to_owned();
             r
         };
@@ -534,23 +534,11 @@ pub(crate) mod bodies {
         let room = "i3122-room";
         let now = chrono::Utc::now();
 
-        let open = rekey_community_member_device_add(b, room, &alice, &node, &alice, now)
+        // v62.0.0 (slice F) — the doors are shut: the earlier rule's
+        // "open" leg is gone with the earlier form.
+        let shut = rekey_community_member_device_add(b, room, &alice, &node, &alice, now)
             .await
-            .expect_err("I3122: the door refuses (open)");
-        match open {
-            Error::DeviceRekeyRefused { rule, .. } => assert_eq!(
-                rule, DEVICE_REKEY_RULE_NOT_AN_OCCURRENCE,
-                "I3122: while the earlier form is open, the earlier rule refuses an owned node \
-                 that is no occurrence of the member"
-            ),
-            other => panic!("I3122 (open): expected the rule-3 refusal, got {other}"),
-        }
-
-        let shut = crate::federation::edition2::door::with_earlier_form_doors_shut(
-            rekey_community_member_device_add(b, room, &alice, &node, &alice, now),
-        )
-        .await
-        .expect_err("I3122: the door stops at the unknown room (shut)");
+            .expect_err("I3122: the door stops at the unknown room (shut)");
         assert!(
             !matches!(
                 shut,

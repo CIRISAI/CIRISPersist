@@ -12,8 +12,7 @@
 //!   inside it by [`stream_claim_verdict`], a shared plan the executor
 //!   re-asks; each item's answer is [`item_answer`];
 //! - the stream plane's records (`stream_dek_insert`,
-//!   `stream_dek_put_grants`, `put_stream_sth`, `put_delivery_receipt`,
-//!   `put_holding_claim`): the gates, then a write that reports what it
+//!   `stream_dek_put_grants`, `put_stream_sth`, `put_delivery_receipt`): the gates, then a write that reports what it
 //!   found under the key for the plan to judge.
 //!
 //! # Which instant each plan reads
@@ -156,15 +155,6 @@ pub(crate) trait BlobFloorStore: BlobStorage + FederationDirectory + Sized {
         &self,
         receipt: PlannedReceipt<'_>,
     ) -> Result<ReceiptWrite, BlobError>;
-
-    /// In ONE transaction: re-ask "still held" (§11.5 / I28), then insert
-    /// the claim row; after the commit, index it. `false`: not held, nothing
-    /// written.
-    async fn store_holding_claim(
-        &self,
-        sha256: &[u8; 32],
-        prepared: super::holding_claim::PreparedHoldingClaim,
-    ) -> Result<bool, BlobError>;
 
     /// Insert the stream DEK row if absent, and read back the stored one.
     async fn store_stream_dek(
@@ -659,9 +649,16 @@ pub(crate) async fn put_delivery_receipt_planned<D: BlobFloorStore>(
 ) -> Result<(), BlobError> {
     super::edition2::door::refuse_earlier_form("delivery_receipt")
         .map_err(|e| BlobError::InvalidArgument(e.to_string()))?;
-    // Step 1: the subscriber's hybrid signature. Necessary, NOT sufficient.
-    super::stream_receipt::verify_receipt_signature(dir, &receipt).await?;
-    store_receipt_checked(dir, receipt).await
+    // v62.0.0 (F0-cp5) — the earlier receipt's bound-hybrid verify is
+    // deleted, so this door admits nothing whatever the switch says: it
+    // never stores a receipt it has not verified.
+    let _ = (dir, receipt);
+    Err(BlobError::InvalidArgument(
+        "put_delivery_receipt: the earlier-form receipt (a bound-hybrid \
+         signature) admits nothing; send a delivery_receipt:{stream_id} statement \
+         (v62.0.0)"
+            .into(),
+    ))
 }
 
 /// v62.0.0 (wave T2) — **the receipt door for an edition-2
@@ -723,30 +720,6 @@ async fn store_receipt_checked<D: BlobFloorStore>(
             )),
         )),
         ReceiptWrite::Held(_) | ReceiptWrite::Inserted => Ok(()),
-    }
-}
-
-/// The door: every backend's `put_holding_claim`. v55.0.0 (#989) — scope,
-/// size, rebuild and audience before the transaction; the transaction
-/// re-asks only "still held".
-pub(crate) async fn put_holding_claim_planned<D: BlobFloorStore>(
-    dir: &D,
-    sha256: &[u8; 32],
-    claim: super::PutBlobAttestation,
-    scope: &super::holding_claim::ClaimScope,
-) -> Result<(), BlobError> {
-    let prepared = super::holding_claim::prepare_announcement(dir, sha256, &claim, scope).await?;
-    if dir.store_holding_claim(sha256, prepared).await? {
-        Ok(())
-    } else {
-        // v62.0.0 (wave GC7) — this node's own blob row is another row.
-        Err(held_on(
-            super::edition2::fold::reason::BLOB_NOT_HELD,
-            &hex::encode(sha256),
-            BlobError::NotHeld {
-                sha256_hex: hex::encode(sha256),
-            },
-        ))
     }
 }
 
@@ -861,8 +834,6 @@ pub(crate) struct PlannedBlob {
     /// The binding AS DECLARED (#846 §3, the adopt floor's): the epoch the
     /// author sealed under, with no key-state check.
     pub(crate) binding: Option<EpochBinding>,
-    /// The holding claim, in the same transaction as the row.
-    pub(crate) claim: Option<super::holding_claim::PreparedHoldingClaim>,
     /// The in-transaction tombstone look's inputs.
     pub(crate) tombstones: TombstoneFloor,
     /// The door, for an error's text.
@@ -880,11 +851,6 @@ pub(crate) struct PlannedAnnouncement {
     /// A community-DEK token: the row must also be bound (an evicted binding
     /// is an eviction RECORD, not a bound row).
     pub(crate) needs_binding: bool,
-    /// The claim, inserted in the same transaction. `None`: the edition-2
-    /// sealed-floor announce ([`announce_held_blob_planned`]), whose claim is
-    /// a `custody` statement the caller emits through the statement door
-    /// after this commits.
-    pub(crate) claim: Option<super::holding_claim::PreparedHoldingClaim>,
 }
 
 /// A chunk DAG the plan admitted: its prepared rows (chunks first, the
@@ -1027,10 +993,32 @@ fn check_claim_size(declared: u64, stored: u64, what: &str) -> Result<(), BlobEr
     }
 }
 
-/// The door: every backend's `put_blob_with_scope`. Admission order (v3.4.0,
-/// #123): scope, tombstone, empty attester, trust threshold, body, claim
-/// size, claim scope and rebuild (#989, CC 3.1.3.3), audience; then one
-/// transaction that stores (plaintext) or announces (sealed tiers).
+/// v62.0.0 (wave T2; T2-fix11, CC 6.1.3) — **the blob put doors, with an
+/// edition-2 holding claim**: `put_blob` (the commons form: `federation`,
+/// plaintext) and `put_blob_with_scope` (any scope and floor). `claim` is the
+/// holder's `custody:{kind}` `here` statement: ONE composite signature (a
+/// holding claim is a CC 6.1 object), admitted through the one statement
+/// door. The earlier form (`PutBlobAttestation`, a bound-hybrid scrub pair
+/// over a JCS row) is deleted (ruling 4).
+///
+/// The pure checks run first, before anything is written:
+/// - the claim names THIS blob, at THIS scope (and group, for a targeted
+///   scope) and THIS size (AV-89);
+/// - the floor's scope rule, the tombstone, the hash-on-write and size cap;
+/// - the admission gate on the holder;
+/// - the holder is in the claim's cohort (CC 3.1.3.3 rule 2).
+///
+/// Plaintext: the bytes are stored, then the claim goes through the
+/// statement door; a claim refused after the bytes landed reaps the bytes
+/// THIS call stored (`delete_blob_unless_claimed`), so a refused claim
+/// leaves no bytes; bytes held before the call stay; an admitted claim finds
+/// its bytes held (it re-stores them after a concurrent reap).
+///
+/// A sealed floor is an ANNOUNCEMENT (§11.5 / I28: it never stores): the row
+/// a cascade stored is read for the content's scope (absent: `NotHeld`,
+/// waiting), the announce step records the author and asks the binding
+/// (`announce_held_blob_planned`'s executor), then the claim goes through the
+/// statement door. Never a claim without bytes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn put_blob_planned<D: BlobWriteStore>(
     dir: &D,
@@ -1038,37 +1026,39 @@ pub(crate) async fn put_blob_planned<D: BlobWriteStore>(
     sha256: &[u8; 32],
     body: super::BlobBody,
     media_type: Option<&str>,
-    attestation: super::PutBlobAttestation,
+    claim: &[u8],
     cohort_scope: &str,
     floor: StorageFloor,
     group_key_id: Option<&str>,
 ) -> Result<(), BlobError> {
     use super::types::cohort_scope::CryptoTier;
+    let read = super::edition2::typed::holding_claim_of(claim)
+        .map_err(|e| BlobError::InvalidArgument(e.to_string()))?;
+    if read.sha256 != *sha256 {
+        return Err(BlobError::InvalidArgument(format!(
+            "put_blob: the holding claim names blob {}, not {}",
+            hex::encode(read.sha256),
+            hex::encode(sha256)
+        )));
+    }
     floor.check_scope(cohort_scope)?;
     let tombstones = tombstone_floor(dir, &[*sha256]).await?;
-    if attestation.attesting_key_id.is_empty() {
-        return Err(BlobError::InvalidArgument(
-            "attesting_key_id is empty".into(),
-        ));
-    }
     if let Some(gate) = dir.blob_admission_gate() {
-        gate.check_blob(&attestation.attesting_key_id).await?;
+        gate.check_blob(&read.holder).await?;
     }
     let (storage_kind, bytes_inline, external_ref, size_bytes) =
         plan_blob_body("put_blob", sha256, &body, dir.inline_bytes_cap())?;
-    check_claim_size(attestation.size, body.size_bytes(), "stored")?;
+    check_claim_size(read.size, body.size_bytes(), "stored")?;
     // v55.0.0 (#989, CC 3.1.3.3 rule 1) — the claim is placed at the content's
-    // scope: this write's for plaintext; for a sealed-tier token, read off the
-    // row a cascade already stored, and an absent row is NotHeld (§11.5 / I28).
+    // scope: this write's for plaintext; for a sealed floor, read off the row
+    // a cascade already stored, and an absent row is NotHeld (§11.5 / I28).
     let plaintext = floor.tier() == CryptoTier::Plaintext;
-    let claim_scope = if plaintext {
+    let want = if plaintext {
         super::holding_claim::ClaimScope::of_content(floor.tier(), cohort_scope, group_key_id)?
     } else {
         super::holding_claim::content_claim_scope(dir, sha256)
             .await?
             .ok_or_else(|| {
-                // v62.0.0 (wave GC7) — the cascade's stored row is another
-                // row: the announcement WAITS for it.
                 held_on(
                     super::edition2::fold::reason::BLOB_NOT_HELD,
                     &hex::encode(sha256),
@@ -1078,36 +1068,81 @@ pub(crate) async fn put_blob_planned<D: BlobWriteStore>(
                 )
             })?
     };
-    let claim =
-        super::holding_claim::prepare_holding_claim_row(sha256, &attestation, &claim_scope)?;
-    super::holding_claim::check_holding_claim_audience(dir, &claim.row).await?;
+    let agrees = read.cohort_scope == want.cohort_scope()
+        && (want.cohort_scope() == super::types::cohort_scope::SELF
+            || read.target.as_deref() == want.target());
+    if !agrees {
+        return Err(BlobError::InvalidArgument(format!(
+            "{}: the holding claim about {} is placed at {} {:?}, but the content is at {} {:?} \
+             (CC 3.1.3.3 rule 1: a claim is placed at its content's scope)",
+            super::holding_claim::CUSTODY_ACK_SCOPE_MISMATCH,
+            hex::encode(sha256),
+            read.cohort_scope,
+            read.target,
+            want.cohort_scope(),
+            want.target()
+        )));
+    }
+    // CC 3.1.3.3 rule 2 — the holder is in the claim's cohort (the audience
+    // half of the custody gate), asked before anything is written.
+    if !want.is_directory()
+        && !super::custody_ack::holder_in_cohort(
+            dir,
+            &read.holder,
+            want.cohort_scope(),
+            want.target(),
+        )
+        .await
+        .map_err(|e| BlobError::Backend(format!("holding claim audience: {e}")))?
+    {
+        return Err(BlobError::InvalidArgument(format!(
+            "custody_ack_outside_cohort: the holder {} is not in the {} cohort {:?} of the \
+             claim it states (CC 3.1.3.3 rule 2)",
+            read.holder,
+            want.cohort_scope(),
+            want.target()
+        )));
+    }
     // §20.5 (PR #852 review) — the ROW's author is the supplied one (a proxy
-    // write's peer); absent that, the claim's attester.
+    // write's peer); absent that, the claim's holder.
     let author = author_key_id
         .map(str::to_owned)
-        .unwrap_or_else(|| attestation.attesting_key_id.clone());
+        .unwrap_or_else(|| read.holder.clone());
+    let refused = |e: super::Error| match e {
+        super::Error::Backend(m) => BlobError::Backend(m),
+        other => BlobError::InvalidArgument(other.to_string()),
+    };
     if !plaintext {
         let held = dir
             .store_planned_announcement(PlannedAnnouncement {
                 sha256: *sha256,
                 author_key_id: author,
                 needs_binding: floor.tier() == CryptoTier::CommunityDek,
-                claim: Some(claim),
             })
             .await?;
-        return if held {
-            Ok(())
-        } else {
-            Err(held_on(
+        if !held {
+            return Err(held_on(
                 super::edition2::fold::reason::BLOB_NOT_HELD,
                 &hex::encode(sha256),
                 BlobError::NotHeld {
                     sha256_hex: hex::encode(sha256),
                 },
-            ))
-        };
+            ));
+        }
+        super::edition2::ingest::put_statement(
+            dir,
+            claim,
+            None,
+            super::edition2::ingest::INGEST_TIER,
+        )
+        .await
+        .map_err(refused)?;
+        return Ok(());
     }
-    dir.store_planned_blob(PlannedBlob {
+    // Held before this call? Then a refused claim leaves the held row as it
+    // was; otherwise the bytes this call stored are reaped (below).
+    let held_before = dir.blob_head(sha256).await?.is_some();
+    let planned = PlannedBlob {
         row: PlannedBlobRow {
             sha256: *sha256,
             storage_kind,
@@ -1122,77 +1157,6 @@ pub(crate) async fn put_blob_planned<D: BlobWriteStore>(
         },
         associate: true,
         binding: None,
-        claim: Some(claim),
-        tombstones,
-        door: "put_blob",
-    })
-    .await
-}
-
-/// v62.0.0 (wave T2) — **the blob door with an edition-2 holding claim**:
-/// `put_blob`'s commons form (`federation`, plaintext) whose claim is a
-/// `custody:{kind}` statement (`here`) instead of a signed JCS row. The
-/// pure checks run first (the claim names THIS blob and THIS size, at
-/// `federation`; the hash-on-write and size cap; the admission gate on the
-/// holder), then the bytes are stored, then the claim goes through the one
-/// statement door (`edition2::ingest::put_statement`): the edition-2
-/// verdict, the custody gate, the holder index the holder directory reads.
-/// A claim refused after the bytes landed reaps the bytes THIS call stored
-/// (`delete_blob_unless_claimed`: kept when any `here` claim cites the blob
-/// at delete time), so a refused claim leaves no bytes; bytes held before
-/// the call stay as they were; an admitted claim finds its bytes held (it
-/// re-stores them after a concurrent reap). Never a claim without bytes.
-pub(crate) async fn put_blob_edition2_planned<D: BlobWriteStore>(
-    dir: &D,
-    sha256: &[u8; 32],
-    body: super::BlobBody,
-    media_type: Option<&str>,
-    claim: &[u8],
-) -> Result<(), BlobError> {
-    use super::types::cohort_scope::{CryptoTier, FEDERATION};
-    let read = super::edition2::typed::holding_claim_of(claim)
-        .map_err(|e| BlobError::InvalidArgument(e.to_string()))?;
-    if read.sha256 != *sha256 {
-        return Err(BlobError::InvalidArgument(format!(
-            "put_blob: the holding claim names blob {}, not {}",
-            hex::encode(read.sha256),
-            hex::encode(sha256)
-        )));
-    }
-    if read.cohort_scope != FEDERATION {
-        return Err(BlobError::InvalidArgument(format!(
-            "put_blob: the commons form's claim is placed at {FEDERATION}, not {:?}",
-            read.cohort_scope
-        )));
-    }
-    let floor = StorageFloor::resolved(CryptoTier::Plaintext);
-    floor.check_scope(FEDERATION)?;
-    let tombstones = tombstone_floor(dir, &[*sha256]).await?;
-    if let Some(gate) = dir.blob_admission_gate() {
-        gate.check_blob(&read.holder).await?;
-    }
-    let (storage_kind, bytes_inline, external_ref, size_bytes) =
-        plan_blob_body("put_blob", sha256, &body, dir.inline_bytes_cap())?;
-    check_claim_size(read.size, body.size_bytes(), "stored")?;
-    // Held before this call? Then a refused claim leaves the held row as it
-    // was; otherwise the bytes this call stored are reaped (below).
-    let held_before = dir.blob_head(sha256).await?.is_some();
-    let planned = PlannedBlob {
-        row: PlannedBlobRow {
-            sha256: *sha256,
-            storage_kind,
-            bytes_inline,
-            external_ref,
-            size_bytes,
-            media_type: media_type.map(str::to_owned),
-            cohort_scope: FEDERATION.to_owned(),
-            tier: floor.tier().as_str().to_owned(),
-            author_key_id: Some(read.holder.clone()),
-            group_key_id: None,
-        },
-        associate: true,
-        binding: None,
-        claim: None,
         tombstones,
         door: "put_blob",
     };
@@ -1213,10 +1177,7 @@ pub(crate) async fn put_blob_edition2_planned<D: BlobWriteStore>(
             // the bytes (the guard and the delete are one transaction).
             dir.delete_blob_unless_claimed(sha256).await?;
         }
-        return Err(match e {
-            super::Error::Backend(m) => BlobError::Backend(m),
-            other => BlobError::InvalidArgument(other.to_string()),
-        });
+        return Err(refused(e));
     }
     // The other side of the race: a concurrent refused writer's reap may
     // have run between this call's store and its claim. The claim stands, so
@@ -1280,7 +1241,6 @@ pub(crate) async fn announce_held_blob_planned<D: BlobWriteStore>(
             sha256: *sha256,
             author_key_id: author_key_id.to_owned(),
             needs_binding: floor.tier() == CryptoTier::CommunityDek,
-            claim: None,
         })
         .await?;
     if held {
@@ -1328,7 +1288,6 @@ pub(crate) async fn store_blob_local_planned<D: BlobWriteStore>(
         },
         associate: tier == super::types::cohort_scope::CryptoTier::Plaintext,
         binding: None,
-        claim: None,
         tombstones,
         door: "store_blob_local",
     })
@@ -1349,9 +1308,11 @@ pub(crate) async fn adopt_sealed_blob_planned<D: BlobWriteStore>(
     floor: StorageFloor,
     binding: Option<EpochBinding>,
     group_key_id: Option<&str>,
-    announce: Option<super::PutBlobAttestation>,
 ) -> Result<[u8; 32], BlobError> {
     use sha2::Digest as _;
+    // v62.0.0 (T2-fix10/fix11; CC 6.1.3) — the adopt floor stores bytes
+    // only: the holding claim is the composite edition-2 statement
+    // `holding_claim::emit_holding_claim` states after the bytes are held.
     floor.check_scope(cohort_scope)?;
     let cap = dir.inline_bytes_cap();
     if envelope_bytes.len() > cap {
@@ -1365,9 +1326,6 @@ pub(crate) async fn adopt_sealed_blob_planned<D: BlobWriteStore>(
     let size_bytes = i64::try_from(envelope_bytes.len()).map_err(|_| {
         BlobError::InvalidArgument("adopt_sealed_blob_at: size_bytes exceeds i64".into())
     })?;
-    if let Some(a) = &announce {
-        check_claim_size(a.size, envelope_bytes.len() as u64, "adopted")?;
-    }
     // v55.0.0 (#989, CC 3.1.3.3 rule 1) — the group a sealed room row names
     // is its binding's community: a group that disagrees is refused.
     if let (Some(b), Some(g)) = (&binding, group_key_id) {
@@ -1381,21 +1339,6 @@ pub(crate) async fn adopt_sealed_blob_planned<D: BlobWriteStore>(
     let group = group_key_id
         .map(str::to_owned)
         .or_else(|| binding.as_ref().map(|b| b.community_key_id.clone()));
-    // The holding claim on the same terms as `put_blob`'s: at the content's
-    // scope, the holder in the cohort.
-    let claim = match announce.as_ref() {
-        Some(a) => {
-            let claim_scope = super::holding_claim::ClaimScope::of_content(
-                floor.tier(),
-                cohort_scope,
-                group.as_deref(),
-            )?;
-            let p = super::holding_claim::prepare_holding_claim_row(&sha256, a, &claim_scope)?;
-            super::holding_claim::check_holding_claim_audience(dir, &p.row).await?;
-            Some(p)
-        }
-        None => None,
-    };
     dir.store_planned_blob(PlannedBlob {
         row: PlannedBlobRow {
             sha256,
@@ -1411,7 +1354,6 @@ pub(crate) async fn adopt_sealed_blob_planned<D: BlobWriteStore>(
         },
         associate: false,
         binding,
-        claim,
         tombstones,
         door: "adopt_sealed_blob_at",
     })

@@ -414,7 +414,7 @@ pub(crate) mod bodies {
         let root = e2::put_key(d, &root_s, &[identity_type::USER]).await;
         // A `supersedes` by the user toward the root naming `target` (64 hex).
         let naming = |label: &str, target: &str| {
-            let mut r = e2::with_earlier_form(|| {
+            let mut r = {
                 ts::bare_attestation(
                     label,
                     &user_s,
@@ -424,7 +424,7 @@ pub(crate) mod bodies {
                         "dimension": TRUST_ACCEPTS_DIMENSION,
                     }),
                 )
-            });
+            };
             r.attestation_type = attestation_type::SUPERSEDES.to_owned();
             r
         };

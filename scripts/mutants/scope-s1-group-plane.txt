@@ -19,5 +19,5 @@
 tests: test(/i148[4-9]|i149[0-2]|i706|group_plane::tests/)
 
 src/federation/group_plane.rs
-src/store/sqlite.rs sqlite_group_link_where group_plane_present read_group_object unlinked_group_objects link_group_plane_row drop_group_projection_row read_group_plane
-src/store/postgres.rs pg_group_link_where group_plane_present read_group_object unlinked_group_objects link_group_plane_row drop_group_projection_row read_group_plane
+src/store/sqlite.rs sqlite_group_link_where group_plane_present read_group_object link_group_plane_row drop_group_projection_row read_group_plane
+src/store/postgres.rs pg_group_link_where group_plane_present read_group_object link_group_plane_row drop_group_projection_row read_group_plane

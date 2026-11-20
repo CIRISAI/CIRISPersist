@@ -67,7 +67,7 @@ pub(crate) mod bodies {
             env[k] = v.clone();
         }
         let id = uuid::Uuid::new_v4().to_string();
-        let mut r = e2::with_earlier_form(|| ts::bare_attestation(&id, who, who, &env));
+        let mut r = ts::bare_attestation(&id, who, who, &env);
         r.attestation_type = attestation_type::SCORES.into();
         r.weight = None;
         r.asserted_at = ms_now();

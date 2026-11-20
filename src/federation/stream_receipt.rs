@@ -175,10 +175,6 @@ pub fn receipt_signing_bytes_of(receipt: &DeliveryReceipt) -> Vec<u8> {
     )
 }
 
-/// The base64 halves of a receipt's bound-hybrid signature (the receipt
-/// keeps the `HybridSignature` shape; it is not a transparency head).
-pub use crate::federation::stream_sth::hybrid_signature_b64_parts;
-
 /// v62.0.0 — decode a stored receipt `signature_blob` (the `HybridSignature`
 /// JSON bytes).
 ///
@@ -193,46 +189,11 @@ pub fn deserialize_receipt_signature(
     })
 }
 
-/// Verify a receipt's subscriber signature against the pinned
-/// `federation_keys` key (Strict). Necessary, NOT sufficient — the
-/// caller MUST additionally JOIN `chunk_root` against a published STH
-/// (§10.5.4 step 2). Mirrors C1b's `verify_stream_sth_signature`.
-pub async fn verify_receipt_signature<F>(
-    directory: &F,
-    receipt: &DeliveryReceipt,
-) -> Result<(), crate::federation::BlobError>
-where
-    F: crate::federation::FederationDirectory,
-{
-    let (ed25519_sig_b64, ml_dsa_65_sig_b64) = hybrid_signature_b64_parts(&receipt.signature);
-    // #1132: an over-long field is refused here, never signed over a
-    // clamped prefix.
-    let signing_bytes = try_receipt_signing_bytes(
-        &receipt.subscriber_key_id,
-        &receipt.stream_id,
-        receipt.epoch,
-        &receipt.chunk_root,
-        receipt.k,
-    )?;
-    crate::verify::verify_hybrid_via_directory(
-        directory,
-        &signing_bytes,
-        &receipt.subscriber_key_id,
-        &ed25519_sig_b64,
-        ml_dsa_65_sig_b64.as_deref(),
-        crate::verify::HybridPolicy::Strict,
-        None,
-    )
-    .await
-    .map(|_| ())
-    .map_err(|e| {
-        crate::federation::BlobError::InvalidArgument(format!(
-            "put_delivery_receipt: subscriber signature verification failed for \
-             key_id={}: {e}",
-            receipt.subscriber_key_id
-        ))
-    })
-}
+// v62.0.0 (F0-cp5; RULINGS "composite signatures only") — the earlier
+// receipt's bound-hybrid verify (`verify_receipt_signature`, Ed25519 +
+// ML-DSA-65 by `subscriber_key_id` through `verify_hybrid_via_directory`) is
+// DELETED with the earlier receipt door's admission: a receipt is a
+// `delivery_receipt:{stream_id}` statement, verified by the edition-2 door.
 
 /// A receipt field one byte longer than a `u32` length prefix can carry
 /// (CIRISPersist#1132). Zero-filled, so the 4 GiB allocation maps the zero

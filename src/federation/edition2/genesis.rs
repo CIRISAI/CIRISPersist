@@ -57,7 +57,7 @@ pub use ciris_verify_core::edition2::genesis::{
     Anchor, BundleReading, Fork, GenesisCharter, GenesisPlacement, GenesisVerdict, PlacedHolder,
     PlacedSeat, PlacedWitness, TipsInCommon,
 };
-use ciris_verify_core::edition2::keys::{check_key_record, KEY_RECORD_FAMILY};
+use ciris_verify_core::edition2::keys::{check_key_record, KeyRecord, KEY_RECORD_FAMILY};
 use ciris_verify_core::edition2::{
     object_id, statement_id, Digest32, KeyDirectory, KeyLookup, KeyOf,
 };
@@ -80,6 +80,7 @@ pub mod token {
         GENESIS_BUNDLE_NOT_ANCHORED as NOT_ANCHORED,
         GENESIS_BUNDLE_PREV_NOT_VALID as PREV_NOT_VALID, GENESIS_BUNDLE_ROW_INVALID as ROW_INVALID,
         GENESIS_BUNDLE_ROW_UNPLACED as ROW_UNPLACED, GENESIS_HOLDER_CUSTODY as HOLDER_CUSTODY,
+        HOLDER_DEVICE_SHARED as DEVICE_SHARED, HOLDER_DEVICE_UNNAMED as DEVICE_UNNAMED,
     };
 
     /// The label of a bundle that waits on a named row or its predecessor
@@ -1036,6 +1037,263 @@ fn named_row_refused(object: &Digest32, row: &Digest32, e: Error) -> Error {
 /// # Errors
 /// The first named row's refusal, under the row's own token
 /// ([`named_row_refused`]).
+/// The hardware class whose device a leaf names by its token serial.
+const CLASS_YUBIKEY_5_FIPS: &str = "YubiKey_5_FIPS";
+
+/// The YubiKey serial extension (`1.3.6.1.4.1.41482.3.7`), its OID's DER
+/// content bytes.
+const OID_YUBICO_SERIAL: [u8; 10] = [0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0xc4, 0x0a, 0x03, 0x07];
+
+/// One DER TLV at the start of `b`: `(tag, contents, rest)`. Single-byte
+/// tags and definite lengths only (an X.509 certificate uses no other);
+/// anything else is `None`.
+fn der_tlv(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = b.split_first()?;
+    if tag & 0x1f == 0x1f {
+        return None;
+    }
+    let (&l0, rest) = rest.split_first()?;
+    let (len, rest) = if l0 < 0x80 {
+        (usize::from(l0), rest)
+    } else {
+        let n = usize::from(l0 & 0x7f);
+        if n == 0 || n > 4 || rest.len() < n {
+            return None;
+        }
+        let len = rest[..n]
+            .iter()
+            .fold(0usize, |a, &x| (a << 8) | usize::from(x));
+        (len, &rest[n..])
+    };
+    if rest.len() < len {
+        return None;
+    }
+    Some((tag, &rest[..len], &rest[len..]))
+}
+
+/// v62.0.0 (C4-fix2; CC 4.2.3) — the token serial a YubiKey PIV
+/// attestation leaf names (extension `1.3.6.1.4.1.41482.3.7`, an OCTET
+/// STRING wrapping a non-negative DER INTEGER, as Verify's verifier reads
+/// it). `None` for a leaf that does not parse as an X.509 certificate, has
+/// no such extension, or carries a value that is not such an integer.
+#[must_use]
+pub fn yubikey_serial(leaf_der: &[u8]) -> Option<u64> {
+    let (0x30, cert, _) = der_tlv(leaf_der)? else {
+        return None;
+    };
+    let (0x30, tbs, _) = der_tlv(cert)? else {
+        return None;
+    };
+    let mut fields = tbs;
+    while !fields.is_empty() {
+        let (tag, body, next) = der_tlv(fields)?;
+        fields = next;
+        // `extensions [3] EXPLICIT Extensions`
+        if tag != 0xa3 {
+            continue;
+        }
+        let (0x30, mut exts, _) = der_tlv(body)? else {
+            return None;
+        };
+        while !exts.is_empty() {
+            let (0x30, ext, next) = der_tlv(exts)? else {
+                return None;
+            };
+            exts = next;
+            let (0x06, oid, after_oid) = der_tlv(ext)? else {
+                return None;
+            };
+            if oid != OID_YUBICO_SERIAL {
+                continue;
+            }
+            // `critical BOOLEAN DEFAULT FALSE`, then `extnValue OCTET STRING`.
+            let (tag, value, after) = der_tlv(after_oid)?;
+            let (tag, value) = if tag == 0x01 {
+                let (t, v, _) = der_tlv(after)?;
+                (t, v)
+            } else {
+                (tag, value)
+            };
+            if tag != 0x04 {
+                return None;
+            }
+            let (0x02, int, tail) = der_tlv(value)? else {
+                return None;
+            };
+            if !tail.is_empty() || int.is_empty() || int[0] & 0x80 != 0 {
+                return None;
+            }
+            let digits = if int.len() > 1 && int[0] == 0 {
+                &int[1..]
+            } else {
+                int
+            };
+            if digits.len() > 8 {
+                return None;
+            }
+            return Some(digits.iter().fold(0u64, |a, &x| (a << 8) | u64::from(x)));
+        }
+        return None;
+    }
+    None
+}
+
+/// v62.0.0 (C4-fix2/3; CC 4.2.3) — what a seated holder's attestation
+/// leaf names as its device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DeviceName {
+    /// The maker's device serial (YubiKey: `1.3.6.1.4.1.41482.3.7`).
+    Serial(u64),
+    /// The SHA-256 of a leaf that names no serial and chains to no vendor
+    /// root (only to a caller-supplied anchor: Verify's vector PKI and the
+    /// test ceremony's MOCK root are such anchors).
+    LeafFingerprint([u8; 32]),
+}
+
+/// v62.0.0 (C4-fix3; CC 4.2.3) — the device a holder's leaf names, by its
+/// HARDWARE CLASS and the provenance of the anchor its chain verifies to:
+///
+/// - `YubiKey_5_FIPS`: the leaf's `.3.7` serial ([`yubikey_serial`]); a leaf
+///   naming none is its own device by fingerprint ONLY if its chain reaches
+///   no vendor anchor (`vendor_rooted == false`), and otherwise names no
+///   device (`None`);
+/// - any other class, or no leaf: `None`.
+///
+/// The same code runs in every build. A production node's attestation store
+/// is Verify's baked store, whose YubiKey anchor is vendor-sourced
+/// (`HardwareValidated`), so every leaf it seats is vendor-rooted and must
+/// name its serial; only a store that also holds a caller-supplied anchor
+/// (a test registers one) seats a leaf that reaches no vendor anchor.
+#[must_use]
+pub fn device_of(
+    hardware_class: &str,
+    leaf: Option<&[u8]>,
+    vendor_rooted: bool,
+) -> Option<DeviceName> {
+    if hardware_class != CLASS_YUBIKEY_5_FIPS {
+        return None;
+    }
+    let leaf = leaf?;
+    match yubikey_serial(leaf) {
+        Some(serial) => Some(DeviceName::Serial(serial)),
+        None if !vendor_rooted => {
+            use sha2::Digest as _;
+            Some(DeviceName::LeafFingerprint(
+                sha2::Sha256::digest(leaf).into(),
+            ))
+        }
+        None => None,
+    }
+}
+
+/// One seated holder's device, as [`distinct_devices`] judges it.
+#[derive(Clone, Copy, Debug)]
+pub struct HolderDevice<'a> {
+    /// The holder's identity reference.
+    pub identity_ref: &'a str,
+    /// What its leaf names ([`device_of`]); `None` names no device.
+    pub device: Option<DeviceName>,
+}
+
+/// v62.0.0 (C4-fix2/3; CC rc21 ad52eb6, CC 4.2.3 "One device per holder")
+/// — the holders a bundle seats name DISTINCT devices. A shared `f9` or
+/// intermediate certificate is not a shared device: only the leaf is read.
+/// `bundle` names the bundle in the message.
+///
+/// # Errors
+/// - `holder_device_unnamed`: a holder names no device;
+/// - `holder_device_shared`: two holders name one device.
+pub fn distinct_devices(bundle: &str, holders: &[HolderDevice<'_>]) -> Result<(), Error> {
+    let mut seen: BTreeMap<DeviceName, &str> = BTreeMap::new();
+    for h in holders {
+        let Some(device) = h.device else {
+            return Err(refuse(
+                token::DEVICE_UNNAMED,
+                format!(
+                    "holder_device_unnamed: holder {}'s attestation leaf names no device (for \
+                     YubiKey_5_FIPS, no serial 1.3.6.1.4.1.41482.3.7): bundle {bundle} is not \
+                     placed (CC 4.2.3); nothing of it is stored",
+                    h.identity_ref
+                ),
+            ));
+        };
+        let shown = match device {
+            DeviceName::Serial(n) => format!("YubiKey serial {n}"),
+            DeviceName::LeafFingerprint(f) => format!("the leaf {}", hex::encode(f)),
+        };
+        if let Some(other) = seen.insert(device, h.identity_ref) {
+            return Err(refuse(
+                token::DEVICE_SHARED,
+                format!(
+                    "holder_device_shared: holders {other} and {} both name {shown}: bundle \
+                     {bundle} is not placed (CC 4.2.3); nothing of it is stored",
+                    h.identity_ref
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Does `rec`'s chain verify to a VENDOR-sourced YubiKey anchor of `roots`
+/// (provenance `VendorOfficial` or stronger)?
+fn vendor_rooted(rec: &KeyRecord, roots: &TrustAnchorStore) -> bool {
+    use ciris_crypto::composite::MLDSA65_PK_LEN;
+    use ciris_verify_core::accord_custody_attestation::verify_yubikey_piv_attestation;
+    use ciris_verify_core::trust_anchor_store::{environments, AnchorProvenance, Purpose};
+    let Some((leaf, above)) = rec.chain.split_first() else {
+        return false;
+    };
+    let above: Vec<&[u8]> = above.iter().map(Vec::as_slice).collect();
+    let ed = &rec.key.as_bytes()[MLDSA65_PK_LEN..];
+    roots
+        .resolve_x509_min_provenance(
+            Purpose::KeyAttestation,
+            environments::YUBIKEY_PIV,
+            AnchorProvenance::VendorOfficial,
+        )
+        .into_iter()
+        .any(|root| verify_yubikey_piv_attestation(leaf, &above, root, ed).is_ok())
+}
+
+/// [`distinct_devices`] over a Valid bundle's placement: each seated
+/// holder's leaf, read from its named `key:record`, judged by
+/// [`device_of`] against the custody gate's own store `roots`. Run on every
+/// Valid offered bundle before anything is stored. CIRISVerify's reader is
+/// told of the rule; until it carries the check, this door does.
+///
+/// # Errors
+/// As [`distinct_devices`].
+fn check_holder_devices(
+    object: &Digest32,
+    p: &GenesisPlacement,
+    rows: &BTreeMap<Digest32, Vec<u8>>,
+    roots: &TrustAnchorStore,
+) -> Result<(), Error> {
+    let devices: Vec<HolderDevice<'_>> = p
+        .holders
+        .iter()
+        .map(|h| {
+            let rec = rows
+                .get(&h.record)
+                .and_then(|s| cose_parts(s))
+                .and_then(|c| check_key_record(&c.payload).ok());
+            let device = rec.as_ref().and_then(|r| {
+                device_of(
+                    &h.hardware_class,
+                    r.chain.first().map(Vec::as_slice),
+                    vendor_rooted(r, roots),
+                )
+            });
+            HolderDevice {
+                identity_ref: h.identity_ref.as_str(),
+                device,
+            }
+        })
+        .collect();
+    distinct_devices(&hex::encode(object), &devices)
+}
+
 fn admit_named(
     object: &Digest32,
     p: &GenesisPlacement,
@@ -1335,6 +1593,9 @@ where
         let Some(p) = o.reading.verdict.placement() else {
             continue;
         };
+        // v62.0.0 (C4-fix2; CC 4.2.3) — one device per holder, before
+        // anything is stored.
+        check_holder_devices(&o.reading.object_id, p, &rows, &roots)?;
         let admitted = admit_named(&o.reading.object_id, p, &o.named, &rows, &held_rows)?;
         plans.push((o, p, admitted));
     }

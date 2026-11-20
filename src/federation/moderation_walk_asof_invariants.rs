@@ -62,6 +62,8 @@ pub mod bodies {
         }
         // The skeleton (switch off), then ONE edition-2 signing step after
         // the subject and the end are set.
+        // CP2 skeleton: the builder's unsigned shape, re-signed as edition 2
+        // (`row_of`) before any door.
         let mut row = fx::with_earlier_form(|| {
             signed_row(granter, recipient, attestation_type::DELEGATES_TO, envelope)
         });

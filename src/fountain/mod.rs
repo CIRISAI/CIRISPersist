@@ -49,7 +49,8 @@ pub mod storage_contention;
 pub mod types;
 
 pub use admit::{
-    check_admission, check_admission_via_envelope, symbol_sha256_hex, FountainAdmitError,
+    check_admission, require_node_local_producer, symbol_sha256_hex, FountainAdmitError,
+    FOUNTAIN_MANIFEST_NOT_CC_OBJECT,
 };
 pub use aggregation::{
     aggregate_corpus_kind, aggregation_member_commitment_from_hex, check_distinct_sources,

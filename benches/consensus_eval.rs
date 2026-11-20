@@ -21,6 +21,10 @@
 //! The multi-device persons view (`KeySelves::of_devices`) is `#[cfg(test)]`
 //! only and is not reachable from a bench.
 //!
+//! v62.0.0 (K1-bench): the `reverse_quorum` cases are renamed
+//! `reverse_quorum_refused/*`: they now time the refusal of a protocol that is
+//! no membership rule, not an evaluation. Every other case is like-for-like.
+//!
 //! Re-run against the baseline:
 //! `cargo bench --bench consensus_eval -- --baseline pre-kernel`.
 
@@ -36,7 +40,11 @@ const ROSTER_SIZES: [usize; 4] = [3, 16, 128, 1024];
 const PROTOCOLS: [(&str, &str); 5] = [
     ("unanimous", cp::UNANIMOUS),
     ("majority", cp::MAJORITY),
-    ("reverse_quorum", "reverse_quorum:2/3:86400"),
+    // v62.0.0 (K1-bench): `reverse_quorum:*` is no longer a membership rule
+    // (RULINGS, "Kernel departures adopted"): `evaluate` refuses it before
+    // any count, so these cases time a REFUSAL, under a new name (the
+    // baseline's `reverse_quorum/*` timed an evaluation).
+    ("reverse_quorum_refused", "reverse_quorum:2/3:86400"),
     ("founder_only", cp::FOUNDER_ONLY),
     ("quorum_2_3", "quorum:2/3"),
 ];

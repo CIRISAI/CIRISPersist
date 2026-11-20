@@ -74,22 +74,17 @@ def engine():
         ciris_persist.engine_teardown_wait(10.0)
 
 
-def test_verify_trace_rejects_an_unknown_key_through_the_detached_path(engine) -> None:
-    """The REJECT path: the lookup runs inside the detach and misses, and the
-    error is built into a ``PyErr`` outside it.
-
-    This is the exact control flow #580 restructured. Before the fix the same
-    lookup happened with the GIL held; the observable answer must be
-    unchanged.
-    """
+def test_verify_trace_refuses_the_earlier_form(engine) -> None:
+    """v62.0.0 (F0-cp5b): a ``CompleteTrace`` with no statement is the earlier
+    form; the dry run refuses it by name, as ``receive_and_persist`` does
+    under full verify (the bound-hybrid verify behind it is deleted)."""
     trace = json.loads(FIXTURE.read_text())
-    trace["signature_key_id"] = "definitely-not-registered-580"
 
     with pytest.raises(ValueError) as excinfo:
         engine.verify_trace(json.dumps(trace))
 
-    assert "verify_unknown_key" in str(excinfo.value), (
-        f"expected the stable verify_unknown_key token, got {excinfo.value!r}"
+    assert "earlier_form_object" in str(excinfo.value), (
+        f"expected the stable earlier_form_object token, got {excinfo.value!r}"
     )
 
 

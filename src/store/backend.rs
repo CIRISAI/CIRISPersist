@@ -545,7 +545,7 @@ pub trait Backend: Send + Sync {
     /// composite + record its aggregation provenance, in ONE transaction:
     ///
     /// 1. Admit the composite via the EXISTING fountain admit path
-    ///    ([`Self::put_fountain_content`] / `check_admission_via_envelope`
+    ///    ([`Self::put_fountain_content`] / `check_admission`
     ///    — the #225 hybrid-manifest verify + per-symbol SHA-256; a
     ///    classical-only composite manifest is REJECTED, the same hard
     ///    cut). Verify-before-mutation (AV-9): nothing is written if the

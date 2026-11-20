@@ -102,7 +102,13 @@ impl SqliteNodeCoreBackend {
 
 impl NodeCoreService for SqliteNodeCoreBackend {
     async fn put_promotion_attestation(&self, att: PromotionAttestation) -> Result<(), Error> {
-        super::verify::verify_envelope_signed(&att, &att.signature, &att.attested_by)?;
+        super::verify::verify_envelope_signed(
+            &self.directory(),
+            &att,
+            &att.signature,
+            &att.attested_by,
+        )
+        .await?;
         let attestation_id = parse_id(&att.attestation_id)?.to_string();
         super::rows::check_promotion_targets(&self.directory(), att.target_kind, &att.target_ids)
             .await?;
@@ -125,9 +131,9 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                     att.attested_by,
                     aggregate_evidence,
                     fmt_datetime(att.attested_at),
-                    att.signature.ed25519,
+                    att.signature.composite,
                     att.attested_by,
-                    att.signature.ed25519,
+                    att.signature.composite,
                 ],
             )
             .map_err(|e| map_sqlite_error(e, "put_promotion_attestation"))?;
@@ -368,27 +374,12 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         attestation: DeliveryAttestation,
     ) -> Result<(), Error> {
         let canonical_hash = attestation.canonical_hash_bytes()?;
-        let sig_classical = attestation.signature_classical_bytes()?;
-        let pqc_bytes = attestation.signature_pqc_bytes()?;
         let directory = self.directory();
         super::rows::check_announcement_held(&directory, &attestation.announcement_id).await?;
-        let canonical = attestation
-            .canonical_bytes()
-            .map_err(|e| Error::Signature(format!("canonical_bytes: {e}")))?;
-        crate::verify::verify_hybrid_via_directory(
-            &directory,
-            &canonical,
-            &attestation.peer_key_id,
-            &attestation.signature_classical_base64,
-            attestation.signature_pqc_base64.as_deref(),
-            // v37.0.0 — Strict, in lockstep with the postgres twin: a policy
-            // that differed between backends would make the accepted set
-            // depend on which backend the node was compiled with.
-            crate::verify::hybrid::HybridPolicy::Strict,
-            None,
-        )
-        .await
-        .map_err(|e| Error::Signature(format!("delivery_attestation verify: {e}")))?;
+        // v62.0.0 (F0-cp5) — ONE composite under the peer's LIVE edition-2
+        // key, the shared check both backends call.
+        let sig_composite =
+            super::verify::verify_delivery_attestation(&directory, &attestation).await?;
         let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation)
             .map_err(|e| Error::Internal(format!("persist_row_hash: {e}")))?;
         let guard = self.conn.lock();
@@ -398,18 +389,16 @@ impl NodeCoreService for SqliteNodeCoreBackend {
             .execute(
                 "INSERT OR IGNORE INTO cirisnode_federation_delivery_attestations (\
                     announcement_id, announcement_canonical_hash, peer_key_id, \
-                    peer_pubkey_ed25519_base64, received_at, transport_id, \
-                    signature_classical, signature_pqc, signature_verified, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9)",
+                    received_at, transport_id, \
+                    signature_composite, signature_verified, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
                 params![
                     attestation.announcement_id,
                     canonical_hash.as_slice(),
                     attestation.peer_key_id,
-                    attestation.peer_pubkey_ed25519_base64,
                     fmt_datetime(attestation.received_at),
                     attestation.transport_id.as_str(),
-                    sig_classical.as_slice(),
-                    pqc_bytes,
+                    sig_composite.as_slice(),
                     persist_row_hash,
                 ],
             )
@@ -433,8 +422,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
             let mut stmt = guard
                 .prepare(
                     "SELECT announcement_id, announcement_canonical_hash, peer_key_id, \
-                            peer_pubkey_ed25519_base64, received_at, transport_id, \
-                            signature_classical, signature_pqc \
+                            received_at, transport_id, signature_composite \
                      FROM cirisnode_federation_delivery_attestations \
                      WHERE announcement_id = ?1 \
                      ORDER BY received_at DESC",
@@ -448,9 +436,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, Vec<u8>>(6)?,
-                        row.get::<_, Option<Vec<u8>>>(7)?,
+                        row.get::<_, Vec<u8>>(5)?,
                     ))
                 })
                 .map_err(|e| map_sqlite_error(e, "list_delivery_attestations query"))?;
@@ -458,7 +444,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
             out.map_err(|e| map_sqlite_error(e, "list_delivery_attestations collect"))?
         };
         let mut out = Vec::with_capacity(rows.len());
-        for (id, hash, peer, pubkey, received_at, transport, sig_c, sig_p) in rows {
+        for (id, hash, peer, received_at, transport, sig) in rows {
             let canonical_hash: [u8; 32] = <[u8; 32]>::try_from(hash.as_slice())
                 .map_err(|_| Error::Backend("stored canonical_hash not 32 bytes".to_string()))?;
             let transport_id = TransportMedium::from_wire_str(&transport).ok_or_else(|| {
@@ -469,14 +455,11 @@ impl NodeCoreService for SqliteNodeCoreBackend {
                 announcement_canonical_hash_base64:
                     super::federation_announcement::encode_canonical_hash_base64(&canonical_hash),
                 peer_key_id: peer,
-                peer_pubkey_ed25519_base64: pubkey,
                 received_at: parse_datetime(&received_at)?,
                 transport_id,
-                signature_classical_base64: super::federation_announcement::encode_signature_base64(
-                    &sig_c,
+                signature_composite_base64: super::federation_announcement::encode_signature_base64(
+                    &sig,
                 ),
-                signature_pqc_base64: sig_p
-                    .map(|b| super::federation_announcement::encode_signature_base64(&b)),
             });
         }
         Ok(out)

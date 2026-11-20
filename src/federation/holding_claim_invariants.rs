@@ -47,8 +47,8 @@
 //!   outside the room is not in the claim's audience.
 //! - **I717** — the claim's scope is the content's at admission: a claim
 //!   about a held blob placed at another scope is refused
-//!   `custody_ack_scope_mismatch`, and `put_holding_claim` refuses a wrong
-//!   scope, a wrong size and a blob it does not hold.
+//!   `custody_ack_scope_mismatch`. (v62.0.0, T2-fix10: the earlier-form
+//!   announce door `put_holding_claim` and its legs are deleted.)
 //! - **I718** — a retired `holds_bytes` row a node still holds is stored and
 //!   reported, never served and never read as a holder; one arriving from a
 //!   peer is refused.
@@ -822,7 +822,6 @@ pub(crate) mod dyn_bodies {
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod blob_bodies {
     use crate::federation::custody_ack::{CustodyState, CUSTODY_ACK_DIMENSION};
-    use crate::federation::holding_claim::ClaimScope;
     use crate::federation::key_grant_invariants::two_node::{
         introduce_as, node_as, seed_community_everywhere,
     };
@@ -1794,23 +1793,11 @@ pub(crate) mod blob_bodies {
             .unwrap();
         let sha = put.at_rest_sha256;
         let head = b.blob_head(&sha).await.unwrap().unwrap();
-        let wrong = ClaimScope::of_content(CryptoTier::Plaintext, cs::FEDERATION, None).unwrap();
-        // the attestation door: a federation claim about the held room blob
-        let claim = crate::federation::holding_claim::sign_holding_claim(
-            &n.signer,
-            &sha,
-            uuid::Uuid::new_v4(),
-            chrono::Utc::now(),
-            head.size_bytes,
-            &wrong,
-        )
-        .await
-        .unwrap();
-        let e = b.put_holding_claim(&sha, claim, &wrong).await.unwrap_err();
-        assert!(
-            e.to_string().contains("custody_ack_scope_mismatch"),
-            "I717 the announce door: {e}"
-        );
+        // v62.0.0 (T2-fix10; CC 6.1.3, ruling 4) — the earlier-form announce
+        // door's legs (`put_holding_claim` with a bound-hybrid claim: the wrong
+        // scope, the wrong size, a blob not held) are DELETED with the door.
+        // A claim is the composite edition-2 statement; its scope is judged at
+        // the attestation door, below.
         let env = crate::federation::custody_ack::custody_ack_envelope(
             &sha,
             CustodyState::Here,
@@ -1829,39 +1816,6 @@ pub(crate) mod blob_bodies {
             e.to_string().contains("custody_ack_scope_mismatch"),
             "I717 the attestation door: {e}"
         );
-        // the right scope, the wrong size
-        let right = crate::federation::holding_claim::content_claim_scope(b, &sha)
-            .await
-            .unwrap()
-            .unwrap();
-        let claim = crate::federation::holding_claim::sign_holding_claim(
-            &n.signer,
-            &sha,
-            uuid::Uuid::new_v4(),
-            chrono::Utc::now(),
-            head.size_bytes + 1,
-            &right,
-        )
-        .await
-        .unwrap();
-        assert!(b.put_holding_claim(&sha, claim, &right).await.is_err());
-        // a blob not held
-        let mut absent = sha;
-        absent[0] ^= 0xff;
-        let claim = crate::federation::holding_claim::sign_holding_claim(
-            &n.signer,
-            &absent,
-            uuid::Uuid::new_v4(),
-            chrono::Utc::now(),
-            1,
-            &right,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            b.put_holding_claim(&absent, claim, &right).await,
-            Err(crate::federation::BlobError::NotHeld { .. })
-        ));
     }
 
     /// **I718** — a retired row a node holds.
@@ -1944,19 +1898,24 @@ pub(crate) mod blob_bodies {
         )
         .await
         .unwrap();
-        // the peer's own claim about the same bytes (it holds a copy too)
-        let sc = ClaimScope::of_content(CryptoTier::Plaintext, cs::FEDERATION, None).unwrap();
-        let claim = crate::federation::holding_claim::sign_holding_claim(
-            &p.signer,
+        // the peer's own claim about the same bytes (it holds a copy too).
+        // v62.0.0 (T2-fix10; CC 6.1.3) — a composite edition-2 `custody`
+        // statement by the peer, through the attestation door (the
+        // bound-hybrid `sign_holding_claim` / `put_holding_claim` are gone).
+        let env = crate::federation::custody_ack::custody_ack_envelope(
             &sha,
-            uuid::Uuid::new_v4(),
-            chrono::Utc::now(),
-            bytes.len() as u64,
-            &sc,
+            CustodyState::Here,
+            Some(bytes.len() as u64),
+            cs::FEDERATION,
+            None,
         )
-        .await
         .unwrap();
-        b.put_holding_claim(&sha, claim, &sc).await.unwrap();
+        let core: crate::federation::envelope::EnvelopeCore = serde_json::from_value(env).unwrap();
+        let input =
+            crate::federation::EmitAttestationInput::with_envelope("scores", core, cs::FEDERATION);
+        crate::federation::attestation_emit::emit_with_local_signer(b, &p.signer, input)
+            .await
+            .expect("I719 the peer's own claim");
         let mut holders = b.list_holders(&sha).await.unwrap();
         holders.sort();
         let mut both = vec![n.key.clone(), p.key.clone()];

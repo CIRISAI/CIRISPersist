@@ -202,7 +202,7 @@ done
 # The leg is skippable ONLY by CERTIFY_SKIP_PYTHON=1, and never silently — the
 # verdict table carries a SKIPPED line and the run stops claiming full
 # certification.
-ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix mutscopes cachetrim cacheunits evidencetsv evidenceptr evidenceptrcc sizetest sizereport floortoken$AXIS_KEYS"
+ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix mutscopes cachetrim cacheunits evidencetsv evidenceptr evidenceptrcc earlierform sizetest sizereport floortoken$AXIS_KEYS"
 
 FOCUS_LEG=""; FOCUS_FILTER=""
 if [ "$MODE" = "focus" ]; then
@@ -609,6 +609,13 @@ run_bg evidencetsv python3 scripts/evidence_tsv_test.py
 # must repoint, which is where the v54 -> v55 dead pointer actually sat.
 run_bg evidenceptr bash -c 'python3 scripts/evidence_pointers_test.py && python3 scripts/evidence_pointers.py check'
 run_bg evidenceptrcc bash -c 'r="${CIRIS_CONSTITUTION_DIR:-../CIRISConstitution}/constitution/claims.tsv"; if [ -f "$r" ]; then python3 scripts/evidence_pointers.py register "$r"; echo "(evidenceptrcc is a report: exit 0 whatever it finds; exit was $?)"; else echo "evidenceptrcc: no Constitution register at $r (set CIRIS_CONSTITUTION_DIR) — not checked"; fi; exit 0'
+# v62.0.0 (JSON-cut slice F; CC 2.6.1.12) — no write door admits the earlier
+# form. From disk, no cargo: every FederationDirectory method, PyO3 door,
+# capsule op and HTTP route that takes a signed object is found, and each must
+# reach `refuse_earlier_form(_row)` unconditionally, be the edition-2 entry, be
+# retired, or carry a written exemption (scripts/earlier_form_doors.tsv). The
+# gate's own witnesses run first: a check nobody has seen fail is a report.
+run_bg earlierform bash -c 'python3 scripts/earlier_form_doors.py --self-test && python3 scripts/earlier_form_doors.py check'
 # v56.0.0 (CIRISPersist#934, #1076 slice T) — size tracking. `sizetest` is the
 # counter's and the table's witnesses (fixture trees, no cargo) and gates like
 # the other tool self-tests. `sizereport` is a REPORT: the per-file delta of
@@ -658,7 +665,7 @@ wait
 # before the expensive legs dispatch, is the point of the fast stage: a compile
 # break under `--features cirisnode` alone should cost seconds, not the full
 # test matrix first.
-FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix mutscopes cachetrim cacheunits evidencetsv evidenceptr evidenceptrcc sizetest sizereport floortoken$AXIS_KEYS"
+FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix mutscopes cachetrim cacheunits evidencetsv evidenceptr evidenceptrcc earlierform sizetest sizereport floortoken$AXIS_KEYS"
 
 # Every `.rc` this run produced must be claimed by a key someone reads. The log
 # directory is wiped at startup, so anything here was written by this run.

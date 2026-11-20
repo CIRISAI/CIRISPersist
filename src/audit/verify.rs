@@ -136,6 +136,19 @@ pub fn truncate_to_micros(dt: chrono::DateTime<chrono::Utc>) -> chrono::DateTime
 ///
 /// [`AuditEntry`]: crate::audit::types::AuditEntry
 pub fn verify_entry_signature(entry: &AuditEntry) -> Result<(), Error> {
+    // v62.0.0 (F0-cp6b; CC 6.1.3, CC 1.13.4) — the one substrate predicate.
+    // An entry's inner Ed25519 signature is verified by no other node (what
+    // is served is the composite-signed head, row hashes and inclusion
+    // proofs), so the plane keeps its own form. Flipped, an entry has no key
+    // a composite would verify under (`actor_id` is the Ed25519 pubkey), so
+    // it is refused by name until the entry carries an identity-ref.
+    use crate::federation::edition2::substrate::{
+        refuse_own_form, substrate_form, SubstrateForm, SubstratePlane,
+    };
+    let form = substrate_form(SubstratePlane::AuditEntry);
+    if form == SubstrateForm::Composite {
+        refuse_own_form(SubstratePlane::AuditEntry).map_err(|e| Error::Signature(e.to_string()))?;
+    }
     if entry.signature.is_empty() {
         return Err(Error::Signature("signature missing".into()));
     }

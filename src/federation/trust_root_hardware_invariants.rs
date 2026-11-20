@@ -13,7 +13,7 @@
 //! across the POLICY, never across versions of one record: every shape is a
 //! fresh root with holders registered the way production registers them.
 
-/// The backend-agnostic witness bodies (I154–I158), each over one
+/// The backend-agnostic witness bodies (I154–I156, I158; I157 deleted at v62), each over one
 /// `&dyn FederationDirectory`; `run` below instantiates them per backend.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod bodies {
@@ -405,69 +405,14 @@ pub mod bodies {
         );
     }
 
-    /// **I157 — replicated records are checked where they land.**
-    pub async fn i157_replicated_records_are_checked_where_they_land(
-        d: &dyn FederationDirectory,
-        tag: &str,
-    ) {
-        let stale = stale_strongbox();
-        let malformed =
-            serde_json::json!({"platform_attestation": {"Android": {"strongbox_backed": "yes"}}});
-        // Malformed evidence on a NON-accord_holder record, by replication:
-        // refused, for the evidence (today: admitted unchecked).
-        let r = ops::apply_replicated_typed_key_with_evidence(
-            d,
-            &format!("{tag}-bad"),
-            identity_type::NODE,
-            Some(malformed),
-        )
-        .await;
-        match r {
-            Err(e) => assert!(
-                e.to_string().contains("malformed"),
-                "{tag} I157: refused FOR THE EVIDENCE, not something else: {e}"
-            ),
-            Ok(o) => panic!(
-                "{tag} I157: a replicated record with malformed evidence was admitted: {o:?}"
-            ),
-        }
-        assert!(
-            d.lookup_public_key(&format!("{tag}-bad"))
-                .await
-                .unwrap()
-                .is_none(),
-            "{tag} I157: a refused row leaves no trace"
-        );
-        // No evidence: admitted (software-class, never downgraded).
-        ops::apply_replicated_typed_key_with_evidence(
-            d,
-            &format!("{tag}-none"),
-            identity_type::NODE,
-            None,
-        )
-        .await
-        .expect("I157: a record with no evidence is admitted");
-        // Stale-nonce VALID evidence by replication: admitted (structure only —
-        // its nonce was fresh where it registered).
-        ops::apply_replicated_typed_key_with_evidence(
-            d,
-            &format!("{tag}-stale"),
-            identity_type::NODE,
-            Some(stale.clone()),
-        )
-        .await
-        .expect("I157: a replicated record's nonce was fresh where it registered");
-        // A locally registering accord_holder with the same stale evidence:
-        // still refused.
-        ops::register_typed_key_with_evidence(
-            d,
-            &format!("{tag}-ah"),
-            identity_type::ACCORD_HOLDER,
-            Some(stale),
-        )
-        .await
-        .expect_err("I157: local admission keeps the freshness leg");
-    }
+    // v62.0.0 (W1-fix5, CP2) — **I157 is DELETED.** Its legs were the
+    // earlier form's: a JSON evidence body on a replicated hybrid record
+    // (`apply_replicated_typed_key_with_evidence`) and the accord-holder nonce
+    // freshness leg at local registration. An edition-2 `key:record` carries no
+    // nonce (the custody gate takes no challenge input, C4-fix I2391); its
+    // evidence is checked for shape where the record lands and walked where a
+    // holder is judged. Restated as W1's I3255 / I3256
+    // (`v62_coverage_invariants`), sqlite and postgres.
 
     /// **I158 — verdicts are memoised by their inputs.** Three holders,
     /// `trust_root_valid` twice → three evaluations, not six. The policy is an
@@ -561,15 +506,6 @@ mod run {
                         &b as &dyn FederationDirectory,
                         &ca,
                         &format!("i156-{}", super::suffix()),
-                    )
-                    .await
-                }
-                #[tokio::test]
-                async fn i157() {
-                    let Some(b) = $fresh.await else { return };
-                    super::super::bodies::i157_replicated_records_are_checked_where_they_land(
-                        &b as &dyn FederationDirectory,
-                        &format!("i157-{}", super::suffix()),
                     )
                     .await
                 }

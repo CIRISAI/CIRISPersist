@@ -1280,31 +1280,6 @@ where
     }
 }
 
-/// Test support: hold `key_id` as a `lenscore_detector` key (a detection
-/// row's attester).
-#[cfg(test)]
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
-pub(crate) async fn test_support_hold<D>(dir: &D, key_id: &str)
-where
-    D: crate::federation::FederationDirectory + ?Sized,
-{
-    if dir
-        .lookup_public_key(key_id)
-        .await
-        .expect("lookup")
-        .is_some()
-    {
-        return;
-    }
-    crate::federation::tier_ingest::test_support::register_hybrid_key_as(
-        dir,
-        key_id,
-        key_id,
-        crate::federation::types::identity_type::LENSCORE_DETECTOR,
-    )
-    .await;
-}
-
 /// Test support: give a bare backend the node identity a hard_case row needs.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {
@@ -1325,29 +1300,6 @@ pub(crate) mod test_support {
     impl DeclaresNode for crate::store::postgres::PostgresBackend {
         fn declare_node_key_for_test(&self, key_id: &str) {
             self.set_node_key_id(key_id);
-        }
-    }
-
-    /// v57.0.0 (CIRISPersist#988) — hold `key_id` as an `identity_type` key,
-    /// unless this directory already holds it (a shared test database).
-    #[cfg(feature = "postgres")]
-    pub(crate) async fn hold_key_as<D>(dir: &D, key_id: &str, identity_type: &str)
-    where
-        D: crate::federation::FederationDirectory + ?Sized,
-    {
-        if dir
-            .lookup_public_key(key_id)
-            .await
-            .expect("lookup")
-            .is_none()
-        {
-            crate::federation::tier_ingest::test_support::register_hybrid_key_as(
-                dir,
-                key_id,
-                key_id,
-                identity_type,
-            )
-            .await;
         }
     }
 
@@ -1418,9 +1370,7 @@ mod tests {
             // earlier shape on purpose: the projection's id fence reads a
             // peer-chosen id (`hard_case_attestation_id`), which an edition-2
             // row (node-computed id) never carries.
-            let mut r = crate::federation::edition2::fixture_switch::with_earlier_form(|| {
-                ts::bare_attestation(id, "i1165-node", "", &envelope)
-            });
+            let mut r = { ts::bare_attestation(id, "i1165-node", "", &envelope) };
             r.attestation_type = super::super::types::attestation_type::SCORES.to_owned();
             r
         };
@@ -1476,9 +1426,7 @@ mod tests {
         let id = hard_case_attestation_id(&event.event_id);
         let row = |envelope: &serde_json::Value| {
             // v62.0.0 — the earlier shape on purpose (see I1165 above).
-            let mut r = crate::federation::edition2::fixture_switch::with_earlier_form(|| {
-                ts::bare_attestation(&id, "i1165-signer", "", envelope)
-            });
+            let mut r = { ts::bare_attestation(&id, "i1165-signer", "", envelope) };
             r.attestation_type = super::super::types::attestation_type::SCORES.to_owned();
             r
         };

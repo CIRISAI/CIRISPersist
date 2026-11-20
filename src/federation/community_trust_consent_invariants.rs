@@ -43,7 +43,7 @@ pub(crate) mod bodies {
     /// A community-trust grant about `node` listing `subjects`, signed by
     /// `attester` (its edition-2 statement's mapped row).
     fn grant(node: &str, subjects: &[&str], attester: &str) -> Attestation {
-        let mut r = e2::with_earlier_form(|| {
+        let mut r = {
             ts::bare_attestation(
                 "",
                 attester,
@@ -53,7 +53,7 @@ pub(crate) mod bodies {
                     "score": 1.0,
                 }),
             )
-        });
+        };
         r.attestation_type = attestation_type::SCORES.to_owned();
         r.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
         e2::row_of(&r, attester)

@@ -1,3 +1,6 @@
+//! **I2390–I2393** (the REAL YubiKey PIV custody chains through the
+//! custody path; see `mod real_custody` at the end of this file).
+//!
 //! **I2310–I2320**: the genesis door, the genesis in force, canonical
 //! standing under ruling C and the accord's halt roster, on sqlite and
 //! postgres, over CIRISVerify 23.3.1's vectors (bundles v3, reseat v2)
@@ -273,14 +276,16 @@ pub(crate) async fn body_named_rows(d: &dyn FederationDirectory) {
     let an = anchor(first).unwrap();
     let offer = first_valid_binding_without(f, "device_class");
     let e = put_genesis_bundle(d, &offer, Some(&an)).await.unwrap_err();
+    // v62.0.0 (Verify 23.3.1) — Verify's bundle reader reads the binding
+    // itself (an occurrence binding with no `device_class` is Invalid in its
+    // place) and refuses the bundle `genesis_bundle_row_invalid` before the
+    // named rows reach their own doors: refused whole, by the reader's token.
     assert_eq!(
         reason(&e),
-        malformed_row::EDITION2_PAYLOAD_INVALID,
-        "I2322: the binding's own refusal: {e:?}"
+        malformed_row::GENESIS_BUNDLE_ROW_INVALID,
+        "I2322: the binding's refusal, read by Verify's bundle reader: {e:?}"
     );
-    // The first missing member is named; at Verify 23.3.1's v3 vectors only
-    // `device_class` is missing (re-signed without it).
-    assert!(message(&e).contains("identity:occurrence"), "I2322: {e:?}");
+    assert!(message(&e).contains("row_invalid"), "I2322: {e:?}");
     assert_eq!(held_voices(d).await, 0, "I2322: no voice stored");
     for s in &offer {
         if let Some(id) = RowId::of_statement(s) {
@@ -960,6 +965,675 @@ pub(crate) async fn body_capsule(
     }
 }
 
+/// v62.0.0 (C4-fix, ceremony gap 3; CC 4.2.2.1) — **I2390–I2393: the REAL
+/// YubiKey PIV custody evidence crosses the edition-2 custody path.** Every
+/// other edition-2 custody fixture is a MOCK 2-cert chain; these witnesses
+/// carry the July holders' (A1, B1, C1) real slot-9c leaves and the real
+/// 4-cert path `9c → f9 → Yubico PIV Attestation B 1 → Yubico Attestation
+/// Intermediate B 1 → Yubico Attestation Root 1`
+/// ([`super::fixture_genesis_real_custody`], public material only).
+///
+/// - I2390 (pure): each fixture certificate is the one its holder's custody
+///   envelope committed to, and each holder's chain verifies to Verify's
+///   BAKED Yubico root (the only `KeyAttestation` root the baked store
+///   resolves for `yubikey-piv`, pinned by its SHA-256) for the holder's own
+///   Ed25519 key: `YubiKey_5_FIPS`, firmware 5.7.4, FIPS, touch always, the
+///   holder's serial.
+/// - I2391 (pure): an edition-2 `key:record` payload over the composite of
+///   the holder's July halves, carrying `attestation_evidence` =
+///   {`hardware_class`, `pq_custody: removable_offline`, `chain`: four CBOR
+///   byte strings, leaf FIRST}, is read by Verify's `check_key_record`
+///   (class and `pq_custody` read back, four certificates), and the custody
+///   gate's check over it (leaf, the path above, the record key's Ed25519
+///   half, the baked root) is `Ok`. The evidence carries no nonce or
+///   challenge, and none is asked for: PIV attests at key generation.
+/// - I2392 (pure): the shapes the path refuses. A chain of hex TEXT strings,
+///   or one hex string, or an empty array, is
+///   `key_record_bad_attestation_evidence`; truncated (no `Intermediate B
+///   1`), reordered, leaf not first, the leaf alone, or one byte of f9
+///   flipped does not verify; `pq_custody: same_element` is read as such
+///   (the gate seats only `removable_offline`).
+/// - I2393 (sqlite, postgres): through `put_genesis_bundle`, a first bundle
+///   whose holder 1 record (signed by its test key) carries the REAL A1
+///   chain as CBOR byte strings, leaf first, is refused
+///   `genesis_holder_custody` / `custody_attested_key_mismatch`. That detail
+///   arises only after the four-cert chain verified to the baked root (the
+///   MOCK root answers `ChainInvalid`, which the gate does not report over a
+///   root that verified), so the door parsed, walked and rooted the real
+///   bytes. Truncated or reordered: `custody_chain_invalid`. As hex text:
+///   `genesis_bundle_row_invalid` / `key_record_bad_attestation_evidence`.
+///   After each, nothing is stored and the node is still pre-genesis; then
+///   the same ceremony with its mock chains is placed (the control).
+///
+/// v62.0.0 (C4-fix2; CC rc21 ad52eb6, CC 4.2.3 "One device per holder") —
+/// **I2394–I2395**:
+///
+/// The device is keyed on the HARDWARE CLASS and the provenance of the
+/// anchor the leaf's chain verifies to, never on a build flag (C4-fix3):
+/// the same code runs in every build, and a production store (Verify's
+/// baked, vendor-sourced Yubico root only) seats no leaf that would take the
+/// fingerprint arm.
+///
+/// - I2394 (pure): the July leaves name three token serials (A1 38165850,
+///   B1 38165563, C1 38165401; extension `1.3.6.1.4.1.41482.3.7`) though
+///   they share one f9, and `distinct_devices` passes them; the same leaf
+///   twice is `holder_device_shared`; a vendor-rooted YubiKey leaf with no
+///   serial, no leaf, or another class is `holder_device_unnamed`; a leaf
+///   with no serial reaching only a caller-supplied anchor (the vector /
+///   MOCK PKI) is its own device by fingerprint.
+/// - I2395 (sqlite, postgres): through `put_genesis_bundle`, a first bundle
+///   whose holders 1 and 2 name one serial in DISTINCT leaves, or whose
+///   holders 1 and 2 carry ONE leaf (two distinct composite keys sharing
+///   their Ed25519 half, which the leaf attests, so both pass custody), is
+///   refused `holder_device_shared` and nothing is stored; the same holders
+///   with three distinct serials are placed.
+///
+/// The real July chains cannot be placed through the door (no holder-signed
+/// statements exist for the July keys; §3 witness 5), so their distinct
+/// serials are witnessed at the judge (I2394), which the door calls.
+mod real_custody {
+    use super::*;
+    use base64::Engine as _;
+    use ciris_crypto::composite::{CompositePublicKey, MLDSA65_PK_LEN};
+    use ciris_verify_core::accord_custody_attestation::{
+        verify_yubikey_piv_attestation, CustodyError, CustodyVerdict,
+    };
+    use ciris_verify_core::edition2::keys::{check_key_record, KeyRecord, PqCustody};
+    use ciris_verify_core::edition2::{cose_key, identity_ref, thumbprint};
+    use ciris_verify_core::trust_anchor_store::{baked, environments, Purpose};
+    use sha2::{Digest as _, Sha256};
+
+    use super::super::fixture_genesis::{
+        ceremony_v2, ceremony_v2_with_holder_evidence, ceremony_v2_with_holders,
+        install_ceremony_v2, mock_attestation_root_der, CeremonySpec, HolderOverride,
+        TestCeremonyV2,
+    };
+    use super::super::fixture_genesis_custody::{
+        HOLDER_CHAINS_HEX, SERIAL_BASE, SERIAL_CHAINS_HEX, SHARED_SERIAL_CHAIN_HEX,
+    };
+    use super::super::fixture_genesis_real_custody::{
+        RealHolder, GENESIS_2_SHA256, REAL_CHAIN_HEX, REAL_CHAIN_SHA256, REAL_HOLDERS,
+    };
+    use super::super::genesis::{
+        device_of, distinct_devices, yubikey_serial, DeviceName, HolderDevice,
+    };
+
+    const CLASS: &str = "YubiKey_5_FIPS";
+
+    fn der(hex_text: &str) -> Vec<u8> {
+        hex::decode(hex_text).expect("fixture hex")
+    }
+
+    fn sha(b: &[u8]) -> String {
+        hex::encode(Sha256::digest(b))
+    }
+
+    fn leaf(h: &RealHolder) -> Vec<u8> {
+        der(h.leaf_9c_hex)
+    }
+
+    /// `[f9, PIV Attestation B 1, Attestation Intermediate B 1]`.
+    fn above() -> Vec<Vec<u8>> {
+        REAL_CHAIN_HEX.iter().map(|h| der(h)).collect()
+    }
+
+    fn ed(h: &RealHolder) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(h.ed25519_b64)
+            .expect("fixture base64")
+    }
+
+    /// The composite of the holder's July halves (`ML-DSA-65 ‖ Ed25519`).
+    fn composite(h: &RealHolder) -> CompositePublicKey {
+        let mldsa = base64::engine::general_purpose::STANDARD
+            .decode(h.mldsa65_b64)
+            .expect("fixture base64");
+        CompositePublicKey::from_halves(&mldsa, &ed(h)).expect("the July halves compose")
+    }
+
+    /// Verify's baked Yubico root: the one `KeyAttestation` root the baked
+    /// store resolves for `yubikey-piv`, at its pinned SHA-256.
+    fn baked_root() -> Vec<u8> {
+        let store = baked::default_store();
+        let roots = store.resolve_x509(Purpose::KeyAttestation, environments::YUBIKEY_PIV);
+        assert_eq!(roots.len(), 1, "the baked store carries one PIV root");
+        let root = roots[0].to_vec();
+        assert_eq!(sha(&root), baked::YUBICO_ROOT_SHA256, "the pinned root");
+        assert_eq!(
+            baked::yubico_attestation_root().expect("the baked root loads"),
+            root
+        );
+        root
+    }
+
+    fn verify(
+        leaf: &[u8],
+        above: &[Vec<u8>],
+        root: &[u8],
+        ed: &[u8],
+    ) -> Result<CustodyVerdict, CustodyError> {
+        let above: Vec<&[u8]> = above.iter().map(Vec::as_slice).collect();
+        verify_yubikey_piv_attestation(leaf, &above, root, ed)
+    }
+
+    fn text(s: &str) -> Value {
+        Value::Text(s.to_owned())
+    }
+
+    /// A deterministic map: entries sorted by their keys' encodings.
+    fn map(mut m: Vec<(&str, Value)>) -> Value {
+        m.sort_by_key(|(k, _)| cde::encode(&text(k)));
+        Value::Map(m.into_iter().map(|(k, v)| (text(k), v)).collect())
+    }
+
+    /// `attestation_evidence` with exactly the three members CC 4.2.2.1
+    /// names: no nonce, no challenge.
+    fn evidence(chain: Value, pq_custody: &str) -> Value {
+        map(vec![
+            ("hardware_class", text(CLASS)),
+            ("pq_custody", text(pq_custody)),
+            ("chain", chain),
+        ])
+    }
+
+    fn bstrs(certs: &[Vec<u8>]) -> Value {
+        Value::Array(certs.iter().cloned().map(Value::Bytes).collect())
+    }
+
+    /// The leaf-first path as CBOR byte strings: `[9c, f9, B 1, Int B 1]`.
+    fn real_chain(h: &RealHolder) -> Vec<Vec<u8>> {
+        let mut c = vec![leaf(h)];
+        c.extend(above());
+        c
+    }
+
+    /// An edition-2 `key:record` payload for `key` carrying `ev`.
+    fn record_payload(key: &CompositePublicKey, ev: Value) -> Value {
+        let iref = identity_ref(&thumbprint(key));
+        map(vec![
+            ("key", cose_key(key)),
+            ("author", text(&iref)),
+            ("asserted_at", Value::Uint(1_780_000_000_000)),
+            ("identity_type", Value::Array(vec![text("accord_holder")])),
+            ("attestation_evidence", ev),
+        ])
+    }
+
+    /// The custody gate's check over a read record (Verify's `custody_gate`
+    /// is private): the leaf, the path above it, the record key's Ed25519
+    /// half, against `root`.
+    fn gate(rec: &KeyRecord, root: &[u8]) -> Result<CustodyVerdict, CustodyError> {
+        let (leaf, above) = rec.chain.split_first().expect("a chain");
+        verify(leaf, above, root, &rec.key.as_bytes()[MLDSA65_PK_LEN..])
+    }
+
+    /// **I2390** — the fixture is the holders' committed bytes, and each real
+    /// 4-cert chain verifies to Verify's baked Yubico root.
+    #[test]
+    fn i2390_each_real_chain_verifies_to_the_baked_yubico_root() {
+        assert_eq!(
+            GENESIS_2_SHA256,
+            "5c474b7993d0c148336da47fd7958baa0a0840521faaf0c2d534a2df9e766972"
+        );
+        for (c, pin) in above().iter().zip(REAL_CHAIN_SHA256) {
+            assert_eq!(
+                sha(c),
+                pin,
+                "I2390: a chain certificate is its pinned bytes"
+            );
+        }
+        let root = baked_root();
+        for h in &REAL_HOLDERS {
+            assert_eq!(sha(&leaf(h)), h.leaf_9c_sha256, "I2390: {} leaf", h.name);
+            let v = verify(&leaf(h), &above(), &root, &ed(h))
+                .unwrap_or_else(|e| panic!("I2390: {} does not verify: {e}", h.name));
+            assert_eq!(v.hardware_class, CLASS, "I2390: {}", h.name);
+            assert_eq!(v.firmware, "5.7.4", "I2390: {}", h.name);
+            assert_eq!(v.serial, Some(h.serial), "I2390: {}", h.name);
+            assert!(v.fips_certified && v.touch_always, "I2390: {}", h.name);
+        }
+    }
+
+    /// **I2391** — the edition-2 `key:record` reads the real evidence (CBOR
+    /// byte strings, leaf first), and the gate's check over it passes for the
+    /// record's own key. No nonce is carried or needed.
+    #[test]
+    fn i2391_the_edition2_record_reads_the_real_chain_with_no_nonce() {
+        let root = baked_root();
+        for h in &REAL_HOLDERS {
+            let key = composite(h);
+            let ev = evidence(bstrs(&real_chain(h)), "removable_offline");
+            assert_eq!(
+                ev.as_map().map(<[(Value, Value)]>::len),
+                Some(3),
+                "I2391: class, pq_custody and chain only: no nonce, no challenge"
+            );
+            let rec = check_key_record(&record_payload(&key, ev))
+                .unwrap_or_else(|e| panic!("I2391: {}: {}", h.name, e.token()));
+            assert_eq!(rec.chain.len(), 4, "I2391: {}: leaf + 3", h.name);
+            assert_eq!(
+                rec.chain[0],
+                leaf(h),
+                "I2391: {}: the leaf is first",
+                h.name
+            );
+            assert_eq!(rec.hardware_class.as_deref(), Some(CLASS), "I2391");
+            assert_eq!(rec.pq_custody, Some(PqCustody::RemovableOffline), "I2391");
+            let v = gate(&rec, &root)
+                .unwrap_or_else(|e| panic!("I2391: {}: the gate's check: {e}", h.name));
+            assert_eq!(v.hardware_class, rec.hardware_class.clone().unwrap());
+            assert_eq!(v.serial, Some(h.serial), "I2391: {}", h.name);
+        }
+    }
+
+    /// **I2392** — the chain shapes the path refuses.
+    #[test]
+    fn i2392_wrong_chain_shapes_are_refused() {
+        let root = baked_root();
+        let h = &REAL_HOLDERS[0];
+        let key = composite(h);
+        let read = |chain: Value| {
+            check_key_record(&record_payload(&key, evidence(chain, "removable_offline")))
+        };
+        let bad = "key_record_bad_attestation_evidence";
+        // Hex TEXT: an array of hex strings, or one hex string, or nothing.
+        let hex_texts = Value::Array(
+            real_chain(h)
+                .iter()
+                .map(|c| Value::Text(hex::encode(c)))
+                .collect(),
+        );
+        assert_eq!(
+            read(hex_texts).unwrap_err().token(),
+            bad,
+            "I2392: hex text array"
+        );
+        let one = Value::Text(real_chain(h).iter().map(hex::encode).collect());
+        assert_eq!(read(one).unwrap_err().token(), bad, "I2392: one hex string");
+        assert_eq!(
+            read(Value::Array(Vec::new())).unwrap_err().token(),
+            bad,
+            "I2392: an empty chain"
+        );
+        // Byte strings, but not the path: each reads, and fails the walk.
+        let (leaf9c, path) = (leaf(h), above());
+        let chain_invalid = |c: Vec<Vec<u8>>, what: &str| {
+            let rec = read(bstrs(&c)).unwrap_or_else(|e| panic!("I2392 {what}: {}", e.token()));
+            match gate(&rec, &root) {
+                Err(CustodyError::ChainInvalid { .. } | CustodyError::CertParse { .. }) => {}
+                other => panic!("I2392 {what}: want a broken chain, got {other:?}"),
+            }
+        };
+        chain_invalid(
+            vec![leaf9c.clone(), path[0].clone(), path[1].clone()],
+            "truncated (no Intermediate B 1)",
+        );
+        chain_invalid(
+            vec![
+                leaf9c.clone(),
+                path[0].clone(),
+                path[2].clone(),
+                path[1].clone(),
+            ],
+            "reordered",
+        );
+        chain_invalid(
+            vec![
+                path[0].clone(),
+                leaf9c.clone(),
+                path[1].clone(),
+                path[2].clone(),
+            ],
+            "leaf not first",
+        );
+        chain_invalid(vec![leaf9c.clone()], "the leaf alone");
+        let mut flipped = path.clone();
+        let mid = flipped[0].len() / 2;
+        flipped[0][mid] ^= 0x01;
+        let mut c = vec![leaf9c];
+        c.extend(flipped);
+        chain_invalid(c, "one byte of f9 flipped");
+        // pq_custody is read as stated; the gate seats only removable_offline.
+        let rec = check_key_record(&record_payload(
+            &key,
+            evidence(bstrs(&real_chain(h)), "same_element"),
+        ))
+        .unwrap();
+        assert_eq!(rec.pq_custody, Some(PqCustody::SameElement), "I2392");
+    }
+
+    /// The holder-1 record carries the REAL A1 evidence; holders 2 and 3 keep
+    /// their MOCK chains (their root registered, as the install helper does).
+    fn with_holder1(spec: &CeremonySpec, chain: Value) -> TestCeremonyV2 {
+        ceremony_v2_with_holder_evidence(
+            spec,
+            spec.holders[0],
+            evidence(chain, "removable_offline"),
+        )
+    }
+
+    async fn offer(d: &dyn FederationDirectory, t: &TestCeremonyV2) -> Error {
+        let mut statements: Vec<Vec<u8>> = t
+            .rows_in_put_order()
+            .into_iter()
+            .map(|r| r.statement.clone())
+            .collect();
+        statements.extend(t.voices.iter().cloned());
+        put_genesis_bundle(d, &statements, Some(&t.anchor()))
+            .await
+            .expect_err("I2393: the bundle is not placed")
+    }
+
+    async fn still_pre_genesis(d: &dyn FederationDirectory, t: &TestCeremonyV2, what: &str) {
+        let g = genesis_in_force(d).await.unwrap();
+        assert!(
+            g.head.is_none() && g.valid.is_empty(),
+            "I2393 {what}: pre-genesis"
+        );
+        assert_eq!(held_voices(d).await, 0, "I2393 {what}: no voice stored");
+        assert!(
+            d.edition2_voices(&RowId(t.holders[0].record.row_id))
+                .await
+                .unwrap()
+                .is_empty(),
+            "I2393 {what}: the holder record is not stored"
+        );
+        assert!(
+            roster_in_force(d, &t.spec.family_key_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "I2393 {what}: no halt roster"
+        );
+    }
+
+    /// **I2393** — the real chain through the bundle door.
+    pub(super) async fn body_real_custody(d: &dyn FederationDirectory) {
+        add_test_attestation_root(mock_attestation_root_der());
+        let spec = CeremonySpec::standard();
+        let a1 = &REAL_HOLDERS[0];
+        let (leaf9c, path) = (leaf(a1), above());
+
+        let real = with_holder1(&spec, bstrs(&real_chain(a1)));
+        let e = offer(d, &real).await;
+        assert_eq!(
+            reason(&e),
+            malformed_row::GENESIS_HOLDER_CUSTODY,
+            "I2393: {e:?}"
+        );
+        assert!(
+            message(&e).starts_with("custody_attested_key_mismatch"),
+            "I2393: the real chain verified to the baked root and reached the key \
+             comparison: {e:?}"
+        );
+        still_pre_genesis(d, &real, "real chain").await;
+
+        for (what, chain) in [
+            (
+                "truncated",
+                vec![leaf9c.clone(), path[0].clone(), path[1].clone()],
+            ),
+            (
+                "reordered",
+                vec![
+                    leaf9c.clone(),
+                    path[0].clone(),
+                    path[2].clone(),
+                    path[1].clone(),
+                ],
+            ),
+        ] {
+            let t = with_holder1(&spec, bstrs(&chain));
+            let e = offer(d, &t).await;
+            assert_eq!(
+                reason(&e),
+                malformed_row::GENESIS_HOLDER_CUSTODY,
+                "I2393 {what}: {e:?}"
+            );
+            assert!(
+                message(&e).starts_with("custody_chain_invalid"),
+                "I2393 {what}: {e:?}"
+            );
+            still_pre_genesis(d, &t, what).await;
+        }
+
+        let hex_texts = Value::Array(
+            real_chain(a1)
+                .iter()
+                .map(|c| Value::Text(hex::encode(c)))
+                .collect(),
+        );
+        let t = with_holder1(&spec, hex_texts);
+        let e = offer(d, &t).await;
+        assert_eq!(
+            reason(&e),
+            malformed_row::GENESIS_BUNDLE_ROW_INVALID,
+            "I2393 hex text: {e:?}"
+        );
+        assert!(
+            message(&e).starts_with("key_record_bad_attestation_evidence"),
+            "I2393 hex text: {e:?}"
+        );
+        still_pre_genesis(d, &t, "hex text").await;
+
+        // The control: the same ceremony with every holder's MOCK chain is
+        // placed, so each refusal above is the chain's.
+        let control = ceremony_v2(&spec);
+        install_ceremony_v2(d, &control)
+            .await
+            .unwrap_or_else(|e| panic!("I2393 control: {e:?}"));
+        assert!(
+            genesis_in_force(d).await.unwrap().head.is_some(),
+            "I2393 control: placed"
+        );
+    }
+
+    /// A MOCK chain from a `(seed, [leaf, f9])` table.
+    fn mock_chain(table: &[(u8, [&str; 2])], seed: u8) -> Vec<Vec<u8>> {
+        table
+            .iter()
+            .find(|(n, _)| *n == seed)
+            .map(|(_, c)| c.iter().map(|h| der(h)).collect())
+            .unwrap_or_else(|| panic!("no mock chain for seed {seed}"))
+    }
+
+    /// A holder whose `YubiKey_5_FIPS` leaf is judged by [`device_of`].
+    fn device<'a>(iref: &'a str, leaf: Option<&Vec<u8>>, vendor_rooted: bool) -> HolderDevice<'a> {
+        HolderDevice {
+            identity_ref: iref,
+            device: device_of(CLASS, leaf.map(Vec::as_slice), vendor_rooted),
+        }
+    }
+
+    /// `distinct_devices`' refusal over `hs`: (reason, message).
+    fn refusal(hs: &[HolderDevice<'_>]) -> (&'static str, String) {
+        let e = distinct_devices("b", hs).unwrap_err();
+        (reason(&e), message(&e))
+    }
+
+    /// **I2394** — one device per holder, at the judge, keyed on the hardware
+    /// class and the anchor's provenance (no build flag).
+    #[test]
+    fn i2394_one_device_per_holder_at_the_judge() {
+        let leaves: Vec<Vec<u8>> = REAL_HOLDERS.iter().map(leaf).collect();
+        let serials: Vec<Option<u64>> = leaves.iter().map(|l| yubikey_serial(l)).collect();
+        assert_eq!(
+            serials,
+            vec![Some(38_165_850), Some(38_165_563), Some(38_165_401)],
+            "I2394: A1, B1, C1 name three serials"
+        );
+        for (h, s) in REAL_HOLDERS.iter().zip(&serials) {
+            assert_eq!(*s, Some(u64::from(h.serial)), "I2394: {}", h.name);
+        }
+        // Vendor-rooted (the baked Yubico root): the device is the serial.
+        // The three share one f9 (the fixture carries one chain) and pass.
+        let real: Vec<HolderDevice<'_>> = REAL_HOLDERS
+            .iter()
+            .zip(&leaves)
+            .map(|(h, l)| device(h.name, Some(l), true))
+            .collect();
+        for (d, s) in real.iter().zip(&serials) {
+            assert_eq!(d.device, s.map(DeviceName::Serial), "I2394: the serial");
+        }
+        distinct_devices("b", &real).expect("I2394: three devices");
+        let twice = [
+            device("A1", Some(&leaves[0]), true),
+            device("X", Some(&leaves[0]), true),
+        ];
+        let (r, m) = refusal(&twice);
+        assert_eq!(r, malformed_row::HOLDER_DEVICE_SHARED, "I2394: {m}");
+        assert!(m.contains("38165850"), "I2394: names the serial: {m}");
+        // A leaf naming a serial is that serial whatever its anchor.
+        assert_eq!(
+            device("A1", Some(&leaves[0]), false).device,
+            Some(DeviceName::Serial(38_165_850))
+        );
+        // A YubiKey leaf naming NO serial: vendor-rooted, it names no device
+        // (what a production store sees); reaching only a caller-supplied
+        // anchor (the vector / MOCK PKI), it is its own device by fingerprint.
+        let m1 = mock_chain(&HOLDER_CHAINS_HEX, 1);
+        let m2 = mock_chain(&HOLDER_CHAINS_HEX, 2);
+        assert_eq!(
+            yubikey_serial(&m1[0]),
+            None,
+            "I2394: the vector PKI's leaves carry no serial"
+        );
+        let (r, _) = refusal(&[device("1", Some(&m1[0]), true)]);
+        assert_eq!(
+            r,
+            malformed_row::HOLDER_DEVICE_UNNAMED,
+            "I2394: vendor-rooted, no serial"
+        );
+        assert!(matches!(
+            device("1", Some(&m1[0]), false).device,
+            Some(DeviceName::LeafFingerprint(_))
+        ));
+        distinct_devices(
+            "b",
+            &[
+                device("1", Some(&m1[0]), false),
+                device("2", Some(&m2[0]), false),
+            ],
+        )
+        .expect("I2394: two mock leaves, two devices");
+        let (r, _) = refusal(&[
+            device("1", Some(&m1[0]), false),
+            device("2", Some(&m1[0]), false),
+        ]);
+        assert_eq!(
+            r,
+            malformed_row::HOLDER_DEVICE_SHARED,
+            "I2394: one mock leaf twice"
+        );
+        // No leaf, or a class that names no device: unnamed.
+        let (r, _) = refusal(&[device("1", None, false)]);
+        assert_eq!(r, malformed_row::HOLDER_DEVICE_UNNAMED, "I2394: no leaf");
+        for class in ["TPM_2_0", "Apple_Secure_Enclave", "MOCK"] {
+            assert_eq!(
+                device_of(class, Some(leaves[0].as_slice()), true),
+                None,
+                "I2394: {class}"
+            );
+        }
+        // The serial-bearing mock leaves read back; the shared one names 1's.
+        for n in 1..=3u8 {
+            let c = mock_chain(&SERIAL_CHAINS_HEX, n);
+            assert_eq!(
+                yubikey_serial(&c[0]),
+                Some(SERIAL_BASE + u64::from(n)),
+                "I2394"
+            );
+        }
+        assert_eq!(
+            yubikey_serial(&der(SHARED_SERIAL_CHAIN_HEX[0])),
+            Some(SERIAL_BASE + 1),
+            "I2394: the shared-serial leaf"
+        );
+        // Bytes that are not a certificate name nothing.
+        assert_eq!(
+            yubikey_serial(&leaves[0][..40]),
+            None,
+            "I2394: a truncated leaf"
+        );
+        assert_eq!(yubikey_serial(&[]), None);
+    }
+
+    fn holder(seed: u8, mldsa: u8, ed: u8, chain: Vec<Vec<u8>>) -> HolderOverride {
+        HolderOverride {
+            seed,
+            mldsa_seed: [mldsa; 32],
+            ed25519_seed: [ed; 32],
+            evidence: evidence(bstrs(&chain), "removable_offline"),
+        }
+    }
+
+    /// **I2395** — one device per holder, through the bundle door.
+    pub(super) async fn body_one_device(d: &dyn FederationDirectory) {
+        add_test_attestation_root(mock_attestation_root_der());
+        let spec = CeremonySpec::standard();
+        let serial = |n: u8| holder(n, n, n + 100, mock_chain(&SERIAL_CHAINS_HEX, n));
+
+        // Holders 1 and 2 name one serial in two distinct leaves.
+        let shared_chain: Vec<Vec<u8>> = SHARED_SERIAL_CHAIN_HEX.iter().map(|h| der(h)).collect();
+        let t = ceremony_v2_with_holders(
+            &spec,
+            &[serial(1), holder(2, 2, 102, shared_chain), serial(3)],
+        );
+        let e = offer(d, &t).await;
+        assert_eq!(
+            reason(&e),
+            malformed_row::HOLDER_DEVICE_SHARED,
+            "I2395 serial: {e:?}"
+        );
+        assert!(
+            message(&e).contains(&format!("YubiKey serial {}", SERIAL_BASE + 1)),
+            "I2395 serial: {e:?}"
+        );
+        still_pre_genesis(d, &t, "one serial").await;
+
+        // Holders 1 and 2 carry ONE leaf: holder 2's key shares holder 1's
+        // Ed25519 half (seed 101), so the leaf attests both and both pass
+        // custody; only the device rule refuses the seat.
+        let t = ceremony_v2_with_holders(
+            &spec,
+            &[holder(2, 2, 101, mock_chain(&HOLDER_CHAINS_HEX, 1))],
+        );
+        let e = offer(d, &t).await;
+        assert_eq!(
+            reason(&e),
+            malformed_row::HOLDER_DEVICE_SHARED,
+            "I2395 leaf: {e:?}"
+        );
+        still_pre_genesis(d, &t, "one leaf").await;
+
+        // Three serials: placed.
+        let t = ceremony_v2_with_holders(&spec, &[serial(1), serial(2), serial(3)]);
+        install_ceremony_v2(d, &t)
+            .await
+            .unwrap_or_else(|e| panic!("I2395 three serials: {e:?}"));
+        assert!(
+            genesis_in_force(d).await.unwrap().head.is_some(),
+            "I2395: placed"
+        );
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2395_sqlite() {
+    let d = sqlite().await;
+    Box::pin(real_custody::body_one_device(&d)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2395_postgres() {
+    let Some(d) = postgres().await else {
+        return;
+    };
+    Box::pin(real_custody::body_one_device(&d)).await;
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn i2323_genesis_import_crosses_the_capsule_sqlite() {
@@ -970,6 +1644,13 @@ async fn i2323_genesis_import_crosses_the_capsule_sqlite() {
         sqlite().await,
     );
     Box::pin(body_capsule(&a, &b, &c, &d)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2393_sqlite() {
+    let d = sqlite().await;
+    Box::pin(real_custody::body_real_custody(&d)).await;
 }
 
 #[cfg(feature = "postgres")]
@@ -984,4 +1665,13 @@ async fn i2323_genesis_import_crosses_the_capsule_postgres() {
         return;
     };
     Box::pin(body_capsule(&a, &b, &c, &d)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2393_postgres() {
+    let Some(d) = postgres().await else {
+        return;
+    };
+    Box::pin(real_custody::body_real_custody(&d)).await;
 }

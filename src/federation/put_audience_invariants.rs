@@ -98,9 +98,8 @@ pub(crate) mod bodies {
             "confidence": 0.9,
             "community_key_id": e2::kid_or_keep(room),
         });
-        let mut r = e2::with_earlier_form(|| {
-            ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), author, author, &env)
-        });
+        let mut r =
+            { ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), author, author, &env) };
         r.attestation_type = attestation_type::SCORES.into();
         r.weight = None;
         r.cohort_scope = cohort_scope::COMMUNITY.into();

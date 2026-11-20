@@ -82,6 +82,44 @@ pub(crate) const KEYS_EDITION_TWO_PG_CONSTRAINTS: &[&str] = &[
     "federation_keys_edition_two_ids",
 ];
 
+/// v62.0.0 (F0-cp5; RULINGS "composite signatures only") — the CIRISNode
+/// delivery attestation's change, made IN V300's edition-1 `CREATE TABLE`
+/// (V300 is unshipped; no `ALTER … DROP COLUMN`, which a system SQLite older
+/// than 3.35 cannot run): the earlier denormalised peer pubkey and the
+/// classical / PQC signature pair give way to ONE composite
+/// (`signature_composite`, 3373 bytes). The I1950 witness reads it as the
+/// one table whose edition-1 DDL edition 2 changes: on SQLite this text
+/// replaces the frozen catalog's; on PostgreSQL the columns and constraints
+/// below are excluded from each side.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const DELIVERY_SQLITE_DDL: &str = "CREATE TABLE cirisnode_federation_delivery_attestations (\n    announcement_id              TEXT NOT NULL,\n    announcement_canonical_hash  BLOB NOT NULL\n        CHECK (length(announcement_canonical_hash) = 32),\n    peer_key_id                  TEXT NOT NULL,\n    received_at                  TEXT NOT NULL,\n    transport_id                 TEXT NOT NULL\n        CHECK (transport_id IN ('reticulum', 'tcp_tls', 'http_over_tls', 'other')),\n    signature_composite          BLOB NOT NULL\n        CHECK (length(signature_composite) = 3373),\n    inserted_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),\n    signature_verified           INTEGER NOT NULL DEFAULT 0,\n    persist_row_hash             TEXT NOT NULL,\n    PRIMARY KEY (announcement_id, peer_key_id)\n)";
+
+/// The delivery-attestation table: its SQLite name, its PostgreSQL name.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const DELIVERY_TABLE: (&str, &str) = (
+    "cirisnode_federation_delivery_attestations",
+    "cirisnode.federation_delivery_attestations",
+);
+/// The columns edition 2 removed from the table, and the (PostgreSQL)
+/// constraints that went with them.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const DELIVERY_DROPPED_COLUMNS: &[&str] = &[
+    "peer_pubkey_ed25519_base64",
+    "signature_classical",
+    "signature_pqc",
+];
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const DELIVERY_DROPPED_PG_CONSTRAINTS: &[&str] = &[
+    "federation_delivery_attestations_signature_classical_check",
+    "federation_delivery_attestations_signature_pqc_check",
+];
+/// The column, and the (PostgreSQL) constraint, it adds.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const DELIVERY_ADDED_COLUMNS: &[&str] = &["signature_composite"];
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const DELIVERY_ADDED_PG_CONSTRAINTS: &[&str] =
+    &["federation_delivery_attestations_signature_composite_check"];
+
 /// The signer FKs edition 1 had and edition 2 keeps (I1950 checks them
 /// present): an edition-2 signer is projected into `federation_keys`.
 #[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
@@ -348,26 +386,42 @@ mod tests {
         let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
         #[cfg(feature = "sqlite")]
         if dialect == "sqlite" {
-            let head = "object\ttable\tfederation_keys\tfederation_keys\t";
+            for (table, alters) in [("federation_keys", super::KEYS_EDITION_TWO_SQLITE)] {
+                let head = format!("object\ttable\t{table}\t{table}\t");
+                let line = lines
+                    .iter_mut()
+                    .find(|l| l.starts_with(&head))
+                    .unwrap_or_else(|| panic!("{table} in the fixture"));
+                let ddl = unesc(&line[head.len()..]);
+                let c = rusqlite::Connection::open_in_memory().unwrap();
+                c.execute_batch(&ddl).unwrap();
+                for alter in alters {
+                    c.execute_batch(alter).unwrap();
+                }
+                let after: String = c
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE name = ?1",
+                        [table],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_ne!(after, ddl, "the edition-2 change to {table} applied");
+                *line = format!("{head}{}", esc(&after));
+            }
+            // v62.0.0 (F0-cp5) — the delivery table's edition-2 DDL, edited in
+            // V300's CREATE TABLE: its text replaces the frozen one.
+            let table = super::DELIVERY_TABLE.0;
+            let head = format!("object\ttable\t{table}\t{table}\t");
             let line = lines
                 .iter_mut()
-                .find(|l| l.starts_with(head))
-                .expect("federation_keys in the fixture");
-            let ddl = unesc(&line[head.len()..]);
-            let c = rusqlite::Connection::open_in_memory().unwrap();
-            c.execute_batch(&ddl).unwrap();
-            for alter in super::KEYS_EDITION_TWO_SQLITE {
-                c.execute_batch(alter).unwrap();
-            }
-            let after: String = c
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE name = 'federation_keys'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_ne!(after, ddl, "the edition-2 columns applied");
-            *line = format!("{head}{}", esc(&after));
+                .find(|l| l.starts_with(&head))
+                .unwrap_or_else(|| panic!("{table} in the fixture"));
+            assert_ne!(
+                unesc(&line[head.len()..]),
+                super::DELIVERY_SQLITE_DDL,
+                "the frozen edition-1 delivery DDL differs from edition 2's"
+            );
+            *line = format!("{head}{}", esc(super::DELIVERY_SQLITE_DDL));
         }
         lines
     }
@@ -409,9 +463,29 @@ mod tests {
         for a in super::KEYS_EDITION_TWO_SQLITE {
             assert_eq!(sqlite.matches(a).count(), 1, "I1950: {a}");
         }
+        assert_eq!(
+            sqlite.matches(super::DELIVERY_SQLITE_DDL).count(),
+            1,
+            "I1950: the delivery table's edition-2 DDL is V300's own text"
+        );
         let pg = std::fs::read_to_string(root.join("postgres/lens/V300__edition2_baseline.sql"))
             .unwrap();
         assert_eq!(pg.matches(super::KEYS_EDITION_TWO_POSTGRES).count(), 1);
+        // The PostgreSQL delivery table carries the composite, not the
+        // earlier columns (its edition-1 DDL edited in place).
+        let at = pg
+            .find("CREATE TABLE cirisnode.federation_delivery_attestations (")
+            .expect("the delivery table in V300 (postgres)");
+        let block = &pg[at..at + pg[at..].find("\n);").expect("its end")];
+        for c in super::DELIVERY_DROPPED_COLUMNS {
+            assert!(!block.contains(c), "I1950: {c} is gone (postgres)");
+        }
+        assert!(block.contains("signature_composite bytea NOT NULL"));
+        assert!(!pg.contains("DROP COLUMN"), "I1950: no DROP COLUMN in V300");
+        assert!(
+            !sqlite.contains("DROP COLUMN"),
+            "I1950: no DROP COLUMN in V300"
+        );
     }
 
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -505,8 +579,69 @@ mod tests {
             super::KEYS_EDITION_TWO_COLUMNS.len() + super::KEYS_EDITION_TWO_PG_CONSTRAINTS.len(),
             "I1950: the federation_keys additions are there"
         );
-        let got: Vec<String> = all.into_iter().filter(|l| !added(l)).collect();
-        let want = fixture("postgres");
+        // v62.0.0 (F0-cp5) — the delivery attestation's change: its added
+        // column and constraint leave `got`, its dropped ones leave `want`,
+        // and its columns are compared without their position (a dropped
+        // column renumbers the ones after it).
+        let (dcol, dcon) = (
+            format!("col\t{}\t", super::DELIVERY_TABLE.1),
+            format!("con\t{}\t", super::DELIVERY_TABLE.1),
+        );
+        let delivery = |l: &String, cols: &[&str], cons: &[&str]| {
+            (l.starts_with(&dcol) && cols.iter().any(|c| l.split('\t').nth(3) == Some(c)))
+                || (l.starts_with(&dcon) && cons.iter().any(|k| l.split('\t').nth(2) == Some(k)))
+        };
+        let unposition = |l: String| -> String {
+            if l.starts_with(&dcol) {
+                let mut f: Vec<&str> = l.split('\t').collect();
+                f[2] = "_";
+                f.join("\t")
+            } else {
+                l
+            }
+        };
+        let n_delivery = all
+            .iter()
+            .filter(|l| {
+                delivery(
+                    l,
+                    super::DELIVERY_ADDED_COLUMNS,
+                    super::DELIVERY_ADDED_PG_CONSTRAINTS,
+                )
+            })
+            .count();
+        assert_eq!(
+            n_delivery,
+            super::DELIVERY_ADDED_COLUMNS.len() + super::DELIVERY_ADDED_PG_CONSTRAINTS.len(),
+            "I1950: the delivery attestation's composite column is there"
+        );
+        let mut got: Vec<String> = all
+            .into_iter()
+            .filter(|l| !added(l))
+            .filter(|l| {
+                !delivery(
+                    l,
+                    super::DELIVERY_ADDED_COLUMNS,
+                    super::DELIVERY_ADDED_PG_CONSTRAINTS,
+                )
+            })
+            .map(unposition)
+            .collect();
+        let mut want: Vec<String> = fixture("postgres")
+            .into_iter()
+            .filter(|l| {
+                !delivery(
+                    l,
+                    super::DELIVERY_DROPPED_COLUMNS,
+                    super::DELIVERY_DROPPED_PG_CONSTRAINTS,
+                )
+            })
+            .map(unposition)
+            .collect();
+        // Both sides re-sorted: the unpositioned lines no longer sort as the
+        // positioned ones did.
+        got.sort();
+        want.sort();
         assert!(want.len() > 1500, "I1950: the fixture is edition 1's");
         assert!(got == want, "I1950 (postgres):\n{}", diff(&want, &got));
         for t in super::EDITION_TWO_ADDITIONS {

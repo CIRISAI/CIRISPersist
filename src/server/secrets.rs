@@ -72,8 +72,9 @@ use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 
-use crate::federation::edition2::ingest::{held_keys_for_kid, kid_of_identity_ref};
-use crate::federation::edition2::liveness::Liveness;
+use crate::federation::edition2::composite_verify::{
+    now_ms, verify_composite_via_directory, CompositeVerifyError,
+};
 use crate::federation::types::delegation_scope;
 use crate::federation::{admission, trust_root, FederationDirectory};
 use crate::secrets::types::MasterKeyRef;
@@ -306,69 +307,36 @@ where
             format!("{HEADER_SIGNATURE} is not base64: {e}"),
         )
     })?;
-    let Some(kid) = kid_of_identity_ref(&key_id) else {
-        return Err(error_response(
-            StatusCode::UNAUTHORIZED,
-            KIND_SIGNATURE_UNKNOWN_KEY,
-            format!(
-                "{HEADER_KEY_ID} {key_id:?} is not an edition-2 identity-ref \
-                 (urn:ietf:params:oauth:ckt:sha-256:…); v62.0.0 authenticates only \
-                 edition-2 keys"
-            ),
-        ));
-    };
-    let held = held_keys_for_kid(directory, &kid)
-        .await
-        .map_err(|e| directory_unavailable(&e, "caller key records"))?;
-    let now = crate::host::clock::now();
-    let at = u64::try_from(now.timestamp_millis()).unwrap_or(0);
-    let record = match held.liveness(&kid, at) {
-        Liveness::Live(record) => record,
-        Liveness::NotHeld | Liveness::Invalid => {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                KIND_SIGNATURE_UNKNOWN_KEY,
-                format!("this node holds no valid key:record for {key_id}"),
-            ));
-        }
-        Liveness::Revoked => {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                KIND_SIGNER_NOT_LIVE,
-                format!("{key_id} is revoked"),
-            ));
-        }
-        Liveness::NotCovered => {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                KIND_SIGNER_NOT_LIVE,
-                format!("no record of {key_id} covers this node's clock ({now})"),
-            ));
-        }
-        Liveness::Waiting(keys) => {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                KIND_SIGNER_NOT_LIVE,
-                format!(
-                    "{key_id}'s record waits on {} key(s) this node does not hold",
-                    keys.len()
-                ),
-            ));
-        }
-    };
     let message = canonical_request(method.as_str(), path_and_query(uri), body);
-    if let Err(e) = record.key.verify(&message, &sig) {
+    // v62.0.0 (F0-cp5) — the one directory-backed composite verifier, shared
+    // with the pipeline ingest, CIRISNode and the capsule.
+    if let Err(e) =
+        verify_composite_via_directory(directory, &message, &key_id, &sig, now_ms()).await
+    {
+        let kind = match &e {
+            CompositeVerifyError::Directory(inner) => {
+                return Err(directory_unavailable(inner, "caller key records"));
+            }
+            CompositeVerifyError::NotIdentityRef(_) | CompositeVerifyError::UnknownKey(_) => {
+                KIND_SIGNATURE_UNKNOWN_KEY
+            }
+            CompositeVerifyError::Revoked(_)
+            | CompositeVerifyError::NotCovered { .. }
+            | CompositeVerifyError::Waiting { .. } => KIND_SIGNER_NOT_LIVE,
+            CompositeVerifyError::ComponentSignature { .. } | CompositeVerifyError::Invalid(_) => {
+                KIND_SIGNATURE_INVALID
+            }
+        };
         tracing::warn!(
             error = %e,
             key_id = %key_id,
-            "secrets route rejected: composite signature failed"
+            "secrets route rejected: composite signature refused"
         );
         return Err(error_response(
             StatusCode::UNAUTHORIZED,
-            KIND_SIGNATURE_INVALID,
+            kind,
             format!(
-                "the composite signature does not verify over \
-                 canonical_request({}, {:?}, <{} body bytes>) under {key_id}'s live key: {e}",
+                "{e} (over canonical_request({}, {:?}, <{} body bytes>))",
                 method.as_str(),
                 path_and_query(uri),
                 body.len()

@@ -972,10 +972,9 @@ pub(crate) async fn licence_withdrawal_body(d: &dyn FederationDirectory) {
 async fn earlier_form_shut_body(d: &dyn FederationDirectory) {
     let row = crate::federation::genesis::ordinary_scores_row("v1-earlier", "v1-earlier-key");
     let roster = vec!["v1-earlier-key".to_owned()];
-    let counted =
-        super::door::with_earlier_form_doors_shut(voices::counted_roster_signers(d, &row, &roster))
-            .await
-            .unwrap();
+    let counted = voices::counted_roster_signers(d, &row, &roster)
+        .await
+        .unwrap();
     assert!(
         counted.is_empty(),
         "I3287 an earlier-form row counts nobody once the doors are shut"

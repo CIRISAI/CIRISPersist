@@ -16,7 +16,8 @@
 //!   like a SHA-256 in either case.
 //! - **I201** (v52.0.0, #953) — a stored receipt lists with the
 //!   `received_at` this node stored it at, and the plain listing is the same
-//!   receipts.
+//!   receipts. v62.0.0 (T2-fix9): the receipt is node B's edition-2
+//!   `delivery_receipt` statement through A's statement door.
 
 pub(crate) mod bodies {
     use crate::federation::epoch_minter_invariants::bodies::{ladder, Pick};
@@ -192,7 +193,7 @@ pub(crate) mod bodies {
     ) where
         B: BlobStorage + FederationDirectory + Sync + 'static,
     {
-        use crate::federation::stream_receipt::{receipt_signing_bytes, DeliveryReceipt};
+        use crate::federation::edition2::fixture_switch as e2;
         let l = ladder(dsn_a, dsn_b, run, pick).await;
         let put = l
             .engine_a
@@ -212,20 +213,23 @@ pub(crate) mod bodies {
             .await
             .unwrap();
         l.ba.put_stream_sth(sth.clone(), &l.node_a).await.unwrap();
-        let subscriber =
-            crate::federation::tier_ingest::test_support::local_signer(&format!("em-b-{run}"));
-        assert_eq!(subscriber.federation_id().await, l.node_b);
-        let bytes = receipt_signing_bytes(&l.node_b, &sid, 0, &sth.root_hash, 1);
-        let receipt = DeliveryReceipt {
-            stream_id: sid.clone(),
-            subscriber_key_id: l.node_b.clone(),
-            epoch: 0,
-            k: 1,
-            chunk_root: sth.root_hash,
-            signature: subscriber.sign_hybrid(&bytes).await.unwrap(),
-        };
+        // v62.0.0 (T2-fix9; F0-cp5 open item c) — B's receipt is its
+        // edition-2 `delivery_receipt:{stream_id}` statement, signed by B's
+        // seed (the ladder's node B key), through A's statement door: the
+        // earlier hybrid receipt drove the door F0-cp2 shut. The subject
+        // (the stored instant and the two listings) is unchanged.
+        let b_seed = format!("em-b-{run}");
+        assert_eq!(e2::kid(&b_seed), l.node_b, "I201: B's seed is node B's key");
+        let receipt = e2::delivery_receipt_statement(
+            &b_seed,
+            &sid,
+            0,
+            1,
+            &sth.root_hash,
+            e2::ms(chrono::Utc::now()),
+        );
         let before = chrono::Utc::now() - chrono::Duration::seconds(5);
-        l.ba.put_delivery_receipt(receipt)
+        e2::put_statement(&*l.ba, &receipt)
             .await
             .expect("I201: the receipt is stored");
         let after = chrono::Utc::now() + chrono::Duration::seconds(5);

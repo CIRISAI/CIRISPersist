@@ -634,66 +634,6 @@ pub struct GoalsFilter {
     pub include_retired: bool,
 }
 
-/// A pre-V204 `goals` row: a typed goal no row backs (`attestation_id` NULL).
-#[derive(Debug, Clone, PartialEq)]
-pub struct LegacyGoal {
-    /// Its v59 id.
-    pub goal_id: String,
-    /// Its declarer.
-    pub declared_by_key_id: String,
-    /// Its statement.
-    pub goal_text: String,
-    /// Its scale (V204 mapped `single_declarer` to `self`).
-    pub scale: String,
-    /// Its cohort.
-    pub cohort_id: Option<String>,
-    /// `meta_dimension`.
-    pub meta_dimension: String,
-    /// `meta_rationale`.
-    pub meta_rationale: String,
-    /// `meta_deliberation`, as stored.
-    pub meta_deliberation: Option<serde_json::Value>,
-    /// Was it retired?
-    pub retired: bool,
-}
-
-impl LegacyGoal {
-    /// The body a rehome re-signs, or `None` when the legacy goal cannot be a
-    /// row (its M-1 or scope would be refused by the gate).
-    #[must_use]
-    pub fn rehome_input(&self) -> Option<GoalInput> {
-        let deliberation_ref = match &self.meta_deliberation {
-            None | Some(serde_json::Value::Null) => None,
-            Some(v) => Some(serde_json::from_value(v.clone()).ok()?),
-        };
-        let input = GoalInput {
-            goal_text: self.goal_text.clone(),
-            scale: self.scale.clone(),
-            cohort_id: self.cohort_id.clone(),
-            meta_goal_alignment: MetaGoalAlignment::new(
-                M1Dimension::from_wire_str(&self.meta_dimension)?,
-                self.meta_rationale.clone(),
-                deliberation_ref,
-            ),
-            score: 1.0,
-        };
-        goal_envelope(&input).ok()?;
-        Some(input)
-    }
-}
-
-/// What a rehome did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GoalRehome {
-    /// This node's legacy goals re-signed as rows (and the legacy row
-    /// removed).
-    pub rehomed: usize,
-    /// Legacy goals removed without a row: another declarer's (persist
-    /// cannot sign for it; the typed row carried no signature of theirs), or
-    /// one the gate would refuse.
-    pub dropped: usize,
-}
-
 /// Canonicalize `goal_text` for byte-stable comparison (the
 /// `goal_text_canonical` column): trim, collapse ASCII whitespace runs.
 pub fn canonicalize_goal_text(text: &str) -> String {
@@ -721,14 +661,12 @@ pub fn canonicalize_goal_text(text: &str) -> String {
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 impl crate::Engine {
     /// v60.0.0 — **declare a goal**: this engine's `goal:{scale}:v1` row.
-    /// Returns its `attestation_id`, the goal's id. Rehomes any pre-V204
-    /// goal first.
+    /// Returns its `attestation_id`, the goal's id.
     ///
     /// # Errors
     ///
     /// The gate's refusals; the plane's.
     pub async fn put_goal(&self, input: &GoalInput) -> Result<String, Error> {
-        self.rehome_legacy_goals().await?;
         self.emit_attestation_self(plan_goal_row(input)?).await
     }
 
@@ -805,49 +743,6 @@ impl crate::Engine {
             goal_id,
         )?)
         .await
-    }
-
-    /// v60.0.0 — **move every pre-V204 goal off the table** (the ledger
-    /// rehome precedent). A legacy goal carries no `attestation_id`, so the
-    /// projection rebuild is red while one remains. This node's own goal is
-    /// re-signed as a row (and withdrawn again when it was retired) and its
-    /// legacy row removed; any other declarer's is removed: persist cannot
-    /// sign for another key, and the typed row never carried that key's
-    /// signature. A legacy goal the gate would refuse is removed too. A no-op
-    /// when none remain.
-    ///
-    /// # Errors
-    ///
-    /// A table read or delete; a refused emit (the legacy row stays).
-    pub async fn rehome_legacy_goals(&self) -> Result<GoalRehome, Error> {
-        let dir = self.federation_directory();
-        let legacy = dir.legacy_goals().await?;
-        let mut out = GoalRehome::default();
-        if legacy.is_empty() {
-            return Ok(out);
-        }
-        let me = self
-            .local_derived_key_id()
-            .await
-            .map_err(|e| Error::Backend(format!("goal signer: {e}")))?;
-        for g in legacy {
-            match g.rehome_input().filter(|_| g.declared_by_key_id == me) {
-                Some(input) => {
-                    let id = self.emit_attestation_self(plan_goal_row(&input)?).await?;
-                    if g.retired {
-                        self.emit_attestation_self(plan_goal_retraction_row(
-                            attestation_type::WITHDRAWS,
-                            &id,
-                        )?)
-                        .await?;
-                    }
-                    out.rehomed += 1;
-                }
-                None => out.dropped += 1,
-            }
-            dir.delete_legacy_goal(&g.goal_id).await?;
-        }
-        Ok(out)
     }
 }
 
@@ -1059,64 +954,6 @@ mod tests {
             decode_goal_input("not json").unwrap_err(),
             Error::InvalidArgument(_)
         ));
-    }
-
-    /// I1176 (unit) — a legacy goal rehomes iff the gate would admit its
-    /// body.
-    #[test]
-    fn i1176_a_legacy_goal_rehomes_iff_its_body_is_admissible() {
-        let g = LegacyGoal {
-            goal_id: "l-1".into(),
-            declared_by_key_id: "k".into(),
-            goal_text: "t".into(),
-            scale: "cohort".into(),
-            cohort_id: Some("c".into()),
-            meta_dimension: "justice".into(),
-            meta_rationale: "r".into(),
-            meta_deliberation: Some(
-                serde_json::json!({"artifact_type": "pdma", "artifact_id": "p"}),
-            ),
-            retired: true,
-        };
-        let i = g.rehome_input().expect("admissible");
-        assert_eq!(i.scale, "cohort");
-        assert_eq!(
-            i.meta_goal_alignment
-                .deliberation_ref
-                .unwrap()
-                .artifact_type,
-            "pdma"
-        );
-        for bad in [
-            LegacyGoal {
-                meta_rationale: String::new(),
-                ..g.clone()
-            },
-            LegacyGoal {
-                meta_dimension: "greed".into(),
-                ..g.clone()
-            },
-            LegacyGoal {
-                meta_deliberation: Some(serde_json::json!(3)),
-                ..g.clone()
-            },
-            LegacyGoal {
-                cohort_id: None,
-                ..g.clone()
-            },
-        ] {
-            assert!(bad.rehome_input().is_none(), "{bad:?}");
-        }
-        let none = LegacyGoal {
-            meta_deliberation: Some(serde_json::Value::Null),
-            ..g
-        };
-        assert!(none
-            .rehome_input()
-            .unwrap()
-            .meta_goal_alignment
-            .deliberation_ref
-            .is_none());
     }
 
     #[test]

@@ -931,14 +931,6 @@ pub(crate) trait GroupPlaneStore: super::FederationDirectory {
         attestation_id: &str,
     ) -> Result<(), Error>;
 
-    /// The SIGNED projection rows of `table` that name no row yet
-    /// (`attestation_id IS NULL`): the rehome's work list (V206's partial
-    /// index makes the probe free when there is none).
-    async fn unlinked_group_objects(
-        &self,
-        table: GroupPlaneTable,
-    ) -> Result<Vec<GroupSigned>, Error>;
-
     /// Every SIGNED projection row of `table` (`authority_key_id` set), as
     /// the signed object it stores and the `attestation_id` it names; and
     /// every row on the attestation plane of the table's families.
@@ -964,23 +956,6 @@ pub(crate) enum GroupRowSync {
     WithoutRow,
     /// No projection row is held under the link.
     NotHeld,
-}
-
-/// **The row follows its object**: read the signed object the projection row
-/// `link` names back as stored (so the row is over what this backend keeps),
-/// mint its row and point the projection at it. Every group write door calls
-/// this once its typed write landed; a supersede calls it for the new head.
-/// An object with no row (unsigned, Ed25519-only) is held without one: the
-/// pointer is cleared and the rebuild gate names a signed one.
-///
-/// # Errors
-///
-/// [`plan_group_row`]'s refusal; the executor's.
-pub(crate) async fn sync_group_row<D>(dir: &D, link: GroupRowLink) -> Result<GroupRowSync, Error>
-where
-    D: GroupPlaneStore + ?Sized,
-{
-    sync_group_row_offered(dir, link, None).await
 }
 
 /// [`sync_group_row`] with the object the door was handed. The row is minted
@@ -1690,51 +1665,6 @@ where
             .await?;
     }
     Ok(())
-}
-
-/// v61 (CIRISPersist#991) — what the one-way rehome at open found: every
-/// signed v60 group record and roster event now has its row, except these.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GroupRehomeReport {
-    /// Projection rows given their row this pass.
-    pub linked: u64,
-    /// Signed projection rows held without a row (Ed25519-only): counted,
-    /// named by the rebuild gate, never re-signed.
-    pub without_row: u64,
-}
-
-/// v61 (CIRISPersist#991) — **the v60 typed rows rehomed once**: every signed
-/// group record and roster event a v60 node holds is given its group-plane
-/// row (minted from the stored object, the key plane's rule), before anything
-/// reads or serves. Idempotent: a linked row is skipped by the probe.
-///
-/// # Errors
-///
-/// The executor's.
-pub(crate) async fn rehome_group_records<D>(dir: &D) -> Result<GroupRehomeReport, Error>
-where
-    D: GroupPlaneStore + ?Sized,
-{
-    let mut report = GroupRehomeReport::default();
-    if !dir.group_plane_present().await? {
-        return Ok(report);
-    }
-    for table in GroupPlaneTable::ALL {
-        for signed in dir.unlinked_group_objects(table).await? {
-            match sync_group_row(dir, signed.link()).await? {
-                GroupRowSync::Linked => report.linked += 1,
-                GroupRowSync::WithoutRow => report.without_row += 1,
-                GroupRowSync::NotHeld => {}
-            }
-        }
-    }
-    tracing::info!(
-        linked = report.linked,
-        without_row = report.without_row,
-        "group-plane rehome at open (v61, CIRISPersist#991): every signed v60 group record \
-         and roster event has its row; the counted rest is held without one (Ed25519-only)"
-    );
-    Ok(report)
 }
 
 /// The projection gate for one group table (`check_projection_rebuild`'s

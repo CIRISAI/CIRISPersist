@@ -59,9 +59,7 @@ use ciris_verify_core::edition2::sign_row_statement;
 use super::door_invariants::fixture::*;
 use super::ingest::{held_keys_for_kid, put_statement, StatementOutcome, INGEST_TIER};
 use super::liveness::{Liveness, RevokerStanding};
-use super::projection::{
-    edition_of_key_record, project_key, project_key_with, EDITION_ONE, EDITION_TWO,
-};
+use super::projection::{edition_of_key_record, project_key, project_key_with, EDITION_TWO};
 use crate::federation::types::Attestation;
 use crate::federation::{malformed_row, Error, FederationDirectory};
 
@@ -590,34 +588,9 @@ pub(crate) async fn body(d: &dyn FederationDirectory, raw: &Raw<'_>) {
         "I2005: the owner's, not the stranger's"
     );
 
-    // I2001: an earlier-form key answers 1 both ways (a stored JSON key).
-    // v62.0.0 (slice E6) — the earlier form on purpose: the builders emit
-    // edition 2 by default, and this leg needs a stored JSON key.
-    let json = super::fixture_switch::with_earlier_form(|| {
-        crate::federation::tier_ingest::test_support::replicated_key_record(
-            "j0-json-key",
-            "agent",
-            "j0-json-key",
-            "j0-json-key",
-            "j0",
-        )
-    });
-    d.put_public_key(crate::federation::SignedKeyRecord {
-        record: json.clone(),
-    })
-    .await
-    .unwrap();
-    assert_eq!(
-        d.key_edition(&json.key_id).await.unwrap(),
-        Some(EDITION_ONE),
-        "I2001 column, earlier form"
-    );
-    let held_json = d.lookup_public_key(&json.key_id).await.unwrap().unwrap();
-    assert_eq!(
-        edition_of_key_record(&held_json),
-        EDITION_ONE,
-        "I2001 provided, earlier form"
-    );
+    // v62.0.0 (slice F) — the earlier-form leg of I2001 (a JSON key through
+    // `put_public_key`, read back as edition 1) is deleted: that door refuses
+    // the earlier form by name now (I2872).
     assert_eq!(
         d.key_edition("j0-not-held").await.unwrap(),
         None,
@@ -626,7 +599,8 @@ pub(crate) async fn body(d: &dyn FederationDirectory, raw: &Raw<'_>) {
 
     // ── I2007b: an earlier-form row is never overwritten ──
     let squat = key(74);
-    // The earlier form on purpose (see I2001 above).
+    // CP2 skeleton: a key record used only for its pubkey column in the raw
+    // INSERT below (beneath every door); it reaches no door.
     let json_squat = super::fixture_switch::with_earlier_form(|| {
         crate::federation::tier_ingest::test_support::replicated_key_record(
             "j0-squat", "agent", "j0-squat", "j0-squat", "j0",
@@ -719,19 +693,14 @@ pub(crate) async fn body(d: &dyn FederationDirectory, raw: &Raw<'_>) {
     );
 }
 
-/// I2009 on a fresh open of the store `body` filled: the rehome and the two
-/// rebuild gates leave the read models alone.
+/// I2009 on a fresh open of the store `body` filled: the open (which runs no
+/// legacy rehome since v62.0.0 C2-fix2) and the two rebuild gates leave the
+/// read models alone.
 pub(crate) async fn read_models_are_not_earlier_form_rows(
-    report: crate::federation::key_plane::KeyPlaneRehomeReport,
     keys: crate::federation::silo_projection::ProjectionRebuild,
     revocations: crate::federation::silo_projection::ProjectionRebuild,
     raw: &Raw<'_>,
 ) {
-    assert_eq!(
-        report.keys_without_row, 0,
-        "I2009: no projection counted: {report:?}"
-    );
-    assert_eq!(report.revocations_without_row, 0, "I2009: {report:?}");
     assert_eq!(keys.divergence(), None, "I2009: the key rebuild gate");
     assert_eq!(
         revocations.divergence(),
@@ -914,7 +883,6 @@ async fn i2000_to_i2009_sqlite() {
     b.run_migrations().await.unwrap();
     use crate::federation::attestation_admit::AttestationStore as _;
     use crate::federation::silo_projection::SiloProjection;
-    let report = b.rehome_key_plane_at_open().await.unwrap();
     let keys = b
         .projection_rebuild(SiloProjection::FederationKeys)
         .await
@@ -923,7 +891,7 @@ async fn i2000_to_i2009_sqlite() {
         .projection_rebuild(SiloProjection::FederationRevocations)
         .await
         .unwrap();
-    read_models_are_not_earlier_form_rows(report, keys, revs, &Raw::Sqlite(&b)).await;
+    read_models_are_not_earlier_form_rows(keys, revs, &Raw::Sqlite(&b)).await;
 }
 
 #[cfg(feature = "postgres")]
@@ -945,7 +913,6 @@ async fn i2000_to_i2009_postgres() {
     b.run_migrations().await.unwrap();
     use crate::federation::attestation_admit::AttestationStore as _;
     use crate::federation::silo_projection::SiloProjection;
-    let report = b.rehome_key_plane_at_open().await.unwrap();
     let keys = b
         .projection_rebuild(SiloProjection::FederationKeys)
         .await
@@ -954,5 +921,5 @@ async fn i2000_to_i2009_postgres() {
         .projection_rebuild(SiloProjection::FederationRevocations)
         .await
         .unwrap();
-    read_models_are_not_earlier_form_rows(report, keys, revs, &Raw::Pg(&b)).await;
+    read_models_are_not_earlier_form_rows(keys, revs, &Raw::Pg(&b)).await;
 }

@@ -34,12 +34,22 @@
 //! stored under the row id THIS node computes from the bytes, never under an
 //! id a peer offers ([`token::ROW_ID_MISMATCH`]).
 
+// v62.0.0 (F0-cp5) — the one directory-backed composite verifier.
+/// v62.0.0 (C5-fix3) — the one composite key / signature half split.
+pub mod composite;
+pub mod composite_verify;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod composite_verify_invariants;
 pub mod door;
 pub mod emit;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod fixture_genesis;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod fixture_genesis_custody;
+// v62.0.0 (C4-fix, ceremony gap 3) — the REAL July holders' YubiKey PIV
+// custody evidence (public certificates and keys), for I2390–I2393.
+#[cfg(test)]
+pub(crate) mod fixture_genesis_real_custody;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod fixture_occurrence;
 #[cfg(any(test, feature = "test-anchor"))]
@@ -88,6 +98,8 @@ mod second_signer_voice_invariants;
 pub mod serve;
 pub mod standing;
 pub mod store;
+// v62.0.0 (F0-cp6) — the CC 6.1.3 substrate planes and their one predicate.
+pub mod substrate;
 pub mod transport_rebind;
 pub mod trust_root_group;
 pub mod typed;
@@ -103,6 +115,8 @@ mod composer_invariants;
 mod door_invariants;
 // v62.0.0 (wave P1e) — I2925: the emit side states every family digest
 // member (needs edition2::payloads, so it lands at syn1 with P1e.patch).
+#[cfg(test)]
+mod doors_shut_invariants;
 #[cfg(test)]
 mod earlier_form_refusal_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -124,7 +138,11 @@ mod group_serve_invariants;
 #[cfg(test)]
 mod halt_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod halt_lifecycle_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod ingest_invariants;
+#[cfg(test)]
+mod open_legacy_invariants;
 // v62.0.0 (CC 2.7, wave P9) — I3600, I3601, I3603: a wait is a wait on every
 // surface.
 #[cfg(test)]
@@ -174,6 +192,10 @@ mod projection_invariants;
 mod rebind_held_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod recovery_signer_invariants;
+// v62.0.0 (JSON-cut slice F) — I2874–I2876: an edition-2 holder recovery,
+// the old key's halt it voids, and the earlier-form recovery refused.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod recovery_halt_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod standing_invariants;
 #[cfg(test)]
@@ -191,7 +213,7 @@ mod typed_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod typed_purge_rooted_invariants;
 // v62.0.0 (v62 P8) — I3530: an external edition-2 holding claim (the door
-// Python's `put_blob_edition2` calls) admitted on a second node.
+// Python's `put_blob` calls) admitted on a second node.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod external_claim_invariants;
 // v62.0.0 (v62 P8) — I3535–I3537: the detection producer on edition 2.

@@ -105,6 +105,13 @@ pub enum FormVerifyError {
     /// The composite does not verify.
     #[error("signature_invalid: {0}")]
     Invalid(String),
+    /// v62.0.0 (E6-fix6) — the signer's LIVE key plane refused it, by name
+    /// (`verify_unknown_key`, `verify_signer_revoked`,
+    /// `verify_signer_not_covered`, `verify_signer_waiting`,
+    /// `verify_not_identity_ref`, …): see
+    /// [`verify_composite_via_directory`](super::edition2::composite_verify::verify_composite_via_directory).
+    #[error(transparent)]
+    Live(#[from] super::edition2::composite_verify::CompositeVerifyError),
 }
 
 /// The pinned keys a signature verifies under: a federation key's two halves.
@@ -130,6 +137,7 @@ impl PinnedKeys {
     ///
     /// # Errors
     /// [`FormVerifyError::Key`] when a half is missing or does not decode.
+    #[allow(clippy::result_large_err)] // X2 4d: the error type is the owner's (box it there)
     pub fn composite(&self) -> Result<CompositePublicKey, FormVerifyError> {
         let key = |m: String| FormVerifyError::Key(m);
         let pqc = self
@@ -152,6 +160,7 @@ impl PinnedKeys {
 ///
 /// # Errors
 /// [`FormVerifyError`].
+#[allow(clippy::result_large_err)] // X2 4d: the error type is the owner's (box it there)
 pub fn verify_sth_signature(
     sth: &SignedTreeHead,
     sig: &[u8],
@@ -164,11 +173,22 @@ pub fn verify_sth_signature(
         .map_err(|e| FormVerifyError::Invalid(e.to_string()))
 }
 
-/// Resolve `key_id` in `directory` and [`verify_sth_signature`].
+/// Verify `sig` over `sth`'s signing bytes under `key_id`'s **LIVE** key.
+///
+/// v62.0.0 (E6-fix6, F0-cp6c §3) — the key is resolved through the edition-2
+/// key plane ([`verify_composite_via_directory`](super::edition2::composite_verify::verify_composite_via_directory):
+/// `held_keys_for_kid`, then liveness at NOW), never the projected
+/// `federation_keys` row (`lookup_public_key`), which carries no revocation
+/// and no record window. Storing a transparency head is a live act (CC
+/// 2.6.1.7; CC 2.4.1.1: a key's rows count only while a record of it is live
+/// and unrevoked), so a revoked, not-covered, waiting or unknown signer is
+/// refused by name. The instant is this node's clock, never the head's own
+/// timestamp (a signer-chosen instant).
 ///
 /// # Errors
-/// [`FormVerifyError::Key`] for an unknown key or a directory fault (fail
-/// closed); otherwise as [`verify_sth_signature`].
+/// [`FormVerifyError::Form`] for an earlier-form or unrecognized signature
+/// (before any key is read); [`FormVerifyError::Live`] for the key plane's
+/// refusal or a composite that does not verify under the live key.
 pub async fn verify_sth_signature_via_directory<F>(
     directory: &F,
     sth: &SignedTreeHead,
@@ -178,15 +198,13 @@ pub async fn verify_sth_signature_via_directory<F>(
 where
     F: super::FederationDirectory + ?Sized,
 {
+    use super::edition2::composite_verify::{now_ms, verify_composite_via_directory};
     // The form first: an earlier-form object is refused by name before any
     // key is looked up.
     classify(sig)?;
-    let rec = directory
-        .lookup_public_key(key_id)
-        .await
-        .map_err(|e| FormVerifyError::Key(format!("key {key_id:?}: directory: {e}")))?
-        .ok_or_else(|| FormVerifyError::Key(format!("key {key_id:?} is not registered")))?;
-    verify_sth_signature(sth, sig, &PinnedKeys::of(&rec))
+    verify_composite_via_directory(directory, &sth.signing_bytes_of(), key_id, sig, now_ms())
+        .await?;
+    Ok(())
 }
 
 /// A witness this verifier trusts, with its pinned keys (the persist

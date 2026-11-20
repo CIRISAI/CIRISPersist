@@ -1,377 +1,79 @@
-//! v59.0.0 (CIRISPersist#1106; CC 5.3.4 rc9 `0edac07`, CC 3.3.6.2) — **a
-//! seated serve node's transit pair rotates by holder quorum, not alone.**
+//! v59.0.0 (CIRISPersist#1106; CC 5.3.4, CC 3.3.6.2) — the earlier-form
+//! serve-node re-bind row, **refused by name** since v62.0.0.
 //!
-//! The pinned genesis bundle (version ≥ 4) carries each seated serve node's
-//! signed transport destination, and the open seeds it `Rooted`
-//! ([`genesis::seed_serve_transport_destinations`](super::genesis::seed_serve_transport_destinations)).
-//! A rotation of that pair is a QUORUM act: the accord holders' canonical
-//! address update.
+//! v62.0.0 (C5-fix1; ceremony gap 1): the earlier re-bind machinery is
+//! deleted with the baked v4 genesis bundle it read. "Seated serve node" was
+//! the PINNED bundle's `serve_nodes`; a v62.0 node carries no pinned bundle,
+//! so the earlier `is_seated_serve_node`, `rebind_held_for`,
+//! `check_serve_rotation` / `refuse_own_serve_rotation` (the unilateral
+//! rotation rule over the pinned transit pair) and the after-admission apply
+//! of the carried row are gone. A seat and its X-Wing transit key come only
+//! from the ingested `ceg-genesis-bundle/2` and an edition-2 re-bind counted
+//! by its holders (`edition2::transport_rebind`).
 //!
-//! # The quorum re-bind
-//!
-//! The update is an attestation row, [`REBIND_DIMENSION`] (`scores`,
-//! federation tier and scope), attested ABOUT the serve node, authored by an
-//! accord holder and cosigned by others in `additional_scrubs` — every scrub
-//! over the same canonical envelope, which the generic federation-tier verify
-//! already checks one by one. Its envelope carries, under
-//! [`REBIND_MEMBER`], the node's own new signed transport destination. It is
-//! admitted ([`check_rebind_admission`]) when:
-//!
-//! - the node is a seated serve node of the pinned bundle;
-//! - the carried row is the node's own (`signer_acts_for`, its hybrid
-//!   signature, the in-row separation rule — the ordinary transport door's
-//!   checks, [`admission::verify_signed_transport_destination`](super::admission::verify_signed_transport_destination));
-//! - the row's distinct, verified accord-holder signers reach the accord
-//!   family charter's threshold (`trust_root::family_quorum_over`: the
-//!   family's `consensus_protocol`, floored at a strict majority of the
-//!   node's OWN roster — never hardcoded).
-//!
-//! Otherwise it is refused [`REBIND_WITHOUT_HOLDER_QUORUM`]. An admitted
-//! re-bind applies the carried row through the ordinary transport door, where
-//! it SUPERSEDES the bundle-seeded binding by the monotonic
-//! `(epoch, asserted_at)` apply. The re-bind replicates like any attestation
-//! row (global reach), so every node that holds the root re-binds.
-//!
-//! # The unilateral rotation is refused
-//!
-//! [`check_serve_rotation`] (run by the transport door): while a seated serve
-//! node's live binding of a kind still carries the pair the pinned bundle
-//! pinned for it (or it holds none yet), a row signed by the node alone that
-//! would replace that pair — a different pair, no pair, or a retirement — is
-//! refused [`SERVE_TRANSIT_PAIR_ROTATION_BEFORE_REBIND`], unless a held,
-//! admitted re-bind carries exactly that row. Re-asserting the pinned pair
-//! (the open's seed, a new epoch with the same pair) is unaffected, and a node
-//! that is not a seated serve node is unaffected.
-//!
-//! # The resolver during supersession
-//!
-//! One live binding per `(occurrence_key_id, transport_kind)`: the re-bind's
-//! row supersedes the bundle-seeded row in that slot (the seeded row is no
-//! longer live), so `self_at_login::transit_kex_pair_for` never sees the
-//! pinned pair and the re-bound pair live at once. A pinned row offered again
-//! later (a re-open) is `Refused` by the same apply — it is older.
-//!
-//! **State used:** "seated serve node" is the PINNED bundle this build reads
-//! (`genesis::canonical_genesis_bundle`: its `serve_nodes` and
-//! `serve_transport_destinations`), not a directory fold.
+//! What stays is the refusal: an earlier-form row on [`REBIND_DIMENSION`] is
+//! refused [`REBIND_WITHOUT_HOLDER_QUORUM`] at every `put_attestation`, so it
+//! is never stored as an ordinary `scores` row and never gives a seat a key.
 
-use super::self_at_login::{SignedTransportDestination, TransitKexPair};
 use super::types::{attestation_type, Attestation};
-use super::{Error, FederationDirectory};
+use super::Error;
 
-/// The re-bind row's dimension (persist-named; CC 5.3.4 names the act, the
-/// holders' accord-signed canonical address update).
+/// The earlier re-bind row's dimension (persist-named; CC 5.3.4 names the act,
+/// the holders' accord-signed canonical address update).
 pub const REBIND_DIMENSION: &str = "transport:canonical_rebind:v1";
-/// The envelope member the node's new signed transport destination rides
-/// under.
-pub const REBIND_MEMBER: &str = "transport_destination";
-/// The refusal token of a re-bind row without the holder quorum
-/// (`Error::InvalidArgument`, Python `ValueError`).
+/// The refusal token of an earlier-form re-bind row (`Error::InvalidArgument`,
+/// Python `ValueError`).
 pub const REBIND_WITHOUT_HOLDER_QUORUM: &str = "transport_rebind_without_holder_quorum";
-/// The refusal token of a seated serve node's UNILATERAL rotation that would
-/// retire its bundle-pinned transit pair before a quorum re-bind is held
-/// (`Error::InvalidArgument`, Python `ValueError`).
-pub const SERVE_TRANSIT_PAIR_ROTATION_BEFORE_REBIND: &str =
-    "serve_transit_pair_rotation_before_rebind";
 
-/// Is `row` a re-bind (by its signed dimension)?
+/// Is `row` an earlier-form re-bind (by its signed dimension)?
 #[must_use]
 pub fn is_rebind_row(row: &Attestation) -> bool {
     row.attestation_type == attestation_type::SCORES
         && super::admission::envelope_dimension(&row.attestation_envelope) == Some(REBIND_DIMENSION)
 }
 
-/// The signed transport destination a re-bind row carries.
-#[must_use]
-pub fn carried_row(row: &Attestation) -> Option<SignedTransportDestination> {
-    if !is_rebind_row(row) {
-        return None;
-    }
-    serde_json::from_value(row.attestation_envelope.get(REBIND_MEMBER)?.clone()).ok()
-}
-
-/// The pinned bundle's transport row for a seated serve node's `kind`, if the
-/// node is seated and the bundle pinned one.
-fn pinned_row(occurrence_key_id: &str, kind: &str) -> Option<&'static SignedTransportDestination> {
-    let bundle = super::genesis::canonical_genesis_bundle();
-    if !bundle
-        .serve_nodes
-        .iter()
-        .any(|n| n.record.key_id == occurrence_key_id)
-    {
-        return None;
-    }
-    bundle.serve_transport_destinations.iter().find(|r| {
-        r.transport_destination.occurrence_key_id == occurrence_key_id
-            && r.transport_destination.transport_kind == kind
-    })
-}
-
-/// v62.0.0 (#1274) — is `key_id` a seated serve node of the pinned bundle
-/// this build reads?
-#[must_use]
-pub fn is_seated_serve_node(key_id: &str) -> bool {
-    super::genesis::canonical_genesis_bundle()
-        .serve_nodes
-        .iter()
-        .any(|n| n.record.key_id == key_id)
-}
-
-/// v62.0.0 (CC rc20 3.3.6.2, CIRISPersist#1274) — **the re-bind this node holds
-/// for a seat**: the carried row of the admitted `transport:canonical_rebind`
-/// about `seat_key_id` whose carried row is latest by `(epoch, asserted_at)`
-/// (the transport door's own order), or `None` when it holds none. Every row
-/// read was admitted by [`check_rebind_admission`] at `put_attestation` (a
-/// held row is an admitted one); a row whose carried destination is about
-/// another key is skipped.
-///
-/// [`transit_xwing_pubkey_for`](super::self_at_login::transit_xwing_pubkey_for)
-/// asks this for THE RULE: a seated serve node's X-Wing transit key is live
-/// only when this returns exactly its live row.
+/// **The earlier re-bind row's admission rule** (run by `put_attestation` on
+/// every backend; a no-op off the dimension): refused, always. No earlier-form
+/// genesis seats a serve node, so no earlier-form row can count as a re-bind
+/// (v62.0.0, C5-fix1).
 ///
 /// # Errors
 ///
-/// A backend read error.
-pub async fn rebind_held_for<D>(
-    dir: &D,
-    seat_key_id: &str,
-) -> Result<Option<SignedTransportDestination>, Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    let mut best: Option<SignedTransportDestination> = None;
-    let mut pages = super::attestation_query::AttestationQuery::to(
-        seat_key_id,
-        super::attestation_query::FOLD_PAGE,
-    )
-    .types(&[attestation_type::SCORES])
-    .dimension(REBIND_DIMENSION)
-    .pages();
-    while let Some(page) = pages.next(dir.as_dyn_directory()).await? {
-        for row in &page {
-            if row.attested_key_id != seat_key_id {
-                continue;
-            }
-            let Some(c) = carried_row(row) else {
-                continue;
-            };
-            if c.transport_destination.occurrence_key_id != seat_key_id {
-                continue;
-            }
-            let later = best.as_ref().is_none_or(|b| {
-                (
-                    c.transport_destination.epoch,
-                    c.transport_destination.asserted_at,
-                ) > (
-                    b.transport_destination.epoch,
-                    b.transport_destination.asserted_at,
-                )
-            });
-            if later {
-                best = Some(c);
-            }
-        }
-    }
-    Ok(best)
-}
-
-fn pair_of(row: &SignedTransportDestination) -> Result<Option<TransitKexPair>, Error> {
-    if row.transport_destination.retired_at.is_some() {
-        return Ok(None);
-    }
-    row.rooted_transit_kex_pair()
-}
-
-/// **The re-bind's admission rule** (run by `put_attestation` on every
-/// backend; a no-op off the dimension).
-///
-/// # Errors
-///
-/// [`REBIND_WITHOUT_HOLDER_QUORUM`] without the quorum (or for a node that is
-/// not a seated serve node, or a carried row that is not its own); the
-/// transport door's refusals of the carried row.
-pub async fn check_rebind_admission<D>(dir: &D, row: &Attestation) -> Result<(), Error>
-where
-    D: FederationDirectory + ?Sized,
-{
+/// [`REBIND_WITHOUT_HOLDER_QUORUM`] for every row on [`REBIND_DIMENSION`].
+pub fn check_rebind_admission(row: &Attestation) -> Result<(), Error> {
     if !is_rebind_row(row) {
         return Ok(());
     }
-    let refuse = |why: String| {
-        Error::InvalidArgument(format!(
-            "{REBIND_WITHOUT_HOLDER_QUORUM}: re-bind row {}: {why} (CC 5.3.4, CIRISPersist#1106)",
-            row.attestation_id
-        ))
-    };
-    let carried = carried_row(row).ok_or_else(|| {
-        refuse(format!(
-            "carries no readable `{REBIND_MEMBER}` signed transport destination"
-        ))
-    })?;
-    let node = &carried.transport_destination.occurrence_key_id;
-    if *node != row.attested_key_id {
-        return Err(refuse(format!(
-            "the carried row is about {node:?}, the re-bind about {:?}",
-            row.attested_key_id
-        )));
-    }
-    let bundle = super::genesis::canonical_genesis_bundle();
-    if !bundle.serve_nodes.iter().any(|n| n.record.key_id == *node) {
-        return Err(refuse(format!(
-            "{node:?} is not a seated serve node of the pinned bundle"
-        )));
-    }
-    super::admission::verify_signed_transport_destination(dir.as_dyn_directory(), &carried).await?;
-    // v62.0.0 (wave GC4; CC 2.7.3) — the checks above read the row's own
-    // bytes and the pinned bundle's seats (door). The count below reads
-    // OTHER rows (the accord family, its roster, the holders' key records):
-    // a fold. Unmet, the re-bind is HELD (`link_unheld` with no family,
-    // `count_short` short of the holders) and re-folds when one lands.
-    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
-    super::edition2::fold::reads(super::edition2::fold::Dep::key(accord));
-    super::edition2::fold::reads(super::edition2::fold::Dep::key(node));
-    super::edition2::fold::reads(super::edition2::fold::Dep::key(&row.scrub_key_id));
-    for s in &row.additional_scrubs {
-        super::edition2::fold::reads(super::edition2::fold::Dep::key(&s.scrub_key_id));
-    }
-    let Some(family) = dir.lookup_family(accord).await? else {
-        return Err(super::edition2::fold::hold(
-            super::edition2::fold::reason::LINK_UNHELD,
-            refuse("this node holds no accord family to count against".into()),
-        ));
-    };
-    let quorum =
-        super::trust_root::family_quorum_over(dir.as_dyn_directory(), row, &family).await?;
-    if quorum.distinct_holders < quorum.required {
-        // v62.0.0 (wave V1b) — short of the accord holders: an edition-2
-        // re-bind waits for their voices (`Pending`).
-        super::edition2::voices::note_short();
-        return Err(refuse(format!(
-            "{} distinct verified accord holder(s) signed it; the charter requires {}",
-            quorum.distinct_holders, quorum.required
-        )));
-    }
-    Ok(())
+    Err(Error::InvalidArgument(format!(
+        "{REBIND_WITHOUT_HOLDER_QUORUM}: re-bind row {}: an earlier-form re-bind seats no key — \
+         a seat's transit key moves only by an edition-2 re-bind over the ingested \
+         ceg-genesis-bundle/2 (CC 3.3.6.2, CIRISPersist#1106)",
+        row.attestation_id
+    )))
 }
 
-/// After an admitted re-bind: apply the carried row through the ordinary
-/// transport door, where it supersedes the bundle-seeded binding.
-///
-/// # Errors
-///
-/// The transport door's refusal; a backend error.
-pub(crate) async fn after_admission<D>(dir: &D, row: &Attestation) -> Result<(), Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    if let Some(carried) = carried_row(row) {
-        dir.put_signed_transport_destination(&carried).await?;
-    }
-    Ok(())
-}
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod tests {
+    use super::*;
 
-/// **The unilateral-rotation rule at a RECEIVER** (the transport door asks
-/// it after the row's own checks): see the module doc.
-///
-/// v62.0.0 (wave GC4; CC rc21 items 12, 13 — 5.3.4, 3.3.6.2) — a receiver
-/// KEEPS a rotation no held re-bind carries and does not count it: inside a
-/// fold attempt the row is HELD `serve_transit_pair_rotation_before_rebind`,
-/// reading `key:<node>`, and concludes when the holders' re-bind carrying it
-/// lands. The node's OWN emission guard is [`refuse_own_serve_rotation`].
-///
-/// # Errors
-///
-/// [`SERVE_TRANSIT_PAIR_ROTATION_BEFORE_REBIND`] (held inside an attempt).
-pub async fn check_serve_rotation(
-    dir: &dyn FederationDirectory,
-    signed: &SignedTransportDestination,
-) -> Result<(), Error> {
-    super::edition2::fold::reads(super::edition2::fold::Dep::key(
-        &signed.transport_destination.occurrence_key_id,
-    ));
-    match serve_rotation_unrooted(dir, signed).await? {
-        None => Ok(()),
-        Some(e) => Err(super::edition2::fold::hold(
-            super::edition2::fold::reason::SERVE_ROTATION_BEFORE_REBIND,
-            e,
-        )),
-    }
-}
-
-/// v62.0.0 (wave GC4; CC rc21 item 12) — **the node's own emission guard**:
-/// the node does not sign a rotation that would retire its pinned pair
-/// before it holds the replacement Rooted. A plain refusal (an emitter
-/// declining to write, never a fold mark): call it on the LOCAL signing path
-/// only, never on receipt (that is [`check_serve_rotation`]).
-///
-/// # Errors
-///
-/// [`SERVE_TRANSIT_PAIR_ROTATION_BEFORE_REBIND`].
-pub async fn refuse_own_serve_rotation(
-    dir: &dyn FederationDirectory,
-    signed: &SignedTransportDestination,
-) -> Result<(), Error> {
-    match super::edition2::fold::isolated(serve_rotation_unrooted(dir, signed)).await? {
-        None => Ok(()),
-        Some(e) => Err(e),
-    }
-}
-
-/// The shared reading: `Some(refusal)` when `signed` rotates a seated serve
-/// node's pinned transit pair and no held re-bind carries it; `None` when it
-/// stands.
-async fn serve_rotation_unrooted(
-    dir: &dyn FederationDirectory,
-    signed: &SignedTransportDestination,
-) -> Result<Option<Error>, Error> {
-    let td = &signed.transport_destination;
-    let Some(pinned) = pinned_row(&td.occurrence_key_id, &td.transport_kind) else {
-        return Ok(None);
-    };
-    let pinned_pair = pair_of(pinned)?;
-    let incoming = pair_of(signed)?;
-    if incoming == pinned_pair {
-        return Ok(None);
-    }
-    // The live binding of this kind: does it still carry the pinned pair?
-    let live = dir
-        .list_signed_transport_destinations_for(&td.occurrence_key_id)
-        .await?
-        .into_iter()
-        .find(|b| {
-            b.transport_destination.transport_kind == td.transport_kind
-                && b.transport_destination.retired_at.is_none()
-        });
-    let live_pair = match &live {
-        Some(b) => pair_of(b)?,
-        None => pinned_pair.clone(),
-    };
-    if live_pair != pinned_pair {
-        // A replacement is already Rooted (a quorum re-bind landed).
-        return Ok(None);
-    }
-    // A held re-bind carrying exactly this row authorizes it.
-    let mut pages = super::attestation_query::AttestationQuery::to(
-        &td.occurrence_key_id,
-        super::attestation_query::FOLD_PAGE,
-    )
-    .types(&[attestation_type::SCORES])
-    .dimension(REBIND_DIMENSION)
-    .pages();
-    while let Some(page) = pages.next(dir).await? {
-        if page
-            .iter()
-            .filter_map(carried_row)
-            .any(|c| c.signed_envelope == signed.signed_envelope)
-        {
-            return Ok(None);
+    /// I2421 (v62.0.0, C5-fix1; ceremony gap 1) — **an earlier-form re-bind
+    /// row is refused by name, whatever it carries**; a row off the dimension
+    /// passes this gate untouched. Pure: the rule reads only the row.
+    #[test]
+    fn i2421_an_earlier_form_rebind_is_refused_by_name() {
+        let mut row = crate::federation::genesis::ordinary_scores_row("i2421", "k");
+        assert!(
+            check_rebind_admission(&row).is_ok(),
+            "I2421: off the dimension"
+        );
+        row.attestation_envelope["dimension"] = serde_json::json!(REBIND_DIMENSION);
+        assert!(is_rebind_row(&row));
+        match check_rebind_admission(&row) {
+            Err(Error::InvalidArgument(m)) => assert!(
+                m.starts_with(REBIND_WITHOUT_HOLDER_QUORUM),
+                "I2421: refused by name: {m}"
+            ),
+            o => panic!("I2421: an earlier-form re-bind is refused, got {o:?}"),
         }
     }
-    Ok(Some(Error::InvalidArgument(format!(
-        "{SERVE_TRANSIT_PAIR_ROTATION_BEFORE_REBIND}: {} is a seated serve node whose \
-         {} transit pair the pinned genesis bundle carries; a rotation signed by the node \
-         alone would retire it before a replacement is Rooted — rotate by the holders' \
-         quorum re-bind (`{REBIND_DIMENSION}`, CC 5.3.4)",
-        td.occurrence_key_id, td.transport_kind
-    ))))
 }

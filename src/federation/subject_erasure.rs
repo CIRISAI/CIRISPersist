@@ -588,8 +588,9 @@ pub(crate) struct PlannedErasureWithdraws {
     pub(crate) depth: usize,
 }
 
-/// The producer's `withdraws` of `target`, planned the way the detection door
-/// plans the detection row itself (`attestation_admit::plan_detection_row`):
+/// The producer's `withdraws` of `target`, planned the way the v57 detection
+/// door planned the detection row itself (the deleted
+/// `attestation_admit::plan_detection_row`):
 /// a local-tier `self` row attested by the producer key the host holds, its
 /// signature deferred to the crossing; the reserved-id, mirror, size and
 /// instant gates; the attested-subject rule; then admitted as RULE 1 by the
@@ -629,7 +630,6 @@ where
     )?;
     super::admission::check_attested_subject_admission(dir, &target.attesting_key_id).await?;
     let mut row = input.into_local_row(attestation_id, at);
-    super::genesis::check_genesis_attestation_reserved(&row)?;
     super::envelope::RowMirror::stamp_local_row(&mut row, false)?;
     super::admission::check_envelope_size_admission(&row.attestation_envelope)?;
     super::admission::check_instant_binding(&row, at, super::admission::DEFAULT_MAX_TOUCH_SKEW)?;

@@ -163,7 +163,7 @@ fn binding_row(claimant: &str, sha_hex: &str) -> Attestation {
 
 /// The claimant's `dmca512` notice over `sha`.
 fn notice(claimant: &str, sha: &[u8; 32]) -> Vec<u8> {
-    let now = chrono::Utc::now();
+    let now = crate::host::clock::now();
     crate::federation::edition2::typed_fixtures::takedown_statement(
         claimant,
         "dmca512",
@@ -237,10 +237,12 @@ pub(crate) async fn notice_first_body(d: &dyn FederationDirectory) {
         !concluded(d, &n).await,
         "I3712: the notice is UN-concluded: no typed row"
     );
+    // The fold re-derives the notice from what is held now: no live row binds
+    // the content to anyone, so the reason is the one it was first held for.
     assert_eq!(
         reason_of(d, &n).await.as_deref(),
-        Some(reason::TAKEDOWN_UNAUTHORISED),
-        "I3712: held, and says why (the binding is retired)"
+        Some(reason::TAKEDOWN_CONTENT_UNBOUND),
+        "I3712: held, and says why (the binding is retired: the content is bound to nobody)"
     );
     assert!(
         !d.edition2_voices(&n).await.unwrap().is_empty(),

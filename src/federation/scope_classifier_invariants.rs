@@ -15,10 +15,56 @@ pub mod bodies {
     use crate::ceg::list::drive_query_invariants::bodies::{
         seed_affiliation, seed_room_for, seed_row,
     };
+    use crate::federation::edition2::ingest::StatementOutcome;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::read::AttestationFilter;
     use crate::scope::{caller_scope_from_directory, CallerScope};
     use std::collections::BTreeSet;
+
+    /// v62.0.0 (E2-fix4; CC 2.7.3) — **the scope verdict of a `seed_row`
+    /// result, by its reason's `kind`**: a typed refusal's
+    /// (`Error::WriteScopeRefused`), or, when the door HELD the row on a fold
+    /// condition (the roster is another row: `link_unheld` for a room not held
+    /// here, `write_scope_refused` for one that does not name the writer), the
+    /// reason whose refusal text the fold recorded as the hold's detail;
+    /// `"admitted"` for a landed row.
+    async fn scope_kind<B>(
+        b: &B,
+        r: Result<Option<StatementOutcome>, crate::federation::Error>,
+    ) -> &'static str
+    where
+        B: crate::federation::FederationDirectory + Sync,
+    {
+        use crate::scope::ScopeRefusalReason as R;
+        match r {
+            Err(crate::federation::Error::WriteScopeRefused(reason)) => reason.kind(),
+            Err(e) => panic!("expected a typed scope refusal, got {e}"),
+            Ok(None | Some(StatementOutcome::Row { .. })) => "admitted",
+            Ok(Some(StatementOutcome::Pending { row_id, .. })) => {
+                let held = crate::federation::edition2::fold::why_held(b, &row_id)
+                    .await
+                    .expect("the fold's record reads")
+                    .unwrap_or_else(|| {
+                        panic!("a write-scope wait with no fold reason: {row_id:?}")
+                    });
+                [
+                    R::MembershipUnresolved,
+                    R::NoCommunityMembership,
+                    R::NoFamilyMembership,
+                ]
+                .into_iter()
+                .find(|c| {
+                    held.detail
+                        == crate::federation::Error::WriteScopeRefused(c.clone()).to_string()
+                })
+                .map_or_else(
+                    || panic!("held {}: {} is no scope refusal", held.reason, held.detail),
+                    |c| c.kind(),
+                )
+            }
+            Ok(Some(other)) => panic!("unexpected outcome {other:?}"),
+        }
+    }
 
     fn set(v: &[&String]) -> BTreeSet<String> {
         v.iter().map(|s| (*s).clone()).collect()
@@ -53,10 +99,13 @@ pub mod bodies {
         let mut write = BTreeSet::new();
         for c in callers {
             let id = format!("i145-w-{c}");
-            if seed_row(b, &id, c, cs::AFFILIATIONS, Some(&room_a), "file:v1")
-                .await
-                .is_ok()
-            {
+            // v62.0.0 (E2-fix4; CC 2.7.3) — a non-member's row is HELD (the
+            // roster is another row), not stored: only a LANDED row (or an
+            // earlier-form admission) is a write.
+            if matches!(
+                seed_row(b, &id, c, cs::AFFILIATIONS, Some(&room_a), "file:v1").await,
+                Ok(None | Some(StatementOutcome::Row { .. }))
+            ) {
                 write.insert(c.clone());
             }
         }
@@ -224,18 +273,15 @@ pub mod bodies {
         let other = format!("i147-other-{s}");
         ts::register_identity_key(b, &writer, crate::federation::types::identity_type::USER).await;
         ts::register_identity_key(b, &other, crate::federation::types::identity_type::USER).await;
-        let kind = |r: Result<
-            Option<crate::federation::edition2::ingest::StatementOutcome>,
-            crate::federation::Error,
-        >| match r {
-            Err(crate::federation::Error::WriteScopeRefused(reason)) => reason.kind(),
-            Err(e) => panic!("I147: expected a typed scope refusal, got {e}"),
-            Ok(_) => "admitted",
-        };
+        // v62.0.0 (E2-fix4; CC 2.7.3) — a room not held here, and one that
+        // does not name the writer, are fold conditions: the row is HELD
+        // (`link_unheld` / `write_scope_refused`) with the same refusal as its
+        // detail, so the verdict reads the same kind ([`scope_kind`]).
         for scope in [cs::COMMUNITY, cs::AFFILIATIONS] {
             let unseen = format!("i147-unseen-{scope}-{s}");
             assert_eq!(
-                kind(
+                scope_kind(
+                    b,
                     seed_row(
                         b,
                         &format!("i147-u-{scope}-{s}"),
@@ -245,7 +291,8 @@ pub mod bodies {
                         "file:v1"
                     )
                     .await
-                ),
+                )
+                .await,
                 "scope_membership_unresolved",
                 "I147/{scope}: a room this directory has never seen is UNRESOLVED (retryable), \
                  not 'not a member' (terminal)"
@@ -253,7 +300,8 @@ pub mod bodies {
             let theirs = format!("i147-theirs-{scope}-{s}");
             seed_room_for(b, scope, &theirs, &[&other]).await;
             assert_eq!(
-                kind(
+                scope_kind(
+                    b,
                     seed_row(
                         b,
                         &format!("i147-t-{scope}-{s}"),
@@ -263,7 +311,8 @@ pub mod bodies {
                         "file:v1"
                     )
                     .await
-                ),
+                )
+                .await,
                 "scope_no_community_membership",
                 "I147/{scope}: a KNOWN room the writer is not in: the roster held here does not \
                  name the writer (re-check when the roster changes)"
@@ -271,7 +320,8 @@ pub mod bodies {
             let ours = format!("i147-ours-{scope}-{s}");
             seed_room_for(b, scope, &ours, &[&writer]).await;
             assert_eq!(
-                kind(
+                scope_kind(
+                    b,
                     seed_row(
                         b,
                         &format!("i147-o-{scope}-{s}"),
@@ -281,7 +331,8 @@ pub mod bodies {
                         "file:v1"
                     )
                     .await
-                ),
+                )
+                .await,
                 "admitted",
                 "I147/{scope}: a member lands"
             );

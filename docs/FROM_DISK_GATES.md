@@ -68,6 +68,19 @@ The gates below still cut test code out of a file by text before they scan. Each
 
 Comment-only strippers (`observe/tests.rs::strip_comments`, `durability_invariants.rs::strip_comments`, `store/parity.rs::strip_file`, the line-prefix `//` skips in the I-number invariants) cut no test code; their gates are in the inventory below.
 
+## The earlier-form door gate (v62.0.0)
+
+`scripts/earlier_form_doors.py` holds slice F's property: **no write door admits an object of the earlier form** (CC 2.6.1.12). It is Python and needs no cargo; certify runs it as the fast gate `earlierform`, and ci.yml runs it in `lint`.
+
+| piece | what it does |
+|---|---|
+| the inventory | Found, not listed. Every `FederationDirectory` method whose parameters name an object type (`Signed*`, the cosign, accord-evidence, genesis-bundle, wholeness and accord-payload types, a roster spec, `serde_json::Value`, or a `*json*` parameter). Every PyO3 fn that calls such a trait door, names a `Signed*` type, calls an earlier-form verifier, or is a write verb taking a `*json*` parameter. Every `DirectoryOp` variant whose fields name an object type. Every non-GET HTTP route. |
+| `scripts/earlier_form_doors.tsv` | One row per door: `refuses` with the call chain to `refuse_earlier_form(_row)`, `edition2` with the chain to the statement entry, `retired` (refuses everything with `EnvelopeKindRetired` and reads nothing), or `exempt` with the reason written out. A door with no row, and a row with no door, are both red. |
+| the chain check | Each hop must be called from the previous body. The hops below the dispatch layers (`src/engine.rs`, `src/ffi/`) must be called at the body's top level, not inside a branch, a closure or a short-circuit. The refusal itself must always be at the top level. A trait door is checked on sqlite and postgres alike: the override's body, or the default where a backend does not override. |
+| test code | Comments and literals are blanked first. An item under a test-only cfg is removed, and so is a whole file whose `mod` is declared under one. The cfg is *evaluated*: P is test-only when it cannot hold with `test` false, so `all(feature = .., test)` and `any(test)` are test code and `any(test, feature = ..)` is production. A cfg naming `test` that does not parse is red. |
+| the CP2 ignores | `#[ignore = "v62-CP2: needs EARLIER_FORM_DOORS_SHUT"]` parks a test that needs the doors shut. The switch is read from `edition2/door.rs` (production code). While it is `false` the marker is allowed. Once it is `true`, any marker left in `src/` or `tests/` is red. A marker spelled other than exactly (`v62-CP2…`) is red at any time. A marker in a comment is not an attribute. `earlier_form_doors.py unignore` deletes the markers, and refuses while the switch is off. |
+| `--self-test` | Fixture trees. Each negative names the red it must produce: a door with no row; the refusal removed, commented out, in a string, under an `if`, behind `&&`, or only in test code under four spellings; one backend skipping the hop; a stale row; an exemption without a reason; a host door through an exempt trait door; a retired arm that reads its object again. |
+
 ## Inventory
 
 Classes:

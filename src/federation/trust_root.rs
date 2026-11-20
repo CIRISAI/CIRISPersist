@@ -304,8 +304,7 @@ where
 ///
 /// - a row naming a `trust:{job}` label: its label decides
 ///   ([`job_dimension_admits`]); it stands;
-/// - an unlabelled member of the pinned bundle
-///   ([`is_pinned_bundle_row`](super::genesis::is_pinned_bundle_row)): it stands;
+/// - (v62.0.0, C5-fix1: the pinned bundle and its exemption are deleted);
 /// - an unlabelled row this node held when the rule arrived
 ///   ([`FederationDirectory::trust_direction_held_among`], V167): it stands;
 /// - any other unlabelled row: denied. It stays stored and stays a delegation
@@ -322,14 +321,13 @@ where
     F: FederationDirectory + ?Sized,
     I: IntoIterator<Item = &'a Attestation>,
 {
-    // Asked of the directory: unlabelled `delegates_to` rows outside the
-    // pinned bundle. One read for the whole set.
+    // Asked of the directory: unlabelled `delegates_to` rows (v62.0.0,
+    // C5-fix1: there is no pinned bundle to exempt). One read for the whole set.
     let mut asked: Vec<String> = rows
         .into_iter()
         .filter(|row| {
             row.attestation_type == attestation_type::DELEGATES_TO
                 && names_no_trust_job(&row.attestation_envelope)
-                && !super::genesis::is_pinned_bundle_row(row)
         })
         .map(|row| row.attestation_id.clone())
         .collect();
@@ -749,6 +747,26 @@ fn evaluate_holder_hardware(
         .as_ref()
         .and_then(|v| serde_json::from_value::<AttestationEvidence>(v.clone()).ok())
         .is_some_and(|e| matches!(e, AttestationEvidence::AndroidGenerationCustody(_)));
+    // v62.0.0 (W1-fix5; CC 4.2.2.1) — an edition-2 record's custody
+    // (`Edition2Custody`: a YubiKey PIV chain) was walked inside
+    // `check_structure` to this node's key-attestation roots for the record's
+    // OWN Ed25519 half, as the genesis reader's custody gate walks it; reaching
+    // here means the walk passed. It reports the measured class and the walk,
+    // as the Android arm does (I3256), never Layer-A-only.
+    let is_edition2 = rec
+        .attestation_evidence
+        .as_ref()
+        .and_then(|v| serde_json::from_value::<AttestationEvidence>(v.clone()).ok())
+        .is_some_and(|e| matches!(e, AttestationEvidence::Edition2Custody(_)));
+    if is_edition2 {
+        return HolderHardware {
+            key_id: rec.key_id.clone(),
+            class: Some(HardwareType::ExternalSecureElement),
+            layer_a: true,
+            layer_b: Some(true),
+            refusal: None,
+        };
+    }
     if !is_custody {
         return HolderHardware {
             key_id: rec.key_id.clone(),
@@ -1242,7 +1260,7 @@ where
 /// a family, given its stored `consensus_protocol` and its OWN active roster.
 ///
 /// **Floored at a strict majority of the node's own roster**, the identical
-/// defense [`super::genesis::bundle::verify_bundle_quorum`] applies to a carried
+/// defense the deleted bundle/1 quorum check applied to a carried
 /// `consensus_protocol`: a tampered policy string cannot talk the threshold
 /// down. Reused rather than re-derived — one rule, two call sites.
 ///
@@ -2404,7 +2422,7 @@ where
         user_key_id,
         subject_key_id,
         scope,
-        &super::admission::accord_holder_roster_key_ids(),
+        &super::admission::accord_holder_roster(directory).await?,
     )
     .await
 }
@@ -2843,7 +2861,7 @@ pub(crate) fn transit_candidate_roots(
 /// [`has_accord_conferred_role_over_roster`](super::admission::has_accord_conferred_role_over_roster))
 /// takes `accord_roster_key_ids` as a CALLER-SUPPLIED parameter, and the
 /// production convenience wrappers fill it from
-/// [`accord_holder_roster_key_ids`](super::admission::accord_holder_roster_key_ids)
+/// [`accord_holder_roster`](super::admission::accord_holder_roster)
 /// — the node's OWN genesis-baked holders. That is correct for this node's own
 /// accord and answers nothing about anyone else's.
 ///
@@ -3467,7 +3485,7 @@ pub async fn resolve_transit_eligibility(
         directory,
         user_key_id,
         peer_key_id,
-        &super::admission::accord_holder_roster_key_ids(),
+        &super::admission::accord_holder_roster(directory).await?,
     )
     .await
 }
@@ -3815,7 +3833,10 @@ where
                 reason::NO_CONSTITUTIONAL_ROOT_YET,
                 Error::NoConstitutionalRootYet {
                     operation: super::genesis::posture::FAMILY_CHARTER_ADMISSION,
-                    leg: super::genesis::GenesisLeg::Family,
+                    // v62.0.0 — the constitutional family's charter is the
+                    // genesis bundle in force; its absence is the root's
+                    // (bundle/1's separate `family` leg is gone).
+                    leg: super::genesis::GenesisLeg::Anchor,
                     fault_kind: "absent",
                     detail: format!(
                         "a `{TRUST_CHARTER_DIMENSION}` naming {} cannot be judged: this node \
@@ -4281,7 +4302,7 @@ where
         directory,
         subject_key_id,
         resolver_key_id,
-        &super::admission::accord_holder_roster_key_ids(),
+        &super::admission::accord_holder_roster(directory).await?,
     )
     .await
 }
@@ -4940,9 +4961,8 @@ mod charter_threshold_tests {
         let policy = match cp {
             "founder_only" | "majority" => floor,
             "unanimous" => roster_size,
-            other => {
-                super::super::genesis::bundle::parse_quorum(other).map_or(roster_size, |(m, _)| m)
-            }
+            other => super::super::canonical_community::parse_quorum(other)
+                .map_or(roster_size, |(m, _)| m),
         };
         policy.max(floor)
     }

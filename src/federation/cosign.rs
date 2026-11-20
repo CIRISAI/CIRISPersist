@@ -1450,46 +1450,6 @@ where
     Ok(out)
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-//  At open: the ref of a cosigned row moves once
-// ─────────────────────────────────────────────────────────────────────────
-
-/// The `attestation_id`s of every held cosignable group row that carries a
-/// cosignature: rows indexed before v61.3.0 under `sha256(bytes)`, whose ref
-/// moves once to [`attestation_wire_hash`](super::wire_index::attestation_wire_hash)
-/// when the backend re-indexes them at open. Their ids are not re-keyed.
-///
-/// # Errors
-///
-/// The group-plane read's.
-pub(crate) async fn cosigned_group_row_ids<D>(dir: &D) -> Result<Vec<String>, Error>
-where
-    D: super::group_plane::GroupPlaneStore + ?Sized,
-{
-    use super::group_plane::GroupPlaneTable as T;
-    if !dir.group_plane_present().await? {
-        return Ok(Vec::new());
-    }
-    let mut ids = Vec::new();
-    for table in [
-        T::FamilyWidenings,
-        T::CommunityWidenings,
-        T::FamilyRevocations,
-        T::CommunityRevocations,
-    ] {
-        for row in dir.read_group_plane(table).await?.rows {
-            if let Ok(Some(signed)) = super::group_plane::group_signed_of_row(&row) {
-                if is_cosignable(&signed) && !signed.cosignatures().is_empty() {
-                    ids.push(row.attestation_id);
-                }
-            }
-        }
-    }
-    ids.sort();
-    ids.dedup();
-    Ok(ids)
-}
-
 /// v62.0.0 (slice E2a; CC 3.1.3 `cosign:{state}`, CC 2.6.1.9) — **the
 /// edition-2 name of a counted act**: the event's row id, the same for every
 /// voice (signatures are outside it, CC 2.6.1.3). The pending hold of an

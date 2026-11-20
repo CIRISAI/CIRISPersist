@@ -665,159 +665,11 @@ pub(crate) mod bodies {
         .expect("I118b: same scope as the original");
     }
 
-    /// **I117d (blob half) — AV-89 at both doors: a claim whose `size` is
-    /// not the byte length the door stores is refused before anything is
-    /// written; the signer refuses a zero size outright; the same claim with
-    /// the true length is admitted (the control).**
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    pub async fn i117d_a_claim_with_the_wrong_size_is_refused<B>(b: &B, s: &str)
-    where
-        B: crate::federation::BlobStorage + FederationDirectory + Sync,
-    {
-        use crate::federation::at_rest_cascade::{fresh_dek, seal};
-        use crate::federation::holding_claim::{sign_holding_claim, ClaimScope};
-        use crate::federation::key_grant_invariants::two_node::{
-            node_as, seed_community_everywhere,
-        };
-        use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
-        use crate::federation::types::identity_type::NODE;
-        use crate::federation::{BlobBody, BlobError, EpochBinding, StorageFloor};
-        let n = node_as(b, &format!("i117d-n-{s}"), NODE).await;
-        let now = chrono::Utc::now();
-        // The put door.
-        let bytes = format!("i117d public bytes {s}").into_bytes();
-        let len = bytes.len() as u64;
-        let sha: [u8; 32] = {
-            use sha2::Digest as _;
-            sha2::Sha256::digest(&bytes).into()
-        };
-        let commons =
-            ClaimScope::of_content(CryptoTier::Plaintext, cohort_scope::FEDERATION, None).unwrap();
-        let zero = sign_holding_claim(&n.signer, &sha, uuid::Uuid::new_v4(), now, 0, &commons)
-            .await
-            .expect_err("I117d: the signer refuses a zero size");
-        assert!(
-            matches!(zero, BlobError::InvalidArgument(_)),
-            "I117d: {zero}"
-        );
-        let wrong = sign_holding_claim(
-            &n.signer,
-            &sha,
-            uuid::Uuid::new_v4(),
-            now,
-            len + 1,
-            &commons,
-        )
-        .await
-        .unwrap();
-        let err = b
-            .put_blob_with_scope(
-                None,
-                &sha,
-                BlobBody::Inline(bytes.clone()),
-                None,
-                wrong,
-                cohort_scope::FEDERATION,
-                StorageFloor::resolved(CryptoTier::Plaintext),
-                None,
-            )
-            .await
-            .expect_err("I117d: the put door refuses a claim whose size is not the stored length");
-        assert!(
-            matches!(err, BlobError::InvalidArgument(_)) && err.to_string().contains("AV-89"),
-            "I117d: {err}"
-        );
-        assert!(
-            b.blob_cohort_scope(&sha).await.unwrap().is_none()
-                && b.list_holders_sized(&sha).await.unwrap().is_empty(),
-            "I117d: a refused put stores nothing and announces nothing"
-        );
-        let right = sign_holding_claim(&n.signer, &sha, uuid::Uuid::new_v4(), now, len, &commons)
-            .await
-            .unwrap();
-        b.put_blob_with_scope(
-            None,
-            &sha,
-            BlobBody::Inline(bytes),
-            None,
-            right,
-            cohort_scope::FEDERATION,
-            StorageFloor::resolved(CryptoTier::Plaintext),
-            None,
-        )
-        .await
-        .expect("I117d: the true length is admitted");
-        assert_eq!(b.list_holders_sized(&sha).await.unwrap()[0].size, len);
-        // The adopt door, at the sealed community shape.
-        let comm = crate::federation::edition2::fixture_switch::kid(&format!("i117d-comm-{s}")); // v62 (E4): the typed row is keyed by identity-ref
-        seed_community_everywhere(&[&n], &comm, &[(&format!("i117d-m-{s}"), Some(&n))]).await;
-        let envelope = seal(
-            &fresh_dek().unwrap(),
-            format!("i117d sealed {s}").as_bytes(),
-            None,
-        )
-        .unwrap()
-        .to_bytes();
-        let elen = envelope.len() as u64;
-        let esha: [u8; 32] = {
-            use sha2::Digest as _;
-            sha2::Sha256::digest(&envelope).into()
-        };
-        let binding = || {
-            Some(EpochBinding {
-                community_key_id: comm.clone(),
-                minter_key_id: n.key.clone(),
-                epoch: 0,
-            })
-        };
-        let room =
-            ClaimScope::of_content(CryptoTier::CommunityDek, COMMUNITY, Some(&comm)).unwrap();
-        let wrong =
-            sign_holding_claim(&n.signer, &esha, uuid::Uuid::new_v4(), now, elen + 1, &room)
-                .await
-                .unwrap();
-        let err = b
-            .adopt_sealed_blob_at(
-                envelope.clone(),
-                None,
-                COMMUNITY,
-                &n.key,
-                StorageFloor::resolved(CryptoTier::CommunityDek),
-                binding(),
-                None,
-                Some(wrong),
-            )
-            .await
-            .expect_err(
-                "I117d: the adopt door refuses an announce whose size is not the sealed length",
-            );
-        assert!(
-            matches!(err, BlobError::InvalidArgument(_)) && err.to_string().contains("AV-89"),
-            "I117d: {err}"
-        );
-        assert!(
-            b.blob_cohort_scope(&esha).await.unwrap().is_none(),
-            "I117d: a refused adopt stores nothing"
-        );
-        let right = sign_holding_claim(&n.signer, &esha, uuid::Uuid::new_v4(), now, elen, &room)
-            .await
-            .unwrap();
-        let got = b
-            .adopt_sealed_blob_at(
-                envelope,
-                None,
-                COMMUNITY,
-                &n.key,
-                StorageFloor::resolved(CryptoTier::CommunityDek),
-                binding(),
-                None,
-                Some(right),
-            )
-            .await
-            .expect("I117d: the true sealed length is admitted");
-        assert_eq!(got, esha);
-        assert_eq!(b.list_holders_sized(&esha).await.unwrap()[0].size, elen);
-    }
+    // v62.0.0 (T2-fix10; CC 6.1.3, ruling 4): I117d DELETED. Its two doors
+    // took a bound-hybrid `PutBlobAttestation` signed by `sign_holding_claim`
+    // (deleted); the adopt door now refuses that claim by name (I3195), and
+    // an edition-2 claim states the stored length itself (`emit_holding_claim`
+    // reads it from the held row).
 
     // v62 (E4 round 3): I119b DELETED: it drove the promotion chokepoint
     // with an earlier-form JSON row; an edition-2 row is its statement and
@@ -1028,9 +880,12 @@ mod run {
                     !stores_size || body.contains("size_bytes"),
                     "I119: {name} {executor} stores the size"
                 );
+                // v62.0.0 (T2-fix11; CC 6.1.3) — the executors write NO claim
+                // row: a holding claim is the composite edition-2 statement
+                // the statement door admits (and indexes) after the commit.
                 assert!(
-                    live_lines(body).any(|l| l.contains("index_holder_claim(")),
-                    "I119: {name} {executor} indexes the claim (#870)"
+                    !live_lines(body).any(|l| l.contains("federation_attestations")),
+                    "I119: {name} {executor} writes no holding-claim row (CC 6.1.3)"
                 );
             }
         }
@@ -1090,11 +945,6 @@ mod run {
                     let Some(a) = $fresh.await else { return };
                     let Some(b) = $fresh.await else { return };
                     bodies::i117b_the_doors_carry_the_stored_length(&a, &b, &super::suffix()).await
-                }
-                #[tokio::test]
-                async fn i117d() {
-                    let Some(b) = $fresh.await else { return };
-                    bodies::i117d_a_claim_with_the_wrong_size_is_refused(&b, &super::suffix()).await
                 }
                 #[tokio::test]
                 async fn i118b() {

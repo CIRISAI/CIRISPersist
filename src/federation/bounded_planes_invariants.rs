@@ -44,8 +44,7 @@ pub(crate) mod bodies {
             let env =
                 serde_json::json!({ "dimension": format!("integrity:i907noise_n{i}"), "id": id });
             // Built in the earlier shape, adjusted, then signed once.
-            let mut r =
-                e2::with_earlier_form(|| ts::bare_attestation(&id, author_seed, subject, &env));
+            let mut r = ts::bare_attestation(&id, author_seed, subject, &env);
             r.attestation_type = attestation_type::SCORES.into();
             r.weight = None;
             r.asserted_at = chrono::Utc::now() - chrono::Duration::minutes(60 - i as i64);

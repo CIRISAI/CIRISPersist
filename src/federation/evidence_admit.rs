@@ -199,6 +199,9 @@ pub(crate) async fn withdraw_location_proof_planned<D: EvidenceStore>(
     dir: &D,
     proof: SignedLocationProof,
 ) -> Result<(), Error> {
+    // v62.0.0 (JSON-cut slice F) — the one shared earlier-form refusal,
+    // before any parse or verify (CC 2.6.1.12).
+    super::edition2::door::refuse_earlier_form("location_proof")?;
     // #984 row 16 — the signature and standing legs, exactly as a put.
     super::verify_location_proof_admission(dir, &proof).await?;
     let subject = proof.location_proof.subject_key_id.clone();

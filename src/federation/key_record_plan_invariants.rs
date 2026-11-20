@@ -35,7 +35,7 @@
 //!   guard, the supersede's anchored-version guard, the replace's hash guard (and no history row), the hybrid
 //!   completion's not-yet-complete guard, the scrub rehydrate's empty-set
 //!   guard; an insert over a differing held row is `Conflict`, over an
-//!   identical one, or with `OnHeld::Keep`, it stands.
+//!   identical one, it stands.
 //! - **I1189** — deleted in v62.0.0 (json-cut C5) with the bundle/1 re-anchor
 //!   door it witnessed.
 //! - **I1190 (the canonical supersede's own decisions)** — over an anchored
@@ -157,7 +157,6 @@ mod unit {
             insert(OnHeld::Conflict).insert_held(Some("other")),
             Err(Error::Conflict(m)) if m.contains("different content")
         ));
-        assert!(insert(OnHeld::Keep).insert_held(Some("other")).is_ok());
         for p in shapes.iter().map(|(p, _)| p) {
             assert!(p.insert_held(Some("other")).is_ok(), "I1188: not an insert");
         }

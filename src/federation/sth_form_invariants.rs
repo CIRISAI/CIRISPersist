@@ -24,6 +24,9 @@
 //!   the node's signer writes (the composite) admit; a tampered composite is
 //!   refused; the earlier bound-hybrid pair is refused by name
 //!   (`sig19_earlier_form`, `storage_contention_earlier_form`).
+//! - **I2751** (E6-fix6) the stream door reads the producer's LIVE key: a
+//!   revoked producer's head is refused `verify_signer_revoked` (sqlite and
+//!   postgres).
 
 use std::sync::Arc;
 
@@ -652,6 +655,80 @@ pub(crate) mod bodies {
             "I1855 {tag}: nothing refused was stored"
         );
     }
+
+    /// The stream-log root over `shas` (the leaves `put_stream_sth` checks).
+    fn stream_root(shas: &[[u8; 32]]) -> [u8; 32] {
+        use ciris_verify_core::transparency::{InMemoryTransparencyStore, TransparencyStore};
+        let s: InMemoryTransparencyStore<super::super::stream_sth::StreamChunkLeaf> =
+            InMemoryTransparencyStore::new(None);
+        for sha in shas {
+            s.append(super::super::stream_sth::StreamChunkLeaf::new(*sha))
+                .unwrap();
+        }
+        s.root().unwrap()
+    }
+
+    /// **I2751** (v62.0.0, E6-fix6; F0-cp6c §3) — **the stream door reads the
+    /// producer's LIVE key.** A head from a live producer key lands; once that
+    /// key is revoked (its own `key:revocation`), the next head it signs is
+    /// refused by name (`verify_signer_revoked`) and nothing is stored. The
+    /// door used to read the projected `federation_keys` row, which carries no
+    /// revocation (CC 2.4.1.1, CC 2.6.1.7).
+    pub(crate) async fn i2751_a_revoked_producer_is_refused<B>(backend: &B, tag: &str)
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        use crate::federation::edition2::composite_verify::VERIFY_SIGNER_REVOKED;
+        use crate::federation::edition2::fixture_switch as e2;
+        let seed = format!("i2751-producer-{tag}");
+        let (producer, producer_id) = register(backend, &seed).await;
+        let stream = format!("i2751-{tag}");
+        let mut shas = Vec::new();
+        for (seq, body) in [&b"AAAA"[..], b"BBBB", b"CC"].iter().enumerate() {
+            shas.push(
+                backend
+                    .put_blob_chunk(&stream, seq as u64, BlobBody::Inline(body.to_vec()), 0)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let log_id = super::super::stream_sth::log_id_for_stream(&stream);
+
+        // Live: the head lands.
+        backend
+            .put_stream_sth(
+                head(&log_id, 2, stream_root(&shas[..2]), &producer),
+                &producer_id,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("I2751 {tag}: a live producer's head lands: {e}"));
+
+        // Revoked: the next head is refused by name, and nothing is stored.
+        e2::put_statement(backend, &e2::key_revocation(&seed, &seed, None))
+            .await
+            .unwrap_or_else(|e| panic!("I2751 {tag}: the self-revocation is admitted: {e}"));
+        let err = backend
+            .put_stream_sth(
+                head(&log_id, 3, stream_root(&shas), &producer),
+                &producer_id,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(VERIFY_SIGNER_REVOKED),
+            "I2751 {tag}: a revoked producer is refused by name: {err}"
+        );
+        assert_eq!(
+            backend
+                .latest_stream_sth(&stream)
+                .await
+                .unwrap()
+                .unwrap()
+                .tree_size,
+            2,
+            "I2751 {tag}: the revoked producer's head was not stored"
+        );
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -678,4 +755,30 @@ async fn i1855_the_stream_door_reads_only_composites_postgres() {
         .unwrap();
     backend.run_migrations().await.unwrap();
     bodies::i1855_the_stream_door_reads_only_composites(&backend, "postgres").await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2751_a_revoked_producer_is_refused_sqlite() {
+    use crate::store::Backend as _;
+    let backend = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    backend.run_migrations().await.unwrap();
+    bodies::i2751_a_revoked_producer_is_refused(&backend, "sqlite").await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn i2751_a_revoked_producer_is_refused_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::empty_dsn() else {
+        eprintln!("I2751: CIRIS_PERSIST_TEST_PG_URL unset; skipped");
+        return;
+    };
+    let backend = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    backend.run_migrations().await.unwrap();
+    bodies::i2751_a_revoked_producer_is_refused(&backend, "postgres").await;
 }

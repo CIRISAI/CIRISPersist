@@ -63,7 +63,7 @@ pub use crate::federation::{
     FederationDirectory, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
 };
 pub use types::{
-    Cell, ContributionType, CreditsLedgerEntry, CreditsUpdate, DiversityProof,
+    Cell, CompositeSignature, ContributionType, CreditsLedgerEntry, CreditsUpdate, DiversityProof,
     ExpertiseLedgerEntry, ExpertiseUpdate, HybridSignature, PromotionAttestation,
     RoutableContributor, TargetRowKind, VoteWeight, Witness, WitnessSet,
 };

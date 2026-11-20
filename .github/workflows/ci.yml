@@ -1726,6 +1726,17 @@ jobs:
           set -euo pipefail
           python3 scripts/evidence_pointers_test.py
           python3 scripts/evidence_pointers.py check
+      # v62.0.0 (JSON-cut slice F; CC 2.6.1.12) — no write door admits an
+      # object of the earlier form: every trait / PyO3 / capsule / HTTP write
+      # door that takes a signed object reaches the one shared refusal, is the
+      # edition-2 entry, is retired, or carries a written exemption
+      # (scripts/earlier_form_doors.tsv). From disk, no cargo; its witnesses
+      # (fixture trees, each negative named) run first.
+      - name: earlier-form doors are shut or exempt (from disk)
+        run: |
+          set -euo pipefail
+          python3 scripts/earlier_form_doors.py --self-test
+          python3 scripts/earlier_form_doors.py check
       # #934 — the size counter behind evidence/size.tsv (fixtures, no
       # cargo). The size DELTA itself is a report (ci-hygiene.yml, reports.yml);
       # this step only proves the instrument counts what it claims to.

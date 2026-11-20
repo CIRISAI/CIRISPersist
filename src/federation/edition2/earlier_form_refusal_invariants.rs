@@ -1,19 +1,16 @@
 //! **I2100** (v62.0.0, JSON-cut slice A): the one shared earlier-form
 //! refusal, on sqlite and postgres.
 //!
-//! - With the switch off ([`EARLIER_FORM_DOORS_SHUT`] is `false` until slice
-//!   F), [`refuse_earlier_form`] admits: every JSON door behaves as before.
-//! - Forced on for a scope ([`with_earlier_form_doors_shut`]), it refuses
-//!   `earlier_form_object` by name, and the attestation door refuses a JSON
-//!   row before it parses or verifies anything.
+//! - v62.0.0 (slice F): [`EARLIER_FORM_DOORS_SHUT`] is `true`, so
+//!   [`refuse_earlier_form`] refuses `earlier_form_object` by name, and the
+//!   attestation door refuses a JSON row before it parses or verifies
+//!   anything. (The switch-off leg and the test-only forcing scope went with
+//!   the flip.)
 //! - A row that carries its edition-2 statement (`ceg_statement`, the
 //!   edition-2 door's mapping) is never an earlier-form object: it passes the
 //!   refusal and reaches the gates.
 
-use super::door::{
-    earlier_form_doors_shut, refuse_earlier_form, with_earlier_form_doors_shut,
-    EARLIER_FORM_DOORS_SHUT,
-};
+use super::door::{earlier_form_doors_shut, refuse_earlier_form, EARLIER_FORM_DOORS_SHUT};
 use crate::federation::{malformed_row, Error};
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use {
@@ -59,25 +56,21 @@ fn reason(e: &Error) -> &'static str {
     }
 }
 
-#[test]
-fn i2100_the_switch_is_off_until_slice_f() {
-    const { assert!(!EARLIER_FORM_DOORS_SHUT, "I2100: slice F flips the switch") };
-    assert!(!earlier_form_doors_shut(), "I2100");
-    refuse_earlier_form("attestation").expect("I2100: inert while off");
-}
+// v62.0.0 (slice F): `i2100_the_switch_is_off_until_slice_f` is deleted —
+// F flipped the switch; I2870 (doors_shut_invariants.rs) asserts it is on.
 
-#[tokio::test]
-async fn i2100_forced_on_it_refuses_by_name() {
-    let e = with_earlier_form_doors_shut(async { refuse_earlier_form("key_record") })
-        .await
-        .unwrap_err();
+#[test]
+fn i2100_the_switch_refuses_by_name() {
+    assert!(
+        EARLIER_FORM_DOORS_SHUT && earlier_form_doors_shut(),
+        "I2100: the doors are shut"
+    );
+    let e = refuse_earlier_form("key_record").unwrap_err();
     assert_eq!(
         reason(&e),
         malformed_row::EDITION2_EARLIER_FORM_OBJECT,
         "I2100"
     );
-    // The scope ends with its future.
-    refuse_earlier_form("key_record").expect("I2100: the scope ended");
 }
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -101,27 +94,24 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
         .unwrap()
         .remove(STATEMENT_MEMBER);
 
-    with_earlier_form_doors_shut(async {
-        refuse_earlier_form_row("attestation", &mapped).expect("I2100: the mapping passes");
-        let e = refuse_earlier_form_row("attestation", &json_row).unwrap_err();
-        assert_eq!(reason(&e), malformed_row::EDITION2_EARLIER_FORM_OBJECT);
-        let e = d
-            .put_attestation(SignedAttestation {
-                attestation: json_row.clone(),
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(
-            reason(&e),
-            malformed_row::EDITION2_EARLIER_FORM_OBJECT,
-            "I2100: the attestation door refuses the JSON row by name"
-        );
-        // The edition-2 statement still lands, through the same door.
-        put_statement(d, &st, None, INGEST_TIER)
-            .await
-            .expect("I2100: the edition-2 door stays open");
-    })
-    .await;
+    refuse_earlier_form_row("attestation", &mapped).expect("I2100: the mapping passes");
+    let e = refuse_earlier_form_row("attestation", &json_row).unwrap_err();
+    assert_eq!(reason(&e), malformed_row::EDITION2_EARLIER_FORM_OBJECT);
+    let e = d
+        .put_attestation(SignedAttestation {
+            attestation: json_row.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        reason(&e),
+        malformed_row::EDITION2_EARLIER_FORM_OBJECT,
+        "I2100: the attestation door refuses the JSON row by name"
+    );
+    // The edition-2 statement still lands, through the same door.
+    put_statement(d, &st, None, INGEST_TIER)
+        .await
+        .expect("I2100: the edition-2 door stays open");
 }
 
 #[cfg(feature = "sqlite")]

@@ -165,7 +165,28 @@ pub(crate) mod bodies {
         );
         let claim = holder_claim(b, &adopter.key, &sha).await;
         assert_claim_is_fetchable(b, &claim, "I113b adopt").await;
+        // v62.0.0 (T2-fix10; CC 6.1.3) — the adopted blob's claim is a CC 6.1
+        // object: an edition-2 `custody` statement under ONE composite
+        // signature (`emit_holding_claim`), stored under its row id, with no
+        // bound-hybrid PQC half.
+        let st = crate::federation::edition2::fixture_switch::carried_statement(&claim)
+            .expect("I113b: the adopted blob's claim is its edition-2 statement");
+        assert_eq!(
+            crate::federation::edition2::names::RowId::of_statement(&st)
+                .expect("I113b: a row statement")
+                .hex(),
+            claim.attestation_id,
+            "I113b: stored under its row id"
+        );
+        assert!(
+            claim.scrub_signature_pqc.is_none(),
+            "I113b: one composite signature, no bound-hybrid PQC half (CC 6.1.3)"
+        );
     }
+
+    // v62.0.0 (T2-fix11; ruling 4): I3195 (T2-fix10, "the adopt door refuses
+    // a bound-hybrid claim by name") DELETED: `PutBlobAttestation` is gone,
+    // so no such claim can be offered — `adopt_sealed_blob_at` takes none.
 
     /// Deliver A's whole Attestation plane to B the way edge does: the
     /// advertised wire hashes, one point read per hash, one
@@ -346,11 +367,12 @@ mod run {
             "sqlite_insert_local_attestation_row",
             "pg_insert_local_attestation_row",
         ];
-        // v55.0.0 (CIRISPersist#989) — the holding claim's shared in-transaction
-        // INSERT. It cannot index (the index reload reads COMMITTED rows); every
-        // door that calls it indexes after its commit, which is asserted below.
-        const CLAIM_INSERT_HELPERS: &[&str] =
-            &["sqlite_insert_holding_claim", "insert_holding_claim_tx"];
+        // v62.0.0 (T2-fix11; CC 6.1.3) — the blob doors' in-transaction claim
+        // INSERT helpers (`sqlite_insert_holding_claim`,
+        // `insert_holding_claim_tx`) and their index hook
+        // (`index_holder_claim`) are deleted: a holding claim is the composite
+        // edition-2 statement the statement door admits, through
+        // `put_attestation`'s own index hook.
         // v58.0.0 (CIRISPersist#991) — the key plane's in-transaction row
         // INSERT (a key-plane door's transaction writes the projection row and
         // its row together). It cannot index (the reload reads COMMITTED rows);
@@ -424,73 +446,24 @@ mod run {
                     .unwrap_or(prod.len());
                 let body = &prod[fn_start.0..body_end];
                 sites_seen += 1;
-                // The hook itself, or the one-line helper both blob doors
-                // share (`index_holder_claim`, pinned below to BE the hook).
-                let indexed = body.contains("index_stored_record(\"Attestation\"")
-                    || body.contains("index_holder_claim(");
+                // The hook itself.
+                let indexed = body.contains("index_stored_record(\"Attestation\"");
                 if !indexed
                     && !LOCAL_TIER_WRITERS.contains(&name)
-                    && !CLAIM_INSERT_HELPERS.contains(&name)
                     && !KEY_PLANE_ROW_HELPERS.contains(&name)
                 {
                     offenders.push(format!("{rel}: `{name}` inserts a federation_attestations row and never indexes it"));
                 }
             }
         }
-        // v55.0.0 — every caller of a claim-insert helper indexes after it.
-        for (rel, text) in [
-            ("src/store/sqlite.rs", include_str!("../store/sqlite.rs")),
-            (
-                "src/store/postgres.rs",
-                include_str!("../store/postgres.rs"),
-            ),
-        ] {
-            for helper in CLAIM_INSERT_HELPERS {
-                let call = format!("{helper}(");
-                for (site, _) in text.match_indices(&call) {
-                    let head = &text[..site];
-                    if head.ends_with("fn ") {
-                        continue;
-                    }
-                    let start = head.rfind("\n    async fn ").expect("a caller method");
-                    let end = text[site..]
-                        .find("\n    }\n")
-                        .map(|k| site + k)
-                        .unwrap_or(text.len());
-                    let body = &text[start..end];
-                    if !body.contains("#[cfg(test)]") && !body.contains("index_holder_claim(") {
-                        offenders.push(format!(
-                            "{rel}: a caller of `{helper}` never runs `index_holder_claim`"
-                        ));
-                    }
-                }
-            }
-        }
-        // The helper is the hook: its body reaches `index_stored_record("Attestation"`.
-        for (rel, text) in [
-            ("src/store/sqlite.rs", include_str!("../store/sqlite.rs")),
-            (
-                "src/store/postgres.rs",
-                include_str!("../store/postgres.rs"),
-            ),
-        ] {
-            let helper = text
-                .split("async fn index_holder_claim(")
-                .nth(1)
-                .unwrap_or_else(|| panic!("I114: {rel} has the index_holder_claim helper"));
-            let helper = &helper[..helper.find("\n    }\n").expect("helper end")];
-            assert!(
-                helper.contains("index_stored_record(\"Attestation\""),
-                "I114: {rel}'s index_holder_claim is the Attestation index hook, not a stand-in"
-            );
-        }
-        // v55.0.0 (CIRISPersist#989) — the two blob doors' INSERTs became ONE
-        // shared claim helper per backend (checked above through its callers).
+        // v62.0.0 (T2-fix11) — the claim helpers are gone; 6 sites remain
+        // (counted from disk at the fix11 tree: put_attestation's, the local
+        // writer's and the key plane's, per backend).
         assert!(
             sites_seen >= 6,
-            "I114: expected at least 6 production INSERT sites across both backends (put door, \
-             the claim helper, local writer, each), saw {sites_seen} — a gate that finds nothing \
-             holds nothing"
+            "I114: expected at least 6 production INSERT sites across both backends \
+             (put_attestation, the local writer, the key-plane row, each), saw {sites_seen} — a \
+             gate that finds nothing holds nothing"
         );
         assert!(
             offenders.is_empty(),

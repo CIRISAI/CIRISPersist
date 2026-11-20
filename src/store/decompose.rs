@@ -35,7 +35,7 @@ pub struct Decomposed {
 /// Decompose a verified `CompleteTrace` into row-shaped writes.
 ///
 /// Caller invariant: `trace` has already passed
-/// [`crate::verify::verify_trace`]. The `signature_verified` field on
+/// `verify_trace` (deleted v62.0.0). The `signature_verified` field on
 /// every produced row is set to `true`; we never produce rows for
 /// unverified bytes (MISSION.md §3 anti-pattern #2).
 ///

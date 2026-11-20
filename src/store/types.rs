@@ -26,7 +26,7 @@ use crate::schema::{LlmCallStatus, ReasoningEventType, TraceLevel};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationSource {
-    /// Persist ran [`crate::verify::verify_trace`] itself during
+    /// Persist ran `verify_trace` (deleted v62.0.0) itself during
     /// ingest — [`VerifyMode::Full`](crate::ingest::VerifyMode::Full).
     /// The default: every pre-V044 row, and every direct-ingest row.
     #[default]
@@ -138,7 +138,7 @@ pub struct TraceEventRow {
     /// authenticity.
     ///
     /// [`VerificationSource::Persist`] — persist ran
-    /// [`crate::verify::verify_trace`] itself during ingest
+    /// `verify_trace` (deleted v62.0.0) itself during ingest
     /// ([`VerifyMode::Full`](crate::ingest::VerifyMode::Full), the
     /// default and the only mode for untrusted direct-ingest input).
     ///

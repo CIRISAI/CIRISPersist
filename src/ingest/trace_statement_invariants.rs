@@ -45,16 +45,27 @@
 //!   unsigned trace is still accepted in this mode and still not served,
 //!   while Full mode refuses the same shape `earlier_form_object`.
 //! - **I3486** two nodes: a row ingested on A, replicated to B by
-//!   `apply_replicated_statement`, its blob delivered by `put_blob_edition2`:
+//!   `apply_replicated_statement`, its blob delivered by `put_blob`:
 //!   B projects the same `trace_events` row-first (on the blob's arrival) and
 //!   blob-first (in the row's own write).
 //! - **I3487** the sign call, end to end: `Engine::seal_trace` signs with the
 //!   Engine's composite LocalSigner and the same Engine ingests the row
-//!   (sqlite, pg).
+//!   (sqlite, pg). P7-fix6: the signer is SELECTED BY REGISTERED KIND, the
+//!   agent's key: an Engine whose own key is a `node` key and which carries
+//!   an `agent` key (`with_trace_signer`) seals a trace signed by the AGENT
+//!   key, which lands; the same Engine without it, or naming its node key
+//!   (`seal_trace_as`), is refused `trace_agent_signer_not_held` (sqlite,
+//!   pg).
 //! - **I3488** a sealed `self` trace (option A), two engines: B holds the
 //!   envelope and the row but no DEK, so the row is HELD `trace_dek_not_held`
 //!   (G0's fold) and projects nothing; A's key grant reaches B and the row
 //!   concludes BY ITSELF, with A's `trace_events` (sqlite, pg).
+//! - **I3489** (P7-fix6; CC ruling (a): CC 3.1.5, `signer_kind.tsv`
+//!   `trace:{form}:{version}` = agent, key_roles R4) the trace door's signer
+//!   kind: (pure) [`trace_signer_is_agent`] over a table of identity sets;
+//!   (sqlite, pg) an agent-signed trace row lands, while a `node`-signed and a
+//!   `user`-signed one are each refused `trace_signer_not_agent` with nothing
+//!   written (no row, no blob: the pre-check runs before the blob plane).
 //! - **I3483** seal scrubs: `prepare_trace_row` (the body of
 //!   `seal_trace_row`) runs persist's scrubber at the given level, so a
 //!   pre-scrub field (an e-mail address in `task_description`) never appears
@@ -62,7 +73,6 @@
 //!   row (sqlite, pg); a level the trace does not state is refused.
 
 use super::*;
-use crate::federation::edition2::door::with_earlier_form_doors_shut;
 use crate::federation::edition2::fixture_switch as e2;
 use crate::federation::{BlobBody, BlobStorage, FederationDirectory};
 use crate::verify::PythonJsonDumpsCanonicalizer;
@@ -321,7 +331,7 @@ where
 
     let blob2 = blob_of(&raw_trace(recently()));
     let st2 = statement(&blob2, &a);
-    let shut = with_earlier_form_doors_shut(ingest(d, &row_batch(&blob2, &st2))).await;
+    let shut = ingest(d, &row_batch(&blob2, &st2)).await;
     assert_eq!(
         kind_of(&shut),
         "admitted",
@@ -349,7 +359,7 @@ where
     hybrid["signature_key_id"] = serde_json::json!("ciris-agent-key:p7-hybrid");
     hybrid["signature_ml_dsa_65"] = serde_json::json!(BASE64.encode([2u8; 3309]));
     hybrid["pqc_key_id"] = serde_json::json!("p7-mldsa");
-    let refused = with_earlier_form_doors_shut(ingest(d, &inline_batch(&hybrid))).await;
+    let refused = ingest(d, &inline_batch(&hybrid)).await;
     assert_eq!(
         kind_of(&refused),
         crate::federation::edition2::token::EARLIER_FORM_OBJECT,
@@ -534,12 +544,7 @@ where
     let mut raw2 = raw_trace(recently());
     raw2["signature_key_id"] = serde_json::json!(kid_a.clone());
     let trace_id2 = raw2["trace_id"].as_str().unwrap().to_owned();
-    let shut = with_earlier_form_doors_shut(ingest_with(
-        d,
-        &inline_batch(&raw2),
-        VerifyMode::TrustPreVerified,
-    ))
-    .await;
+    let shut = ingest_with(d, &inline_batch(&raw2), VerifyMode::TrustPreVerified).await;
     assert_eq!(
         kind_of(&shut),
         "admitted",
@@ -553,7 +558,7 @@ where
     // The verifying path, by contrast, refuses the same shape by name.
     let mut raw3 = raw_trace(recently());
     raw3["signature_key_id"] = serde_json::json!(kid_a);
-    let verifying = with_earlier_form_doors_shut(ingest(d, &inline_batch(&raw3))).await;
+    let verifying = ingest(d, &inline_batch(&raw3)).await;
     assert_eq!(
         kind_of(&verifying),
         crate::federation::edition2::token::EARLIER_FORM_OBJECT,
@@ -650,7 +655,7 @@ where
 }
 
 /// Deliver `blob` to `d` on the blob plane as a peer's replication does:
-/// T2's `put_blob_edition2` under a holder's `custody:ack:v1` claim.
+/// T2's `put_blob` under a holder's `custody:ack:v1` claim.
 async fn deliver_blob<D>(d: &D, holder: &str, blob: &[u8])
 where
     D: BlobStorage,
@@ -664,7 +669,7 @@ where
         None,
         u64::try_from(recently().timestamp_millis()).unwrap(),
     );
-    d.put_blob_edition2(
+    d.put_blob(
         &sha,
         BlobBody::Inline(blob.to_vec()),
         Some(TRACE_BLOB_MEDIA_TYPE),
@@ -676,7 +681,7 @@ where
 
 /// I3486 — **two nodes**: a trace row ingested on A reaches B by
 /// replication (`apply_replicated_statement`) and its blob by the blob
-/// plane (`put_blob_edition2`); B projects the trace's `trace_events` in
+/// plane (`put_blob`); B projects the trace's `trace_events` in
 /// EITHER order: row first (on the blob's arrival) and blob first (in the
 /// row's own write).
 async fn exercise_replicated_projection<D>(a_node: &D, b_node: &D)
@@ -768,11 +773,14 @@ pub(crate) mod engine_level {
 
     pub(crate) type Pick<B> = fn(&Engine) -> Arc<B>;
 
+    /// P7-fix6 — registered as an `agent`: `seal_trace` signs the trace row
+    /// with the Engine's agent-kind key, and a trace is authored by its agent
+    /// (CC 3.1.5, key_roles R4).
     async fn node_engine(alias: &str, dsn: &str) -> Engine {
         let e = Engine::with_signer_pre_genesis(ts::local_signer(alias), dsn)
             .await
             .unwrap();
-        e.register_self_federation_key(crate::federation::types::identity_type::NODE, None, None)
+        e.register_self_federation_key(crate::federation::types::identity_type::AGENT, None, None)
             .await
             .unwrap();
         e
@@ -824,6 +832,77 @@ pub(crate) mod engine_level {
         );
     }
 
+    /// **I3487 (P7-fix6) — the trace's signer is selected by REGISTERED
+    /// kind.** An Engine whose own key is registered `node`:
+    /// - holding no agent key, `seal_trace` is refused
+    ///   `trace_agent_signer_not_held` (no silent fallback to the node key);
+    /// - carrying an `agent` key (`with_trace_signer`), it seals a trace
+    ///   signed by the AGENT key, which the same Engine ingests and projects;
+    /// - naming its node key (`seal_trace_as`) is refused by the same token.
+    pub(crate) async fn i3487_agent_signer_selected_by_kind<B>(dsn: &str, run: &str, pick: Pick<B>)
+    where
+        B: Backend + FederationDirectory + BlobStorage + Sync,
+    {
+        let node_alias = format!("p7-kind-node-{run}");
+        let engine = Engine::with_signer_pre_genesis(ts::local_signer(&node_alias), dsn)
+            .await
+            .unwrap();
+        let node_iss = engine
+            .register_self_federation_key(crate::federation::types::identity_type::NODE, None, None)
+            .await
+            .unwrap();
+        let raw = raw_trace(recently());
+        let only_node = engine.seal_trace(&raw, TraceLevel::Generic).await;
+        match &only_node {
+            Err(IngestError::TraceRefused { kind, .. }) => {
+                assert_eq!(*kind, TRACE_AGENT_SIGNER_NOT_HELD, "I3487: node key only");
+            }
+            other => panic!("I3487: a node-only Engine is refused by name, got {other:?}"),
+        }
+
+        let agent = ts::local_signer(&format!("p7-kind-agent-{run}"));
+        let agent_iss =
+            e2::put_key_for_signer(engine.federation_directory().as_ref(), &agent, &["agent"])
+                .await;
+        let both = engine.clone().with_trace_signer(agent);
+        let trace_id = raw["trace_id"].as_str().unwrap().to_owned();
+        let sealed = both
+            .seal_trace(&raw, TraceLevel::Generic)
+            .await
+            .unwrap_or_else(|e| panic!("I3487: node + agent seals: {} ({e})", e.kind()));
+        let (signed_as, _) = check_trace_row_shape(&sealed.statement, &sealed.trace_blob)
+            .expect("I3487: the sealed row names its blob");
+        assert_eq!(signed_as, agent_iss, "I3487: signed by the AGENT key");
+        assert_ne!(signed_as, node_iss, "I3487: never by the node key");
+        let summary = both
+            .receive_and_persist_with(
+                &row_batch(&sealed.trace_blob, &sealed.statement),
+                &crate::scrub::NullScrubber,
+                VerifyMode::Full,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("I3487: the agent-signed row lands: {} ({e})", e.kind()));
+        assert_eq!(summary.signatures_verified, 1, "I3487");
+        assert!(
+            events_of(pick(&both).as_ref(), &trace_id).await > 0,
+            "I3487: projected"
+        );
+
+        let named_node = both
+            .seal_trace_as(
+                &raw_trace(recently()),
+                TraceLevel::Generic,
+                Some(node_iss.as_str()),
+            )
+            .await;
+        match &named_node {
+            Err(IngestError::TraceRefused { kind, .. }) => {
+                assert_eq!(*kind, TRACE_AGENT_SIGNER_NOT_HELD, "I3487: named node key");
+            }
+            other => panic!("I3487: naming the node key is refused, got {other:?}"),
+        }
+    }
+
     /// **I3488 — a sealed `self` trace (option A), two nodes.** A seals
     /// through `Engine::seal_trace`: the blob is the at-rest envelope (its
     /// digest is what the row names) wrapped only to A. B adopts the envelope
@@ -865,7 +944,7 @@ pub(crate) mod engine_level {
         introduce_as(
             &[&a, &b],
             &[&alias_a, &alias_b],
-            crate::federation::types::identity_type::NODE,
+            crate::federation::types::identity_type::AGENT,
         )
         .await;
         // The trace's owner is A's own identity; A is its only occurrence.
@@ -1194,6 +1273,109 @@ fn i3479_the_binding_is_exact() {
     }
 }
 
+/// **I3489 (pure)** — the signer-kind predicate (CC ruling (a)).
+#[test]
+fn i3489_trace_signer_kind() {
+    // (identity_type, admitted)
+    let table: &[(&str, bool)] = &[
+        ("agent", true),
+        (" agent ", true),
+        ("node,agent", true),
+        ("user", false),
+        ("agent,user", false),
+        ("node", false),
+        ("primitive", false),
+        ("steward", false),
+        ("", false),
+        ("agents", false),
+    ];
+    for (ty, admitted) in table {
+        assert_eq!(trace_signer_is_agent(ty), *admitted, "I3489: {ty:?}");
+    }
+    // A row of another dimension is never this rule's.
+    assert!(check_trace_signer_kind(Some("capacity:x:v1"), "k", "node").is_ok());
+    assert!(check_trace_signer_kind(None, "k", "node").is_ok());
+    // The trace families, in either form: `trace:*` and `trace_summary:*`.
+    assert!(check_trace_signer_kind(Some("trace_summary:digest:v1"), "k", "node").is_err());
+    assert!(check_trace_signer_kind(Some("trace_summary:digest:v1"), "k", "agent").is_ok());
+    assert!(check_trace_signer_kind(Some("trace:demo:v1"), "k", "primitive").is_err());
+    let refused = check_trace_signer_kind(Some(TRACE_COMPLETE_DIMENSION), "k", "user")
+        .expect_err("I3489: a person-signed trace row");
+    assert!(
+        matches!(
+            &refused,
+            crate::federation::Error::MalformedRow { reason, .. } if *reason == TRACE_SIGNER_NOT_AGENT
+        ),
+        "I3489: refused by name: {refused:?}"
+    );
+}
+
+/// **I3489** on one backend: an agent-signed trace row lands; a node-signed
+/// and a person-signed one are refused by name with nothing written.
+async fn exercise_signer_kind<D>(d: &D)
+where
+    D: Backend + FederationDirectory + BlobStorage,
+{
+    let agent = unique("kind-agent");
+    let kid_agent = e2::put_key(d, &agent, &["agent"]).await;
+    let blob = blob_of(&raw_trace(recently()));
+    let st = statement(&blob, &agent);
+    assert_eq!(
+        kind_of(&ingest(d, &row_batch(&blob, &st)).await),
+        "admitted",
+        "I3489: an agent-signed trace row lands"
+    );
+    assert!(
+        d.get_attestation(&row_id_hex(&blob, &kid_agent))
+            .await
+            .unwrap()
+            .is_some(),
+        "I3489: the agent's row is held"
+    );
+
+    let node = unique("kind-node");
+    let kid_node = e2::put_key(d, &node, &["node"]).await;
+    let blob = blob_of(&raw_trace(recently()));
+    let st = statement(&blob, &node);
+    assert_eq!(
+        kind_of(&ingest(d, &row_batch(&blob, &st)).await),
+        TRACE_SIGNER_NOT_AGENT,
+        "I3489: a node-signed trace row is refused by name"
+    );
+    assert!(
+        d.get_attestation(&row_id_hex(&blob, &kid_node))
+            .await
+            .unwrap()
+            .is_none(),
+        "I3489: no row written"
+    );
+    assert!(
+        held_blob(d, &blob).await.is_none(),
+        "I3489: no blob written (the pre-check runs before the blob plane)"
+    );
+
+    let person = unique("kind-person");
+    let kid_person = e2::put_key(d, &person, &["user"]).await;
+    let blob = blob_of(&raw_trace(recently()));
+    let st = statement(&blob, &person);
+    assert_eq!(
+        kind_of(&ingest(d, &row_batch(&blob, &st)).await),
+        TRACE_SIGNER_NOT_AGENT,
+        "I3489: a person-signed trace row is refused by name"
+    );
+    assert!(
+        d.get_attestation(&row_id_hex(&blob, &kid_person))
+            .await
+            .unwrap()
+            .is_none(),
+        "I3489: no row written"
+    );
+    assert!(
+        held_blob(d, &blob).await.is_none(),
+        "I3489: no blob written"
+    );
+}
+
 #[cfg(feature = "sqlite")]
 mod sqlite {
     use super::*;
@@ -1229,6 +1411,12 @@ mod sqlite {
         let a = backend().await;
         let b = backend().await;
         Box::pin(exercise_replicated_projection(&a, &b)).await;
+    }
+
+    #[tokio::test]
+    async fn i3489_trace_signer_kind_sqlite() {
+        let b = backend().await;
+        Box::pin(exercise_signer_kind(&b)).await;
     }
 
     #[cfg(feature = "scrub")]
@@ -1277,6 +1465,12 @@ mod postgres {
         Box::pin(exercise_replicated_projection(&a, &b)).await;
     }
 
+    #[tokio::test]
+    async fn i3489_trace_signer_kind_postgres() {
+        let Some(b) = backend().await else { return };
+        Box::pin(exercise_signer_kind(&b)).await;
+    }
+
     #[cfg(feature = "scrub")]
     #[tokio::test]
     async fn i3483_seal_scrubs_postgres() {
@@ -1309,6 +1503,15 @@ mod engine_runs {
             .await;
         }
         #[tokio::test]
+        async fn i3487_agent_signer_selected_by_kind_sqlite() {
+            Box::pin(engine_level::i3487_agent_signer_selected_by_kind(
+                "sqlite::memory:",
+                &suffix(),
+                pick,
+            ))
+            .await;
+        }
+        #[tokio::test]
         async fn i3488_sealed_self_trace_sqlite() {
             Box::pin(engine_level::i3488_sealed_self_trace_waits_for_its_dek(
                 "sqlite::memory:",
@@ -1332,6 +1535,18 @@ mod engine_runs {
                 return;
             };
             Box::pin(engine_level::i3487_seal_then_ingest(&dsn, &suffix(), pick)).await;
+        }
+        #[tokio::test]
+        async fn i3487_agent_signer_selected_by_kind_postgres() {
+            let Some(dsn) = crate::test_pg::empty_dsn() else {
+                return;
+            };
+            Box::pin(engine_level::i3487_agent_signer_selected_by_kind(
+                &dsn,
+                &suffix(),
+                pick,
+            ))
+            .await;
         }
         #[tokio::test]
         async fn i3488_sealed_self_trace_postgres() {

@@ -128,7 +128,9 @@ pub const DIMENSION_RELEASED: &str = "quarantine:released:v1";
 /// **This was "the only one of 109"; on the 114-family rc3 cut it is one of
 /// FOUR, and the shape of the gap changed with the count.** The others are
 /// `regime:{artifact}:{version}` (CIRISPersist#571), `mesh_config:{key}` and
-/// `content_rating:{scheme}:{rating}`. All four sit in **CC 3.1.9.2** — as do
+/// `content_rating:{scheme}:{rating}` (v62.0.0, CC rc20: THREE — the
+/// `content_rating:` row no longer states an emitter; CC 3.3.12 leaves it
+/// open vocabulary). All of them sit in **CC 3.1.9.2** — as do
 /// all 12 of that section's families, **none** of which carries a
 /// `reserved_rule`. So this is not four unlucky rows: CC's generator sources
 /// reserved rules from CC 3.4 plus a `Reserved?` table column, and 3.1.9.2's
@@ -181,6 +183,93 @@ pub mod field {
     pub const RELEASES: &str = "releases_marker_id";
     /// Free text: WHY. Recorded, never interpreted.
     pub const GROUNDS: &str = "grounds";
+}
+
+/// v62.0.0 (K2-fix9) — **the `quarantine:{state}` cells of CC rc21's family
+/// model** that CIRISVerify 23.3.1 does not vendor yet. Each cell is applied
+/// by persist here; **drop each when Verify vendors it (23.3.3)** and read
+/// Verify's answer instead.
+///
+/// - **authorship** — "group=affiliations & seats=one => counted ;
+///   authored" (CC 4.4.3.12): authored by the slash-duty holder; counted
+///   (`affiliation_member_action@subject_group`) only in an affiliation's
+///   one-voice seat. Verify 23.3.1 ALREADY vendors this cell
+///   (`family_authorship.json`), so persist's family model reads it from
+///   Verify; [`crate::federation::edition2::occurrence::PersistCells`] pins
+///   it with the empty second-signer list below.
+/// - **second_signers** — none ([`SECOND_SIGNERS`]).
+/// - **signer_rule** — `seat_role(slash)` via `delegates_to(slash)` (CC
+///   3.1.9.2, CC 4.5.5) ([`SIGNER_RULE`]): applied by
+///   [`check_delegated_duty_scores_admission`](super::admission::check_delegated_duty_scores_admission)
+///   on the quarantine arm. An unauthorized signer is refused
+///   `federation_delegated_scope_unauthorized` (`put_attestation`), and at
+///   the statement door the row is held with the GC1 reason
+///   `delegated_scope_unauthorized` (CC 2.7.3: the seat is other rows).
+/// - **signer_kind** — `attest` / `withdraw` / `supersede`: any-of(`agent`,
+///   person), rule `actor_content` (CC 3.4.7.3 C and E) ([`SIGNER_KINDS`],
+///   [`SIGNER_KIND_RULE`]). A node key never signs it:
+///   [`check_signer_kind`], a refusal on the signer's own key record (a door
+///   input, CC 2.7.3).
+/// - **marker-plane precedence** (CC 3.1.9.2, part_3 l.646): the marker
+///   plane never withholds itself ([`filter_withheld_rows`]), and a withhold
+///   outranks a release whatever their instants ([`fold_quarantine`]).
+pub mod cells {
+    /// DROP AT 23.3.3. The family's model second signers: none.
+    pub const SECOND_SIGNERS: &[&str] = &[];
+    /// DROP AT 23.3.3. The signer rule (CC 3.1.9.2, CC 4.5.5).
+    pub const SIGNER_RULE: &str = "seat_role(slash) via delegates_to(slash)";
+    /// DROP AT 23.3.3. The signer kinds for `attest` / `withdraw` /
+    /// `supersede` (CC 3.4.7.3 C and E): an agent or a person (`user` /
+    /// `accord_holder`).
+    pub const SIGNER_KINDS: &[&str] = &["agent", "user", "accord_holder"];
+    /// DROP AT 23.3.3. The signer-kind rule's name in CC's model.
+    pub const SIGNER_KIND_RULE: &str = "actor_content";
+    /// The refusal token of [`super::check_signer_kind`]: a quarantine
+    /// marker signed by a key that is neither an agent nor a person.
+    /// `Error::InvalidArgument` (Python `ValueError`), terminal.
+    pub const SIGNER_KIND_REFUSED: &str = "quarantine_signer_kind_refused";
+}
+
+/// v62.0.0 (K2-fix9; CC 3.4.7.3 C and E, the `quarantine:{state}`
+/// signer_kind cell, DROP AT 23.3.3) — **a quarantine marker is signed by an
+/// agent or a person, never by a node key.** Read from the SIGNER's own key
+/// record (`lookup_public_key(attesting_key_id)`): a door input, so the
+/// refusal is terminal, not a hold. A signer whose record is not held here
+/// is left to the key gates (it waits there). A no-op for any row that is
+/// not a quarantine marker.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] prefixed [`cells::SIGNER_KIND_REFUSED`];
+/// directory reads.
+pub async fn check_signer_kind<F>(directory: &F, row: &Attestation) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use super::types::identity_type::set_contains;
+    let Some(dimension) = envelope_str(row, "dimension") else {
+        return Ok(());
+    };
+    if !dimension.starts_with(super::admission::QUARANTINE_DIMENSION_PREFIX) {
+        return Ok(());
+    }
+    let Some(rec) = directory.lookup_public_key(&row.attesting_key_id).await? else {
+        return Ok(());
+    };
+    if cells::SIGNER_KINDS
+        .iter()
+        .any(|k| set_contains(&rec.identity_type, k))
+    {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "{}: {} is signed by {} ({}), but a quarantine marker is signed by an agent or a \
+         person, never a node key (CC 3.4.7.3 C and E, rule {})",
+        cells::SIGNER_KIND_REFUSED,
+        row.attestation_id,
+        row.attesting_key_id,
+        rec.identity_type,
+        cells::SIGNER_KIND_RULE
+    )))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -425,6 +514,25 @@ fn envelope_nonempty<'a>(row: &'a Attestation, key: &str) -> Option<&'a str> {
 /// [`DIMENSION_RELEASED`]; its [`field::QUARANTINES`] names `key_id`; and its
 /// `asserted_at <= now`.
 ///
+/// v62.0.0 (K2-fix9; CC 3.1.9.2, part_3 l.646 at rc21: "a withhold outranks
+/// a release whatever their instants. The withhold holds until a release
+/// names the withhold it lifts. Between one holder's own markers the CC
+/// 3.5.1 default applies.") — the precedence, in two layers:
+///
+/// 1. **One holder's own markers** (the same `attesting_key_id`): the CC
+///    3.5.1 default, newest-wins, ordered by `(asserted_at,
+///    withhold-beats-release, attestation_id)`. That gives the holder's
+///    governing marker; a holder's own later release lifts their own
+///    withhold.
+/// 2. **Across holders:** a holder's governing WITHHOLD stays live unless a
+///    release (by anyone) NAMES it ([`field::RELEASES`]). A release that
+///    names no live withhold lifts nothing, however late its instant, so no
+///    second holder can lift a quarantine by out-dating it.
+///
+/// The state is `Withheld` while any live withhold remains (the governing
+/// marker is the newest live withhold), else `Released` (the newest release
+/// governs). Within layer 1 the tie rules below are unchanged:
+///
 /// **Newest-wins**, ordered by `(asserted_at, withhold-beats-release,
 /// attestation_id)`. The last two components are not decoration:
 ///
@@ -465,16 +573,48 @@ pub fn fold_quarantine(
     // 1 for a withhold and 0 for a release — restriction sorts LAST, i.e. wins.
     let withhold_rank =
         |m: &Attestation| u8::from(envelope_str(m, "dimension") == Some(DIMENSION_WITHHELD));
-    effective.sort_by(|a, b| {
+    let order = |a: &&Attestation, b: &&Attestation| {
         a.asserted_at
             .cmp(&b.asserted_at)
             .then_with(|| withhold_rank(a).cmp(&withhold_rank(b)))
             .then_with(|| a.attestation_id.cmp(&b.attestation_id))
-    });
+    };
+    effective.sort_by(&order);
     let mut marker_ids: Vec<String> = effective.iter().map(|m| m.attestation_id.clone()).collect();
     marker_ids.sort();
 
-    let governing = effective[effective.len() - 1];
+    // Layer 1 (CC 3.5.1): each holder's own governing marker.
+    let mut per_holder: std::collections::BTreeMap<&str, &Attestation> =
+        std::collections::BTreeMap::new();
+    for m in &effective {
+        // `effective` is sorted ascending: the last write per holder wins.
+        per_holder.insert(m.attesting_key_id.as_str(), m);
+    }
+    // Layer 2: a withhold is lifted across holders only by a release that
+    // NAMES it.
+    let named: std::collections::BTreeSet<&str> = effective
+        .iter()
+        .filter(|m| envelope_str(m, "dimension") == Some(DIMENSION_RELEASED))
+        .filter_map(|m| envelope_nonempty(m, field::RELEASES))
+        .collect();
+    let mut live: Vec<&Attestation> = per_holder
+        .values()
+        .copied()
+        .filter(|m| {
+            envelope_str(m, "dimension") == Some(DIMENSION_WITHHELD)
+                && !named.contains(m.attestation_id.as_str())
+        })
+        .collect();
+    live.sort_by(&order);
+    let governing = match live.last() {
+        Some(w) => *w,
+        None => effective
+            .iter()
+            .rev()
+            .find(|m| envelope_str(m, "dimension") == Some(DIMENSION_RELEASED))
+            .copied()
+            .unwrap_or(effective[effective.len() - 1]),
+    };
     let state = match envelope_str(governing, "dimension") {
         Some(DIMENSION_WITHHELD) => QuarantineState::Withheld,
         _ => QuarantineState::Released,
@@ -948,6 +1088,81 @@ mod tests {
         assert_eq!(f.marker_id.as_deref(), Some("m-w2"));
     }
 
+    /// v62.0.0 (K2-fix9; CC 3.1.9.2, part_3 l.646) — **I2854 (pure)**: a
+    /// withhold outranks a release whatever their instants. Another holder's
+    /// NEWER release that names no live withhold lifts nothing; a release
+    /// naming the withhold lifts it, whatever its instant; between one
+    /// holder's own markers the CC 3.5.1 default (newest-wins) still applies.
+    #[test]
+    fn i2854_a_withhold_outranks_a_release_whatever_their_instants() {
+        let names = |mut r: Attestation, target: &str| {
+            r.attestation_envelope[field::RELEASES] = serde_json::json!(target);
+            r
+        };
+        let w = marker(
+            "m-w",
+            "k-mod-a",
+            "k-bad",
+            DIMENSION_WITHHELD,
+            "2026-08-02T10:00:00Z",
+        );
+        let r_other = names(
+            marker(
+                "m-r",
+                "k-mod-b",
+                "k-bad",
+                DIMENSION_RELEASED,
+                "2026-08-02T12:00:00Z",
+            ),
+            "m-something-else",
+        );
+        let f = fold_quarantine(
+            "k-bad",
+            &[w.clone(), r_other.clone()],
+            ts("2026-08-02T13:00:00Z"),
+        );
+        assert_eq!(
+            (f.state, f.marker_id.as_deref()),
+            (QuarantineState::Withheld, Some("m-w")),
+            "I2854: a newer release by another holder that names no live withhold lifts nothing"
+        );
+        // An OLDER release naming the withhold lifts it: instants do not order
+        // them, the name does.
+        let r_named = names(
+            marker(
+                "m-r2",
+                "k-mod-b",
+                "k-bad",
+                DIMENSION_RELEASED,
+                "2026-08-02T09:00:00Z",
+            ),
+            "m-w",
+        );
+        let f = fold_quarantine("k-bad", &[w.clone(), r_named], ts("2026-08-02T13:00:00Z"));
+        assert_eq!(
+            f.state,
+            QuarantineState::Released,
+            "I2854: the named withhold is lifted"
+        );
+        // Between one holder's own markers: CC 3.5.1, newest-wins.
+        let own = names(
+            marker(
+                "m-r3",
+                "k-mod-a",
+                "k-bad",
+                DIMENSION_RELEASED,
+                "2026-08-02T11:00:00Z",
+            ),
+            "m-none",
+        );
+        let f = fold_quarantine("k-bad", &[w, own], ts("2026-08-02T13:00:00Z"));
+        assert_eq!(
+            f.state,
+            QuarantineState::Released,
+            "I2854: a holder's own later release lifts its own withhold"
+        );
+    }
+
     #[test]
     fn a_future_dated_marker_does_not_govern_in_either_direction() {
         let w = marker(
@@ -1226,6 +1441,213 @@ pub(crate) mod test_support {
             .any(|r| r.attestation_id == id)
     }
 
+    /// v62.0.0 (K2-fix9) — **I2850–I2853: the `quarantine:{state}` cells**
+    /// (`quarantine::cells`; CC rc21's family model, DROP AT 23.3.3), on every
+    /// backend. Every instant is anchored to the founder's key window
+    /// (`e2::key_window_start_ms`), never to the wall clock; the roster and
+    /// the markers sit at fixed offsets after it.
+    ///
+    /// - **I2850** — a slash-seat holder's withhold lands (`Admitted`) and
+    ///   withholds.
+    /// - **I2851** — a NODE key's marker is refused
+    ///   [`cells::SIGNER_KIND_REFUSED`] (CC 3.4.7.3 C and E, terminal: the
+    ///   signer's own key record).
+    /// - **I2852** — a non-holder's marker is refused
+    ///   `federation_delegated_scope_unauthorized` at `put_attestation`, and
+    ///   at the statement door it is held with the GC1 reason
+    ///   `delegated_scope_unauthorized` (CC 2.7.3).
+    /// - **I2853** — a withhold outranks a release whatever their instants
+    ///   (CC 3.1.9.2, part_3 l.646): a second holder's newer release that
+    ///   names only its OWN withhold leaves the first holder's withhold
+    ///   standing; the release naming it lifts it.
+    pub(crate) async fn exercise_quarantine_cells(dir: &dyn FederationDirectory, suffix: &str) {
+        let founder = format!("q9-founder-{suffix}");
+        let member = format!("q9-member-{suffix}");
+        let stranger = format!("q9-stranger-{suffix}");
+        let actor = format!("q9-actor-{suffix}");
+        let community = format!("q9-commons-{suffix}");
+        let node = format!("q9-node-{suffix}");
+        for k in [&founder, &member, &stranger, &actor, &community] {
+            register_user_key(dir, k).await;
+        }
+        register_key(dir, &node, crate::federation::types::identity_type::NODE).await;
+        let base = DateTime::<Utc>::from_timestamp_millis(
+            i64::try_from(e2::key_window_start_ms(&founder)).expect("a window start fits i64"),
+        )
+        .expect("an instant");
+        let at = |hours: i64| base + chrono::Duration::hours(hours);
+        let (actor_k, community_k) = (e2::kid(&actor), e2::kid(&community));
+
+        // The community whose authority set is {founder, member}, founded at
+        // the anchor.
+        let community_row = crate::federation::tier_ingest::test_support::sign_community(
+            &founder,
+            crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                community_key_id: community.clone(),
+                community_name: format!("commons {community}"),
+                members: vec![
+                    crate::federation::types::CommunityMember {
+                        key_id: founder.clone(),
+                        joined_at: base,
+                        role: Some("founder".to_owned()),
+                    },
+                    crate::federation::types::CommunityMember {
+                        key_id: member.clone(),
+                        joined_at: base,
+                        role: Some("member".to_owned()),
+                    },
+                ],
+                founded_at: base,
+                consensus_protocol: "majority".to_owned(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        e2::put_voices(
+            dir,
+            &e2::community_voices(&community_row, 1, None, e2::ms(base)),
+        )
+        .await
+        .expect("I2850: the community roster lands");
+
+        // ── I2850: the slash-seat holder's withhold lands.
+        let w1 = signed_row(
+            &founder,
+            &actor_k,
+            withhold_envelope(&actor_k, &community_k, "q9-deleg-f", "spam"),
+            at(1),
+        );
+        let w1_id = w1.attestation_id.clone();
+        assert_eq!(
+            record_quarantine_marker(dir, &w1).await.expect("I2850"),
+            QuarantineOutcome::Admitted,
+            "({suffix}) I2850: a slash-seat holder's quarantine lands"
+        );
+        assert!(
+            resolve_quarantine(dir, &actor_k, Utc::now())
+                .await
+                .expect("resolve")
+                .withholds(),
+            "({suffix}) I2850: and withholds"
+        );
+
+        // ── I2851: a node key never signs it.
+        let by_node = signed_row(
+            &node,
+            &actor_k,
+            withhold_envelope(&actor_k, &community_k, "q9-deleg-n", "spam"),
+            at(2),
+        );
+        match dir
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: by_node,
+            })
+            .await
+        {
+            Err(Error::InvalidArgument(m)) if m.starts_with(cells::SIGNER_KIND_REFUSED) => {}
+            other => panic!("({suffix}) I2851: a node key's quarantine is refused: {other:?}"),
+        }
+
+        // ── I2852: a non-holder is refused / held, by the slash seat.
+        let usurp = signed_row(
+            &stranger,
+            &actor_k,
+            withhold_envelope(&actor_k, &community_k, "q9-deleg-s", "spam"),
+            at(3),
+        );
+        match dir
+            .put_attestation(crate::federation::SignedAttestation { attestation: usurp })
+            .await
+        {
+            Err(e) if e.kind() == "federation_delegated_scope_unauthorized" => {}
+            other => panic!(
+                "({suffix}) I2852: a non-holder is refused \
+                 federation_delegated_scope_unauthorized: {other:?}"
+            ),
+        }
+        let usurp_door = signed_row(
+            &stranger,
+            &actor_k,
+            withhold_envelope(&actor_k, &community_k, "q9-deleg-s2", "spam"),
+            at(3) + chrono::Duration::minutes(30),
+        );
+        let usurp_id = crate::federation::edition2::names::RowId(e2::rid_digest(&usurp_door));
+        let out = e2::put_signed(dir, &usurp_door)
+            .await
+            .expect("I2852: the door keeps it");
+        assert!(
+            matches!(
+                out,
+                crate::federation::edition2::ingest::StatementOutcome::Pending { .. }
+            ),
+            "({suffix}) I2852: held at the statement door: {out:?}"
+        );
+        let why = crate::federation::edition2::fold::why_held(dir, &usurp_id)
+            .await
+            .expect("I2852: read the hold")
+            .expect("I2852: held");
+        assert_eq!(
+            why.reason,
+            crate::federation::edition2::fold::reason::gc1::DELEGATED_SCOPE_UNAUTHORIZED,
+            "({suffix}) I2852: {why:?}"
+        );
+
+        // ── I2853: a withhold outranks a release whatever their instants.
+        let wm = signed_row(
+            &member,
+            &actor_k,
+            withhold_envelope(&actor_k, &community_k, "q9-deleg-m", "spam"),
+            at(4),
+        );
+        let wm_id = wm.attestation_id.clone();
+        assert_eq!(
+            record_quarantine_marker(dir, &wm).await.expect("I2853"),
+            QuarantineOutcome::Admitted,
+            "({suffix}) I2853: the second holder's withhold"
+        );
+        let rm = signed_row(
+            &member,
+            &actor_k,
+            release_envelope(&actor_k, &community_k, &wm_id, "q9-deleg-m", "own"),
+            at(5),
+        );
+        assert_eq!(
+            record_quarantine_marker(dir, &rm).await.expect("I2853"),
+            QuarantineOutcome::Admitted,
+            "({suffix}) I2853: the second holder releases ITS withhold"
+        );
+        let fold = resolve_quarantine(dir, &actor_k, Utc::now())
+            .await
+            .expect("resolve");
+        assert_eq!(
+            (fold.state, fold.marker_id.as_deref()),
+            (QuarantineState::Withheld, Some(w1_id.as_str())),
+            "({suffix}) I2853: the newest marker is a release, but it names only its own \
+             withhold; the first holder's withhold still governs"
+        );
+        let rf = signed_row(
+            &founder,
+            &actor_k,
+            release_envelope(&actor_k, &community_k, &w1_id, "q9-deleg-f", "lifted"),
+            at(6),
+        );
+        assert_eq!(
+            record_quarantine_marker(dir, &rf).await.expect("I2853"),
+            QuarantineOutcome::Admitted,
+            "({suffix}) I2853"
+        );
+        assert_eq!(
+            resolve_quarantine(dir, &actor_k, Utc::now())
+                .await
+                .expect("resolve")
+                .state,
+            QuarantineState::Released,
+            "({suffix}) I2853: the release naming the withhold lifts it"
+        );
+    }
+
     /// **The #570 asks-2/3/5 witness:**
     ///
     /// 1. an unattributed marker is REFUSED naming `unattributed` (ask 3's
@@ -1252,7 +1674,6 @@ pub(crate) mod test_support {
         let deputy_mod = format!("qa-dep-mod-{suffix}");
         let actor = format!("qa-actor-{suffix}");
         let community = format!("qa-commons-{suffix}");
-        let now = Utc::now();
 
         for k in [&founder, &member, &stranger, &actor, &community] {
             register_user_key(dir, k).await;
@@ -1260,6 +1681,28 @@ pub(crate) mod test_support {
         for k in [&deputy_slash, &deputy_mod] {
             register_agent_key(dir, k).await;
         }
+        // v62.0.0 (E0 fix 10) — every fixture instant is anchored to the
+        // signing keys' WINDOW, never the wall clock: the deputies (agent keys)
+        // and the node signing the hard_case rows are default-window keys, so
+        // they share one start (`e2::key_window_start_ms`). The fixture sits at
+        // K2's fixed offset into it (`OWNER_BINDING_OFFSET_DAYS`), and each act
+        // takes the next second (`tick`), so the withhold precedes its release
+        // as written.
+        let now = {
+            let start = e2::key_window_start_ms(&deputy_slash);
+            DateTime::<Utc>::from_timestamp_millis(
+                i64::try_from(start).expect("a window start in range"),
+            )
+            .expect("a window start in range")
+                + chrono::Duration::days(
+                    crate::federation::tier_ingest::test_support::OWNER_BINDING_OFFSET_DAYS,
+                )
+        };
+        let step = std::cell::Cell::new(0_i64);
+        let tick = || {
+            step.set(step.get() + 1);
+            now + chrono::Duration::seconds(step.get())
+        };
         // v62 (E3): the seeds sign; the stored, compared ids are identity-refs.
         let (founder_k, stranger_k, actor_k, community_k) = (
             e2::kid(&founder),
@@ -1325,7 +1768,7 @@ pub(crate) mod test_support {
         );
 
         let mk = |author: &str, subject: &str, env: serde_json::Value| {
-            signed_row(author, subject, env, Utc::now())
+            signed_row(author, subject, env, tick())
         };
 
         // ── (1) UNATTRIBUTED: no delegation_id ⇒ refused.
@@ -1498,18 +1941,31 @@ pub(crate) mod test_support {
 
         // ── (8) SCOPE ISOLATION on the removal duty. A `moderate`-only
         //        delegate may file reports; it may NOT take things away.
+        // v62.0.0 (E0 fix 10; CC 2.6.1.9, CC ruled quarantine:{state} is a row
+        // authored by the community's slash-duty holder) — each deputy is
+        // SEATED: an own-act `self:delegates_to` waits for the delegate's voice
+        // and, a deputy being an agent (a machine key), its owner's
+        // (`delegate_owner`). The founder owns both deputies (an agent's owner
+        // binding, `e2::put_agent_owner_binding`), and the delegation lands
+        // through `e2::land_delegation` with exactly the roles K2's resolved
+        // reader names, asserted SEATED (a held edge would make arm 8 a check
+        // that cannot fail).
         for (deputy, scope) in [
             (&deputy_mod, DELEGATION_SCOPE_MODERATE),
             (&deputy_slash, DELEGATION_SCOPE_SLASH),
         ] {
-            // v62 (E3b-fix4; CC 2.6.1.9, E0.api v1.15): the own-act
-            // delegation lands with the delegate's voice.
-            e2::land_delegation(
-                dir,
-                &delegation_row(&founder, &e2::kid(deputy), &[scope], Utc::now()),
-            )
-            .await
-            .expect("delegates_to lands");
+            e2::put_agent_owner_binding(dir, &founder, deputy, e2::ms(tick())).await;
+            let edge = delegation_row(&founder, &e2::kid(deputy), &[scope], tick());
+            let (out, unvoiced) = e2::land_delegation(dir, &edge)
+                .await
+                .expect("the delegation is admitted");
+            assert!(
+                matches!(
+                    out,
+                    crate::federation::edition2::ingest::StatementOutcome::Row { .. }
+                ),
+                "({suffix}) the {scope} deputy is seated: {out:?}, unvoiced {unvoiced:?}"
+            );
         }
         let by_mod_deputy = mk(
             &deputy_mod,
@@ -1550,7 +2006,7 @@ pub(crate) mod test_support {
             Some(&founder_k),
             "att-deleg-1",
             "sustained spam",
-            Utc::now(),
+            tick(),
         );
         unattributed
             .detail
@@ -1590,7 +2046,7 @@ pub(crate) mod test_support {
             Some(&founder_k),
             "att-deleg-1",
             "sustained spam",
-            Utc::now(),
+            tick(),
         );
         dir.record_hard_case(attributed.clone())
             .await
@@ -1618,5 +2074,47 @@ pub(crate) mod test_support {
             "({suffix}) enumerating what a compromised authority did is the \
              whole reason the attribution is required"
         );
+    }
+}
+
+/// v62.0.0 (K2-fix9) — the `quarantine:{state}` cells, sqlite and postgres.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod cells_runners {
+    fn suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i2850_i2853_quarantine_cells_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Box::pin(super::test_support::exercise_quarantine_cells(
+            &b,
+            &suffix(),
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i2850_i2853_quarantine_cells_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Box::pin(super::test_support::exercise_quarantine_cells(
+            &b,
+            &suffix(),
+        ))
+        .await;
     }
 }

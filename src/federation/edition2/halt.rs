@@ -27,20 +27,50 @@
 //! held for the accord within its `valid_until`), kept in `ceg_statements`,
 //! and a constitutional halt latches the accord's active halt.
 //!
-//! Not here: the counted lifecycle rows (`confirmed`, `active`; Verify's
-//! `verify_lifecycle_row`) and the fuse (`HaltLatch::apply_forward`).
-//! TODO(cut-a-halt-lifecycle).
+//! v62.0.0 (C2-fix, ceremony gap 8; CC 4.2.1.1, CC 4.2.1.3) — **the
+//! lifecycle and the fuse.** [`put_lifecycle`] is the store door of a
+//! counted lifecycle row (`accord:lifecycle:{confirmed,active}`), read by
+//! Verify's [`verify_lifecycle_row`] under the roster of the bundle its
+//! `refs.head` names, over the halt its `refs.target` names. Its voices are
+//! kept as they arrive; short of a strict majority the row is held
+//! (`count_short`); counted, it drives the latch. [`halt_in_force`] reads the
+//! latch at an instant. The transitions are Verify's `HaltLatch` table
+//! (`accord_halt_latch`, model `AccordHaltFuse.tla`):
+//!
+//! | row (verified)          | no halt in force     | lone halt                                  | confirmed halt  |
+//! |-------------------------|----------------------|--------------------------------------------|-----------------|
+//! | constitutional          | **latch** (receipt)  | changes nothing (the fuse is not reset)    | changes nothing |
+//! | `confirmed` (counted)   | changes nothing      | **confirm**, if it names this halt         | changes nothing |
+//! | `active` (counted)      | changes nothing      | **resume**, if it names this halt          | **resume**, if it names this halt |
+//! | time                    | —                    | **lapses** at receipt + `halt_fuse_secs`   | never lapses    |
+//!
+//! - The fuse counts from RECEIPT on this node's clock (the active halt's
+//!   `set_at`), never from the signed `asserted_at`, and its length is the
+//!   bundle in force's `halt_fuse_secs` (86400 when the charter omits it).
+//! - A lapsed halt is gone before anything else is judged: a confirmation
+//!   counted after the fuse confirms nothing, and a fresh halt latches anew.
+//! - A confirmation is KEPT as the latch's state: the counted `confirmed` row
+//!   that confirmed the halt in force concludes (its fold state is clear); a
+//!   counted row that changed nothing is not concluded (it keeps whatever
+//!   hold its short voices recorded, `count_short`, or none), so it never
+//!   confirms a halt latched later. There is no registered token yet for
+//!   "counted, names no halt in force"; see C2-fix's notes.
+//! - A halt received after its `valid_until` that a counted `active` row
+//!   already names does not fire (CC 4.2.1.1).
+//! - A re-put of a held halt is not a new receipt: it latches nothing.
 
 use std::collections::BTreeMap;
 
+use chrono::{DateTime, Utc};
 use ciris_verify_core::cde::Value;
 use ciris_verify_core::edition2::family::SelectContext;
 use ciris_verify_core::edition2::identity_ref;
 
 pub use ciris_verify_core::edition2::accord_halt::{
-    named_accord_root, verify_invocation_row, HaltReading, HaltRefusal, HaltRoster, HaltWaiting,
-    InvocationRow, InvokeKind, RosterHolder, ACCORD_ROW_TYPE, FAMILY_CONSTITUTIONAL, FAMILY_DRILL,
-    FAMILY_NOTIFY,
+    named_accord_root, named_head, verify_invocation_row, verify_lifecycle_row, HaltReading,
+    HaltRefusal, HaltRoster, HaltWaiting, InvocationRow, InvokeKind, LifecycleKind, LifecycleRow,
+    RosterHolder, ACCORD_ROW_TYPE, DEFAULT_HALT_FUSE_SECS, FAMILY_CONSTITUTIONAL, FAMILY_DRILL,
+    FAMILY_LIFECYCLE, FAMILY_NOTIFY,
 };
 
 use super::door::AdmittedRow;
@@ -80,6 +110,13 @@ where
     Ok(super::genesis::genesis_in_force(dir)
         .await?
         .halt_roster(accord_root))
+}
+
+/// Is `statement` of the lifecycle family (by its header, unverified)?
+#[must_use]
+pub fn is_lifecycle(statement: &[u8]) -> bool {
+    statement_parts(statement)
+        .is_some_and(|(h, _)| h.get_int(-70002).and_then(Value::as_text) == Some(FAMILY_LIFECYCLE))
 }
 
 /// What [`put_invocation`] did.
@@ -215,12 +252,34 @@ fn replay_fold(mut held: Vec<HeldInvocation>) -> BTreeMap<RowId, RowId> {
 ///   latches the accord's active halt (`set_active_halt(accord_root, row
 ///   id)`): ONE holder's statement, no count.
 ///
+/// v62.0.0 (C2-fix) — a constitutional halt latches only as the latch
+/// table above allows: not while another halt is in force (a second halt
+/// changes nothing and does not reset the fuse), not on a re-put of a held
+/// halt, and not when received after its `valid_until` while a counted
+/// `active` row names it. A lapsed halt in the table is replaced.
+///
 /// # Errors
 /// As above; directory failures.
 pub async fn put_invocation<F>(
     dir: &F,
     bytes: &[u8],
     roster: Option<&HaltRoster>,
+) -> Result<InvocationOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    put_invocation_at(dir, bytes, roster, crate::host::clock::now()).await
+}
+
+/// [`put_invocation`] received at `now` (the latch's clock).
+///
+/// # Errors
+/// As [`put_invocation`].
+pub async fn put_invocation_at<F>(
+    dir: &F,
+    bytes: &[u8],
+    roster: Option<&HaltRoster>,
+    now: DateTime<Utc>,
 ) -> Result<InvocationOutcome, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -326,7 +385,9 @@ where
             held: true,
         });
     }
-    let latched = inv.kind() == InvokeKind::Constitutional;
+    let latched = inv.kind() == InvokeKind::Constitutional
+        && new
+        && latch_allows(dir, roster, &inv, own, now).await?;
     if latched {
         dir.set_active_halt(accord_root, &hex::encode(inv.row_id()))
             .await?;
@@ -360,4 +421,388 @@ where
         std::iter::once(super::fold::Dep::Row(row).read_key()).collect(),
     )
     .await
+}
+
+// ------------------------------------------------------------------ the latch
+
+/// v62.0.0 (C2-fix) — the halt in force for an accord at an instant
+/// ([`halt_in_force`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HaltInForce {
+    /// The active halt's id as the table keeps it (the halt's row id, hex).
+    pub halt_id: String,
+    /// The halt's row id; `None` for an id that is not one (a halt of the
+    /// earlier form, which no edition-2 row confirms or ends).
+    pub halt_row: Option<RowId>,
+    /// When THIS node received it: the fuse's origin.
+    pub received_at: DateTime<Utc>,
+    /// Confirmed by a counted `confirmed` row before its fuse ran.
+    pub confirmed: bool,
+    /// When it lapses: `None` once confirmed (or for an earlier-form halt).
+    pub lapses_at: Option<DateTime<Utc>>,
+}
+
+/// The fuse in force for `accord_root`: the bundle in force's
+/// `halt_fuse_secs`, or 86400.
+async fn fuse_secs<F>(dir: &F, accord_root: &str) -> Result<u64, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(u64::from(
+        roster_in_force(dir, accord_root)
+            .await?
+            .map_or(DEFAULT_HALT_FUSE_SECS, |r| r.halt_fuse_secs()),
+    ))
+}
+
+fn row_id_of_hex(s: &str) -> Option<RowId> {
+    hex::decode(s)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        .map(RowId)
+}
+
+/// The leaf of a lifecycle statement's `dimension`
+/// (`accord:lifecycle:{kind}:vN`), unverified: read only from rows this door
+/// counted.
+fn lifecycle_leaf(statement: &[u8]) -> Option<String> {
+    let (_, p) = statement_parts(statement)?;
+    let d = p.get_text("dimension").and_then(Value::as_text)?;
+    d.strip_prefix("accord:lifecycle:")
+        .and_then(|rest| rest.split(':').next())
+        .map(str::to_owned)
+}
+
+/// Is there a counted lifecycle row of `kind` naming `halt` as its target,
+/// concluded by this door (its fold state clear)?
+async fn concluded_lifecycle<F>(dir: &F, halt: &RowId, kind: LifecycleKind) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    for row in dir.edition2_rows_naming(halt, "target").await? {
+        let Some(state) = dir.fold_state(&row).await? else {
+            continue;
+        };
+        if state.family != FAMILY_LIFECYCLE || state.held.is_some() {
+            continue;
+        }
+        let voices = dir.edition2_voices(&row).await?;
+        if voices
+            .first()
+            .and_then(|v| lifecycle_leaf(v))
+            .is_some_and(|leaf| leaf == kind.as_str())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// v62.0.0 (C2-fix, ceremony gap 8) — **the halt in force** for
+/// `accord_root` at `now`: the latched halt, unless it is a lone halt whose
+/// fuse has run (`received_at + halt_fuse_secs <= now`) or a counted `active`
+/// row has ended it. A read: it changes nothing (the next door that judges a
+/// row clears a lapsed halt from the table).
+///
+/// # Errors
+/// Directory read failures.
+pub async fn halt_in_force<F>(
+    dir: &F,
+    accord_root: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<HaltInForce>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(active) = dir.get_active_halt(accord_root).await? else {
+        return Ok(None);
+    };
+    let Some(halt_row) = row_id_of_hex(&active.active_halt_id) else {
+        // A halt of the earlier form: no edition-2 row confirms, ends or
+        // lapses it here; it is reported as it stands.
+        return Ok(Some(HaltInForce {
+            halt_id: active.active_halt_id,
+            halt_row: None,
+            received_at: active.set_at,
+            confirmed: false,
+            lapses_at: None,
+        }));
+    };
+    if concluded_lifecycle(dir, &halt_row, LifecycleKind::Active).await? {
+        return Ok(None);
+    }
+    let confirmed = concluded_lifecycle(dir, &halt_row, LifecycleKind::Confirmed).await?;
+    let fuse = fuse_secs(dir, accord_root).await?;
+    let lapses_at = active
+        .set_at
+        .checked_add_signed(
+            chrono::Duration::try_seconds(i64::try_from(fuse).unwrap_or(i64::MAX))
+                .unwrap_or(chrono::Duration::MAX),
+        )
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+    if !confirmed && now >= lapses_at {
+        return Ok(None);
+    }
+    Ok(Some(HaltInForce {
+        halt_id: active.active_halt_id,
+        halt_row: Some(halt_row),
+        received_at: active.set_at,
+        confirmed,
+        lapses_at: (!confirmed).then_some(lapses_at),
+    }))
+}
+
+/// Clear a halt the table still keeps but that is no longer in force at
+/// `now` (lapsed, or ended): "a lone halt whose fuse has run is gone before
+/// anything else is judged". Returns the halt in force.
+async fn settle_latch<F>(
+    dir: &F,
+    accord_root: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<HaltInForce>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let in_force = halt_in_force(dir, accord_root, now).await?;
+    if in_force.is_none() {
+        if let Some(stale) = dir.get_active_halt(accord_root).await? {
+            dir.clear_active_halt(accord_root, &stale.active_halt_id)
+                .await?;
+        }
+    }
+    Ok(in_force)
+}
+
+/// May the constitutional halt `inv` latch at `now`?
+async fn latch_allows<F>(
+    dir: &F,
+    roster: &HaltRoster,
+    inv: &InvocationRow,
+    own: RowId,
+    now: DateTime<Utc>,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if settle_latch(dir, roster.accord_root(), now)
+        .await?
+        .is_some()
+    {
+        // A second halt changes nothing and does not reset the fuse.
+        return Ok(false);
+    }
+    let received_after = u64::try_from(now.timestamp_millis()).is_ok_and(|n| n > inv.valid_until());
+    if received_after && concluded_lifecycle(dir, &own, LifecycleKind::Active).await? {
+        // Past its valid_until, a halt a held resumption names does not fire.
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// What [`put_lifecycle`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LifecycleOutcome {
+    /// The voice is kept; the row's voices are short of a strict majority
+    /// (held `count_short`).
+    Pending {
+        /// The lifecycle row.
+        row_id: RowId,
+        /// Was the statement new.
+        new: bool,
+    },
+    /// The row is counted and changed the latch.
+    Applied {
+        /// The lifecycle row.
+        row_id: RowId,
+        /// Was the statement new.
+        new: bool,
+        /// `Confirmed` or `Active` (resumed).
+        kind: LifecycleKind,
+    },
+    /// The row is counted and changed nothing: it names no halt in force
+    /// (another halt, one that lapsed, or none).
+    Unchanged {
+        /// The lifecycle row.
+        row_id: RowId,
+        /// Was the statement new.
+        new: bool,
+    },
+}
+
+impl LifecycleOutcome {
+    /// The lifecycle row.
+    #[must_use]
+    pub fn row_id(&self) -> RowId {
+        match self {
+            Self::Pending { row_id, .. }
+            | Self::Applied { row_id, .. }
+            | Self::Unchanged { row_id, .. } => *row_id,
+        }
+    }
+
+    /// Was the statement new.
+    #[must_use]
+    pub fn is_new(&self) -> bool {
+        match self {
+            Self::Pending { new, .. } | Self::Applied { new, .. } | Self::Unchanged { new, .. } => {
+                *new
+            }
+        }
+    }
+}
+
+fn malformed_lifecycle(member: &str) -> Error {
+    Error::malformed_row(
+        PLANE,
+        malformed_row::ACCORD_INVOCATION_INVALID,
+        format!("refused:member:{member}"),
+    )
+}
+
+/// The halt a lifecycle row targets, verified as Verify read it: under the
+/// roster of a held Valid bundle of `accord_root`. `None`: not verifiable
+/// under any held bundle (it waits).
+fn verified_halt(
+    halt: &[u8],
+    placements: &[super::genesis::GenesisPlacement],
+) -> Option<InvocationRow> {
+    placements.iter().find_map(|p| {
+        match verify_invocation_row(halt, &HaltRoster::from_placement(p)) {
+            HaltReading::Valid(inv) => Some(inv),
+            HaltReading::Waiting(_) | HaltReading::Refused(_) => None,
+        }
+    })
+}
+
+/// v62.0.0 (C2-fix, ceremony gap 8; CC 4.2.1.1, CC 4.2.1.3) — **the
+/// lifecycle store door**, received now. See [`put_lifecycle_at`].
+///
+/// # Errors
+/// As [`put_lifecycle_at`].
+pub async fn put_lifecycle<F>(dir: &F, bytes: &[u8]) -> Result<LifecycleOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    put_lifecycle_at(dir, bytes, crate::host::clock::now()).await
+}
+
+/// **The lifecycle store door** at `now`:
+///
+/// - the bundle `refs.head` names must be a held Valid bundle, else the
+///   statement WAITS on it (retryable `federation_attester_key_unknown`
+///   naming `ceg-genesis-bundle/2:<id>`); the halt `refs.target` names must
+///   be held and verify under a held bundle, else it waits on that row;
+/// - the statement alone is read by [`verify_lifecycle_row`] under that
+///   bundle's roster: a key the roster does not hold WAITS; `iss_not_holder`
+///   is refused by name; every other statement fault is
+///   `accord_invocation_invalid` with the reader's token. Nothing of a
+///   refused or waiting statement is kept;
+/// - a valid voice is kept (`ceg_statements`); the row's held voices are
+///   counted: short of a strict majority it is held `count_short`
+///   ([`LifecycleOutcome::Pending`]); counted, it is applied to the latch
+///   at `now` (the table in this module's header). A row that confirmed the
+///   halt in force, and every counted resumption, concludes; a confirmation
+///   that changed nothing is not concluded.
+///
+/// # Errors
+/// As above; directory failures.
+pub async fn put_lifecycle_at<F>(
+    dir: &F,
+    bytes: &[u8],
+    now: DateTime<Utc>,
+) -> Result<LifecycleOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    super::door::require_statement_form(bytes)?;
+    let head = named_head(bytes).ok_or_else(|| malformed_lifecycle("head"))?;
+    let target = statement_parts(bytes)
+        .and_then(|(_, p)| super::names::names_of(&p).ok())
+        .and_then(|n| super::names::single(&n, "target"))
+        .ok_or_else(|| malformed_lifecycle("target"))?;
+    let state = super::genesis::genesis_in_force(dir).await?;
+    let Some(roster) = HaltRoster::from_placements_by_head(&state.valid, &head) else {
+        return Err(Error::unknown_signer(
+            &format!("{GENESIS_BUNDLE_TYP}:{}", hex::encode(head)),
+            PLANE,
+        ));
+    };
+    let wait_on_halt = || Error::unknown_signer(&format!("row:{}", target.hex()), PLANE);
+    let Some(halt_bytes) = dir.edition2_voices(&target).await?.into_iter().next() else {
+        return Err(wait_on_halt());
+    };
+    let Some(halt) = verified_halt(&halt_bytes, &state.valid) else {
+        return Err(wait_on_halt());
+    };
+    // The statement alone: a voice, a wait, or a refusal.
+    match verify_lifecycle_row(&[bytes.to_vec()], &roster, &halt) {
+        HaltReading::Valid(_) => {}
+        HaltReading::Refused(HaltRefusal::CountUnmet { have, .. }) if have >= 1 => {}
+        HaltReading::Refused(HaltRefusal::CountUnmet { .. }) => {
+            // No voice counted and nothing refused: its key is one the
+            // roster does not hold (CC 4.2.1.1: it waits, never refused).
+            let named = super::ingest::statement_kid(bytes)
+                .map_or_else(|| format!("row:{}", target.hex()), |k| identity_ref(&k));
+            return Err(Error::unknown_signer(&named, PLANE));
+        }
+        HaltReading::Waiting(w) => return Err(waiting_error(&w)),
+        HaltReading::Refused(r) => return Err(refusal_error(&r)),
+    }
+    let admitted: AdmittedRow =
+        super::door::admit_row(bytes, &roster, None, SelectContext::default())?;
+    let row_id = admitted.row_id;
+    let new = dir.put_edition2_statement(&admitted).await?;
+    let mut voices = dir.edition2_voices(&row_id).await?;
+    if !voices.iter().any(|v| v.as_slice() == bytes) {
+        voices.push(bytes.to_vec());
+    }
+    let row = match verify_lifecycle_row(&voices, &roster, &halt) {
+        HaltReading::Valid(row) => row,
+        HaltReading::Waiting(_) | HaltReading::Refused(_) => {
+            super::fold::record_pending(
+                dir,
+                row_id,
+                FAMILY_LIFECYCLE,
+                super::ingest::INGEST_TIER,
+                None,
+                std::iter::once(super::fold::Dep::Row(target).read_key()).collect(),
+            )
+            .await?;
+            return Ok(LifecycleOutcome::Pending { row_id, new });
+        }
+    };
+    let accord_root = roster.accord_root();
+    let in_force = settle_latch(dir, accord_root, now).await?;
+    let names_it = in_force
+        .as_ref()
+        .and_then(|h| h.halt_row)
+        .is_some_and(|h| h.0 == *row.target());
+    let kind = row.kind();
+    let applied = match kind {
+        LifecycleKind::Confirmed => names_it && in_force.as_ref().is_some_and(|h| !h.confirmed),
+        LifecycleKind::Active => {
+            if names_it {
+                dir.clear_active_halt(accord_root, &target.hex()).await?;
+            }
+            names_it
+        }
+    };
+    // A counted resumption is remembered whether or not it ended a halt in
+    // force (Verify's `held_resumptions`): a late halt it names never fires.
+    if applied || kind == LifecycleKind::Active {
+        super::fold::record(
+            dir,
+            row_id,
+            FAMILY_LIFECYCLE,
+            super::ingest::INGEST_TIER,
+            None,
+            std::iter::once(super::fold::Dep::Row(target).read_key()).collect(),
+        )
+        .await?;
+    }
+    Ok(if applied {
+        LifecycleOutcome::Applied { row_id, new, kind }
+    } else {
+        LifecycleOutcome::Unchanged { row_id, new }
+    })
 }

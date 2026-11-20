@@ -653,7 +653,11 @@ fn wire_signature(
 ) -> Result<crate::verify::sig19::Sig19, StorageContentionError> {
     use crate::verify::sig19::{Sig19, Sig19Error};
     Sig19::from_wire_fields(ed_b64, mldsa_b64, composite_b64).map_err(|e| match e {
-        Sig19Error::EarlierForm => StorageContentionError::EarlierForm,
+        // v62.0.0 (F0-cp5b) — a lone half is the earlier component form:
+        // refused by name with it.
+        Sig19Error::EarlierForm | Sig19Error::ComponentSignature(_) => {
+            StorageContentionError::EarlierForm
+        }
         _ => StorageContentionError::MalformedBase64("signature_composite_base64"),
     })
 }

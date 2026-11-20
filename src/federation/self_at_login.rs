@@ -1197,15 +1197,14 @@ pub(crate) async fn other_keys_of<D: crate::federation::FederationDirectory + ?S
 ///
 /// 1. Read it only from live (unretired) [`BindingProvenance::Rooted`]
 ///    bindings; none, or two live bindings carrying different keys ⇒ `None`.
-/// 2. **THE RULE.** For a seated serve node of the pinned bundle, the key is
-///    live ONLY when an admitted `transport:canonical_rebind` carries exactly
-///    the live row ([`rebind_held_for`](super::transport_rebind::rebind_held_for)).
-///    CC 3.3.6.2: "A seated serve node's new transit key moves by
-///    `transport:canonical_rebind`, counted by the accord's holders, before
-///    the handshake changes." A seat publishing the key ALONE (a re-assertion
-///    of its pinned earlier-form pair, which the transport door admits) is
-///    held and served, but its X-Wing key is not live: otherwise a seat would
-///    choose its own forward transit key, which #1106 exists to prevent.
+/// 2. **THE RULE.** For a seat of the genesis bundle in force the key is the
+///    bundle binding's, moved only by a counted edition-2 re-bind
+///    (`edition2::transport_rebind::seat_transit_key`); a binding the seat
+///    publishes itself is not read. CC 3.3.6.2: "A seated serve node's new
+///    transit key moves by `transport:canonical_rebind`, counted by the
+///    accord's holders, before the handshake changes." v62.0.0 (C5-fix1): the
+///    earlier-form seat check over the baked v4 bundle is deleted; no
+///    earlier-form genesis seats a node.
 /// 3. The cross-row rule at use: a half equal to any key on the node's current
 ///    occurrence (as [`transit_kex_pair_for`] gathers them), or to a half of
 ///    the live row's earlier-form pair ⇒ `None`.
@@ -1249,19 +1248,11 @@ pub async fn transit_xwing_pubkey_for<D: crate::federation::FederationDirectory 
             Some(_) => return Ok(None),
         }
     }
-    let Some((key, row)) = found else {
+    let Some((key, _)) = found else {
         // v62.0.0 (wave O1; E8's finding) — no route-plane key: the
         // edition-2 bind's, for a node that is not a seat.
         return super::edition2::occurrence::bind_transit_xwing_for(dir, occurrence_key_id).await;
     };
-    if super::transport_rebind::is_seated_serve_node(occurrence_key_id)
-        && super::transport_rebind::rebind_held_for(dir, occurrence_key_id)
-            .await?
-            .as_ref()
-            != Some(row)
-    {
-        return Ok(None);
-    }
     let others = other_keys_of(dir, occurrence_key_id, &live).await?;
     let mut pair_halves: Vec<Vec<u8>> = Vec::new();
     for b in &live {

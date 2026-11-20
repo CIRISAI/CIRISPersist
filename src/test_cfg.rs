@@ -62,6 +62,7 @@ fn i693_the_test_only_cfg_vocabulary() {
     for no in [
         "#[cfg(any(test, feature = \"test-anchor\"))]",
         "#[cfg(not(test))]",
+        "#[cfg(not(any(test, feature = \"test-anchor\")))]",
         "#[cfg(feature = \"test-anchor\")]",
         "#[cfg(all(any(test, feature = \"test-anchor\"), feature = \"sqlite\"))]",
         "#[cfg(all(feature = \"x\", test))]",

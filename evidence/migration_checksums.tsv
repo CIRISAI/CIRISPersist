@@ -9,6 +9,13 @@
 # on, V300's bytes are its contract.
 # v62.0.0 (X2 pass 4c, BF9): re-pinned again over the round-3 V300 edits (the pin was
 # already stale at the round-3 base, P1); still unshipped.
+# v62.0.0 (F0-cp5): re-pinned (still unshipped) for the delivery-attestation
+# composite ALTERs; the J0 pin had also drifted (V300 changed in de1a7468).
+# v62.0.0 (F0-cp5/cp6c): re-pinned (still unshipped) for the delivery-attestation
+# composite, edited in V300's CREATE TABLE (no DROP COLUMN); the J0 pin had also drifted (V300 changed in de1a7468).
+# v62.0.0 (red round 3, X1): the wave stack (de1a7468) edited the unshipped V300
+# again, so its two rows are re-pinned to the bytes on disk (refinery's
+# SipHasher13 over name, version and text). Still unshipped: no node ran it.
 # dialect	version	name	checksum
-sqlite	300	edition2_baseline	6682566096164642708
-postgres	300	edition2_baseline	3881616209039396314
+sqlite	300	edition2_baseline	3392621981409750751
+postgres	300	edition2_baseline	5070577711594960456

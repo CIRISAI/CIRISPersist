@@ -119,14 +119,32 @@ pub(crate) mod bodies {
         .await
         .unwrap_or_else(|e| panic!("I2965 (b): the officer's licence admits: {e}"));
 
-        // (c) A key with no edge from the board.
+        // (c) A key with no edge from the board. v62.0.0 (CC 2.7, the
+        // CC27 refuse-versus-hold rulings): whether the issuer is the board's
+        // delegate reads OTHER rows, so it is the fold's: the licence is HELD
+        // (`Pending`) for the licensure gate's reason and concludes nothing,
+        // never refused at the door. It lands no typed row.
         let forged = licence(&stranger_seed, &holder_seed, &stem, Some(&edge_id));
-        let err = e2::put_signed(d, &forged)
+        let out = e2::put_signed(d, &forged)
             .await
-            .expect_err("I2965 (c): a stranger's licence for the board is refused");
+            .unwrap_or_else(|e| panic!("I2965 (c): a stranger's licence is held: {e}"));
         assert!(
-            err.to_string().contains(REFUSAL),
-            "I2965 (c): refused by the licensure gate, got {err}"
+            matches!(
+                out,
+                crate::federation::edition2::ingest::StatementOutcome::Pending { .. }
+            ),
+            "I2965 (c): a stranger's licence for the board is held, not admitted: {out:?}"
+        );
+        let id = crate::federation::edition2::voices::carried_row_id(&forged)
+            .expect("the licence carries its statement");
+        assert_eq!(
+            crate::federation::edition2::fold::why_held(d, &id)
+                .await
+                .expect("read")
+                .map(|h| h.reason)
+                .as_deref(),
+            Some(REFUSAL),
+            "I2965 (c): held for the licensure gate's reason"
         );
         assert!(d
             .get_attestation(&e2::rid(&forged))

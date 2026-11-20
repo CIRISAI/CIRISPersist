@@ -152,11 +152,25 @@ pub(crate) mod bodies {
                 }),
             ),
         ] {
+            let confers = envelope
+                .get("dimension")
+                .and_then(serde_json::Value::as_str)
+                == Some(TRUST_CONFERS_DIMENSION);
             let mut edge = ts::bare_attestation("", &e2::kid(from), &e2::kid(to), &envelope);
             edge.attestation_type = attestation_type::DELEGATES_TO.to_owned();
-            e2::try_put_row(b, &edge, from)
+            let edge = e2::try_put_row(b, &edge, from)
                 .await
                 .unwrap_or_else(|e| panic!("the trust edge {from} -> {to} is admitted: {e:?}"));
+            // v62.0.0 (P8-fix11, a foreign hunk) — a conferral waits for its
+            // delegate's own voice (CC 2.6.1.9, K2's `delegate` role; the
+            // G0-fix3 finding on P4's twin fixture). Without it the
+            // conferral is held, and so is every detection it should stand.
+            if confers {
+                let st = e2::carried_statement(&edge).expect("the conferral's statement");
+                e2::put_statement(b, &e2::voice_of(&st, to))
+                    .await
+                    .expect("the detector's own voice on its conferral");
+            }
         }
     }
 

@@ -62,10 +62,6 @@ pub(crate) struct OccurrenceWrite {
 /// The occurrence executor. Storage only.
 #[async_trait::async_trait]
 pub(crate) trait OccurrenceStore: FederationDirectory + Sized {
-    /// v58.0.0 (#991) — re-home pre-V198 key-plane rows before a key-plane
-    /// write.
-    async fn rehome_key_plane_before_write(&self) -> Result<(), Error>;
-
     /// In ONE transaction: the last-signed-wins upsert (strictly newer
     /// `asserted_at` only, at a fresh serve position), the #930 history row
     /// whether or not it applied, the pair's `identity:occurrence:v1` row;
@@ -167,7 +163,6 @@ pub(crate) async fn put_identity_occurrence_planned<D: OccurrenceStore>(
     // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — a roster change lands by the
     // two-path door or is held as a proposal.
     super::self_roster::gate_occurrence(dir, &occurrence).await?;
-    dir.rehome_key_plane_before_write().await?;
     let SignedIdentityOccurrence {
         identity_occurrence: row,
         attesting_key_id,

@@ -77,7 +77,7 @@ pub fn revocation_fold_target(row: &super::Attestation) -> Option<&str> {
 pub(crate) mod test_support {
     use super::DIMENSION;
     use crate::federation::types::{attestation_tier, attestation_type};
-    use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
+    use crate::federation::{Attestation, FederationDirectory};
 
     pub(crate) fn grant(id: &str, node: &str, peer: &str) -> Attestation {
         // v21.3.0 (CIRISPersist#510 P1) — a `consent:replication:v1` row
@@ -121,40 +121,13 @@ pub(crate) mod test_support {
         sealed_row_
     }
 
-    fn withdraws(id: &str, issuer: &str, target_id: &str) -> Attestation {
-        let envelope = serde_json::json!({
-            "references_attestation_id": target_id,
-            "withdrawal_reason": "test",
-        });
-        let (och, ed_sig, pqc_sig) =
-            crate::federation::tier_ingest::test_support::sign_envelope(issuer, &envelope);
-        let now = chrono::Utc::now();
-        let mut sealed_row_ = Attestation {
-            attestation_id: id.to_owned(),
-            attesting_key_id: issuer.to_owned(),
-            attested_key_id: issuer.to_owned(),
-            attestation_type: attestation_type::WITHDRAWS.to_owned(),
-            weight: None,
-            asserted_at: now,
-            expires_at: None,
-            attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
-            scrub_key_id: issuer.to_owned(),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            subject_key_ids: Vec::new(),
-            withdraws_admission_rule: None,
-            cohort_scope: "federation".to_owned(),
-            tier: attestation_tier::FEDERATION.to_owned(),
-            promoted_at: None,
-            additional_scrubs: Vec::new(),
-        };
-        crate::federation::tier_ingest::test_support::seal_row_in_place(issuer, &mut sealed_row_);
-        crate::federation::tier_ingest::test_support::reseal(&mut sealed_row_);
-        sealed_row_
+    /// v62.0.0 — a `withdraws` of `target` by `issuer`: an edition-2
+    /// composer naming the target by its row id (`refs.target`), in the
+    /// target's family (E0's `composer_of`). The earlier form's free
+    /// `references_attestation_id` / `withdrawal_reason` envelope is not a
+    /// member of the composer's payload.
+    fn withdraws(issuer: &str, target: &Attestation) -> Attestation {
+        crate::federation::edition2::fixture_switch::composer_of("withdraws", target, issuer)
     }
 
     /// A grant to peer P1 makes `list_consent_peers` include P1; a
@@ -170,49 +143,40 @@ pub(crate) mod test_support {
         dir: &dyn FederationDirectory,
         suffix: &str,
     ) {
+        // v62.0.0 — the node's key is an edition-2 `key:record` (`kid(node)`);
+        // the grants are its statements (E0's flipped `grant`), put through
+        // the statement door, and every id read back is a kid.
+        use crate::federation::edition2::fixture_switch as e2;
         let node = format!("node-e7-{suffix}");
         let peer1 = format!("peer-e7-1-{suffix}");
         let peer2 = format!("peer-e7-2-{suffix}");
-        let grant1_id = uuid::Uuid::new_v4().to_string();
-        let grant2_id = uuid::Uuid::new_v4().to_string();
-        let withdraws_id = uuid::Uuid::new_v4().to_string();
         crate::federation::tier_ingest::test_support::register_hybrid_key(dir, &node).await;
 
-        dir.put_attestation(SignedAttestation {
-            attestation: grant(&grant1_id, &node, &peer1),
-        })
-        .await
-        .expect("grant 1 admits");
-        dir.put_attestation(SignedAttestation {
-            attestation: grant(&grant2_id, &node, &peer2),
-        })
-        .await
-        .expect("grant 2 admits");
+        let grant1 = grant("-", &node, &peer1);
+        let grant2 = grant("-", &node, &peer2);
+        e2::put_signed(dir, &grant1).await.expect("grant 1 admits");
+        e2::put_signed(dir, &grant2).await.expect("grant 2 admits");
 
         let mut peers = dir
-            .list_consent_peers(&node)
+            .list_consent_peers(&e2::kid(&node))
             .await
             .expect("list_consent_peers");
         peers.sort();
-        assert_eq!(
-            peers,
-            vec![peer1.clone(), peer2.clone()],
-            "both live grants must be visible, sorted"
-        );
+        let mut want = vec![e2::kid_or_keep(&peer1), e2::kid_or_keep(&peer2)];
+        want.sort();
+        assert_eq!(peers, want, "both live grants must be visible, sorted");
 
-        dir.put_attestation(SignedAttestation {
-            attestation: withdraws(&withdraws_id, &node, &grant1_id),
-        })
-        .await
-        .expect("withdraws admits");
+        e2::put_signed(dir, &withdraws(&node, &grant1))
+            .await
+            .expect("withdraws admits");
 
         let peers_after = dir
-            .list_consent_peers(&node)
+            .list_consent_peers(&e2::kid(&node))
             .await
             .expect("list_consent_peers after fold");
         assert_eq!(
             peers_after,
-            vec![peer2],
+            vec![e2::kid_or_keep(&peer2)],
             "peer-1's consent was withdrawn — it must disappear; peer-2 (untouched) survives"
         );
     }
@@ -238,9 +202,13 @@ pub(crate) mod test_support {
         use crate::federation::types::cohort_scope;
         use crate::federation::types::LocalAttestationInput;
 
-        let node = format!("node-509b-{suffix}");
+        // v62.0.0 — the node's key is an edition-2 `key:record`: every id it
+        // writes and reads by is its kid.
+        use crate::federation::edition2::fixture_switch as e2;
+        let node_seed = format!("node-509b-{suffix}");
         let peer = format!("peer-509b-{suffix}");
-        crate::federation::tier_ingest::test_support::register_hybrid_key(dir, &node).await;
+        crate::federation::tier_ingest::test_support::register_hybrid_key(dir, &node_seed).await;
+        let node = e2::kid(&node_seed);
 
         // ── list_local_tier_attestations: the cursor contract ──
         let local_input = || LocalAttestationInput {
@@ -315,12 +283,9 @@ pub(crate) mod test_support {
         // `bootstrap_admission::test_support::exercise_actor_signature_survives_the_crossing`.)
 
         // ── list_live_consent_grants_by: grant → live, withdraw → gone ──
-        let grant_id = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(SignedAttestation {
-            attestation: grant(&grant_id, &node, &peer),
-        })
-        .await
-        .expect("grant admits");
+        let g = grant("-", &node_seed, &peer);
+        let grant_id = g.attestation_id.clone();
+        e2::put_signed(dir, &g).await.expect("grant admits");
 
         let live = dir
             .list_live_consent_grants_by(&node)
@@ -331,12 +296,9 @@ pub(crate) mod test_support {
             "the live grant must be visible"
         );
 
-        let withdraws_id = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(SignedAttestation {
-            attestation: withdraws(&withdraws_id, &node, &grant_id),
-        })
-        .await
-        .expect("withdraws admits");
+        e2::put_signed(dir, &withdraws(&node_seed, &g))
+            .await
+            .expect("withdraws admits");
 
         let live_after = dir
             .list_live_consent_grants_by(&node)

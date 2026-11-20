@@ -341,7 +341,9 @@ pub(crate) mod parity_test_support {
                 additional_scrubs: Vec::new(),
             },
         );
-        dir.put_attestation(crate::federation::SignedAttestation { attestation: att })
+        // v62.0.0 — the sealed row is an edition-2 statement (E0's flip):
+        // it enters through the statement door.
+        crate::federation::edition2::fixture_switch::put_signed(dir, &att)
             .await
             .expect("an open-vocabulary content_class row admits from any emitter (#571)");
     }
@@ -351,7 +353,9 @@ pub(crate) mod parity_test_support {
         subject: &str,
         dimension: &str,
     ) -> ContentClassFlag {
-        dir.resolve_content_class_flag(subject, dimension, chrono::Utc::now())
+        // v62.0.0 — the rows name the subject by its kid.
+        let subject = crate::federation::edition2::fixture_switch::kid_or_keep(subject);
+        dir.resolve_content_class_flag(&subject, dimension, chrono::Utc::now())
             .await
             .expect("fold")
     }
@@ -374,6 +378,7 @@ pub(crate) mod parity_test_support {
         node: &str,
         tag: &str,
     ) {
+        use crate::federation::edition2::fixture_switch::kid;
         use crate::federation::tier_ingest::test_support::register_hybrid_key;
 
         let subject = format!("cc-subject-{tag}");
@@ -400,7 +405,7 @@ pub(crate) mod parity_test_support {
         emit(dir, &raiser, &subject, DIM, false, t(1)).await;
         let raised = fold(dir, &subject, DIM).await;
         assert!(
-            raised.flagged && raised.raised_by == vec![raiser.clone()],
+            raised.flagged && raised.raised_by == vec![kid(&raiser)],
             "({tag}) an unconferred emitter's protective flag must stand: {raised:?}"
         );
 
@@ -418,7 +423,7 @@ pub(crate) mod parity_test_support {
         );
         assert_eq!(
             forged.refused_withdrawals,
-            vec![stranger.clone()],
+            vec![kid(&stranger)],
             "({tag}) the refusal is legible, not silent: {forged:?}"
         );
         assert!(
@@ -432,12 +437,12 @@ pub(crate) mod parity_test_support {
         let still = fold(dir, &subject, DIM).await;
         assert_eq!(
             still.raised_by,
-            vec![raiser.clone()],
+            vec![kid(&raiser)],
             "({tag}) exact-dimension: a `generated` marking is not a flag: {still:?}"
         );
         let generated = fold(dir, &subject, GENERATED_DIM).await;
         assert!(
-            generated.flagged && generated.raised_by == vec![stranger.clone()],
+            generated.flagged && generated.raised_by == vec![kid(&stranger)],
             "({tag}) and the `generated` plane folds on its own: {generated:?}"
         );
 
@@ -447,7 +452,7 @@ pub(crate) mod parity_test_support {
             dir,
             node,
             &format!("cc-root-{tag}"),
-            &classifier,
+            &kid(&classifier),
             crate::federation::types::delegation_scope::INFRA_CLASSIFY_CONTENT,
         )
         .await;
@@ -458,8 +463,8 @@ pub(crate) mod parity_test_support {
             "({tag}) a conferred classifier's withdrawal clears the plane: {cleared:?}"
         );
         assert_eq!(
-            cleared.cleared_by.as_deref(),
-            Some(classifier.as_str()),
+            cleared.cleared_by,
+            Some(kid(&classifier)),
             "({tag}) and names who cleared it: {cleared:?}"
         );
 
@@ -468,7 +473,7 @@ pub(crate) mod parity_test_support {
         emit(dir, &raiser, &subject, DIM, false, t(5)).await;
         let re_raised = fold(dir, &subject, DIM).await;
         assert!(
-            re_raised.flagged && re_raised.raised_by == vec![raiser.clone()],
+            re_raised.flagged && re_raised.raised_by == vec![kid(&raiser)],
             "({tag}) a raise after the clear re-flags: {re_raised:?}"
         );
 
@@ -481,7 +486,7 @@ pub(crate) mod parity_test_support {
             dir,
             node,
             &format!("cc-root-{tag}"),
-            &detector,
+            &kid(&detector),
             crate::federation::types::delegation_scope::INFRA_DETECT,
         )
         .await;
@@ -492,14 +497,14 @@ pub(crate) mod parity_test_support {
             "({tag}) `infra:detect` is not classification authority: {detect_try:?}"
         );
         assert!(
-            detect_try.refused_withdrawals.contains(&detector),
+            detect_try.refused_withdrawals.contains(&kid(&detector)),
             "({tag}) and the refusal is recorded: {detect_try:?}"
         );
 
         // (7) The family stem itself is refused — folding it would read CC
         // 3.4.14 R1's mandatory marking as a flag.
         let err = dir
-            .resolve_content_class_flag(&subject, super::FAMILY_STEM, chrono::Utc::now())
+            .resolve_content_class_flag(&kid(&subject), super::FAMILY_STEM, chrono::Utc::now())
             .await
             .expect_err("the bare family stem is not a fold-able dimension");
         assert_eq!(err.kind(), "federation_invalid_argument", "({tag}) {err}");

@@ -46,7 +46,7 @@ pub mod bodies {
         };
         // v62 (E4): the earlier-shaped literal, then the author's edition-2
         // statement of it through the statement door.
-        let mut row = e2::with_earlier_form(|| ts::bare_attestation(id, author, author, &env));
+        let mut row = ts::bare_attestation(id, author, author, &env);
         row.attestation_type = attestation_type::SCORES.into();
         row.cohort_scope = "federation".into();
         row.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
@@ -76,7 +76,7 @@ pub mod bodies {
             // v62 (E4 round 3): a composer's payload is the common members and
             // `refs.target` only (P1e); `withdrawal_reason` is not one.
         });
-        let mut w = e2::with_earlier_form(|| ts::bare_attestation(id, issuer, issuer, &env));
+        let mut w = ts::bare_attestation(id, issuer, issuer, &env);
         w.attestation_type = attestation_type::WITHDRAWS.into();
         w.cohort_scope = "federation".into();
         let st = e2::statement_of_family(&w, issuer, &e2::family_of(&target));
@@ -459,7 +459,7 @@ pub mod bodies {
             "id": bad, "dimension": "file:v1", "cohort_scope": "federation",
             "content": {"content_sha256": sha_hex, "community_key_id": "", "tier": 7}
         });
-        let mut row = e2::with_earlier_form(|| ts::bare_attestation(&bad, &a, &a, &env));
+        let mut row = ts::bare_attestation(&bad, &a, &a, &env);
         row.attestation_type = attestation_type::SCORES.into();
         row.cohort_scope = "federation".into();
         row.subject_key_ids = vec![a.clone()];

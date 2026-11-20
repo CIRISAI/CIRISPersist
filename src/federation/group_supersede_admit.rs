@@ -241,6 +241,9 @@ pub(crate) async fn supersede_group_row_planned<D: GroupSupersedeStore>(
     new_snapshot: serde_json::Value,
     authorization: Option<serde_json::Value>,
 ) -> Result<u32, Error> {
+    // v62.0.0 (JSON-cut slice F) — the one shared earlier-form refusal,
+    // before any parse or verify (CC 2.6.1.12).
+    super::edition2::door::refuse_earlier_form("group_roster")?;
     // v61 (CIRISPersist#991) — the new head as its signer signed it, for its
     // `group:roster:v1` row.
     let offered_head = match cohort {

@@ -60,7 +60,7 @@ pub mod types;
 pub mod wire_envelope;
 
 pub use inline_text::InlineTextEnvelope;
-pub use types::{HybridSignatureBlock, PipelineEnvelope, PipelineMetadata, PipelineSidecar};
+pub use types::{CompositeSignatureBlock, PipelineEnvelope, PipelineMetadata, PipelineSidecar};
 pub use wire_envelope::{MatchAddress, WireEnvelope};
 
 #[cfg(feature = "classify")]

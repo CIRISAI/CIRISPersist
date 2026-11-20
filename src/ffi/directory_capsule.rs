@@ -482,6 +482,11 @@ pub enum DirectoryOp {
     /// silently verify against the wrong method (accept a forged signature),
     /// so this MUST run inside persist's `.so`. `canonical_bytes` is the
     /// exact bytes the signatures cover.
+    ///
+    /// v62.0.0 (F0-cp5; RULINGS "composite signatures only") — RETIRED: the
+    /// arm refuses `Unsupported { method: "verify_hybrid_via_directory" }`
+    /// and reads nothing. Kept (append-only) so an old consumer's op is
+    /// answered by name; use [`DirectoryOp::VerifyCompositeViaDirectory`].
     VerifyHybridViaDirectory {
         /// The canonical bytes the signatures were computed over.
         canonical_bytes: Vec<u8>,
@@ -1587,22 +1592,25 @@ pub enum DirectoryOp {
         /// `identity_ref`.
         identity_ref: String,
     },
-    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::put_accord_decision`]; the proxy answered
-    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    /// v61.4.2 (the capsule stub sweep) — the former `FederationDirectory::put_accord_decision`.
+    /// v62.0.0 (CC rc20): RETIRED with the accord live-quorum records; the
+    /// arm refuses `Unsupported` and reads nothing. APPEND-ONLY (Growth).
     PutAccordDecision {
         /// `decision`.
         decision: ciris_verify_core::accord_live_quorum::AccordDecision,
     },
-    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::put_accord_participation`]; the proxy answered
-    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    /// v61.4.2 (the capsule stub sweep) — the former `FederationDirectory::put_accord_participation`.
+    /// v62.0.0 (CC rc20): RETIRED with the accord live-quorum records; the
+    /// arm refuses `Unsupported` and reads nothing. APPEND-ONLY (Growth).
     PutAccordParticipation {
         /// `participation`.
         participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
         /// `standing_roster`.
         standing_roster: Vec<ciris_verify_core::threshold::ThresholdMember>,
     },
-    /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::put_accord_proposal`]; the proxy answered
-    /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
+    /// v61.4.2 (the capsule stub sweep) — the former `FederationDirectory::put_accord_proposal`.
+    /// v62.0.0 (CC rc20): RETIRED with the accord live-quorum records; the
+    /// arm refuses `Unsupported` and reads nothing. APPEND-ONLY (Growth).
     PutAccordProposal {
         /// `proposal`.
         proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
@@ -1743,6 +1751,23 @@ pub enum DirectoryOp {
     RebindHeldFor {
         /// The seat's identity-ref.
         seat_identity_ref: String,
+    },
+    /// v62.0.0 (F0-cp5; RULINGS "composite signatures only") — the
+    /// security-critical verify, edition 2:
+    /// [`verify_composite_via_directory`](crate::federation::edition2::composite_verify::verify_composite_via_directory)
+    /// runs inside persist's `.so` (the reason `VerifyHybridViaDirectory`
+    /// existed) over ONE composite signature under `identity_ref`'s LIVE
+    /// edition-2 key at `at_ms`. Result rides `CompositeVerify`. APPEND-ONLY
+    /// (Growth).
+    VerifyCompositeViaDirectory {
+        /// The exact bytes the composite covers.
+        message: Vec<u8>,
+        /// The signer's edition-2 identity-ref.
+        identity_ref: String,
+        /// The composite signature's raw bytes.
+        composite_sig: Vec<u8>,
+        /// The instant the key's liveness is read at (POSIX ms).
+        at_ms: u64,
     },
 }
 
@@ -2081,6 +2106,28 @@ pub enum DirectoryOpResult {
     /// v62.0.0 (ceremony gap 2) — `edition2::transport_rebind::rebind_held_for`.
     /// APPEND-ONLY (Growth).
     RebindHeld(Option<Edition2HeldRebind>),
+    /// v62.0.0 (F0-cp5) — `VerifyCompositeViaDirectory`: the verify VERDICT,
+    /// intact. `Ok` is the signer's identity-ref; a refusal rides INSIDE this
+    /// variant with its token and whether it is a wait. A failed directory
+    /// read is the top-level `TypedErr` (verify could not run). APPEND-ONLY
+    /// (Growth).
+    CompositeVerify(Result<String, CompositeVerifyRefusal>),
+}
+
+/// v62.0.0 (F0-cp5) — a refusal of
+/// [`verify_composite_via_directory`](crate::federation::edition2::composite_verify::verify_composite_via_directory)
+/// across the capsule: its stable token
+/// (`verify_component_signature`, `verify_unknown_key`, …), whether the same
+/// call may succeed later (a record that waits, an instant not yet covered),
+/// and the message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompositeVerifyRefusal {
+    /// The refusal's stable token.
+    pub token: String,
+    /// A wait, not a final refusal.
+    pub retryable: bool,
+    /// The refusal's message (leads with the token).
+    pub detail: String,
 }
 
 /// v62.0.0 (CC 2.7) — a failed op's error as it crosses the capsule: what
@@ -2716,10 +2763,10 @@ pub fn earlier_form_op_plane(op: &DirectoryOp) -> Option<&'static str> {
         // (`derived::put_edge_detection_event`) is not wired to the
         // switch; the capsule follows the Rust door rather than diverge.
         DirectoryOp::PutEdgeDetectionEvent { .. } => None,
-        // TODO(json-cut): an earlier-form signature check, not a door; its
-        // fate is the "composite components as standalone keys" ruling
-        // (JSON_CUT_PLAN §8.6).
-        DirectoryOp::VerifyHybridViaDirectory { .. } => None,
+        // v62.0.0 (F0-cp5) — signature checks, not doors: the earlier one is
+        // a retired arm that reads nothing, the composite one admits nothing.
+        DirectoryOp::VerifyHybridViaDirectory { .. }
+        | DirectoryOp::VerifyCompositeViaDirectory { .. } => None,
     }
 }
 
@@ -3301,31 +3348,34 @@ pub async fn dispatch_directory_op(
                 Err(e) => op_err(&e),
             }
         }
+        // v62.0.0 (JSON-cut slice F; CC rc20) — the accord proposal,
+        // participation and decision records are retired (a roster change is
+        // a later genesis bundle): their trait doors are deleted and these
+        // append-only ops stay as refusing arms that read nothing.
         DirectoryOp::PutAccordDecision { decision } => {
-            match dir.put_accord_decision(decision).await {
-                Ok(()) => DirectoryOpResult::Unit,
-                Err(e) => op_err(&e),
-            }
+            let _ = decision;
+            op_err(&crate::federation::Error::Unsupported {
+                method: "put_accord_decision",
+            })
         }
         DirectoryOp::PutAccordParticipation {
             participation,
             standing_roster,
         } => {
-            match dir
-                .put_accord_participation(participation, &standing_roster)
-                .await
-            {
-                Ok(()) => DirectoryOpResult::Unit,
-                Err(e) => op_err(&e),
-            }
+            let _ = (participation, standing_roster);
+            op_err(&crate::federation::Error::Unsupported {
+                method: "put_accord_participation",
+            })
         }
         DirectoryOp::PutAccordProposal {
             proposal,
             authority_signature,
-        } => match dir.put_accord_proposal(proposal, authority_signature).await {
-            Ok(()) => DirectoryOpResult::Unit,
-            Err(e) => op_err(&e),
-        },
+        } => {
+            let _ = (proposal, authority_signature);
+            op_err(&crate::federation::Error::Unsupported {
+                method: "put_accord_proposal",
+            })
+        }
         DirectoryOp::PutCommunityMembershipRevocation { revocation } => {
             match dir.put_community_membership_revocation(revocation).await {
                 Ok(()) => DirectoryOpResult::Unit,
@@ -3764,6 +3814,9 @@ pub async fn dispatch_directory_op(
             Ok(v) => DirectoryOpResult::Reachability(v),
             Err(e) => op_err(&e),
         },
+        // v62.0.0 (F0-cp5; RULINGS "composite signatures only") — retired:
+        // the bound-hybrid verify reads nothing and is refused by name;
+        // `VerifyCompositeViaDirectory` is its edition-2 successor.
         DirectoryOp::VerifyHybridViaDirectory {
             canonical_bytes,
             signing_key_id,
@@ -3772,29 +3825,46 @@ pub async fn dispatch_directory_op(
             policy,
             row_age,
         } => {
-            // v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — Strict is the
-            // only policy this door accepts. `verify_hybrid_via_directory`
-            // asks `require_strict_policy` (the one hybrid-required check)
-            // FIRST, so any other variant is refused INSIDE HybridVerify (the
-            // verdict slot, like every other verify refusal) with
-            // `verify_policy_violation`, before the directory lookup or any
-            // crypto. The field stays on the wire until v62.
-            //
-            // The verify runs entirely here — inside persist's `.so`, against
-            // persist's own vtable — so no consumer-side vtable skew can reach
-            // the signature-check lookups. The VerifyOutcome verdict is
-            // preserved intact; a VerifyError flattens INSIDE HybridVerify.
-            let outcome = crate::verify::hybrid::verify_hybrid_via_directory(
-                dir,
-                &canonical_bytes,
-                &signing_key_id,
-                &ed25519_sig_b64,
-                ml_dsa_65_sig_b64.as_deref(),
+            let _ = (
+                canonical_bytes,
+                signing_key_id,
+                ed25519_sig_b64,
+                ml_dsa_65_sig_b64,
                 policy,
                 row_age,
+            );
+            op_err(&crate::federation::Error::Unsupported {
+                method: "verify_hybrid_via_directory",
+            })
+        }
+        DirectoryOp::VerifyCompositeViaDirectory {
+            message,
+            identity_ref,
+            composite_sig,
+            at_ms,
+        } => {
+            use crate::federation::edition2::composite_verify::{
+                verify_composite_via_directory, CompositeVerifyError,
+            };
+            // The verify runs entirely here, inside persist's `.so`, against
+            // persist's own vtable.
+            match verify_composite_via_directory(
+                dir,
+                &message,
+                &identity_ref,
+                &composite_sig,
+                at_ms,
             )
-            .await;
-            DirectoryOpResult::HybridVerify(outcome.map_err(|e| e.to_string()))
+            .await
+            {
+                Ok(signer) => DirectoryOpResult::CompositeVerify(Ok(signer.identity_ref)),
+                Err(CompositeVerifyError::Directory(e)) => op_err(&e),
+                Err(e) => DirectoryOpResult::CompositeVerify(Err(CompositeVerifyRefusal {
+                    token: e.token().to_owned(),
+                    retryable: e.is_retryable(),
+                    detail: e.to_string(),
+                })),
+            }
         }
         DirectoryOp::BuildDelegationGraph {
             from_key,
@@ -4718,15 +4788,6 @@ impl crate::federation::BlackholeRules for OpsDirectory {
 /// A far-side failure arrives as [`crate::derived::Error::Backend`] carrying
 /// the far side's message (a `Conflict` keeps its text, not its variant).
 impl crate::derived::DerivedSchema for OpsDirectory {
-    async fn put_detection_event(
-        &self,
-        _event: crate::derived::DetectionEvent,
-    ) -> Result<(), crate::derived::Error> {
-        Err(crate::derived::Error::NotImplemented(
-            "put_detection_event: not routed through the directory capsule",
-        ))
-    }
-
     async fn get_detection_events(
         &self,
         _filter: crate::derived::EventFilter,
@@ -7319,26 +7380,6 @@ impl FederationDirectory for OpsDirectory {
             )),
         }
     }
-    async fn put_accord_proposal(
-        &self,
-        proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
-        authority_signature: Option<serde_json::Value>,
-    ) -> Result<(), Error> {
-        // v61.4.2 (the capsule stub sweep).
-        match self
-            .run_op(&DirectoryOp::PutAccordProposal {
-                proposal,
-                authority_signature,
-            })
-            .await?
-        {
-            DirectoryOpResult::Unit => Ok(()),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
     async fn get_accord_proposal(
         &self,
         proposal_digest: &str,
@@ -7377,26 +7418,6 @@ impl FederationDirectory for OpsDirectory {
             )),
         }
     }
-    async fn put_accord_participation(
-        &self,
-        participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
-        standing_roster: &[ciris_verify_core::threshold::ThresholdMember],
-    ) -> Result<(), Error> {
-        // v61.4.2 (the capsule stub sweep).
-        match self
-            .run_op(&DirectoryOp::PutAccordParticipation {
-                participation,
-                standing_roster: standing_roster.to_vec(),
-            })
-            .await?
-        {
-            DirectoryOpResult::Unit => Ok(()),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
     async fn list_accord_participations(
         &self,
         proposal_digest: &str,
@@ -7409,22 +7430,6 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::AccordParticipations(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-    async fn put_accord_decision(
-        &self,
-        decision: ciris_verify_core::accord_live_quorum::AccordDecision,
-    ) -> Result<(), Error> {
-        // v61.4.2 (the capsule stub sweep).
-        match self
-            .run_op(&DirectoryOp::PutAccordDecision { decision })
-            .await?
-        {
-            DirectoryOpResult::Unit => Ok(()),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -8145,9 +8150,12 @@ mod tests {
         // v62.0.0 (X2 pass 4c) — re-pinned over the integrated order: L1's
         // `ListSettledEdition2RosterProposals`, O1 fix 5's
         // `Edition2RosterProposal`, then the five above. GROWTH; ABI stays 14.
+        // v62.0.0 (F0-cp5) — GROWTH: `VerifyCompositeViaDirectory` APPENDED;
+        // `VerifyHybridViaDirectory` keeps its fields (its arm now refuses);
+        // ABI stays 14. (X2 pass 4d: re-pinned over the integrated order.)
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "d36caa2e9fbb6ec3fcc19e60d725e8438947652770c0d56a927fae8e1e52ddc1",
+            "46ea3e96544eff31cddb1c974bc85fcf0e9d58ee813c63c9b8c8ab29f0c2ba02",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -8224,8 +8232,9 @@ mod tests {
         // v62.0.0 (L1-fix3) — re-pinned over the merged order: `HeldRows`,
         // `VoiceOutcome`, `GenesisAdmission`, `RebindHeld`. GROWTH.
         assert_eq!(
+            // v62.0.0 (F0-cp5) — GROWTH: `CompositeVerify` APPENDED.
             structural_digest("DirectoryOpResult"),
-            "f958b2043be6204758ee464c3a334b3c1937f62507bfb15361be4024ce7da0e7",
+            "ce8099d4605263a57f7511078755a0bc6909fb77fe70a0075d05e97c0f3e7986",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
@@ -8801,128 +8810,74 @@ mod tests {
         unsafe { (directory.vtable.drop)(directory.data) };
     }
 
+    /// v62.0.0 (F0-cp5) — **I2885 (capsule): the retired bound-hybrid verify
+    /// is refused by name and reads nothing; the composite op verifies inside
+    /// persist's `.so`** and carries its refusals INSIDE `CompositeVerify`,
+    /// byte-identical to the direct call. (The earlier
+    /// `verify_hybrid_via_directory` round trip and I1562's policy legs
+    /// witnessed the bound-hybrid verify and are deleted.)
     #[test]
-    fn verify_hybrid_via_directory_round_trips_and_preserves_verdict() {
-        // CIRISPersist#320 audit / CIRISEdge#245 — the security-critical op.
-        // Unknown key → verify_hybrid_via_directory returns Err(Crypto
-        // "verify_unknown_key"); the op must preserve it INSIDE HybridVerify
-        // (not collapse to the top-level Err), byte-identical to the direct
-        // call — proving the verify ran entirely inside persist's `.so`.
+    fn i2885_capsule_verify_is_composite_only() {
+        use crate::federation::edition2::composite_verify::{
+            verify_composite_via_directory, VERIFY_COMPONENT_SIGNATURE,
+        };
+        use crate::federation::edition2::fixture_switch as e2;
         let rt = test_runtime();
         let (dir, directory) = test_directory();
-
-        let op = DirectoryOp::VerifyHybridViaDirectory {
-            canonical_bytes: b"canonical".to_vec(),
-            signing_key_id: "no-such-key".into(),
-            ed25519_sig_b64: "AAAA".into(),
-            ml_dsa_65_sig_b64: None,
-            policy: crate::verify::hybrid::HybridPolicy::Strict,
-            row_age: None,
-        };
-        let res = run_op(&rt, &directory, &op);
-        let via_direct = rt.block_on(crate::verify::hybrid::verify_hybrid_via_directory(
-            dir.as_ref(),
-            b"canonical",
-            "no-such-key",
-            "AAAA",
-            None,
-            crate::verify::hybrid::HybridPolicy::Strict,
-            None,
-        ));
-        match res {
-            DirectoryOpResult::HybridVerify(got) => {
-                // Byte-identical to the direct call (verdict preserved intact).
-                assert_eq!(got, via_direct.map_err(|e| e.to_string()));
-                // And it's the stable unknown-key token, INSIDE HybridVerify —
-                // not the top-level Err (which is reserved for other ops).
-                match got {
-                    Err(s) => assert!(s.contains("verify_unknown_key"), "got {s}"),
-                    Ok(o) => panic!("expected verify Err for unknown key, got {o:?}"),
-                }
-            }
-            other => panic!("expected HybridVerify, got {other:?}"),
-        }
-
-        // SAFETY: single-drop, matched vtable.
-        unsafe { (directory.vtable.drop)(directory.data) };
-    }
-
-    /// v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — **I1562: the capsule's
-    /// verify door accepts only `Strict`.** A genuine hybrid signature from a
-    /// registered hybrid key verifies under `Strict` (the control: the gate is
-    /// not a blanket refusal), and the SAME signature under `Ed25519Fallback`
-    /// or `SoftFreshness` is refused inside `HybridVerify` with
-    /// `verify_policy_violation`. A classical-only signature from an UNKNOWN
-    /// key under `Ed25519Fallback` is refused with the policy token too, not
-    /// `verify_unknown_key`: the refusal runs before the directory lookup.
-    #[test]
-    fn i1562_capsule_verify_hybrid_refuses_every_policy_but_strict() {
-        use crate::federation::tier_ingest::test_support as ts;
-        use crate::verify::hybrid::{HybridPolicy, VerifyOutcome, VERIFY_POLICY_VIOLATION};
-        let rt = test_runtime();
-        let (dir, directory) = test_directory();
-        let key = "i1562-capsule-signer";
-        rt.block_on(ts::register_hybrid_key(dir.as_ref(), key));
-        let msg = b"CIRISPersist#1233 I1562 capsule".to_vec();
-        let sig = ts::threshold_sign(key, &msg);
-        // v62.0.0 (round 3, E7) — the key is held by its identity-ref
-        // (`register_hybrid_key` puts `e2::kid(seed)`'s record, the same
-        // pair the seed signs with); the verify door looks that id up.
-        let key_ref = crate::federation::edition2::fixture_switch::kid(key);
-        let key = key_ref.as_str();
-        let op = |key_id: &str, pqc: Option<String>, policy: HybridPolicy| {
-            DirectoryOp::VerifyHybridViaDirectory {
-                canonical_bytes: msg.clone(),
-                signing_key_id: key_id.into(),
-                ed25519_sig_b64: sig.ed25519_signature_base64.clone(),
-                ml_dsa_65_sig_b64: pqc,
-                policy,
-                row_age: Some(std::time::Duration::from_secs(1)),
-            }
-        };
 
         match run_op(
             &rt,
             &directory,
-            &op(
-                key,
-                sig.mldsa65_signature_base64.clone(),
-                HybridPolicy::Strict,
-            ),
-        ) {
-            DirectoryOpResult::HybridVerify(Ok(VerifyOutcome::HybridVerified)) => {}
-            other => panic!("I1562: a genuine hybrid signature verifies under Strict: {other:?}"),
-        }
-
-        for policy in [
-            HybridPolicy::Ed25519Fallback,
-            HybridPolicy::SoftFreshness {
-                window: std::time::Duration::from_secs(86_400),
+            &DirectoryOp::VerifyHybridViaDirectory {
+                canonical_bytes: b"canonical".to_vec(),
+                signing_key_id: "no-such-key".into(),
+                ed25519_sig_b64: "AAAA".into(),
+                ml_dsa_65_sig_b64: None,
+                policy: crate::verify::hybrid::HybridPolicy::Strict,
+                row_age: None,
             },
-        ] {
-            match run_op(
-                &rt,
-                &directory,
-                &op(key, sig.mldsa65_signature_base64.clone(), policy),
-            ) {
-                DirectoryOpResult::HybridVerify(Err(s)) => assert!(
-                    s.starts_with(VERIFY_POLICY_VIOLATION),
-                    "I1562: {policy:?} over a VALID signature is refused by policy: {s}"
-                ),
-                other => panic!("I1562: {policy:?} must be refused, got {other:?}"),
-            }
+        ) {
+            DirectoryOpResult::TypedErr(e) => assert!(
+                format!("{e:?}").contains("verify_hybrid_via_directory"),
+                "I2885: refused by name: {e:?}"
+            ),
+            other => panic!("I2885: the retired op is refused, got {other:?}"),
         }
 
-        match run_op(
-            &rt,
-            &directory,
-            &op("i1562-no-such-key", None, HybridPolicy::Ed25519Fallback),
-        ) {
-            DirectoryOpResult::HybridVerify(Err(s)) => assert!(
-                s.starts_with(VERIFY_POLICY_VIOLATION) && !s.contains("verify_unknown_key"),
-                "I1562: the policy refusal precedes the directory lookup: {s}"
-            ),
-            other => panic!("I1562: expected the policy refusal, got {other:?}"),
+        let seed = "i2885-capsule-signer";
+        let who = rt.block_on(e2::put_key(dir.as_ref(), seed, &["user"]));
+        let msg = b"F0-cp5 I2885 capsule".to_vec();
+        let sig = e2::signing_key(seed).sign(&msg).expect("composite sign");
+        let at = e2::ms(crate::host::clock::now());
+        let op = |sig: Vec<u8>| DirectoryOp::VerifyCompositeViaDirectory {
+            message: msg.clone(),
+            identity_ref: who.clone(),
+            composite_sig: sig,
+            at_ms: at,
+        };
+        match run_op(&rt, &directory, &op(sig.clone())) {
+            DirectoryOpResult::CompositeVerify(Ok(signer)) => {
+                assert_eq!(signer, who, "I2885: the live signer");
+            }
+            other => panic!("I2885: a live key's composite verifies: {other:?}"),
+        }
+        let half = sig[..64].to_vec();
+        let direct = rt
+            .block_on(verify_composite_via_directory(
+                dir.as_ref(),
+                &msg,
+                &who,
+                &half,
+                at,
+            ))
+            .expect_err("I2885: a lone half is refused directly");
+        match run_op(&rt, &directory, &op(half)) {
+            DirectoryOpResult::CompositeVerify(Err(r)) => {
+                assert_eq!(r.token, VERIFY_COMPONENT_SIGNATURE, "I2885: {r:?}");
+                assert!(!r.retryable, "I2885: final");
+                assert_eq!(r.detail, direct.to_string(), "I2885: byte-identical");
+            }
+            other => panic!("I2885: a lone half is refused by name: {other:?}"),
         }
 
         // SAFETY: single-drop, matched vtable.
@@ -11058,44 +11013,6 @@ mod tests {
         })
     }
 
-    fn proposal_1890() -> ciris_verify_core::accord_live_quorum::AccordProposal {
-        ciris_verify_core::accord_live_quorum::AccordProposal {
-            family_key_id: "x".into(),
-            action: ciris_verify_core::accord_live_quorum::AccordAction::RosterChange,
-            nonce: "n-1890".into(),
-            window_until: "2031-01-01T00:00:00Z".into(),
-            prior_family_digest: "prior".into(),
-            payload_sha256: "payload".into(),
-        }
-    }
-
-    fn decision_1890() -> ciris_verify_core::accord_live_quorum::AccordDecision {
-        ciris_verify_core::accord_live_quorum::AccordDecision {
-            proposal: proposal_1890(),
-            live_set: Vec::new(),
-            yes: 0,
-            no: 0,
-            abstain: 0,
-            authorized: false,
-        }
-    }
-
-    fn participation_1890() -> ciris_verify_core::accord_live_quorum::AccordParticipation {
-        ciris_verify_core::accord_live_quorum::AccordParticipation {
-            family_key_id: "x".into(),
-            proposal_digest: proposal_1890().digest(),
-            member_id: KEY_1890.into(),
-            vote: ciris_verify_core::accord_live_quorum::Vote::Yes,
-            window_until: "2031-01-01T00:00:00Z".into(),
-            signed_at: "2026-03-01T00:00:00Z".into(),
-            signature: ciris_verify_core::threshold::ThresholdSignature {
-                member_id: KEY_1890.into(),
-                ed25519_signature_base64: "sig".into(),
-                mldsa65_signature_base64: None,
-            },
-        }
-    }
-
     fn community_revocation_1890() -> SignedCommunityMembershipRevocation {
         crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
             KEY_1890,
@@ -11463,53 +11380,6 @@ mod tests {
                 },
             ),
             (
-                "put_accord_decision",
-                "put_accord_decision",
-                true,
-                DirectoryOp::PutAccordDecision {
-                    decision: decision_1890(),
-                },
-                |p| {
-                    Box::pin(async move {
-                        p.put_accord_decision(decision_1890())
-                            .await
-                            .map(|v| format!("{v:?}"))
-                    })
-                },
-            ),
-            (
-                "put_accord_participation",
-                "put_accord_participation",
-                true,
-                DirectoryOp::PutAccordParticipation {
-                    participation: participation_1890(),
-                    standing_roster: Vec::new(),
-                },
-                |p| {
-                    Box::pin(async move {
-                        p.put_accord_participation(participation_1890(), &[])
-                            .await
-                            .map(|v| format!("{v:?}"))
-                    })
-                },
-            ),
-            (
-                "put_accord_proposal",
-                "put_accord_proposal",
-                true,
-                DirectoryOp::PutAccordProposal {
-                    proposal: proposal_1890(),
-                    authority_signature: None,
-                },
-                |p| {
-                    Box::pin(async move {
-                        p.put_accord_proposal(proposal_1890(), None)
-                            .await
-                            .map(|v| format!("{v:?}"))
-                    })
-                },
-            ),
-            (
                 "put_community_membership_revocation",
                 "put_community_membership_revocation",
                 true,
@@ -11718,7 +11588,9 @@ mod tests {
         // v62.0.0 (L1-fix3) — + `held_rows_for`, `voice_status`; with O1 fix 5's
         // `edition2_roster_proposal` the table is 34 rows (`submit_voice` is
         // I1894's: its first act is a parse, no leaf to fail).
-        assert_eq!(table.len(), 34, "I1890: one row per routed method");
+        // v62.0.0 (X2 pass 4d) — 31: F0's CP2 cut deleted the three earlier-form
+        // accord doors (`put_accord_proposal` / `_participation` / `_decision`).
+        assert_eq!(table.len(), 31, "I1890: one row per routed method");
         let mut red = Vec::new();
         for (method, fault, write, op, call) in table {
             let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -12755,7 +12627,6 @@ mod tests {
         ("reseal_attestation_v31", INHERITED_DEFAULT),
         ("list_expired_attestation_ids", INHERITED_DEFAULT),
         ("purge_attestation_v31", INHERITED_DEFAULT),
-        ("purge_genesis_delegation_row_v31", INHERITED_DEFAULT),
         ("store_lineage_head_cosign", INHERITED_DEFAULT),
         ("note_self_roster_proposal", INHERITED_DEFAULT),
         ("list_open_self_roster_proposals", INHERITED_DEFAULT),
@@ -13085,6 +12956,11 @@ mod proxy_gate {
         ),
         (
             "VerifyHybridViaDirectory",
+            "retired at v62.0.0 (F0-cp5): kept so an old consumer's op is answered with \
+             `Unsupported`, never issued by a current proxy",
+        ),
+        (
+            "VerifyCompositeViaDirectory",
             "the verify runs inside persist's .so against its own vtable, by design: a \
              consumer-side proxy would reintroduce the vtable skew the op exists to avoid",
         ),
@@ -13567,18 +13443,16 @@ mod edition2_ops {
         let put_occ_rev = || DirectoryOp::PutIdentityOccurrenceRevocation {
             revocation: serde_json::json!({ "identity_occurrence_revocation": {} }),
         };
-        let shut = rt.block_on(
-            crate::federation::edition2::door::with_earlier_form_doors_shut(async {
-                (
-                    dispatch_directory_op(dir.as_ref(), put_row())
-                        .await
-                        .into_flattened(),
-                    dispatch_directory_op(dir.as_ref(), put_occ_rev())
-                        .await
-                        .into_flattened(),
-                )
-            }),
-        );
+        let shut = rt.block_on(async {
+            (
+                dispatch_directory_op(dir.as_ref(), put_row())
+                    .await
+                    .into_flattened(),
+                dispatch_directory_op(dir.as_ref(), put_occ_rev())
+                    .await
+                    .into_flattened(),
+            )
+        });
         for (r, plane) in [
             (shut.0, "attestation"),
             (shut.1, "identity_occurrence_revocation"),
@@ -13732,19 +13606,16 @@ mod edition2_ops {
         assert!(bad.is_empty(), "I2487:\n{}", bad.join("\n"));
     }
 
-    /// I2486 (pure) — the classifier's refusal is inert while the switch is
-    /// off, and names the plane once it is on.
+    /// I2486 (pure) — the classifier's refusal names the plane (v62.0.0: the
+    /// switch is on; the inert-while-off leg went with the earlier form).
     #[tokio::test]
     async fn i2486_the_op_refusal_follows_the_switch() {
         let op = DirectoryOp::PutIdentityOccurrenceRevocation {
             revocation: serde_json::json!({}),
         };
-        refuse_earlier_form_op(&op).expect("I2486: inert while off");
-        let e = crate::federation::edition2::door::with_earlier_form_doors_shut(async {
-            refuse_earlier_form_op(&op)
-        })
-        .await
-        .expect_err("I2486: refused once shut");
+        let e = async { refuse_earlier_form_op(&op) }
+            .await
+            .expect_err("I2486: refused once shut");
         assert_eq!(
             typed_error_string(&e)
                 .split(": ")
@@ -13758,11 +13629,9 @@ mod edition2_ops {
             "I2486: the reading"
         );
         let read = DirectoryOp::LookupPublicKey { key_id: "k".into() };
-        crate::federation::edition2::door::with_earlier_form_doors_shut(async {
-            refuse_earlier_form_op(&read)
-        })
-        .await
-        .expect("I2486: a read is never refused");
+        async { refuse_earlier_form_op(&read) }
+            .await
+            .expect("I2486: a read is never refused");
     }
 }
 

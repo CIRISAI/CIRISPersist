@@ -173,11 +173,14 @@ async fn open_write_read() {
         .expect("open");
     backend.run_migrations().await.expect("migrate");
     crate::federation::tier_ingest::test_support::register_hybrid_key(&backend, "i1792-key").await;
-    let got = crate::federation::FederationDirectory::lookup_public_key(&backend, "i1792-key")
+    // v62.0.0 — the registered key is an edition-2 `key:record`, read back by
+    // its identity-ref (`kid` of the seed it was registered under).
+    let kid = crate::federation::edition2::fixture_switch::kid("i1792-key");
+    let got = crate::federation::FederationDirectory::lookup_public_key(&backend, &kid)
         .await
         .expect("read")
         .expect("the written key reads back");
-    assert_eq!(got.key_id, "i1792-key");
+    assert_eq!(got.key_id, kid);
 }
 
 /// **I1792.** In the single-thread profile a current-thread runtime opens a

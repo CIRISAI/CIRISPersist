@@ -896,6 +896,21 @@ where
             }
         });
     }
+    // v62.0.0 (C2-fix, ceremony gap 8; CC 4.2.1.3) — a counted accord
+    // lifecycle row (`confirmed`, `active`) is judged against the holders of
+    // the bundle its `refs.head` names, never the key plane
+    // (`edition2::halt::put_lifecycle`).
+    if super::halt::is_lifecycle(bytes) {
+        return Ok(match super::halt::put_lifecycle(dir, bytes).await? {
+            super::halt::LifecycleOutcome::Pending { row_id, new } => {
+                StatementOutcome::Pending { row_id, new }
+            }
+            super::halt::LifecycleOutcome::Applied { row_id, new, .. }
+            | super::halt::LifecycleOutcome::Unchanged { row_id, new } => {
+                StatementOutcome::Row { row_id, new }
+            }
+        });
+    }
     let mut keys = held_keys_for(dir, bytes).await?;
     // v62.0.0 (slice J0) — a key-plane statement already held was judged when
     // it arrived. Its re-put is read over the records alone, so a revoke-all

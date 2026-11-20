@@ -597,31 +597,25 @@ runners!(postgres, async {
 });
 
 /// I1807 — the Engine door emits the newcomer's rows.
+///
+/// v62.0.0 (v62 P8-fix6, CP2) — edition 2 throughout, no earlier-form
+/// scope: the engine's own key is the minter NODE alice owns. Its
+/// `key:record` is the edition-2 statement of `kid(alias)` registered as
+/// `node` (the fixture `node_as`, the key the engine's LocalSigner signs
+/// as); the room's `own_node` states alice's owner binding of it and its own
+/// self-occurrence. The earlier body registered the engine's key as a `user`
+/// through `register_self_federation_key`, which made it no node alice could
+/// own.
 async fn i1807_engine_door(engine: crate::Engine, alias: &str) {
     use crate::federation::types::cohort_scope::COMMUNITY;
-    // v62.0.0 (E3b r3): the engine's own key is a NODE (alice OWNS it by
-    // her owner binding, `own_node`); a person's user key is never a node's.
-    engine
-        .register_self_federation_key(NODE, None, None)
-        .await
-        .expect("register the engine's own key");
     let key = engine.local_derived_key_id().await.unwrap();
     macro_rules! body {
         ($b:expr) => {{
             let b = $b;
-            let id = b.load_or_init_content_kem_identity().await.unwrap();
-            let n = Node {
-                backend: b,
-                signer: ts::local_signer(alias),
-                key: key.clone(),
-                kem: crate::federation::EncryptionPubkeys {
-                    x25519_base64: id.x25519_pubkey_b64,
-                    ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
-                },
-            };
-            // v62.0.0 (E3b r3): released from the P8 hold (P8's Engine
-            // producer is on the base); the engine's NODE key is alice's by
-            // her owner binding.
+            // The minter node: `kid(alias)` as a `node` key record, signing
+            // with the engine's own LocalSigner.
+            let n = node_as(b, alias, NODE).await;
+            assert_eq!(n.key, key, "I1807: the engine's key is the minter node");
             let room = seed(&n, alias, alias).await;
             engine
                 .put_blob_scoped(COMMUNITY, Some(&room.comm), b"minutes", None, None)
@@ -676,29 +670,23 @@ async fn i1807_engine_door(engine: crate::Engine, alias: &str) {
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn i1807_sqlite() {
-    Box::pin(async {
-        let alias = format!("i1807-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-        let e = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), "sqlite::memory:")
-            .await
-            .unwrap();
-        i1807_engine_door(e, &alias).await;
-    })
-    .await
+    let alias = format!("i1807-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let e = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), "sqlite::memory:")
+        .await
+        .unwrap();
+    Box::pin(i1807_engine_door(e, &alias)).await;
 }
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn i1807_postgres() {
-    Box::pin(async {
-        let Some(dsn) = crate::test_pg::isolated_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let alias = format!("i1807-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-        let e = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), &dsn)
-            .await
-            .unwrap();
-        i1807_engine_door(e, &alias).await;
-    })
-    .await
+    let Some(dsn) = crate::test_pg::isolated_dsn() else {
+        eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+        return;
+    };
+    let alias = format!("i1807-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let e = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), &dsn)
+        .await
+        .unwrap();
+    Box::pin(i1807_engine_door(e, &alias)).await;
 }

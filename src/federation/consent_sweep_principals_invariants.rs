@@ -298,6 +298,160 @@ pub mod bodies {
             .unwrap()
             .is_empty());
     }
+
+    /// **I168 — an owned agent's sealed traces are promoted by its human's
+    /// consent.** The production shape: the machine's consent is authored
+    /// by its owner and names it in `for_key_id`; the machine authored no
+    /// grant of its own. Before #905 the sweep loaded zero grants here.
+    ///
+    /// v62.0.0 (v62 P8-fix6, CP2) — edition 2 throughout:
+    /// - the machine's key is its engine's own edition-2 `key:record`
+    ///   (`register_self_federation_key`), the key `kid(node)` its signer
+    ///   signs as;
+    /// - the owner binding is the owner's statement plus the machine's own
+    ///   voice ([`put_owner_binding`], C557);
+    /// - the sealed local row is the machine's OWN edition-2 statement put at
+    ///   the `local` tier (`attestation_emit::produce_row` →
+    ///   `put_statement_with_origin(.., LOCAL, Authored)`), so the sweep's
+    ///   crossing is the statement custody: the same row id flips to
+    ///   `federation` (P8, CC 2.6.1.9);
+    /// - the owner's grant is [`grant`] (edition 2), naming the machine.
+    ///
+    /// The row's dimension is `observation:reachability:v1` (a family the
+    /// producer states without a blob; a `trace:complete:v1` row needs its
+    /// trace blob's `evidence_refs`), and the grant covers `observation:`.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub async fn i168_the_sweep_promotes_an_owned_agents_rows(dsn: &str, s: &str) {
+        use crate::federation::types::cohort_scope;
+        let node = format!("i168-node-{s}");
+        let engine = crate::Engine::with_signer_pre_genesis(ts::local_signer(&node), dsn)
+            .await
+            .expect("engine");
+        // The machine registers its own key (the row every attestation ABOUT
+        // it resolves against) — the production boot shape.
+        let registered = engine
+            .register_self_federation_key(NODE, None, None)
+            .await
+            .expect("register self");
+        let derived = engine.local_derived_key_id().await.expect("derived key");
+        assert_eq!(registered, derived, "I168: the self row IS the derived key");
+        assert_eq!(
+            derived,
+            e2::kid(&node),
+            "I168: the engine signs as its seed's identity-ref"
+        );
+        let dir = engine.federation_directory();
+        let alice = format!("i168-alice-{s}");
+        let peer = format!("i168-peer-{s}");
+        ts::register_identity_key(&*dir, &alice, USER).await;
+        ts::register_identity_key(&*dir, &peer, NODE).await;
+        // The human is bound to the machine (her statement and its voice);
+        // the machine is claimed.
+        put_owner_binding(&*dir, &alice, &node).await;
+        // A sealed local row authored by the machine: its own statement at
+        // the local tier.
+        let signer = engine
+            .composite_signer("i168")
+            .expect("I168: the engine's composite signer");
+        let input = crate::federation::EmitAttestationInput::with_envelope(
+            attestation_type::SCORES,
+            crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
+                "dimension": "observation:reachability:v1",
+                "score": 0.5,
+            }))
+            .expect("an envelope"),
+            cohort_scope::SELF,
+        );
+        let produced = crate::federation::attestation_emit::produce_row(&*dir, signer, input, None)
+            .await
+            .expect("I168: the machine states its row");
+        crate::federation::edition2::ingest::put_statement_with_origin(
+            &*dir,
+            &produced.statement,
+            None,
+            attestation_tier::LOCAL,
+            crate::federation::replication::admission::WriteOrigin::Authored,
+        )
+        .await
+        .expect("I168: the local put");
+        let before_id =
+            crate::federation::edition2::names::RowId::of_statement(&produced.statement)
+                .expect("a row statement")
+                .hex();
+        let before = dir.get_attestation(&before_id).await.unwrap().expect("row");
+        assert_eq!(before.tier, attestation_tier::LOCAL);
+        assert_eq!(
+            before.attesting_key_id, derived,
+            "I168: authored by the machine"
+        );
+        // Control: no grant → the sweep promotes nothing, and says so.
+        let none = engine.promote_consented_backlog().await.expect("sweep");
+        assert_eq!(none.promoted, 0, "I168 control: nothing covers the row yet");
+        // The OWNER's grant, naming the machine — the machine authored none.
+        put(
+            &*dir,
+            grant("", &alice, &peer, Some(&node), &["observation:"]),
+        )
+        .await;
+        assert!(
+            dir.list_live_consent_grants_by(&derived)
+                .await
+                .unwrap()
+                .is_empty(),
+            "I168 precondition: the machine has NO self-authored grant — the v47 sweep saw zero"
+        );
+        // Capture what the sweep says while it runs: a skip is logged, not
+        // returned, and the line is the diagnosis.
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let report = {
+            struct Cap(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+            struct V(String);
+            impl tracing::field::Visit for V {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.push_str(&format!("{}={:?} ", f.name(), v));
+                }
+            }
+            impl tracing::Subscriber for Cap {
+                fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                    true
+                }
+                fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                    tracing::span::Id::from_u64(1)
+                }
+                fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+                fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+                fn event(&self, e: &tracing::Event<'_>) {
+                    let mut v = V(format!("[{}] ", e.metadata().level()));
+                    e.record(&mut v);
+                    self.0.lock().unwrap().push(v.0);
+                }
+                fn enter(&self, _: &tracing::span::Id) {}
+                fn exit(&self, _: &tracing::span::Id) {}
+            }
+            let _g = tracing::subscriber::set_default(Cap(std::sync::Arc::clone(&lines)));
+            engine.promote_consented_backlog().await.expect("sweep")
+        };
+        let said = lines.lock().unwrap().join("\n");
+        assert_eq!(
+            report.promoted, 1,
+            "I168: the human's grant lifts the owned agent's row: {report:?}\n--- the sweep said ---\n{said}"
+        );
+        // The statement custody: the SAME row id crossed (a row id does not
+        // depend on the tier).
+        let after = dir
+            .get_attestation(&before.attestation_id)
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(
+            after.tier,
+            attestation_tier::FEDERATION,
+            "I168: promoted to the federation tier"
+        );
+        // Idempotent: a second sweep has nothing left.
+        let again = engine.promote_consented_backlog().await.expect("sweep");
+        assert_eq!(again.promoted, 0);
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -344,159 +498,33 @@ mod run {
         Some(b)
     });
 
-    /// **I168 — an owned agent's sealed traces are promoted by its human's
-    /// consent.** The production shape: the machine's consent is authored
-    /// by its owner and names it in `for_key_id`; the machine authored no
-    /// grant of its own. Before #905 the sweep loaded zero grants here.
+    /// **I168** (sqlite, postgres) — see [`super::bodies::i168_the_sweep_promotes_an_owned_agents_rows`].
+    /// v62.0.0 (v62 P8-fix6, CP2) — edition 2 on both backends, no
+    /// earlier-form scope.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn i168_the_sweep_promotes_an_owned_agents_rows() {
-        Box::pin(crate::federation::edition2::fixture_switch::with_earlier_form_async(async {
-        use crate::federation::tier_ingest::test_support as ts;
-        use crate::federation::types::attestation_tier;
-        use crate::federation::types::identity_type::{NODE, USER};
-        let s = super::run::suffix();
-        let node_alias = format!("i168-node-{s}");
-        // v62 (E3b, round 3): mint the alias's identity-ref first. The
-        // engine's derived id IS `kid(alias)` (cut B), and a fixture that
-        // later signs for it resolves the seed through `seed_of`, which knows
-        // only the kids this process minted (`seed_for`'s never-from-kid
-        // guard panicked on the unminted ref).
-        let _ = crate::federation::edition2::fixture_switch::kid(&node_alias);
-        let signer = ts::local_signer(&node_alias);
-        let engine = crate::Engine::with_signer(signer, "sqlite::memory:")
-            .await
-            .expect("engine");
-        // The machine registers its own key (the row every attestation ABOUT
-        // it resolves against) — the production boot shape.
-        let registered = engine
-            .register_self_federation_key("node", None, None)
-            .await
-            .expect("register self");
-        let derived = engine.local_derived_key_id().await.expect("derived key");
-        assert_eq!(registered, derived, "I168: the self row IS the derived key");
-        let dir = engine.federation_directory();
-        let alice = format!("i168-alice-{s}");
-        let peer = format!("i168-peer-{s}");
-        ts::register_identity_key(&*dir, &alice, USER).await;
-        ts::register_identity_key(&*dir, &peer, NODE).await;
-        // The human is bound to the machine; the machine is claimed.
-        super::bodies_put(
-            &*dir,
-            ts::owner_binding_attestation(&format!("i168-ob-{s}"), &alice, &derived),
-        )
+    async fn i168_sqlite() {
+        let d = tempfile::tempdir().unwrap();
+        let dsn = format!("sqlite:///{}", d.path().join("i168.db").display());
+        Box::pin(super::bodies::i168_the_sweep_promotes_an_owned_agents_rows(
+            &dsn,
+            &suffix(),
+        ))
         .await;
-        // A sealed local trace authored by the machine.
-        let before_id = dir
-            .attestation_insert_local(crate::federation::types::LocalAttestationInput {
-                attestation_id: None,
-                attesting_key_id: derived.clone(),
-                attested_key_id: None,
-                attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
-                weight: None,
-                expires_at: None,
-                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                    serde_json::json!({
-                        "dimension": "trace:complete:v1",
-                        "trace_id": format!("i168-trace-{s}"),
-                        "agent_id_hash": "agent-hash-905",
-                        "trace": {},
-                    }),
-                )
-                .unwrap(),
-                subject_key_ids: vec![derived.clone()],
-                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
-                scrub_signature_classical: None,
-                scrub_signature_pqc: None,
-            })
-            .await
-            .expect("insert local trace");
-        let before = dir.get_attestation(&before_id).await.unwrap().expect("row");
-        assert_eq!(before.tier, attestation_tier::LOCAL);
-        // Control: no grant → the sweep promotes nothing, and says so.
-        let none = engine.promote_consented_backlog().await.expect("sweep");
-        assert_eq!(none.promoted, 0, "I168 control: nothing covers the row yet");
-        // The OWNER's grant, naming the machine — the machine authored none.
-        super::bodies_put(
-            &*dir,
-            super::bodies::grant(
-                &format!("i168-g-{s}"),
-                &alice,
-                &peer,
-                Some(&derived),
-                &["trace:"],
-            ),
-        )
-        .await;
-        assert!(
-            dir.list_live_consent_grants_by(&derived)
-                .await
-                .unwrap()
-                .is_empty(),
-            "I168 precondition: the machine has NO self-authored grant — the v47 sweep saw zero"
-        );
-        // Capture what the sweep says while it runs: a skip is logged, not
-        // returned, and the line is the diagnosis.
-        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let report = {
-            struct Cap(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-            struct V(String);
-            impl tracing::field::Visit for V {
-                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
-                    self.0.push_str(&format!("{}={:?} ", f.name(), v));
-                }
-            }
-            impl tracing::Subscriber for Cap {
-                fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-                    true
-                }
-                fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                    tracing::span::Id::from_u64(1)
-                }
-                fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-                fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-                fn event(&self, e: &tracing::Event<'_>) {
-                    let mut v = V(format!("[{}] ", e.metadata().level()));
-                    e.record(&mut v);
-                    self.0.lock().unwrap().push(v.0);
-                }
-                fn enter(&self, _: &tracing::span::Id) {}
-                fn exit(&self, _: &tracing::span::Id) {}
-            }
-            let _g = tracing::subscriber::set_default(Cap(std::sync::Arc::clone(&lines)));
-            engine.promote_consented_backlog().await.expect("sweep")
-        };
-        let said = lines.lock().unwrap().join("\n");
-        assert_eq!(
-            report.promoted, 1,
-            "I168: the human's grant lifts the owned agent's row: {report:?}\n--- the sweep said ---\n{said}"
-        );
-        let after = dir
-            .get_attestation(&before.attestation_id)
-            .await
-            .unwrap()
-            .expect("row");
-        assert_eq!(
-            after.tier,
-            attestation_tier::FEDERATION,
-            "I168: promoted to the federation tier"
-        );
-        // Idempotent: a second sweep has nothing left.
-        let again = engine.promote_consented_backlog().await.expect("sweep");
-        assert_eq!(again.promoted, 0);
-    }))
-    .await
     }
-}
 
-// Only I168 (sqlite) drives the engine through this; keep the server-only
-// axis (`-D warnings`) free of a dead helper.
-#[cfg(all(test, feature = "sqlite"))]
-async fn bodies_put(
-    d: &dyn crate::federation::FederationDirectory,
-    a: crate::federation::Attestation,
-) {
-    d.put_attestation(crate::federation::SignedAttestation { attestation: a })
-        .await
-        .unwrap_or_else(|e| panic!("put attestation: {e}"));
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i168_postgres() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("i168 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+            return;
+        };
+        Box::pin(super::bodies::i168_the_sweep_promotes_an_owned_agents_rows(
+            &dsn,
+            &suffix(),
+        ))
+        .await;
+        eprintln!("i168 postgres: RAN");
+    }
 }

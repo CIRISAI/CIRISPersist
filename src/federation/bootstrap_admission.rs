@@ -1525,31 +1525,25 @@ pub mod test_support {
     /// widens to a broad tier. A producer's OWN row widens to `community`. The
     /// same verdict at the same kind for a row born federation-tier.
     pub async fn exercise_promotion_cohort_standing_gate(dir: &dyn FederationDirectory, tag: &str) {
-        // v62.0.0 (E0 fix 4; lead's ruling (a)) — HELD in the earlier form: the
-        // community and family are put through the typed plane
-        // (`put_community` / `put_family` with an earlier-form AdmitSpec
-        // signature), which has no edition-2 projection yet. Mixing it with
-        // edition-2 keys meant the plane's signer was never registered
-        // (`signed_envelope: … not a registered federation key`). Every
-        // builder and register helper polled inside takes the earlier form.
-        Box::pin(
-            crate::federation::edition2::fixture_switch::with_earlier_form_async(
-                promotion_cohort_standing_gate_held(dir, tag),
-            ),
-        )
-        .await;
+        // v62.0.0 (E0 fix 7; CP2) — edition 2 end to end: the community,
+        // family and affiliation land through T1's group statement door
+        // (`fixture_switch::put_{community,family}_any`, keyed by
+        // identity-refs); every audience and party is named by its stored id.
+        Box::pin(promotion_cohort_standing_gate_body(dir, tag)).await;
     }
 
-    async fn promotion_cohort_standing_gate_held(dir: &dyn FederationDirectory, tag: &str) {
+    async fn promotion_cohort_standing_gate_body(dir: &dyn FederationDirectory, tag: &str) {
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::{attestation_tier, cohort_scope, identity_type};
         use crate::federation::{CrossingBasis, MeshCrossingOutcome};
 
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let producer = format!("{tag}-p592-{run}"); // P — the row's author
-        let stranger = format!("{tag}-s592-{run}"); // S — the party P names
-        let comm = format!("{tag}-c592-{run}"); // a community P belongs to
-        let fam = format!("{tag}-f592-{run}"); // a family P belongs to
+        // ROLE FIRST: a test key seeds from the first 32 bytes of its name
+        // (`guard_seed_collision`).
+        let producer = format!("p592-{tag}-{run}"); // P — the row's author
+        let stranger = format!("s592-{tag}-{run}"); // S — the party P names
+        let comm = format!("c592-{tag}-{run}"); // a community P belongs to
+        let fam = format!("f592-{tag}-{run}"); // a family P belongs to
                                                // P is a human (USER): the community door binds agent/node members to a
                                                // steward and this fixture is about STANDING, not stewardship.
         ts::register_hybrid_key_as(dir, &producer, &producer, identity_type::USER).await;
@@ -1559,63 +1553,70 @@ pub mod test_support {
         // P is a MEMBER of both cohorts: a cohort placement is a membership
         // claim the put door proves first (AV-45); with membership proven, what
         // is left to refuse is STANDING — the party the row names.
+        let id = crate::federation::edition2::fixture_switch::stored_id;
         let now = crate::host::clock::now();
-        dir.put_community(ts::sign_community(
-            &producer,
-            crate::federation::types::Community {
-                prev_head_digest: String::new(),
-                charter_digest: String::new(),
-                community_key_id: comm.clone(),
-                community_name: format!("{tag}-community-{run}"),
-                members: vec![crate::federation::types::CommunityMember {
-                    key_id: producer.clone(),
-                    joined_at: now,
-                    role: Some("founder".to_owned()),
-                }],
-                founded_at: now,
-                consensus_protocol: "quorum:1/1".into(),
-                policy_blob: None,
-                persist_row_hash: String::new(),
-            },
-        ))
+        crate::federation::edition2::fixture_switch::put_community_any(
+            dir,
+            ts::sign_community(
+                &producer,
+                crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
+                    community_key_id: comm.clone(),
+                    community_name: format!("{tag}-community-{run}"),
+                    members: vec![crate::federation::types::CommunityMember {
+                        key_id: producer.clone(),
+                        joined_at: now,
+                        role: Some("founder".to_owned()),
+                    }],
+                    founded_at: now,
+                    consensus_protocol: "quorum:1/1".into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ),
+        )
         .await
         .expect("B9: the community admits");
-        dir.put_family(ts::sign_family(
-            &producer,
-            crate::federation::types::Family {
-                prev_head_digest: String::new(),
-                charter_digest: String::new(),
-                family_key_id: fam.clone(),
-                family_name: format!("{tag}-family-{run}"),
-                members: vec![crate::federation::types::FamilyMember {
-                    key_id: producer.clone(),
-                    joined_at: now,
-                    role: Some("founder".to_owned()),
-                }],
-                founded_at: now,
-                consensus_protocol: "founder_only".to_owned(),
-                consensus_protocol_entrenched: false,
-                dissolved_at: None,
-                persist_row_hash: String::new(),
-            },
-        ))
+        crate::federation::edition2::fixture_switch::put_family_any(
+            dir,
+            ts::sign_family(
+                &producer,
+                crate::federation::types::Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
+                    family_key_id: fam.clone(),
+                    family_name: format!("{tag}-family-{run}"),
+                    members: vec![crate::federation::types::FamilyMember {
+                        key_id: producer.clone(),
+                        joined_at: now,
+                        role: Some("founder".to_owned()),
+                    }],
+                    founded_at: now,
+                    consensus_protocol: "founder_only".to_owned(),
+                    consensus_protocol_entrenched: false,
+                    dissolved_at: None,
+                    persist_row_hash: String::new(),
+                },
+            ),
+        )
         .await
         .expect("B9: the family admits");
         let community = crate::federation::Audience::Community {
-            community_key_id: comm.clone(),
+            community_key_id: id(&comm),
         };
         let family = crate::federation::Audience::Family {
-            family_key_id: fam.clone(),
+            family_key_id: id(&fam),
         };
         // v47.0.0 (CIRISPersist#897) — an affiliation is a room (CC
         // 4.4.3.2.8), so it stands in the targeted arm with the other two.
         // v54.0.0 (#1034) — the affiliation is its own declared record, with
         // P in it, so only AV-84 can refuse a third-party row placed there.
-        let aff = format!("{tag}-a592-{run}");
+        let aff = format!("a592-{tag}-{run}");
         ts::register_hybrid_key(dir, &aff).await;
         ts::seed_two_member_affiliation(dir, &aff, &producer, &producer).await;
         let affiliations = crate::federation::Audience::Affiliations {
-            community_key_id: aff.clone(),
+            community_key_id: id(&aff),
         };
         let stage = |attested: String| {
             let producer = producer.clone();
@@ -1658,7 +1659,7 @@ pub mod test_support {
             );
             let msg = format!("{err}");
             assert!(
-                msg.contains(scope) && msg.contains(&stranger),
+                msg.contains(scope) && msg.contains(&id(&stranger)),
                 "({tag}) B9: the refusal names the placement and the party: {msg}"
             );
             let after = dir
@@ -1973,8 +1974,15 @@ pub mod test_support {
                 .put_attestation(SignedAttestation { attestation: r })
                 .await
                 .expect_err(label);
+            // v62.0.0 (E0 fix 9) — under edition 2 a backwards lease is a
+            // statement whose `valid_until` precedes its `asserted_at`: Verify's
+            // door refuses it first, by the window, before persist's gate.
+            let msg = format!("{err}");
             assert!(
-                format!("{err}").contains(needle),
+                msg.contains(needle)
+                    || (crate::federation::edition2::fixture_switch::emit_edition2()
+                        && label == "backwards"
+                        && msg.contains("covers no instant")),
                 "({tag}) #946 {label}: got {err}"
             );
             assert!(dir.get_attestation(&id).await.expect("read").is_none());
@@ -2107,7 +2115,15 @@ pub mod test_support {
         }
 
         let put = |id: &str, attester: &str, status: &str| {
-            let mut r = scores_row(id, attester, &holder, &format!("licensure:{authority}:v1"));
+            // v62.0.0 (E0 fix 9; CC rc21) — a key inside a family name is its
+            // BARE thumbprint (`kid_thumb`); a label segment is refused
+            // `namespace_dimension_case_malformed`.
+            let auth_seg = if crate::federation::edition2::fixture_switch::emit_edition2() {
+                crate::federation::edition2::fixture_switch::kid_thumb(&authority)
+            } else {
+                authority.clone()
+            };
+            let mut r = scores_row(id, attester, &holder, &format!("licensure:{auth_seg}:v1"));
             r.attestation_envelope["status"] = serde_json::json!(status);
             ts::reseal(&mut r);
             SignedAttestation { attestation: r }
@@ -2566,69 +2582,79 @@ pub mod test_support {
         us: &str,
         tag: &str,
     ) {
-        // v62.0.0 (E0 fix 4; lead's ruling (a)) — HELD in the earlier form, as
-        // [`exercise_promotion_cohort_standing_gate`]: the shared community is
-        // put through the typed plane, which has no edition-2 projection yet.
-        crate::federation::edition2::fixture_switch::with_earlier_form_async(
-            privileged_sync_door_804_held(dir, us, tag),
-        )
-        .await;
+        // v62.0.0 (E0 fix 7; CP2) — edition 2 end to end: the shared
+        // community lands through T1's group statement door; the node, its
+        // mate and the stranger are named by their stored ids (the caller
+        // declares the node's self id as `kid(us)`).
+        Box::pin(privileged_sync_door_804_body(dir, us, tag)).await;
     }
 
-    async fn privileged_sync_door_804_held(dir: &dyn FederationDirectory, us: &str, tag: &str) {
+    async fn privileged_sync_door_804_body(dir: &dyn FederationDirectory, us: &str, tag: &str) {
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::{attestation_tier, cohort_scope, identity_type};
 
         let run = uuid::Uuid::new_v4().simple().to_string();
         let us = us.to_owned();
-        let mate = format!("{tag}-mate-{run}");
-        let stranger = format!("{tag}-stranger-{run}");
-        let comm = format!("{tag}-comm-{run}");
+        // ROLE FIRST: a test key seeds from the first 32 bytes of its name,
+        // and the pg tag carries a uuid (`guard_seed_collision`).
+        let mate = format!("mate-{tag}-{run}");
+        let stranger = format!("stranger-{tag}-{run}");
+        let comm = format!("comm-{tag}-{run}");
         // The community's own key must exist too — a cohort is addressed by a
         // registered key, not a bare string.
         for k in [&us, &mate, &stranger, &comm] {
             ts::register_hybrid_key_as(dir, k, k, identity_type::USER).await;
         }
+        let id = crate::federation::edition2::fixture_switch::stored_id;
         let now = crate::host::clock::now();
         // A community this node and `mate` both belong to — and `stranger`
         // does not. This is the ONLY difference between the two arms.
-        dir.put_community(ts::sign_community(
-            &us,
-            crate::federation::types::Community {
-                prev_head_digest: String::new(),
-                charter_digest: String::new(),
-                community_key_id: comm.clone(),
-                community_name: format!("{tag}-c-{run}"),
-                members: vec![
-                    crate::federation::types::CommunityMember {
-                        key_id: us.clone(),
-                        joined_at: now,
-                        role: Some("founder".to_owned()),
-                    },
-                    crate::federation::types::CommunityMember {
-                        key_id: mate.clone(),
-                        joined_at: now,
-                        role: None,
-                    },
-                ],
-                founded_at: now,
-                consensus_protocol: "quorum:1/1".into(),
-                policy_blob: None,
-                persist_row_hash: String::new(),
-            },
-        ))
+        crate::federation::edition2::fixture_switch::put_community_any(
+            dir,
+            ts::sign_community(
+                &us,
+                crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
+                    community_key_id: comm.clone(),
+                    community_name: format!("{tag}-c-{run}"),
+                    members: vec![
+                        crate::federation::types::CommunityMember {
+                            key_id: us.clone(),
+                            joined_at: now,
+                            role: Some("founder".to_owned()),
+                        },
+                        crate::federation::types::CommunityMember {
+                            key_id: mate.clone(),
+                            joined_at: now,
+                            role: None,
+                        },
+                    ],
+                    founded_at: now,
+                    consensus_protocol: "quorum:1/1".into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ),
+        )
         .await
         .unwrap_or_else(|e| panic!("({tag}) #804: the community admits: {e}"));
 
         // ── the resolver first, so a failure below names the right thing ──
-        let mate_shares =
-            crate::federation::replication::admission::shares_cohort_with(dir, &us, &mate)
-                .await
-                .unwrap_or_else(|e| panic!("({tag}) #804: cohort resolution failed: {e}"));
-        let stranger_shares =
-            crate::federation::replication::admission::shares_cohort_with(dir, &us, &stranger)
-                .await
-                .unwrap_or_else(|e| panic!("({tag}) #804: cohort resolution failed: {e}"));
+        let mate_shares = crate::federation::replication::admission::shares_cohort_with(
+            dir,
+            &id(&us),
+            &id(&mate),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #804: cohort resolution failed: {e}"));
+        let stranger_shares = crate::federation::replication::admission::shares_cohort_with(
+            dir,
+            &id(&us),
+            &id(&stranger),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #804: cohort resolution failed: {e}"));
         assert!(
             mate_shares,
             "({tag}) #804: persist must resolve the community it holds — `{us}` and `{mate}` are \
@@ -2675,7 +2701,7 @@ pub mod test_support {
                 SignedAttestation {
                     attestation: sync_row(i),
                 },
-                &mate,
+                &id(&mate),
             )
             .await
             .unwrap_or_else(|e| panic!("({tag}) #804: a cohort mate's sync admits: {e}"));
@@ -2693,7 +2719,7 @@ pub mod test_support {
                 SignedAttestation {
                     attestation: sync_row(1_000_000 + i),
                 },
-                &stranger,
+                &id(&stranger),
             )
             .await
             .unwrap_or_else(|e| panic!("({tag}) #804: a stranger's write still admits: {e}"));
@@ -3471,273 +3497,12 @@ pub mod test_support {
         );
     }
 
-    /// **B11 (CIRISPersist#643) — THE TYPED COLUMNS ARE SIGNED MATERIAL.**
-    ///
-    /// The signature covers `attestation_envelope` and nothing else, so before
-    /// this every typed column was a field a relay could rewrite while keeping
-    /// the producer's own signature valid. Two of them decide everything:
-    ///
-    /// - **the VERB.** `references_attestation_id` — the TARGET of a retraction
-    ///   — was already inside the signed envelope; `attestation_type` — whether
-    ///   this is a retraction at all — was not. Flip `withdraws` → `scores` and
-    ///   the retraction becomes an ordinary claim while the thing it retracted
-    ///   stays live.
-    /// - **the AUTHORITY.** `resolve_withdraws_admission_rule` returns rule-2
-    ///   standing when a canonical binding hash of the issuer appears in
-    ///   `subject_key_ids`. APPENDING one in transit hands that key revocation
-    ///   authority over the row.
-    ///
-    /// Every arm below MUTATES A COLUMN AND NOTHING ELSE on a row this
-    /// directory has already accepted in its honest form, so the signature, the
-    /// content hash and every other gate are held constant and the ONLY variable
-    /// is the binding. The control arm (a) is what makes that claim checkable:
-    /// without it, a refusal could be any of the twenty other gates.
-    ///
-    /// Absence is its own arm (h): the operator's standing decision on this
-    /// break window is to refuse an unbound row outright — no grandfathering, no
-    /// regime flag, nothing to find later.
-    pub async fn exercise_row_column_binding(dir: &dyn FederationDirectory, tag: &str) {
-        use crate::federation::envelope::{paths, row_paths};
-
-        // Invocation-unique: the postgres arm shares a long-lived database.
-        let run = uuid::Uuid::new_v4().simple().to_string();
-        let author = format!("{tag}-643a-{run}");
-        let other = format!("{tag}-643b-{run}");
-        for k in [&author, &other] {
-            crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
-        }
-
-        // The honest row, sealed the way a producer must now seal one.
-        let honest = |id: &str| {
-            let mut row = scores_row(id, &author, &author, "trust:demo:v1");
-            row.attestation_envelope
-                .as_object_mut()
-                .expect("envelope is an object")
-                .insert("references_attestation_id".into(), "target-1".into());
-            crate::federation::tier_ingest::test_support::reseal(&mut row);
-            row
-        };
-
-        // ── (a) THE CONTROL. The honest row ADMITS. Without this arm every
-        //    refusal below could be some other gate and the witness would be a
-        //    check that cannot fail.
-        dir.put_attestation(SignedAttestation {
-            attestation: honest(&uuid::Uuid::new_v4().to_string()),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("({tag}) B11-a: a correctly sealed row must ADMIT: {e}"));
-
-        // Mutate ONE column on a freshly sealed row and demand a refusal that
-        // NAMES that column and the rule. `expect_err` alone would pass on an
-        // unregistered key or a broken signature.
-        async fn refuses(
-            dir: &dyn FederationDirectory,
-            tag: &str,
-            arm: &str,
-            member: &str,
-            row: Attestation,
-        ) {
-            let id = row.attestation_id.clone();
-            let Err(err) = dir
-                .put_attestation(SignedAttestation { attestation: row })
-                .await
-            else {
-                panic!("({tag}) B11-{arm}: a rewritten `{member}` must be REFUSED");
-            };
-            let msg = format!("{err}");
-            assert!(
-                msg.contains(member) && msg.contains("643"),
-                "({tag}) B11-{arm}: the refusal must name `{member}` and the rule: {msg}"
-            );
-            // v55.0.0 (CIRISPersist#1055) — a column off its signed mirror is
-            // the terminal `MalformedRow`, typed apart from an argument error.
-            assert_eq!(
-                err.kind(),
-                "federation_malformed_row",
-                "({tag}) B11-{arm}: refusal kind is parity-asserted across backends: {err:?}"
-            );
-            // REFUSED, not refused-after-storing (AV-9).
-            assert!(
-                dir.get_attestation(&id)
-                    .await
-                    .expect("get_attestation")
-                    .is_none(),
-                "({tag}) B11-{arm}: a refused row must leave no trace"
-            );
-        }
-
-        // ── (b) VERB SUBSTITUTION — the headline. Sign a `withdraws`, ship a
-        //    `scores`. The envelope still names the target it retracts.
-        let mut verb = honest(&uuid::Uuid::new_v4().to_string());
-        verb.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.to_owned();
-        crate::federation::tier_ingest::test_support::reseal(&mut verb);
-        assert_eq!(
-            verb.attestation_envelope[paths::ROW][row_paths::ATTESTATION_TYPE],
-            serde_json::json!(crate::federation::types::attestation_type::WITHDRAWS),
-            "({tag}) B11-b: precondition — the signed mirror says `withdraws`"
-        );
-        verb.attestation_type = crate::federation::types::attestation_type::SCORES.to_owned();
-        refuses(dir, tag, "b", row_paths::ATTESTATION_TYPE, verb).await;
-
-        // ── (c) AUTHORITY INJECTION — append a canonical binding hash to
-        //    `subject_key_ids`, which is what grants rule-2 revocation standing.
-        let mut authority = honest(&uuid::Uuid::new_v4().to_string());
-        authority
-            .subject_key_ids
-            .push(format!("sha256:{}", "0".repeat(64)));
-        refuses(dir, tag, "c", row_paths::SUBJECT_KEY_IDS, authority).await;
-
-        // ── (d) WHO THE CLAIM IS ABOUT.
-        let mut about = honest(&uuid::Uuid::new_v4().to_string());
-        about.attested_key_id = other.clone();
-        refuses(dir, tag, "d", row_paths::ATTESTED_KEY_ID, about).await;
-
-        // ── (e) WHO MAY SEE IT. Widening the audience of somebody else's row
-        //    is the confused-deputy shape one plane over from #443's route
-        //    hijack.
-        let mut audience = honest(&uuid::Uuid::new_v4().to_string());
-        audience.cohort_scope = crate::federation::types::cohort_scope::COMMUNITY.to_owned();
-        refuses(dir, tag, "e", row_paths::COHORT_SCOPE, audience).await;
-
-        // ── (f) HOW MUCH IT COUNTS. `trust_scoring` / `topology` fold
-        //    `weight.unwrap_or(1.0)`, so an unsigned weight is an unsigned
-        //    volume knob on a signed claim.
-        let mut louder = honest(&uuid::Uuid::new_v4().to_string());
-        louder.weight = Some(99.0);
-        refuses(dir, tag, "f", row_paths::WEIGHT, louder).await;
-
-        // ── (g) THE ROW'S IDENTITY. A fresh id on byte-identical signed
-        //    content is the REPLAY shape (#598 B10-a): with the id bound, the
-        //    same envelope can only ever name one row.
-        let mut replay = honest(&uuid::Uuid::new_v4().to_string());
-        replay.attestation_id = uuid::Uuid::new_v4().to_string();
-        refuses(dir, tag, "g", row_paths::ATTESTATION_ID, replay).await;
-
-        // ── (g2) WHO MADE THE CLAIM. Bound explicitly rather than left to the
-        //    ingest verifier's implicit binding, so the property survives the
-        //    local tier where signature verification is deferred.
-        let mut author_swap = honest(&uuid::Uuid::new_v4().to_string());
-        author_swap.attesting_key_id = other.clone();
-        let id = author_swap.attestation_id.clone();
-        let err = dir
-            .put_attestation(SignedAttestation {
-                attestation: author_swap,
-            })
-            .await
-            .expect_err("({tag}) B11-g2: a rewritten `attesting_key_id` must be REFUSED");
-        assert!(
-            format!("{err}").contains(row_paths::ATTESTING_KEY_ID)
-                && format!("{err}").contains("643"),
-            "({tag}) B11-g2: the refusal must name the authorship binding, not merely the \
-             signature: {err}"
-        );
-        assert!(
-            dir.get_attestation(&id).await.expect("get").is_none(),
-            "({tag}) B11-g2: a refused row must leave no trace"
-        );
-
-        // ── (h) ABSENCE. No `row` object at all — the pre-#643 wire shape.
-        //    REFUSED, not tolerated: there is no legacy regime.
-        let mut unbound = honest(&uuid::Uuid::new_v4().to_string());
-        unbound
-            .attestation_envelope
-            .as_object_mut()
-            .expect("envelope is an object")
-            .remove(paths::ROW);
-        // Re-sign the STRIPPED envelope, so the row is internally consistent in
-        // every way the OLD gates could see: valid hybrid signature, matching
-        // `original_content_hash`. The only thing wrong with it is that nothing
-        // binds its columns — which is exactly the pre-#643 status quo.
-        let (och, sc, sp) = crate::federation::tier_ingest::test_support::sign_envelope(
-            &author,
-            &unbound.attestation_envelope,
-        );
-        unbound.original_content_hash = och;
-        unbound.scrub_signature_classical = sc;
-        unbound.scrub_signature_pqc = sp;
-        let id = unbound.attestation_id.clone();
-        let err = dir
-            .put_attestation(SignedAttestation {
-                attestation: unbound,
-            })
-            .await
-            .expect_err(
-                "({tag}) B11-h: a row carrying no signed `row` object must be REFUSED — no \
-                 grandfathering (CIRISPersist#643)",
-            );
-        let msg = format!("{err}");
-        assert!(
-            msg.contains(paths::ROW) && msg.contains("643"),
-            "({tag}) B11-h: the refusal must name the missing mirror and the rule: {msg}"
-        );
-        // v31.0.0 (CIRISPersist#658) — the message is a SPECIFICATION, not
-        // prose. This is the text an external producer builds its mirror from
-        // during the v31.0.0 re-mint, `RowMirror` is `deny_unknown_fields`,
-        // and only `subject_key_ids` / `weight` default — so a message that
-        // omits a required member refuses the producer a second time, by the
-        // very text that told it what to build. It named five while the gate
-        // enforced seven. Asserted EXHAUSTIVELY off `row_paths::ALL`, so a
-        // future eighth member cannot be added to the mirror and left out of
-        // the message.
-        for member in crate::federation::envelope::row_paths::ALL {
-            assert!(
-                msg.contains(member),
-                "({tag}) B11-h: the refusal must name every member a producer has to stamp — \
-                 `{member}` is missing from: {msg}"
-            );
-        }
-        assert!(
-            dir.get_attestation(&id).await.expect("get").is_none(),
-            "({tag}) B11-h: a refused row must leave no trace"
-        );
-
-        // ── (i) MALFORMED. A mirror missing ONE member is not a partial
-        //    binding, it is no binding — refused, and refused with the member
-        //    set named so a producer can fix it.
-        let mut partial = honest(&uuid::Uuid::new_v4().to_string());
-        partial.attestation_envelope[paths::ROW]
-            .as_object_mut()
-            .expect("mirror is an object")
-            .remove(row_paths::COHORT_SCOPE);
-        let (och, sc, sp) = crate::federation::tier_ingest::test_support::sign_envelope(
-            &author,
-            &partial.attestation_envelope,
-        );
-        partial.original_content_hash = och;
-        partial.scrub_signature_classical = sc;
-        partial.scrub_signature_pqc = sp;
-        let err = dir
-            .put_attestation(SignedAttestation {
-                attestation: partial,
-            })
-            .await
-            .expect_err("({tag}) B11-i: a mirror missing a member must be REFUSED");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("643"),
-            "({tag}) B11-i: the refusal must name the rule: {msg}"
-        );
-        // v31.0.0 (CIRISPersist#658) — same specification duty as (h): this is
-        // the message the producer sees when its mirror is one member short,
-        // so it must list the members in full.
-        for member in crate::federation::envelope::row_paths::ALL {
-            assert!(
-                msg.contains(member),
-                "({tag}) B11-i: the malformed-mirror refusal must name every member — \
-                 `{member}` is missing from: {msg}"
-            );
-        }
-
-        // ── (j) NON-VACUITY OF THE CONTROL, at the end. The gate is a rule and
-        //    not a lockdown: after seven refusals a fresh honest row still
-        //    admits, so nothing above wedged the directory into refusing
-        //    everything (which would make every arm above pass for free).
-        dir.put_attestation(SignedAttestation {
-            attestation: honest(&uuid::Uuid::new_v4().to_string()),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("({tag}) B11-j: the gate is a door, not a wall: {e}"));
-    }
+    // v62.0.0 (E0 fix 8) — B11 `exercise_row_column_binding` (#643: the
+    // typed columns bound to the signed envelope's row MIRROR) is DELETED. An
+    // edition-2 row has no mirror: the statement IS the row (CC 2.6.1.1), and
+    // a column that is not the statement's projection is refused by
+    // `ingest::verify_carried` (`typed_diverges_from_envelope`) on every
+    // column at once (earlier-form behaviour, round-3 ruling 4).
 
     /// **B10-b — TWO DIRECTORIES FED THE SAME ENVELOPES CANNOT DISAGREE.**
     ///

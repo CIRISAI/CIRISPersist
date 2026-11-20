@@ -7,14 +7,9 @@
 //!
 //! # Model
 //!
-//! Per `CIRISNodeCore/SCHEMA.md` §2.2, every `ContributorId`
-//! (`author_id`, `voter_id`, `accuser_id`, `adjudicator_id`,
-//! `requester_id`) **IS** the Ed25519 pubkey — base64-encoded.
-//! Federation-consensus envelopes are self-signed against the
-//! identity-as-pubkey embedded in the envelope itself; persist does
-//! not need a federation_keys directory lookup for cirisnode-track
-//! verification (in contrast to the v0.4.1 outbound-envelope path
-//! that uses `verify_hybrid_via_directory`).
+//! v62.0.0 (F0-cp5): the signer is an edition-2 identity-ref and its key is
+//! read from the directory (see "Signer" below). The v0.7.1 model, where a
+//! `ContributorId` IS the Ed25519 pubkey and no directory is read, is gone.
 //!
 //! # Canonical-bytes shape
 //!
@@ -37,65 +32,29 @@
 //! signed body — the envelope's own timestamp (`submitted_at`,
 //! `cast_at`, `filed_at`, etc.) carries the asserted-at time.
 //!
-//! # Policy
+//! # Signer (v62.0.0, F0-cp5; RULINGS "composite signatures only")
 //!
-//! [`HybridPolicy::Ed25519Fallback`], **PINNED**, and **non-conformant until
-//! v62** (CIRISPersist#1233). Classical-only envelopes verify against
-//! Ed25519.
-//!
-//! ## Why this is a gap, and where it closes
-//!
-//! These are federation-consensus envelopes read by other consumers, so they
-//! are federation-tier rows and CC 5.3.2.4.3.1 binds them with no
-//! accommodation (CC's reading on CIRISPersist#1233). Unlike the audit
-//! plane, whose hybrid gate is the signed tree head over its log, nothing
-//! here carries an ML-DSA-65 half across the boundary: this check IS the
-//! gate, and it is classical. It is a classical-only accommodation, kept only
-//! because persist has nothing yet to verify a PQC half against.
-//!
-//! v62 makes it conformant: a `ContributorId` becomes a key id that resolves
-//! to a hybrid `federation_keys` record (the substrate already takes
-//! `federation_keys` writes only at `algorithm: hybrid`), the envelope must
-//! carry its `signature_pqc` half (the canonicalizer already strips it, so
-//! the wire slot exists), and a contributor with no hybrid key is confined to
-//! local-tier. Until then this policy argument stays as it is.
-//!
-//! ## Correction (v37.0.0): hybrid envelopes are NOT accepted here
-//!
-//! This doc previously claimed "Hybrid envelopes (Ed25519 + ML-DSA-65)
-//! also accepted via the upstream `verify_hybrid` impl". That has been
-//! false since it was written. [`verify_envelope_signed`] passes
-//! `ml_dsa_65_pubkey_b64` as an unconditional `None`, and `verify_hybrid`
-//! pairs sig+pubkey both-or-neither: an envelope carrying
-//! `signature.ml_dsa_65 = Some(..)` hits `PqcFieldsMustBeBoth` and is
-//! REFUSED. Only the classical-only shape verifies. There is no
-//! per-contributor ML-DSA-65 pubkey directory on the cirisnode track for
-//! it to check against.
-//!
-//! ## Why a policy flip alone is an outage, not a fix
-//!
-//! Because `ml_dsa_65_pubkey_b64` is always `None`, `Strict` is
-//! **unconditionally unsatisfiable** here rather than merely stricter:
-//! PQC-present → `PqcFieldsMustBeBoth`, PQC-absent → `Strict` →
-//! `HybridPendingRejected`. Every envelope refused, both branches. This
-//! was measured, not assumed — flipping it reds
-//! `verify_round_trip_accepts_legitimate_sig` (the module's only
-//! accepts-a-good-signature witness) with `hybrid-pending row rejected by
-//! Strict policy`.
-//!
-//! So the v62 fix is the key model first (a per-contributor PQC pubkey
-//! source plumbed into [`verify_envelope_signed`]) and `Strict` second.
-//! Contrast the delivery-attestation path in `super::sqlite` /
-//! `super::postgres`, which resolves BOTH pubkeys from `federation_keys` via
-//! `verify_hybrid_via_directory` and therefore DID flip to `Strict` in
-//! v37.0.0.
+//! The signer is named by its edition-2 **identity-ref**, not a pubkey
+//! literal: `attested_by` (a promotion record) and `peer_key_id` (a delivery
+//! attestation) are `urn:ietf:params:oauth:ckt:sha-256:…`, and the signer's
+//! LIVE key is read from the directory by the shared
+//! [`verify_composite_via_directory`]. The envelope carries ONE composite
+//! (ML-DSA-65-Ed25519) signature. The earlier model (SCHEMA §2.2: the
+//! identity field IS the Ed25519 pubkey, verified classical-only under a
+//! PINNED `Ed25519Fallback`, CIRISPersist#1233) is gone: a pubkey literal is
+//! refused `verify_not_identity_ref`, a lone Ed25519 half
+//! `verify_component_signature`.
 
 use serde::Serialize;
 
+use crate::federation::edition2::composite_verify::{
+    now_ms, verify_composite_via_directory, CompositeVerifyError,
+};
+use crate::federation::FederationDirectory;
 use crate::verify::canonical::canonicalize_envelope_for_signing;
-use crate::verify::hybrid::{verify_hybrid_with_policy, HybridPolicy};
 
-use super::types::HybridSignature;
+use super::federation_announcement::DeliveryAttestation;
+use super::types::CompositeSignature;
 use super::Error;
 
 /// Produce canonical bytes for a federation-consensus envelope.
@@ -111,142 +70,79 @@ pub fn canonical_bytes_for_envelope<T: Serialize>(envelope: &T) -> Result<Vec<u8
         .map_err(|e| Error::Internal(format!("canonicalize: {e}")))
 }
 
-/// Verify a federation-consensus envelope's signature against the
-/// contributor's Ed25519 pubkey embedded in the envelope.
+/// A [`CompositeVerifyError`] as this track's [`Error`]: a failed directory
+/// read is `Backend`; every refusal is `Signature`, led by its token.
+fn refusal(e: CompositeVerifyError) -> Error {
+    match e {
+        CompositeVerifyError::Directory(inner) => Error::Backend(format!("key read: {inner}")),
+        other => Error::Signature(format!("{other}")),
+    }
+}
+
+/// Verify a federation-consensus envelope's ONE composite signature under
+/// the LIVE edition-2 key of `signer_identity_ref` (v62.0.0, F0-cp5).
 ///
 /// Caller passes:
-/// - `envelope`: the typed envelope (Serialize impl)
-/// - `sig`: the envelope's `signature` (HybridSignature)
-/// - `contributor_pubkey_b64`: the contributor identity field that
-///   per SCHEMA.md §2.2 IS the Ed25519 pubkey (standard base64,
-///   exactly as `verify_hybrid` expects)
+/// - `dir`: the directory the signer's key plane is read from;
+/// - `envelope`: the typed envelope (Serialize impl), whose `signature`
+///   field is stripped before canonicalising;
+/// - `sig`: the envelope's [`CompositeSignature`];
+/// - `signer_identity_ref`: the signer field (e.g. `attested_by`).
 ///
-/// Returns `Error::Signature` with the underlying `VerifyError` kind
-/// string on any failure. Stable tokens cross the FFI boundary; the
-/// verbose detail goes to tracing only.
-pub fn verify_envelope_signed<T: Serialize>(
+/// # Errors
+/// [`Error::Signature`] led by the refusal's token
+/// (`verify_not_identity_ref`, `verify_unknown_key`,
+/// `verify_component_signature`, …); [`Error::Backend`] for a failed read.
+pub async fn verify_envelope_signed<T, F>(
+    dir: &F,
     envelope: &T,
-    sig: &HybridSignature,
-    contributor_pubkey_b64: &str,
-) -> Result<(), Error> {
-    if sig.ed25519.is_empty() {
-        return Err(Error::Signature("ed25519 signature missing".into()));
-    }
-    let canonical = canonical_bytes_for_envelope(envelope)?;
-    // v61.1.0 (CIRISPersist#1233) — the crate-private policy-taking twin: the
-    // public `verify_hybrid` refuses every policy but `Strict`.
-    verify_hybrid_with_policy(
-        &canonical,
-        &sig.ed25519,
-        sig.ml_dsa_65.as_deref(),
-        contributor_pubkey_b64,
-        // No per-contributor ML-DSA-65 pubkey directory on the cirisnode
-        // track — contributor identity is single-key (Ed25519). Passing
-        // `None` unconditionally means an envelope that DOES carry
-        // `signature.ml_dsa_65` is refused as `PqcFieldsMustBeBoth`,
-        // NOT hybrid-verified (the module doc used to claim otherwise;
-        // corrected in v37.0.0).
-        None,
-        // PINNED, and non-conformant until v62 (CIRISPersist#1233): these
-        // are federation-tier envelopes and CC 5.3.2.4.3.1 binds them. With
-        // the pubkey above always `None`, `Strict` refuses EVERY envelope on
-        // both branches — an outage, not a tightening. v62 resolves a
-        // ContributorId to a hybrid `federation_keys` record first; see the
-        // module doc.
-        HybridPolicy::Ed25519Fallback,
-        None,
+    sig: &CompositeSignature,
+    signer_identity_ref: &str,
+) -> Result<(), Error>
+where
+    T: Serialize,
+    F: FederationDirectory + ?Sized,
+{
+    let raw = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        sig.composite.trim(),
     )
-    .map_err(|e| Error::Signature(format!("{e}")))?;
+    .map_err(|e| Error::Signature(format!("signature.composite is not base64: {e}")))?;
+    let canonical = canonical_bytes_for_envelope(envelope)?;
+    verify_composite_via_directory(dir, &canonical, signer_identity_ref, &raw, now_ms())
+        .await
+        .map_err(refusal)?;
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cirisnode::types::{PromotionAttestation, TargetRowKind};
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine as _;
-    use chrono::Utc;
-    use ed25519_dalek::{Signer as _, SigningKey};
-    use uuid::Uuid;
-
-    /// A promotion record (the one cirisnode object still verified here,
-    /// v60.0.0) signed with the supplied key.
-    fn sign_contribution(key: &SigningKey, author_id: &str) -> PromotionAttestation {
-        let mut env = PromotionAttestation {
-            attestation_id: Uuid::new_v4().to_string(),
-            target_kind: TargetRowKind::Contribution,
-            target_ids: vec![Uuid::new_v4().to_string()],
-            attested_by: author_id.to_owned(),
-            aggregate_evidence: serde_json::json!({"q": "test"}),
-            signature: HybridSignature {
-                ed25519: String::new(),
-                ml_dsa_65: None,
-                signed_at: Utc::now(),
-            },
-            attested_at: Utc::now(),
-        };
-        let canonical = canonical_bytes_for_envelope(&env).unwrap();
-        let sig = key.sign(&canonical);
-        env.signature.ed25519 = B64.encode(sig.to_bytes());
-        env
-    }
-
-    #[test]
-    fn verify_round_trip_accepts_legitimate_sig() {
-        let key = SigningKey::from_bytes(&[0xAB; 32]);
-        let pubkey = B64.encode(key.verifying_key().to_bytes());
-        let env = sign_contribution(&key, &pubkey);
-        verify_envelope_signed(&env, &env.signature, &pubkey)
-            .expect("legitimate sig should verify");
-    }
-
-    #[test]
-    fn verify_rejects_tampered_payload() {
-        let key = SigningKey::from_bytes(&[0xCD; 32]);
-        let pubkey = B64.encode(key.verifying_key().to_bytes());
-        let mut env = sign_contribution(&key, &pubkey);
-        // Tamper after sign — flip a payload field.
-        env.aggregate_evidence = serde_json::json!({"q": "TAMPERED"});
-        let err = verify_envelope_signed(&env, &env.signature, &pubkey).unwrap_err();
-        assert!(
-            matches!(err, Error::Signature(_)),
-            "expected Signature, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn verify_rejects_wrong_pubkey() {
-        let signer = SigningKey::from_bytes(&[0xEE; 32]);
-        let imposter = SigningKey::from_bytes(&[0xFF; 32]);
-        let signer_pub = B64.encode(signer.verifying_key().to_bytes());
-        let imposter_pub = B64.encode(imposter.verifying_key().to_bytes());
-        let env = sign_contribution(&signer, &signer_pub);
-        // Verify against a different pubkey.
-        let err = verify_envelope_signed(&env, &env.signature, &imposter_pub).unwrap_err();
-        assert!(matches!(err, Error::Signature(_)));
-    }
-
-    #[test]
-    fn verify_rejects_empty_signature() {
-        let key = SigningKey::from_bytes(&[0x11; 32]);
-        let pubkey = B64.encode(key.verifying_key().to_bytes());
-        let mut env = sign_contribution(&key, &pubkey);
-        env.signature.ed25519 = String::new();
-        let err = verify_envelope_signed(&env, &env.signature, &pubkey).unwrap_err();
-        match err {
-            Error::Signature(msg) => assert!(msg.contains("missing"), "got: {msg}"),
-            other => panic!("expected Signature, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn verify_rejects_malformed_base64() {
-        let key = SigningKey::from_bytes(&[0x22; 32]);
-        let pubkey = B64.encode(key.verifying_key().to_bytes());
-        let mut env = sign_contribution(&key, &pubkey);
-        env.signature.ed25519 = "not-valid-base64!@#$".to_owned();
-        let err = verify_envelope_signed(&env, &env.signature, &pubkey).unwrap_err();
-        assert!(matches!(err, Error::Signature(_)));
-    }
+/// Verify a [`DeliveryAttestation`]'s ONE composite over
+/// [`DeliveryAttestation::canonical_bytes`] under `peer_key_id`'s LIVE
+/// edition-2 key. Both backends' `put_delivery_attestation` call this, so
+/// the accepted set cannot depend on the backend. Returns the composite's
+/// raw bytes (what the row stores).
+///
+/// # Errors
+/// As [`verify_envelope_signed`]; [`Error::InvalidArgument`] for a
+/// signature that is not base64.
+pub async fn verify_delivery_attestation<F>(
+    dir: &F,
+    attestation: &DeliveryAttestation,
+) -> Result<Vec<u8>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let sig = attestation.signature_composite_bytes()?;
+    let canonical = attestation
+        .canonical_bytes()
+        .map_err(|e| Error::Signature(format!("canonical_bytes: {e}")))?;
+    verify_composite_via_directory(dir, &canonical, &attestation.peer_key_id, &sig, now_ms())
+        .await
+        .map_err(refusal)?;
+    Ok(sig)
 }
+
+// v62.0.0 (F0-cp5) — the earlier pubkey-literal tests (round trip,
+// tampered payload, wrong pubkey, empty / malformed Ed25519 half) asserted
+// the classical-only identity-as-pubkey model and are deleted; the
+// directory-backed witnesses are I2883 (`cirisnode::composite_invariants`,
+// sqlite + postgres).

@@ -53,7 +53,6 @@ residual (CC 5.4.6).
 | `exercise_conferral_is_not_stewardship` via `conferral_is_not_stewardship_{sqlite,postgres}_87` | `src/federation/admission.rs`; `src/store/{sqlite,postgres}.rs` | sqlite+pg | A conferral is never counted as stewardship |
 | I1361 `i1361_infra_relay_is_accord_conferred` | `src/federation/v601_asks_invariants.rs` | sqlite+pg | `infra:relay` is conferred only by a 2-of-3 holder co-scrub (CC 5.4.6 item 4). A scrub by a key outside the roster reads false |
 | I190 (`i190_*` runners) | `src/federation/canonical_community_invariants.rs` | sqlite+pg | The canonical community admits at 2 of 3 and refuses 1 of 3. A founder the accord did not confer is refused. `trust:accepts` is the one-row un-trust |
-| `a_withdrawn_trust_root_stops_projecting_global_685` | `tests/withdrawn_trust_root_685.rs` | sqlite (`test-anchor` builds only) | A withdrawn root stops projecting global standing |
 | `promotion_cohort_standing_is_not_av45_592`, `every_authority_claim_declares_a_conferral_mode`, `a_deferred_conferral_mode_never_backs_a_membership_test_607` | `src/federation/admission.rs` | pure | Every authority claim states how it is conferred, and a deferred mode never backs a membership test |
 
 **Gaps.**

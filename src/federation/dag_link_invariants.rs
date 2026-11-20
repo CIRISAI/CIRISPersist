@@ -236,7 +236,7 @@ pub(crate) mod bodies {
         // v62 (E4): the earlier-shaped literal, then the owner's edition-2
         // statement of it through the statement door. The row id is the
         // node's (`e2::rid`); `id` is only a label.
-        let mut row = e2::with_earlier_form(|| ts::bare_attestation(id, owner, owner, &env));
+        let mut row = ts::bare_attestation(id, owner, owner, &env);
         row.attestation_type = attestation_type::SCORES.into();
         row.cohort_scope = "federation".into();
         row.subject_key_ids = vec![owner.to_owned()];
@@ -262,7 +262,7 @@ pub(crate) mod bodies {
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("withdraw {id}: the target {target} is held"));
-        let mut w = e2::with_earlier_form(|| ts::bare_attestation(id, owner, owner, &env));
+        let mut w = ts::bare_attestation(id, owner, owner, &env);
         w.attestation_type = attestation_type::WITHDRAWS.into();
         w.cohort_scope = "federation".into();
         e2::put_statement(b, &e2::statement_of_family(&w, owner, &e2::family_of(&t)))

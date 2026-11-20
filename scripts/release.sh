@@ -12,7 +12,8 @@
 #                 previous section's version, the UNRELEASED header present,
 #                 a gh with `gh attestation` (2.49+; GH=/path/to/gh) for stage 10
 #   2 cheap       the five no-backend axes, the pyo3 lane, both clippy passes,
-#                 pyi_surface — the legs certify most often goes red on late
+#                 pyi_surface — the legs certify most often goes red on late —
+#                 and earlier_form_doors.py release-check (no held CP2 rewrite)
 #   3 bump        Cargo version, evidence/cc_impl.tsv re-stamp (count
 #                 asserted), CHANGELOG date, `cargo check`, the release commit
 #   4 pr          push the branch, open (or reuse) the PR
@@ -97,6 +98,10 @@ cheap_legs() {
     echo "clippy-lint cargo clippy --features ${lint_set// /,} --all-targets -- -D warnings"
     echo "clippy-all cargo clippy --all-features --all-targets -- -D warnings"
     echo "pyi python3 scripts/pyi_surface.py check"
+    # v62.0.0 (JSON-cut slice F, the lead's CP2 ruling) — a test held as
+    # `#[ignore = "v62-CP2 rewrite pending: <owner> …"]` is a bridge for an
+    # owner's edition-2 rewrite; the release cannot tag while one remains.
+    echo "cp2rewrites python3 scripts/earlier_form_doors.py release-check"
 }
 
 # ── 1. preflight ────────────────────────────────────────────────────────

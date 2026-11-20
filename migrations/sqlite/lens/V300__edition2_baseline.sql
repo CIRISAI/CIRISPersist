@@ -1881,14 +1881,11 @@ CREATE TABLE cirisnode_federation_delivery_attestations (
     announcement_canonical_hash  BLOB NOT NULL
         CHECK (length(announcement_canonical_hash) = 32),
     peer_key_id                  TEXT NOT NULL,
-    peer_pubkey_ed25519_base64   TEXT NOT NULL,
     received_at                  TEXT NOT NULL,
     transport_id                 TEXT NOT NULL
         CHECK (transport_id IN ('reticulum', 'tcp_tls', 'http_over_tls', 'other')),
-    signature_classical          BLOB NOT NULL
-        CHECK (length(signature_classical) = 64),
-    signature_pqc                BLOB
-        CHECK (signature_pqc IS NULL OR length(signature_pqc) = 3309),
+    signature_composite          BLOB NOT NULL
+        CHECK (length(signature_composite) = 3373),
     inserted_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
     signature_verified           INTEGER NOT NULL DEFAULT 0,
     persist_row_hash             TEXT NOT NULL,

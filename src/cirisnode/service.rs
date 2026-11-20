@@ -104,15 +104,14 @@ pub trait NodeCoreService: Send + Sync {
     /// (replay-safe per FSD §3.2.1).
     ///
     /// Pre-insert verification:
-    /// 1. shape: 32-byte canonical hash, 64-byte Ed25519 signature, optional
-    ///    3309-byte PQC signature ([`Error::InvalidArgument`]);
+    /// 1. shape: a 32-byte canonical hash ([`Error::InvalidArgument`]);
     /// 2. v60.0.0 — the announcement is a `contribution:federation_announcement`
     ///    row THIS node holds (the V046 foreign key's rule, now that the
     ///    announcement is a row; [`Error::InvalidArgument`]);
-    /// 3. hybrid signature verify via
-    ///    [`crate::verify::verify_hybrid_via_directory`] over
-    ///    [`DeliveryAttestation::canonical_bytes`], Strict
-    ///    ([`Error::Signature`]).
+    /// 3. v62.0.0 (F0-cp5) — ONE composite signature over
+    ///    [`DeliveryAttestation::canonical_bytes`] under `peer_key_id`'s LIVE
+    ///    edition-2 key ([`super::verify::verify_delivery_attestation`];
+    ///    [`Error::Signature`] led by the refusal's token).
     fn put_delivery_attestation(
         &self,
         attestation: DeliveryAttestation,

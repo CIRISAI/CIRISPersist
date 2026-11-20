@@ -43,7 +43,7 @@ pub(crate) mod bodies {
         RecipientBasis,
     };
     use crate::federation::replication_audience_invariants::bodies::{
-        claim, entries, family, grant, nodes, put, room, users,
+        claim, entries, family, grant, kr, nodes, put, room, users,
     };
     use crate::federation::types::cohort_scope::{COMMUNITY, FAMILY, SELF};
     use crate::federation::types::device_class;
@@ -55,7 +55,13 @@ pub(crate) mod bodies {
         author: Option<&str>,
         group: Option<&str>,
     ) -> std::collections::BTreeSet<String> {
-        match content_audience(d, scope, author, group).await.unwrap() {
+        // v62.0.0 — keys are edition-2 `key:record`s: the directory names
+        // every party by its kid (`kr` of the seed).
+        let (author, group) = (author.map(kr), group.map(kr));
+        match content_audience(d, scope, author.as_deref(), group.as_deref())
+            .await
+            .unwrap()
+        {
             ContentAudience::Nodes(n) => n,
             other => panic!("expected a node audience at {scope}, got {other:?}"),
         }
@@ -75,8 +81,8 @@ pub(crate) mod bodies {
             scope,
             AuthorityClass::ProducerSteward,
             false,
-            group,
-            peer,
+            &kr(group),
+            &kr(peer),
         )
         .await
         .unwrap();
@@ -111,11 +117,11 @@ pub(crate) mod bodies {
         for author in [&owner, &laptop] {
             let a = nodes_of(d, SELF, Some(author), None).await;
             assert!(
-                a.contains(&laptop) && a.contains(&phone),
+                a.contains(&kr(&laptop)) && a.contains(&kr(&phone)),
                 "I410 the owner's personal nodes are the audience: {a:?}"
             );
             assert!(
-                !a.contains(&server),
+                !a.contains(&kr(&server)),
                 "I410 a server-class node holds no self content: {a:?}"
             );
         }
@@ -147,11 +153,11 @@ pub(crate) mod bodies {
         family(d, &fam, &[&a, &b]).await;
         let aud = nodes_of(d, FAMILY, Some(&a), Some(&fam)).await;
         assert!(
-            aud.contains(&a_laptop) && aud.contains(&b_phone),
+            aud.contains(&kr(&a_laptop)) && aud.contains(&kr(&b_phone)),
             "I411 both members' nodes hold the family's bytes: {aud:?}"
         );
         assert!(
-            !aud.contains(&x_laptop),
+            !aud.contains(&kr(&x_laptop)),
             "I411 a stranger's node does not: {aud:?}"
         );
         let (judged, may) = advertisable(d, FAMILY, &fam, &b_phone).await;
@@ -165,8 +171,8 @@ pub(crate) mod bodies {
             FAMILY,
             AuthorityClass::ProducerSteward,
             false,
-            &fam,
-            &b_phone,
+            &kr(&fam),
+            &kr(&b_phone),
         )
         .await
         .unwrap();
@@ -178,7 +184,9 @@ pub(crate) mod bodies {
         // a family row that names no family has no audience to resolve: it
         // is never everyone, and nothing is reported as a target
         assert_eq!(
-            content_audience(d, FAMILY, Some(&a), None).await.unwrap(),
+            content_audience(d, FAMILY, Some(kr(&a).as_str()), None)
+                .await
+                .unwrap(),
             ContentAudience::Unresolvable,
             "I411 a family row with no group key is unresolvable, never everyone"
         );
@@ -204,7 +212,7 @@ pub(crate) mod bodies {
         assert!(
             nodes_of(d, FAMILY, Some(&owner), Some(&fam))
                 .await
-                .contains(&work_laptop),
+                .contains(&kr(&work_laptop)),
             "I412 control: a personal laptop holds the family by default"
         );
         put(
@@ -219,10 +227,13 @@ pub(crate) mod bodies {
         .expect("I412 the owner's allow list for the work laptop");
         let aud = nodes_of(d, FAMILY, Some(&owner), Some(&fam)).await;
         assert!(
-            !aud.contains(&work_laptop),
+            !aud.contains(&kr(&work_laptop)),
             "I412 the denied laptop is not in the family audience: {aud:?}"
         );
-        assert!(aud.contains(&phone), "I412 the phone still is: {aud:?}");
+        assert!(
+            aud.contains(&kr(&phone)),
+            "I412 the phone still is: {aud:?}"
+        );
         let (judged, may) = advertisable(d, FAMILY, &fam, &work_laptop).await;
         assert!(
             judged && !may,
@@ -232,7 +243,7 @@ pub(crate) mod bodies {
         assert!(
             nodes_of(d, COMMUNITY, Some(&owner), Some(&work))
                 .await
-                .contains(&work_laptop),
+                .contains(&kr(&work_laptop)),
             "I412 the listed room reaches it"
         );
     }
@@ -319,7 +330,9 @@ pub(crate) mod bodies {
         known: &std::collections::BTreeMap<String, CustodyVerdict>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> DurabilityDeficit {
-        let aud = content_audience(d, SELF, Some(owner), None).await.unwrap();
+        let aud = content_audience(d, SELF, Some(kr(owner).as_str()), None)
+            .await
+            .unwrap();
         deficit_over(
             d,
             &hex::encode(sha),

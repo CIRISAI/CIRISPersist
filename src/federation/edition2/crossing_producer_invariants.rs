@@ -311,26 +311,25 @@ pub(crate) mod bodies {
         )
         .expect("I3524: describable");
 
-        let (stated, widened) =
-            crate::federation::edition2::door::with_earlier_form_doors_shut(async {
-                let stated = match a.enter_mesh(&local_id, &ci, None).await {
-                    Ok(MeshCrossingOutcome::Crossed(c)) => c,
-                    other => panic!("I3524: the row is restated: {other:?}"),
-                };
-                let s = held(&a, &stated.attestation_id).await;
-                let ci_w =
-                    crossing::describe(&s, Audience::Federation, CrossingBasis::ProducerAuthority)
-                        .expect("I3524: describable");
-                let widened = match a
-                    .widen_audience(&stated.attestation_id, &ci_w, None, &[])
-                    .await
-                {
-                    Ok(MeshCrossingOutcome::Crossed(w)) => w,
-                    other => panic!("I3524: the restatement widens: {other:?}"),
-                };
-                (stated, widened)
-            })
-            .await;
+        let (stated, widened) = async {
+            let stated = match a.enter_mesh(&local_id, &ci, None).await {
+                Ok(MeshCrossingOutcome::Crossed(c)) => c,
+                other => panic!("I3524: the row is restated: {other:?}"),
+            };
+            let s = held(&a, &stated.attestation_id).await;
+            let ci_w =
+                crossing::describe(&s, Audience::Federation, CrossingBasis::ProducerAuthority)
+                    .expect("I3524: describable");
+            let widened = match a
+                .widen_audience(&stated.attestation_id, &ci_w, None, &[])
+                .await
+            {
+                Ok(MeshCrossingOutcome::Crossed(w)) => w,
+                other => panic!("I3524: the restatement widens: {other:?}"),
+            };
+            (stated, widened)
+        }
+        .await;
         assert_ne!(stated.attestation_id, local_id, "I3524: a new row");
         let s = held(&a, &stated.attestation_id).await;
         let st = carried_statement(&s).expect("I3524: an edition-2 statement");
@@ -707,10 +706,7 @@ pub(crate) mod bodies {
             .await
             .expect("I3541: B admits the signed draft");
         // The earlier form, behind the switch.
-        let refused = crate::federation::edition2::door::with_earlier_form_doors_shut(
-            a.sign_hybrid(b"earlier"),
-        )
-        .await;
+        let refused = a.sign_hybrid(b"earlier").await;
         assert!(
             matches!(refused, Err(crate::engine::SignError::EarlierFormShut)),
             "I3541: {refused:?}"

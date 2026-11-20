@@ -333,6 +333,12 @@ mod tests {
             "src/federation/at_rest_cascade.rs",   // the self/family cascade
             "src/federation/community_dek.rs",     // the community cascade
             "src/federation/chunk_dag_cascade.rs", // #832 — the chunk cascade
+            // v62.0.0 (wave P7) — the trace blob's floor: the bytes the row
+            // names, stored verbatim; the floor is chosen from the bytes
+            // (a sealed envelope or not) and `check_scope` refuses plaintext
+            // under self/family BEFORE the write (the module doc). Kept equal
+            // to rules/i14-storage-floor.yml's `ignores`.
+            "src/federation/trace_blob_floor.rs",
         ];
         let mut offenders = Vec::new();
         for entry in walkdir("src") {
@@ -341,6 +347,13 @@ mod tests {
                 .unwrap_or(&entry)
                 .to_owned();
             if !rel.ends_with(".rs") || allowed.contains(&rel.as_str()) {
+                continue;
+            }
+            // v62.0.0 — a `*_invariants.rs` file is a test module (each is
+            // declared `#[cfg(test)]` / `#[cfg(all(test, …))]` where its parent
+            // names it), the convention `bounded_reads_table`'s scanner reads
+            // by: its floor calls are witnesses, not doors.
+            if rel.ends_with("_invariants.rs") {
                 continue;
             }
             let text = production_only(&std::fs::read_to_string(&entry).unwrap());
@@ -380,6 +393,21 @@ mod tests {
                             .rev()
                             .find(|l| l.trim_start().starts_with("fn "))
                             .is_some_and(|l| l.contains("fn put_blob_signing_at<"))
+                    {
+                        continue;
+                    }
+                    // v62.0.0 (wave P7) — the trace blob plane stores a
+                    // trace's bytes VERBATIM (the producer sealed a `self` /
+                    // `family` blob through `put_blob_scoped`, option A), and
+                    // its floor refuses the contradiction (a plaintext `self`
+                    // blob, a sealed commons one) before the store: the door
+                    // places nothing unsealed under a cohort. Only there.
+                    if rel == "src/ingest.rs"
+                        && lines[..n]
+                            .iter()
+                            .rev()
+                            .find(|l| l.contains(" fn ") || l.trim_start().starts_with("fn "))
+                            .is_some_and(|l| l.contains("fn store_trace_blob_on<"))
                     {
                         continue;
                     }

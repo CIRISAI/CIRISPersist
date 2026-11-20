@@ -226,8 +226,31 @@ pub(crate) mod bodies {
 
     // ── fixtures ─────────────────────────────────────────────────────────
 
+    /// A fixture's calendar instant, dated INSIDE the signing node key's
+    /// window. v62.0.0 (E0 fix 8; CC 2.4.1.1): node / agent keys sign these
+    /// rows, and such a key's rows lapse with its own record, so a fixed 2026
+    /// date would stop verifying on a calendar date. Every literal is shifted
+    /// by ONE offset, so the order and the gaps between the fixture's instants
+    /// are exactly as written. The latest node-signed literal, `2026-06-05`,
+    /// sits at K2's fixed offset (`OWNER_BINDING_OFFSET_DAYS`, day 150) into
+    /// the node key's window (`e2::key_window_start_ms`: every node key here
+    /// is put with the default window, so they share one start), and the
+    /// earliest node-signed one (`2026-04-01`) at day 85. The user-signed
+    /// `2026-03-01` (no end) is at day 54. The lapsed `valid_until`
+    /// `2026-01-01` is five days before the start, still in the past. Not
+    /// the wall clock: the key's own window.
     fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
-        admission::truncate_to_substrate_resolution(s.parse().unwrap())
+        let fixed: chrono::DateTime<chrono::Utc> = s.parse().unwrap();
+        let anchor: chrono::DateTime<chrono::Utc> = "2026-06-05T00:00:00Z".parse().unwrap();
+        // Any default-window node key of the corpus reads the same start; an
+        // unregistered seed reads the default node start too (K2's helper).
+        let start_ms = e2::key_window_start_ms("i536-window-anchor");
+        let start = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            i64::try_from(start_ms).expect("a window start in range"),
+        )
+        .expect("a window start in range");
+        let anchored = start + chrono::Duration::days(ts::OWNER_BINDING_OFFSET_DAYS);
+        admission::truncate_to_substrate_resolution(fixed + (anchored - anchor))
     }
 
     pub(crate) async fn keys(d: &dyn FederationDirectory, keys: &[(&str, &str)]) {

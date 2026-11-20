@@ -1764,13 +1764,23 @@ mod tests {
     fn retaining_the_contradiction_count_pins_almost_the_whole_registry() {
         let retained = pinned_families(true).len();
         let withheld = pinned_families(false).len();
+        // v62.0.0 (CC rc20/rc21 re-vendors, measured by the suite): 158 / 16 of
+        // 187. rc20 folds ten literal leaves into three closed-vocabulary rows
+        // (`capacity:{factor}`, `detection:{detector}`,
+        // `accord:lifecycle:{kind}`), drops `credits:…:substrate_building` and
+        // adds `location_proof:{version}` and `trust:blessing`: the retained
+        // side loses seven, and the two `+1.0 only` lifecycle leaves become
+        // one withheld row.
         assert_eq!(
             (retained, withheld),
-            (165, 17),
+            (158, 16),
             "the contradiction-count contrast moved (retained={retained}, \
              withheld={withheld})"
         );
-        assert_eq!(vendored_family_polarities().len(), 192);
+        assert_eq!(
+            vendored_family_polarities().len(),
+            crate::federation::namespace::registry::VENDORED_N_FAMILIES
+        );
     }
 
     /// **The signed fold's escape hatch is a zero-confidence row — and that is

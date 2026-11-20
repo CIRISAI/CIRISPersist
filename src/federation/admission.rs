@@ -5596,9 +5596,12 @@ pub async fn licensure_issuance_at(
                 // (`refs.head`), never at its signed instant.
                 LicenceRoots::Quorum(c) => match edition2_named_head(row) {
                     Some(head) => community_quorum_at_head(directory, c, row, &head, t).await?,
-                    // TODO(json-cut): the earlier form names no head; its
-                    // count reads the roster at the signed instant.
-                    None => community_quorum_cosigned_at(directory, c, row, t).await?,
+                    // v62.0.0 (JSON-cut slice F; CC 2.7.4) — a row that
+                    // names no head (the earlier form, whose doors are shut,
+                    // or an edition-2 row without `refs.head`) is counted
+                    // over no roster version, so it is no act of the quorum.
+                    // The signed-instant read is gone from this leg.
+                    None => false,
                 },
             };
             if stands {
@@ -14888,8 +14891,12 @@ pub async fn check_canonical_role_admission(
     directory: &dyn super::FederationDirectory,
     row: &super::KeyRecord,
 ) -> Result<(), Error> {
-    check_canonical_role_admission_over_roster(directory, row, &accord_holder_roster_key_ids())
-        .await
+    check_canonical_role_admission_over_roster(
+        directory,
+        row,
+        &accord_holder_roster(directory).await?,
+    )
+    .await
 }
 
 /// [`check_canonical_role_admission`] with an explicit accord-holder roster
@@ -15104,26 +15111,6 @@ pub async fn check_canonical_role_admission_over_roster_with_custody_root(
         scrub_key_id: row.scrub_key_id.clone(),
         reason,
     })
-}
-
-/// v21.3.0 (CIRISPersist#513) — does `row` belong to the compiled-in
-/// genesis canonical LINEAGE (same `key_id` as an embedded
-/// `canonical_seed.json` record)?
-///
-/// #513 is a Sybil floor on trust-root **minting** — scarcity for NEW
-/// roots. The genesis lineage id predates the floor (its real history
-/// includes 2-scrub artifacts: the pre-ceremony anchor, the re-blessed
-/// v2 record), so records for THAT id keep exactly today's bar: the
-/// legacy strict-majority accord quorum + withdrawal-wins — real A1/B1/C1
-/// signatures, no regression, nothing an attacker gains that they don't
-/// already need. Every NEW canonical `key_id` — including a rotation
-/// successor, which is how an unattested root would otherwise launder in —
-/// meets the full floor (this gate runs at every write chokepoint).
-fn is_baked_genesis_canonical(row: &super::KeyRecord) -> bool {
-    crate::federation::genesis::canonical_genesis_bundle()
-        .serve_nodes
-        .iter()
-        .any(|baked| baked.record.key_id == row.key_id)
 }
 
 /// The accord-family **m-of-n co-scrub quorum core** — the shared enforcement
@@ -15850,8 +15837,12 @@ pub async fn check_infra_attest_role_admission(
     directory: &dyn super::FederationDirectory,
     row: &super::KeyRecord,
 ) -> Result<(), Error> {
-    check_infra_attest_role_admission_over_roster(directory, row, &accord_holder_roster_key_ids())
-        .await
+    check_infra_attest_role_admission_over_roster(
+        directory,
+        row,
+        &accord_holder_roster(directory).await?,
+    )
+    .await
 }
 
 /// v31.0.0 (CIRISPersist#656) — **the FIFTH `federation_keys` admission path.**
@@ -16053,8 +16044,12 @@ pub async fn check_co_steward_role_admission(
     directory: &dyn super::FederationDirectory,
     row: &super::KeyRecord,
 ) -> Result<(), Error> {
-    check_co_steward_role_admission_over_roster(directory, row, &accord_holder_roster_key_ids())
-        .await
+    check_co_steward_role_admission_over_roster(
+        directory,
+        row,
+        &accord_holder_roster(directory).await?,
+    )
+    .await
 }
 
 /// v22.0.0 (CIRISPersist#543 finding 5 / AV-77) — the CEG dimension a node
@@ -16299,7 +16294,7 @@ pub async fn check_privileged_identity_type_admission(
     check_privileged_identity_type_admission_over_roster(
         directory,
         row,
-        &accord_holder_roster_key_ids(),
+        &accord_holder_roster(directory).await?,
     )
     .await
 }
@@ -16483,8 +16478,13 @@ pub async fn has_accord_conferred_role(
     key_id: &str,
     role: &str,
 ) -> Result<bool, Error> {
-    has_accord_conferred_role_over_roster(directory, key_id, role, &accord_holder_roster_key_ids())
-        .await
+    has_accord_conferred_role_over_roster(
+        directory,
+        key_id,
+        role,
+        &accord_holder_roster(directory).await?,
+    )
+    .await
 }
 
 /// v22.0.0 (CIRISPersist#543 / AV-75) — the **delegation-plane** effective-role
@@ -16569,7 +16569,12 @@ where
     let Some(row) = directory.lookup_public_key(key_id).await? else {
         return Ok(false);
     };
-    record_carries_accord_scrub_over_roster(directory, &row, &accord_holder_roster_key_ids()).await
+    record_carries_accord_scrub_over_roster(
+        directory,
+        &row,
+        &accord_holder_roster(directory).await?,
+    )
+    .await
 }
 
 /// v53.1.4 — does `row`, as HELD, carry the accord's m-of-n co-scrub under
@@ -16724,7 +16729,7 @@ pub async fn is_canonical(
     directory: &dyn super::FederationDirectory,
     key_id: &str,
 ) -> Result<bool, Error> {
-    is_canonical_over_roster(directory, key_id, &accord_holder_roster_key_ids()).await
+    is_canonical_over_roster(directory, key_id, &accord_holder_roster(directory).await?).await
 }
 
 /// [`is_canonical`] over an explicit accord roster.
@@ -16740,13 +16745,12 @@ pub async fn is_canonical_over_roster(
     if ciris_verify_core::edition2::is_identity_ref(key_id) {
         return super::edition2::genesis::is_canonical_by_bundle(directory, key_id).await;
     }
-    // TODO(json-cut): the earlier store's co-scrub conferral (both its forms)
-    // is read only for earlier-form key ids, until the JSON doors close and
-    // the baked JSON genesis is replaced.
-    let Some(record) = directory.lookup_public_key(key_id).await? else {
-        return Ok(false);
-    };
-    holds_canonical_conferral(directory, &record, roster_key_ids).await
+    // v62.0.0 (C5-fix1; ceremony gap 1): an earlier-form key id is never
+    // canonical. Its co-scrub conferral was counted over the baked roster,
+    // which is deleted; the roster is the ingested genesis's edition-2
+    // holders, whom no earlier-form signature can name. Clean break.
+    let _ = roster_key_ids;
+    Ok(false)
 }
 
 /// v62.0.0 (#1274) — the canonical servers among the candidate `key_ids`
@@ -16761,7 +16765,7 @@ pub async fn canonical_servers_among(
     directory: &dyn super::FederationDirectory,
     key_ids: Vec<String>,
 ) -> Result<Vec<super::KeyRecord>, Error> {
-    let roster = accord_holder_roster_key_ids();
+    let roster = accord_holder_roster(directory).await?;
     let mut out = Vec::new();
     for id in key_ids {
         let Some(record) = directory.lookup_public_key(&id).await? else {
@@ -16836,8 +16840,8 @@ pub fn names_canonical_conferral(record: &super::KeyRecord) -> bool {
 
 /// v62.0.0 (#1274) — **the canonical conferral's co-scrub**, verified: the
 /// record's stored scrub set meets the accord's count over its stored
-/// `registration_envelope` — at the pre-floor bar for the compiled-in genesis
-/// canonical lineage and an armed test anchor, else with the #513 custody
+/// `registration_envelope` — at the pre-floor bar under an armed test anchor,
+/// else with the #513 custody
 /// floor. The ONE core the admission gate and every reader
 /// ([`is_canonical`], `list_canonical_servers`, `verify_canonical_seeded`)
 /// share, so what admits is what reads. Withdrawal is not consulted here (the
@@ -16851,8 +16855,9 @@ pub async fn canonical_conferral_coscrub(
     row: &super::KeyRecord,
     roster_key_ids: &[String],
 ) -> Result<(), String> {
-    let legacy = is_baked_genesis_canonical(row)
-        || crate::federation::genesis::test_anchor_override_active();
+    // v62.0.0 (C5-fix1): the compiled-in genesis canonical lineage is
+    // deleted, so only an armed test anchor takes the pre-floor bar.
+    let legacy = crate::federation::genesis::test_anchor_override_active();
     if legacy {
         verify_accord_family_coscrub(directory, row, roster_key_ids).await
     } else {
@@ -16976,17 +16981,37 @@ pub fn canonical_withdrawal_payload_sha256(
 // absolute (a strict majority of distinct real accord holders whose YES
 // participations verify) — inflating `|L|` with captured keys cannot lower it.
 
-/// The accord-holder standing-roster `key_id`s (A1/B1/C1) — the FIXED identities
-/// whose PINNED directory pubkeys form the canonical-withdraw quorum roster.
-/// Sourced from the EFFECTIVE genesis records, never caller input: the baked
-/// trio in production, and — only on a `test-anchor` build with the runtime
-/// gate armed (#449) — the synthesized SW test-root holders, so the whole
-/// accord quorum machinery follows the same anchor verify roots against.
-pub(crate) fn accord_holder_roster_key_ids() -> Vec<String> {
-    super::genesis::effective_accord_holder_records()
+/// v62.0.0 (C5-fix1; ceremony gap 1) — **the accord-holder roster: the
+/// holders of the ingested genesis in force**, by identity-ref (an edition-2
+/// key is projected into `federation_keys` under its identity-ref, so every
+/// `*_over_roster` lookup resolves it).
+///
+/// The baked A1/B1/C1 roster (`accord_holder_roster_key_ids`, read from the
+/// compiled `accord_holder_seed.json` or the test-anchor block) is deleted:
+/// no production genesis gives standing. A node that holds no
+/// `ceg-genesis-bundle/2` (or holds a fork of the genesis, where Verify roots
+/// on neither tip) answers the EMPTY roster, and every gate over it fails
+/// closed — [`accord_threshold`]`(0) = 1` is unmeetable, and
+/// [`require_seated_accord_roster`](super::genesis::posture::require_seated_accord_roster)
+/// refuses an empty roster by name.
+///
+/// An earlier-form (JSON) co-scrub can never meet this roster: its holders
+/// are edition-2 keys, and an earlier-form signature by an edition-2 key is
+/// refused (`earlier_form_signer_is_edition2`).
+///
+/// # Errors
+///
+/// The genesis store could not be read.
+pub(crate) async fn accord_holder_roster<F>(directory: &F) -> Result<Vec<String>, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let in_force = super::edition2::genesis::genesis_in_force(directory).await?;
+    Ok(in_force
+        .holders()
         .iter()
-        .map(|r| r.record.key_id.clone())
-        .collect()
+        .map(|h| h.identity_ref.clone())
+        .collect())
 }
 
 /// v60.1.0 (CIRISPersist#1117; CC 4.2.6 / CC 4.5.1.2, rc10) — **the accord
@@ -17053,7 +17078,7 @@ pub async fn accord_threshold_now<F>(directory: &F) -> Result<AccordThreshold, E
 where
     F: super::FederationDirectory + ?Sized,
 {
-    accord_threshold_over_roster(directory, &accord_holder_roster_key_ids()).await
+    accord_threshold_over_roster(directory, &accord_holder_roster(directory).await?).await
 }
 
 /// v13.1.0 (CIRISPersist#377) — verify a withdraw/supersede authority by
@@ -17211,7 +17236,7 @@ pub async fn verify_canonical_withdraw_authority(
         OP_WITHDRAW_CANONICAL,
         key_id,
         None,
-        &accord_holder_roster_key_ids(),
+        &accord_holder_roster(directory).await?,
     )
     .await
 }
@@ -17265,7 +17290,7 @@ pub async fn verify_canonical_supersede_authority(
         OP_SUPERSEDE_CANONICAL,
         old_key_id,
         Some(new_key_id),
-        &accord_holder_roster_key_ids(),
+        &accord_holder_roster(directory).await?,
     )
     .await
 }
@@ -17288,7 +17313,7 @@ pub async fn withdraw_canonical_role(
         directory,
         key_id,
         proposal_digest,
-        &accord_holder_roster_key_ids(),
+        &accord_holder_roster(directory).await?,
     )
     .await
 }
@@ -17339,7 +17364,7 @@ pub async fn withdraw_infra_attest_role(
         directory,
         key_id,
         proposal_digest,
-        &accord_holder_roster_key_ids(),
+        &accord_holder_roster(directory).await?,
     )
     .await
 }
@@ -17409,7 +17434,7 @@ pub async fn withdraw_accord_role(
         role,
         key_id,
         proposal_digest,
-        &accord_holder_roster_key_ids(),
+        &accord_holder_roster(directory).await?,
     )
     .await
 }
@@ -17467,7 +17492,7 @@ pub async fn supersede_canonical(
         old_key_id,
         new_record,
         proposal_digest,
-        &accord_holder_roster_key_ids(),
+        &accord_holder_roster(directory).await?,
     )
     .await
 }
@@ -19925,6 +19950,10 @@ pub async fn check_delegated_duty_scores_admission(
         // marker takes something away, so it is gated on the ONE scope that
         // authorizes removal, walked under exactly the same policy as the two
         // emit duties above (there is no laxer path for the harsher op).
+        // v62.0.0 (K2-fix9; CC 3.4.7.3 C and E) — the signer_kind cell: an
+        // agent or a person signs it, never a node key (the signer's own key
+        // record: terminal).
+        super::quarantine::check_signer_kind(directory, row).await?;
         DELEGATION_SCOPE_SLASH
     } else {
         return Ok(());
@@ -27228,9 +27257,12 @@ pub(crate) mod steward_liveness_test_support {
             attestation_type::SUPERSEDES,
         ]
         .contains(&kind);
-        if composer {
-            return sealed_row_;
-        }
+        // v62.0.0 (E0 fix 9) — a composer whose target this process sealed is
+        // sealed too: the codec gives it the target's family
+        // (`fixture_switch::resolve_target`). Callers that `put_signed` it
+        // (v51's I126/I128) need the statement. A composer whose target the
+        // codec cannot name stays the literal, as before, for [`store`].
+        let _ = composer;
         crate::federation::edition2::fixture_switch::try_row_of(&sealed_row_, signer)
             .unwrap_or(sealed_row_)
     }
@@ -28946,7 +28978,23 @@ pub(crate) mod moderation_walk_liveness_test_support {
         // composite key, is admitted as-self.
         let key = bundle.holder_key(0);
         let holder = bundle.holder_identity_ref(0).to_owned();
-        let now = crate::federation::admission::truncate_to_substrate_resolution(Utc::now());
+        // v62.0.0 (E0 fix 9) — the holder's key is no fixture seed's: let the
+        // in-memory door read its statement (`e2::row_of_statement` below).
+        let _ = e2::register_foreign_key(&key);
+        // v62.0.0 (E0 fix 10) — dated from the holder's KEY RECORD, never the
+        // wall clock: a key with no end still has a start. One second after
+        // its `valid_from` (the record's start, as `federation_keys` projects
+        // it), inside the record by construction.
+        let now = {
+            let rec = dir
+                .lookup_public_key(&holder)
+                .await
+                .expect("lookup the holder's key")
+                .expect("the bundle holder's key record is held");
+            crate::federation::admission::truncate_to_substrate_resolution(
+                rec.valid_from + chrono::Duration::seconds(1),
+            )
+        };
         let dimension = "quarantine:deadmit:v1";
         let shaped = Attestation {
             attestation_id: String::new(),

@@ -63,8 +63,11 @@
 //!
 //! A missing link waits ([`KeyOf::Waiting`]): the predecessor's statement
 //! (its key), or the named record ([`ChainMissing::Record`]). A record of a
-//! key signed only by other keys never makes it a key of another identity;
-//! it may still make the key live to sign as itself (liveness above).
+//! key signed only by other keys never makes it a key of another identity.
+//! v62.0.0 (K1, triage round 3): nor does a record stating an end make the
+//! key live unless the key's own voice is on it (CC 2.4.1.1: "Each key's own
+//! holder signs its record of this form"; the kernel's
+//! `key_end::well_formed`).
 //!
 //! **One check, two callers** (v62.0.0, slice C3: CIRISVerify 23.3.0).
 //! Verify's row reader asks `KeyDirectory::key_of` itself, after the
@@ -356,6 +359,18 @@ impl HeldKeys {
                 .iter()
                 .filter(|v| inclusive((v.record.asserted_at, v.record.valid_until), at))
                 .all(|v| v.record.valid_until == Some(at)),
+            // v62.0.0 (K1, triage round 3) — or carries no voice of the key
+            // it records (CC 2.4.1.1: "Each key's own holder signs its
+            // record"; the kernel's `key_end::well_formed`)
+            valid
+                .iter()
+                .filter(|v| inclusive((v.record.asserted_at, v.record.valid_until), at))
+                .all(|v| {
+                    v.record.valid_until == Some(at)
+                        || !valid
+                            .iter()
+                            .any(|w| w.row_id == v.row_id && w.signer == *kid)
+                }),
         );
         if !answer.value {
             return Liveness::NotCovered;

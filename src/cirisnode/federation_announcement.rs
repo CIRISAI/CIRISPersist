@@ -52,7 +52,12 @@ pub const SUBJECT_KIND: &str = "federation_announcement";
 /// Domain-separation tag for [`DeliveryAttestation::canonical_bytes`]
 /// — FSD §3.2.1. **Locked** wire constant; changing it is a
 /// coordinated NodeCore + Edge + Persist break.
-pub const DELIVERY_ATTESTATION_DOMAIN: &[u8] = b"ciris-edge-delivery-attestation-v1";
+///
+/// v62.0.0 (F0-cp5) — `-v2`: the layout drops the earlier peer-pubkey
+/// segment (the peer is named by its edition-2 identity-ref, and its live
+/// key is read from the directory), and the attestation carries ONE
+/// composite signature. A v1-signed attestation does not verify.
+pub const DELIVERY_ATTESTATION_DOMAIN: &[u8] = b"ciris-edge-delivery-attestation-v2";
 
 /// Federation announcement payload — mirrors FSD §2.1 byte-for-byte.
 ///
@@ -316,14 +321,11 @@ pub struct DeliveryAttestation {
     /// standard on the wire (44 chars).
     pub announcement_canonical_hash_base64: String,
 
-    /// The peer that is acknowledging receipt — `federation_keys.key_id`
-    /// from persist's directory.
+    /// The peer that is acknowledging receipt: its edition-2
+    /// identity-ref (`urn:ietf:params:oauth:ckt:sha-256:…`). v62.0.0
+    /// (F0-cp5): its LIVE `key:record` is read from the directory; the
+    /// earlier denormalised `peer_pubkey_ed25519_base64` is gone.
     pub peer_key_id: String,
-
-    /// Base64 of the peer's Ed25519 pubkey (denormalized for offline
-    /// verification convenience; MUST match
-    /// `federation_keys[peer_key_id].pubkey_ed25519`).
-    pub peer_pubkey_ed25519_base64: String,
 
     /// When the peer's edge accepted the validated announcement.
     pub received_at: DateTime<Utc>,
@@ -331,16 +333,12 @@ pub struct DeliveryAttestation {
     /// Transport medium the announcement arrived over.
     pub transport_id: TransportMedium,
 
-    /// MANDATORY classical Ed25519 signature (64 bytes raw) over
-    /// the canonical-bytes encoding. Base64-standard on the wire.
-    pub signature_classical_base64: String,
-
-    /// OPTIONAL PQC ML-DSA-65 signature (3309 bytes raw, FIPS 204
-    /// final) over `canonical_bytes || signature_classical` per the
-    /// persist AV-33 bound-signature convention. Base64-standard on
-    /// the wire.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signature_pqc_base64: Option<String>,
+    /// v62.0.0 (F0-cp5; RULINGS "composite signatures only") — ONE
+    /// composite (ML-DSA-65-Ed25519) signature over
+    /// [`Self::canonical_bytes`], base64-standard. The earlier
+    /// `signature_classical_base64` / `signature_pqc_base64` pair is gone; a
+    /// lone half sent here is refused `verify_component_signature`.
+    pub signature_composite_base64: String,
 }
 
 impl DeliveryAttestation {
@@ -355,7 +353,6 @@ impl DeliveryAttestation {
     ///   ‖ u64_be(announcement_id.len())          ‖ announcement_id
     ///   ‖ announcement_canonical_hash            (32B raw, base64-decoded)
     ///   ‖ u64_be(peer_key_id.len())              ‖ peer_key_id
-    ///   ‖ u64_be(peer_pubkey_b64.len())          ‖ peer_pubkey_b64
     ///   ‖ i64_be(received_at.timestamp_millis()) (8B fixed)
     ///   ‖ u64_be(transport_id_str.len())         ‖ transport_id_str
     /// ```
@@ -372,7 +369,6 @@ impl DeliveryAttestation {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, Error> {
         let announcement_id = self.announcement_id.as_bytes();
         let peer_key_id = self.peer_key_id.as_bytes();
-        let peer_pubkey = self.peer_pubkey_ed25519_base64.as_bytes();
         let transport = self.transport_id.as_str().as_bytes();
         let canonical_hash = self.canonical_hash_bytes()?;
 
@@ -380,7 +376,6 @@ impl DeliveryAttestation {
             + 8 + announcement_id.len()
             + canonical_hash.len()
             + 8 + peer_key_id.len()
-            + 8 + peer_pubkey.len()
             + 8 // received_at i64
             + 8 + transport.len();
         let mut out = Vec::with_capacity(cap);
@@ -391,8 +386,6 @@ impl DeliveryAttestation {
         out.extend_from_slice(&canonical_hash);
         out.extend_from_slice(&(peer_key_id.len() as u64).to_be_bytes());
         out.extend_from_slice(peer_key_id);
-        out.extend_from_slice(&(peer_pubkey.len() as u64).to_be_bytes());
-        out.extend_from_slice(peer_pubkey);
         out.extend_from_slice(&self.received_at.timestamp_millis().to_be_bytes());
         out.extend_from_slice(&(transport.len() as u64).to_be_bytes());
         out.extend_from_slice(transport);
@@ -420,35 +413,16 @@ impl DeliveryAttestation {
         Ok(arr)
     }
 
-    /// Decode the mandatory classical Ed25519 signature to raw bytes
-    /// (expected 64). Returns [`Error::InvalidArgument`] on
-    /// base64-decode failure or wrong length.
-    pub fn signature_classical_bytes(&self) -> Result<[u8; 64], Error> {
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(self.signature_classical_base64.as_bytes())
+    /// Decode [`Self::signature_composite_base64`] to raw bytes. Its length
+    /// is the verifier's to judge (a component half's length is refused by
+    /// name there). Returns [`Error::InvalidArgument`] on base64-decode
+    /// failure.
+    pub fn signature_composite_bytes(&self) -> Result<Vec<u8>, Error> {
+        base64::engine::general_purpose::STANDARD
+            .decode(self.signature_composite_base64.as_bytes())
             .map_err(|e| {
-                Error::InvalidArgument(format!("signature_classical_base64 not base64: {e}"))
-            })?;
-        let arr: [u8; 64] = raw.as_slice().try_into().map_err(|_| {
-            Error::InvalidArgument(format!(
-                "signature_classical_base64 must decode to 64 bytes (got {})",
-                raw.len()
-            ))
-        })?;
-        Ok(arr)
-    }
-
-    /// Decode the optional PQC ML-DSA-65 signature to raw bytes.
-    /// Returns `Ok(None)` if absent; `Err(InvalidArgument)` on
-    /// base64-decode failure.
-    pub fn signature_pqc_bytes(&self) -> Result<Option<Vec<u8>>, Error> {
-        match &self.signature_pqc_base64 {
-            None => Ok(None),
-            Some(s) => base64::engine::general_purpose::STANDARD
-                .decode(s.as_bytes())
-                .map(Some)
-                .map_err(|e| Error::InvalidArgument(format!("signature_pqc_base64: {e}"))),
-        }
+                Error::InvalidArgument(format!("signature_composite_base64 not base64: {e}"))
+            })
     }
 }
 
@@ -458,7 +432,7 @@ pub fn encode_canonical_hash_base64(hash: &[u8; 32]) -> String {
     base64::engine::general_purpose::STANDARD.encode(hash)
 }
 
-/// Convenience: base64-encode a 64-byte Ed25519 signature.
+/// Convenience: base64-encode a signature's raw bytes.
 pub fn encode_signature_base64(sig: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(sig)
 }
@@ -690,13 +664,11 @@ mod tests {
             announcement_id: "11111111-1111-1111-1111-111111111111".into(),
             announcement_canonical_hash_base64: encode_canonical_hash_base64(&[0xAB; 32]),
             peer_key_id: "edge-peer-01".into(),
-            peer_pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             received_at: DateTime::parse_from_rfc3339("2026-06-01T00:00:00.000Z")
                 .unwrap()
                 .with_timezone(&Utc),
             transport_id: TransportMedium::Reticulum,
-            signature_classical_base64: encode_signature_base64(&[0u8; 64]),
-            signature_pqc_base64: None,
+            signature_composite_base64: encode_signature_base64(&[0u8; 3373]),
         }
     }
 
@@ -737,13 +709,13 @@ mod tests {
     #[test]
     fn canonical_bytes_resist_field_confusion() {
         let mut a_att = fixture_attestation();
-        a_att.peer_key_id = "ab".into();
-        a_att.peer_pubkey_ed25519_base64 = "cZ".into();
+        a_att.announcement_id = "ab".into();
+        a_att.peer_key_id = "cZ".into();
         let a = a_att.canonical_bytes().unwrap();
 
         let mut b_att = fixture_attestation();
-        b_att.peer_key_id = "a".into();
-        b_att.peer_pubkey_ed25519_base64 = "bcZ".into();
+        b_att.announcement_id = "a".into();
+        b_att.peer_key_id = "bcZ".into();
         let b = b_att.canonical_bytes().unwrap();
 
         assert_ne!(a, b, "length-prefixed encoding must not alias");
@@ -762,7 +734,7 @@ mod tests {
         // golden + the encoder's actual output is the regression
         // signal).
         let mut expected = Vec::new();
-        expected.extend_from_slice(b"ciris-edge-delivery-attestation-v1");
+        expected.extend_from_slice(b"ciris-edge-delivery-attestation-v2");
         // announcement_id len + bytes
         let id = b"11111111-1111-1111-1111-111111111111";
         expected.extend_from_slice(&(id.len() as u64).to_be_bytes());
@@ -773,10 +745,6 @@ mod tests {
         let pkid = b"edge-peer-01";
         expected.extend_from_slice(&(pkid.len() as u64).to_be_bytes());
         expected.extend_from_slice(pkid);
-        // peer pubkey len + bytes
-        let pp = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-        expected.extend_from_slice(&(pp.len() as u64).to_be_bytes());
-        expected.extend_from_slice(pp);
         // received_at i64 ms = 2026-06-01T00:00:00Z = 1780272000000
         let ts_ms: i64 = 1_780_272_000_000;
         expected.extend_from_slice(&ts_ms.to_be_bytes());
@@ -800,19 +768,6 @@ mod tests {
     }
 
     #[test]
-    fn delivery_attestation_with_pqc_round_trip() {
-        let mut att = fixture_attestation();
-        att.signature_pqc_base64 = Some(encode_signature_base64(&vec![0xFE; 3309]));
-        let s = serde_json::to_string(&att).unwrap();
-        let back: DeliveryAttestation = serde_json::from_str(&s).unwrap();
-        assert_eq!(att, back);
-        assert_eq!(
-            back.signature_pqc_bytes().unwrap().map(|v| v.len()),
-            Some(3309)
-        );
-    }
-
-    #[test]
     fn canonical_hash_bytes_rejects_wrong_length() {
         let mut att = fixture_attestation();
         att.announcement_canonical_hash_base64 =
@@ -822,11 +777,10 @@ mod tests {
     }
 
     #[test]
-    fn signature_classical_bytes_rejects_wrong_length() {
+    fn signature_composite_bytes_rejects_non_base64() {
         let mut att = fixture_attestation();
-        att.signature_classical_base64 =
-            base64::engine::general_purpose::STANDARD.encode([0u8; 32]); // 32 instead of 64
-        let err = att.signature_classical_bytes().unwrap_err();
+        att.signature_composite_base64 = "not base64 !".into();
+        let err = att.signature_composite_bytes().unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
     }
 }

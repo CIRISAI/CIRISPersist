@@ -20,10 +20,9 @@
 //!   negative stance is a declaration.
 //! - **I1180** (sqlite, postgres engines) — the Engine's goal doors
 //!   (`put_goal`, `amend_goal`, `retire_goal`, `recant_goal`) sign the four
-//!   rows; only the declarer amends, retires or recants; a pre-V204 typed
-//!   goal is red in the rebuild until `rehome_legacy_goals` moves it (this
-//!   node's re-signed, its retirement re-signed; another declarer's
-//!   dropped).
+//!   rows; only the declarer amends, retires or recants. (v62.0.0: the
+//!   pre-V204 legacy-goal rehome leg is deleted with `rehome_legacy_goals`,
+//!   ruling 4.)
 //! - **I1181** (sqlite, postgres) — V204 over an upgrading store: the typed
 //!   goals stay as legacy rows (`attestation_id` NULL), `single_declarer`
 //!   reads `self`, `inserted_at` is gone.
@@ -589,7 +588,6 @@ pub(crate) mod bodies {
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod engine_bodies {
     use crate::federation::goal::{GoalInput, M1Dimension, MetaGoalAlignment};
-    use crate::federation::silo_projection::SiloProjection;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::USER;
     use crate::federation::Error;
@@ -621,13 +619,7 @@ pub(crate) mod engine_bodies {
     }
 
     // ── I1180 ─────────────────────────────────────────────────────────────
-    pub(crate) async fn i1180_the_engine_doors_sign_the_four_verbs(
-        e: &Engine,
-        insert_legacy: impl Fn(
-            String,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-    ) {
+    pub(crate) async fn i1180_the_engine_doors_sign_the_four_verbs(e: &Engine) {
         let dir = e.federation_directory();
         let me = e.local_derived_key_id().await.unwrap();
         let id = e.put_goal(&input("v0")).await.expect("I1180: declare");
@@ -711,60 +703,9 @@ pub(crate) mod engine_bodies {
             );
         }
 
-        // The rehome: a legacy goal of this node's (retired), and one of
-        // another declarer's.
-        insert_legacy(me.clone()).await;
-        insert_legacy(other_id.clone()).await;
-        let err = e
-            .check_silo_projection(SiloProjection::Goals)
-            .await
-            .expect_err("I1180: a typed goal with no row is not its rebuild");
-        assert!(err.to_string().contains("goals"), "I1180: {err}");
-        let n = e.rehome_legacy_goals().await.expect("I1180: rehome");
-        assert_eq!((n.rehomed, n.dropped), (1, 1), "I1180: {n:?}");
-        e.check_silo_projection(SiloProjection::Goals)
-            .await
-            .expect("I1180: green after the rehome");
-        assert!(dir.legacy_goals().await.unwrap().is_empty());
-        let mine = dir
-            .list_goals(crate::federation::GoalsFilter {
-                declared_by_key_id: Some(me.clone()),
-                include_retired: true,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let rehomed = mine
-            .iter()
-            .find(|g| g.goal_text == format!("legacy goal of {me}"))
-            .expect("I1180: the node's legacy goal is a row");
-        let every = dir
-            .list_goals(crate::federation::GoalsFilter {
-                include_retired: true,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(
-            every
-                .iter()
-                .all(|g| g.goal_text != format!("legacy goal of {other_id}")),
-            "I1180: another declarer's legacy goal is never re-signed as this node's"
-        );
-        assert!(
-            rehomed.retired_at.is_some(),
-            "I1180: its retirement is re-signed"
-        );
-        assert_eq!(rehomed.scope.scale(), "cohort");
-        assert_eq!(
-            e.rehome_legacy_goals().await.unwrap(),
-            crate::federation::GoalRehome::default(),
-            "I1180: a second rehome has nothing to move"
-        );
-        // put_goal rehomes first.
-        insert_legacy(other_id).await;
-        e.put_goal(&input("after")).await.unwrap();
-        assert!(dir.legacy_goals().await.unwrap().is_empty());
+        // v62.0.0 (JSON-cut slice F, ruling 4): the legacy-goal rehome leg is
+        // deleted with `rehome_legacy_goals`; a V300 store holds no pre-V204
+        // goal.
     }
 }
 
@@ -840,34 +781,11 @@ mod run {
         b::i1182_an_approach_keys_on_the_goal_row(&p, &tag()).await;
     }
 
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    /// The legacy goal both engines seed: `declarer`'s, scale `cohort`,
-    /// retired.
-    fn legacy_sql(table: &str, declarer: &str, retired: &str) -> String {
-        format!(
-            "INSERT INTO {table} (goal_id, declared_by_key_id, declared_at, goal_text, \
-             goal_text_canonical, scale, scope_cohort_id, meta_dimension, meta_rationale, \
-             meta_deliberation, retired_at, persist_row_hash) VALUES ('legacy-{}', '{declarer}', \
-             '2026-01-01T00:00:00Z', 'legacy goal of {declarer}', 'legacy goal of {declarer}', \
-             'cohort', 'c1', 'justice', \
-             'r', NULL, {retired}, 'h')",
-            uuid::Uuid::new_v4().simple()
-        )
-    }
-
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i1180_sqlite_engine() {
         let e = super::engine_bodies::engine("sqlite::memory:", &format!("i1180-{}", tag())).await;
-        let sq = e.sqlite_backend().expect("sqlite").clone();
-        super::engine_bodies::i1180_the_engine_doors_sign_the_four_verbs(&e, move |who| {
-            let sq = sq.clone();
-            Box::pin(async move {
-                sq.test_execute(&legacy_sql("goals", &who, "'2026-02-01T00:00:00Z'"))
-                    .await
-            })
-        })
-        .await;
+        super::engine_bodies::i1180_the_engine_doors_sign_the_four_verbs(&e).await;
     }
 
     #[cfg(feature = "postgres")]
@@ -877,19 +795,7 @@ mod run {
             return;
         };
         let e = super::engine_bodies::engine(&dsn, &format!("i1180-{}", tag())).await;
-        let pg = e.postgres_backend().expect("postgres").clone();
-        super::engine_bodies::i1180_the_engine_doors_sign_the_four_verbs(&e, move |who| {
-            let pg = pg.clone();
-            Box::pin(async move {
-                pg.test_execute(&legacy_sql(
-                    "cirislens.goals",
-                    &who,
-                    "'2026-02-01T00:00:00Z'",
-                ))
-                .await
-            })
-        })
-        .await;
+        super::engine_bodies::i1180_the_engine_doors_sign_the_four_verbs(&e).await;
     }
 
     // ── I1181 — V204 over an upgrading node ───────────────────────────────

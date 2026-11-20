@@ -414,6 +414,8 @@ pub(crate) async fn carried_body(d: &dyn FederationDirectory) {
     );
 
     // The invitation, citing the head it stands on.
+    // CP2 skeleton: the builder's unsigned shape, re-signed as edition 2
+    // (`row_of`) before any door.
     let mut literal = e2::with_earlier_form(|| {
         proposal_row("t1c-founder", "family", &gid, &joiner, None, at(6_000))
     });

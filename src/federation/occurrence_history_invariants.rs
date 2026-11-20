@@ -2,14 +2,26 @@
 //! assertion**, so a verdict at an earlier instant never moves when a later
 //! assertion lands (FSD `SECOND_DEVICE.md` §8.5).
 //!
+//! v62.0.0 (O1 fix 10; CP2) — restated over EDITION-2 binds (CC 3.3.6: one
+//! `identity:occurrence` row carries the occurrence key's own voice and the
+//! identity's, so "agreement" is the bind's own voice, at the bind's signed
+//! instant) and edition-2 `identity:occurrence_revocation` rows. Each bind is
+//! one entry of the V161 history (written by the edition-2 transaction
+//! helper); the verdicts read that history.
+//!
 //! - **I270** — a renewal does not move an earlier verdict.
-//! - **I271** — the identity re-signing the pair does not erase the
-//!   occurrence's agreement.
-//! - **I272** — an interval before the occurrence first agreed does not count.
+//! - **I271** — DELETED at v62.0.0 (red round 3, X1): "the identity
+//!   re-signing the pair" is the earlier form's own act; every edition-2 bind
+//!   carries the occurrence's own voice (O1, CC 3.3.6), so it cannot be stated.
+//! - **I272** — DELETED at v62.0.0 (O1 fix 10): "the identity claims at t0,
+//!   the occurrence agrees later at t2" is the earlier form's split of one
+//!   binding into two rows. An edition-2 bind is ONE row whose two voices sign
+//!   one payload (one instant); the identity's statement without the
+//!   occurrence key's own binds nothing at all (O1's I3022 witnesses that).
 //! - **I273** — a revocation still ends each interval (the #421
 //!   re-establishment rule, per assertion).
-//! - **I274** — an older assertion arriving after a newer one lands in the
-//!   history and counts; the current-state row is unchanged.
+//! - **I274** — an older bind arriving after a newer one lands in the history
+//!   and counts; the current-state row is unchanged.
 //! - **I275** — the V161 backfill: the migration's copy of the current rows
 //!   restores the history the fold reads.
 //! - **I276** — `node_bearing_at_with_next` names the next historical edge.
@@ -17,13 +29,15 @@
 //!
 //! I277 (the adopter-shaped roster judgement) lives in `rc5_adopts_invariants`
 //! beside the infrastructure-room helpers it needs; I279 (the fail-open
-//! provenance token) in `self_at_login`. Every body runs on memory, sqlite and
-//! postgres — the three folds agree on the same row sequence by construction.
+//! provenance token) in `self_at_login`. Every body runs on sqlite and
+//! postgres.
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) mod bodies {
-    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::ingest::StatementOutcome;
     use crate::federation::types::identity_type as it;
+    use crate::federation::types::IdentityOccurrenceRevocation;
     use crate::federation::{
         is_node_bearing_key_at, node_bearing_at_with_next, FederationDirectory,
     };
@@ -34,30 +48,64 @@ pub(crate) mod bodies {
         DateTime::<Utc>::from_timestamp_millis(t.timestamp_millis()).expect("ms")
     }
 
-    async fn keys(d: &dyn FederationDirectory, tag: &str) -> (String, String) {
-        let node = format!("node-id-{tag}");
-        let install = format!("install-{tag}");
-        ts::register_hybrid_key_as(d, &node, &node, it::NODE).await;
-        ts::register_hybrid_key_as(d, &install, &install, it::PRIMITIVE).await;
-        (node, install)
+    /// The seeds and kids of a node identity and an install key (E0
+    /// edition-2 `key:record`s; a node key's default window covers now).
+    struct Keys {
+        node_s: String,
+        install_s: String,
+        node: String,
+        install: String,
     }
 
-    async fn signed(
-        d: &dyn FederationDirectory,
-        signer: &str,
-        id: &str,
-        occ: &str,
-        t: DateTime<Utc>,
-    ) {
-        d.put_identity_occurrence(ts::signed_content_only_occurrence(signer, id, occ, t).await)
-            .await
-            .unwrap_or_else(|e| panic!("occurrence {id}/{occ} by {signer} at {t}: {e}"));
+    async fn keys(d: &dyn FederationDirectory, tag: &str) -> Keys {
+        let (node_s, install_s) = (format!("node-id-{tag}"), format!("install-{tag}"));
+        e2::put_key(d, &node_s, &[it::NODE]).await;
+        e2::put_key(d, &install_s, &[it::PRIMITIVE]).await;
+        Keys {
+            node: e2::kid(&node_s),
+            install: e2::kid(&install_s),
+            node_s,
+            install_s,
+        }
     }
 
-    /// The identity claims at `t − 1s`, the occurrence agrees at `t`.
-    async fn bound_at(d: &dyn FederationDirectory, id: &str, occ: &str, t: DateTime<Utc>) {
-        signed(d, id, id, occ, t - Duration::seconds(1)).await;
-        signed(d, occ, id, occ, t).await;
+    /// An edition-2 bind of the install key under the node, signed at `t`:
+    /// the install key's own voice, then the node's (O1's door, CC 3.3.6).
+    async fn bind(d: &dyn FederationDirectory, k: &Keys, t: DateTime<Utc>) {
+        let opts = e2::BindOptions {
+            asserted_at_ms: e2::ms(t),
+            ..e2::BindOptions::default()
+        };
+        let out = e2::put_bind(d, &k.node_s, &k.node_s, &k.install_s, "server", &opts).await;
+        assert!(
+            matches!(out, Ok(StatementOutcome::Row { .. })),
+            "bind {} under {} at {t}: {out:?}",
+            k.install_s,
+            k.node_s
+        );
+    }
+
+    /// The node's edition-2 revocation of the install's occurrence, effective
+    /// at `at` (a node identity's revocation is its own single signer's).
+    async fn revoke(d: &dyn FederationDirectory, k: &Keys, at: DateTime<Utc>) {
+        let rev = IdentityOccurrenceRevocation {
+            identity_key_id: k.node.clone(),
+            occurrence_key_id: k.install.clone(),
+            revoked_at: at,
+            effective_at: at,
+            reason: None,
+            witness_set: Vec::new(),
+            persist_row_hash: String::new(),
+        };
+        let voice =
+            e2::occurrence_revocation_voice(d, &k.node_s, true, &rev, None, &[], &[], e2::ms(at))
+                .await;
+        let out = e2::put_statement(d, &voice).await;
+        assert!(
+            matches!(out, Ok(StatementOutcome::Row { .. })),
+            "revoke {} at {at}: {out:?}",
+            k.install_s
+        );
     }
 
     async fn bearing(d: &dyn FederationDirectory, k: &str, t: DateTime<Utc>) -> bool {
@@ -68,71 +116,21 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let (node, install) = keys(d, tag).await;
-        bound_at(d, &node, &install, ago(300)).await;
+        let k = keys(d, tag).await;
+        bind(d, &k, ago(300)).await;
         assert!(
-            bearing(d, &install, ago(200)).await,
+            bearing(d, &k.install, ago(200)).await,
             "{tag} I270: bearing at t1"
         );
-        // The occurrence renews its own agreement later.
-        signed(d, &install, &node, &install, ago(100)).await;
+        // The pair is bound again later (a renewal: a newer bind).
+        bind(d, &k, ago(100)).await;
         assert!(
-            bearing(d, &install, ago(200)).await,
+            bearing(d, &k.install, ago(200)).await,
             "{tag} I270: a renewal at t3 moved the verdict at t1 < t3"
         );
         assert!(
-            bearing(d, &install, ago(10)).await,
+            bearing(d, &k.install, ago(10)).await,
             "{tag} I270: bearing now"
-        );
-    }
-
-    pub(crate) async fn i271_the_identity_re_signing_does_not_erase_agreement(
-        d: &dyn FederationDirectory,
-        tag: &str,
-    ) {
-        let (node, install) = keys(d, tag).await;
-        bound_at(d, &node, &install, ago(300)).await;
-        // The identity re-signs the pair: the current row is now the
-        // identity's, and the occurrence's own row is gone from it.
-        signed(d, &node, &node, &install, ago(100)).await;
-        assert!(
-            crate::federation::occurrence_agreed_to(d, &node, &install)
-                .await
-                .unwrap(),
-            "{tag} I271: the occurrence's agreement survives the identity's re-signing"
-        );
-        assert!(
-            bearing(d, &install, ago(200)).await,
-            "{tag} I271: bearing at t1"
-        );
-        assert!(
-            bearing(d, &install, ago(10)).await,
-            "{tag} I271: bearing now"
-        );
-    }
-
-    pub(crate) async fn i272_before_agreement_does_not_count(
-        d: &dyn FederationDirectory,
-        tag: &str,
-    ) {
-        let (node, install) = keys(d, tag).await;
-        let agreed = ago(100);
-        signed(d, &node, &node, &install, ago(300)).await;
-        signed(d, &install, &node, &install, agreed).await;
-        assert_eq!(
-            crate::federation::occurrence_agreed_from(d, &node, &install)
-                .await
-                .unwrap(),
-            Some(agreed),
-            "{tag} I272: agreement is the occurrence's own first signature"
-        );
-        assert!(
-            !bearing(d, &install, ago(200)).await,
-            "{tag} I272: the identity's claim at t0 counted before the occurrence agreed at t2"
-        );
-        assert!(
-            bearing(d, &install, ago(50)).await,
-            "{tag} I272: bearing after agreement"
         );
     }
 
@@ -140,39 +138,34 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let (node, install) = keys(d, tag).await;
-        bound_at(d, &node, &install, ago(300)).await;
-        d.put_attestation(ts::occurrence_withdrawal(d, &node, &node, &install, ago(200)).await)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I273: revocation: {e}"));
-        bound_at(d, &node, &install, ago(100)).await;
+        let k = keys(d, tag).await;
+        bind(d, &k, ago(300)).await;
+        revoke(d, &k, ago(200)).await;
+        bind(d, &k, ago(100)).await;
         assert!(
-            bearing(d, &install, ago(250)).await,
+            bearing(d, &k.install, ago(250)).await,
             "{tag} I273: bearing before the revocation"
         );
         assert!(
-            !bearing(d, &install, ago(150)).await,
+            !bearing(d, &k.install, ago(150)).await,
             "{tag} I273: the revocation ends the first interval"
         );
         assert!(
-            bearing(d, &install, ago(50)).await,
+            bearing(d, &k.install, ago(50)).await,
             "{tag} I273: re-established after"
         );
 
-        // (b) A revocation effective at EXACTLY an assertion's instant ends
-        // that assertion (`effective_at >= asserted_at`, the #421 rule): a
+        // (b) A revocation effective at EXACTLY a bind's instant ends that
+        // bind (`effective_at >= asserted_at`, the #421 rule): a
         // re-establishment must be strictly later than the revocation.
-        let tag_b = format!("{tag}-b");
-        let (node_b, install_b) = keys(d, &tag_b).await;
-        bound_at(d, &node_b, &install_b, ago(300)).await;
+        let kb = keys(d, &format!("{tag}-b")).await;
+        bind(d, &kb, ago(300)).await;
         let at = ago(200);
-        signed(d, &install_b, &node_b, &install_b, at).await;
-        d.put_attestation(ts::occurrence_withdrawal(d, &node_b, &node_b, &install_b, at).await)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I273(b): revocation: {e}"));
+        bind(d, &kb, at).await;
+        revoke(d, &kb, at).await;
         assert!(
-            !bearing(d, &install_b, ago(150)).await,
-            "{tag} I273(b): a revocation at an assertion's own instant ends it"
+            !bearing(d, &kb.install, ago(150)).await,
+            "{tag} I273(b): a revocation at a bind's own instant ends it"
         );
     }
 
@@ -180,46 +173,46 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let (node, install) = keys(d, tag).await;
+        let k = keys(d, tag).await;
         let older = ago(300);
-        bound_at(d, &node, &install, ago(100)).await;
+        bind(d, &k, ago(100)).await;
         let current_before = d
-            .list_identity_occurrences_by_occurrence_key(&install)
+            .list_identity_occurrences_by_occurrence_key(&k.install)
             .await
             .unwrap();
-        // An OLDER occurrence-signed assertion arrives after the newer one.
-        signed(d, &install, &node, &install, older).await;
+        // An OLDER bind of the same pair arrives after the newer one.
+        bind(d, &k, older).await;
         assert_eq!(
-            d.list_identity_occurrences_by_occurrence_key(&install)
+            d.list_identity_occurrences_by_occurrence_key(&k.install)
                 .await
                 .unwrap(),
             current_before,
-            "{tag} I274: the current-state row is unchanged by an older assertion"
+            "{tag} I274: the current-state row is unchanged by an older bind"
         );
         let history = d
-            .list_identity_occurrence_history_by_occurrence(&install)
+            .list_identity_occurrence_history_by_occurrence(&k.install)
             .await
             .unwrap();
         assert_eq!(
             history
                 .first()
                 .map(|a| (a.asserted_at, a.attesting_key_id.clone())),
-            Some((older, Some(install.clone()))),
-            "{tag} I274: the older assertion is in the history, first: {history:?}"
+            Some((older, Some(k.node.clone()))),
+            "{tag} I274: the older bind is in the history, first (its author the node): \
+             {history:?}"
         );
         assert!(
-            bearing(d, &install, ago(200)).await,
-            "{tag} I274: the older assertion's interval counts"
+            bearing(d, &k.install, ago(200)).await,
+            "{tag} I274: the older bind's interval counts"
         );
     }
 
     pub(crate) async fn i276_the_next_edge_is_historical(d: &dyn FederationDirectory, tag: &str) {
-        let (node, install) = keys(d, tag).await;
-        let t0 = ago(300);
-        let t2 = ago(100);
-        bound_at(d, &node, &install, t0).await;
-        signed(d, &install, &node, &install, t2).await;
-        let (b, next) = node_bearing_at_with_next(d, &install, ago(200))
+        let k = keys(d, tag).await;
+        let (t0, t2) = (ago(300), ago(100));
+        bind(d, &k, t0).await;
+        bind(d, &k, t2).await;
+        let (b, next) = node_bearing_at_with_next(d, &k.install, ago(200))
             .await
             .unwrap();
         assert!(b, "{tag} I276: bearing at t1");
@@ -234,10 +227,10 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let (node, install) = keys(d, tag).await;
+        let k = keys(d, tag).await;
         d.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
-            identity_key_id: node.clone(),
-            occurrence_key_id: install.clone(),
+            identity_key_id: k.node.clone(),
+            occurrence_key_id: k.install.clone(),
             device_class: crate::federation::types::device_class::SERVER.into(),
             hardware_attestation: None,
             asserted_at: ago(300),
@@ -249,22 +242,22 @@ pub(crate) mod bodies {
         .await
         .unwrap();
         let history = d
-            .list_identity_occurrence_history_by_occurrence(&install)
+            .list_identity_occurrence_history_by_occurrence(&k.install)
             .await
             .unwrap();
         assert_eq!(history.len(), 1, "{tag} I278: the local row is history");
         assert_eq!(history[0].attesting_key_id, None, "{tag} I278: unsigned");
         assert!(
-            !bearing(d, &install, ago(200)).await,
+            !bearing(d, &k.install, ago(200)).await,
             "{tag} I278: a trusted-local row is never agreement"
         );
-        signed(d, &install, &node, &install, ago(100)).await;
+        bind(d, &k, ago(100)).await;
         assert!(
-            !bearing(d, &install, ago(200)).await,
+            !bearing(d, &k.install, ago(200)).await,
             "{tag} I278: the local interval starts no earlier than the agreement"
         );
         assert!(
-            bearing(d, &install, ago(50)).await,
+            bearing(d, &k.install, ago(50)).await,
             "{tag} I278: bearing after agreement"
         );
     }
@@ -290,8 +283,6 @@ mod runners {
                     };
                 }
                 w!(i270_a_renewal_does_not_move_an_earlier_verdict);
-                w!(i271_the_identity_re_signing_does_not_erase_agreement);
-                w!(i272_before_agreement_does_not_count);
                 w!(i273_a_revocation_ends_each_interval);
                 w!(i274_an_older_assertion_arriving_late_counts);
                 w!(i276_the_next_edge_is_historical);

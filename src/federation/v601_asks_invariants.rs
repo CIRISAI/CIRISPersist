@@ -321,6 +321,9 @@ pub(crate) mod bodies {
                 serde_json::json!({
                     "references_attestation_id": request_id,
                     "amendment_digest": "cd".repeat(32),
+                    // v62.0.0 (E0 fix 9; CC rc21 ruling) — a response
+                    // correlates on the deferral it answers, by its id.
+                    "deferral_id": "d-1",
                 }),
             )
         };

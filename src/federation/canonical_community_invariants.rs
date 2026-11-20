@@ -14,11 +14,10 @@
 //! short is REFUSED, not reported; (g) a supersede cannot lift the
 //! entrenchment, drop the constraint, or change without the founders' quorum.
 //!
-//! The fixture is a BARE directory standing up the genesis accord roster under
-//! test-held keys ([`register_genesis_accord_roster`]) — nobody holds the #268
-//! ceremony's private halves, so the real row's signing is outside persist.
-//!
-//! [`register_genesis_accord_roster`]: crate::federation::accord_test_support::register_genesis_accord_roster
+//! v62.0.0 (W1-fix4, after C5-fix1): the earlier-form fixtures (the accord
+//! roster under test keys, accord-conferred stewards, the co-scrubbed
+//! canonical row) are deleted with C5's baked genesis; what stays is the
+//! edition-2 rooted infrastructure room (`bodies`).
 
 /// v62.0.0 (JSON cut, wave 3, E5) — **every I190 / I330–I334 witness is
 /// deleted** (lead's ruling 1: canonical is the bundle in force's
@@ -30,145 +29,13 @@
 /// (c, g, h, i, j, k, k2, l, m, n, o*, p, q, r, t, u–z) → I2316 / I2333 (a later
 /// bundle at the holders' majority), I2318 (forks), I2320 / I2304 (re-seat);
 /// I330–I334 (holders found and live, departed, node-bearing, non-roster) →
-/// I2330, I2333, I2334, I2335/I2336. The helpers below stay ONLY because other
-/// agents' (held) tests still call them; they go with those callers at F.
+/// I2330, I2333, I2334, I2335/I2336. What stays is the edition-2 fixture
+/// other files' witnesses stand on: `rooted_infrastructure_room_e2`.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
-    use crate::federation::accord_test_support as ops;
-    use crate::federation::canonical_community::{
-        self as cc, CIRIS_CANONICAL_COMMUNITY_KEY_ID as CANON,
-    };
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{
-        identity_type, Community, CommunityMember, KeyRecord, RosterCosignature, SignedCommunity,
-        SignedKeyRecord,
-    };
+    use crate::federation::types::{identity_type, Community, CommunityMember};
     use crate::federation::FederationDirectory;
-
-    /// The three founders (human steward keys) and the one serve node. Short,
-    /// distinct-first-byte ids: the test signer seeds from the first 32 bytes.
-    pub(crate) const FOUNDERS: [&str; 3] = ["us-steward", "eu-steward", "ap-steward"];
-    pub(crate) const SERVE_NODE: &str = "cc1-serve-node";
-
-    pub(crate) fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
-        s.parse().expect("rfc3339")
-    }
-
-    /// A key record for `key_id` with its deterministic test pubkeys.
-    fn key_record(key_id: &str, identity: &str) -> KeyRecord {
-        let (ed, mldsa) = ts::hybrid_pubkeys(key_id);
-        let now = at("2026-01-01T00:00:00Z");
-        KeyRecord {
-            key_id: key_id.to_owned(),
-            pubkey_ed25519_base64: ed,
-            pubkey_ml_dsa_65_base64: mldsa,
-            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
-            identity_type: identity.to_owned(),
-            identity_ref: key_id.to_owned(),
-            valid_from: now,
-            valid_until: None,
-            registration_envelope: serde_json::json!({ "id": key_id }),
-            original_content_hash: "deadbeef".to_owned(),
-            scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
-            scrub_signature_pqc: None,
-            scrub_key_id: key_id.to_owned(),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            attestation_evidence: None,
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        }
-    }
-
-    /// `key_id` as an accord-CONFERRED record: its registration co-scrubbed
-    /// 2-of-3 by the genesis holders (the ceremony plane, CC 3.2 T2).
-    pub(crate) async fn put_conferred(
-        d: &dyn FederationDirectory,
-        holders: &[ops::Identity],
-        key_id: &str,
-        identity: &str,
-    ) {
-        let record =
-            ops::accord_conferred(key_record(key_id, identity), &[&holders[0], &holders[1]]);
-        d.put_public_key(SignedKeyRecord { record })
-            .await
-            .unwrap_or_else(|e| panic!("conferred {key_id} admits: {e}"));
-    }
-
-    /// The trust root stood up on a bare directory: the genesis holders under
-    /// test keys, the entrenched accord family, three human stewards the
-    /// accord conferred, and one serve node. Returns the holders.
-    pub(crate) async fn stand_up(d: &dyn FederationDirectory) -> Vec<ops::Identity> {
-        let holders = ops::register_genesis_accord_roster(d)
-            .await
-            .expect("genesis accord roster");
-        crate::federation::genesis::seed_accord_family(d)
-            .await
-            .expect("accord family");
-        for f in FOUNDERS {
-            put_conferred(d, &holders, f, "user,steward").await;
-        }
-        ts::register_hybrid_key_as(d, SERVE_NODE, SERVE_NODE, identity_type::NODE).await;
-        holders
-    }
-
-    /// v62.0.0 (CC rc20 3.2 / 4.4.3.4, CIRISPersist#1274) — **a conformant,
-    /// ROOTED infrastructure room** for fixtures that need the infrastructure
-    /// carve-out (plaintext at rest, the Commons audience, node members
-    /// without a steward). Until v62 a fixture got the carve-out by
-    /// self-registering the room's key as `substrate_persist`; CC rc20 3.4.7.1
-    /// ("`substrate_persist` is a key type that confers no authority … Nothing
-    /// is admitted on its strength") closed that, and the carve-out now needs a
-    /// conformant record rooted in this node's trust set. So this stands up the
-    /// trust root (the genesis holders under test keys, the accord family,
-    /// three accord-conferred human stewards as founders: "Infrastructure does
-    /// not vote") and puts `room` as a trust-root-grade `quorum:2/3` record,
-    /// co-scrubbed 2-of-3 by the accord, with `members` seated as `member`.
-    /// `tag` keeps the founders' ids distinct per room (their FIRST bytes
-    /// differ: the test signer seeds from the first 32 bytes of a key id).
-    /// Returns the stored record.
-    pub(crate) async fn rooted_infrastructure_room(
-        d: &dyn FederationDirectory,
-        room: &str,
-        members: &[&str],
-        tag: &str,
-    ) -> Community {
-        let holders = ops::register_genesis_accord_roster(d)
-            .await
-            .expect("genesis accord roster");
-        // A second room in one directory finds the family already seeded.
-        let _ = crate::federation::genesis::seed_accord_family(d).await;
-        let founders: Vec<String> = ["us", "eu", "ap"]
-            .iter()
-            .map(|p| format!("{p}-{tag}"))
-            .collect();
-        for f in &founders {
-            put_conferred(d, &holders, f, "user,steward").await;
-        }
-        let refs: Vec<&str> = founders.iter().map(String::as_str).collect();
-        let mut row = canonical_row(&refs);
-        row.community_key_id = room.to_owned();
-        row.community_name = format!("infrastructure {tag}");
-        let joined = row.founded_at;
-        row.members.retain(|m| m.role.as_deref() == Some("founder"));
-        for m in members {
-            row.members.push(CommunityMember {
-                key_id: (*m).to_owned(),
-                joined_at: joined,
-                role: Some("member".to_owned()),
-            });
-        }
-        d.put_community(signed(row, &["A1", "B1"]))
-            .await
-            .unwrap_or_else(|e| panic!("the rooted infrastructure room {room}: {e}"));
-        assert!(
-            cc::is_rooted(d, room).await.unwrap(),
-            "fixture: {room} is rooted"
-        );
-        d.lookup_community(room).await.unwrap().expect("held")
-    }
 
     /// v62.0.0 (JSON cut, critical path, E5) — a backend whose node key a
     /// fixture can set (the sqlite / postgres inherent `set_node_key_id`; not
@@ -203,15 +70,22 @@ pub(crate) mod bodies {
     /// 2. ONE shared W1 root per directory (`rooted_trust_root` over the
     ///    bundle's `HOLDER_SEEDS` at `quorum:2/3`; idempotent per directory,
     ///    W1.api v1.4).
-    /// 3. The room: `room_seed`'s `key:record` (`user`), three person founders
-    ///    (`{tag}-infra-f{0,1,2}`, `user`), founded by their `group:roster`
-    ///    voices (T1) as a conformant `infrastructure` record at `quorum:2/3`
-    ///    whose `charter_digest` cites the shared root's charter.
-    /// 4. Each of `members` widened in (a founder's proposal, the member's
-    ///    acceptance, the widening voiced by two founders: the growth gate
-    ///    #955); a `node` member also gets a live owner binding at `federation`
-    ///    from `{tag}-infra-owner-{i}` (`user`), its serve seat's announced
-    ///    owner (P5).
+    /// 3. The room: `room_seed`'s `key:record` (`user`), founded by
+    ///    `group:roster` voices (T1) as a conformant trust-root-grade
+    ///    `infrastructure` record at `quorum:2/3` whose `charter_digest` cites
+    ///    the shared root's charter. v62 (W1-fix4, after C5-fix1): its three
+    ///    FOUNDERS are the holders of the genesis bundle in force
+    ///    (`fixture_genesis::HOLDER_SEEDS`; the trust-root door's holder arm
+    ///    and the birth's count over the bundle's holders), and
+    ///    `{tag}-infra-p` (`user`) is seated as a plain member.
+    /// 4. Each of `members` widened in (`{tag}-infra-p`'s proposal, the
+    ///    member's acceptance, the widening voiced by holders 1 and 2: the
+    ///    growth gate #955); a `node` member also gets a live owner binding at
+    ///    `federation` from `{tag}-infra-owner-{i}` (`user`), its serve seat's
+    ///    announced owner (P5).
+    ///
+    /// A caller that signs as a founder uses `fixture_genesis::test_key(h)` for
+    /// `h` in `HOLDER_SEEDS` (identity-ref `identity_ref_of(h)`).
     ///
     /// Members must already be keys (seeds or identity-refs this process
     /// minted). A caller-set node key must be a kid E0 minted.
@@ -227,7 +101,7 @@ pub(crate) mod bodies {
         use crate::federation::edition2::fixture_genesis;
         use crate::federation::edition2::fixture_switch as e2;
         use crate::federation::edition2::fixture_trust_root as w1;
-        use crate::federation::edition2::group::GroupRecord;
+        use crate::federation::edition2::group::{GroupRecord, MembershipRecord};
         use crate::federation::edition2::group_fixtures as gf;
         use crate::federation::membership_acceptance::test_support::{
             acceptance_row, proposal_row,
@@ -249,34 +123,47 @@ pub(crate) mod bodies {
             .charter
             .hex();
 
-        // 3. The room, citing the shared root's charter.
+        // 3. The room, citing the shared root's charter. v62 (W1-fix4, after
+        //    C5-fix1): a trust-root-grade room's FOUNDERS are holders of the
+        //    genesis bundle in force (the trust-root door's holder arm; its
+        //    birth is counted over the bundle's holders, W1), the same
+        //    founding `rooted_trust_root` makes. An E0 person
+        //    (`{tag}-infra-p`) is seated as a plain member: it voices the
+        //    founding (every listed person does) and proposes the members
+        //    below (a member of the room, in scope for its proposals).
         let room = e2::put_key(b, room_seed, &[identity_type::USER]).await;
-        let founders: Vec<String> = [0, 1, 2]
+        // The seed signs (E0: a signer seeds from the seed name, never from
+        // `kid()`); the roster names its identity-ref.
+        let proposer_seed = format!("{tag}-infra-p");
+        let proposer = e2::put_key(b, &proposer_seed, &[identity_type::USER]).await;
+        let holder_keys: Vec<_> = fixture_genesis::HOLDER_SEEDS
             .iter()
-            .map(|i| format!("{tag}-infra-f{i}"))
+            .map(|h| fixture_genesis::test_key(*h))
             .collect();
-        let mut founder_ids = Vec::new();
-        for f in &founders {
-            founder_ids.push(e2::put_key(b, f, &[identity_type::USER]).await);
-        }
         let at = e2::ms(crate::host::clock::now());
         let joined = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
             i64::try_from(at).expect("ms") - 60_000,
         )
         .expect("an instant");
+        let mut seated: Vec<CommunityMember> = fixture_genesis::HOLDER_SEEDS
+            .iter()
+            .map(|h| CommunityMember {
+                key_id: fixture_genesis::identity_ref_of(*h),
+                joined_at: joined,
+                role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
+            })
+            .collect();
+        seated.push(CommunityMember {
+            key_id: proposer.clone(),
+            joined_at: joined,
+            role: Some("member".to_owned()),
+        });
         let record = Community {
             prev_head_digest: String::new(),
             charter_digest: charter,
             community_key_id: room.clone(),
             community_name: format!("infrastructure {tag}"),
-            members: founder_ids
-                .iter()
-                .map(|f| CommunityMember {
-                    key_id: f.clone(),
-                    joined_at: joined,
-                    role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
-                })
-                .collect(),
+            members: seated,
             founded_at: joined,
             consensus_protocol: "quorum:2/3".to_owned(),
             policy_blob: Some(serde_json::json!({
@@ -291,40 +178,49 @@ pub(crate) mod bodies {
             })),
             persist_row_hash: String::new(),
         };
-        let keys: Vec<_> = founders.iter().map(|f| e2::signing_key(f)).collect();
-        let key_refs: Vec<_> = keys.iter().collect();
+        let proposer_key = e2::signing_key(&proposer_seed);
+        let mut key_refs: Vec<_> = holder_keys.iter().collect();
+        key_refs.push(&proposer_key);
         let voices = gf::roster_voices(&GroupRecord::Community(record), 1, None, at, &key_refs);
-        gf::put_voices(b, &voices)
-            .await
-            .unwrap_or_else(|e| panic!("the infrastructure room {room}: {e}"));
+        // The last voice is `Row` or a further `Voice` of the landed row;
+        // the room is asserted held either way.
+        let landed = gf::put_voices(b, &voices).await;
+        assert!(
+            b.lookup_community(&room)
+                .await
+                .expect("lookup the room")
+                .is_some(),
+            "the infrastructure room {room} did not land: {landed:?}"
+        );
 
-        // 4. The members.
+        // 4. The members: the proposer's proposal, the member's acceptance,
+        //    then the widening voiced by two founders (holders 1 and 2: the
+        //    room's `quorum:2/3` over its founders).
         for (i, m) in members.iter().enumerate() {
             let member = e2::kid(m);
             let now = crate::host::clock::now();
-            let p = proposal_row(&founders[0], COMMUNITY, &room, &member, None, now);
+            let p = proposal_row(&proposer_seed, COMMUNITY, &room, &member, None, now);
             e2::put_signed(b, &p)
                 .await
                 .unwrap_or_else(|e| panic!("proposal of {member}: {e}"));
             e2::put_signed(b, &acceptance_row(&member, &p, now))
                 .await
                 .unwrap_or_else(|e| panic!("acceptance by {member}: {e}"));
-            let mut w = ts::sign_community_membership_widening(
-                &founders[0],
-                CommunityMembershipWidening {
-                    community_key_id: room.clone(),
-                    member_key_id: member.clone(),
-                    joined_at: now,
-                    effective_at: now,
-                    role: None,
-                    persist_row_hash: String::new(),
-                },
-            );
-            ts::cosign_community_membership_widening(&mut w, &founders[1]);
+            let w = MembershipRecord::CommunityWidening(CommunityMembershipWidening {
+                community_key_id: room.clone(),
+                member_key_id: member.clone(),
+                joined_at: now,
+                effective_at: now,
+                role: None,
+                persist_row_hash: String::new(),
+            });
             let head = gf::held_head(b, &room).await.map(|(h, _)| h);
-            gf::put_voices(b, &gf::community_widening_voices(&w, head.as_ref()))
-                .await
-                .unwrap_or_else(|e| panic!("widening {member} into {room}: {e}"));
+            gf::put_voices(
+                b,
+                &gf::membership_voices(&w, head.as_ref(), &[&holder_keys[0], &holder_keys[1]]),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("widening {member} into {room}: {e}"));
             let is_node = b
                 .lookup_public_key(&member)
                 .await
@@ -340,62 +236,4 @@ pub(crate) mod bodies {
         }
         room
     }
-
-    /// The CC 3.2 worked example as a record.
-    pub(crate) fn canonical_row(founders: &[&str]) -> Community {
-        let joined = at("2026-09-20T00:00:00Z");
-        let mut members: Vec<CommunityMember> = founders
-            .iter()
-            .map(|k| CommunityMember {
-                key_id: (*k).to_owned(),
-                joined_at: joined,
-                role: Some("founder".to_owned()),
-            })
-            .collect();
-        members.push(CommunityMember {
-            key_id: SERVE_NODE.to_owned(),
-            joined_at: joined,
-            role: Some("member".to_owned()),
-        });
-        Community {
-            prev_head_digest: String::new(),
-            charter_digest: String::new(),
-            community_key_id: CANON.to_owned(),
-            community_name: "CIRIS Canonical Services".to_owned(),
-            members,
-            founded_at: joined,
-            consensus_protocol: "quorum:2/3".to_owned(),
-            policy_blob: Some(serde_json::json!({
-                "cohort_subkind": "infrastructure",
-                "cohort_subkind_payload": {
-                    "infrastructure_constraint": {
-                        "service_class": "canonical",
-                        "admission_quorum_basis": "founders",
-                    }
-                },
-                "consensus_protocol_entrenched": true,
-            })),
-            persist_row_hash: String::new(),
-        }
-    }
-
-    /// Sign `row` by `signers[0]` and co-sign by the rest.
-    pub(crate) fn signed(row: Community, signers: &[&str]) -> SignedCommunity {
-        let mut s = ts::sign_community(signers[0], row);
-        // v52.0.0 (#955, Q1) — the listed founders consent by co-signing (the
-        // fixture signer adds them); the named signers are added once each.
-        s.cosignatures
-            .retain(|c| !signers.contains(&c.authority_key_id.as_str()));
-        for c in &signers[1..] {
-            let (_h, classical, pqc) = ts::sign_envelope(c, &s.community.signing_envelope());
-            s.cosignatures.push(RosterCosignature {
-                authority_key_id: (*c).to_owned(),
-                scrub_signature_classical: classical,
-                scrub_signature_pqc: pqc,
-            });
-        }
-        s
-    }
-
-    // ── #972 — a seated accord holder founds an infrastructure community ──
 }

@@ -110,6 +110,9 @@ fn payload_invalid(message: impl Into<String>) -> Error {
 /// a family this model does not register falls through to
 /// `VendoredFamilyModel`).
 ///
+/// v62.0.0 (K2-fix9) — and the `quarantine:{state}` rule, pinned (see
+/// `quarantine_rule`; DROP AT 23.3.3).
+///
 /// One cell, `identity:occurrence`'s `second_signers`:
 /// `[{role: occurrence, member: occurrence_key_id}]` (CC 3.3.6, CC 3.3.6.4;
 /// CIRISConstitution rc21 90d537b, "An occurrence's proof of possession has a
@@ -139,8 +142,35 @@ fn with_occurrence_voice(mut rule: FamilyRule) -> FamilyRule {
     rule
 }
 
+/// v62.0.0 (K2-fix9) — the `quarantine:{state}` family id
+/// (`namespace_match::family_id("quarantine:{state}")`).
+fn is_quarantine_family(family_id: &str) -> bool {
+    family_id == ciris_verify_core::namespace_match::family_id("quarantine:{state}")
+}
+
+/// v62.0.0 (K2-fix9; CC rc21 family model, `quarantine:{state}`; **DROP AT
+/// 23.3.3**, when CIRISVerify vendors these cells) — the quarantine family's
+/// rule, pinned: its authorship is CC's vendored cell ("group=affiliations &
+/// seats=one => counted ; authored", CC 4.4.3.12: authored by the slash-duty
+/// holder, counted as `affiliation_member_action@subject_group` only in an
+/// affiliation's one-voice seat), and its second signers are NONE
+/// ([`crate::federation::quarantine::cells::SECOND_SIGNERS`]). The signer
+/// rule (`seat_role(slash)`, CC 3.1.9.2 / CC 4.5.5), the signer kind
+/// (agent / person, never a node key, CC 3.4.7.3 C and E) and the marker
+/// plane's precedence (CC 3.1.9.2) are not family-rule fields; persist
+/// applies them in `quarantine` (`quarantine::cells`).
+fn quarantine_rule(mut rule: FamilyRule) -> FamilyRule {
+    rule.roles.retain(|(r, _)| {
+        crate::federation::quarantine::cells::SECOND_SIGNERS.contains(&r.as_str())
+    });
+    rule
+}
+
 impl FamilyModel for PersistCells {
     fn rule(&self, family_id: &str) -> Option<FamilyRule> {
+        if is_quarantine_family(family_id) {
+            return VendoredFamilyModel.rule(family_id).map(quarantine_rule);
+        }
         if family_id != OCCURRENCE_FAMILY {
             return None;
         }
@@ -150,6 +180,12 @@ impl FamilyModel for PersistCells {
     }
 
     fn rule_for(&self, family_id: &str, leaf: Option<&str>, ctx: &SelectContext) -> RuleAnswer {
+        if is_quarantine_family(family_id) {
+            return match VendoredFamilyModel.rule_for(family_id, leaf, ctx) {
+                RuleAnswer::Rule(r) => RuleAnswer::Rule(quarantine_rule(r)),
+                other => other,
+            };
+        }
         if family_id != OCCURRENCE_FAMILY {
             return RuleAnswer::Unregistered;
         }

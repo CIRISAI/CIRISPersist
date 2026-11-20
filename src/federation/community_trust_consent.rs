@@ -111,10 +111,9 @@ async fn owners_at(
 ///    in BOTH forms — the node and the agent key that acts on it, so each
 ///    party can withdraw (CC 2.4.1.1 rule 2); only the attester recants. A
 ///    new grant missing the node or the agent key is refused
-///    [`SUBJECTS_INCOMPLETE`]; a node-authored grant already HELD that lists
-///    only its owner (the v52 shape) is grandfathered — its byte-identical
-///    re-offer is admitted as held, and the fold keeps counting it (the open
-///    logs how many, [`is_legacy_node_authored_grant`]).
+///    [`SUBJECTS_INCOMPLETE`]. (v62.0.0: a V300 store holds no v52-shape
+///    grant — `edition_upgrade` deletes earlier stores — so the open no
+///    longer counts grandfathered ones.)
 ///
 /// [`owner_granters_in_force_at`]: super::admission::owner_granters_in_force_at
 ///
@@ -235,59 +234,6 @@ pub async fn check_community_trust_grant_admission(
         ));
     }
     Ok(())
-}
-
-/// v59.0.0 (CIRISPersist#1096) — is `row` a HELD node-authored capture grant
-/// in the v52 shape (it names its owner but not the node or an agent key)?
-/// Such a row is grandfathered: it keeps counting in the fold; a new one is
-/// refused [`SUBJECTS_INCOMPLETE`]. The sqlite / postgres opens count them in
-/// one log line.
-pub async fn is_legacy_node_authored_grant(
-    directory: &dyn FederationDirectory,
-    row: &Attestation,
-) -> Result<bool, Error> {
-    if row.attestation_type != attestation_type::SCORES
-        || !is_community_trust(row)
-        || row.attesting_key_id != row.attested_key_id
-    {
-        return Ok(false);
-    }
-    let owners = owners_at(directory, &row.attested_key_id, row.asserted_at).await?;
-    Ok(!names_three_parties(
-        directory,
-        &row.subject_key_ids,
-        &row.attested_key_id,
-        &owners,
-    )
-    .await?)
-}
-
-/// v59.0.0 (CIRISPersist#1096) — the open's count of
-/// [`is_legacy_node_authored_grant`] rows among `candidate_ids` (the backend
-/// selects the node-authored rows of the family), logged once.
-pub async fn log_legacy_node_authored_grants(
-    directory: &dyn FederationDirectory,
-    candidate_ids: &[String],
-    backend: &'static str,
-) -> Result<u64, Error> {
-    let mut n = 0u64;
-    for id in candidate_ids {
-        if let Some(row) = directory.get_attestation(id).await? {
-            if is_legacy_node_authored_grant(directory, &row).await? {
-                n += 1;
-            }
-        }
-    }
-    if n > 0 {
-        tracing::info!(
-            backend,
-            legacy_node_authored_grants = n,
-            "consent:community_trust: {n} held node-authored grant(s) name only the owner (the v52 \
-             shape); grandfathered — they keep counting, a new grant must name the node, the \
-             owner and the agent key (CIRISPersist#1096)"
-        );
-    }
-    Ok(n)
 }
 
 /// **The fold** (CC 3.3.1, normative) over the rows ABOUT `node`

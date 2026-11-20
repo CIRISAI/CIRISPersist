@@ -92,7 +92,7 @@ pub(crate) mod bodies {
         match form {
             Form::Scores => env["dimension"] = serde_json::json!(family),
         }
-        let mut r = e2::with_earlier_form(|| ts::bare_attestation(&id, signer, about, &env));
+        let mut r = ts::bare_attestation(&id, signer, about, &env);
         r.attestation_type = attestation_type::SCORES.to_owned();
         r.weight = None;
         r.cohort_scope = cohort_scope::SELF.to_owned();

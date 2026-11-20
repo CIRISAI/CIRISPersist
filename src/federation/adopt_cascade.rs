@@ -188,11 +188,18 @@ where
     let (floor, binding) = resolve_adopt(backend, ctx.our_key_id, envelope, provenance).await?;
     let announce = disposition == AdoptDisposition::Announce;
     would_hold(backend, ctx, provenance).await?;
-    let claim = if announce {
+    // v62.0.0 (T2-fix10; CC 6.1.3) — the holding claim is a CC 6.1 object:
+    // ONE composite signature, stated through the statement door by
+    // `holding_claim::emit_holding_claim` once the bytes are held (as the
+    // sealing cascades announce). The bound-hybrid `sign_holding_claim` and
+    // the earlier-form claim row the adopt floor inserted are deleted (ruling
+    // 4). The holder's refusals stay ahead of the bytes: an announcing adopt
+    // needs this node's LocalSigner with both halves of its composite key,
+    // and the holder in the content's cohort, before anything is written.
+    let announcer = if announce {
         use sha2::Digest as _;
         let sha256: [u8; 32] = sha2::Sha256::digest(envelope).into();
-        // The HOLDER claims (I23): attested and signed by this node's
-        // derived key, never the author's.
+        // The HOLDER claims (I23): this node's key, never the author's.
         let local = local.ok_or_else(|| {
             BlobError::AttestationEmissionFailed(
                 "hybrid-only: announcing an adopted blob needs this node's PQC LocalSigner \
@@ -200,24 +207,32 @@ where
                     .into(),
             )
         })?;
-        // v55.0.0 (CIRISPersist#989) — the claim at the content's scope; the
-        // floor rebuilds the same scope from its own tier, cohort and group.
+        let holder = local.federation_id().await;
+        if local.pqc_signer().is_none() {
+            return Err(BlobError::AttestationEmissionFailed(format!(
+                "hybrid-only: {holder} has no ML-DSA-65 key, so it cannot sign the composite \
+                 holding claim (CC 6.1.3); a classical-only producer does not announce \
+                 (CIRISPersist#851 §20.5)"
+            )));
+        }
+        // v55.0.0 (CIRISPersist#989) — the claim at the content's scope, the
+        // holder in its cohort (CC 3.1.3.3 rule 2): the audience half of the
+        // custody gate, asked of the row this claim will state.
         let scope = crate::federation::holding_claim::ClaimScope::of_content(
             provenance.tier,
             &provenance.cohort_scope,
             adopt_group(provenance, binding.as_ref()),
         )?;
-        Some(
-            crate::federation::holding_claim::sign_holding_claim(
-                local,
-                &sha256,
-                uuid::Uuid::new_v4(),
-                crate::host::clock::now(),
-                envelope.len() as u64,
-                &scope,
-            )
-            .await?,
-        )
+        let row = crate::federation::holding_claim::holding_claim_row(
+            &sha256,
+            &holder,
+            &uuid::Uuid::new_v4().to_string(),
+            crate::host::clock::now(),
+            envelope.len() as u64,
+            &scope,
+        )?;
+        crate::federation::holding_claim::check_holding_claim_audience(backend, &row).await?;
+        Some(local)
     } else {
         None
     };
@@ -230,9 +245,30 @@ where
             floor,
             binding.clone(),
             adopt_group(provenance, binding.as_ref()),
-            claim,
         )
         .await?;
+    // The composite edition-2 claim, at the stored content's scope and
+    // length (`emit_holding_claim` reads both from the held row).
+    if let Some(local) = announcer {
+        match crate::federation::holding_claim::emit_holding_claim(
+            backend,
+            local,
+            &sha256,
+            crate::host::clock::now(),
+        )
+        .await?
+        {
+            crate::federation::holding_claim::HoldingClaimOutcome::Emitted { .. } => {}
+            crate::federation::holding_claim::HoldingClaimOutcome::NotInCohort { scope } => {
+                return Err(BlobError::AttestationEmissionFailed(format!(
+                    "the adopted blob {} is held, but this node is not in its cohort {:?} and \
+                     cannot claim it (CC 3.1.3.3 rule 2)",
+                    hex::encode(sha256),
+                    scope
+                )));
+            }
+        }
+    }
     // #848 §13 (CIRISPersist#850 review) — the row now names its author:
     // project every content-axis `KeyGrant` set the AUTHOR signed that
     // arrived before the bytes — or, since v46.3.0 (#884), one of the

@@ -158,14 +158,14 @@ pub mod bodies {
     ) -> Result<String, Error> {
         let id = uuid::Uuid::new_v4().to_string();
         // Built in the earlier shape, shaped, then signed once (v62.0.0).
-        let mut row = e2::with_earlier_form(|| {
+        let mut row = {
             ts::bare_attestation(
                 &id,
                 granter,
                 grantee,
                 &serde_json::json!({ "id": id, "scope": ["act_on_behalf"] }),
             )
-        });
+        };
         row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
         shape(&mut row);
         restamp(&mut row);
@@ -242,8 +242,7 @@ pub mod bodies {
             "id": id,
             "references_attestation_id": target,
         });
-        let mut row =
-            e2::with_earlier_form(|| ts::bare_attestation(&id, granter, grantee, &envelope));
+        let mut row = ts::bare_attestation(&id, granter, grantee, &envelope);
         row.attestation_type = attestation_type::WITHDRAWS.to_owned();
         row.asserted_at += ahead;
         row.scrub_timestamp = row.asserted_at;

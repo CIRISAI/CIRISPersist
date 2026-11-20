@@ -7,18 +7,22 @@
 //! edge: a typed sidecar carrying pre-computed classify / extract /
 //! encrypt-and-store outputs, wrapped around the agent's original
 //! (now scrubbed) [`BatchEnvelope`]. The edge is a federation peer
-//! registered in `federation_keys`; the wrapper is signed with the
-//! edge's hybrid (Ed25519 + ML-DSA-65) key.
+//! holding a live edition-2 `key:record`; the wrapper is signed with ONE
+//! composite (ML-DSA-65-Ed25519) signature by that key (v62.0.0, F0-cp5).
 //!
 //! Pipeline (FSD §4.3 invariants 1-7):
 //!
 //! 1. `pipeline_schema_version` in
 //!    [`PipelineEnvelope::SCHEMA_VERSION_V1`] — reject unknown with 422.
-//! 2. Verify `edge_signature` against the directory via
-//!    [`verify_hybrid_via_directory`]. Reject with 422.
-//! 3. Verify EACH inner [`CompleteTrace`]'s agent signature. Defense-
-//!    in-depth: the edge could be compromised; the agent's signature
-//!    is the ground-truth for content authenticity. Reject with 422.
+//! 2. Verify `edge_signature.composite` under `edge_key_id`'s LIVE
+//!    edition-2 key via [`verify_composite_via_directory`]. Reject with 422
+//!    (a key not held yet, or a record that waits, is the 424 wait). The
+//!    earlier `{ed25519, ml_dsa_65}` pair is refused by name
+//!    (`verify_component_signature`).
+//! 3. Each inner [`CompleteTrace`] carries its `trace:complete:v1` statement
+//!    (the agent's composite), checked by the edition-2 statement door when
+//!    the persister ingests the batch; one without is the earlier form,
+//!    refused `earlier_form_object` with 422 (v62.0.0).
 //! 4. `pii_scrubbed == true` whenever `stages_executed` contains
 //!    `"scrub"`. Reject with 422.
 //! 5. `sidecar.classifications.len() == sum(components per event)`.
@@ -55,68 +59,25 @@
 //! today is wasted work but not incorrect: the sidecar's stages are
 //! deterministic, and re-running them yields the same outputs.
 //!
-//! # Deploy ordering (v37.0.0) — READ BEFORE ROLLING THIS OUT
+//! # Deploy ordering (v62.0.0) — the composite flag day
 //!
-//! v37.0.0 changes what invariant 2 accepts, in two independent ways.
-//! Both are flag days shared with CIRISEdge; neither is negotiable at
-//! runtime (no env var, no per-peer epoch — the operator declared a hard
-//! break).
-//!
-//! 1. **Canonicalization re-pin (CIRISPersist#716).**
-//!    [`canonicalize_for_edge_signing`] now rebuilds the edge-signed
-//!    bytes through
-//!    [`ceg_produce_canonicalize`](crate::verify::canonical::ceg_produce_canonicalize)
-//!    (V2Jcs) instead of hand-building the V1Python canonicalizer. An
-//!    edge still signing V1Python bytes is refused.
-//! 2. **PQC posture (`HybridPolicy::Strict`).** The edge signature must
-//!    now carry BOTH halves. An Ed25519-only `edge_signature` — accepted
-//!    through v36.x — is refused, and the edge's ML-DSA-65 pubkey must be
-//!    registered in `federation_keys`.
-//!
-//! **The two breaks have DIFFERENT shapes. Do not plan for one shape.**
-//!
-//! * **(2) PQC/Strict is immediate and total.** Any edge whose
-//!   `federation_keys` row lacks `pubkey_ml_dsa_65`, or that sends no
-//!   `ml_dsa_65` half, is refused on EVERY request from the instant v37
-//!   serves traffic. Payload-independent. This is the break that decides
-//!   the deploy window.
-//! * **(1) The canonicalizer re-pin is PAYLOAD-DEPENDENT.** V1Python and
-//!   RFC 8785 JCS produce byte-IDENTICAL output for payloads with no
-//!   non-ASCII characters and no divergent float tokens (`1e-05` vs
-//!   `1e-5`). An un-re-pinned edge sending all-ASCII envelopes therefore
-//!   KEEPS VERIFYING against v37, and fails only when a payload first
-//!   contains non-ASCII. Both halves of this are pinned as witnesses
-//!   (`v1_canonicalized_edge_signature_is_rejected` and
-//!   `v1_canonicalized_ascii_envelope_still_verifies`) because the
-//!   asymmetry is easy to get wrong in exactly the expensive direction.
-//!
-//! **The trap:** "we deployed v37 and edge ingest kept working" is NOT
-//! evidence that the edge re-pinned its canonicalizer. It is evidence
-//! that recent traffic happened to be ASCII. The latent failure then
-//! arrives later, detached from the deploy, looking like data corruption
-//! or a key problem. Verify the edge's canonicalizer by BUILD, not by
-//! observed success.
-//!
-//! **Ordering: cut both in the same window; if you must sequence, roll
-//! PERSIST FIRST.** Persist-first is strictly better for diagnosis: a v37
-//! persist refusing an un-re-pinned edge answers with
-//! [`edge_signature_rejection_detail`]'s message — which names the
-//! canonicalizer re-pin and the Strict flip explicitly, and rules out the
-//! key — in the 422 body the edge itself receives. A v36 persist refusing
-//! a re-pinned edge answers with a bare "ed25519 signature mismatch",
-//! indistinguishable from a credential problem. Both orderings drop the
-//! same traffic; only one of them explains itself.
+//! v62.0.0 (JSON-cut slice F, F0-cp5; RULINGS "composite signatures only")
+//! changes what invariant 2 accepts. The edge signs the same bytes as
+//! before ([`canonicalize_raw_for_edge_signing`]: the envelope less
+//! `edge_signature`, under CEG-produce/JCS, the v37.0.0 re-pin of
+//! CIRISPersist#716), but with ONE composite signature by its edition-2 key,
+//! named by its identity-ref in `edge_key_id`. The two-field form is refused
+//! by name on every request from the instant v62 serves traffic; there is no
+//! window. Roll the edge's composite signer with (or before) persist v62.
 //!
 //! Nothing re-verifies from storage on this plane — `edge_signature` is
 //! checked once at admission — so the outage is bounded to in-flight
-//! requests and ends the moment both sides are on v37. No stored corpus
-//! goes dark (contrast the audit plane, PINNED by #714 for exactly that
-//! reason).
+//! requests from edges still on the earlier form.
 //!
 //! [`PipelineEnvelope`]: crate::pipeline::types::PipelineEnvelope
 //! [`BatchEnvelope`]: crate::schema::BatchEnvelope
 //! [`CompleteTrace`]: crate::schema::CompleteTrace
-//! [`verify_hybrid_via_directory`]: crate::verify::verify_hybrid_via_directory
+//! [`verify_composite_via_directory`]: crate::federation::edition2::composite_verify::verify_composite_via_directory
 //! [`IngestHandle::try_submit_with_sidecar`]: crate::queue::IngestHandle::try_submit_with_sidecar
 
 use axum::extract::State;
@@ -125,6 +86,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::federation::edition2::composite_verify::{
+    now_ms, verify_composite_via_directory, CompositeVerifyError, VERIFY_COMPONENT_SIGNATURE,
+};
 use crate::federation::FederationDirectory;
 use crate::ingest::IngestError;
 use crate::pipeline::types::PipelineEnvelope;
@@ -132,20 +96,15 @@ use crate::queue::QueueError;
 use crate::schema::BatchEvent;
 use crate::server::AppState;
 use crate::store::Backend;
-use crate::verify::hybrid::VerifyError;
-use crate::verify::{
-    canonical::ceg_produce_canonicalize, ed25519::verify_trace, verify_hybrid_via_directory,
-    HybridPolicy,
-};
+use crate::verify::canonical::ceg_produce_canonicalize;
 
 // ── Stable error kind tokens (THREAT_MODEL.md AV-15) ─────────────────
 
 /// `pipeline_schema_version` not in the allowed set.
 pub const KIND_SCHEMA_VERSION: &str = "pipeline_invariant_schema_version";
-/// Edge hybrid signature failed verify (or edge key not in directory).
+/// Edge composite signature refused (v62.0.0: the refusal's own token leads
+/// the detail).
 pub const KIND_EDGE_SIGNATURE: &str = "pipeline_invariant_edge_signature";
-/// Inner agent CompleteTrace signature failed verify.
-pub const KIND_INNER_SIGNATURE: &str = "pipeline_invariant_inner_signature";
 /// v62.0.0 (wave P7) — the body is not JSON, or not a `PipelineEnvelope`
 /// (once any row-form trace event is expanded).
 pub const KIND_ENVELOPE_MALFORMED: &str = "pipeline_invariant_envelope_malformed";
@@ -156,9 +115,15 @@ pub const KIND_CLASSIFICATIONS_COUNT: &str = "pipeline_invariant_classifications
 /// An `encrypted_secret.secret_uuid` doesn't appear as
 /// `{SECRET:uuid:description}` anywhere in the scrubbed envelope.
 pub const KIND_ORPHAN_SECRET: &str = "pipeline_invariant_orphan_secret";
-/// v1.3.0 (CIRISPersist#46) — Edge key doesn't carry a writer role
-/// tag in `federation_keys.roles`. Reject with 403.
-pub const KIND_ROLE_TAG: &str = "pipeline_invariant_role_tag";
+/// v62.0.0 (F0-cp5b; the lead's ruling) — the edge holds no LIVE
+/// `self:delegates_to` from this node's owner bearing
+/// [`INFRA_PIPELINE_WRITER`](crate::federation::types::delegation_scope::INFRA_PIPELINE_WRITER)
+/// (a grant not yet seated with the edge's voice is not live). `403`. It
+/// replaces the earlier role-tag kind (`pipeline_invariant_role_tag`).
+pub const KIND_WRITER_NOT_DELEGATED: &str = "pipeline_writer_not_delegated";
+/// v62.0.0 (F0-cp5b) — this node has no identity, no live owner, or more than
+/// one: no owner can confer the writer scope. `403`, fail closed.
+pub const KIND_CONFERRER_UNRESOLVED: &str = "pipeline_conferrer_unresolved";
 
 /// v62.0.0 (CC 2.7) — the edge's or the agent's key record is not held
 /// here YET: a WAIT, answered `424 Failed Dependency` with
@@ -172,11 +137,112 @@ pub const KIND_KEY_NOT_HELD: &str = "verify_unknown_key";
 /// held (the route's other retryable answers use the same).
 const KEY_NOT_HELD_RETRY_AFTER_SECONDS: u32 = 5;
 
-/// Role tag required for the pipeline ingest writer (v1.3.0 #46).
-const ROLE_PIPELINE_WRITER: &str = "cirislens_pipeline_writer";
-/// Alternate role tag accepted for the pipeline ingest writer
-/// (overlaps the secrets writer privilege tier).
-const ROLE_SECRETS_WRITER: &str = "cirislens_secrets_writer";
+/// v62.0.0 (F0-cp5b) — why [`authorize_pipeline_writer`] refused an edge.
+#[derive(Debug)]
+pub enum WriterRefusal {
+    /// This node has no identity (`node_key_id` unset).
+    NoNodeIdentity,
+    /// This node has no live owner.
+    NoOwner(String),
+    /// More than one live owner holds the seat (fail closed).
+    AmbiguousOwner(String),
+    /// The edge holds no live owner grant bearing the scope.
+    NotDelegated {
+        /// The edge's identity-ref.
+        edge: String,
+        /// The node's owner.
+        owner: String,
+    },
+    /// A directory read failed (retryable).
+    Directory(crate::federation::Error),
+}
+
+impl WriterRefusal {
+    /// The stable kind token.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NoNodeIdentity | Self::NoOwner(_) | Self::AmbiguousOwner(_) => {
+                KIND_CONFERRER_UNRESOLVED
+            }
+            Self::NotDelegated { .. } => KIND_WRITER_NOT_DELEGATED,
+            Self::Directory(_) => "store_lookup_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for WriterRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::federation::types::delegation_scope::INFRA_PIPELINE_WRITER as S;
+        match self {
+            Self::NoNodeIdentity => write!(
+                f,
+                "this node has no identity (node_key_id unset), so no owner can confer {S}"
+            ),
+            Self::NoOwner(node) => {
+                write!(
+                    f,
+                    "node {node} has no live owner, so no owner can confer {S}"
+                )
+            }
+            Self::AmbiguousOwner(e) => {
+                write!(
+                    f,
+                    "{e} — no single owner confers {S}; refused (fail closed)"
+                )
+            }
+            Self::NotDelegated { edge, owner } => write!(
+                f,
+                "{edge} holds no live self:delegates_to from this node's owner {owner} bearing \
+                 scope {S:?} (a grant counts once the edge's own voice seats it; \
+                 secrets:writer does not cover it)"
+            ),
+            Self::Directory(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// v62.0.0 (F0-cp5b; the lead's ruling) — **may `edge` write a pipeline
+/// envelope?** True iff this node's owner (`admission::owner_of_unmarked`
+/// over `node_key_id`) holds a LIVE `self:delegates_to` to `edge` bearing
+/// [`INFRA_PIPELINE_WRITER`](crate::federation::types::delegation_scope::INFRA_PIPELINE_WRITER)
+/// (`trust_root::owner_granted_scope`, the predicate P6's secrets door uses).
+/// Nothing the edge's own key record says about itself confers anything.
+///
+/// # Errors
+/// [`WriterRefusal`].
+pub async fn authorize_pipeline_writer<F>(directory: &F, edge: &str) -> Result<(), WriterRefusal>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use crate::federation::types::delegation_scope::INFRA_PIPELINE_WRITER;
+    let Some(node) = directory.node_key_id() else {
+        return Err(WriterRefusal::NoNodeIdentity);
+    };
+    let owner = match crate::federation::admission::owner_of_unmarked(directory, &node).await {
+        Ok(Some(owner)) => owner,
+        Ok(None) => return Err(WriterRefusal::NoOwner(node)),
+        Err(e @ crate::federation::Error::AmbiguousNodeOwner { .. }) => {
+            return Err(WriterRefusal::AmbiguousOwner(e.to_string()));
+        }
+        Err(e) => return Err(WriterRefusal::Directory(e)),
+    };
+    match crate::federation::trust_root::owner_granted_scope(
+        directory,
+        edge,
+        &owner,
+        INFRA_PIPELINE_WRITER,
+    )
+    .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(WriterRefusal::NotDelegated {
+            edge: edge.to_owned(),
+            owner,
+        }),
+        Err(e) => Err(WriterRefusal::Directory(e)),
+    }
+}
 
 // ── Route handler ────────────────────────────────────────────────────
 
@@ -206,6 +272,25 @@ where
             )
         }
     };
+    // v62.0.0 (F0-cp5) — the earlier two-field edge signature is refused by
+    // name before the typed parse (which would only say a member is missing).
+    if let Some(sig) = raw.get("edge_signature").and_then(|v| v.as_object()) {
+        if let Some(half) = ["ed25519", "ml_dsa_65"]
+            .into_iter()
+            .find(|h| sig.contains_key(*h))
+        {
+            return invariant_response(
+                KIND_EDGE_SIGNATURE,
+                format!(
+                    "{VERIFY_COMPONENT_SIGNATURE}: edge_signature carries the earlier \
+                     component member {half:?}. v62.0.0: the edge signs ONE composite \
+                     (ML-DSA-65-Ed25519) over the same canonical bytes, sent as \
+                     edge_signature.composite, by its edition-2 identity-ref; the \
+                     composite rule admits no standalone component signer"
+                ),
+            );
+        }
+    }
     let mut typed_value = raw.clone();
     if let Some(inner) = raw.get("envelope") {
         let inner_bytes = serde_json::to_vec(inner).unwrap_or_default();
@@ -257,173 +342,90 @@ where
         Ok(b) => b,
         Err(detail) => return invariant_response(KIND_EDGE_SIGNATURE, detail),
     };
-    // v37.0.0 — Strict. This was Ed25519Fallback from v1.1.0, waiting on
-    // "once edge keys are PQC-complete across the fleet". That wait is
-    // over: `HybridPolicy`'s own doc says Ed25519Fallback is a
-    // development / sovereign-mode posture and NOT for federation
-    // production, and this is the edge ingest WRITE path — the most
-    // production plane persist serves. An Ed25519-only edge_signature is
-    // now refused (`VerifyError::HybridPendingRejected`), matching the
-    // #465 tightening `root_binding` already took on the provenance
-    // plane. row_age is still not applicable for write-path verifies (the
-    // edge_signature is computed fresh per request), and it is inert
-    // under Strict regardless.
-    let policy = HybridPolicy::Strict;
-    let edge_sig_outcome = verify_hybrid_via_directory(
+    // v62.0.0 (F0-cp5) — ONE composite under the edge's LIVE edition-2 key
+    // (the shared `verify_composite_via_directory`).
+    let sig = match base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        envelope.edge_signature.composite.trim(),
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            return invariant_response(
+                KIND_EDGE_SIGNATURE,
+                format!("edge_signature.composite is not base64: {e}"),
+            )
+        }
+    };
+    if let Err(e) = verify_composite_via_directory(
         &*state.directory,
         &canonical_bytes,
         &envelope.edge_key_id,
-        &envelope.edge_signature.ed25519,
-        envelope.edge_signature.ml_dsa_65.as_deref(),
-        policy,
-        None,
-    )
-    .await;
-    if let Err(e) = edge_sig_outcome {
-        // v37.0.0 — the detail names the flag-day cause. Both v37 breaks
-        // (the #716 canonicalizer re-pin and the Strict flip above) land
-        // here looking like a bad key; `edge_signature_rejection_detail`
-        // is what stops an operator from re-issuing keys to fix a
-        // canonicalization change. It goes to BOTH the log and the 422
-        // body, so the un-re-pinned peer reads its own cause on the wire.
-        let detail = edge_signature_rejection_detail(&e);
-        tracing::warn!(
-            error = %e,
-            kind = e.kind(),
-            edge_key_id = %envelope.edge_key_id,
-            detail = %detail,
-            "pipeline ingest rejected: edge signature failed verify"
-        );
-        // v62.0.0 (CC 2.7) — an edge key this node does not hold yet is a
-        // wait, not a bad signature.
-        if is_unknown_key(&e) {
-            return key_not_held_response(detail);
-        }
-        return invariant_response(KIND_EDGE_SIGNATURE, detail);
-    }
-
-    // 2b. Role-tag enforcement (v1.3.0, CIRISPersist#46). After the
-    //     edge signature verifies, fetch the edge's KeyRecord and
-    //     require a writer role tag — `cirislens_pipeline_writer`
-    //     OR `cirislens_secrets_writer` (the secrets-writer tier
-    //     overlaps because secrets-writers send pipeline traffic
-    //     too). Reject with 403 if no writer role is present.
-    let edge_record = match FederationDirectory::lookup_public_key(
-        &*state.directory,
-        &envelope.edge_key_id,
+        &sig,
+        now_ms(),
     )
     .await
     {
-        Ok(Some(rec)) => rec,
-        // v62.0.0 (CC 2.7) — the key was dropped between the verify and
-        // this read: not held, a wait.
-        Ok(None) => {
-            return key_not_held_response(format!(
-                "edge key not in directory: {}",
-                envelope.edge_key_id
-            ));
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "edge key lookup failed during role-tag check");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    kind: "store_lookup_failed",
-                    detail: format!("{e}"),
-                    retry_after_seconds: Some(5),
-                }),
-            )
-                .into_response();
-        }
-    };
-    let has_writer_role = edge_record
-        .capability_roles
-        .iter()
-        .any(|r| r == ROLE_PIPELINE_WRITER || r == ROLE_SECRETS_WRITER);
-    if !has_writer_role {
+        tracing::warn!(
+            error = %e,
+            kind = e.token(),
+            edge_key_id = %envelope.edge_key_id,
+            "pipeline ingest rejected: edge signature refused"
+        );
+        return edge_signature_refusal(&e);
+    }
+
+    // 2b. v62.0.0 (F0-cp5b; the lead's ruling) — the writer capability:
+    //     a live `self:delegates_to` from this node's owner to the edge
+    //     bearing `infra:pipeline_writer`, seated with the edge's voice. It
+    //     replaces the earlier `capability_roles` tags (a key's own claim).
+    if let Err(refusal) = authorize_pipeline_writer(&*state.directory, &envelope.edge_key_id).await
+    {
         tracing::warn!(
             edge_key_id = %envelope.edge_key_id,
-            roles = ?edge_record.capability_roles,
-            "pipeline ingest rejected: edge key has no writer role tag"
+            kind = refusal.kind(),
+            "pipeline ingest rejected: {refusal}"
         );
+        let (status, retry) = match &refusal {
+            WriterRefusal::Directory(_) => (StatusCode::SERVICE_UNAVAILABLE, Some(5)),
+            _ => (StatusCode::FORBIDDEN, None),
+        };
         return (
-            StatusCode::FORBIDDEN,
+            status,
             Json(ErrorResponse {
-                kind: KIND_ROLE_TAG,
-                detail: format!(
-                    "edge key {} missing required role ({} or {})",
-                    envelope.edge_key_id, ROLE_PIPELINE_WRITER, ROLE_SECRETS_WRITER
-                ),
-                retry_after_seconds: None,
+                kind: refusal.kind(),
+                detail: refusal.to_string(),
+                retry_after_seconds: retry,
             }),
         )
             .into_response();
     }
 
-    // 3. Inner agent signature verify (FSD §4.3 invariant 3 — defense-
-    //    in-depth). Same path the persister uses; running it pre-queue
-    //    fails fast on a compromised-edge / forged-inner-trace path.
+    // 3. The inner traces (FSD §4.3 invariant 3). v62.0.0 (wave P7; CC
+    //    3.1.5) — an inner trace carrying its `trace:complete:v1` row is
+    //    verified by the edition-2 statement door when the persister ingests
+    //    the batch (`ingest::admit_trace_statement`, before anything of the
+    //    trace is written). One without is the earlier form: refused by name.
+    //    v62.0.0 (F0-cp6d) — the earlier-form verify that followed the
+    //    refusal (an agent key read + `verify_trace`) is deleted; the route
+    //    refuses even were the switch open (fail closed: it never queues an
+    //    unverified inner trace).
     for event in &envelope.envelope.events {
-        let BatchEvent::CompleteTrace {
-            trace, statement, ..
-        } = event;
-        // v62.0.0 (wave P7; CC 3.1.5) — an inner trace carrying its
-        // `trace:complete:v1` row is verified by the edition-2 statement door
-        // when the persister ingests the batch (`ingest::admit_trace_statement`,
-        // before anything of the trace is written); there is no component
-        // signature to check here. One without is the earlier form: refused by
-        // name once the earlier-form doors are shut, else checked as before.
+        let BatchEvent::CompleteTrace { statement, .. } = event;
         if statement.is_some() {
             continue;
         }
-        if let Err(e) =
-            crate::federation::edition2::door::refuse_earlier_form(crate::ingest::TRACE_PLANE)
-        {
-            return invariant_response(
-                crate::federation::edition2::token::EARLIER_FORM_OBJECT,
-                format!("{e}"),
-            );
-        }
-        let key = match Backend::lookup_public_key(&*state.directory, &trace.signature_key_id).await
-        {
-            Ok(Some(k)) => k,
-            // v62.0.0 (CC 2.7) — the agent's key record has not reached
-            // this node yet: a wait, as on the ingest path.
-            Ok(None) => {
-                return key_not_held_response(format!(
-                    "unknown agent key {}",
-                    trace.signature_key_id
-                ));
-            }
-            Err(e) => {
-                // Backend lookup failure — 503 is the conventional
-                // shape for "transient infra" elsewhere on the route.
-                tracing::error!(error = %e, "agent key lookup failed");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse {
-                        kind: "store_lookup_failed",
-                        detail: format!("{e}"),
-                        retry_after_seconds: Some(5),
-                    }),
-                )
-                    .into_response();
-            }
+        let detail = match crate::federation::edition2::door::refuse_earlier_form(
+            crate::ingest::TRACE_PLANE,
+        ) {
+            Err(e) => e.to_string(),
+            Ok(()) => "an inline trace with no trace:complete:v1 statement is the earlier \
+                           form; this route admits only the row form"
+                .to_owned(),
         };
-        // v4.6 (#176) — select the canonicalizer by the trace's SIGNED
-        // schema epoch (Python-compat for 1.x/2.x, JCS for 3.x+). Signed-
-        // bytes-bound: not caller-selectable.
-        let canon = crate::verify::canonical::canonicalizer_for(
-            crate::verify::ed25519::canon_version_for_trace_schema(
-                trace.trace_schema_version.as_str(),
-            ),
+        return invariant_response(
+            crate::federation::edition2::token::EARLIER_FORM_OBJECT,
+            detail,
         );
-        if let Err(e) = verify_trace(trace, canon, &key) {
-            return invariant_response(
-                KIND_INNER_SIGNATURE,
-                format!("agent signature failed verify: {e}"),
-            );
-        }
     }
 
     // 4. pii_scrubbed consistency (FSD §4.3 invariant 4).
@@ -567,11 +569,36 @@ where
 /// Build a 422 response carrying a stable kind token + detail. The
 /// shape matches [`IngestError::PipelineInvariant`] — the wire body
 /// is the AV-15-safe surface lens consumers parse.
-/// v62.0.0 (CC 2.7) — is this verify failure "the key is not held here"?
-/// `verify_hybrid_via_directory` reports it as
-/// `VerifyError::Crypto("verify_unknown_key")`.
-fn is_unknown_key(e: &VerifyError) -> bool {
-    matches!(e, VerifyError::Crypto(msg) if msg.contains(KIND_KEY_NOT_HELD))
+/// v62.0.0 (F0-cp5) — the answer to an edge signature
+/// [`verify_composite_via_directory`] refused. A key not held yet, a record
+/// that waits on a key, and an instant no record covers are the WAIT (`424`,
+/// [`KIND_KEY_NOT_HELD`], CC 2.7); a failed directory read is `503`; every
+/// other refusal is the terminal `422` [`KIND_EDGE_SIGNATURE`], its detail
+/// led by the refusal's own token.
+fn edge_signature_refusal(e: &CompositeVerifyError) -> Response {
+    match e {
+        CompositeVerifyError::UnknownKey(_)
+        | CompositeVerifyError::Waiting { .. }
+        | CompositeVerifyError::NotCovered { .. } => key_not_held_response(format!("{e}")),
+        CompositeVerifyError::Directory(inner) => {
+            tracing::error!(error = %inner, "edge key read failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    kind: "store_lookup_failed",
+                    detail: format!("{e}"),
+                    retry_after_seconds: Some(5),
+                }),
+            )
+                .into_response()
+        }
+        CompositeVerifyError::NotIdentityRef(_)
+        | CompositeVerifyError::Revoked(_)
+        | CompositeVerifyError::ComponentSignature { .. }
+        | CompositeVerifyError::Invalid(_) => {
+            invariant_response(KIND_EDGE_SIGNATURE, format!("{e}"))
+        }
+    }
 }
 
 /// v62.0.0 (CC 2.7) — the WAIT: `424`, [`KIND_KEY_NOT_HELD`], with
@@ -626,10 +653,8 @@ fn invariant_response(kind: &'static str, detail: String) -> Response {
 /// the two rules actually diverge (non-ASCII, or non-ES float tokens).
 /// The two canonicalizations are byte-identical for plain-ASCII payloads,
 /// so an un-re-pinned edge fails at invariant 2 on its first DIVERGENT
-/// envelope, not necessarily on its first envelope. See
-/// [`edge_signature_rejection_detail`] for the operator-facing message
-/// that names the cause, and the module `# Deploy ordering (v37.0.0)`
-/// note for why that asymmetry is a trap. Unlike the audit plane — which #714
+/// envelope, not necessarily on its first envelope. Unlike the audit
+/// plane — which #714
 /// PINNED to V1 because it re-verifies STORED rows — nothing here
 /// re-verifies from storage: `edge_signature` is checked once, at
 /// admission, against bytes rebuilt from the request. So the blast radius
@@ -655,71 +680,6 @@ fn canonicalize_raw_for_edge_signing(envelope: &serde_json::Value) -> Result<Vec
         obj.remove("edge_signature");
     }
     ceg_produce_canonicalize(&value).map_err(|e| format!("canonicalize: {e}"))
-}
-
-/// v37.0.0 (CIRISPersist#716 + the #465-class PQC tightening) — render an
-/// edge-signature [`VerifyError`] into a detail string that names the
-/// **flag-day cause**, not just the symptom.
-///
-/// Both v37.0.0 breaks surface here as a signature that "just doesn't
-/// verify", and both look exactly like a key/registration problem to an
-/// operator reading a log line. That misdiagnosis is the expensive
-/// outcome — it sends someone to re-register keys for a canonicalizer
-/// re-pin. So each one states its own cause and its own remedy:
-///
-/// * `Crypto` (Ed25519 mismatch) — most likely the #716 canonicalizer
-///   re-pin: this build rebuilds the signed bytes under CEG-produce/JCS,
-///   so a V1Python-signed envelope will not verify no matter how correct
-///   the key is. The message also states that the two rules AGREE on
-///   plain ASCII, because that is what makes an un-re-pinned edge look
-///   healthy right up until the payload that breaks it.
-/// * `HybridPendingRejected` — the [`HybridPolicy::Strict`] flip: the
-///   signer's `federation_keys` row is classical-only and it sent no
-///   `ml_dsa_65` half, which v36 and earlier accepted.
-/// * `PqcFieldsMustBeBoth` — the sig/pubkey pairing: exactly one of the
-///   envelope's `ml_dsa_65` half and the row's `pubkey_ml_dsa_65` is
-///   present. Distinct from the above so an operator can tell "this edge
-///   never registered PQC" from "the PQC half went missing in flight".
-///
-/// The detail reaches the peer: [`invariant_response`] serializes it into
-/// the 422 body's `detail` field, so the signer sees the cause on the
-/// wire and not only in persist's logs.
-fn edge_signature_rejection_detail(e: &VerifyError) -> String {
-    match e {
-        VerifyError::Crypto(msg) if msg.contains("verify_unknown_key") => {
-            format!("{e} — edge_key_id is not registered in federation_keys")
-        }
-        VerifyError::Crypto(_) => format!(
-            "{e} — NOTE (v37.0.0 flag day, CIRISPersist#716): this build \
-             canonicalizes the edge-signed bytes under CEG-produce/JCS \
-             (V2Jcs). An envelope signed over the previous V1Python \
-             canonicalization WILL NOT VERIFY here even with a correct, \
-             correctly-registered key. The two rules diverge on non-ASCII \
-             text (JCS emits raw UTF-8; V1Python escaped it as \\uXXXX) and \
-             on float tokens — they agree on plain ASCII, so an \
-             un-re-pinned signer can appear healthy until its first \
-             non-ASCII payload, which is likely what just happened. \
-             Re-pin the signer to CEG-produce/JCS and re-sign; this is not \
-             a key problem."
-        ),
-        VerifyError::HybridPendingRejected => format!(
-            "{e} — NOTE (v37.0.0 flag day): the edge signature policy is \
-             now HybridPolicy::Strict. An Ed25519-only edge_signature was \
-             accepted through v36.x and is REFUSED here: send the ml_dsa_65 \
-             half and register the edge's ML-DSA-65 pubkey in \
-             federation_keys. This is not a key-validity problem."
-        ),
-        VerifyError::PqcFieldsMustBeBoth => format!(
-            "{e} — the envelope's ml_dsa_65 signature half and this \
-             edge_key_id's federation_keys.pubkey_ml_dsa_65 must BOTH be \
-             present or BOTH absent, and exactly one of them is. Either the \
-             envelope omitted the half for a PQC-registered edge (v37.0.0: \
-             send it — HybridPolicy::Strict requires it), or it sent the \
-             half for an edge with no registered PQC pubkey (register the \
-             edge's ML-DSA-65 pubkey). Not a key-validity problem."
-        ),
-        _ => format!("{e}"),
-    }
 }
 
 // ── Wire shapes ──────────────────────────────────────────────────────
@@ -758,12 +718,19 @@ impl IngestError {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-#[cfg(all(test, feature = "sqlite"))]
+// v62.0.0 (P7-fix5, P7-fix7) — every backend gets the door: EVERY route
+// witness runs on sqlite AND postgres (one backend-generic `*_on` body, a
+// sqlite runner and a `_postgres` runner over `build_pg_app`); the one pure
+// witness runs in either build. The allow covers any helper a postgres-only
+// build leaves unused.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code, unused_imports))]
 mod tests {
     use super::*;
+    use crate::federation::edition2::fixture_switch as e2;
     use crate::journal::Journal;
     use crate::pipeline::types::{
-        HybridSignatureBlock, PipelineEnvelope, PipelineMetadata, PipelineSidecar,
+        CompositeSignatureBlock, PipelineEnvelope, PipelineMetadata, PipelineSidecar,
     };
     use crate::queue::{spawn_persister, DEFAULT_QUEUE_DEPTH};
     use crate::schema::{
@@ -771,6 +738,7 @@ mod tests {
         TraceComponent, TraceLevel,
     };
     use crate::scrub::NullScrubber;
+    #[cfg(feature = "sqlite")]
     use crate::store::sqlite::SqliteBackend;
     use crate::verify::ed25519::canonical_payload_value;
     use crate::verify::{Canonicalizer, PythonJsonDumpsCanonicalizer};
@@ -784,46 +752,28 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    /// Fixed seed for the edge signing key — tests are reproducible.
-    const EDGE_SEED: [u8; 32] = [0xE1; 32];
+    /// v62.0.0 (F0-cp5) — the edge's edition-2 key (a fixture seed): the
+    /// envelope names it by its identity-ref (`e2::kid(EDGE)`).
+    const EDGE: &str = "f0-cp5-lens-edge";
     /// Fixed seed for the inner agent signing key.
     const AGENT_SEED: [u8; 32] = [0x42; 32];
-    /// `key_id` the edge identifies itself by in `federation_keys`.
-    const EDGE_KEY_ID: &str = "cirislens-edge-test-1";
     /// `signature_key_id` on the inner agent trace.
     const AGENT_KEY_ID: &str = "ciris-agent-key:pipeline-test";
-    /// v37.0.0 — fixed seed for the edge's ML-DSA-65 half. The edge
-    /// signature policy is now `HybridPolicy::Strict`, so a fixture edge
-    /// key without a PQC half can no longer sign an acceptable envelope.
-    const EDGE_PQC_SEED: [u8; 32] = [0xE9; 32];
-    /// `pqc_key_id` the edge stamps on the envelope.
-    const EDGE_PQC_KEY_ID: &str = "cirislens-edge-test-1-pqc";
 
-    fn edge_mldsa() -> ciris_keyring::MlDsa65SoftwareSigner {
-        ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&EDGE_PQC_SEED, EDGE_PQC_KEY_ID)
-            .expect("deterministic ML-DSA-65 keypair from seed")
+    /// ONE composite by [`EDGE`] over `bytes`, base64.
+    fn edge_composite(bytes: &[u8]) -> String {
+        BASE64.encode(e2::signing_key(EDGE).sign(bytes).expect("composite sign"))
     }
 
-    /// v37.0.0 — sign `envelope` the way a re-pinned CIRISEdge does:
-    /// canonicalize through the produce gate, Ed25519-sign those bytes,
-    /// then ML-DSA-65-sign `(canonical || ed25519_sig)` — the bound form
-    /// `verify_hybrid` reconstructs. Sets BOTH halves.
+    /// v62.0.0 (F0-cp5) — sign `envelope` the way an edge does: canonicalize
+    /// through the produce gate, then ONE composite over those bytes.
     ///
     /// Every fixture goes through here so there is exactly one place that
     /// knows the edge signing shape; the witnesses that must deviate from
-    /// it (V1 bytes, PQC omitted) do so explicitly and say why.
+    /// it (V1 bytes, a lone half) do so explicitly and say why.
     async fn sign_edge(envelope: &mut PipelineEnvelope) {
-        use ciris_keyring::PqcSigner as _;
         let canonical = canonicalize_for_edge_signing(envelope).expect("canonicalize");
-        let ed_sig = SigningKey::from_bytes(&EDGE_SEED)
-            .sign(&canonical)
-            .to_bytes();
-        let mut bound = Vec::with_capacity(canonical.len() + ed_sig.len());
-        bound.extend_from_slice(&canonical);
-        bound.extend_from_slice(&ed_sig);
-        let pqc_sig = edge_mldsa().sign(&bound).await.expect("ml-dsa sign");
-        envelope.edge_signature.ed25519 = BASE64.encode(ed_sig);
-        envelope.edge_signature.ml_dsa_65 = Some(BASE64.encode(&pqc_sig));
+        envelope.edge_signature.composite = edge_composite(&canonical);
     }
 
     fn temp_journal() -> (tempfile::TempDir, Arc<Journal>) {
@@ -833,26 +783,52 @@ mod tests {
         (dir, Arc::new(j))
     }
 
-    async fn build_app(queue_depth: usize) -> (Router, Arc<SqliteBackend>) {
-        use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, PqcSigner as _};
-        let backend = Arc::new(crate::store::test_backend::test_backend());
-        // Register the edge fixture key + agent fixture key in the
-        // directory so verify can resolve them.
-        let edge_sk = SigningKey::from_bytes(&EDGE_SEED);
-        backend.add_public_key(EDGE_KEY_ID, edge_sk.verifying_key());
-        // v1.3.0 (CIRISPersist#46): edge keys need a writer role to
-        // pass the role-tag invariant gate. Pipeline tests grant
-        // `cirislens_pipeline_writer`; the alternate
-        // `cirislens_secrets_writer` would also pass.
-        backend.set_roles(EDGE_KEY_ID, vec!["cirislens_pipeline_writer".to_owned()]);
-        // v37.0.0 — the edge key must be hybrid-COMPLETE now that the
-        // route verifies under `HybridPolicy::Strict`. `add_public_key`
-        // alone writes a hybrid-pending row (pubkey_ml_dsa_65 = None),
-        // which Strict refuses.
-        let edge_pqc_pk = edge_mldsa().public_key().await.expect("ml-dsa pk");
-        backend.set_pqc_pubkey(EDGE_KEY_ID, &BASE64.encode(&edge_pqc_pk));
-        let agent_sk = SigningKey::from_bytes(&AGENT_SEED);
-        backend.add_public_key(AGENT_KEY_ID, agent_sk.verifying_key());
+    /// v62.0.0 (P7-fix5) — a backend the route's witnesses run on: the
+    /// store traits the router and the persister need, and the inherent
+    /// "this node is" setter the writer grant's fixture reads (I2889).
+    trait RouteBackend:
+        crate::store::Backend + crate::federation::FederationDirectory + 'static
+    {
+        fn tell_node(&self, key_id: String);
+    }
+
+    #[cfg(feature = "sqlite")]
+    impl RouteBackend for SqliteBackend {
+        fn tell_node(&self, key_id: String) {
+            self.set_node_key_id(key_id);
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    impl RouteBackend for crate::store::postgres::PostgresBackend {
+        fn tell_node(&self, key_id: String) {
+            self.set_node_key_id(key_id);
+        }
+    }
+
+    /// v62.0.0 (P7-fix5) — the pipeline app over ANY [`RouteBackend`]: the
+    /// edge's live edition-2 key, this node's owner seated and the edge
+    /// granted `infra:pipeline_writer` (F0-cp5b, I2889's fixture), the
+    /// persister and the router.
+    async fn app_on<B: RouteBackend>(backend: Arc<B>, queue_depth: usize) -> Router {
+        use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner};
+        // v62.0.0 (F0-cp5) — the edge holds a live edition-2 key.
+        e2::put_key(&*backend, EDGE, &["node"]).await;
+        // v62.0.0 (F0-cp5b) — the writer capability: this node's owner grants
+        // the edge `infra:pipeline_writer`, seated with the edge's voice
+        // (I2889's fixture).
+        {
+            use crate::server::pipeline_writer_invariants as w;
+            backend.tell_node(e2::kid(w::NODE));
+            w::seat_owner(&*backend).await;
+            w::grant(
+                &*backend,
+                EDGE,
+                &[crate::federation::types::delegation_scope::INFRA_PIPELINE_WRITER],
+                true,
+            )
+            .await;
+        }
 
         let (_dir, journal) = temp_journal();
         std::mem::forget(_dir);
@@ -869,14 +845,39 @@ mod tests {
             "server-test-signer".to_owned(),
         );
         std::mem::forget(persister);
-        (
-            crate::server::router(AppState {
-                handle,
-                journal,
-                directory: backend.clone(),
-            }),
-            backend,
-        )
+        crate::server::router(AppState {
+            handle,
+            journal,
+            directory: backend,
+        })
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn build_app(queue_depth: usize) -> (Router, Arc<SqliteBackend>) {
+        // v62.0.0 (P7-fix7) — no earlier-form key seam: with the doors shut
+        // nothing reads an inner earlier-form signer (row-form traces are the
+        // statement door's; an inline trace is refused before any key read).
+        let backend = Arc::new(crate::store::test_backend::test_backend());
+        let app = app_on(backend.clone(), queue_depth).await;
+        (app, backend)
+    }
+
+    /// v62.0.0 (P7-fix5) — [`build_app`] on a fresh, migrated postgres
+    /// database; `None` (the twin returns) when no test DSN is set.
+    #[cfg(feature = "postgres")]
+    async fn build_pg_app(
+        queue_depth: usize,
+    ) -> Option<(Router, Arc<crate::store::postgres::PostgresBackend>)> {
+        use crate::store::Backend as _;
+        let dsn = crate::test_pg::empty_dsn()?;
+        let backend = Arc::new(
+            crate::store::postgres::PostgresBackend::connect(&dsn)
+                .await
+                .expect("connect the test database"),
+        );
+        backend.run_migrations().await.expect("migrations");
+        let app = app_on(backend.clone(), queue_depth).await;
+        Some((app, backend))
     }
 
     /// Build a signed agent CompleteTrace + outer BatchEnvelope. The
@@ -978,13 +979,11 @@ mod tests {
             pipeline_schema_version: PipelineEnvelope::SCHEMA_VERSION_V1.to_string(),
             envelope: batch,
             sidecar,
-            edge_signature: HybridSignatureBlock {
-                ed25519: String::new(),
-                ml_dsa_65: None,
+            edge_signature: CompositeSignatureBlock {
+                composite: String::new(),
                 signed_at,
             },
-            edge_key_id: EDGE_KEY_ID.into(),
-            edge_pqc_key_id: Some(EDGE_PQC_KEY_ID.into()),
+            edge_key_id: e2::kid(EDGE),
         };
         sign_edge(&mut envelope).await;
         envelope
@@ -1046,32 +1045,40 @@ mod tests {
     /// v62.0.0 (CC 2.7, wave P9) — **I3609: a key this node does not hold yet
     /// is a retryable wait at the pipeline route**, the ingest path's token
     /// (`verify_unknown_key`) at `424` with `retry_after_seconds`, never the
-    /// terminal 422: an agent key not registered (the envelope re-signed by
-    /// the edge, so the edge gate passes), and an edge key not registered.
+    /// terminal 422: an edge key not registered. (P7-fix4: the agent leg is
+    /// deleted; a row-form trace's signer is the persister's statement door's
+    /// to judge, retryable `federation_attester_key_unknown`.)
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i3609_a_key_not_held_is_a_retryable_424() {
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        Box::pin(i3609_a_key_not_held_is_a_retryable_424_on(&app, &*backend)).await;
+    }
 
-        let mut env = make_signed_pipeline_envelope(make_signed_batch(1)).await;
-        for event in &mut env.envelope.events {
-            let BatchEvent::CompleteTrace { trace, .. } = event;
-            trace.signature_key_id = "ciris-agent-key:not-held-here".into();
-        }
-        sign_edge(&mut env).await;
-        let (status, body) = post_envelope(&app, &env).await;
-        assert_eq!(
-            status,
-            StatusCode::FAILED_DEPENDENCY,
-            "I3609 agent: {body:?}"
-        );
-        let e = body.expect_error();
-        assert_eq!(e.kind, KIND_KEY_NOT_HELD, "I3609 agent");
-        assert!(e.retry_after_seconds.is_some(), "I3609 agent: retryable");
+    /// [`i3609_a_key_not_held_is_a_retryable_424`] on postgres (P7-fix7: every backend gets the door).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i3609_a_key_not_held_is_a_retryable_424_postgres() {
+        let Some((app, backend)) = build_pg_app(DEFAULT_QUEUE_DEPTH).await else {
+            return;
+        };
+        Box::pin(i3609_a_key_not_held_is_a_retryable_424_on(&app, &*backend)).await;
+    }
 
+    async fn i3609_a_key_not_held_is_a_retryable_424_on<B: RouteBackend>(
+        app: &Router,
+        _backend: &B,
+    ) {
+        // v62.0.0 (P7-fix4) — the agent leg (an inline inner trace whose
+        // earlier-form signer key is not held) is deleted: the route no
+        // longer checks an inner earlier-form signature (the doors are shut,
+        // so an inline inner trace is refused `earlier_form_object`), and a
+        // row-form trace's signer is judged by the persister's statement door
+        // (`federation_attester_key_unknown`, retryable: P7 I3474 / fix2).
         let mut env = make_signed_pipeline_envelope(make_signed_batch(1)).await;
-        env.edge_key_id = "cirislens-edge-not-held-here".into();
+        env.edge_key_id = e2::kid("f0-cp5-lens-edge-not-held-here");
         sign_edge(&mut env).await;
-        let (status, body) = post_envelope(&app, &env).await;
+        let (status, body) = post_envelope(app, &env).await;
         assert_eq!(
             status,
             StatusCode::FAILED_DEPENDENCY,
@@ -1082,30 +1089,96 @@ mod tests {
         assert!(e.retry_after_seconds.is_some(), "I3609 edge: retryable");
     }
 
+    /// v62.0.0 (F0-cp5b) — **I2889 (route): an edge whose composite verifies
+    /// but who holds no owner grant of `infra:pipeline_writer` is refused by
+    /// name**, `403` `pipeline_writer_not_delegated`, final (no
+    /// `retry_after_seconds`): never the 424 key wait that cannot clear.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i2889_an_ungranted_edge_is_refused_by_name() {
+        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        Box::pin(i2889_an_ungranted_edge_is_refused_by_name_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    /// [`i2889_an_ungranted_edge_is_refused_by_name`] on postgres (P7-fix5: every backend gets the door).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i2889_an_ungranted_edge_is_refused_by_name_postgres() {
+        let Some((app, backend)) = build_pg_app(DEFAULT_QUEUE_DEPTH).await else {
+            return;
+        };
+        Box::pin(i2889_an_ungranted_edge_is_refused_by_name_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    async fn i2889_an_ungranted_edge_is_refused_by_name_on<B: RouteBackend>(
+        app: &Router,
+        backend: &B,
+    ) {
+        const UNGRANTED: &str = "f0-cp5b-lens-edge-ungranted";
+        let who = e2::put_key(backend, UNGRANTED, &["node"]).await;
+        let mut env = make_signed_pipeline_envelope(make_signed_batch(1)).await;
+        env.edge_key_id = who;
+        let canonical = canonicalize_for_edge_signing(&env).unwrap();
+        env.edge_signature.composite = BASE64.encode(
+            e2::signing_key(UNGRANTED)
+                .sign(&canonical)
+                .expect("composite sign"),
+        );
+        let (status, body) = post_envelope(app, &env).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "I2889: {body:?}");
+        let e = body.expect_error();
+        assert_eq!(e.kind, KIND_WRITER_NOT_DELEGATED, "I2889");
+        assert!(e.retry_after_seconds.is_none(), "I2889: final");
+    }
+
     /// Happy path: well-formed envelope flows through every gate.
+    ///
+    /// v62.0.0 (P7-fix4) — on the v62 trace wire: the inner trace as its row
+    /// + blob ([`to_row_form`]).
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn pipeline_ingest_accepts_well_formed_envelope() {
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        Box::pin(pipeline_ingest_accepts_well_formed_envelope_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    /// [`pipeline_ingest_accepts_well_formed_envelope`] on postgres (P7-fix5: every backend gets the door).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn pipeline_ingest_accepts_well_formed_envelope_postgres() {
+        let Some((app, backend)) = build_pg_app(DEFAULT_QUEUE_DEPTH).await else {
+            return;
+        };
+        Box::pin(pipeline_ingest_accepts_well_formed_envelope_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    async fn pipeline_ingest_accepts_well_formed_envelope_on<B: RouteBackend>(
+        app: &Router,
+        backend: &B,
+    ) {
         let batch = make_signed_batch(2);
         let env = make_signed_pipeline_envelope(batch).await;
-        let (status, _) = post_envelope(&app, &env).await;
-        assert_eq!(status, StatusCode::OK);
+        let (status, body) = post_row_form(app, backend, &env).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
     }
 
     /// v62.0.0 (wave P7) — sign a RAW envelope value the way the edge does
     /// (the route checks the signature over the body as sent).
     async fn sign_edge_raw(value: &mut serde_json::Value) {
-        use ciris_keyring::PqcSigner as _;
         let canonical = canonicalize_raw_for_edge_signing(value).expect("canonicalize");
-        let ed_sig = SigningKey::from_bytes(&EDGE_SEED)
-            .sign(&canonical)
-            .to_bytes();
-        let mut bound = Vec::with_capacity(canonical.len() + ed_sig.len());
-        bound.extend_from_slice(&canonical);
-        bound.extend_from_slice(&ed_sig);
-        let pqc_sig = edge_mldsa().sign(&bound).await.expect("ml-dsa sign");
-        value["edge_signature"]["ed25519"] = serde_json::json!(BASE64.encode(ed_sig));
-        value["edge_signature"]["ml_dsa_65"] = serde_json::json!(BASE64.encode(&pqc_sig));
+        value["edge_signature"]["composite"] = serde_json::json!(edge_composite(&canonical));
     }
 
     async fn post_raw(app: &Router, value: &serde_json::Value) -> (StatusCode, String) {
@@ -1122,6 +1195,114 @@ mod tests {
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// v62.0.0 (P7-fix4; P7-fix5) — the inner agent's edition-2 key (a
+    /// fixture seed), put as an **`agent`** key: a trace is authored by the
+    /// agent (the `trace:{form}:{version}` family's authorship, CC 3.4.5:
+    /// self-emitted; whether the door also refuses other signer kinds waits
+    /// on CC, P7-fix6). An agent record ends (at most 365 days), so
+    /// the row-form trace is dated from the key's own window
+    /// (`key_window_start_ms` + `OWNER_BINDING_OFFSET_DAYS`, K2's owner-binding
+    /// rule), never the wall clock nor the batch fixture's fixed dates.
+    const ROW_AGENT: &str = "p7-fix4-pipeline-agent";
+
+    /// v62.0.0 (P7-fix4) — **`env` as an edge sends it on the v62 trace
+    /// wire**: every inner event in the ROW form (P7): `statement` (the
+    /// agent's `trace:complete:v1` row, one composite under [`ROW_AGENT`]'s
+    /// live key) + `trace_blob` (the trace's JCS bytes, no signature
+    /// members), and no inline `trace`; then the edge's composite over the
+    /// body as sent ([`sign_edge_raw`]). The typed envelope's sidecar (the
+    /// mutations a test made) is carried unchanged. With the earlier-form
+    /// doors shut, an inline inner trace is refused at the route, so every
+    /// fixture that must pass the inner gate goes through here.
+    async fn to_row_form(kid: &str, env: &PipelineEnvelope) -> serde_json::Value {
+        let mut value = serde_json::to_value(env).unwrap();
+        row_form_events(kid, &mut value);
+        sign_edge_raw(&mut value).await;
+        value
+    }
+
+    /// Put [`ROW_AGENT`]'s live key on `backend` (ONCE per test: the record
+    /// is signed, so a second put is a second row); its identity-ref.
+    async fn row_agent<D: crate::federation::FederationDirectory + ?Sized>(backend: &D) -> String {
+        e2::put_key(backend, ROW_AGENT, &["agent"]).await
+    }
+
+    /// The inner events of a raw envelope, rewritten to the row form in place
+    /// under `kid` ([`row_agent`]); the edge signature is NOT recomputed.
+    fn row_form_events(kid: &str, value: &mut serde_json::Value) {
+        let events = value["envelope"]["events"]
+            .as_array_mut()
+            .expect("the inner events");
+        // Dated from the agent key's OWN window (K2's rule, the one the owner
+        // bindings use): its start plus a fixed offset, never the wall clock.
+        let offset_days =
+            u64::try_from(crate::federation::tier_ingest::test_support::OWNER_BINDING_OFFSET_DAYS)
+                .expect("a positive day count");
+        let completed_ms = e2::key_window_start_ms(ROW_AGENT) + offset_days * 86_400_000;
+        let completed = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            i64::try_from(completed_ms).expect("ms fits i64"),
+        )
+        .expect("a valid instant");
+        let started = completed - chrono::Duration::seconds(19);
+        let stamp = |t: chrono::DateTime<chrono::Utc>| {
+            serde_json::json!(t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        };
+        for event in events.iter_mut() {
+            let mut trace = event["trace"].clone();
+            trace["started_at"] = stamp(started);
+            trace["completed_at"] = stamp(completed);
+            let blob = crate::ingest::canonical_trace_blob(&trace).expect("a trace object");
+            let parsed: CompleteTrace =
+                serde_json::from_slice(&blob).expect("the blob is a CompleteTrace");
+            let payload =
+                crate::ingest::trace_row_payload(&parsed, &blob, kid).expect("the row payload");
+            let statement = ciris_verify_core::edition2::sign_row_statement(
+                &e2::signing_key(ROW_AGENT),
+                kid,
+                kid,
+                crate::ingest::TRACE_ROW_TYPE,
+                crate::ingest::TRACE_FAMILY_ID,
+                &payload,
+                vec![],
+            )
+            .expect("sign the trace row");
+            let obj = event.as_object_mut().expect("an event object");
+            obj.remove("trace");
+            obj.insert(
+                "statement".into(),
+                serde_json::json!(BASE64.encode(statement)),
+            );
+            obj.insert("trace_blob".into(), serde_json::json!(BASE64.encode(blob)));
+        }
+    }
+
+    /// POST a raw envelope, read back as [`post_envelope`] does.
+    async fn post_value(app: &Router, value: &serde_json::Value) -> (StatusCode, ErrorOrAccepted) {
+        let (status, text) = post_raw(app, value).await;
+        let parsed = if status == StatusCode::OK {
+            ErrorOrAccepted::Accepted
+        } else {
+            ErrorOrAccepted::Error(serde_json::from_str(&text).unwrap_or_else(|_| {
+                ErrorResponseOwned {
+                    kind: "<unparseable>".into(),
+                    detail: text.clone(),
+                    retry_after_seconds: None,
+                }
+            }))
+        };
+        (status, parsed)
+    }
+
+    /// [`to_row_form`] then [`post_value`].
+    async fn post_row_form<D: crate::federation::FederationDirectory + ?Sized>(
+        app: &Router,
+        backend: &D,
+        env: &PipelineEnvelope,
+    ) -> (StatusCode, ErrorOrAccepted) {
+        let kid = row_agent(backend).await;
+        post_value(app, &to_row_form(&kid, env).await).await
     }
 
     /// The well-formed envelope with its first event in the ROW form:
@@ -1153,11 +1334,35 @@ mod tests {
     /// edge signature is checked over the body as sent, and the batch is
     /// queued with the event unchanged (the persister's statement door checks
     /// the row against the blob's bytes).
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i3484_pipeline_ingest_accepts_the_row_form() {
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        Box::pin(i3484_pipeline_ingest_accepts_the_row_form_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    /// [`i3484_pipeline_ingest_accepts_the_row_form`] on postgres (P7-fix7: every backend gets the door).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i3484_pipeline_ingest_accepts_the_row_form_postgres() {
+        let Some((app, backend)) = build_pg_app(DEFAULT_QUEUE_DEPTH).await else {
+            return;
+        };
+        Box::pin(i3484_pipeline_ingest_accepts_the_row_form_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    async fn i3484_pipeline_ingest_accepts_the_row_form_on<B: RouteBackend>(
+        app: &Router,
+        _backend: &B,
+    ) {
         let value = row_form_envelope(|t| crate::ingest::canonical_trace_blob(t).unwrap()).await;
-        let (status, body) = post_raw(&app, &value).await;
+        let (status, body) = post_raw(app, &value).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -1167,11 +1372,35 @@ mod tests {
 
     /// **I3485** (v62.0.0, wave P7) — a row-form event whose blob carries a
     /// signature member of its own is refused at the route by name.
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i3485_pipeline_ingest_refuses_a_signed_blob() {
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        Box::pin(i3485_pipeline_ingest_refuses_a_signed_blob_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    /// [`i3485_pipeline_ingest_refuses_a_signed_blob`] on postgres (P7-fix7: every backend gets the door).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i3485_pipeline_ingest_refuses_a_signed_blob_postgres() {
+        let Some((app, backend)) = build_pg_app(DEFAULT_QUEUE_DEPTH).await else {
+            return;
+        };
+        Box::pin(i3485_pipeline_ingest_refuses_a_signed_blob_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    async fn i3485_pipeline_ingest_refuses_a_signed_blob_on<B: RouteBackend>(
+        app: &Router,
+        _backend: &B,
+    ) {
         let value = row_form_envelope(|t| serde_json::to_vec(t).unwrap()).await;
-        let (status, body) = post_raw(&app, &value).await;
+        let (status, body) = post_raw(app, &value).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "I3485: {body}");
         assert!(
             body.contains(crate::ingest::TRACE_BLOB_CARRIES_SIGNATURE),
@@ -1180,13 +1409,37 @@ mod tests {
     }
 
     /// FSD §4.3 invariant 1: unknown schema version rejected.
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn pipeline_ingest_rejects_unknown_schema_version() {
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        Box::pin(pipeline_ingest_rejects_unknown_schema_version_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    /// [`pipeline_ingest_rejects_unknown_schema_version`] on postgres (P7-fix7: every backend gets the door).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn pipeline_ingest_rejects_unknown_schema_version_postgres() {
+        let Some((app, backend)) = build_pg_app(DEFAULT_QUEUE_DEPTH).await else {
+            return;
+        };
+        Box::pin(pipeline_ingest_rejects_unknown_schema_version_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    async fn pipeline_ingest_rejects_unknown_schema_version_on<B: RouteBackend>(
+        app: &Router,
+        _backend: &B,
+    ) {
         let batch = make_signed_batch(1);
         let mut env = make_signed_pipeline_envelope(batch).await;
         env.pipeline_schema_version = "99.0".into();
-        let (status, body) = post_envelope(&app, &env).await;
+        let (status, body) = post_envelope(app, &env).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body.expect_error().kind, KIND_SCHEMA_VERSION);
     }
@@ -1194,15 +1447,39 @@ mod tests {
     /// FSD §4.3 invariant 4: stages_executed contains "scrub" but
     /// pii_scrubbed=false. Re-sign after the mutation so we hit the
     /// invariant gate, not the edge-signature gate.
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn pipeline_ingest_rejects_pii_scrubbed_inconsistency() {
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        Box::pin(pipeline_ingest_rejects_pii_scrubbed_inconsistency_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    /// [`pipeline_ingest_rejects_pii_scrubbed_inconsistency`] on postgres (P7-fix5: every backend gets the door).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn pipeline_ingest_rejects_pii_scrubbed_inconsistency_postgres() {
+        let Some((app, backend)) = build_pg_app(DEFAULT_QUEUE_DEPTH).await else {
+            return;
+        };
+        Box::pin(pipeline_ingest_rejects_pii_scrubbed_inconsistency_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    async fn pipeline_ingest_rejects_pii_scrubbed_inconsistency_on<B: RouteBackend>(
+        app: &Router,
+        backend: &B,
+    ) {
         let batch = make_signed_batch(1);
         let mut env = make_signed_pipeline_envelope(batch).await;
         env.sidecar.pipeline_metadata.pii_scrubbed = false;
-        // Re-sign — the metadata change invalidates the edge sig.
-        sign_edge(&mut env).await;
-        let (status, body) = post_envelope(&app, &env).await;
+        // v62.0.0 (P7-fix4) — the row form, re-signed by the edge over the
+        // body as sent (the metadata change invalidated the old signature).
+        let (status, body) = post_row_form(app, backend, &env).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body.expect_error().kind, KIND_PII_SCRUBBED);
     }
@@ -1211,16 +1488,42 @@ mod tests {
     /// component count. Only runs when `classify` is compiled in (the
     /// sidecar `classifications` field is feature-gated).
     #[cfg(feature = "classify")]
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn pipeline_ingest_rejects_classifications_count_mismatch() {
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        Box::pin(pipeline_ingest_rejects_classifications_count_mismatch_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    /// [`pipeline_ingest_rejects_classifications_count_mismatch`] on postgres (P7-fix5: every backend gets the door).
+    #[cfg(feature = "classify")]
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn pipeline_ingest_rejects_classifications_count_mismatch_postgres() {
+        let Some((app, backend)) = build_pg_app(DEFAULT_QUEUE_DEPTH).await else {
+            return;
+        };
+        Box::pin(pipeline_ingest_rejects_classifications_count_mismatch_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "classify")]
+    async fn pipeline_ingest_rejects_classifications_count_mismatch_on<B: RouteBackend>(
+        app: &Router,
+        backend: &B,
+    ) {
         let batch = make_signed_batch(2);
         let mut env = make_signed_pipeline_envelope(batch).await;
         // 2 components but 3 classifications.
         env.sidecar.classifications.push(Vec::new());
-        // Re-sign.
-        sign_edge(&mut env).await;
-        let (status, body) = post_envelope(&app, &env).await;
+        // v62.0.0 (P7-fix4) — the row form (the blob carries the same 2
+        // components), re-signed by the edge.
+        let (status, body) = post_row_form(app, backend, &env).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body.expect_error().kind, KIND_CLASSIFICATIONS_COUNT);
     }
@@ -1229,11 +1532,28 @@ mod tests {
     /// in the scrubbed envelope. Only runs when `secrets` is compiled
     /// in.
     #[cfg(feature = "secrets")]
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn pipeline_ingest_rejects_orphan_secret() {
+        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        Box::pin(pipeline_ingest_rejects_orphan_secret_on(&app, &*backend)).await;
+    }
+
+    /// [`pipeline_ingest_rejects_orphan_secret`] on postgres (P7-fix5: every backend gets the door).
+    #[cfg(feature = "secrets")]
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn pipeline_ingest_rejects_orphan_secret_postgres() {
+        let Some((app, backend)) = build_pg_app(DEFAULT_QUEUE_DEPTH).await else {
+            return;
+        };
+        Box::pin(pipeline_ingest_rejects_orphan_secret_on(&app, &*backend)).await;
+    }
+
+    #[cfg(feature = "secrets")]
+    async fn pipeline_ingest_rejects_orphan_secret_on<B: RouteBackend>(app: &Router, backend: &B) {
         use crate::pipeline::classify::Sensitivity;
         use crate::secrets::types::{EncryptedSecretRecord, SecretRecord};
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
         let batch = make_signed_batch(1);
         let mut env = make_signed_pipeline_envelope(batch).await;
         // Inject an "encrypted secret" whose UUID DOESN'T appear in
@@ -1262,36 +1582,152 @@ mod tests {
         };
         env.sidecar.encrypted_secrets.push(orphan);
         env.sidecar.pipeline_metadata.secrets_encrypted = 1;
-        // Re-sign.
-        sign_edge(&mut env).await;
-        let (status, body) = post_envelope(&app, &env).await;
+        // v62.0.0 (P7-fix4) — the row form, re-signed by the edge. The route
+        // searches the expanded (typed) envelope, whose trace is the blob's.
+        let (status, body) = post_row_form(app, backend, &env).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body.expect_error().kind, KIND_ORPHAN_SECRET);
     }
 
     /// FSD §4.3 invariant 2: edge signature must verify. Flip a byte
-    /// in `edge_signature.ed25519` and assert the route rejects.
+    /// in `edge_signature.composite` and assert the route rejects.
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn pipeline_ingest_rejects_bad_edge_signature() {
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        Box::pin(pipeline_ingest_rejects_bad_edge_signature_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    /// [`pipeline_ingest_rejects_bad_edge_signature`] on postgres (P7-fix7: every backend gets the door).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn pipeline_ingest_rejects_bad_edge_signature_postgres() {
+        let Some((app, backend)) = build_pg_app(DEFAULT_QUEUE_DEPTH).await else {
+            return;
+        };
+        Box::pin(pipeline_ingest_rejects_bad_edge_signature_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    async fn pipeline_ingest_rejects_bad_edge_signature_on<B: RouteBackend>(
+        app: &Router,
+        _backend: &B,
+    ) {
         let batch = make_signed_batch(1);
         let mut env = make_signed_pipeline_envelope(batch).await;
         // Decode, flip byte 0, re-encode — base64-clean and produces
-        // a still-64-byte signature that won't verify.
-        let mut sig_bytes = BASE64.decode(&env.edge_signature.ed25519).unwrap();
+        // a still-composite-length signature that won't verify.
+        let mut sig_bytes = BASE64.decode(&env.edge_signature.composite).unwrap();
         sig_bytes[0] ^= 0xFF;
-        env.edge_signature.ed25519 = BASE64.encode(&sig_bytes);
-        let (status, body) = post_envelope(&app, &env).await;
+        env.edge_signature.composite = BASE64.encode(&sig_bytes);
+        let (status, body) = post_envelope(app, &env).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(body.expect_error().kind, KIND_EDGE_SIGNATURE);
+        let err = body.expect_error();
+        assert_eq!(err.kind, KIND_EDGE_SIGNATURE);
+        assert!(
+            err.detail.starts_with(
+                crate::federation::edition2::composite_verify::VERIFY_COMPOSITE_INVALID
+            ),
+            "{}",
+            err.detail
+        );
     }
 
-    // ── v37.0.0 flag-day witnesses ───────────────────────────────────
+    /// v62.0.0 (F0-cp5) — **I2882: the earlier edge signature is refused by
+    /// name at the route.** The two-field `{ed25519, ml_dsa_65}` block (both
+    /// halves, or the Ed25519 half alone) is refused
+    /// `verify_component_signature` before the typed parse; a lone Ed25519
+    /// half sent AS the composite is refused by its length; an edge named by
+    /// a label, not an identity-ref, is refused `verify_not_identity_ref`.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i2882_the_earlier_edge_signature_is_refused_by_name() {
+        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        Box::pin(i2882_the_earlier_edge_signature_is_refused_by_name_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    /// [`i2882_the_earlier_edge_signature_is_refused_by_name`] on postgres (P7-fix7: every backend gets the door).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i2882_the_earlier_edge_signature_is_refused_by_name_postgres() {
+        let Some((app, backend)) = build_pg_app(DEFAULT_QUEUE_DEPTH).await else {
+            return;
+        };
+        Box::pin(i2882_the_earlier_edge_signature_is_refused_by_name_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    async fn i2882_the_earlier_edge_signature_is_refused_by_name_on<B: RouteBackend>(
+        app: &Router,
+        _backend: &B,
+    ) {
+        use crate::federation::edition2::composite_verify::VERIFY_NOT_IDENTITY_REF;
+        let env = make_signed_pipeline_envelope(make_signed_batch(1)).await;
+        let canonical = canonicalize_for_edge_signing(&env).unwrap();
+        let ed_half = BASE64.encode(
+            SigningKey::from_bytes(&[0xE1; 32])
+                .sign(&canonical)
+                .to_bytes(),
+        );
+        for block in [
+            serde_json::json!({"ed25519": ed_half, "ml_dsa_65": "AAAA", "signed_at": "2026-05-14T00:00:00Z"}),
+            serde_json::json!({"ed25519": ed_half, "signed_at": "2026-05-14T00:00:00Z"}),
+            serde_json::json!({"composite": env.edge_signature.composite, "ed25519": ed_half,
+                               "signed_at": "2026-05-14T00:00:00Z"}),
+        ] {
+            let mut value = serde_json::to_value(&env).unwrap();
+            value["edge_signature"] = block.clone();
+            let (status, body) = post_raw(app, &value).await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "I2882 {block}: {body}"
+            );
+            assert!(
+                body.contains(KIND_EDGE_SIGNATURE) && body.contains(VERIFY_COMPONENT_SIGNATURE),
+                "I2882 {block}: refused by name: {body}"
+            );
+        }
+
+        let mut lone = env.clone();
+        lone.edge_signature.composite = ed_half;
+        let (status, body) = post_envelope(app, &lone).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "I2882 lone half");
+        assert!(
+            body.expect_error()
+                .detail
+                .starts_with(VERIFY_COMPONENT_SIGNATURE),
+            "I2882 lone half: {body:?}"
+        );
+
+        let mut label = env.clone();
+        label.edge_key_id = "cirislens-edge-test-1".into();
+        sign_edge(&mut label).await;
+        let (status, body) = post_envelope(app, &label).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "I2882 label");
+        assert!(
+            body.expect_error()
+                .detail
+                .starts_with(VERIFY_NOT_IDENTITY_REF),
+            "I2882 label: {body:?}"
+        );
+    }
+
+    // ── v37.0.0 canonicalizer witnesses ──────────────────────────────
     //
-    // Two independent breaks land on invariant 2 in this cut:
-    //   * CIRISPersist#716 — `canonicalize_for_edge_signing` re-pinned
-    //     from V1Python to CEG-produce/JCS.
-    //   * The `HybridPolicy::Ed25519Fallback` -> `Strict` flip.
+    // CIRISPersist#716 — `canonicalize_for_edge_signing` re-pinned from
+    // V1Python to CEG-produce/JCS. (The v37 Strict-policy witnesses are
+    // deleted with the two-field signature, v62.0.0 F0-cp5; I2882 above.)
     //
     // Each gets a witness that asserts the NEW behaviour against a
     // HAND-WRITTEN expectation. None of them derive the expected value by
@@ -1309,6 +1745,7 @@ mod tests {
     /// expectations below are written as literal bytes on that axis and
     /// are mutually exclusive: no single canonicalizer can satisfy both
     /// the "present" and the "absent" assertion.
+    // P7-fix7 — pure (no backend, no app): runs in every backend build.
     #[tokio::test]
     async fn edge_signing_canonicalizes_under_ceg_produce_jcs() {
         let batch = make_signed_batch(1);
@@ -1356,10 +1793,33 @@ mod tests {
     /// is payload-DEPENDENT, which is the operationally dangerous part —
     /// an un-re-pinned edge appears healthy until the first divergent
     /// payload. This witness pins the divergent half.
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn v1_canonicalized_edge_signature_is_rejected() {
-        use ciris_keyring::PqcSigner as _;
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        Box::pin(v1_canonicalized_edge_signature_is_rejected_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    /// [`v1_canonicalized_edge_signature_is_rejected`] on postgres (P7-fix7: every backend gets the door).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn v1_canonicalized_edge_signature_is_rejected_postgres() {
+        let Some((app, backend)) = build_pg_app(DEFAULT_QUEUE_DEPTH).await else {
+            return;
+        };
+        Box::pin(v1_canonicalized_edge_signature_is_rejected_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    async fn v1_canonicalized_edge_signature_is_rejected_on<B: RouteBackend>(
+        app: &Router,
+        _backend: &B,
+    ) {
         let batch = make_signed_batch(1);
         let mut env = make_signed_pipeline_envelope(batch).await;
         // Non-ASCII — the axis on which V1Python (\uXXXX escapes) and
@@ -1373,36 +1833,19 @@ mod tests {
         let v1_bytes = PythonJsonDumpsCanonicalizer
             .canonicalize_value(&value)
             .unwrap();
-        let ed_sig = SigningKey::from_bytes(&EDGE_SEED)
-            .sign(&v1_bytes)
-            .to_bytes();
-        let mut bound = Vec::with_capacity(v1_bytes.len() + ed_sig.len());
-        bound.extend_from_slice(&v1_bytes);
-        bound.extend_from_slice(&ed_sig);
-        let pqc_sig = edge_mldsa().sign(&bound).await.unwrap();
-        env.edge_signature.ed25519 = BASE64.encode(ed_sig);
-        env.edge_signature.ml_dsa_65 = Some(BASE64.encode(&pqc_sig));
+        env.edge_signature.composite = edge_composite(&v1_bytes);
 
-        let (status, body) = post_envelope(&app, &env).await;
+        let (status, body) = post_envelope(app, &env).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         let err = body.expect_error();
         assert_eq!(err.kind, KIND_EDGE_SIGNATURE);
-        // LOUD + SELF-EXPLAINING: the detail must send the operator to
-        // the canonicalizer, not to the key. A bare "signature failed
-        // verify" here is the outcome this witness exists to prevent.
+        // v62.0.0 (F0-cp5) — the composite does not verify over the bytes
+        // this build rebuilds, refused by its token.
         assert!(
-            err.detail.contains("CEG-produce/JCS") && err.detail.contains("V1Python"),
-            "rejection detail must name the canonicalization re-pin; got: {}",
-            err.detail
-        );
-        assert!(
-            err.detail.contains("CIRISPersist#716"),
-            "rejection detail must cite the issue; got: {}",
-            err.detail
-        );
-        assert!(
-            err.detail.contains("not a key problem"),
-            "rejection detail must rule OUT the key, the likeliest misdiagnosis; got: {}",
+            err.detail.starts_with(
+                crate::federation::edition2::composite_verify::VERIFY_COMPOSITE_INVALID
+            ),
+            "{}",
             err.detail
         );
     }
@@ -1420,16 +1863,43 @@ mod tests {
     /// nothing broke" is NOT evidence that the edge re-pinned. Anyone
     /// planning the window on the belief that the break is immediate and
     /// total is planning against behaviour this test contradicts.
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn v1_canonicalized_ascii_envelope_still_verifies() {
-        use ciris_keyring::PqcSigner as _;
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
+        Box::pin(v1_canonicalized_ascii_envelope_still_verifies_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    /// [`v1_canonicalized_ascii_envelope_still_verifies`] on postgres (P7-fix5: every backend gets the door).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn v1_canonicalized_ascii_envelope_still_verifies_postgres() {
+        let Some((app, backend)) = build_pg_app(DEFAULT_QUEUE_DEPTH).await else {
+            return;
+        };
+        Box::pin(v1_canonicalized_ascii_envelope_still_verifies_on(
+            &app, &*backend,
+        ))
+        .await;
+    }
+
+    async fn v1_canonicalized_ascii_envelope_still_verifies_on<B: RouteBackend>(
+        app: &Router,
+        backend: &B,
+    ) {
         let batch = make_signed_batch(1);
         let mut env = make_signed_pipeline_envelope(batch).await;
         // Pure ASCII — the fixture's default shape.
         env.sidecar.pipeline_metadata.edge_build_id = "edge-ascii-build".into();
 
-        let mut value = serde_json::to_value(&env).unwrap();
+        // v62.0.0 (P7-fix4) — the body as sent on the v62 trace wire (the
+        // inner trace as its row + blob: base64 text, still pure ASCII).
+        let mut sent = serde_json::to_value(&env).unwrap();
+        row_form_events(&row_agent(backend).await, &mut sent);
+        let mut value = sent.clone();
         value.as_object_mut().unwrap().remove("edge_signature");
         let v1_bytes = PythonJsonDumpsCanonicalizer
             .canonicalize_value(&value)
@@ -1438,20 +1908,12 @@ mod tests {
         // the V1 bytes ARE the bytes this build rebuilds.
         assert_eq!(
             v1_bytes,
-            canonicalize_for_edge_signing(&env).unwrap(),
+            canonicalize_raw_for_edge_signing(&sent).unwrap(),
             "V1Python and JCS must coincide on an all-ASCII payload"
         );
-        let ed_sig = SigningKey::from_bytes(&EDGE_SEED)
-            .sign(&v1_bytes)
-            .to_bytes();
-        let mut bound = Vec::with_capacity(v1_bytes.len() + ed_sig.len());
-        bound.extend_from_slice(&v1_bytes);
-        bound.extend_from_slice(&ed_sig);
-        let pqc_sig = edge_mldsa().sign(&bound).await.unwrap();
-        env.edge_signature.ed25519 = BASE64.encode(ed_sig);
-        env.edge_signature.ml_dsa_65 = Some(BASE64.encode(&pqc_sig));
+        sent["edge_signature"]["composite"] = serde_json::json!(edge_composite(&v1_bytes));
 
-        let (status, _) = post_envelope(&app, &env).await;
+        let (status, _) = post_value(app, &sent).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -1460,72 +1922,27 @@ mod tests {
         );
     }
 
-    /// v37.0.0 — a hybrid-COMPLETE key that omits the PQC signature half
-    /// is refused as `PqcFieldsMustBeBoth`, not `HybridPendingRejected`.
-    ///
-    /// The row carries a PQC pubkey and the SENDER dropped the half — a
-    /// downgrade against a hybrid-capable identity — so it must refuse with
-    /// the both-or-neither detail. (v62.0.0: the classical-only key-row
-    /// sibling witnessed a hybrid-pending row, an earlier-form state, and is
-    /// deleted.)
-    #[tokio::test]
-    async fn pqc_sig_omitted_against_hybrid_complete_key_is_rejected() {
-        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH).await;
-        let batch = make_signed_batch(1);
-        let mut env = make_signed_pipeline_envelope(batch).await;
-        env.edge_signature.ml_dsa_65 = None;
-
-        let (status, body) = post_envelope(&app, &env).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        let err = body.expect_error();
-        assert_eq!(err.kind, KIND_EDGE_SIGNATURE);
-        assert!(
-            err.detail
-                .contains("PQC signature without pubkey (or vice versa)"),
-            "expected the both-or-neither refusal; got: {}",
-            err.detail
-        );
-        assert!(
-            err.detail.contains("HybridPolicy::Strict requires it"),
-            "detail must state the remedy for the omitted-half direction; got: {}",
-            err.detail
-        );
-        assert!(
-            err.detail.contains("Not a key-validity problem"),
-            "detail must rule OUT the key; got: {}",
-            err.detail
-        );
-    }
-
-    /// v37.0.0 — the two flag-day failures must NOT read alike. An
-    /// operator triaging one must not be handed the other's remedy.
-    #[tokio::test]
-    async fn flag_day_rejection_details_are_distinguishable() {
-        use crate::verify::hybrid::VerifyError;
-        let canon = edge_signature_rejection_detail(&VerifyError::Crypto(
-            "ed25519 signature mismatch".to_string(),
-        ));
-        let strict = edge_signature_rejection_detail(&VerifyError::HybridPendingRejected);
-        let unknown =
-            edge_signature_rejection_detail(&VerifyError::Crypto("verify_unknown_key".to_string()));
-
-        assert!(canon.contains("CIRISPersist#716") && canon.contains("Re-pin the signer"));
-        assert!(!canon.contains("HybridPolicy::Strict"));
-
-        assert!(strict.contains("HybridPolicy::Strict"));
-        assert!(!strict.contains("CIRISPersist#716"));
-
-        // The genuine key problem still reads as one — the loud
-        // canonicalizer note must not swallow it.
-        assert!(unknown.contains("not registered in federation_keys"));
-        assert!(!unknown.contains("CIRISPersist#716"));
-    }
-
     /// Mission constraint (MISSION.md §3 anti-pattern #7) — full
     /// queue surfaces 429 + Retry-After on the new route too.
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn pipeline_ingest_429_on_full_queue() {
-        let (app, _backend) = build_app(1).await;
+        let (app, backend) = build_app(1).await;
+        Box::pin(pipeline_ingest_429_on_full_queue_on(&app, &*backend)).await;
+    }
+
+    /// [`pipeline_ingest_429_on_full_queue`] on postgres (P7-fix5: every backend gets the door).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn pipeline_ingest_429_on_full_queue_postgres() {
+        let Some((app, backend)) = build_pg_app(1).await else {
+            return;
+        };
+        Box::pin(pipeline_ingest_429_on_full_queue_on(&app, &*backend)).await;
+    }
+
+    async fn pipeline_ingest_429_on_full_queue_on<B: RouteBackend>(app: &Router, backend: &B) {
+        let kid = row_agent(backend).await;
         // Saturate the queue with rapid valid-envelope submissions.
         // The persister drains one at a time; with queue_depth=1 the
         // second-in-flight submission lands 429. The envelopes are signed
@@ -1536,7 +1953,8 @@ mod tests {
         for _ in 0..200 {
             let batch = make_signed_batch(1);
             let env = make_signed_pipeline_envelope(batch).await;
-            bodies.push(serde_json::to_vec(&env).unwrap());
+            // v62.0.0 (P7-fix4) — each body on the v62 trace wire.
+            bodies.push(serde_json::to_vec(&to_row_form(&kid, &env).await).unwrap());
         }
         // Submitted concurrently: each handler runs to its first await, so
         // many reach the queue while the persister holds the one slot.

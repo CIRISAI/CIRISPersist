@@ -374,6 +374,8 @@ pub mod two_node {
         at: chrono::DateTime<chrono::Utc>,
     ) -> Vec<Vec<u8>> {
         let id = format!("ob-{}", uuid::Uuid::new_v4().simple());
+        // CP2 skeleton: the builder's unsigned shape, re-signed as edition 2
+        // (`row_of`) before any door.
         let mut earlier = e2::with_earlier_form(|| ts::owner_binding_attestation(&id, owner, node));
         let at = crate::federation::admission::truncate_to_substrate_resolution(at);
         earlier.asserted_at = at;

@@ -939,36 +939,22 @@ pub fn raw_payload(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// v62.0.0 (JSON-cut slice A; CC 2.6.1.12, rc20 "nothing carries, clean
-/// mesh") — **THE switch that shuts the earlier-form doors.** While it is
-/// `false` every JSON door admits as before; slice F flips it to `true`, in
-/// this one place, and every door wired to [`refuse_earlier_form`] refuses
-/// an earlier-form object by name ([`token::EARLIER_FORM_OBJECT`]).
-pub const EARLIER_FORM_DOORS_SHUT: bool = false;
+/// mesh") — **THE switch that shuts the earlier-form doors.** Slice F
+/// flipped it to `true`, in this one place: every door wired to
+/// [`refuse_earlier_form`] refuses an earlier-form object by name
+/// ([`token::EARLIER_FORM_OBJECT`]), before any parse or verify
+/// (I2870–I2873). `scripts/earlier_form_doors.py` holds the wiring from
+/// disk: a write door that takes an object and does not reach the refusal
+/// is red.
+pub const EARLIER_FORM_DOORS_SHUT: bool = true;
 
-#[cfg(test)]
-tokio::task_local! {
-    /// A test forces the switch on for the future it scopes
-    /// ([`with_earlier_form_doors_shut`]), so a witness can assert each
-    /// door's refusal before F flips [`EARLIER_FORM_DOORS_SHUT`].
-    static FORCE_SHUT: bool;
-}
-
-/// Is the earlier form shut at this node's doors?
+/// Is the earlier form shut at this node's doors? v62.0.0 (slice F): always,
+/// in this edition. The test-only scope that forced it on before the flip
+/// (`with_earlier_form_doors_shut`) is deleted with the open state it
+/// overrode.
 #[must_use]
 pub fn earlier_form_doors_shut() -> bool {
-    #[cfg(test)]
-    if FORCE_SHUT.try_with(|f| *f).unwrap_or(false) {
-        return true;
-    }
     EARLIER_FORM_DOORS_SHUT
-}
-
-/// Test only: run `fut` with the switch forced on.
-#[cfg(test)]
-pub(crate) async fn with_earlier_form_doors_shut<T>(
-    fut: impl std::future::Future<Output = T>,
-) -> T {
-    FORCE_SHUT.scope(true, fut).await
 }
 
 /// **The one shared refusal every earlier-form door calls** (v62.0.0,

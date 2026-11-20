@@ -23,6 +23,9 @@
 //!   reader over persist's directory gives the vector's exact verdict, and
 //!   the door the matching refusal. `after_valid_until` waits on a record of
 //!   the key covering the instant (`MissingKey::CoveringRecord`, CC 2.4.1.1).
+//!   DEPARTURE (K1, triage round 3): `held_through_chain` (B's node record
+//!   with A's voice alone) waits the same way here, where Verify reads it
+//!   Valid: CC 2.4.1.1, "Each key's own holder signs its record".
 //! - `objects`: the header verdicts agree, and persist's object id equals
 //!   the vector's.
 //! - `key_of_iss_v1.json` (I2366): every case through Verify's reader with
@@ -223,6 +226,21 @@ fn i1901_refusals_give_verifys_reasons() {
                 );
                 format!("refused:{}", malformed_row::EDITION2_ROW_REF_EDITION_1)
             }
+            // v62.0.0 (wave P1d) — the family's closed payload map runs with
+            // the door's pure gates, before Verify's verdict, and names a
+            // missing required `asserted_at` first; Verify's reader alone
+            // gives the vector's reason. Both refuse the statement.
+            "no_asserted_at" => {
+                assert_eq!(
+                    reader_label(&verify_row_statement(
+                        &hx(&c["statement_hex"]),
+                        &dir(seeds(c))
+                    )),
+                    expect,
+                    "I1901 {id}: Verify's reader"
+                );
+                format!("refused:{}", malformed_row::EDITION2_PAYLOAD_INVALID)
+            }
             _ => want,
         };
         assert_eq!(got, want, "I1901 {id}");
@@ -280,7 +298,33 @@ fn i1901_i2365_key_directory_through_persists_reading() {
             held.insert_record(hx(r)).unwrap();
         }
         let st = hx(&c["statement_hex"]);
-        let expect = c["expect"].as_str().unwrap();
+        // v62.0.0 (K1, triage round 3) — a DEPARTURE from Verify's vector:
+        // `held_through_chain` holds B's node record with A's voice alone.
+        // CC 2.4.1.1: "Each key's own holder signs its record of this form,
+        // so the genesis ends no key and gives no key a power over
+        // another"; persist's liveness is the kernel's key-end reading
+        // (`key_end::well_formed`: a record stating an end carries its own
+        // key's signature), so no record of B covers the statement's
+        // instant and it waits on one that does (CC 2.4.1.1: retryable).
+        // Named in the differential (`key_record_own_voice`); routed to
+        // Verify / CC (K1-fix3.md).
+        let departed;
+        let expect = if id == "held_through_chain" {
+            let (protected, payload) = super::liveness::statement_parts(&st).unwrap();
+            let kid = protected
+                .get_int(4)
+                .and_then(cde::Value::as_bytes)
+                .map(hex::encode)
+                .unwrap();
+            let at = payload
+                .get_text("asserted_at")
+                .and_then(cde::Value::as_u64)
+                .unwrap();
+            departed = format!("waiting{COLON}covering_record{COLON}{kid}{COLON}{at}");
+            departed.as_str()
+        } else {
+            c["expect"].as_str().unwrap()
+        };
         assert_eq!(
             reader_label(&verify_row_statement(&st, &held)),
             expect,

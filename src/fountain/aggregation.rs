@@ -22,7 +22,7 @@
 //! [`super::types::FountainManifestV1`] (the edge fountain-encodes it like
 //! any content, with `corpus_kind = "aggregate:<source_corpus_kind>"`), so
 //! it rides the EXISTING #225 hybrid-manifest admit gate
-//! ([`super::admit::check_admission_via_envelope`]) unchanged.
+//! ([`super::admit::check_admission`]) unchanged.
 //!
 //! # v8.4.0 — the §19.7 CONFORM step (closes the #230 residual)
 //! v8.3.0 stored `aggregation_meta` **opaque** because the §19.7 wire shape
@@ -36,7 +36,7 @@
 //!     verify-core wire [`ciris_verify_core::substrate::AggregationMetaV1`],
 //!     resolves the aggregator hybrid pubkeys off the composite manifest
 //!     envelope (the aggregator IS the composite's producer; same convention
-//!     as [`super::admit::check_admission_via_envelope`]), and calls
+//!     as [`super::admit::check_admission`]), and calls
 //!     [`ciris_verify_core::substrate::verify_aggregation_meta`]. A
 //!     missing/invalid ML-DSA-65 half is REJECTED **before** any write
 //!     (verify-before-mutation; never store-then-quarantine). The
@@ -195,7 +195,7 @@ pub fn aggregate_corpus_kind(source_corpus_kind: &str) -> String {
 /// hybrid pubkeys are NOT carried here — they are resolved off the composite
 /// manifest envelope (`pubkey_ed25519` / `pubkey_ml_dsa_65`), bound into the
 /// verify so a forged pubkey fails the signature (the same argument
-/// [`super::admit::check_admission_via_envelope`] makes).
+/// [`super::admit::check_admission`] makes).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregationMetaVerifyInputsV1 {
     /// §19.7.1 schema version (`1`).
@@ -524,7 +524,12 @@ impl AggregationMetaV1 {
             &v.sig_composite_b64,
         )
         .map_err(|e| match e {
-            crate::verify::sig19::Sig19Error::EarlierForm => AggregationMetaError::EarlierForm,
+            // v62.0.0 (F0-cp5b) — a lone half is the earlier component
+            // form: refused by name with it.
+            crate::verify::sig19::Sig19Error::EarlierForm
+            | crate::verify::sig19::Sig19Error::ComponentSignature(_) => {
+                AggregationMetaError::EarlierForm
+            }
             _ => AggregationMetaError::MalformedInput("sig_composite"),
         })?;
         let verified = matches!(

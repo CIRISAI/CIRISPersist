@@ -1962,43 +1962,9 @@ impl PeerWriteQuota {
     /// it lead the whole chain. See [`RESERVED_CLASS_BUDGET_MULTIPLE`] for
     /// what a *pure* (hence forgeable) class decision does and does not buy.
     pub fn classify(row: &crate::federation::types::Attestation) -> WriteAdmissionClass {
-        // v31.1.0 (CIRISPersist#665) — **A ROW CLAIMING A BAKED GENESIS ID IS
-        // ITS OWN CLASS, BECAUSE THE NODE'S OWN SEED IS NOT A PEER AND A CLAIM
-        // IS NOT AN IDENTITY.**
-        //
-        // 31.1.0 made boot install `genesis-charter` / `genesis-grant:…` /
-        // `genesis-lifecycle` through `put_attestation`, which charges this
-        // quota — so a FRESH engine came up having "observed" one peer (`A1`)
-        // that no peer had ever spoken as. That corrupts the signal at its
-        // source: `tracked_peers` exists to separate *"nobody has talked to
-        // us"* from *"peers have, and none were denied"*, and `node_state`
-        // reads `tracked_peers > 0` as the thing that lifts the peer-quota band
-        // out of `unknown` into `green`. Every fresh node would have reported a
-        // TESTED quota on the strength of its own compiled-in artifact.
-        //
-        // The first fix routed these ids to `Reserved`, which does not open a
-        // bucket — correct about the symptom and **wrong about the budget**.
-        // This runs at TIER 0, ahead of any signature check, so the only thing
-        // establishing `attesting_key_id = "A1"` is the row SAYING SO.
-        // `check_genesis_attestation_reserved` runs before it and does not help:
-        // it compares the CLAIMED key against the roster and authenticates
-        // nothing. An unauthenticated peer could therefore drain the budget that
-        // keeps accord objections writable, using rows
-        // `verify_federation_tier_ingest` was about to reject — the same DoS
-        // this cut moved that gate forward to close, re-opened one budget over.
-        //
-        // So the class is neither: charged against the node budget and the
-        // shared untracked tail — what any stranger already pays, so no new
-        // scarcity is exposed — and never promoted to a peer bucket. **Debit
-        // only what the claim is entitled to.** See
-        // `WriteAdmissionClass::GenesisClaim` for the full reasoning, including
-        // why being denied a bucket is strictly more restrictive for an attacker
-        // than being given one.
-        if crate::federation::genesis::genesis_delegation_ids()
-            .contains(&row.attestation_id.as_str())
-        {
-            return WriteAdmissionClass::GenesisClaim;
-        }
+        // v62.0.0 (C5-fix1): the baked genesis ids are deleted, so no row
+        // claims one and `GenesisClaim` is never classified (the variant and
+        // its debit rule stay for F's cut).
         match crate::federation::admission::envelope_dimension(&row.attestation_envelope) {
             Some(dim)
                 if RESERVED_CLASS_DIMENSION_PREFIXES

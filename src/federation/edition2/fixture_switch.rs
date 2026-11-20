@@ -604,6 +604,37 @@ fn refs_value(v: &serde_json::Value) -> Value {
     }
 }
 
+/// `refs` from row ids by role, as `emit::payload_from_envelope` states
+/// them: a top-level role naming one row is that row-ref, several a sorted
+/// set; an `also:<r>` role is `also: { <r>: [sorted row-refs] }`.
+fn refs_value_of(roles: &std::collections::BTreeMap<&'static str, Vec<Digest32>>) -> Value {
+    let set = |ids: &Vec<Digest32>| {
+        let mut ids = ids.clone();
+        ids.sort_unstable();
+        ids.dedup();
+        det_set(
+            ids.iter()
+                .map(ciris_verify_core::edition2::row_ref)
+                .collect(),
+        )
+    };
+    let mut top: Vec<(Value, Value)> = Vec::new();
+    let mut also: Vec<(Value, Value)> = Vec::new();
+    for (role, ids) in roles {
+        if let Some(r) = role.strip_prefix("also:") {
+            also.push((text(r), set(ids)));
+        } else if ids.len() == 1 {
+            top.push((text(role), ciris_verify_core::edition2::row_ref(&ids[0])));
+        } else {
+            top.push((text(role), set(ids)));
+        }
+    }
+    if !also.is_empty() {
+        top.push((text("also"), det_map(also)));
+    }
+    det_map(top)
+}
+
 /// The payload member types of the family id `family`
 /// ([`payloads::FAMILIES`], keyed by pattern).
 fn member_types(family: &str) -> Vec<(&'static str, Ty)> {
@@ -780,7 +811,63 @@ fn payload_of(row: &Attestation, family: &str, signer_iref: &str) -> Value {
     o.remove("asserted_at");
     o.remove("expires_at");
     let has_refs = o.contains_key("refs");
-    let target = o.remove(REFERENCES_MEMBER);
+    let target = o.remove(REFERENCES_MEMBER).filter(|t| {
+        // v62.0.0 (E0 fix 8) — an earlier-form SELF-reference (a trust
+        // charter's, a delegation's: `references_attestation_id` = the row's
+        // own id) names no other row. An edition-2 row cannot name itself (its
+        // id is computed over its payload), so the echo is not stated.
+        t.as_str() != Some(row.attestation_id.as_str())
+    });
+    // v62.0.0 (E0 fix 8) — a JSON `null` member is an absent one (CBOR
+    // `null` is no ceg-value, CC 2.6.1.3; `emit::payload_from_envelope` skips
+    // it the same way).
+    o.retain(|_, v| !v.is_null());
+    // v62.0.0 (E0 fix 9; P1's `REF_MEMBERS`, CC 2.6.1.3 "a member that names
+    // a row stands in `refs` and nowhere else") — the earlier members this
+    // family states under a `refs` role (a deferral response's
+    // `references_attestation_id` → `answers`; an amendment's `authorized_by`
+    // / `evidence_refs` → `also:cites`), each name resolved to a row id as a
+    // target is ([`resolve_target`]).
+    let mut ref_roles: std::collections::BTreeMap<&'static str, Vec<Digest32>> =
+        std::collections::BTreeMap::new();
+    let mut target = target;
+    if has_refs {
+        // A mapped row re-sealed: its `refs` are the statement's, and the
+        // mapping's projections of them back to earlier members are not
+        // members of the payload.
+        for (_, member, _) in payloads::ref_members(family) {
+            o.remove(member);
+        }
+    } else {
+        for (role, member, _) in payloads::ref_members(family) {
+            let taken = if member == REFERENCES_MEMBER {
+                target.take()
+            } else {
+                o.remove(member)
+            };
+            let Some(v) = taken else { continue };
+            let names: Vec<String> = match &v {
+                serde_json::Value::String(x) => vec![x.clone()],
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            for n in names {
+                let id = resolve_target(&n).unwrap_or_else(|| {
+                    panic!(
+                        "fixture_switch: `{member}` {n:?} is not a row id, nor the id a fixture \
+                         gave a row it sealed: name the row by rid(&row)"
+                    )
+                });
+                let d = <[u8; 32]>::try_from(hex::decode(&id).expect("hex").as_slice())
+                    .expect("32 bytes");
+                ref_roles.entry(role).or_default().push(d);
+            }
+        }
+    }
     let dimension = o
         .get("dimension")
         .and_then(serde_json::Value::as_str)
@@ -806,6 +893,11 @@ fn payload_of(row: &Attestation, family: &str, signer_iref: &str) -> Value {
             "carried" | "seat_commitment" | "amendment_digest" | "call_fingerprint"
         ) {
             digest_value(v, k)
+        } else if GROUP_KEY_MEMBERS.contains(&k.as_str()) && v.is_string() {
+            // v62.0.0 (E0 fix 7) — a cohort target names a group KEY, and an
+            // edition-2 group is keyed by its identity-ref
+            // (`group_fixtures::community_with_kids`).
+            identity_value(v, k)
         } else if k == "refs" {
             refs_value(v)
         } else if k == "author" {
@@ -827,13 +919,7 @@ fn payload_of(row: &Attestation, family: &str, signer_iref: &str) -> Value {
             if let Some(id) = resolve_target(t) {
                 let d = <[u8; 32]>::try_from(hex::decode(&id).expect("hex").as_slice())
                     .expect("32 bytes");
-                m.push((
-                    text("refs"),
-                    det_map(vec![(
-                        text("target"),
-                        ciris_verify_core::edition2::row_ref(&d),
-                    )]),
-                ));
+                ref_roles.entry("target").or_default().push(d);
             } else {
                 panic!(
                     "fixture_switch: `{REFERENCES_MEMBER}` {t:?} is not a row id, nor the id a \
@@ -841,6 +927,9 @@ fn payload_of(row: &Attestation, family: &str, signer_iref: &str) -> Value {
                 );
             }
         }
+    }
+    if !ref_roles.is_empty() {
+        m.push((text("refs"), refs_value_of(&ref_roles)));
     }
     // The typed `weight` column, when the envelope states none: the payload's
     // fixed-scale `weight` (CC 2.6.1.5, round(w × 10⁶)); the store binds the
@@ -855,6 +944,20 @@ fn payload_of(row: &Attestation, family: &str, signer_iref: &str) -> Value {
     m.push((text("asserted_at"), Value::Uint(ms(row.asserted_at))));
     if let Some(e) = row.expires_at {
         m.push((text("expires_at"), Value::Uint(ms(e))));
+    }
+    // v62.0.0 (E0 fix 9) — a REQUIRED instant member of a mapped family that
+    // the earlier envelope omits (a revocation's `revoked_at` /
+    // `effective_at`, stated by its typed record and not its envelope) is the
+    // row's own instant: the fixture states the act as of when it is signed.
+    if let Some(f) = payloads::family_by_id(family) {
+        for mem in f.members {
+            if mem.ty == Ty::Ms
+                && matches!(mem.presence, payloads::Presence::Required)
+                && !m.iter().any(|(k, _)| k.as_text() == Some(mem.name))
+            {
+                m.push((text(mem.name), Value::Uint(ms(row.asserted_at))));
+            }
+        }
     }
     if !o.contains_key("cohort_scope")
         && !row.cohort_scope.is_empty()
@@ -876,6 +979,27 @@ fn payload_of(row: &Attestation, family: &str, signer_iref: &str) -> Value {
     let authored_here = m.iter().any(|(k, _)| k.as_text() == Some("author"));
     if !authored_here && !counted(family, dimension.as_deref()) {
         m.push((text("author"), text(signer_iref)));
+    }
+    // v62.0.0 (E0 fix 8) — fold ONLY what the door would refuse: a payload the
+    // door's own check admits as it stands (a leaf outside the family's mapped
+    // set, e.g. `membership:acceptance`) keeps its members where the gates
+    // read them.
+    if payloads::check_by_id(family, &row.attestation_type, &det_map(m.clone())).is_ok() {
+        return det_map(m);
+    }
+    // v62.0.0 (E0 fix 9) — the row's `expires_at` COLUMN, where the family
+    // derives the end itself and closes the member (a custody report is live
+    // 72 hours from its asserted_at): not stated when the door admits the
+    // payload without it.
+    if m.iter().any(|(k, _)| k.as_text() == Some("expires_at")) {
+        let without: Vec<(Value, Value)> = m
+            .iter()
+            .filter(|(k, _)| k.as_text() != Some("expires_at"))
+            .cloned()
+            .collect();
+        if payloads::check_by_id(family, &row.attestation_type, &det_map(without.clone())).is_ok() {
+            return det_map(without);
+        }
     }
     det_map(fold_into_body(m, family, &row.attestation_type))
 }
@@ -1011,6 +1135,30 @@ pub fn counted_statement_of_family(a: &Attestation, seed: &str, family: &str) ->
 #[must_use]
 pub fn counted_row_of(a: &Attestation, seed: &str) -> Attestation {
     row_of_statement(&counted_statement_of(a, seed), tier_of(a))
+}
+
+/// v62.0.0 (E0 fix 8) — is `row` a composer (`withdraws` / `recants` /
+/// `supersedes`) that names no target yet: no `refs` and no
+/// `references_attestation_id` other than its own id (a self-echo names
+/// nothing)? Such a row cannot be a statement (the door requires
+/// `refs.target`); `tier_ingest::test_support::seal_row_in_place` leaves it
+/// unsealed until its target is set.
+#[must_use]
+pub fn is_untargeted_composer(row: &Attestation) -> bool {
+    if !COMPOSER_ROW_TYPES.contains(&row.attestation_type.as_str()) {
+        return false;
+    }
+    let env = &row.attestation_envelope;
+    if env.get("refs").is_some_and(|r| !r.is_null()) {
+        return false;
+    }
+    match env
+        .get(REFERENCES_MEMBER)
+        .and_then(serde_json::Value::as_str)
+    {
+        None => true,
+        Some(t) => t.is_empty() || t == row.attestation_id,
+    }
 }
 
 /// [`statement_of`], or why the row names no family.
@@ -1156,6 +1304,45 @@ pub fn row_of(a: &Attestation, seed: &str) -> Attestation {
                 .unwrap_or("-")
         )
     })
+}
+
+/// v62.0.0 (E0 fix 9) — **the seal a fixture builder applies**: [`row_of`]
+/// when the door admits the statement; when the door REFUSES it (a score
+/// out of range, a closed member, a family rule a witness is about to
+/// assert), the row carrying that very statement, UNADMITTED (its ids are
+/// the statement's: `attestation_id` = the row id the bytes name,
+/// `attesting_key_id` = the signer's identity-ref), so the put door refuses
+/// it by the same reason the witness expects, at the put, as an `Err`. Never
+/// a panic at the seal for a refusal the door owns. A row that names no
+/// family still panics (no statement can be built; use the `try_*` forms).
+///
+/// # Panics
+/// A row that names no family.
+#[must_use]
+pub fn seal(a: &Attestation, seed: &str) -> Attestation {
+    let st = statement_of(a, seed);
+    match try_row_of_statement(&st, tier_of(a)) {
+        Ok(r) => r,
+        Err(_) => {
+            let mut r = a.clone();
+            let iss = kid(seed);
+            let id = RowId::of_statement(&st).map_or_else(|| r.attestation_id.clone(), |i| i.hex());
+            if let Some(o) = r.attestation_envelope.as_object_mut() {
+                o.remove("row");
+                o.insert(
+                    STATEMENT_MEMBER.to_owned(),
+                    serde_json::Value::String(hex::encode(&st)),
+                );
+            }
+            r.attesting_key_id = iss.clone();
+            r.scrub_key_id = iss;
+            r.attested_key_id = subject_of(&a.attested_key_id);
+            r.attestation_id = id.clone();
+            r.persist_row_hash = id;
+            r.additional_scrubs = Vec::new();
+            r
+        }
+    }
 }
 
 /// [`row_of`] wrapped for `put_attestation`.
@@ -1338,6 +1525,21 @@ fn note_window(seed: &str, window: Option<(u64, u64)>) {
 /// re-seal. Named, never read as a default window the key does not have.
 #[must_use]
 pub fn key_window_start_ms(seed: &str) -> u64 {
+    try_key_window_start_ms(seed).unwrap_or_else(|| {
+        panic!(
+            "fixture_switch: key_window_start_ms({seed}): {} was put with an explicit window \
+             (asserted_at / valid_until given), which this cannot read: date the row from that \
+             record's own asserted_at_ms and re-seal",
+            kid(seed)
+        )
+    })
+}
+
+/// v62.0.0 (E0 fix 9) — [`key_window_start_ms`], or `None` for a key put with
+/// an EXPLICIT window (a builder whose caller re-dates the row then needs no
+/// default; it never reads a window the key does not have).
+#[must_use]
+pub fn try_key_window_start_ms(seed: &str) -> Option<u64> {
     let k = kid(seed);
     if let Some((from, _)) = default_windows()
         .lock()
@@ -1345,18 +1547,16 @@ pub fn key_window_start_ms(seed: &str) -> u64 {
         .get(&k)
         .copied()
     {
-        return from;
+        return Some(from);
     }
-    assert!(
-        !explicit_windows()
-            .lock()
-            .expect("explicit-window set")
-            .contains(&k),
-        "fixture_switch: key_window_start_ms({seed}): {k} was put with an explicit window \
-         (asserted_at / valid_until given), which this cannot read: date the row from that \
-         record's own asserted_at_ms and re-seal"
-    );
-    default_asserted_at(&["node"])
+    if explicit_windows()
+        .lock()
+        .expect("explicit-window set")
+        .contains(&k)
+    {
+        return None;
+    }
+    Some(default_asserted_at(&["node"]))
 }
 
 /// The default window a node / agent key gets with no options.
@@ -1532,6 +1732,29 @@ pub fn is_foreign_kid(s: &str) -> bool {
         .lock()
         .expect("foreign map")
         .contains_key(s)
+}
+
+/// v62.0.0 (E0 fix 9) — **let the in-memory door hold a key no seed names**
+/// (a genesis bundle holder's, a hand-built composite) without putting it in
+/// a store: [`row_of_statement`] / [`admit`] then read its statements as they
+/// read a seeded signer's (a `user` record of it from 0, signed by itself).
+/// Its kid. A seed still cannot be recovered from it ([`is_foreign_kid`]).
+#[must_use]
+pub fn register_foreign_key(key: &CompositeSigningKey) -> String {
+    let k = identity_ref(&thumbprint(key.public_key()));
+    let rec = key_record_for_composite(
+        key,
+        &["user"],
+        &KeyRecordOptions {
+            asserted_at_ms: Some(0),
+            ..KeyRecordOptions::default()
+        },
+    );
+    foreign_records()
+        .lock()
+        .expect("foreign map")
+        .insert(k.clone(), rec);
+    k
 }
 
 /// A self-signed `key:record` of a composite key NOT derived from a seed.
@@ -3179,6 +3402,97 @@ mod store_tests {
 // (`family_voices`, `community_voices`, `family_revocation_voices`, ...,
 // `put_voices`, `row_id_of`), so a held test reaches them as `e2::..`.
 pub use super::group_fixtures::*;
+
+/// v62.0.0 (E0 fix 7) — the members that name a cohort's group key (the
+/// earlier gates' cohort-target aliases): stated as identity-refs.
+const GROUP_KEY_MEMBERS: &[&str] = &[
+    "community_id",
+    "community_key_id",
+    "family_id",
+    "family_key_id",
+];
+
+/// v62.0.0 (E0 fix 7) — a key as the store names it in the form the test
+/// runs under: its identity-ref under the switch, the label in a held test.
+#[must_use]
+pub fn stored_id(seed: &str) -> String {
+    if emit_edition2() {
+        kid(seed)
+    } else {
+        seed.to_owned()
+    }
+}
+
+fn require_landed(what: &str, out: StatementOutcome) -> Result<(), Error> {
+    match out {
+        StatementOutcome::Row { .. } | StatementOutcome::KeyPlane { .. } => Ok(()),
+        other => Err(Error::InvalidArgument(format!(
+            "fixture_switch: {what} did not land as a row: {other:?} (a voice short of the \
+             group's protocol; stand up every listed member's key)"
+        ))),
+    }
+}
+
+/// v62.0.0 (E0 fix 7; T1's group statement door) — **put a community in the
+/// form the test runs under**: under the switch its `group:roster` voices
+/// (`community_voices`, version 1, asserted now), which must LAND as the
+/// typed row (a held roster is an `Err`, never a silent `Ok`); in a held
+/// test `put_community`.
+///
+/// # Errors
+/// The doors' refusals; a roster that does not land.
+pub async fn put_community_any<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    signed: crate::federation::SignedCommunity,
+) -> Result<(), Error> {
+    if !emit_edition2() {
+        return dir.put_community(signed).await;
+    }
+    let at = ms(crate::host::clock::now());
+    require_landed(
+        "the community roster",
+        put_voices(dir, &community_voices(&signed, 1, None, at)).await?,
+    )
+}
+
+/// [`put_community_any`]'s family twin (`family_voices`).
+///
+/// # Errors
+/// As [`put_community_any`].
+pub async fn put_family_any<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    signed: crate::federation::SignedFamily,
+) -> Result<(), Error> {
+    if !emit_edition2() {
+        return dir.put_family(signed).await;
+    }
+    let at = ms(crate::host::clock::now());
+    require_landed(
+        "the family roster",
+        put_voices(dir, &family_voices(&signed, 1, None, at)).await?,
+    )
+}
+
+/// A community membership removal in the form the test runs under: the
+/// `membership:{stage}` voices over the held roster's head
+/// (`community_revocation_voices`, `held_head`), which must land.
+///
+/// # Errors
+/// As [`put_community_any`].
+pub async fn put_community_membership_revocation_any<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    signed: crate::federation::SignedCommunityMembershipRevocation,
+) -> Result<(), Error> {
+    if !emit_edition2() {
+        return dir.put_community_membership_revocation(signed).await;
+    }
+    let group = kid_or_keep(&signed.community_membership_revocation.community_key_id);
+    let head = held_head(dir, &group).await.map(|(h, _)| h);
+    require_landed(
+        "the membership removal",
+        put_voices(dir, &community_revocation_voices(&signed, head.as_ref())).await?,
+    )
+}
 
 /// v62.0.0 (wave O1) — the shared `identity:occurrence` bind builders
 /// (`edition2::fixture_occurrence`; O1.api.md).

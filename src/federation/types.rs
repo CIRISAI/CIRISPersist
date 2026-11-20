@@ -990,6 +990,18 @@ pub mod delegation_scope {
     /// never spells the token.
     pub const INFRA_RELAY: &str = "infra:relay";
 
+    /// v62.0.0 (F0-cp5b; the lead's ruling) — `infra:pipeline_writer`: write
+    /// a `PipelineEnvelope` through `POST /api/v1/pipeline/ingest`. A
+    /// CAPABILITY conferred by a live `self:delegates_to` from THIS node's
+    /// owner to the edge's node key, read by `server::pipeline` through
+    /// `trust_root::owner_granted_scope` (as P6's `secrets:*`). It replaces
+    /// the earlier form's `cirislens_pipeline_writer` / `cirislens_secrets_writer`
+    /// role tags, strings the key record carried about itself (CC 3.4.7: no
+    /// key declares itself into a duty). On the INFRA axis: an edge is a node
+    /// key, and CC 4.4.3.4.3 lets a node key carry only `infra:*`. One scope,
+    /// one meaning: `secrets:writer` does not cover it.
+    pub const INFRA_PIPELINE_WRITER: &str = "infra:pipeline_writer";
+
     /// `agency:act_on_behalf` — take action attributable to a principal.
     pub const AGENCY_ACT_ON_BEHALF: &str = "agency:act_on_behalf";
     /// `agency:message_io` — send/receive messages as a principal.
@@ -1132,6 +1144,8 @@ pub mod delegation_scope {
         SECRETS_READER,
         SECRETS_WRITER,
         SECRETS_ADMIN,
+        // v62.0.0 (F0-cp5b) — APPENDED, never inserted (pinned by position).
+        INFRA_PIPELINE_WRITER,
     ];
 
     /// v62.0.0 (P6; RULINGS "Planes": the secrets API is LOCAL) —
@@ -1193,6 +1207,8 @@ pub mod delegation_scope {
         INFRA_CLASSIFY_CONTENT,
         // v60.1.0 (CIRISPersist#1119) — appended.
         INFRA_RELAY,
+        // v62.0.0 (F0-cp5b) — appended.
+        INFRA_PIPELINE_WRITER,
     ];
 
     /// v30.7.0 (CIRISPersist#625) — the `agency:*` axis: what a key may do ON
@@ -5801,15 +5817,16 @@ mod tests {
     fn infra_relay_is_appended_and_pinned_by_position() {
         use super::delegation_scope as ds;
         assert_eq!(ds::INFRA_RELAY, "infra:relay");
-        // v62.0.0 (P6): 25 + the three secrets scopes, appended after it.
-        assert_eq!(ds::ALL.len(), 28);
+        // v62.0.0 (P6): 25 + the three secrets scopes, appended after it;
+        // (F0-cp5b) + `infra:pipeline_writer`.
+        assert_eq!(ds::ALL.len(), 29);
         assert_eq!(
             ds::ALL[24],
             ds::INFRA_RELAY,
             "appended to ALL, never inserted"
         );
         assert_eq!(ds::ALL[23], ds::SCOPE_OWNER_BINDING_RECOVERY);
-        assert_eq!(ds::INFRA.len(), 13);
+        assert_eq!(ds::INFRA.len(), 14);
         assert_eq!(
             ds::INFRA[12],
             ds::INFRA_RELAY,
@@ -5829,7 +5846,7 @@ mod tests {
         assert_eq!(ds::SECRETS_WRITER, "secrets:writer");
         assert_eq!(ds::SECRETS_ADMIN, "secrets:admin");
         assert_eq!(
-            &ds::ALL[24..],
+            &ds::ALL[24..28],
             &[
                 ds::INFRA_RELAY,
                 ds::SECRETS_READER,
@@ -5841,6 +5858,21 @@ mod tests {
             ds::SECRETS,
             &[ds::SECRETS_READER, ds::SECRETS_WRITER, ds::SECRETS_ADMIN]
         );
+    }
+
+    /// v62.0.0 (F0-cp5b) — **I2888: `infra:pipeline_writer` is APPENDED to
+    /// `ALL` and to `INFRA`, last in both** (a consumer mirrors them by
+    /// position), on the INFRA axis (a node key may carry it, CC 4.4.3.4.3).
+    #[test]
+    fn i2888_pipeline_writer_is_appended_and_pinned_by_position() {
+        use super::delegation_scope as ds;
+        assert_eq!(ds::INFRA_PIPELINE_WRITER, "infra:pipeline_writer");
+        assert_eq!(ds::ALL[28], ds::INFRA_PIPELINE_WRITER, "I2888: ALL[28]");
+        assert_eq!(ds::ALL.len(), 29, "I2888: last in ALL");
+        assert_eq!(ds::INFRA[13], ds::INFRA_PIPELINE_WRITER, "I2888: INFRA[13]");
+        assert_eq!(ds::INFRA.len(), 14, "I2888: last in INFRA");
+        assert!(ds::INFRA_PIPELINE_WRITER.starts_with(ds::INFRA_PREFIX));
+        assert!(!ds::SECRETS.contains(&ds::INFRA_PIPELINE_WRITER));
     }
 
     /// v30.7.0 (CIRISPersist#625) — **every `delegation_scope` constant is either

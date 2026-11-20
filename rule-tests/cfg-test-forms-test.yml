@@ -16,12 +16,18 @@ valid:
     #[cfg(feature = "test-anchor")]
     fn a() {}
   - |
+    #[cfg(not(any(test, feature = "test-anchor")))]
+    fn a() {}
+  - |
     #[cfg(all(
         any(test, feature = "test-anchor"),
         any(feature = "postgres", feature = "sqlite")
     ))]
     mod t {}
 invalid:
+  - |
+    #[cfg(not(all(test, feature = "x")))]
+    fn a() {}
   - |
     #[cfg(all(
         test,

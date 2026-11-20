@@ -1,0 +1,172 @@
+# scripts/earlier_form_doors.tsv — every write door that takes an object, and
+# how it refuses the earlier form (v62.0.0, JSON-cut slice F). Read and gated
+# by scripts/earlier_form_doors.py; its docstring is the grammar.
+# surface	door	verdict	route	note
+trait	add_community_member	refuses	trait:*	-
+trait	add_family_member	refuses	trait:*	-
+trait	add_member	refuses	trait:*	-
+trait	apply_replicated_accord_evidence	refuses	federation/accord_carriage.rs::admit_replicated_accord_evidence	-
+trait	apply_replicated_attestation	refuses	federation/attestation_apply.rs::apply_planned	-
+trait	apply_replicated_community	refuses	federation/community_admit.rs::apply_replicated_community_planned	-
+trait	apply_replicated_key_record	refuses	federation/key_plane.rs::apply_replicated_key_record_planned	-
+trait	grant_trust	refuses	federation/consent_admit.rs::grant_trust_planned	-
+trait	put_attestation	refuses	trait:put_attestation_with_origin	-
+trait	put_attestation_authored	refuses	trait:put_attestation_with_origin	-
+trait	put_attestation_synced	refuses	federation/attestation_apply.rs::apply_planned	-
+trait	put_attestation_with_origin	refuses	federation/attestation_admit.rs::put_attestation_planned	-
+trait	put_community	refuses	federation/community_admit.rs::put_community_planned	-
+trait	put_community_membership_revocation	refuses	federation/community_admit.rs::put_community_membership_revocation_planned	-
+trait	put_community_membership_widening	refuses	federation/community_admit.rs::put_community_membership_widening_planned	-
+trait	put_family	refuses	federation/family_admit.rs::put_family_planned	-
+trait	put_family_membership_revocation	refuses	federation/family_admit.rs::put_family_membership_revocation_planned	-
+trait	put_family_membership_widening	refuses	federation/family_admit.rs::put_family_membership_widening_planned	-
+trait	put_identity_occurrence	refuses	federation/occurrence_admit.rs::put_identity_occurrence_planned	-
+trait	put_lineage_head_cosign	refuses	federation/lineage_witness.rs::admit_lineage_head_cosign	-
+trait	put_location_proof	refuses	federation/evidence_admit.rs::put_location_proof_planned	-
+trait	put_public_key	refuses	federation/key_plane.rs::key_record_write_planned	-
+trait	put_revocation	refuses	federation/key_plane.rs::put_revocation_planned	-
+trait	put_signed_transport_destination	refuses	federation/transport_admit.rs::put_signed_transport_destination_planned	-
+trait	put_touch_claim	refuses	federation/evidence_admit.rs::put_touch_claim_planned	-
+trait	put_wholeness_witness	composite	federation/evidence_admit.rs::put_wholeness_witness_planned > witness/admit.rs::admit_witness	CC 6.1 object: ONE composite over its 6.1 preimage (Sig19); a lone half / the bound-hybrid pair refused by name
+trait	revoke_member	refuses	trait:*	-
+trait	revoke_trust	refuses	federation/consent_admit.rs::revoke_trust_planned	-
+trait	store_invalid_replaced_key_record	refuses	federation/key_plane.rs::key_record_write_planned	-
+trait	store_lineage_head_cosign	refuses	-	the store leaf is a trait door too, so it refuses itself (F0)
+trait	store_rebound_key_record	refuses	federation/key_plane.rs::key_record_write_planned	-
+trait	supersede_affiliations	refuses	federation/group_amendment.rs::supersede_community_signed	-
+trait	supersede_affiliations_with_quorum	refuses	federation/group_amendment.rs::supersede_community_signed	-
+trait	supersede_community	refuses	federation/group_amendment.rs::supersede_community_signed	-
+trait	supersede_community_with_quorum	refuses	federation/group_amendment.rs::supersede_community_signed	-
+trait	supersede_family	refuses	federation/group_amendment.rs::supersede_family_signed	-
+trait	supersede_family_with_quorum	refuses	federation/group_amendment.rs::supersede_family_signed	-
+trait	supersede_group_row	refuses	federation/group_supersede_admit.rs::supersede_group_row_planned	-
+trait	swap_member	refuses	trait:*	-
+trait	verify_membership_quorum	exempt	-	verification only, writes nothing; its write callers (supersede_*_with_quorum) refuse first
+trait	widen_audience	refuses	trait:put_attestation_authored	-
+trait	withdraw_location_proof	refuses	federation/evidence_admit.rs::withdraw_location_proof_planned	-
+pyo3	add_community_member	refuses	trait:*	-
+pyo3	add_peer_record_json	exempt	-	node-local peer bookkeeping (an operator's pin), not a signed CEG object
+pyo3	adopt_sealed_blob_json	exempt	-	bytes plane: ciphertext plus a provenance naming a held row; the row arrives through the row doors
+pyo3	adopt_sealed_chunk_json	exempt	-	bytes plane: ciphertext plus a provenance naming a held row; the row arrives through the row doors
+pyo3	adopt_sealed_chunks_json	exempt	-	bytes plane: ciphertext plus a provenance naming a held row; the row arrives through the row doors
+pyo3	adopt_sealed_manifest_child_json	exempt	-	bytes plane: ciphertext plus a provenance naming a held row; the row arrives through the row doors
+pyo3	apply_replicated_accord_evidence	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	apply_replicated_attestation	refuses	trait:*	-
+pyo3	apply_replicated_key_grant	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	apply_replicated_key_record	retired	-	-
+pyo3	apply_replicated_purge_json	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	attestation_insert_local	exempt	-	a producer: the node signs its own row from unsigned input (slice B re-targets it to sign_row)
+pyo3	attestation_insert_local_many	exempt	-	a producer: the node signs its own row from unsigned input (slice B re-targets it to sign_row)
+pyo3	attestation_upsert_local	exempt	-	a producer: the node signs its own row from unsigned input (slice B re-targets it to sign_row)
+pyo3	attestation_upsert_local_many	exempt	-	a producer: the node signs its own row from unsigned input (slice B re-targets it to sign_row)
+pyo3	audit_record_entry	substrate	audit/sqlite.rs::record_entry > audit/verify.rs::verify_entry_signature | audit/postgres.rs::record_entry > audit/verify.rs::verify_entry_signature	CC 1.13.4: no other node verifies an entry's inner signature (served: composite head, hashes, proofs); the substrate predicate keeps its form
+pyo3	ceremony_record	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	cirisgraph_upsert_edge	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	cirisgraph_upsert_node	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	cirisnode_amend_goal_json	exempt	-	a producer: the node signs its own row from unsigned input (slice B re-targets it to sign_row)
+pyo3	cirisnode_put_contribution	exempt	-	a producer: the node signs its own row from unsigned input (slice B re-targets it to sign_row)
+pyo3	cirisnode_put_delivery_attestation	composite	cirisnode/sqlite.rs::put_delivery_attestation > cirisnode/verify.rs::verify_delivery_attestation | cirisnode/postgres.rs::put_delivery_attestation > cirisnode/verify.rs::verify_delivery_attestation	CIRISNode local bookkeeping: ONE composite under the peer's live edition-2 key (F0-cp5)
+pyo3	cirisnode_put_goal_json	exempt	-	a producer: the node signs its own row from unsigned input (slice B re-targets it to sign_row)
+pyo3	cirisnode_put_moderation_event	exempt	-	CIRISNode local bookkeeping over held rows; scope ruling pending (JSON_CUT_PLAN §1b, §8)
+pyo3	cirisnode_put_promotion_attestation	composite	cirisnode/sqlite.rs::put_promotion_attestation > cirisnode/verify.rs::verify_envelope_signed | cirisnode/postgres.rs::put_promotion_attestation > cirisnode/verify.rs::verify_envelope_signed	CIRISNode local bookkeeping: ONE composite under the signer's live edition-2 key (F0-cp5)
+pyo3	cirisnode_put_reconsideration_attestation	exempt	-	CIRISNode local bookkeeping over held rows; scope ruling pending (JSON_CUT_PLAN §1b, §8)
+pyo3	cirisnode_put_reconsideration_request	exempt	-	CIRISNode local bookkeeping over held rows; scope ruling pending (JSON_CUT_PLAN §1b, §8)
+pyo3	cirisnode_put_slashing_attestation	exempt	-	CIRISNode local bookkeeping over held rows; scope ruling pending (JSON_CUT_PLAN §1b, §8)
+pyo3	cohort_add_member	refuses	trait:*	-
+pyo3	cohort_revoke_member	refuses	trait:*	-
+pyo3	cohort_supersede_group	refuses	trait:*	-
+pyo3	cohort_supersede_group_with_quorum	refuses	trait:*	-
+pyo3	cohort_swap_member	refuses	trait:*	-
+pyo3	cohort_verify_membership_quorum	exempt	-	verification only, writes nothing (as trait verify_membership_quorum)
+pyo3	continuity_record	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	correlation_record	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	deferral_record	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	deregister_federation_key	refuses	trait:*	-
+pyo3	emit_key_grant	exempt	-	a producer: the node signs its own row from unsigned input (slice B re-targets it to sign_row)
+pyo3	federation_grant_trust	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	federation_revoke_trust	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	feedback_record	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	incident_record	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	install_storage_budget_v1_py	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	ledger_detect_double_head	exempt	-	a pure detector over two ledger heads; writes nothing
+pyo3	ledger_put_checkpoint	exempt	-	ledger plane (CC 3.3.10), not a CEG row
+pyo3	ledger_put_entry_range	exempt	-	ledger plane (CC 3.3.10), not a CEG row
+pyo3	ledger_record_fork_evidence	exempt	-	ledger plane (CC 3.3.10), not a CEG row
+pyo3	list_signed_identity_occurrences_for_json	exempt	-	a read: serves held rows
+pyo3	put_aggregated_tier	node_local	store/sqlite.rs::put_aggregated_tier > store/backend_plan.rs::put_aggregated_tier_planned > fountain/admit.rs::check_admission | store/postgres.rs::put_aggregated_tier > store/backend_plan.rs::put_aggregated_tier_planned > fountain/admit.rs::check_admission	NODE-LOCAL (CC: the fountain is not a CC object): a manifest produced by another node is refused fountain_manifest_not_cc_object; this node's own coding is unpinned (CC 1.13.4); its aggregation meta is a 6.1 composite
+pyo3	put_attestation	refuses	trait:*	-
+pyo3	put_blob_chunks_json	exempt	-	node-local blob bytes under this node's own signer; no signed object is admitted
+pyo3	put_blob_chunks_signing_json	exempt	-	node-local blob bytes under this node's own signer; no signed object is admitted
+pyo3	put_blob	edition2	store/sqlite.rs::put_blob > store/sqlite.rs::put_blob_with_scope > federation/blob_admit.rs::put_blob_planned | store/postgres.rs::put_blob > store/postgres.rs::put_blob_with_scope > federation/blob_admit.rs::put_blob_planned	the claim is the holder's composite custody:{kind} statement through put_statement (P8; T2-fix11, CC 6.1.3)
+pyo3	put_blob_signing	exempt	-	node-local bytes or tier data under this node's own signer; no signed object is admitted
+pyo3	put_calibration_bundle	substrate	derived/calibration_admit.rs::verify_calibration_bundle	CC 6.1.3: crosses nodes, so the substrate predicate requires ONE composite over its preimage (lone/bound-hybrid refused by name)
+pyo3	put_community_json	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	put_delivery_receipt	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	put_edge_detection_event	exempt	-	an adjacent signed plane (edge detection), not a CEG row; scope ruling pending (JSON_CUT_PLAN §8)
+pyo3	put_family_json	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	put_fountain_content	node_local	store/sqlite.rs::put_fountain_content > store/backend_plan.rs::put_fountain_content_planned > fountain/admit.rs::check_admission | store/postgres.rs::put_fountain_content > store/backend_plan.rs::put_fountain_content_planned > fountain/admit.rs::check_admission	NODE-LOCAL (CC: the fountain is not a CC object): a manifest produced by another node is refused fountain_manifest_not_cc_object; this node's own coding is unpinned (CC 1.13.4)
+pyo3	put_identity_occurrence_json	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	put_lineage_head_cosign_json	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	put_public_key	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	put_revocation	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	put_scope_blob	exempt	-	node-local bytes or tier data under this node's own signer; no signed object is admitted
+pyo3	put_stream_sth	exempt	-	a signed tree head under a sig19 composite (slice D, 691798ea), not a JSON object over JCS
+pyo3	put_wholeness_witness_json	composite	trait:put_wholeness_witness	CC 6.1 object: ONE composite over its 6.1 preimage (Sig19); a lone half / the bound-hybrid pair refused by name
+pyo3	rebind_held_for_json	exempt	-	a read: the counted edition-2 re-bind for a seat (transport_rebind::rebind_held_for, C3); writes nothing
+pyo3	rebind_key_record	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	register_federation_key	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	register_occurrence	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	register_self_federation_key	exempt	-	a producer: the node signs its own row from unsigned input (slice B re-targets it to sign_row)
+pyo3	scheduled_task_upsert	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	secrets_store_detected_secret	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	service_token_revocation_record	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	store_blob_local_json	exempt	-	node-local blob bytes under this node's own signer; no signed object is admitted
+pyo3	supersede_canonical	refuses	federation/admission.rs::supersede_canonical > federation/admission.rs::supersede_canonical_over_roster > trait:*	-
+pyo3	task_upsert	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	telemetry_record_metric	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	telemetry_record_metrics_batch	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	thought_upsert	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	ticket_upsert	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	wa_cert_upsert	exempt	-	agent-local store of an unsigned record; no signed object is admitted
+pyo3	widen_audience	refuses	trait:*	-
+capsule	AddCommunityMember	refuses	trait:*	-
+capsule	AddFamilyMember	refuses	trait:*	-
+capsule	ApplyReplicatedAccordEvidence	refuses	federation/accord_carriage.rs::admit_replicated_accord_evidence	-
+capsule	ApplyReplicatedAttestation	refuses	trait:*	-
+capsule	ApplyReplicatedAttestationSynced	refuses	trait:*	-
+capsule	ApplyReplicatedKeyRecord	retired	-	-
+capsule	PutAccordDecision	retired	-	the accord live-quorum records are retired (CC rc20); the append-only op refuses Unsupported
+capsule	PutAccordParticipation	retired	-	the accord live-quorum records are retired (CC rc20); the append-only op refuses Unsupported
+capsule	PutAccordProposal	retired	-	the accord live-quorum records are retired (CC rc20); the append-only op refuses Unsupported
+capsule	PutAttestation	refuses	trait:*	-
+capsule	PutAttestationAuthored	refuses	trait:*	-
+capsule	PutAttestationSynced	refuses	trait:*	-
+capsule	PutCommunity	refuses	trait:*	-
+capsule	PutCommunityMembershipRevocation	refuses	trait:*	-
+capsule	PutCommunityMembershipWidening	refuses	trait:*	-
+capsule	PutFamily	refuses	trait:*	-
+capsule	PutFamilyMembershipRevocation	refuses	trait:*	-
+capsule	PutFamilyMembershipWidening	refuses	trait:*	-
+capsule	PutIdentityOccurrence	refuses	trait:*	-
+capsule	PutIdentityOccurrenceRevocation	retired	-	-
+capsule	PutLineageHeadCosign	refuses	trait:*	-
+capsule	PutLocationProof	refuses	trait:*	-
+capsule	PutPublicKey	refuses	trait:*	-
+capsule	PutRevocation	refuses	trait:*	-
+capsule	PutSignedTransportDestination	refuses	trait:*	-
+capsule	SupersedeGroupRow	refuses	trait:*	-
+capsule	WithdrawLocationProof	refuses	trait:*	-
+http	delete_forget	exempt	-	secrets plane: a request authenticated by its caller's signature, not a CEG row
+http	post_decrypt	exempt	-	secrets plane: a request authenticated by its caller's signature, not a CEG row
+http	post_encrypt	exempt	-	secrets plane: a request authenticated by its caller's signature, not a CEG row
+http	post_events	exempt	-	the Agent trace wire (accord events), not a CEG row; scope ruling pending (JSON_CUT_PLAN §8)
+http	post_pipeline_ingest	composite	-	the edge's PipelineEnvelope: ONE composite under the edge's live edition-2 key (F0-cp5); the two-field form refused by name
+http	post_recall	exempt	-	secrets plane: a request authenticated by its caller's signature, not a CEG row
+http	post_reencrypt_all	exempt	-	secrets plane: a request authenticated by its caller's signature, not a CEG row
+http	post_rotate_master_key	exempt	-	secrets plane: a request authenticated by its caller's signature, not a CEG row
+http	post_statement	edition2	-	the edition-2 statement door (D2): put_statement / apply_replicated_statement
+http	post_store	exempt	-	secrets plane: a request authenticated by its caller's signature, not a CEG row
+http	post_try_claim	exempt	-	secrets plane: a request authenticated by its caller's signature, not a CEG row
+http	put_filter_config	exempt	-	secrets plane: a request authenticated by its caller's signature, not a CEG row
+# v62.0.0 (F0-cp6c) — the BlobStorage doors, now inventoried.
+trait	put_stream_sth	composite	federation/blob_admit.rs::put_stream_sth_planned > federation/blobs.rs::verify_stream_sth_signature > federation/sth_form.rs::verify_sth_signature_via_directory	a stream head: ONE composite under the producer's key; the earlier HybridSignature head refused by name (sth_signature_earlier_form)

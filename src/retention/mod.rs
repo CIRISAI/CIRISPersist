@@ -1422,17 +1422,9 @@ mod tests {
                 .unwrap();
             rows
         };
-        // v59.1.0 — the baked v4 genesis seeds the serve nodes' signed routes at
-        // open (#1106). They are assertions too, so they must survive beside the
-        // test's own: read them from the bundle rather than pinning a key id.
-        let mut expected: Vec<String> = crate::federation::genesis::canonical_genesis_bundle()
-            .serve_transport_destinations
-            .iter()
-            .map(|r| r.transport_destination.occurrence_key_id.clone())
-            .chain(std::iter::once("assert-key".to_string()))
-            .collect();
-        expected.sort();
-        expected.dedup();
+        // v62.0.0 (C5-fix1): no baked genesis seeds serve-node routes at open,
+        // so the test's own assertion is the only route.
+        let expected: Vec<String> = vec!["assert-key".to_string()];
         assert_eq!(
             survivors, expected,
             "#776: a route that was never a sighting has no staleness clock — it is current \

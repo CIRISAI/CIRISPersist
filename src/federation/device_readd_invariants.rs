@@ -914,7 +914,6 @@ mod run {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    #[ignore = "v62-CP2: needs EARLIER_FORM_DOORS_SHUT"]
     async fn i188_sqlite() {
         use crate::store::sqlite::SqliteBackend;
         use crate::store::Backend as _;
@@ -946,7 +945,6 @@ mod run {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
-    #[ignore = "v62-CP2: needs EARLIER_FORM_DOORS_SHUT"]
     async fn i188_postgres() {
         use crate::store::postgres::PostgresBackend;
         use crate::store::Backend as _;
@@ -1783,7 +1781,6 @@ mod run_two_node {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    #[ignore = "v62-CP2: needs EARLIER_FORM_DOORS_SHUT"]
     async fn i188_two_node_sqlite() {
         // v62.0.0 (E13) — edition 2; DEPENDS ON T1.serve.patch.
         Box::pin(super::two_node::i188_the_minter_rewraps_its_own_history(
@@ -1800,7 +1797,6 @@ mod run_two_node {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
-    #[ignore = "v62-CP2: needs EARLIER_FORM_DOORS_SHUT"]
     async fn i188_two_node_postgres() {
         // v62.0.0 (E13) — edition 2; DEPENDS ON T1.serve.patch.
         let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
@@ -1820,7 +1816,6 @@ mod run_two_node {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    #[ignore = "v62-CP2: needs EARLIER_FORM_DOORS_SHUT"]
     async fn i380_shared_engine_sqlite() {
         // v62.0.0 (E13) — edition 2; DEPENDS ON T1.serve.patch.
         let dir = tempfile::tempdir().unwrap();
@@ -1851,7 +1846,6 @@ mod run_two_node {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
-    #[ignore = "v62-CP2: needs EARLIER_FORM_DOORS_SHUT"]
     async fn i380_shared_engine_postgres() {
         // v62.0.0 (E13) — edition 2; DEPENDS ON T1.serve.patch.
         let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
@@ -1882,7 +1876,6 @@ mod run_two_node {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    #[ignore = "v62-CP2: needs EARLIER_FORM_DOORS_SHUT"]
     async fn i188k_never_rotated_sqlite() {
         // v62.0.0 (E13) — edition 2; DEPENDS ON T1.serve.patch.
         Box::pin(super::two_node::i188k_a_never_rotated_room_rewraps(
@@ -1899,7 +1892,6 @@ mod run_two_node {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
-    #[ignore = "v62-CP2: needs EARLIER_FORM_DOORS_SHUT"]
     async fn i188k_never_rotated_postgres() {
         // v62.0.0 (E13) — edition 2; DEPENDS ON T1.serve.patch.
         let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {

@@ -45,9 +45,7 @@ pub(crate) mod bodies {
             "community_key_id": room,
             "references_attestation_id": flagged.attestation_id,
         });
-        let mut r = e2::with_earlier_form(|| {
-            ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), by, by, &env)
-        });
+        let mut r = { ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), by, by, &env) };
         r.attestation_type = attestation_type::SCORES.into();
         r.weight = None;
         r.cohort_scope = cohort_scope::COMMUNITY.into();
@@ -211,9 +209,8 @@ pub(crate) mod bodies {
                 "community_key_id": room,
                 "content_type": "text/plain",
             });
-            let mut r = e2::with_earlier_form(|| {
-                ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), author, author, &env)
-            });
+            let mut r =
+                { ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), author, author, &env) };
             r.attestation_type = attestation_type::SCORES.into();
             r.weight = None;
             r.cohort_scope = cohort_scope::COMMUNITY.into();
@@ -308,9 +305,7 @@ pub(crate) mod bodies {
             "community_id": room,
             "community_key_id": room,
         });
-        let mut r = e2::with_earlier_form(|| {
-            ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), by, by, &env)
-        });
+        let mut r = { ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), by, by, &env) };
         r.attestation_type = attestation_type::SCORES.into();
         r.weight = None;
         r.cohort_scope = cohort_scope::COMMUNITY.into();

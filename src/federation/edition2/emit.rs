@@ -233,6 +233,17 @@ fn digest_member(v: &serde_json::Value) -> Result<Value, ProduceError> {
     }
 }
 
+/// v62.0.0 — the earlier envelope members a composer (`withdraws`,
+/// `recants`, `supersedes`) drops when it is stated: the target's id (stated
+/// as `refs.target`), the row type restated as `kind`, and the target's
+/// type. A composer's payload is the common members and `refs.target` only
+/// (`payloads::check_composer`, CC 2.4.1.1).
+pub const COMPOSER_EARLIER_MEMBERS: &[&str] = &[
+    "references_attestation_id",
+    "kind",
+    "references_attestation_type",
+];
+
 /// **The JSON members of a row as its edition-2 payload.**
 ///
 /// v62.0.0 (wave P1e) — `family` is the family id the row is stated under
@@ -614,12 +625,17 @@ pub fn draft_from_envelope(
             .get("dimension")
             .and_then(serde_json::Value::as_str),
     );
+    let drop: &[&str] = if super::payloads::COMPOSER_ROW_TYPES.contains(&row_type) {
+        COMPOSER_EARLIER_MEMBERS
+    } else {
+        &["references_attestation_id"]
+    };
     let mut payload = payload_from_envelope(
         envelope,
         &family,
         asserted_at_ms,
         authored.then_some(iss),
-        &["references_attestation_id"],
+        drop,
     )
     .map_err(|e| produce_error("draft", e))?;
     if let Some((t, _)) = target {

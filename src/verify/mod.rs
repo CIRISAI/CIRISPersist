@@ -29,7 +29,8 @@ pub use canonical_validation::{
     validate_canonical_datetime, validate_canonical_hex, validate_envelope_canonical_form,
     validate_signed_at_not_future, CanonicalizationError, MAX_SIGNED_AT_FUTURE_SKEW,
 };
-pub use ed25519::{canonical_payload_value, verify_trace, PublicKeyDirectory};
+// v62.0.0 (F0-cp6e) — `verify_trace` and `PublicKeyDirectory` are removed.
+pub use ed25519::canonical_payload_value;
 pub use hybrid::{
     verify_hybrid, verify_hybrid_via_directory, HybridPolicy, VerifyError as HybridVerifyError,
     VerifyOutcome,

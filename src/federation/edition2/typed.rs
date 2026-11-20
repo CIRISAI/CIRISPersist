@@ -661,10 +661,8 @@ fn composite_halves(statement: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
         Value::Tag(18, inner) => inner.as_array()?.get(3)?.as_bytes()?.to_vec(),
         _ => return None,
     };
-    if sig.len() != ciris_crypto::composite::SIGNATURE_LEN {
-        return None;
-    }
-    let (mldsa, ed) = sig.split_at(ciris_crypto::composite::MLDSA65_SIG_LEN);
+    // v62.0.0 (C5-fix3): the one composite split, by Verify's named layout.
+    let (mldsa, ed) = super::composite::signature_halves(&sig)?;
     Some((mldsa.to_vec(), ed.to_vec()))
 }
 
@@ -757,6 +755,10 @@ pub struct HoldingClaimRead {
     pub size: u64,
     /// The cohort it is placed at.
     pub cohort_scope: String,
+    /// v62.0.0 (T2-fix11) — the cohort's target (the community / family a
+    /// targeted scope names: `community_id` / `family_id`), `None` for an
+    /// untargeted scope.
+    pub target: Option<String>,
 }
 
 /// **Read an edition-2 holding claim** ([`HoldingClaimRead`]).
@@ -797,11 +799,16 @@ pub fn holding_claim_of(statement: &[u8]) -> Result<HoldingClaimRead, Error> {
         _ => None,
     }
     .ok_or_else(|| invalid("a holding claim names exactly one blob digest"))?;
+    let cohort_scope = req_text(&payload, "cohort_scope")?.to_owned();
+    let target = cohort_target_member(&cohort_scope)
+        .and_then(|m| text_of(&payload, m))
+        .map(str::to_owned);
     Ok(HoldingClaimRead {
         holder: iss,
         sha256,
         size: req_u64(&payload, "size")?,
-        cohort_scope: req_text(&payload, "cohort_scope")?.to_owned(),
+        cohort_scope,
+        target,
     })
 }
 

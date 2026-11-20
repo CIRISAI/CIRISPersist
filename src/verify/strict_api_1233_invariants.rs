@@ -12,21 +12,29 @@
 //! - **I1568 (trace)** `verify_trace_hybrid`: `verify::ed25519`'s
 //!   `i1568_verify_trace_hybrid_refuses_every_policy_but_strict`.
 //! - **I1568 (this module, sqlite + postgres)** `verify_hybrid_via_directory`
-//!   over a registered hybrid key: a genuine hybrid signature verifies under
-//!   `Strict`; the SAME signature under `Ed25519Fallback` or `SoftFreshness`
-//!   is refused `PolicyViolation` (with both PQC halves present the policy
-//!   would otherwise be ignored and the call would verify, so the refusal is
-//!   the gate); and an UNKNOWN key under a non-strict policy is refused with
-//!   the policy token, not `verify_unknown_key` — the gate runs before the
-//!   directory lookup.
+//!   over a key this node HOLDS: under `Ed25519Fallback` or `SoftFreshness`
+//!   the call is refused `PolicyViolation` whatever the signature, and an
+//!   UNKNOWN key under a non-strict policy is refused with the policy token,
+//!   not `verify_unknown_key` — the gate runs before the directory lookup;
+//!   under `Strict` an unknown key reaches the lookup (`verify_unknown_key`).
+//!
+//! v62.0.0 (JSON-cut slice F, CP2) — the held key is an edition-2
+//! `key:record` (`fixture_switch::put_key`), projected into `federation_keys`
+//! with its component halves; the earlier form's `register_hybrid_key` goes
+//! through `put_public_key`, which refuses the earlier form at CP2. The leg
+//! "a genuine bound hybrid verifies under `Strict`" is DROPPED: whether an
+//! edition-2 key's component halves verify the earlier bound hybrid is
+//! JSON_CUT_PLAN §8.6, open with CC, and a witness must not settle it. The
+//! gate (Strict only, before the lookup) is the live property this module
+//! holds, for the production callers of the bound hybrid (cirisnode, stream
+//! receipts, the trust plane, the capsule op, detection, the pipeline).
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::FederationDirectory;
     use crate::verify::hybrid::{
-        verify_hybrid_via_directory, HybridPolicy, VerifyError, VerifyOutcome,
-        VERIFY_POLICY_VIOLATION,
+        verify_hybrid_via_directory, HybridPolicy, VerifyError, VERIFY_POLICY_VIOLATION,
     };
 
     /// I1568 — `verify_hybrid_via_directory` refuses every policy but
@@ -35,26 +43,15 @@ pub(crate) mod bodies {
     where
         D: FederationDirectory + ?Sized,
     {
-        // The distinguishing part first: test seeds take a key_id's first 32
-        // bytes.
-        let key = format!("{tag}-i1568-signer");
-        ts::register_hybrid_key(dir, &key).await;
+        // A key this node holds (an edition-2 `key:record`, its projection
+        // carries both component halves): the policy is refused although the
+        // lookup would find it.
+        let seed = format!("{tag}-i1568-signer");
+        let key =
+            crate::federation::edition2::fixture_switch::put_key(dir, &seed, &["agent"]).await;
         let msg = b"CIRISPersist#1233 I1568 via directory".as_slice();
-        let sig = ts::threshold_sign(&key, msg);
+        let sig = ts::threshold_sign(&seed, msg);
         let pqc = sig.mldsa65_signature_base64.clone();
-
-        let strict = verify_hybrid_via_directory(
-            dir,
-            msg,
-            &key,
-            &sig.ed25519_signature_base64,
-            pqc.as_deref(),
-            HybridPolicy::Strict,
-            None,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("I1568 {tag}: a genuine hybrid signature verifies: {e}"));
-        assert_eq!(strict, VerifyOutcome::HybridVerified, "I1568 {tag}");
 
         let unknown = verify_hybrid_via_directory(
             dir,
@@ -88,7 +85,7 @@ pub(crate) mod bodies {
                 Some(std::time::Duration::from_secs(1)),
             )
             .await
-            .expect_err("I1568: a non-strict policy over a VALID signature is refused");
+            .expect_err("I1568: a non-strict policy over a held key is refused");
             assert!(
                 matches!(err, VerifyError::PolicyViolation { policy: p } if p == policy),
                 "I1568 {tag}: {policy:?} is a policy violation: {err:?}"

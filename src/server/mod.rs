@@ -44,6 +44,9 @@ use crate::store::Backend;
 // v62.0.0 (JSON-cut slice D) — the edition-2 routes, an opt-in router.
 pub mod edition2;
 pub mod pipeline;
+// v62.0.0 (F0-cp5b) — I2889: the owner-granted `infra:pipeline_writer` capability.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod pipeline_writer_invariants;
 #[cfg(feature = "secrets-server")]
 pub mod secrets;
 
@@ -154,49 +157,25 @@ pub const TRUST_ROOT_BUNDLE_PATH: &str = "/v1/trust-root/bundle";
 /// CC 5.3.4 — the kept alias of [`TRUST_ROOT_BUNDLE_PATH`]; same body.
 pub const STEWARD_KEY_ALIAS_PATH: &str = "/v1/steward-key";
 
-/// v50.0.0 (CIRISPersist#926, ruling (b)) — serve the compiled-in
-/// GenesisBundle with this node's `ciris-canonical` community row BESIDE it
-/// ([`crate::federation::canonical_community::TrustRootBundleResponse`]). The
-/// bundle bytes are the pinned artifact, unchanged; the row is data a consumer
-/// re-verifies against its own pins
-/// ([`crate::federation::canonical_community::pin_trust_from_bundle_response`]).
-/// A node that holds no row serves `community: null` — honest, not an error.
+/// CC 5.3.4 — the trust-root route: the edition-2 body
+/// ([`edition2::TrustRootStatements`]), the held named rows and voices of each
+/// `ceg-genesis-bundle/2` in force, in lineage order. A node that holds no
+/// genesis serves an empty `statements` list — honest, not an error.
 ///
-/// v62.0.0 (JSON-cut slice D, CC 5.3.4) — once the earlier-form doors are
-/// shut ([`crate::federation::edition2::door::earlier_form_doors_shut`]) the
-/// bundle/1 JSON is an earlier-form object this node no longer serves: the
-/// same paths serve the edition-2 body ([`edition2::TrustRootStatements`],
-/// the held voices of each bundle in force).
+/// v62.0.0 (C5-fix1; ceremony gap 1): the bundle/1 JSON body (the compiled-in
+/// v4 GenesisBundle with the `ciris-canonical` row beside it) is deleted with
+/// the baked genesis, so this route no longer depends on the earlier-form
+/// switch.
 async fn get_trust_root_bundle<F>(State(state): State<AppState<F>>) -> Response
 where
     F: FederationDirectory + Backend + 'static,
 {
-    if crate::federation::edition2::door::earlier_form_doors_shut() {
-        return match edition2::trust_root_statements(&*state.directory).await {
-            Ok(body) => (StatusCode::OK, Json(body)).into_response(),
-            Err(e) => {
-                tracing::warn!(kind = e.kind(), error = %e, "trust-root statements route failed");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(TrustRootErrorResponse {
-                        detail: "trust-root bundle unavailable",
-                    }),
-                )
-                    .into_response()
-            }
-        };
-    }
-    match crate::federation::canonical_community::trust_root_bundle_response(
-        &*state.directory,
-        crate::federation::genesis::canonical_genesis_bundle(),
-    )
-    .await
-    {
+    match edition2::trust_root_statements(&*state.directory).await {
         Ok(body) => (StatusCode::OK, Json(body)).into_response(),
         Err(e) => {
             // The detail is logged, not served: an unauthenticated read gets a
             // generic body.
-            tracing::warn!(kind = e.kind(), error = %e, "trust-root bundle route failed");
+            tracing::warn!(kind = e.kind(), error = %e, "trust-root statements route failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(TrustRootErrorResponse {
@@ -401,58 +380,26 @@ mod tests {
         assert!(h.queue_capacity_remaining > 0);
     }
 
-    /// v50.0.0 (CIRISPersist#926, I190 (e) at the HTTP edge) — both CC 5.3.4
-    /// paths serve the compiled-in bundle with the `ciris-canonical` row
-    /// BESIDE it, from one handler; before the row exists it is served as
-    /// `null`, never invented.
+    /// I2420 (v62.0.0, C5-fix1; ceremony gap 1) — **no production genesis
+    /// gives standing at the HTTP edge**: a fresh node holds no
+    /// `ceg-genesis-bundle/2`, so both CC 5.3.4 paths serve the edition-2
+    /// body with no statements — never a compiled-in bundle.
     #[tokio::test]
-    async fn trust_root_bundle_route_serves_the_community_beside_the_bundle_926() {
-        use crate::federation::canonical_community_invariants::bodies as i190;
-        let (app, backend) = build_app(DEFAULT_QUEUE_DEPTH);
-        let get = |path: &'static str| {
-            let app = app.clone();
-            async move {
-                let resp = app
-                    .oneshot(Request::get(path).body(Body::empty()).unwrap())
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status(), StatusCode::OK, "{path}");
-                let body = resp.into_body().collect().await.unwrap().to_bytes();
-                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
-            }
-        };
-        let before = get(TRUST_ROOT_BUNDLE_PATH).await;
-        assert!(before["community"].is_null(), "no row yet: {before}");
-        i190::stand_up(&*backend).await;
-        backend
-            .put_community(i190::signed(
-                i190::canonical_row(&i190::FOUNDERS),
-                &["A1", "B1"],
-            ))
-            .await
-            .unwrap();
-        let bundle = crate::federation::genesis::canonical_genesis_bundle();
+    async fn i2420_trust_root_route_serves_nothing_before_a_genesis() {
+        let (app, _backend) = build_app(DEFAULT_QUEUE_DEPTH);
         for path in [TRUST_ROOT_BUNDLE_PATH, STEWARD_KEY_ALIAS_PATH] {
-            let v = get(path).await;
+            let resp = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(
-                v["charter_root_key_id"],
-                bundle.family_key_id.as_str(),
-                "{path}"
-            );
-            assert_eq!(
-                v["bundle"],
-                serde_json::to_value(bundle).unwrap(),
-                "{path}: the bundle is served as carried"
-            );
-            assert_eq!(
-                v["community"]["community"]["community_key_id"], "ciris-canonical",
-                "{path}"
-            );
-            assert!(
-                v["community"]["cosignatures"]
-                    .as_array()
-                    .is_some_and(|a| a.iter().any(|c| c["authority_key_id"] == "B1")),
-                "{path}: the named cosigner is carried: {v}"
+                v,
+                serde_json::json!({ "statements": [] }),
+                "I2420 {path}: a node with no genesis serves no statements: {v}"
             );
         }
     }

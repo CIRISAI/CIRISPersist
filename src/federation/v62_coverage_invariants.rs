@@ -100,6 +100,16 @@
 //!   holders of the bundle in force: with four holders, two voices are
 //!   `Pending`, the third lands.
 //!
+//! - **I3255** (W1-fix5; was I157, CC 4.2.2.1) — custody evidence on an
+//!   edition-2 `key:record` is checked for its shape where the record lands:
+//!   a hex-text chain is refused `edition2_statement_invalid` (nothing
+//!   stored), the same key's byte-string chain lands, no evidence lands and
+//!   projects none, and a chain lifted from another key lands but is refused
+//!   where custody is judged.
+//!
+//! - **I3256** (W1-fix5; was I185's holder-hardware leg) — every holder of a
+//!   rooted edition-2 root reports the measured class and a walked chain.
+//!
 //! Not witnessed here, and why (W1.md): the witnessed-mode legs of T4a (I194's
 //! `trust_root_head_stale` / unwitnessed, I375) have no edition-2 form (wave 3
 //! rule 4: `lineage_head` cosign has no forward form).
@@ -1540,6 +1550,190 @@ pub(crate) async fn i3254_rebind_counts_a_strict_majority(d: &dyn FederationDire
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+//  (W1-fix5) Custody evidence on an edition-2 `key:record` (CC 4.2.2.1)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A deterministic CBOR map (members sorted by their encodings).
+fn det_map(mut m: Vec<(&str, Value)>) -> Value {
+    m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(&Value::Text((*k).to_owned())));
+    Value::Map(
+        m.into_iter()
+            .map(|(k, v)| (Value::Text(k.to_owned()), v))
+            .collect(),
+    )
+}
+
+/// The CC 4.2.2.1 custody evidence a `key:record` states: a YubiKey PIV
+/// class, `removable_offline`, and `chain` as given.
+fn custody_evidence(chain: Vec<Value>) -> Value {
+    det_map(vec![
+        ("hardware_class", Value::Text("YubiKey_5_FIPS".to_owned())),
+        ("pq_custody", Value::Text("removable_offline".to_owned())),
+        ("chain", Value::Array(chain)),
+    ])
+}
+
+/// The A1 holder's REAL slot-9c chain (C4-fix's fixture), leaf first, hex.
+fn real_a1_chain_hex() -> Vec<String> {
+    use crate::federation::edition2::fixture_genesis_real_custody::{REAL_CHAIN_HEX, REAL_HOLDERS};
+    std::iter::once(REAL_HOLDERS[0].leaf_9c_hex)
+        .chain(REAL_CHAIN_HEX)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// A `key:record` of `seed` (`user`) carrying `evidence`.
+fn record_with_evidence(seed: &str, evidence: Value) -> Vec<u8> {
+    e2::key_record_with(
+        seed,
+        &["user"],
+        &e2::KeyRecordOptions {
+            extra: vec![("attestation_evidence".to_owned(), evidence)],
+            ..Default::default()
+        },
+    )
+}
+
+/// **I3255** (was I157 "replicated records are checked where they land",
+/// restated on the edition-2 `key:record`; CC 4.2.2.1) — custody evidence is
+/// checked for its SHAPE where a record lands, through the one entry every
+/// replicated row takes (`put_statement`, tier `federation`):
+/// - the chain stated as hex TEXT (not byte strings) is refused
+///   `edition2_statement_invalid` and the key is not stored; the SAME key's
+///   record with the same certificates as byte strings lands, so the refusal
+///   was for the evidence's shape;
+/// - a record with no evidence lands and projects none;
+/// - a well-formed chain that attests ANOTHER key (the A1 holder's real
+///   chain, lifted onto a test key) lands (the door reads shape only; the
+///   custody gate takes no challenge input, C4-fix I2391) and projects the
+///   chain leaf first, and the custody walk where a holder is judged refuses
+///   it (it names A1's key, not this record's).
+pub(crate) async fn i3255_key_record_evidence_is_checked_where_it_lands(
+    d: &dyn FederationDirectory,
+) {
+    use crate::federation::edition2::token;
+    use crate::federation::hardware_attestation::record_ed25519;
+    use crate::federation::HardwareAttestationPolicy;
+
+    let chain_hex = real_a1_chain_hex();
+    let as_bytes: Vec<Value> = chain_hex
+        .iter()
+        .map(|h| Value::Bytes(hex::decode(h).expect("fixture hex")))
+        .collect();
+    let as_text: Vec<Value> = chain_hex.iter().map(|h| Value::Text(h.clone())).collect();
+
+    // The chain as hex text: refused for the shape, nothing stored.
+    let lifted = "w1f5-lifted-chain";
+    let lifted_kid = e2::kid(lifted);
+    match e2::put_statement(d, &record_with_evidence(lifted, custody_evidence(as_text))).await {
+        Err(Error::MalformedRow { reason, .. }) => assert_eq!(
+            reason,
+            token::STATEMENT_INVALID,
+            "I3255: a text chain is refused by the statement door's token"
+        ),
+        other => panic!("I3255: a text chain must be refused, got {other:?}"),
+    }
+    assert!(
+        d.lookup_public_key(&lifted_kid).await.unwrap().is_none(),
+        "I3255: a refused record leaves no key"
+    );
+
+    // No evidence: lands, projects none.
+    let bare = e2::put_key(d, "w1f5-no-evidence", &["user"]).await;
+    let rec = d
+        .lookup_public_key(&bare)
+        .await
+        .unwrap()
+        .expect("I3255: a record with no evidence lands");
+    assert!(
+        rec.attestation_evidence
+            .as_ref()
+            .is_none_or(serde_json::Value::is_null),
+        "I3255: no evidence projects none: {:?}",
+        rec.attestation_evidence
+    );
+
+    // The same key, the chain as byte strings: lands (shape only).
+    match e2::put_statement(d, &record_with_evidence(lifted, custody_evidence(as_bytes))).await {
+        Ok(StatementOutcome::KeyPlane { .. }) => {}
+        other => panic!("I3255: a well-formed custody body lands at the key plane, got {other:?}"),
+    }
+    let rec = d
+        .lookup_public_key(&lifted_kid)
+        .await
+        .unwrap()
+        .expect("I3255: the well-formed record is the key's");
+    let ev = rec
+        .attestation_evidence
+        .clone()
+        .expect("I3255: the custody body is projected");
+    let projected: Vec<String> = ev["chain"]
+        .as_array()
+        .expect("I3255: the chain is projected")
+        .iter()
+        .map(|c| c.as_str().expect("hex").to_lowercase())
+        .collect();
+    assert_eq!(projected, chain_hex, "I3255: the chain, leaf first");
+    assert_eq!(ev["hardware_class"], "YubiKey_5_FIPS", "I3255: the class");
+
+    // Where a holder is judged, the lifted chain is refused: it names A1's
+    // key, not this record's.
+    let judged = HardwareAttestationPolicy::default().check_structure(
+        &rec.key_id,
+        record_ed25519(&rec).as_deref(),
+        rec.attestation_evidence.as_ref(),
+    );
+    assert!(
+        judged.is_err(),
+        "I3255: a chain lifted from another key is refused where custody is judged: {judged:?}"
+    );
+}
+
+/// **I3256** (was I185's holder-hardware leg, restated on edition-2 custody;
+/// CC 4.2.2.1) — every holder of a rooted edition-2 root reports the
+/// MEASURED class (`ExternalSecureElement`, a YubiKey PIV chain) and a PASSED
+/// chain walk (`layer_b: Some(true)`) against its own record's key, never
+/// Layer-A-only: `trust_root_valid` over `rooted_trust_root`, whose founders
+/// are the genesis bundle's holders with their custody chains.
+pub(crate) async fn i3256_a_holder_reports_the_measured_class_and_a_walked_chain(
+    d: &dyn FederationDirectory,
+) {
+    use crate::federation::edition2::fixture_trust_root::rooted_trust_root;
+    use crate::federation::trust_root::trust_root_valid;
+    use ciris_keyring::HardwareType;
+
+    let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
+    let node = d.node_key_id().expect("the runner set the node key");
+    let v = trust_root_valid(d, &node, &r.root).await.unwrap();
+    assert!(
+        v.valid && v.holders_hardware_attested,
+        "I3256: the rooted root is valid and attested: {v:?}"
+    );
+    let mut judged: Vec<String> = v
+        .holders_hardware
+        .iter()
+        .map(|h| h.key_id.clone())
+        .collect();
+    judged.sort();
+    let mut founders = r.founders.clone();
+    founders.sort();
+    assert_eq!(judged, founders, "I3256: every founder is judged");
+    for h in &v.holders_hardware {
+        assert_eq!(
+            (h.class, h.layer_a, h.layer_b, h.refusal.as_deref()),
+            (
+                Some(HardwareType::ExternalSecureElement),
+                true,
+                Some(true),
+                None
+            ),
+            "I3256: {} reports the measured class and a walked chain: {h:?}",
+            h.key_id
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 //  Runners: sqlite and postgres
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -1890,4 +2084,40 @@ async fn i3254_postgres() {
         return;
     };
     Box::pin(i3254_rebind_counts_a_strict_majority(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3255_sqlite() {
+    Box::pin(i3255_key_record_evidence_is_checked_where_it_lands(
+        &sqlite().await,
+    ))
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3255_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(i3255_key_record_evidence_is_checked_where_it_lands(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i3256_sqlite() {
+    Box::pin(
+        i3256_a_holder_reports_the_measured_class_and_a_walked_chain(&sqlite_with_node().await),
+    )
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i3256_postgres() {
+    let Some(b) = postgres_with_node().await else {
+        return;
+    };
+    Box::pin(i3256_a_holder_reports_the_measured_class_and_a_walked_chain(&b)).await;
 }

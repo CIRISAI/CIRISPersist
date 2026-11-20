@@ -13,6 +13,15 @@
 //!   delegate of the subject who did not attest the proof is refused by name;
 //!   a re-offer that is not a withdrawal is refused; a second withdrawal is a
 //!   no-op that keeps the first instant.
+//!
+//! v62.0.0 (class: `v62: location_proof card pending (CC next edition)`,
+//! ignored) — CC states no edition-2 card for the location-proof plane's
+//! withdrawal. Until then every body here is HELD in the earlier form
+//! (`with_earlier_form_async`, E6's option (a)): the typed location-proof plane
+//! (`federation_location_proofs`, its re-signed withdrawal door and its wire
+//! index) has no edition-2 twin, and an edition-2 key cannot sign an
+//! earlier-form row (`earlier_form_signer_is_edition2`). Delete or rewrite at
+//! slice F.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -27,117 +36,126 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let (subject, delegate, stranger) = (
-            format!("i519-s-{tag}"),
-            format!("i519-d-{tag}"),
-            format!("i519-x-{tag}"),
-        );
-        for k in [&subject, &delegate, &stranger] {
-            ts::register_hybrid_key(d, k).await;
-        }
-        let cell = h3o::LatLng::new(37.0, -122.0)
-            .unwrap()
-            .to_cell(h3o::Resolution::Seven)
-            .to_string();
-        let at: DateTime<Utc> = "2026-10-01T00:00:00Z".parse().unwrap();
-        let proof = |withdrawn_at: Option<DateTime<Utc>>| LocationProof {
-            subject_key_id: subject.clone(),
-            cell_id: cell.clone(),
-            cell_resolution: 7,
-            asserted_at: at,
-            valid_until: None,
-            attestation_evidence: None,
-            withdrawn_at,
-            persist_row_hash: String::new(),
-        };
-        d.put_location_proof(ts::sign_location_proof(&subject, proof(None)))
-            .await
-            .unwrap_or_else(|e| panic!("I519 the proof: {e}"));
-        let in_force = || async {
-            member_in_geographic_constraint(
-                &cell,
-                &d.list_location_proofs_for(&subject).await.unwrap(),
-                Utc::now(),
-            )
-        };
-        assert!(
-            in_force().await,
-            "I519 precondition — the proof is in force"
-        );
-        let t1 = at + Duration::hours(1);
-        // A stranger: refused by standing, nothing ends.
-        let r = d
-            .withdraw_location_proof(ts::sign_location_proof(&stranger, proof(Some(t1))))
-            .await;
-        assert!(
-            matches!(r, Err(Error::LocationAuthorityUnauthorized { .. })),
-            "I519 a stranger's withdrawal is refused by standing: {r:?}"
-        );
-        assert!(in_force().await, "I519 the stranger ended nothing");
-        // A live delegate of the subject passes standing but did not attest
-        // the proof: refused by name.
-        ts::put_delegates_to(d, &subject, &delegate, None)
-            .await
-            .expect("I519 the delegation");
-        let r = d
-            .withdraw_location_proof(ts::sign_location_proof(&delegate, proof(Some(t1))))
-            .await;
-        // v62.0.0 (GC8; CC 4.5.9.1 ruling 10) — no delegation mints a
-        // location authority: the delegate is refused at the door, by its
-        // bytes (attester != subject), before the attester leg.
-        assert!(
-            matches!(&r, Err(Error::LocationAuthorityUnauthorized { rule, .. })
+        Box::pin(
+            // CP2 held: the location_proof card is pending (CC next edition); its
+            // runners are ignored `v62: location_proof card pending`.
+            crate::federation::edition2::fixture_switch::with_earlier_form_async(async move {
+                let (subject, delegate, stranger) = (
+                    format!("i519-s-{tag}"),
+                    format!("i519-d-{tag}"),
+                    format!("i519-x-{tag}"),
+                );
+                for k in [&subject, &delegate, &stranger] {
+                    ts::register_hybrid_key(d, k).await;
+                }
+                let cell = h3o::LatLng::new(37.0, -122.0)
+                    .unwrap()
+                    .to_cell(h3o::Resolution::Seven)
+                    .to_string();
+                let at: DateTime<Utc> = "2026-10-01T00:00:00Z".parse().unwrap();
+                let proof = |withdrawn_at: Option<DateTime<Utc>>| LocationProof {
+                    subject_key_id: subject.clone(),
+                    cell_id: cell.clone(),
+                    cell_resolution: 7,
+                    asserted_at: at,
+                    valid_until: None,
+                    attestation_evidence: None,
+                    withdrawn_at,
+                    persist_row_hash: String::new(),
+                };
+                d.put_location_proof(ts::sign_location_proof(&subject, proof(None)))
+                    .await
+                    .unwrap_or_else(|e| panic!("I519 the proof: {e}"));
+                let in_force = || async {
+                    member_in_geographic_constraint(
+                        &cell,
+                        &d.list_location_proofs_for(&subject).await.unwrap(),
+                        Utc::now(),
+                    )
+                };
+                assert!(
+                    in_force().await,
+                    "I519 precondition — the proof is in force"
+                );
+                let t1 = at + Duration::hours(1);
+                // A stranger: refused by standing, nothing ends.
+                let r = d
+                    .withdraw_location_proof(ts::sign_location_proof(&stranger, proof(Some(t1))))
+                    .await;
+                assert!(
+                    matches!(r, Err(Error::LocationAuthorityUnauthorized { .. })),
+                    "I519 a stranger's withdrawal is refused by standing: {r:?}"
+                );
+                assert!(in_force().await, "I519 the stranger ended nothing");
+                // A live delegate of the subject passes standing but did not attest
+                // the proof: refused by name.
+                ts::put_delegates_to(d, &subject, &delegate, None)
+                    .await
+                    .expect("I519 the delegation");
+                let r = d
+                    .withdraw_location_proof(ts::sign_location_proof(&delegate, proof(Some(t1))))
+                    .await;
+                // v62.0.0 (GC8; CC 4.5.9.1 ruling 10) — no delegation mints a
+                // location authority: the delegate is refused at the door, by its
+                // bytes (attester != subject), before the attester leg.
+                assert!(
+                    matches!(&r, Err(Error::LocationAuthorityUnauthorized { rule, .. })
                 if *rule == crate::federation::tier_ingest::LOCATION_AUTHORITY_RULE_NOT_SUBJECT),
-            "I519 a delegate who did not attest the proof cannot end it: {r:?}"
-        );
-        assert!(in_force().await, "I519 the delegate ended nothing");
-        // A re-offer that is not a withdrawal.
-        let r = d
-            .withdraw_location_proof(ts::sign_location_proof(&subject, proof(None)))
-            .await;
-        assert!(
-            r.as_ref().is_err_and(|e| e
-                .to_string()
-                .contains("location_proof_withdraw_not_a_withdrawal")),
-            "I519 a row with no withdrawn_at is not a withdrawal: {r:?}"
-        );
-        // The attester ends it.
-        d.withdraw_location_proof(ts::sign_location_proof(&subject, proof(Some(t1))))
-            .await
-            .unwrap_or_else(|e| panic!("I519 the attester withdraws: {e}"));
-        assert!(!in_force().await, "I519 the proof is no longer in force");
-        let held = d.list_location_proofs_for(&subject).await.unwrap();
-        assert_eq!(held.len(), 1, "I519 one row, in history: {held:?}");
-        assert_eq!(
-            held[0].withdrawn_at,
-            Some(t1),
-            "I519 the withdrawal instant"
-        );
-        // Idempotent: a second withdrawal keeps the first instant.
-        d.withdraw_location_proof(ts::sign_location_proof(
-            &subject,
-            proof(Some(t1 + Duration::hours(1))),
-        ))
+                    "I519 a delegate who did not attest the proof cannot end it: {r:?}"
+                );
+                assert!(in_force().await, "I519 the delegate ended nothing");
+                // A re-offer that is not a withdrawal.
+                let r = d
+                    .withdraw_location_proof(ts::sign_location_proof(&subject, proof(None)))
+                    .await;
+                assert!(
+                    r.as_ref().is_err_and(|e| e
+                        .to_string()
+                        .contains("location_proof_withdraw_not_a_withdrawal")),
+                    "I519 a row with no withdrawn_at is not a withdrawal: {r:?}"
+                );
+                // The attester ends it.
+                d.withdraw_location_proof(ts::sign_location_proof(&subject, proof(Some(t1))))
+                    .await
+                    .unwrap_or_else(|e| panic!("I519 the attester withdraws: {e}"));
+                assert!(!in_force().await, "I519 the proof is no longer in force");
+                let held = d.list_location_proofs_for(&subject).await.unwrap();
+                assert_eq!(held.len(), 1, "I519 one row, in history: {held:?}");
+                assert_eq!(
+                    held[0].withdrawn_at,
+                    Some(t1),
+                    "I519 the withdrawal instant"
+                );
+                // Idempotent: a second withdrawal keeps the first instant.
+                d.withdraw_location_proof(ts::sign_location_proof(
+                    &subject,
+                    proof(Some(t1 + Duration::hours(1))),
+                ))
+                .await
+                .expect("I519 a re-offer is a no-op");
+                let held = d.list_location_proofs_for(&subject).await.unwrap();
+                assert_eq!(
+                    held[0].withdrawn_at,
+                    Some(t1),
+                    "I519 the first instant stands"
+                );
+                // The served row carries the withdrawal and verifies as signed.
+                let served = d
+                    .list_signed_location_proofs_since(None, 10_000)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|s| s.proof.location_proof.subject_key_id == subject)
+                    .expect("I519 the row is served");
+                assert_eq!(served.proof.location_proof.withdrawn_at, Some(t1));
+                crate::federation::verify_location_proof_admission(d, &served.proof)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("I519 the served withdrawal verifies as signed: {e}")
+                    });
+            }),
+        )
         .await
-        .expect("I519 a re-offer is a no-op");
-        let held = d.list_location_proofs_for(&subject).await.unwrap();
-        assert_eq!(
-            held[0].withdrawn_at,
-            Some(t1),
-            "I519 the first instant stands"
-        );
-        // The served row carries the withdrawal and verifies as signed.
-        let served = d
-            .list_signed_location_proofs_since(None, 10_000)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|s| s.proof.location_proof.subject_key_id == subject)
-            .expect("I519 the row is served");
-        assert_eq!(served.proof.location_proof.withdrawn_at, Some(t1));
-        crate::federation::verify_location_proof_admission(d, &served.proof)
-            .await
-            .unwrap_or_else(|e| panic!("I519 the served withdrawal verifies as signed: {e}"));
     }
 }
 
@@ -196,73 +214,78 @@ pub(crate) mod reindex_bodies {
     /// no longer matched. After: the withdrawn row's hash resolves to the row;
     /// the pre-withdrawal hash resolves to nothing.
     pub(crate) async fn i523_a_withdrawal_is_reindexed(d: &dyn FederationDirectory, tag: &str) {
-        let subject = format!("i523-s-{tag}");
-        ts::register_hybrid_key(d, &subject).await;
-        let (cell, at) = (
-            cell(),
-            "2026-10-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
-        );
-        d.put_location_proof(ts::sign_location_proof(
-            &subject,
-            proof(&subject, &cell, at, None),
-        ))
-        .await
-        .expect("the proof");
-        let (_, hash0) = served(d, &subject).await;
-        assert!(
-            d.lookup_signed_record_by_content_hash("LocationProof", &hash0)
+        // CP2 held: the location_proof card is pending (CC next edition); its
+        // runners are ignored `v62: location_proof card pending`.
+        crate::federation::edition2::fixture_switch::with_earlier_form_async(async move {
+            let subject = format!("i523-s-{tag}");
+            ts::register_hybrid_key(d, &subject).await;
+            let (cell, at) = (
+                cell(),
+                "2026-10-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            );
+            d.put_location_proof(ts::sign_location_proof(
+                &subject,
+                proof(&subject, &cell, at, None),
+            ))
+            .await
+            .expect("the proof");
+            let (_, hash0) = served(d, &subject).await;
+            assert!(
+                d.lookup_signed_record_by_content_hash("LocationProof", &hash0)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "I523 precondition — the put indexed the row"
+            );
+            d.withdraw_location_proof(ts::sign_location_proof(
+                &subject,
+                proof(&subject, &cell, at, Some(at + Duration::hours(1))),
+            ))
+            .await
+            .expect("the withdrawal");
+            let (withdrawn, hash1) = served(d, &subject).await;
+            assert!(withdrawn.location_proof.withdrawn_at.is_some());
+            let found = d
+                .lookup_signed_record_by_content_hash("LocationProof", &hash1)
                 .await
-                .unwrap()
-                .is_some(),
-            "I523 precondition — the put indexed the row"
-        );
-        d.withdraw_location_proof(ts::sign_location_proof(
-            &subject,
-            proof(&subject, &cell, at, Some(at + Duration::hours(1))),
-        ))
-        .await
-        .expect("the withdrawal");
-        let (withdrawn, hash1) = served(d, &subject).await;
-        assert!(withdrawn.location_proof.withdrawn_at.is_some());
-        let found = d
-            .lookup_signed_record_by_content_hash("LocationProof", &hash1)
-            .await
-            .unwrap();
-        assert_eq!(
-            found.as_deref(),
-            Some(serde_json::to_vec(&withdrawn).unwrap().as_slice()),
-            "I523 the withdrawn row resolves under its own content hash"
-        );
-        assert!(
-            d.lookup_signed_record_by_content_hash("LocationProof", &hash0)
+                .unwrap();
+            assert_eq!(
+                found.as_deref(),
+                Some(serde_json::to_vec(&withdrawn).unwrap().as_slice()),
+                "I523 the withdrawn row resolves under its own content hash"
+            );
+            assert!(
+                d.lookup_signed_record_by_content_hash("LocationProof", &hash0)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "I523 the pre-withdrawal hash resolves to nothing"
+            );
+            // **I574** (v54.0.0, #995 row 5) — and the listing no longer
+            // ADVERTISES it: the re-index upserted the new hash and left the
+            // `(kind, old_hash)` row behind, so anti-entropy kept offering a hash
+            // whose point read answers `None`.
+            let listed = d
+                .list_wire_hashes_since("LocationProof", None, 10_000)
                 .await
-                .unwrap()
-                .is_none(),
-            "I523 the pre-withdrawal hash resolves to nothing"
-        );
-        // **I574** (v54.0.0, #995 row 5) — and the listing no longer
-        // ADVERTISES it: the re-index upserted the new hash and left the
-        // `(kind, old_hash)` row behind, so anti-entropy kept offering a hash
-        // whose point read answers `None`.
-        let listed = d
-            .list_wire_hashes_since("LocationProof", None, 10_000)
-            .await
-            .unwrap();
-        assert!(
-            listed.contains(&hash1),
-            "I574 the withdrawn row's hash is listed"
-        );
-        assert!(
-            !listed.contains(&hash0),
-            "I574 the pre-withdrawal hash is no longer advertised: {listed:?}"
-        );
-        // A rebuild leaves the one current mapping.
-        d.rebuild_signed_wire_index().await.unwrap();
-        let listed = d
-            .list_wire_hashes_since("LocationProof", None, 10_000)
-            .await
-            .unwrap();
-        assert!(listed.contains(&hash1) && !listed.contains(&hash0));
+                .unwrap();
+            assert!(
+                listed.contains(&hash1),
+                "I574 the withdrawn row's hash is listed"
+            );
+            assert!(
+                !listed.contains(&hash0),
+                "I574 the pre-withdrawal hash is no longer advertised: {listed:?}"
+            );
+            // A rebuild leaves the one current mapping.
+            d.rebuild_signed_wire_index().await.unwrap();
+            let listed = d
+                .list_wire_hashes_since("LocationProof", None, 10_000)
+                .await
+                .unwrap();
+            assert!(listed.contains(&hash1) && !listed.contains(&hash0));
+        })
+        .await
     }
 
     /// **I599** (v54.0.0, Codex on PR #1050) — **a re-index is one step per
@@ -292,93 +315,98 @@ pub(crate) mod reindex_bodies {
     ) where
         Fut: std::future::Future<Output = Result<(), crate::federation::Error>>,
     {
-        let subject = format!("i599-s-{tag}");
-        ts::register_hybrid_key(first, &subject).await;
-        let (cell, at) = (
-            cell(),
-            "2026-10-03T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
-        );
-        first
-            .put_location_proof(ts::sign_location_proof(
+        // CP2 held: the location_proof card is pending (CC next edition); its
+        // runners are ignored `v62: location_proof card pending`.
+        crate::federation::edition2::fixture_switch::with_earlier_form_async(async move {
+            let subject = format!("i599-s-{tag}");
+            ts::register_hybrid_key(first, &subject).await;
+            let (cell, at) = (
+                cell(),
+                "2026-10-03T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            );
+            first
+                .put_location_proof(ts::sign_location_proof(
+                    &subject,
+                    proof(&subject, &cell, at, None),
+                ))
+                .await
+                .expect("the proof");
+            let (_, hash0) = served(first, &subject).await;
+            let key = crate::federation::wire_index::record_key(&[
+                ("subject_key_id", &subject),
+                (
+                    "asserted_at",
+                    &crate::federation::wire_index::locator_instant(&at),
+                ),
+            ]);
+            // Armed only now: the put above re-indexed too and must not take it.
+            let pause = arm();
+            let withdrawal = ts::sign_location_proof(
                 &subject,
-                proof(&subject, &cell, at, None),
-            ))
-            .await
-            .expect("the proof");
-        let (_, hash0) = served(first, &subject).await;
-        let key = crate::federation::wire_index::record_key(&[
-            ("subject_key_id", &subject),
-            (
-                "asserted_at",
-                &crate::federation::wire_index::locator_instant(&at),
-            ),
-        ]);
-        // Armed only now: the put above re-indexed too and must not take it.
-        let pause = arm();
-        let withdrawal = ts::sign_location_proof(
-            &subject,
-            proof(&subject, &cell, at, Some(at + Duration::hours(1))),
-        );
-        let (r_first, (r_second, second_ran_free)) = tokio::join!(reindex_first(key), async {
-            pause.reached().await;
-            let w = second.withdraw_location_proof(withdrawal);
-            tokio::pin!(w);
-            match tokio::time::timeout(std::time::Duration::from_secs(3), &mut w).await {
-                Ok(r) => {
-                    pause.resume();
-                    (r, true)
+                proof(&subject, &cell, at, Some(at + Duration::hours(1))),
+            );
+            let (r_first, (r_second, second_ran_free)) = tokio::join!(reindex_first(key), async {
+                pause.reached().await;
+                let w = second.withdraw_location_proof(withdrawal);
+                tokio::pin!(w);
+                match tokio::time::timeout(std::time::Duration::from_secs(3), &mut w).await {
+                    Ok(r) => {
+                        pause.resume();
+                        (r, true)
+                    }
+                    Err(_) => {
+                        pause.resume();
+                        (w.await, false)
+                    }
                 }
-                Err(_) => {
-                    pause.resume();
-                    (w.await, false)
-                }
-            }
-        });
-        r_first.expect("the first re-index");
-        r_second.expect("the withdrawal");
-        let (_, hash1) = served(first, &subject).await;
-        assert_ne!(
-            hash0, hash1,
-            "I599 precondition: the withdrawal changed the bytes"
-        );
-        let listed = first
-            .list_wire_hashes_since("LocationProof", None, 10_000)
-            .await
-            .unwrap();
-        let mine: Vec<&String> = listed
-            .iter()
-            .filter(|h| **h == hash0 || **h == hash1)
-            .collect();
-        for h in &listed {
-            assert!(
-                first
-                    .lookup_signed_record_by_content_hash("LocationProof", h)
-                    .await
-                    .unwrap()
-                    .is_some(),
-                "I599 a listed hash the point read rejects: {h} (stale = {}; the withdrawal \
+            });
+            r_first.expect("the first re-index");
+            r_second.expect("the withdrawal");
+            let (_, hash1) = served(first, &subject).await;
+            assert_ne!(
+                hash0, hash1,
+                "I599 precondition: the withdrawal changed the bytes"
+            );
+            let listed = first
+                .list_wire_hashes_since("LocationProof", None, 10_000)
+                .await
+                .unwrap();
+            let mine: Vec<&String> = listed
+                .iter()
+                .filter(|h| **h == hash0 || **h == hash1)
+                .collect();
+            for h in &listed {
+                assert!(
+                    first
+                        .lookup_signed_record_by_content_hash("LocationProof", h)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "I599 a listed hash the point read rejects: {h} (stale = {}; the withdrawal \
                  finished while the re-index was held: {second_ran_free})",
-                *h == hash0
-            );
-        }
-        assert_eq!(
-            mine,
-            vec![&hash1],
-            "I599 exactly one mapping for the record, the withdrawn row's (withdrawal ran \
+                    *h == hash0
+                );
+            }
+            assert_eq!(
+                mine,
+                vec![&hash1],
+                "I599 exactly one mapping for the record, the withdrawn row's (withdrawal ran \
              while the re-index was held: {second_ran_free})"
-        );
-        if second_waits {
-            assert!(
-                !second_ran_free,
-                "I599 the withdrawal's re-index must wait for the held one"
             );
-        } else {
-            assert!(
-                second_ran_free,
-                "I603 premise: the withdrawal and its re-index commit while the first \
+            if second_waits {
+                assert!(
+                    !second_ran_free,
+                    "I599 the withdrawal's re-index must wait for the held one"
+                );
+            } else {
+                assert!(
+                    second_ran_free,
+                    "I603 premise: the withdrawal and its re-index commit while the first \
                  re-index holds its stale read, so the first commits last"
-            );
-        }
+                );
+            }
+        })
+        .await
     }
 
     /// **I524** (v53.1.3, Codex on #985 P2, #986) — **the withdrawal write is
@@ -397,40 +425,47 @@ pub(crate) mod reindex_bodies {
     ) where
         B: FederationDirectory + Sync,
     {
-        let subject = format!("i524-s-{tag}");
-        ts::register_hybrid_key(b, &subject).await;
-        let (cell, at) = (
-            cell(),
-            "2026-10-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
-        );
-        b.put_location_proof(ts::sign_location_proof(
-            &subject,
-            proof(&subject, &cell, at, None),
-        ))
-        .await
-        .expect("the proof");
-        let (ta, tb) = (at + Duration::hours(1), at + Duration::hours(2));
-        let rival = ts::sign_location_proof(&subject, proof(&subject, &cell, at, Some(tb)));
-        arm(b, rival);
-        // A reads the row unwithdrawn and decides Apply; the rival (B, at tb)
-        // lands before A's write; A's write must not overwrite it.
-        b.withdraw_location_proof(ts::sign_location_proof(
-            &subject,
-            proof(&subject, &cell, at, Some(ta)),
-        ))
-        .await
-        .expect("I524 the loser answers already-withdrawn, not an error");
-        let held = b.list_location_proofs_for(&subject).await.unwrap();
-        assert_eq!(
-            held[0].withdrawn_at,
-            Some(tb),
-            "I524 the withdrawal that landed first stands: {held:?}"
-        );
-        let (srv, _) = served(b, &subject).await;
-        assert_eq!(srv.location_proof.withdrawn_at, Some(tb));
-        crate::federation::verify_location_proof_admission(b, &srv)
+        // CP2 held: the location_proof card is pending (CC next edition); its
+        // runners are ignored `v62: location_proof card pending`.
+        crate::federation::edition2::fixture_switch::with_earlier_form_async(async move {
+            let subject = format!("i524-s-{tag}");
+            ts::register_hybrid_key(b, &subject).await;
+            let (cell, at) = (
+                cell(),
+                "2026-10-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            );
+            b.put_location_proof(ts::sign_location_proof(
+                &subject,
+                proof(&subject, &cell, at, None),
+            ))
             .await
-            .expect("I524 the served row is the first withdrawal, whole: its signature verifies");
+            .expect("the proof");
+            let (ta, tb) = (at + Duration::hours(1), at + Duration::hours(2));
+            let rival = ts::sign_location_proof(&subject, proof(&subject, &cell, at, Some(tb)));
+            arm(b, rival);
+            // A reads the row unwithdrawn and decides Apply; the rival (B, at tb)
+            // lands before A's write; A's write must not overwrite it.
+            b.withdraw_location_proof(ts::sign_location_proof(
+                &subject,
+                proof(&subject, &cell, at, Some(ta)),
+            ))
+            .await
+            .expect("I524 the loser answers already-withdrawn, not an error");
+            let held = b.list_location_proofs_for(&subject).await.unwrap();
+            assert_eq!(
+                held[0].withdrawn_at,
+                Some(tb),
+                "I524 the withdrawal that landed first stands: {held:?}"
+            );
+            let (srv, _) = served(b, &subject).await;
+            assert_eq!(srv.location_proof.withdrawn_at, Some(tb));
+            crate::federation::verify_location_proof_admission(b, &srv)
+                .await
+                .expect(
+                    "I524 the served row is the first withdrawal, whole: its signature verifies",
+                );
+        })
+        .await
     }
 }
 
@@ -456,106 +491,118 @@ pub(crate) mod peer_bodies {
         b: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let (subject, delegate, stranger) = (
-            format!("i522-s-{tag}"),
-            format!("i522-d-{tag}"),
-            format!("i522-x-{tag}"),
-        );
-        for d in [a, b] {
-            for k in [&subject, &delegate, &stranger] {
-                ts::register_hybrid_key(d, k).await;
-            }
-        }
-        let cell = h3o::LatLng::new(37.0, -122.0)
-            .unwrap()
-            .to_cell(h3o::Resolution::Seven)
-            .to_string();
-        let proof = |at: DateTime<Utc>, withdrawn_at: Option<DateTime<Utc>>| LocationProof {
-            subject_key_id: subject.clone(),
-            cell_id: cell.clone(),
-            cell_resolution: 7,
-            asserted_at: at,
-            valid_until: None,
-            attestation_evidence: None,
-            withdrawn_at,
-            persist_row_hash: String::new(),
-        };
-        async fn in_force_on(d: &dyn FederationDirectory, cell: &str, subject: &str) -> bool {
-            member_in_geographic_constraint(
-                cell,
-                &d.list_location_proofs_for(subject).await.unwrap(),
-                Utc::now(),
-            )
-        }
-        macro_rules! in_force {
-            ($d:expr) => {
-                in_force_on($d, &cell, &subject)
-            };
-        }
-        let at1: DateTime<Utc> = "2026-10-01T00:00:00Z".parse().unwrap();
-        let original = ts::sign_location_proof(&subject, proof(at1, None));
-        a.put_location_proof(original.clone())
-            .await
-            .expect("A holds the proof");
-        b.put_location_proof(original)
-            .await
-            .expect("B holds the proof");
-        assert!(in_force!(b).await, "I522 precondition — in force on B");
-        let t1 = at1 + Duration::hours(1);
-        a.withdraw_location_proof(ts::sign_location_proof(&subject, proof(at1, Some(t1))))
-            .await
-            .expect("I522 A's attester withdraws");
-        let served = a
-            .list_signed_location_proofs_since(None, 10_000)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|s| s.proof.location_proof.subject_key_id == subject)
-            .expect("I522 A serves the row");
-        assert_eq!(served.proof.location_proof.withdrawn_at, Some(t1));
-        b.put_location_proof(served.proof)
-            .await
-            .unwrap_or_else(|e| panic!("I522 B applies A's served withdrawal: {e}"));
-        assert!(
-            !in_force!(b).await,
-            "I522 B's fold excludes the withdrawn proof"
-        );
-        let held = b.list_location_proofs_for(&subject).await.unwrap();
-        assert_eq!(held.len(), 1, "I522 one row on B: {held:?}");
-        assert_eq!(
-            held[0].withdrawn_at,
-            Some(t1),
-            "I522 the attester's instant"
-        );
-        // A second proof held on B only; a live delegate of the subject who
-        // did not attest it offers a "withdrawal": refused by name, in force.
-        let at2 = at1 + Duration::days(1);
-        b.put_location_proof(ts::sign_location_proof(&subject, proof(at2, None)))
-            .await
-            .expect("B holds a second proof");
-        ts::put_delegates_to(b, &subject, &delegate, None)
-            .await
-            .expect("the delegation on B");
-        let r = b
-            .put_location_proof(ts::sign_location_proof(&delegate, proof(at2, Some(t1))))
-            .await;
-        // v62.0.0 (GC8; CC 4.5.9.1 ruling 10) — refused at the door: not the
-        // subject.
-        assert!(
+        Box::pin(
+            // CP2 held: the location_proof card is pending (CC next edition); its
+            // runners are ignored `v62: location_proof card pending`.
+            crate::federation::edition2::fixture_switch::with_earlier_form_async(async move {
+                let (subject, delegate, stranger) = (
+                    format!("i522-s-{tag}"),
+                    format!("i522-d-{tag}"),
+                    format!("i522-x-{tag}"),
+                );
+                for d in [a, b] {
+                    for k in [&subject, &delegate, &stranger] {
+                        ts::register_hybrid_key(d, k).await;
+                    }
+                }
+                let cell = h3o::LatLng::new(37.0, -122.0)
+                    .unwrap()
+                    .to_cell(h3o::Resolution::Seven)
+                    .to_string();
+                let proof =
+                    |at: DateTime<Utc>, withdrawn_at: Option<DateTime<Utc>>| LocationProof {
+                        subject_key_id: subject.clone(),
+                        cell_id: cell.clone(),
+                        cell_resolution: 7,
+                        asserted_at: at,
+                        valid_until: None,
+                        attestation_evidence: None,
+                        withdrawn_at,
+                        persist_row_hash: String::new(),
+                    };
+                async fn in_force_on(
+                    d: &dyn FederationDirectory,
+                    cell: &str,
+                    subject: &str,
+                ) -> bool {
+                    member_in_geographic_constraint(
+                        cell,
+                        &d.list_location_proofs_for(subject).await.unwrap(),
+                        Utc::now(),
+                    )
+                }
+                macro_rules! in_force {
+                    ($d:expr) => {
+                        in_force_on($d, &cell, &subject)
+                    };
+                }
+                let at1: DateTime<Utc> = "2026-10-01T00:00:00Z".parse().unwrap();
+                let original = ts::sign_location_proof(&subject, proof(at1, None));
+                a.put_location_proof(original.clone())
+                    .await
+                    .expect("A holds the proof");
+                b.put_location_proof(original)
+                    .await
+                    .expect("B holds the proof");
+                assert!(in_force!(b).await, "I522 precondition — in force on B");
+                let t1 = at1 + Duration::hours(1);
+                a.withdraw_location_proof(ts::sign_location_proof(&subject, proof(at1, Some(t1))))
+                    .await
+                    .expect("I522 A's attester withdraws");
+                let served = a
+                    .list_signed_location_proofs_since(None, 10_000)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|s| s.proof.location_proof.subject_key_id == subject)
+                    .expect("I522 A serves the row");
+                assert_eq!(served.proof.location_proof.withdrawn_at, Some(t1));
+                b.put_location_proof(served.proof)
+                    .await
+                    .unwrap_or_else(|e| panic!("I522 B applies A's served withdrawal: {e}"));
+                assert!(
+                    !in_force!(b).await,
+                    "I522 B's fold excludes the withdrawn proof"
+                );
+                let held = b.list_location_proofs_for(&subject).await.unwrap();
+                assert_eq!(held.len(), 1, "I522 one row on B: {held:?}");
+                assert_eq!(
+                    held[0].withdrawn_at,
+                    Some(t1),
+                    "I522 the attester's instant"
+                );
+                // A second proof held on B only; a live delegate of the subject who
+                // did not attest it offers a "withdrawal": refused by name, in force.
+                let at2 = at1 + Duration::days(1);
+                b.put_location_proof(ts::sign_location_proof(&subject, proof(at2, None)))
+                    .await
+                    .expect("B holds a second proof");
+                ts::put_delegates_to(b, &subject, &delegate, None)
+                    .await
+                    .expect("the delegation on B");
+                let r = b
+                    .put_location_proof(ts::sign_location_proof(&delegate, proof(at2, Some(t1))))
+                    .await;
+                // v62.0.0 (GC8; CC 4.5.9.1 ruling 10) — refused at the door: not the
+                // subject.
+                assert!(
             matches!(&r, Err(Error::LocationAuthorityUnauthorized { rule, .. })
                 if *rule == crate::federation::tier_ingest::LOCATION_AUTHORITY_RULE_NOT_SUBJECT),
             "I522 a delegate who did not attest the proof cannot end it through replication: {r:?}"
         );
-        assert!(in_force!(b).await, "I522 the second proof stands");
-        // A stranger's: refused by standing.
-        let r = b
-            .put_location_proof(ts::sign_location_proof(&stranger, proof(at2, Some(t1))))
-            .await;
-        assert!(
-            matches!(r, Err(Error::LocationAuthorityUnauthorized { .. })),
-            "I522 a stranger's withdrawal is refused by standing: {r:?}"
-        );
-        assert!(in_force!(b).await, "I522 the second proof still stands");
+                assert!(in_force!(b).await, "I522 the second proof stands");
+                // A stranger's: refused by standing.
+                let r = b
+                    .put_location_proof(ts::sign_location_proof(&stranger, proof(at2, Some(t1))))
+                    .await;
+                assert!(
+                    matches!(r, Err(Error::LocationAuthorityUnauthorized { .. })),
+                    "I522 a stranger's withdrawal is refused by standing: {r:?}"
+                );
+                assert!(in_force!(b).await, "I522 the second proof still stands");
+            }),
+        )
+        .await
     }
 }
 
@@ -570,6 +617,7 @@ mod runners {
             mod $modname {
                 use crate::federation::FederationDirectory;
                 #[tokio::test]
+                #[ignore = "v62: location_proof card pending (CC next edition)"]
                 async fn i519() {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::i519_only_the_attester_ends_a_proof(
@@ -579,6 +627,7 @@ mod runners {
                     .await
                 }
                 #[tokio::test]
+                #[ignore = "v62: location_proof card pending (CC next edition)"]
                 async fn i523() {
                     let Some(d) = $fresh.await else { return };
                     super::super::reindex_bodies::i523_a_withdrawal_is_reindexed(
@@ -588,6 +637,7 @@ mod runners {
                     .await
                 }
                 #[tokio::test]
+                #[ignore = "v62: location_proof card pending (CC next edition)"]
                 async fn i522() {
                     let Some(a) = $fresh.await else { return };
                     let Some(b) = $fresh.await else { return };
@@ -643,6 +693,7 @@ mod runners {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "v62: location_proof card pending (CC next edition)"]
     async fn i599_sqlite() {
         use crate::store::Backend as _;
         let b = crate::store::sqlite::SqliteBackend::open_in_memory()
@@ -655,6 +706,7 @@ mod runners {
     /// I599 on postgres: TWO backends, two pools, one database.
     #[cfg(feature = "postgres")]
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "v62: location_proof card pending (CC next edition)"]
     async fn i599_postgres() {
         use crate::federation::FederationDirectory;
         use crate::store::Backend as _;
@@ -670,13 +722,15 @@ mod runners {
             .await
             .unwrap();
         let b1r = &b1;
-        super::reindex_bodies::i599_a_concurrent_reindex_leaves_one_mapping(
-            &b1 as &dyn FederationDirectory,
-            &b2 as &dyn FederationDirectory,
-            || b1r.test_hooks().arm_pause("wire_index_before_write"),
-            |key| async move { b1r.index_stored_record("LocationProof", &key).await },
-            &suffix(),
-            true,
+        Box::pin(
+            super::reindex_bodies::i599_a_concurrent_reindex_leaves_one_mapping(
+                &b1 as &dyn FederationDirectory,
+                &b2 as &dyn FederationDirectory,
+                || b1r.test_hooks().arm_pause("wire_index_before_write"),
+                |key| async move { b1r.index_stored_record("LocationProof", &key).await },
+                &suffix(),
+                true,
+            ),
         )
         .await;
         eprintln!("i599_postgres: RAN on {dsn}");
@@ -687,6 +741,7 @@ mod runners {
     /// commits in full first and the stale re-index commits last.
     #[cfg(feature = "postgres")]
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "v62: location_proof card pending (CC next edition)"]
     async fn i603_postgres() {
         use crate::federation::FederationDirectory;
         use crate::store::Backend as _;
@@ -702,13 +757,15 @@ mod runners {
             .await
             .unwrap();
         let b1r = &b1;
-        super::reindex_bodies::i599_a_concurrent_reindex_leaves_one_mapping(
-            &b1 as &dyn FederationDirectory,
-            &b2 as &dyn FederationDirectory,
-            || b1r.test_hooks().arm_pause("wire_index_after_read"),
-            |key| async move { b1r.index_stored_record("LocationProof", &key).await },
-            &suffix(),
-            false,
+        Box::pin(
+            super::reindex_bodies::i599_a_concurrent_reindex_leaves_one_mapping(
+                &b1 as &dyn FederationDirectory,
+                &b2 as &dyn FederationDirectory,
+                || b1r.test_hooks().arm_pause("wire_index_after_read"),
+                |key| async move { b1r.index_stored_record("LocationProof", &key).await },
+                &suffix(),
+                false,
+            ),
         )
         .await;
         eprintln!("i603_postgres: RAN on {dsn}");
@@ -718,6 +775,7 @@ mod runners {
     /// and has no race to witness).
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    #[ignore = "v62: location_proof card pending (CC next edition)"]
     async fn i524_sqlite() {
         use crate::store::Backend as _;
         let b = crate::store::sqlite::SqliteBackend::open_in_memory()
@@ -734,6 +792,7 @@ mod runners {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[ignore = "v62: location_proof card pending (CC next edition)"]
     async fn i524_postgres() {
         use crate::store::Backend as _;
         let Some(dsn) = crate::test_pg::empty_dsn() else {

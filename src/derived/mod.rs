@@ -43,6 +43,9 @@
 
 use std::future::Future;
 
+// v62.0.0 (F0-cp6b) — the calibration bundle's signature, in the substrate
+// predicate's form.
+pub mod calibration_admit;
 pub mod detection_row;
 pub mod types;
 
@@ -59,9 +62,12 @@ pub use types::{
 ///
 /// # Verify boundary
 ///
-/// The put paths (`put_detection_event`, `put_calibration_bundle`)
-/// expect canonical bytes + hybrid signature already verified by the
-/// caller. The [`Engine`] PyO3 surface does the verify;
+/// The put path (`put_calibration_bundle`) expects canonical bytes +
+/// hybrid signature already verified by the caller. v62.0.0 (P8-fix11) — a
+/// detection has no put here: it is its detector's own edition-2
+/// `detection:{detector}` statement, admitted through the statement door
+/// (`detection_row::state_detection` / `draft_detection`), and
+/// `detection_events` is its projection. The [`Engine`] PyO3 surface does the verify;
 /// implementations of this trait are storage-only. A backend that
 /// receives a tampered or unverified row is allowed to assume the
 /// caller has already failed the verify boundary, BUT the DB-level
@@ -69,18 +75,6 @@ pub use types::{
 /// catch shape-violations independently.
 pub trait DerivedSchema: Send + Sync {
     // ── detection_events ──────────────────────────────────────────
-
-    /// Insert a [`DetectionEvent`]. Idempotent on `detection_id`
-    /// collision with matching content (no-op); errors on collision
-    /// with differing content.
-    ///
-    /// Caller MUST have already verified the hybrid signature. The
-    /// [`Engine`] PyO3 surface enforces this; the storage trait does
-    /// not re-verify.
-    fn put_detection_event(
-        &self,
-        event: DetectionEvent,
-    ) -> impl Future<Output = Result<(), Error>> + Send;
 
     /// Page-style lookup over `detection_events`. Filter is `AND`-ed
     /// across set fields; an empty filter returns up to the backend's
@@ -101,7 +95,7 @@ pub trait DerivedSchema: Send + Sync {
     /// matches; raises [`Error::Conflict`] when the same `detection_id`
     /// is re-submitted with a different row hash.
     ///
-    /// **Signature trust model.** Unlike `put_detection_event`, the
+    /// **Signature trust model.** Unlike a `detection:*` statement, the
     /// edge-detection envelope carries a single opaque `signature`
     /// over the canonical row (edge#39 ProbePatternObserver shape).
     /// Edge owns the verification policy — it signs at the transport

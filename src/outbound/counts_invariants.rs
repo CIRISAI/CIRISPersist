@@ -54,10 +54,14 @@ mod bodies {
     {
         use OutboundStatus::*;
         let now = chrono::Utc::now();
-        // The queue's FKs name registered keys.
-        let (sender, dest) = (format!("i577-sender-{tag}"), format!("i577-dest-{tag}"));
-        crate::federation::tier_ingest::test_support::register_hybrid_key(q, &sender).await;
-        crate::federation::tier_ingest::test_support::register_hybrid_key(q, &dest).await;
+        // The queue's FKs name registered keys. v62.0.0: a registered key is
+        // an edition-2 `key:record`, projected onto `federation_keys` under
+        // its identity-ref (`kid(seed)`), so the queue names the kids.
+        use crate::federation::edition2::fixture_switch as e2;
+        let (sender_seed, dest_seed) = (format!("i577-sender-{tag}"), format!("i577-dest-{tag}"));
+        crate::federation::tier_ingest::test_support::register_hybrid_key(q, &sender_seed).await;
+        crate::federation::tier_ingest::test_support::register_hybrid_key(q, &dest_seed).await;
+        let (sender, dest) = (e2::kid(&sender_seed), e2::kid(&dest_seed));
         let mut ids = Vec::new();
         // (requires_ack, max_attempts, eligible now)
         for (i, (ack, max, now_ok)) in [

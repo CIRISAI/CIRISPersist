@@ -71,7 +71,7 @@
 //!   held it is `no_cosignature`; with two founders' voices held, the fold
 //!   (`cosign::edition2_voices`) is exactly their issuers and the count
 //!   reaches the trust root (`root_not_held` here).
-//! - **I3170** `put_blob_edition2` stores the bytes and admits the edition-2
+//! - **I3170** `put_blob` stores the bytes and admits the edition-2
 //!   holding claim; the holder directory (`list_holders_of`) names the
 //!   holder.
 //! - **I3171** a claim naming another blob is refused before any byte is
@@ -86,6 +86,10 @@
 //! - **I3193** the eviction window: an own claim admitted between the
 //!   eviction's retraction and its commit is taken out by the eviction's
 //!   re-fold (held `blob_not_held`).
+//! - **I3197** (T2-fix11; CC 6.1.3) the put door's stored claim is the
+//!   holder's composite statement (its row id, no PQC half), and
+//!   `put_blob_with_scope` refuses a claim placed at another scope
+//!   (`custody_ack_scope_mismatch`) before anything is written.
 //! - **I3172** a `trust:accepts:v1` edge projects into the v1.3 trust plane
 //!   (`lookup_trust`): `trusted_by` = its granter, `Direct`, `valid_until`
 //!   as `expires_at`, and `trust_type` DERIVED `temporary`.
@@ -1144,7 +1148,7 @@ where
         "I3192 another holder's claim lands"
     );
     // The bytes land (with a later claim): the early claim concludes.
-    d.put_blob_edition2(
+    d.put_blob(
         &sha,
         crate::federation::BlobBody::Inline(bytes.clone()),
         None,
@@ -1272,7 +1276,7 @@ where
 
     // I3171 — a claim naming another blob stores nothing.
     let e = d
-        .put_blob_edition2(
+        .put_blob(
             &sha,
             crate::federation::BlobBody::Inline(bytes.clone()),
             None,
@@ -1305,7 +1309,7 @@ where
         .unwrap(),
     );
     assert!(
-        d.put_blob_edition2(
+        d.put_blob(
             &other_sha,
             crate::federation::BlobBody::Inline(other),
             None,
@@ -1323,7 +1327,7 @@ where
 
     // I3170 — the bytes and the claim; the holder directory reads it.
     let st = claim(&sha);
-    d.put_blob_edition2(
+    d.put_blob(
         &sha,
         crate::federation::BlobBody::Inline(bytes.clone()),
         Some("text/plain"),
@@ -1346,6 +1350,65 @@ where
         holders.contains(&hi),
         "I3170 the holder directory: {holders:?}"
     );
+    // I3197 (T2-fix11; CC 6.1.3) — the claim row the put door stored is the
+    // holder's composite statement: its row id is the statement's, and it
+    // carries no bound-hybrid PQC half.
+    let row = d
+        .get_attestation(&rid(&st).hex())
+        .await
+        .unwrap()
+        .expect("I3197 the claim row, under its row id");
+    assert!(
+        crate::federation::edition2::fixture_switch::carried_statement(&row).is_some(),
+        "I3197 the claim row carries its statement"
+    );
+    assert!(
+        row.scrub_signature_pqc.is_none(),
+        "I3197 one composite signature, no bound-hybrid PQC half"
+    );
+    // I3197 — `put_blob_with_scope` judges the claim's placement before
+    // anything is written: a claim placed at `self` for a commons write is
+    // refused `custody_ack_scope_mismatch`, and stores nothing.
+    let placed = b"t2 fix11 misplaced claim".to_vec();
+    let placed_sha: [u8; 32] = sha2::Sha256::digest(&placed).into();
+    let misplaced = sign(
+        &h,
+        &hi,
+        CUSTODY_PREFIX,
+        &custody_payload(
+            &hi,
+            &placed_sha,
+            CustodyState::Here,
+            Some(placed.len() as u64),
+            crate::federation::types::cohort_scope::SELF,
+            None,
+            now_ms(),
+        )
+        .unwrap(),
+    );
+    let e = d
+        .put_blob_with_scope(
+            None,
+            &placed_sha,
+            crate::federation::BlobBody::Inline(placed),
+            None,
+            &misplaced,
+            crate::federation::types::cohort_scope::FEDERATION,
+            crate::federation::StorageFloor::resolved(
+                crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+            ),
+            None,
+        )
+        .await
+        .expect_err("I3197 a misplaced claim is refused");
+    assert!(
+        e.to_string().contains("custody_ack_scope_mismatch"),
+        "I3197 by name: {e}"
+    );
+    assert!(
+        d.blob_head(&placed_sha).await.unwrap().is_none(),
+        "I3197 nothing is written"
+    );
 
     // I3181 — the reap is conditional, in one transaction: bytes a `here`
     // claim names are kept (a concurrent writer whose claim landed keeps
@@ -1360,11 +1423,13 @@ where
     );
     let loose = b"t2 unclaimed local bytes".to_vec();
     let loose_sha: [u8; 32] = sha2::Sha256::digest(&loose).into();
+    // A commons write names its scope as the constant (I14: a commons door
+    // reaches the floor only by naming a commons scope literally).
     d.store_blob_local(
         &loose_sha,
         crate::federation::BlobBody::Inline(loose),
         None,
-        "federation",
+        crate::federation::types::cohort_scope::FEDERATION,
         crate::federation::StorageFloor::resolved(
             crate::federation::types::cohort_scope::CryptoTier::Plaintext,
         ),

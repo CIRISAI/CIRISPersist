@@ -39,6 +39,11 @@ pub enum Sig19Error {
     /// The composite does not verify (which half is not said).
     #[error("sig19_composite_invalid")]
     CompositeInvalid,
+    /// v62.0.0 (F0-cp5b; CC 6.1.3) — a lone Ed25519 or ML-DSA-65 half where
+    /// the object's ONE composite belongs, refused by name before any key is
+    /// read. The message leads with `verify_component_signature`.
+    #[error("{0}")]
+    ComponentSignature(String),
 }
 
 impl Sig19 {
@@ -47,9 +52,21 @@ impl Sig19 {
     /// # Errors
     /// [`Sig19Error::Malformed`] on bad base64.
     pub fn composite_b64(b64: &str) -> Result<Self, Sig19Error> {
-        B64.decode(b64)
-            .map(Self)
-            .map_err(|e| Sig19Error::Malformed(format!("composite sig base64: {e}")))
+        let raw = B64
+            .decode(b64)
+            .map_err(|e| Sig19Error::Malformed(format!("composite sig base64: {e}")))?;
+        // v62.0.0 (F0-cp5b; CC 6.1.3) — the one composite shape check shared
+        // with the directory verifier: a lone half is refused by name.
+        use crate::federation::edition2::composite_verify::{
+            require_composite_length, CompositeVerifyError,
+        };
+        require_composite_length(raw.len()).map_err(|e| match e {
+            CompositeVerifyError::ComponentSignature { .. } => {
+                Sig19Error::ComponentSignature(e.to_string())
+            }
+            other => Sig19Error::Malformed(other.to_string()),
+        })?;
+        Ok(Self(raw))
     }
 
     /// Parse the one-argument wire form a caller passes: a base64 composite.

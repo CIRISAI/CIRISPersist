@@ -225,8 +225,14 @@ pub fn key_projection(held: &HeldKeys, kid: &Digest32) -> Result<Option<KeyProje
     } else {
         valid.iter().filter_map(|v| v.record.valid_until).max()
     };
-    let pk = chosen.record.key.as_bytes();
-    let (mldsa, ed) = pk.split_at(pk.len() - 32);
+    // v62.0.0 (C5-fix3): the one composite split, by Verify's named layout.
+    let (mldsa, ed) = super::composite::key_halves(&chosen.record.key).ok_or_else(|| {
+        Error::Backend(format!(
+            "key {} is not a {}-byte composite",
+            identity_ref(kid),
+            ciris_crypto::composite::PUBLIC_KEY_LEN
+        ))
+    })?;
     let b64 = base64::engine::general_purpose::STANDARD;
     let iref = identity_ref(kid);
     Ok(Some(KeyProjection {

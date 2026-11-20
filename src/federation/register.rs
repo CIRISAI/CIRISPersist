@@ -1185,7 +1185,7 @@ pub(crate) async fn verify_canonical_supersede(
     record: &KeyRecord,
 ) -> Result<bool, Error> {
     // Both quorum questions against the PRODUCTION genesis accord roster.
-    let roster = super::admission::accord_holder_roster_key_ids();
+    let roster = super::admission::accord_holder_roster(directory).await?;
     decide_canonical_supersede(
         existing,
         record,
@@ -1585,31 +1585,15 @@ pub fn key_id_fingerprint(pubkey_ed25519_base64: &str) -> Option<String> {
     id.strip_prefix("id-").map(str::to_owned)
 }
 
-/// v59.0.0 (CIRISPersist#1103) — is `record` one the genesis bundle pin or a
-/// family vouches for, exempt from the fingerprint rule? A bundle-pinned
-/// anchor (an accord holder or a serve node of the pinned
-/// [`GenesisBundle`](super::genesis::bundle::GenesisBundle), the accord
-/// holders this build seeds, under the SAME Ed25519 key) or a held family's
-/// id. Keyed off the bundle and the families, never a string prefix.
+/// v59.0.0 (CIRISPersist#1103) — is `record` one a held family vouches for,
+/// exempt from the fingerprint rule? A held family's id. Keyed off the
+/// families, never a string prefix. v62.0.0 (C5-fix1): the bundle-pin arm
+/// (the baked v4 holders and serve nodes, the baked accord family id) is
+/// deleted with the baked genesis.
 async fn fingerprint_exempt<F>(directory: &F, record: &KeyRecord) -> Result<bool, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    let pinned = |r: &super::SignedKeyRecord| {
-        r.record.key_id == record.key_id
-            && r.record.pubkey_ed25519_base64 == record.pubkey_ed25519_base64
-    };
-    let bundle = super::genesis::canonical_genesis_bundle();
-    if bundle.holders.iter().chain(&bundle.serve_nodes).any(pinned)
-        || super::genesis::effective_accord_holder_records()
-            .iter()
-            .any(pinned)
-    {
-        return Ok(true);
-    }
-    if bundle.family_key_id == record.key_id {
-        return Ok(true);
-    }
     Ok(directory.lookup_family(&record.key_id).await?.is_some())
 }
 

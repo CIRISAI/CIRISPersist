@@ -24,7 +24,7 @@
 //! `minted_by_persist` entries — scoped to the three families persist is the
 //! PRODUCER of, because CC 3.1.7 R2(a) is a producer obligation. R2(a) is not
 //! the whole exposure. Measured on the vendored rc5 @ 4b624513 cut, the minted
-//! set is **4 of 22** (three from #590, plus `mesh_config:` — CIRISPersist#570
+//! set is **4 of 21** (three from #590, plus `mesh_config:` — CIRISPersist#570
 //! ask 1; v60.0.0 added `goal:`, CIRISPersist#988 item 4; v60.1.0 added
 //! `identity_amendment:`, CIRISPersist#1120). v50.0.0 (CIRISPersist#924): CC's `_meta.case_rule.reserved_stems`
 //! now states the `capacity:` and `detection:` rules at the FAMILY (the
@@ -35,6 +35,9 @@
 //! rc5 registered `session:{kind}` WITH its `substrate-self-report` rule, so
 //! the gap it recorded is closed and the pin is retired; `duty:{kind}` landed
 //! registered but `reserved: false`, so persist still rules where CC does not.
+//! v62.0.0 (CC rc20): `hard_case:{kind}` carries its rule on the row
+//! (`reserved_rule`, CC 3.4.4: "substrate-emitted"), so `authority_for`
+//! resolves it and the `hard_case:` pin retired (the inventory is 21).
 //!
 //! # What is derived and what is pinned
 //!
@@ -441,18 +444,6 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
                  it either; what the row could carry is the trust-root-emitter CLASS",
     },
     PersistFamilyRule {
-        prefix: "hard_case:",
-        rule: "substrate-emitted — substrate_persist or the node key (identity_type ∋ \
-               substrate_persist | node), and a row ABOUT ANOTHER PARTY only with \
-               infra:record_hard_case conferred from a root this node trusts; on the row's \
-               family in either form, the attestation_type or a scores dimension (#1174)",
-        enforced_at: &["federation::admission::check_reserved_prefix_admission"],
-        gap: RowRuleGap::NoRuleOnTheRow,
-        minted_by_persist: false,
-        cc_ask: "CIRISConstitution#67 (the row states no emitter; persist's substrate-emitter arm \
-                 is the only statement of it)",
-    },
-    PersistFamilyRule {
         prefix: "health:liveness:",
         rule: "witness_relation MUST be external — a service never attests its own liveness \
                (attester != attested)",
@@ -606,6 +597,28 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
 /// [`tests::not_a_family_rule_entries_are_not_secretly_ruled`], so the
 /// declaration cannot outlive its truth.
 pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
+    // v62.0.0 (red round 3, X1) — three edition-2 spellings that are not
+    // dimension families.
+    (
+        "also:",
+        "v62.0.0 (wave P1e; CC 2.6.1) — the `refs.also` ROLE names (`also:ack`, \
+         `also:cites`) as `edition2::names::names_of` spells them, in the payload \
+         check's closed also-role list and the emit mapping's ref roles. A refs role, \
+         never a family: no row's dimension starts with it.",
+    ),
+    (
+        "family:",
+        "v62.0.0 (wave GC8) — a fold read key's kind (`family:<group key>`, \
+         `edition2::fold`'s group reads) in a test fixture: the key a family roster's \
+         fold is touched by, not a dimension family.",
+    ),
+    (
+        "urn:",
+        "v62.0.0 (E0, the fixture flip) — the identity-ref scheme \
+         (`urn:ietf:params:oauth:ckt:sha-256:`, Verify's `edition2::IDENTITY_REF_PREFIX`) \
+         that `fixture_switch::is_kid` and the receipts witnesses test for: a key's \
+         name, never a dimension family.",
+    ),
     (
         "deferral:",
         "v60.1.0 (CIRISPersist#1120) — `identity_amendment::DEFERRAL_*_DIMENSION` name the \
@@ -1219,9 +1232,9 @@ mod tests {
         // stop, so it is checked here rather than trusted.
         assert_eq!(
             RULES_NOT_ON_THE_ROW.len(),
-            22,
+            21,
             "the inventory now has {} entries; this module's doc says the minted set is \"4 of \
-             22\". Update BOTH numbers so the claim a reader acts on is the claim the build \
+             21\". Update BOTH numbers so the claim a reader acts on is the claim the build \
              checked.",
             RULES_NOT_ON_THE_ROW.len()
         );

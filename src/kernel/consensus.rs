@@ -205,6 +205,32 @@ fn arm_over(b: &Ballot<'_>, elig: &[&crate::federation::consensus::Seat]) -> Res
 /// no seat holds, so it is no voice.
 const NO_VOICE: &str = "\u{2205}no-voice";
 
+/// v62.0.0 (K1, triage round 3) — **is a ballot presented to the kernel as
+/// the member's own resignation** (a withdrawal of its seat, DIFFERENCES.md
+/// 5a) rather than counted?
+///
+/// Only a `founder_only` removal a founder alone signs of ITSELF: persist's
+/// door counts that founder's voice (any active founder admits), and CC
+/// 3.3.4 makes it the member's own `membership:resignation`. Under every
+/// other protocol the door counts a removal WITHOUT the member it names (CC
+/// 2.7.5): `open:self_admit` runs under the CC 4.5.13 floor ("one voice
+/// never decides who is in a room", DIFFERENCES.md 5b), and `unanimous` /
+/// `majority` / `quorum` / `weighted` take their count of the other
+/// members, resignation being its own row. Presenting those as resignations
+/// let one voice (a person removing their own other device's seat) decide
+/// who is in a room (I1530b).
+fn resignation_presented(
+    arm: &Arm,
+    direction: Direction,
+    subject_alone_signs: bool,
+    subject_is_a_founder: bool,
+) -> bool {
+    arm.word == "founder_only"
+        && direction == Direction::Remove
+        && subject_alone_signs
+        && subject_is_a_founder
+}
+
 /// The rows a ballot is presented as (`G`, `F`, `C`), `C` last.
 pub fn ballot_rows(b: &Ballot<'_>, arm: &Arm) -> Vec<KRow> {
     let elig = eligible_seats(b);
@@ -300,11 +326,17 @@ pub fn ballot_rows(b: &Ballot<'_>, arm: &Arm) -> Vec<KRow> {
     };
     let to: Vec<String> = b.subject.map(|s| vec![person(s)]).unwrap_or_default();
     let cid = RowId::synthetic(3, 0);
-    // a removal its subject alone signs is the member's own leaving: CC
-    // 3.3.4's `membership:resignation`, a withdrawal by the member of the
-    // offer that seats it, which ends its seat alone (DIFFERENCES.md 5a)
-    if b.direction == Direction::Remove && to.len() == 1 && voices == to && members.contains(&to[0])
-    {
+    // a founder's removal that founder alone signs, under `founder_only`, is
+    // the member's own leaving: CC 3.3.4's `membership:resignation`, a
+    // withdrawal by the member of the offer that seats it, which ends its
+    // seat alone (DIFFERENCES.md 5a). v62.0.0 (K1, triage round 3) — ONLY
+    // there ([`resignation_presented`]).
+    if resignation_presented(
+        arm,
+        b.direction,
+        to.len() == 1 && voices == to,
+        to.first().is_some_and(|t| founders.contains(t)),
+    ) {
         let target = seat_of.get(to[0].as_str()).copied().unwrap_or(gid);
         rows.push(
             KRow::new(cid, vec![head, target], c_signer).with_seat(SeatFields {
@@ -438,14 +470,15 @@ fn count_over<'a>(
         .filter_map(|k| b.persons.voice(k))
         .collect();
     let to: Vec<&str> = b.subject.map(person).into_iter().collect();
-    // a removal its subject alone signs is the member's own leaving (CC
-    // 3.3.4): a withdrawal of the seat, not a count
-    if b.direction == Direction::Remove
-        && to.len() == 1
-        && voices.len() == 1
-        && voices.contains(to[0])
-        && members.contains(to[0])
-    {
+    // a founder's removal that founder alone signs, under `founder_only`, is
+    // the member's own leaving (CC 3.3.4): a withdrawal of the seat, not a
+    // count ([`resignation_presented`])
+    if resignation_presented(
+        arm,
+        b.direction,
+        to.len() == 1 && voices.len() == 1 && voices.contains(to[0]),
+        to.first().is_some_and(|t| mem.contains(t)) && arm.counted == SEAT_FOUNDER,
+    ) {
         return true;
     }
     // the seat rule's `Conf::Group` arm itself, over the head the ballot

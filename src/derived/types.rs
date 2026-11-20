@@ -17,9 +17,8 @@
 //! canonicalizer edge and every other federation primitive use
 //! (CIRISPersist#7 single-source-of-truth).
 //!
-//! Persist's [`crate::derived::DerivedSchema::put_detection_event`]
-//! and [`crate::derived::DerivedSchema::put_calibration_bundle`] back
-//! ends do **not** verify these signatures themselves — that is the
+//! Persist's [`crate::derived::DerivedSchema::put_calibration_bundle`]
+//! back end does **not** verify these signatures themselves — that is the
 //! [`Engine`] surface's responsibility, which calls
 //! [`crate::verify::verify_hybrid_via_directory`] under
 //! [`crate::verify::HybridPolicy::Strict`] before the backend write

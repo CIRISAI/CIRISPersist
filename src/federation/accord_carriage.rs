@@ -77,7 +77,7 @@ use ciris_verify_core::accord_live_quorum::{AccordParticipation, AccordProposal}
 use ciris_verify_core::threshold::ThresholdMember;
 
 use super::admission::{
-    accord_holder_roster_key_ids, canonical_withdrawal_payload_sha256, op_withdraw_role,
+    accord_holder_roster, canonical_withdrawal_payload_sha256, op_withdraw_role,
     OP_WITHDRAW_CANONICAL, OP_WITHDRAW_INFRA_ATTEST,
 };
 use super::types::{identity_type, roles};
@@ -275,7 +275,7 @@ pub async fn admit_replicated_accord_evidence(
     admit_replicated_accord_evidence_over_roster(
         directory,
         evidence,
-        &accord_holder_roster_key_ids(),
+        &accord_holder_roster(directory).await?,
     )
     .await
 }
@@ -310,14 +310,10 @@ pub async fn admit_replicated_accord_evidence(
 ///    [`strict_majority_policy`]. The sender's `authority_signature` and any
 ///    `AccordDecision.authorized` bool are NOT consulted — they are not
 ///    inputs to this function at all.
-/// 4. Only now does anything land: the proposal, then each participation —
-///    which `put_accord_participation` re-verifies a SECOND time against the
-///    same roster as it stores it.
-/// 5. The V104/V095 projection is re-derived locally
-///    ([`project_role_withdrawals_for_proposal`]).
-///
-/// Idempotent: a replayed bundle re-tallies, re-stores nothing new, and
-/// re-derives the same tombstones.
+/// 4. v62.0.0 (JSON-cut slice F; CC rc20): nothing lands. The proposal,
+///    participation and decision records have no write door in this edition,
+///    so a bundle that clears steps 0–3 is refused
+///    ([`Error::AccordEvidenceUnverified`]) and projects nothing.
 ///
 /// # On step 4's nonce
 ///
@@ -449,62 +445,17 @@ pub async fn admit_replicated_accord_evidence_over_roster(
         )));
     }
 
-    // (4-pre) CHECK-TIME NOVELTY (v36.0.0, CIRISPersist#675) — read BEFORE
-    // anything lands, so `Duplicate` is a statement about state this
-    // admission verifiably observed, not a differencing of shared state
-    // across the writes (the removed `participations_admitted` bug). Byte
-    // compare against the stored rows: a same-member row with DIFFERING
-    // bytes counts as novel here, and the put below then refuses it as an
-    // M6 conflict, so `effect` is never returned for it.
-    let novel_proposal = directory
-        .get_accord_proposal(&proposal_digest)
-        .await?
-        .is_none();
-    let stored_before = directory
-        .list_accord_participations(&proposal_digest)
-        .await?;
-    let novel_participations = evidence
-        .participations
-        .iter()
-        .filter(|p| !stored_before.iter().any(|s| s.participation == **p))
-        .count();
-    let effect = if novel_proposal || novel_participations > 0 {
-        AccordAdmissionEffect::Supplied {
-            novel_proposal,
-            novel_participations,
-        }
-    } else {
-        AccordAdmissionEffect::Duplicate
-    };
-
-    // (4) Now — and only now — store. See the doc note on M4.
-    directory
-        .put_accord_proposal(
-            evidence.proposal.clone(),
-            evidence.authority_signature.clone(),
-        )
-        .await?;
-    for participation in &evidence.participations {
-        // Re-verified a second time, per row, as it lands: the member must be
-        // in the roster and `AccordParticipation::verify` must pass.
-        directory
-            .put_accord_participation(participation.clone(), &roster)
-            .await?;
-    }
-
-    // (5) Re-derive OUR OWN withdrawal projection. This is why (4) is safe.
-    let withdrawals_projected =
-        project_role_withdrawals_for_proposal(directory, &evidence.proposal, roster_key_ids)
-            .await?;
-
-    Ok(AccordEvidenceAdmission {
-        proposal_digest,
-        yes: tally.yes,
-        threshold: policy.m,
-        roster_size: policy.n,
-        effect,
-        withdrawals_projected,
-    })
+    // (4) v62.0.0 (JSON-cut slice F; CC rc20) — nothing lands. The rc20
+    // edition has no accord proposal, participation or decision record (a
+    // roster change is a later genesis bundle), so their write doors are
+    // gone and a bundle that clears every check above is still refused: a
+    // node of this edition stores no live-quorum evidence and projects no
+    // withdrawal from it.
+    Err(refuse(
+        "accord live-quorum evidence is retired (CC rc20): the proposal, participation and \
+         decision records have no write door in this edition"
+            .to_owned(),
+    ))
 }
 
 /// The `(op, role)` pairs a withdrawal projection can re-derive for one
@@ -872,7 +823,8 @@ pub async fn project_role_withdrawal_for_key(
 pub async fn rematerialize_role_withdrawals(
     directory: &dyn FederationDirectory,
 ) -> Result<Vec<(String, String)>, Error> {
-    rematerialize_role_withdrawals_over_roster(directory, &accord_holder_roster_key_ids()).await
+    rematerialize_role_withdrawals_over_roster(directory, &accord_holder_roster(directory).await?)
+        .await
 }
 
 /// v31.1.0 (CIRISPersist#662) — [`rematerialize_role_withdrawals`] with an

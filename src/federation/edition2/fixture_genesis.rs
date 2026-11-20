@@ -480,6 +480,17 @@ fn holder_record(iref: &str, key: &CompositeSigningKey, chain: Vec<Vec<u8>>, at:
             Value::Array(chain.into_iter().map(Value::Bytes).collect()),
         ),
     ]);
+    holder_record_with_evidence(iref, key, evidence, at)
+}
+
+/// A holder's `key:record` as [`holder_record`], carrying `evidence` as its
+/// `attestation_evidence` verbatim (whatever its shape).
+fn holder_record_with_evidence(
+    iref: &str,
+    key: &CompositeSigningKey,
+    evidence: Value,
+    at: u64,
+) -> NamedRow {
     let payload = map(vec![
         ("key", cose_key(key.public_key())),
         ("author", text(iref)),
@@ -726,6 +737,126 @@ pub fn ceremony_v2(spec: &CeremonySpec) -> TestCeremonyV2 {
     let signers: Vec<(CompositeSigningKey, String)> = holders
         .iter()
         .map(|h| (test_key(h.seed), h.identity_ref.clone()))
+        .collect();
+    assemble_bundle(
+        spec,
+        1,
+        None,
+        spec.t0_ms + DAY_MS / 2,
+        holders,
+        seats,
+        Vec::new(),
+        &signers,
+        None,
+    )
+}
+
+/// v62.0.0 (C4-fix2) — one holder minted otherwise than [`ceremony_v2`]
+/// mints it: its composite key from these seeds (ML-DSA-65 `mldsa_seed`,
+/// Ed25519 `ed25519_seed`) and its `key:record` carrying `evidence` as its
+/// `attestation_evidence` verbatim. Its identity reference is its own key's;
+/// its recovery commitment is still `recovery_key(seed)`'s.
+#[derive(Clone, Debug)]
+pub struct HolderOverride {
+    /// The spec holder seed it replaces.
+    pub seed: u8,
+    /// The ML-DSA-65 seed of its composite key.
+    pub mldsa_seed: [u8; 32],
+    /// The Ed25519 seed of its composite key.
+    pub ed25519_seed: [u8; 32],
+    /// Its record's `attestation_evidence`.
+    pub evidence: Value,
+}
+
+impl HolderOverride {
+    fn key(&self) -> CompositeSigningKey {
+        CompositeSigningKey::from_seeds(&self.mldsa_seed, &self.ed25519_seed)
+    }
+}
+
+/// v62.0.0 (C4-fix, ceremony gap 3) — [`ceremony_v2`] with holder
+/// `holder_seed`'s `key:record` carrying `evidence` as its
+/// `attestation_evidence` (any shape: a real YubiKey chain, a truncated or
+/// reordered one, a hex-text one). The record is still authored by the
+/// holder's identity and signed by its test key, and the bundle names it
+/// and is signed by every holder, so only the evidence differs from
+/// [`ceremony_v2`]'s. The anchor (the holders' kids) is unchanged.
+///
+/// # Panics
+/// As [`ceremony_v2_with_holders`].
+#[must_use]
+pub fn ceremony_v2_with_holder_evidence(
+    spec: &CeremonySpec,
+    holder_seed: u8,
+    evidence: Value,
+) -> TestCeremonyV2 {
+    ceremony_v2_with_holders(
+        spec,
+        &[HolderOverride {
+            seed: holder_seed,
+            mldsa_seed: [holder_seed; 32],
+            ed25519_seed: [holder_seed.wrapping_add(100); 32],
+            evidence,
+        }],
+    )
+}
+
+/// v62.0.0 (C4-fix2) — [`ceremony_v2`] with each [`HolderOverride`]'s
+/// holder minted from its own seeds and evidence (and signing its voice
+/// with that key); every other holder and seat as [`ceremony_v2`] mints
+/// them. The anchor is the holders' kids as minted.
+///
+/// # Panics
+/// As [`ceremony_v2`]; and an override whose seed is not one of the spec's
+/// holders.
+#[must_use]
+pub fn ceremony_v2_with_holders(
+    spec: &CeremonySpec,
+    overrides: &[HolderOverride],
+) -> TestCeremonyV2 {
+    check_spec(spec);
+    for o in overrides {
+        assert!(
+            spec.holders.contains(&o.seed),
+            "test_ceremony_v2: holder seed {} is not a holder of the spec",
+            o.seed
+        );
+    }
+    let mut holders = Vec::new();
+    let mut signers: Vec<(CompositeSigningKey, String)> = Vec::new();
+    for s in &spec.holders {
+        match overrides.iter().find(|o| o.seed == *s) {
+            Some(o) => {
+                let key = o.key();
+                let kid = thumbprint(key.public_key());
+                let iref = identity_ref(&kid);
+                let record =
+                    holder_record_with_evidence(&iref, &key, o.evidence.clone(), spec.t0_ms);
+                let recovery_seed = s + RECOVERY_SEED_OFFSET;
+                holders.push(HolderV2 {
+                    seed: *s,
+                    holder_seed: *s,
+                    recovery_seed,
+                    kid,
+                    identity_ref: iref.clone(),
+                    record,
+                    recovery_commitment: recovery_commitment(&[test_key(recovery_seed)
+                        .public_key()
+                        .clone()]),
+                });
+                signers.push((key, iref));
+            }
+            None => {
+                let h = mint_holder(*s, spec.t0_ms);
+                signers.push((test_key(h.seed), h.identity_ref.clone()));
+                holders.push(h);
+            }
+        }
+    }
+    let seats: Vec<SeatV2> = spec
+        .serve_nodes
+        .iter()
+        .map(|s| mint_seat(*s, spec.t0_ms))
         .collect();
     assemble_bundle(
         spec,

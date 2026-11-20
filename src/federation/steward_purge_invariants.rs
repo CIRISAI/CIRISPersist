@@ -166,9 +166,11 @@
 //!   record a PERSON is the subject of (interim): a bundle naming an unheld
 //!   attestation id and an unheld trace id applies (`skip_unheld`); a row
 //!   about a `user` key then arriving at the attestation id is admitted,
-//!   served, listed void, and survives finalize and the delete door; a trace
-//!   a person signed arriving at the trace id is ingested and survives
-//!   finalize and the trace delete door. An ordinary row, and a row whose
+//!   served, listed void, and survives finalize and the delete door. v62
+//!   (CC 3.1.5: a trace is an agent's statement): a person-signed trace is
+//!   refused at the door `trace_signer_not_agent`, nothing written, and an
+//!   agent's trace at the tombstoned trace id is `purge_tombstoned`, its
+//!   tombstone standing through finalize. An ordinary row, and a row whose
 //!   subject key does not resolve here (no person PROVEN), at a tombstoned id
 //!   are still `purge_tombstoned` (an unresolvable subject: the retryable
 //!   `federation_attester_key_unknown`, I832); and the serve-by-hash reload
@@ -176,7 +178,7 @@
 //! - **I832** (Codex round 4 follow-up; memory, sqlite, postgres) — a row (or
 //!   trace) arriving at a tombstoned id BEFORE its subject's (signer's) key
 //!   record is refused RETRYABLY (`federation_attester_key_unknown`, plane
-//!   `purge_tombstone_subject`; for a trace, `verify_unknown_key`), not
+//!   `purge_tombstone_subject`; for a trace, an agent's, `verify_unknown_key`), not
 //!   stored; once the key lands as a person the re-offer is admitted and
 //!   voided; once it lands as a non-person the re-offer is `purge_tombstoned`.
 //! - **I831** (Codex round 4 sweep on PR #1057; memory, sqlite, postgres) —
@@ -798,8 +800,7 @@ pub(crate) mod bodies {
         if !refs.is_empty() {
             env["evidence_refs"] = serde_json::json!(refs);
         }
-        let mut row =
-            e2::with_earlier_form(|| ts::bare_attestation("e10", attester, attested, &env));
+        let mut row = ts::bare_attestation("e10", attester, attested, &env);
         row.attestation_type = attestation_type::SCORES.to_owned();
         row.asserted_at = distinct_instant();
         row.scrub_timestamp = row.asserted_at;
@@ -3696,7 +3697,7 @@ pub(crate) mod bodies {
     ) -> Vec<u8> {
         let envelope =
             crate::federation::hard_case::hard_case_envelope(event).expect("the event's envelope");
-        let mut a = e2::with_earlier_form(|| ts::bare_attestation("e10", seed, seed, &envelope));
+        let mut a = ts::bare_attestation("e10", seed, seed, &envelope);
         a.attestation_type = attestation_type::SCORES.to_owned();
         a.asserted_at = event.emitted_at;
         a.scrub_timestamp = event.emitted_at;
@@ -3984,7 +3985,7 @@ pub(crate) mod bodies {
             "agent_id_hash": "deadbeef",
             "manifest": manifest,
         });
-        let mut row = e2::with_earlier_form(|| ts::bare_attestation(id, AGENT, AGENT, &env));
+        let mut row = ts::bare_attestation(id, AGENT, AGENT, &env);
         row.attestation_type = attestation_type::SCORES.to_owned();
         // A trace is self-emitted: its producer is among its subjects.
         row.subject_key_ids = vec![k(AGENT)];
@@ -4075,7 +4076,7 @@ pub(crate) mod bodies {
             .await
             .expect_err("I698: an unknown manifest run_kind is refused");
         assert_eq!(e.kind(), "federation_trace_dimension_invalid", "I698: {e}");
-        let mut inline = crate::federation::edition2::fixture_switch::with_earlier_form(|| {
+        let mut inline = {
             ts::bare_attestation(
                 &uuid::Uuid::new_v4().to_string(),
                 AGENT,
@@ -4087,7 +4088,7 @@ pub(crate) mod bodies {
                     "trace": {"trace_id": "trace-i698-inline", "run_kind": 7},
                 }),
             )
-        });
+        };
         inline.attestation_type = attestation_type::SCORES.to_owned();
         inline.subject_key_ids = vec![k(AGENT)];
         inline.asserted_at = distinct_instant();
@@ -4357,7 +4358,8 @@ pub(crate) mod bodies {
             canonical_bytes: canonical.to_vec(),
             ed25519_sig: vec![1u8; 64],
             ml_dsa_65_sig: vec![2u8; 3309],
-            signing_key_id: k("key-lens"),
+            // v62.0.0 (P8-fix11) — the conferred edition-2 detector.
+            signing_key_id: crate::derived::detection_row::test_support::detector(),
             ts: crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now()),
         }
     }
@@ -4371,6 +4373,11 @@ pub(crate) mod bodies {
     /// and the table is still its rows' rebuild
     /// (CLM-silo-projection-rebuildable); after `purge_finalize` deletes the
     /// row its projection row is gone, and the rebuild is byte-equal again.
+    ///
+    /// v62.0.0 (P8-fix11) — each detection is its conferred detector's own
+    /// edition-2 statement (`detection_row::test_support`), the row id
+    /// node-computed; the late detection is refused by the producer's purged
+    /// trace gate (`purge_tombstoned`).
     pub(crate) async fn i825_a_purged_traces_detections_are_tombstoned<
         D: Seams
             + crate::derived::DerivedSchema
@@ -4382,21 +4389,13 @@ pub(crate) mod bodies {
         let r = root(d).await;
         seed_trace(d, "trace-i825", AGENT, "gpt-real").await;
         seed_trace(d, "trace-i825-other", BYSTANDER, "gpt-real").await;
-        // v57.0.0 (#988 item 3) — a detection row's attester is a held
-        // lenscore_detector key.
-        e2::put_key(
-            d.as_dyn_directory(),
-            "key-lens",
-            &e2::identity_types_of(crate::federation::types::identity_type::LENSCORE_DETECTOR),
-        )
-        .await;
+        // v62.0.0 (P8-fix11) — a detection stands by its detector's
+        // `infra:detect` conferral from a root THIS node accepts.
+        use crate::derived::detection_row::test_support as det;
+        det::confer_here(d.as_dyn_directory()).await;
         let purged = detection("trace-i825", b"purged-body");
-        d.put_detection_event(purged.clone()).await.unwrap();
-        d.put_detection_event(detection("trace-i825-other", b"kept-body"))
-            .await
-            .unwrap();
-        let purged_row =
-            crate::derived::detection_row::detection_attestation_id(&purged.detection_id);
+        let purged_row = det::state(d, &purged).await;
+        det::state(d, &detection("trace-i825-other", b"kept-body")).await;
 
         // The purge door: the actor's selection derives the detection row
         // through its evidence (the trace).
@@ -4479,12 +4478,15 @@ pub(crate) mod bodies {
         assert_eq!(kept[0].canonical_bytes, b"kept-body");
         // The round-4 sweep: a detection ARRIVING after the purge cannot
         // re-attach the purged trace's linkage and content.
-        let e = d
-            .put_detection_event(detection("trace-i825", b"late-body"))
-            .await
-            .expect_err("I825: a detection naming a purged trace is refused");
+        let e = crate::derived::detection_row::state_detection(
+            d,
+            &crate::federation::tier_ingest::test_support::local_signer(det::DETECTOR),
+            &detection("trace-i825", b"late-body"),
+        )
+        .await
+        .expect_err("I825: a detection naming a purged trace is refused");
         assert!(
-            matches!(&e, crate::derived::Error::InvalidArgument(m) if m.starts_with(token::TOMBSTONED)),
+            matches!(&e, crate::federation::Error::PurgeRefused { token: t, .. } if *t == token::TOMBSTONED),
             "I825: {e:?}"
         );
     }
@@ -4562,7 +4564,10 @@ pub(crate) mod bodies {
         let (ordinary_st, ordinary) = fed_statement(SCORER, AGENT, "chat:message:v1");
         let (unknown_st, unknown) =
             fed_statement(SCORER, "nobody-knows-me-i828", "chat:message:v1");
-        let trace_id = "trace-i828-alice";
+        // v62.0.0 (E10-fix2; CC 3.1.5, signer_kind trace = agent/agent_own):
+        // a trace is an AGENT's statement, so the tombstoned trace id is an
+        // agent's trace. A person-signed trace does not exist (below).
+        let trace_id = "trace-i828-agent";
         let mut ids: Vec<String> = [&about_alice, &ordinary, &unknown]
             .iter()
             .map(|id| format!("attestation:{id}"))
@@ -4599,10 +4604,29 @@ pub(crate) mod bodies {
             .await
             .expect_err("I828: an unresolved subject is not admitted");
         assert_eq!(e.kind(), "federation_attester_key_unknown", "I828: {e:?}");
-        // A trace a person signed arrives at the tombstoned trace id.
-        ingest(d, &batch(&trace_json(trace_id, ALICE, "gpt-real", None)))
+        // A trace a person signs is refused at the statement door by its
+        // signer (CC 3.1.5; P7-fix6), whatever its id: nothing is written.
+        let alice_trace_id = "trace-i828-alice";
+        let mut alice_trace = trace_json(alice_trace_id, ALICE, "gpt-real", None);
+        stamp_now(&mut alice_trace);
+        let alice_st = trace_statement(&alice_trace, ALICE);
+        let e = ingest_full(d, &with_statement(&batch(&alice_trace), &alice_st))
             .await
-            .expect("I828: a trace a person signed is ingested over the tombstone");
+            .expect_err("I828: a person-signed trace is refused");
+        assert_eq!(e.kind(), "trace_signer_not_agent", "I828: {e}");
+        assert_eq!(
+            dir.purge_trace_row_counts(&[alice_trace_id.to_owned()])
+                .await
+                .unwrap(),
+            (0, 0),
+            "I828: nothing of a person-signed trace is written"
+        );
+        // An agent's trace at the tombstoned trace id: the tombstone stands
+        // (its signer is no person).
+        let e = ingest(d, &batch(&trace_json(trace_id, AGENT, "gpt-real", None)))
+            .await
+            .expect_err("I828: an agent's trace at a tombstoned id is refused");
+        assert_eq!(e.kind(), token::TOMBSTONED, "I828: {e}");
 
         assert!(
             served_ids(d).await.contains(&about_alice),
@@ -4611,11 +4635,9 @@ pub(crate) mod bodies {
         let later = t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1);
         let mut st = status_at(dir, &applied.notice_id, later).await.unwrap();
         st.voided.sort();
-        let mut want = vec![
-            format!("attestation:{about_alice}"),
-            format!("trace:{trace_id}"),
-        ];
-        want.sort();
+        // Only the person's row voids its tombstone; the agent's trace
+        // tombstone stands.
+        let want = vec![format!("attestation:{about_alice}")];
         assert_eq!(
             st.voided, want,
             "I828: the ledger names the void tombstones"
@@ -4627,7 +4649,7 @@ pub(crate) mod bodies {
         assert_eq!(
             dir.purge_delete_tombstoned_trace(trace_id).await.unwrap(),
             (0, 0),
-            "I828: the trace delete door leaves a person's trace"
+            "I828: the trace delete door deletes nothing (no trace is held)"
         );
         let mut fin = finalize_at(dir, &applied.notice_id, later, None)
             .await
@@ -4635,13 +4657,12 @@ pub(crate) mod bodies {
         fin.voided.sort();
         assert_eq!(fin.voided, want, "I828: {fin:?}");
         assert!(dir.get_attestation(&about_alice).await.unwrap().is_some());
-        assert!(
+        assert_eq!(
             dir.purge_trace_row_counts(&[trace_id.to_owned()])
                 .await
-                .unwrap()
-                .0
-                > 0,
-            "I828: the person's trace survives finalize"
+                .unwrap(),
+            (0, 0),
+            "I828: the refused agent trace never landed"
         );
         assert!(served_ids(d).await.contains(&about_alice));
     }
@@ -4656,7 +4677,7 @@ pub(crate) mod bodies {
         // The rows, signed now: the bundle names their row ids first.
         let (bob_st, about_bob) = fed_statement(SCORER, BOB, "chat:message:v1");
         let (carol_st, about_carol) = fed_statement(SCORER, CAROL, "chat:message:v1");
-        let trace_id = "trace-i832-bob";
+        let trace_id = "trace-i832-carol";
         let mut ids: Vec<String> = [&about_bob, &about_carol]
             .iter()
             .map(|id| format!("attestation:{id}"))
@@ -4692,7 +4713,9 @@ pub(crate) mod bodies {
             );
             assert!(dir.get_attestation(id).await.unwrap().is_none());
         }
-        let e = ingest(d, &batch(&trace_json(trace_id, BOB, "gpt-real", None)))
+        // v62.0.0 (E10-fix2; CC 3.1.5) — a trace is an AGENT's: the trace leg
+        // is CAROL's (an agent), never a person's.
+        let e = ingest(d, &batch(&trace_json(trace_id, CAROL, "gpt-real", None)))
             .await
             .expect_err("I832: a trace whose signer is not held yet is not admitted");
         assert_eq!(e.kind(), "verify_unknown_key", "I832 trace: {e}");
@@ -4706,17 +4729,15 @@ pub(crate) mod bodies {
             .await
             .expect_err("I832: once the key lands as a non-person, the tombstone stands");
         assert_eq!(refusal(&e).0, token::TOMBSTONED, "I832: {e:?}");
-        ingest(d, &batch(&trace_json(trace_id, BOB, "gpt-real", None)))
+        let e = ingest(d, &batch(&trace_json(trace_id, CAROL, "gpt-real", None)))
             .await
-            .expect("I832: the person's trace is admitted once the key lands");
+            .expect_err("I832: once the agent's key lands, its trace meets the tombstone");
+        assert_eq!(e.kind(), token::TOMBSTONED, "I832 trace: {e}");
         let later = t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1);
         let mut st = status_at(dir, &applied.notice_id, later).await.unwrap();
         st.voided.sort();
-        let mut want = vec![
-            format!("attestation:{about_bob}"),
-            format!("trace:{trace_id}"),
-        ];
-        want.sort();
+        // Only the person's row voids its tombstone.
+        let want = vec![format!("attestation:{about_bob}")];
         assert_eq!(st.voided, want, "I832: voided once admitted");
     }
 

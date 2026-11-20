@@ -1547,10 +1547,18 @@ pub(crate) mod test_support {
                 // above, identity fields + exactly one of inline/manifest
                 // here) — a REAL trace, so the witness proves the predicate
                 // over the row a producer actually writes.
+                // v62.0.0 (E0 fix 9) — the edition-2 `trace:{form}:{version}`
+                // payload requires `manifest` (the trace is a blob named by its
+                // manifest, never inline).
                 serde_json::json!({
                     "trace_id": format!("lb-trace-{suffix}"),
                     "agent_id_hash": "sha256:lb-fixture-agent",
-                    "trace": {"step": "load-bearing witness"},
+                    "manifest": {
+                        "schema": "trace_manifest:v1",
+                        "content_hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                        "byte_len": 2_000_000,
+                        "component_count": 16,
+                    },
                 }),
             ),
             "retained trace admits",

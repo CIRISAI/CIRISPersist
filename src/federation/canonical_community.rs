@@ -11,8 +11,8 @@
 //! to nothing.
 //!
 //! The ruling chose (b): the row is NOT inside the GenesisBundle (its bytes and
-//! [`verify_bundle_quorum`](super::genesis::bundle::verify_bundle_quorum) are
-//! untouched and stay the only ROOT authority). It is an ordinary `community`
+//! the bundle quorum are untouched and stay the only ROOT authority; v62.0.0:
+//! the bundle is the ingested `ceg-genesis-bundle/2`). It is an ordinary `community`
 //! row that the door admits only when:
 //!
 //! 1. **the shape is CC 3.2's trust-root grade** — `cohort_subkind:
@@ -73,7 +73,6 @@
 use super::edition2::fold::{self, Dep};
 use super::types::{
     consensus_protocol as cp, identity_type, Community, KeyRecord, ScrubSig, SignedCommunity,
-    SignedKeyRecord,
 };
 use super::{Error, FederationDirectory};
 use serde::{Deserialize, Serialize};
@@ -183,7 +182,7 @@ pub fn check_trust_root_shape(community: &Community) -> Result<(), Error> {
     let quorum_form = community
         .consensus_protocol
         .strip_prefix(cp::QUORUM_PREFIX)
-        .and_then(|_| super::genesis::bundle::parse_quorum(&community.consensus_protocol))
+        .and_then(|_| parse_quorum(&community.consensus_protocol))
         .is_some_and(|(m, n)| m >= 1 && m <= n);
     if !quorum_form {
         return Err(violation(
@@ -296,7 +295,7 @@ where
 /// family (#972 — nothing more is asked of a seated holder) OR a `user` key
 /// with an accord-conferred `steward` whose conferral has not been withdrawn
 /// (CC 3.2 T2). The conferral is judged against the COMPILED accord holder roster
-/// (`accord_holder_roster_key_ids`, the ceremony plane every key-plane
+/// (`accord_holder_roster`, the ceremony plane every key-plane
 /// conferral uses); the row's own quorum is judged against the family's
 /// revocation-folded roster ([`accord_quorum_over_community`]).
 ///
@@ -360,7 +359,7 @@ where
         directory,
         founder,
         identity_type::STEWARD,
-        &super::admission::accord_holder_roster_key_ids(),
+        &super::admission::accord_holder_roster(directory).await?,
     )
     .await?
     {
@@ -712,7 +711,7 @@ impl Memo {
                     directory,
                     &rec,
                     identity_type::STEWARD,
-                    &super::admission::accord_holder_roster_key_ids(),
+                    &super::admission::accord_holder_roster(directory).await?,
                 )
                 .await?
             }
@@ -1532,7 +1531,8 @@ where
         }),
     );
     let mut keys: std::collections::BTreeSet<String> =
-        super::admission::accord_holder_roster_key_ids()
+        super::admission::accord_holder_roster(directory)
+            .await?
             .into_iter()
             .collect();
     if let Some(f) = &family {
@@ -2535,10 +2535,8 @@ where
     // nothing to gate: it is stored as a delegation and the readers never
     // count it (`trust_root::direction_denied_ids`). A pinned-bundle row
     // keeps the reading its direction gives it, gate included.
-    if super::trust_root::names_no_trust_job(envelope)
-        && !attestation_id
-            .is_some_and(|id| super::genesis::is_pinned_bundle_statement(id, envelope))
-    {
+    // v62.0.0 (C5-fix1): the pinned bundle is deleted, so no row is exempt.
+    if super::trust_root::names_no_trust_job(envelope) {
         return Ok(());
     }
     let root = attested_key_id;
@@ -3871,251 +3869,22 @@ where
     }
 }
 
-/// CC 5.3.4 — the body `GET /v1/trust-root/bundle` (alias `/v1/steward-key`)
-/// serves: the GenesisBundle, byte-for-byte as carried, with the
-/// `ciris-canonical` community row BESIDE it — never inside it — and the key
-/// records the row names, so a consumer resolves `pinned_trust =
-/// {community_key_id: ciris-canonical, family: humanity-accord}` from one
-/// fetch ([`pin_trust_from_bundle_response`]).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrustRootBundleResponse {
-    /// The GenesisBundle, unchanged.
-    pub bundle: super::genesis::bundle::GenesisBundle,
-    /// Hex SHA-256 [`authorization_digest`](super::genesis::bundle::authorization_digest)
-    /// of the bundle — what its holder authorizations sign.
-    pub authorization_digest: String,
-    /// The accord family the bundle roots (`bundle.family_key_id`).
-    pub charter_root_key_id: String,
-    /// The signed ROOTED `ciris-canonical` row, or `None` when this node holds
-    /// none (or holds one that is not rooted — see `community_withheld`).
-    pub community: Option<SignedCommunity>,
-    /// Why `community` is `None` although a row is stored at the id (a squat,
-    /// a non-conformant row). `None` when a row is served or none is stored.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub community_withheld: Option<String>,
-    /// The key records of every member the row names (founders first), as
-    /// this node stores them — what a consumer's door needs to admit the row.
-    #[serde(default)]
-    pub community_member_records: Vec<SignedKeyRecord>,
-    /// The accord quorum evidence (proposal + participations) behind every
-    /// steward withdrawal of a key the chain names (#926 re-check, MEDIUM-W):
-    /// a consumer re-tallies it through the ordinary evidence door and so
-    /// judges historical links against the SAME, signed withdrawal instant
-    /// every other node uses — never its own sync time.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub steward_withdrawal_evidence: Vec<super::accord_carriage::AccordQuorumEvidence>,
+/// Parse `quorum:M/N` → `(M, N)`: the one parser for the wire form (a
+/// family's, a community's and a trust root's `consensus_protocol`).
+/// v62.0.0 (C5-fix1): moved here from the deleted `genesis::bundle`.
+pub(crate) fn parse_quorum(s: &str) -> Option<(usize, usize)> {
+    let rest = s.strip_prefix("quorum:")?;
+    let (m, n) = rest.split_once('/')?;
+    Some((m.parse().ok()?, n.parse().ok()?))
 }
 
-/// Build the CC 5.3.4 response from this node's own state.
-///
-/// # Errors
-///
-/// Directory read failures; a bundle whose digest cannot be computed.
-pub async fn trust_root_bundle_response<F>(
-    directory: &F,
-    bundle: &super::genesis::bundle::GenesisBundle,
-) -> Result<TrustRootBundleResponse, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let digest = super::genesis::bundle::authorization_digest(bundle)?;
-    let (community, community_withheld) =
-        match stored_standing(directory, CIRIS_CANONICAL_COMMUNITY_KEY_ID).await? {
-            StoredStanding::Rooted(signed) => (Some(*signed), None),
-            StoredStanding::Absent => (None, None),
-            StoredStanding::Stalled { reason, .. } | StoredStanding::NotRooted { reason } => {
-                (None, Some(reason))
-            }
-        };
-    let mut community_member_records = Vec::new();
-    let mut steward_withdrawal_evidence = Vec::new();
-    if let Some(signed) = &community {
-        // Every key the CHAIN names — each version's members, authority and
-        // proof signers, founders first — so a fresh consumer can verify every
-        // historical link (founder key records are never deleted, so a key a
-        // later version retired is still served).
-        let mut ordered: Vec<String> = founders(&signed.community)
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        for v in chain_of(signed) {
-            let mut named: Vec<String> = v
-                .community
-                .members
-                .iter()
-                .map(|m| m.key_id.clone())
-                .collect();
-            named.push(v.authority_key_id.clone());
-            named.extend(v.cosignatures.iter().map(|c| c.authority_key_id.clone()));
-            if let Some(p) = &v.supersede_proof {
-                named.extend(p.quorum_signatures.iter().map(|s| s.member_id.clone()));
-            }
-            for k in named {
-                if !ordered.contains(&k) {
-                    ordered.push(k);
-                }
-            }
-        }
-        let mut digests = std::collections::BTreeSet::new();
-        for key_id in &ordered {
-            if let Some(record) = directory.lookup_public_key(key_id).await? {
-                community_member_records.push(SignedKeyRecord { record });
-            }
-            if let Some(w) = directory
-                .lookup_role_withdrawal(identity_type::STEWARD, key_id)
-                .await?
-            {
-                digests.insert(w.authority_decision_digest);
-            }
-        }
-        // O(withdrawals) point reads — never a scan of accord history on an
-        // unauthenticated GET (review LOW-3).
-        let mut proposals = Vec::with_capacity(digests.len());
-        for digest in &digests {
-            if let Some(stored) = directory.get_accord_proposal(digest).await? {
-                let at = stored.created_at;
-                proposals.push((stored, at));
-            }
-        }
-        if !proposals.is_empty() {
-            steward_withdrawal_evidence = super::accord_carriage::assemble_evidence_page(
-                directory.as_dyn_directory(),
-                proposals,
-            )
-            .await?;
-        }
-    }
-    Ok(TrustRootBundleResponse {
-        bundle: bundle.clone(),
-        authorization_digest: hex::encode(digest),
-        charter_root_key_id: bundle.family_key_id.clone(),
-        community,
-        community_withheld,
-        community_member_records,
-        steward_withdrawal_evidence,
-    })
-}
-
-/// What a consumer pinned from one [`TrustRootBundleResponse`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PinnedTrust {
-    /// `pinned_trust.family` — the accord family whose quorum verified.
-    pub family: String,
-    /// How many distinct holders' bundle authorizations verified here.
-    pub bundle_holders_verified: usize,
-    /// The community as resolved on the consumer after admission.
-    pub community: ResolvedCommunity,
-}
-
-/// The consumer half of CC 4.4 / 5.3.4: from ONE response, (1) verify the
-/// bundle's holder quorum against THIS node's own roster (a short quorum is
-/// refused — the #809 assertion, gated), (2) admit the key records the row
-/// names through the ordinary key door, (3) admit the community row through
-/// the ordinary community door, which re-runs the accord quorum
-/// ([`check_trust_root_community_admission`]) against this node's own pins,
-/// and (4) resolve it. Nothing in the response is trusted for being in the
-/// response.
-///
-/// **Why the key records go in before the community.** The community door
-/// judges each founder from THIS node's key records, so they must exist first.
-/// Each record passes the key door on its own terms (a founder's accord
-/// co-scrub is re-verified against this node's pins; a serve node's record is
-/// a self-registration any caller may submit), so a response whose community
-/// is then refused leaves behind only records this node would have admitted
-/// from anyone — never a community, and never a conferral the accord did not
-/// sign.
-///
-/// # Errors
-///
-/// [`Error::GenesisBundleInvalid`] for a bundle whose quorum does not verify;
-/// [`Error::InvalidArgument`] when no `ciris-canonical` row travels beside it;
-/// every refusal of the key and community doors.
-pub async fn pin_trust_from_bundle_response<F>(
-    directory: &F,
-    response: &TrustRootBundleResponse,
-) -> Result<PinnedTrust, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let proof = super::genesis::bundle::verify_bundle_quorum(directory, &response.bundle).await?;
-    let bundle_holders_verified = proof.distinct_holders();
-    let Some(signed) = response.community.clone() else {
-        return Err(Error::InvalidArgument(format!(
-            "trust-root response carries no {CIRIS_CANONICAL_COMMUNITY_KEY_ID:?} community row \
-             beside the bundle — nothing to pin (CIRISPersist#926){}",
-            response
-                .community_withheld
-                .as_deref()
-                .map(|r| format!("; the server withheld it: {r}"))
-                .unwrap_or_default()
-        )));
-    };
-    if signed.community.community_key_id != CIRIS_CANONICAL_COMMUNITY_KEY_ID {
-        return Err(Error::InvalidArgument(format!(
-            "trust-root response carries community {:?}, not {CIRIS_CANONICAL_COMMUNITY_KEY_ID:?}",
-            signed.community.community_key_id
-        )));
-    }
-    for record in &response.community_member_records {
-        if directory
-            .lookup_public_key(&record.record.key_id)
-            .await?
-            .is_none()
-        {
-            directory.put_public_key(record.clone()).await?;
-        }
-    }
-    admit_response_withdrawals(directory, response).await?;
-    let id = signed.community.community_key_id.clone();
-    directory.put_community(signed).await?;
-    let community = resolve_community(directory, &id)
-        .await?
-        .ok_or_else(|| Error::Backend(format!("community {id:?} admitted but not rooted")))?;
-    Ok(PinnedTrust {
-        family: response.bundle.family_key_id.clone(),
-        bundle_holders_verified,
-        community,
-    })
-}
-
-/// Admit the steward-withdrawal evidence a [`TrustRootBundleResponse`]
-/// carries, through the ORDINARY accord evidence door (re-tallied against
-/// THIS node's own accord roster), then re-derive this node's own steward
-/// withdrawals for every key the response names. Evidence that does not
-/// re-tally is refused by that door, not trusted for being in the response.
-///
-/// # Errors
-///
-/// The evidence door's refusals; directory failures.
-// FOLD(#926-rotation): persist has no steward SUPERSEDE door today — a
-// founder's retirement is a plain withdraw, so this projects plain withdrawals
-// only. If a steward supersede door is ever added, project its
-// (old → successor) pairs over the chain-named keys here too.
-pub async fn admit_response_withdrawals<F>(
-    directory: &F,
-    response: &TrustRootBundleResponse,
-) -> Result<(), Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    for evidence in &response.steward_withdrawal_evidence {
-        directory.apply_replicated_accord_evidence(evidence).await?;
-    }
-    if response.steward_withdrawal_evidence.is_empty() {
-        return Ok(());
-    }
-    let roster = super::admission::accord_holder_roster_key_ids();
-    for r in &response.community_member_records {
-        super::accord_carriage::project_role_withdrawal_for_key(
-            directory.as_dyn_directory(),
-            identity_type::STEWARD,
-            &r.record.key_id,
-            &roster,
-        )
-        .await?;
-    }
-    Ok(())
-}
+// v62.0.0 (C5-fix1; ceremony gap 1): the bundle/1 trust-root response
+// (`TrustRootBundleResponse`, `trust_root_bundle_response`) and its consumer
+// (`pin_trust_from_bundle_response`, `PinnedTrust`,
+// `admit_response_withdrawals`) are deleted with the baked genesis. The
+// trust-root route serves the edition-2 body
+// (`server::edition2::trust_root_statements`); a node imports a genesis at
+// `edition2::genesis::put_genesis_bundle`.
 
 /// v54.1.0 (CIRISPersist#1046, CIRISConstitution#165 §1) — **the trust
 /// root's own `consensus_protocol` over a cosigned envelope that is NOT one of

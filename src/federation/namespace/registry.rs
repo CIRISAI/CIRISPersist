@@ -1822,6 +1822,7 @@ mod tests {
     /// generating no `reserved_rule`, so `authority_for` reports the family
     /// open and no substrate can enforce what CC wrote. `quarantine.rs` used to
     /// call itself *"the only one of 109"*; the re-vendor made that four of 114
+    /// (three since rc20, when `content_rating:`'s row stopped stating one)
     /// while the sentence still read as freshly checked — a claim rotting in the
     /// direction that looks verified, which is the class
     /// `manifest_absence_claims_still_hold` exists for.
@@ -1853,9 +1854,14 @@ mod tests {
             .collect();
 
         let names: Vec<&str> = prose_only.iter().map(|e| e.prefix.as_str()).collect();
+        // v62.0.0 (CC rc20) — three: `content_rating:{scheme}:{rating}`'s row no
+        // longer states an emitter (rc20's description: "semantics and schemes
+        // at CC 3.3.12", the open vocabulary; persist's discrimination is the
+        // read-side `trusted_publisher` filter, `family_rules`' pin). The rule
+        // did not land; the prose that claimed one left.
         assert_eq!(
             prose_only.len(),
-            4,
+            3,
             "the prose-only emitter-rule population moved (now {}): {names:?}. If CC has landed a \
              rule, the count DROPS — delete the corresponding pin and write the gate. If a new row \
              arrived stating a rule nothing can parse, it joins the CC ask. Either way the doc \

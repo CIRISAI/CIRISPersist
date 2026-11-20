@@ -21,10 +21,12 @@
 //!   `federation`, the node's voice on it), the same seat serves: `Canonical`
 //!   tier, trust-root reach. The owner withdrawing the binding takes the
 //!   standing away at once (the test is live, CC 2.7.5).
-//! - **I3112** — an agent is never exempt: a trust-root room (the door's
-//!   verdict is "authorized infrastructure") listing an unstewarded `agent`
-//!   member is refused `UnstewardedCommunityMember` and nothing is stored;
-//!   the same room with only its unstewarded `node` member admits.
+//! - **I3112** — an agent is never exempt: an edition-2 trust-root room (an
+//!   `infrastructure` community founded by the bundle's holders through
+//!   `group:roster` voices; the trust-root door's verdict) listing an
+//!   unstewarded `agent` member is HELD `unstewarded_community_member`
+//!   (the door's `UnstewardedCommunityMember`, a fold condition) and nothing
+//!   is stored; the same room with only its unstewarded `node` member lands.
 //! - **I3113** — an unowned seat's own `hard_case:*` statement is admitted
 //!   and held: the rule withholds serve standing, never the node's
 //!   accountability records.
@@ -41,7 +43,6 @@ pub(crate) mod bodies {
     use crate::federation::admission::{
         is_canonical, seat_serve_standing, serve_seat_owner_announced, serves_under_seat,
     };
-    use crate::federation::canonical_community_invariants::bodies as cci;
     use crate::federation::edition2::fixture_genesis as fg;
     use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::hard_case::{self, HardCaseEvent};
@@ -49,7 +50,7 @@ pub(crate) mod bodies {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::trust_root::{resolve_serve_tier, ServeTier};
     use crate::federation::types::{attestation_type, identity_type, Attestation};
-    use crate::federation::{Error, FederationDirectory};
+    use crate::federation::FederationDirectory;
     use ciris_verify_core::cde::Value;
 
     /// Now, at the millisecond the edition-2 wire carries, a minute back so a
@@ -231,61 +232,130 @@ pub(crate) mod bodies {
         );
     }
 
-    /// The trust-root room `id` (the CC 3.2 worked example, co-scrubbed 2-of-3
-    /// by the accord), its unstewarded serve node seated as a member, plus
-    /// `extra` as a member.
-    fn trust_root_room(id: &str, extra: Option<&str>) -> crate::federation::SignedCommunity {
-        let mut row = cci::canonical_row(&cci::FOUNDERS);
-        row.community_key_id = id.to_owned();
-        row.community_name = format!("infrastructure {id}");
+    /// v62 (W1-fix3, CP2 rewrite) — an edition-2 trust-root room at
+    /// `e2::kid(seed)`: an `infrastructure` community founded by the holders
+    /// of the bundle in force (each a FOUNDER, `quorum:2/3`, the birth
+    /// counted over the bundle's holders, W1's trust-root door), plus `extra`
+    /// as a plain member. Its founding voices, one per holder, in order.
+    fn trust_root_room(seed: &str, extra: Option<&str>) -> Vec<Vec<u8>> {
+        use crate::federation::edition2::group::GroupRecord;
+        use crate::federation::types::{Community, CommunityMember};
+        let founded = now_ms();
+        let mut members: Vec<CommunityMember> = fg::HOLDER_SEEDS
+            .iter()
+            .map(|h| CommunityMember {
+                key_id: fg::identity_ref_of(*h),
+                joined_at: founded,
+                role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
+            })
+            .collect();
         if let Some(k) = extra {
-            row.members.push(crate::federation::types::CommunityMember {
+            members.push(CommunityMember {
                 key_id: k.to_owned(),
-                joined_at: row.founded_at,
+                joined_at: founded,
                 role: Some("member".to_owned()),
             });
         }
-        cci::signed(row, &["A1", "B1"])
+        let room = GroupRecord::Community(Community {
+            community_key_id: e2::kid(seed),
+            community_name: format!("infrastructure {seed}"),
+            members,
+            founded_at: founded,
+            consensus_protocol: "quorum:2/3".to_owned(),
+            policy_blob: Some(serde_json::json!({
+                "cohort_subkind": crate::federation::canonical_community::COHORT_SUBKIND_INFRASTRUCTURE,
+                "cohort_subkind_payload": {
+                    "infrastructure_constraint": {
+                        "admission_quorum_basis":
+                            crate::federation::canonical_community::ADMISSION_QUORUM_BASIS_FOUNDERS,
+                    },
+                },
+                "consensus_protocol_entrenched": true,
+            })),
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
+            persist_row_hash: String::new(),
+        });
+        let at = u64::try_from(founded.timestamp_millis()).expect("ms") + 1_000;
+        let keys: Vec<_> = fg::HOLDER_SEEDS.iter().map(|h| fg::test_key(*h)).collect();
+        let refs: Vec<_> = keys.iter().collect();
+        crate::federation::edition2::group_fixtures::roster_voices(&room, 1, None, at, &refs)
     }
 
     /// **I3112** — the trust-root door exempts the node member and never the
-    /// agent.
+    /// agent. v62 (W1-fix3): the rooms are edition-2 `group:roster` foundings
+    /// by the bundle's holders; the agent's room is HELD
+    /// `unstewarded_community_member` by the steward gate's fold condition
+    /// (CC 2.7.3: the member's binding is another row) and nothing is stored.
     pub async fn i3112_an_agent_is_never_exempt_at_the_trust_root_door(
         d: &dyn FederationDirectory,
     ) {
-        e2::with_earlier_form_async(async move {
-            cci::stand_up(d).await;
-            let agent = "i3112-agent";
-            ts::register_hybrid_key_as(d, agent, agent, identity_type::AGENT).await;
+        use crate::federation::edition2::fold;
+        use crate::federation::edition2::group_fixtures::row_id_of;
+        use crate::federation::edition2::ingest::StatementOutcome;
+        install(d).await;
+        let agent = e2::put_key(d, "i3112-agent", &[identity_type::AGENT]).await;
+        let node = e2::put_key(d, "i3112-node", &[identity_type::NODE]).await;
 
-            let room_a = "i3112-room-a";
-            match d.put_community(trust_root_room(room_a, Some(agent))).await {
-                Err(Error::UnstewardedCommunityMember {
-                    community_key_id,
-                    member_key_id,
-                    member_role,
-                }) => {
-                    assert_eq!(community_key_id, room_a, "I3112");
-                    assert_eq!(member_key_id, agent, "I3112: the agent is named");
-                    assert_eq!(member_role, identity_type::AGENT, "I3112");
-                }
-                other => panic!(
-                    "I3112: an unstewarded agent on a trust-root room's roster must be refused, \
-                     got {other:?}"
-                ),
-            }
-            assert!(
-                d.lookup_community(room_a).await.unwrap().is_none(),
-                "I3112: verify-before-mutation: nothing stored"
+        let voices = trust_root_room("i3112-room-a", Some(&agent));
+        let mut last = None;
+        for v in &voices {
+            last = Some(
+                e2::put_statement(d, v)
+                    .await
+                    .expect("I3112: a holder's founding voice is kept"),
             );
-
-            let room_b = "i3112-room-b";
-            d.put_community(trust_root_room(room_b, None))
+        }
+        assert!(
+            matches!(last, Some(StatementOutcome::Pending { .. })),
+            "I3112: an unstewarded agent on a trust-root room's roster concludes nothing: \
+             {last:?}"
+        );
+        let held = fold::why_held(d, &row_id_of(&voices[0]))
+            .await
+            .unwrap()
+            .expect("I3112: the founding is held");
+        assert_eq!(
+            held.reason,
+            fold::reason::gc1::UNSTEWARDED_COMMUNITY_MEMBER,
+            "I3112: held by the steward gate: {held:?}"
+        );
+        // The agent, structurally (never the refusal's display text): the
+        // held founding's declared reads name the agent's key, so it re-folds
+        // when the agent's steward binding lands (`fold_dependents`).
+        assert!(
+            d.fold_dependents(&[fold::Dep::key(&agent).read_key()])
                 .await
-                .expect("I3112 control: the unstewarded NODE member is exempt");
-            assert!(d.lookup_community(room_b).await.unwrap().is_some());
-        })
-        .await
+                .unwrap()
+                .contains(&row_id_of(&voices[0])),
+            "I3112: the hold waits on the agent's key: {held:?}"
+        );
+        assert!(
+            d.lookup_community(&e2::kid("i3112-room-a"))
+                .await
+                .unwrap()
+                .is_none(),
+            "I3112: verify-before-mutation: nothing stored"
+        );
+
+        // The control: the same room with its unstewarded NODE member lands.
+        let mut last = None;
+        for v in &trust_root_room("i3112-room-b", Some(&node)) {
+            last = Some(
+                e2::put_statement(d, v)
+                    .await
+                    .expect("I3112 control: a holder's founding voice"),
+            );
+        }
+        assert!(
+            matches!(last, Some(StatementOutcome::Row { .. })),
+            "I3112 control: the unstewarded NODE member is exempt: {last:?}"
+        );
+        assert!(d
+            .lookup_community(&e2::kid("i3112-room-b"))
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// **I3113** — an unowned seat states a `hard_case:*` about itself at
@@ -309,9 +379,7 @@ pub(crate) mod bodies {
             // The seat is the author `hard_case:*` commits to (an authored
             // family): the statement is the seat's own.
             envelope["author"] = serde_json::Value::String(seat.clone());
-            let mut literal = e2::with_earlier_form(|| {
-                ts::bare_attestation("unused", "i3113-scribe", &seat, &envelope)
-            });
+            let mut literal = { ts::bare_attestation("unused", "i3113-scribe", &seat, &envelope) };
             literal.attestation_type = attestation_type::SCORES.to_owned();
             literal.asserted_at = at;
             literal.scrub_timestamp = at;

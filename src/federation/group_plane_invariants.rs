@@ -44,12 +44,6 @@
 //! re-offer of a held row settles; and a roster event re-put under the same key
 //! with other co-signers leaves the row that matches what the store kept.
 //!
-//! I1489 — an upgraded node: a v60 schema (through V205) holds signed typed
-//! records and roster events with no rows; V206/V207 and the rehome at open
-//! give every one its row, checked by a from-disk count (no signed projection
-//! row names no row; the plane holds one row per signed object), every
-//! projection rebuilds byte-equal, and a second rehome links nothing.
-//!
 //! I1497 — the member listing retires with no successor (the steward's ruling:
 //! no outward member listing). A v60 node (through V208) holds a private
 //! room's listing rows (two members listed `public`) and a peer's

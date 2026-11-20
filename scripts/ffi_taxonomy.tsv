@@ -166,6 +166,7 @@ Engine	apply_replicated_key_grant	deontic
 Engine	apply_replicated_key_record	deontic
 Engine	apply_replicated_statement	deontic	
 Engine	held_rows_for	empirical	
+Engine	detection_draft	procedural	
 Engine	put_edition2_statement	deontic	
 Engine	attestation_insert_local	empirical	
 Engine	attestation_insert_local_many	empirical	
@@ -185,7 +186,6 @@ Engine	cache_stats	empirical
 Engine	cirisnode_amend_goal_json	empirical	
 Engine	cirisnode_check_goal_projection	empirical	
 Engine	cirisnode_recant_goal_json	empirical	
-Engine	cirisnode_rehome_goals	axiotic	
 Engine	blackhole_list_json	empirical	
 Engine	blackhole_prune_expired_iso	deontic	
 Engine	blackhole_record_hit	deontic	
@@ -198,6 +198,7 @@ Engine	bundles_in_force_json	deontic
 # node's trust (the accord's roster, the canonical seats). A wrong entry
 # grants or withholds constitutional authority.
 Engine	put_genesis_bundle	deontic	
+Engine	verify_composite_via_directory	epistemic	
 Engine	amendment_standings_json	deontic	
 # v62.0.0 (ceremony gap 2) — the pre-roll gate's re-bind read is DEONTIC like
 # bundles_in_force_json: a wrong answer makes a key live a seat's holders never counted.
@@ -476,7 +477,6 @@ Engine	local_pqc_public_key_b64	ontological
 Engine	local_pqc_sign	ontological	
 Engine	local_public_key_b64	ontological	
 Engine	local_sign	ontological	
-Engine	local_sign_hybrid	ontological	
 Engine	seal_trace_statement	ontological	
 Engine	local_signer_capsule	structural	
 Engine	locale_leaf_hash_hex	pragmatic	
@@ -517,9 +517,6 @@ Engine	promote_consented_backlog	procedural
 Engine	provenance_chain	testimonial	self_audit
 Engine	public_key_b64	ontological	
 Engine	publish_change	structural	
-Engine	put_accord_decision_json	deontic	
-Engine	put_accord_participation_json	deontic	
-Engine	put_accord_proposal_json	deontic	
 Engine	put_aggregated_tier	axiotic	
 Engine	put_attestation	deontic	
 Engine	put_blob_chunk	empirical	
@@ -527,14 +524,12 @@ Engine	put_blob_chunk_scoped	deontic
 Engine	put_blob_chunks_json	empirical	
 Engine	put_blob_encrypted_community	deontic	
 Engine	put_blob_encrypted_self_family	deontic	
-Engine	put_blob_edition2	deontic	
-Engine	put_blob_json	empirical	
+Engine	put_blob	deontic	
 Engine	put_blob_scoped	deontic	
 Engine	put_blob_signing	deontic	
 Engine	put_calibration_bundle	empirical	
 Engine	put_community_json	deontic	
 Engine	put_delivery_receipt	testimonial	delivery_event
-Engine	put_detection_event	empirical	
 Engine	put_edge_detection_event	deontic	
 Engine	put_family_json	deontic	
 Engine	put_fountain_content	deontic	
@@ -632,6 +627,7 @@ Engine	set_self_key_id	ontological
 Engine	set_storage_budget_bytes	deontic	
 Engine	set_trust_threshold	deontic	
 Engine	sign	ontological	
+Engine	sign_draft	procedural	
 Engine	signer_ops_capsule	structural	
 Engine	steward_bind	deontic	
 Engine	steward_bind_incapacity	deontic	
@@ -704,12 +700,7 @@ Engine	verify_coord_check_observed_region	deontic
 Engine	verify_coord_compare_for_merge	axiotic	
 Engine	verify_coord_constants_json	nomological	
 Engine	verify_corpus_want_v1	deontic	
-Engine	verify_hybrid	deontic	
-Engine	verify_hybrid_via_directory	deontic	
 Engine	verify_locale_inclusion_json	testimonial	log_commitment
-Engine	verify_signed_attestation	deontic	
-Engine	verify_signed_key_record	deontic	
-Engine	verify_signed_revocation	deontic	
 Engine	verify_skill_import_manifest_b64	deontic	
 Engine	verify_storage_budget_v1	deontic	
 Engine	verify_trace	epistemic	
@@ -763,14 +754,13 @@ Engine	capacity_consent_stance	deontic
 # v54.1.0 (CIRISPersist#1041) — the same fold WITH the rows it rests on: deontic
 # for the same reason; the basis a scorer records is what the gate decides on.
 Engine	capacity_consent_stance_with_basis	deontic	
-# v50.0.0 (CIRISPersist#926) — `resolve_community_json` and
-# `pin_trust_from_bundle_response_json` are DEONTIC: a wrong entry names the
-# founders a consumer trusts (or admits a row its accord did not found), which
-# is a security finding. `trust_root_bundle_response_json` is EMPIRICAL: it
+# v50.0.0 (CIRISPersist#926) — `resolve_community_json` is DEONTIC: a wrong
+# entry names the founders a consumer trusts, which is a security finding
+# (v62.0.0, C5-fix1: `pin_trust_from_bundle_response_json` is deleted).
+# `trust_root_bundle_response_json` is EMPIRICAL: it
 # serves this node's stored state, re-derivable by re-reading it.
 Engine	resolve_community_json	deontic	
 Engine	trust_root_bundle_response_json	empirical	
-Engine	pin_trust_from_bundle_response_json	deontic	
 Engine	open_sealed_manifest_json	deontic	
 Engine	promote_adopted_manifest_to_dag_json	deontic	
 Engine	open_sealed_manifest_page_json	deontic	

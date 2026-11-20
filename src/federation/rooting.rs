@@ -555,12 +555,14 @@ pub const ROOTING_LOG_TARGET: &str = "ciris_persist::rooting";
 /// trust-root** bootstrap. **This replaces trust-on-first-use** —
 /// CIRISEdge's `PeerResolver` calls it on its cold-start path.
 ///
-/// This wrapper pins the trusted terminus anchor to the HUMANITY_ACCORD
-/// holder keyset (A1/B1/C1) via
-/// [`ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor`] —
-/// the accord holders ARE the mesh's trusted primitive keyset
-/// (CIRISPersist#344). Use [`root_binding_anchored`] to supply a different
-/// anchor (tests).
+/// This wrapper pins the trusted terminus anchor to the accord holders of the
+/// INGESTED genesis (the Ed25519 halves of the composite keys
+/// `edition2::genesis::genesis_in_force` seats) — the accord holders ARE the
+/// mesh's trusted primitive keyset (CIRISPersist#344). v62.0.0 (C5-fix1;
+/// ceremony gap 1): Verify's baked A1/B1/C1 keyset
+/// (`accord_holder_bootstrap_anchor`) no longer anchors anything; a node that
+/// holds no genesis has an EMPTY anchor and every binding is `Rejected`. Use
+/// [`root_binding_anchored`] to supply a different anchor (tests).
 ///
 /// Returns [`RootingVerdict::Confirmed`] iff ALL hold:
 ///
@@ -614,13 +616,21 @@ pub async fn root_binding<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    // Secure by default: the trusted anchor is the pinned HUMANITY_ACCORD
-    // holder keyset (A1/B1/C1). Every existing caller (CIRISEdge's cold-start
+    // Secure by default: the trusted anchor is the accord holders of the
+    // ingested genesis. Every existing caller (CIRISEdge's cold-start
     // announce path) therefore gets anchor enforcement with no code change —
-    // the terminus MUST be one of the real accord holders, not any
-    // self-signed steward a peer asserts. Tests inject their own anchor via
-    // [`root_binding_anchored`].
-    let anchor = ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor();
+    // the terminus MUST be one of the genesis's accord holders, not any
+    // self-signed steward a peer asserts. No genesis held (or a store that
+    // cannot answer) ⇒ the empty anchor ⇒ `Rejected`: fail closed. Tests
+    // inject their own anchor via [`root_binding_anchored`].
+    let anchor: Vec<[u8; 32]> = match super::edition2::genesis::genesis_in_force(directory).await {
+        Ok(in_force) => in_force
+            .holders()
+            .iter()
+            .filter_map(|h| super::edition2::composite::ed25519_public(&h.key))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
     root_binding_anchored(directory, key_id, claimed_pubkey_ed25519_base64, &anchor).await
 }
 

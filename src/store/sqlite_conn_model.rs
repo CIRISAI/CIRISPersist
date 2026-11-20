@@ -493,7 +493,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("read_stream_chunk_hashes", ConnClass::Read),
     ("store_stream_sth", ConnClass::Write),
     ("store_delivery_receipt", ConnClass::Write),
-    ("store_holding_claim", ConnClass::Write),
     ("store_stream_dek", ConnClass::Write),
     ("store_stream_dek_grants", ConnClass::Write),
     // v61 (CIRISPersist#934, S4a) — the directory executor and the trust
@@ -924,9 +923,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
         ConnClass::HelperWrite,
     ),
     ("sqlite_project_consent_peer_set", ConnClass::HelperWrite),
-    // v54.1.0 (Codex round 3 on PR #1057) — the Art. 17 detection tombstone,
-    // shared by the DSAR erasure and the steward purge's trace delete.
-    ("sqlite_tombstone_detection_events", ConnClass::HelperWrite),
     (
         "sqlite_drop_orphaned_thought_signatures",
         ConnClass::HelperWrite,
@@ -937,7 +933,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sqlite_update_peer_field", ConnClass::Write),
     ("sqlite_upsert_wire_index", ConnClass::HelperWrite),
     // v55.0.0 (CIRISPersist#989) — the three claim doors' shared INSERT.
-    ("sqlite_insert_holding_claim", ConnClass::HelperWrite),
     ("store_planned_local_attestation", ConnClass::Write),
     // v56.0.0 (CIRISPersist#934 step 1) — the attestation plane's executor
     // (`AttestationStore`): its two reads and its writes. The doors that held
@@ -965,9 +960,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("read_group_plane_object", ConnClass::Read),
     // CIRISPersist#1198 — the V213 vote windows.
     ("vote_window_first_held", ConnClass::Read),
-    // v59.0.0 (sealed-transport floor) — the eager key-plane rehome at open.
-    ("rehome_key_plane_at_open", ConnClass::Read),
-    ("legacy_community_trust_grants_at_open", ConnClass::Read),
     // v61 (the canonical's read storm) — ANALYZE once on a never-analyzed
     // store, then `PRAGMA optimize`: both write sqlite_stat1, on the writer.
     ("plan_statistics_at_open", ConnClass::Write),
@@ -976,16 +968,14 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("settle_self_roster_proposal", ConnClass::Write),
     ("store_planned_attestation", ConnClass::Write),
     ("store_planned_reseal", ConnClass::Write),
-    // v57.0.0 (CIRISPersist#988 items 2, 3) — the hard_case and detection
-    // doors' executors, the legacy rehomes, the projection rebuild, and the
-    // writers they share. `record_hard_case` and `put_detection_event` are
-    // calls into the shared plans now and touch no connection.
+    // v57.0.0 (CIRISPersist#988 items 2, 3) — the hard_case door's
+    // executor, the projection rebuild, and the writers they share.
+    // `record_hard_case` is a call into the shared plan and touches no
+    // connection. v62.0.0 (P8-fix11) — the detection door's executor
+    // (`store_planned_detection`) is deleted with the earlier-form door.
     ("store_planned_hard_case", ConnClass::Write),
-    ("rehome_legacy_hard_case_events", ConnClass::Write),
-    ("store_planned_detection", ConnClass::Write),
     ("trace_agent_id_hash", ConnClass::Read),
     ("detection_row_ids_for_agent", ConnClass::Read),
-    ("rehome_legacy_detection_events", ConnClass::Write),
     ("projection_rebuild", ConnClass::Write),
     (
         "sqlite_insert_local_attestation_row",
@@ -1003,12 +993,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sqlite_project_ledger", ConnClass::HelperWrite),
     ("sqlite_ledger_projection_rebuild", ConnClass::HelperWrite),
     // v60.0.0 (CIRISPersist#988 item 4) — the goals projection's writer (the
-    // refold, on the executor's transaction) and its rebuild; the legacy
-    // goal reads and removals the rehome drives.
+    // refold, on the executor's transaction) and its rebuild. (v62.0.0: the
+    // legacy-goal reads and removals left with the rehome, ruling 4.)
     ("sqlite_project_goal", ConnClass::HelperWrite),
     ("sqlite_goal_projection_rebuild", ConnClass::HelperWrite),
-    ("legacy_goals", ConnClass::Read),
-    ("delete_legacy_goal", ConnClass::Write),
     // v58.0.0 (CIRISPersist#991) — the key plane's rows and projections.
     ("sqlite_key_plane_present", ConnClass::HelperRead),
     ("sqlite_plane_rows", ConnClass::HelperRead),
@@ -1021,11 +1009,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
         "sqlite_occurrence_projection_rebuild",
         ConnClass::HelperRead,
     ),
-    ("rehome_legacy_key_plane", ConnClass::Write),
     // v61 (CIRISPersist#991) — the group plane's executor.
     ("group_plane_present", ConnClass::Read),
     ("read_group_object", ConnClass::Read),
-    ("unlinked_group_objects", ConnClass::Read),
     ("link_group_plane_row", ConnClass::Write),
     ("drop_group_projection_row", ConnClass::Write),
     ("read_group_plane", ConnClass::Read),

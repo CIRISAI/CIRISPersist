@@ -203,6 +203,14 @@ pub struct Engine {
     /// substrate refuses nothing).
     disk_pressure_state:
         Option<tokio::sync::watch::Receiver<crate::federation::DiskPressureSnapshot>>,
+    /// v62.0.0 (P7-fix6; CC 3.1.5, key_roles R4, CC 3.4.7.3 Clause A) —
+    /// further composite keys this Engine may sign a TRACE with, beside its
+    /// own ([`Self::local_signer`]). A trace row is signed by the AGENT's key
+    /// and nothing else signs it; a host whose Engine key is its node
+    /// identity carries the agent key here ([`Self::with_trace_signer`]).
+    /// [`Self::seal_trace`] selects among all of them by REGISTERED kind.
+    /// Empty by default (the Agent's Engine key IS its agent key).
+    trace_signers: Arc<[Arc<crate::signing::LocalSigner>]>,
 }
 
 /// v2.12.0 (CIRISPersist#112) — error from [`Engine::sign_hybrid`].
@@ -543,6 +551,7 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
+            trace_signers: Arc::from(Vec::new()),
         };
         // v30.2.0 (CIRISPersist#607) — a node knows who it IS at construction,
         // so the backend is told here rather than waiting on
@@ -606,6 +615,7 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
+            trace_signers: Arc::from(Vec::new()),
         };
         // v30.2.0 (CIRISPersist#607) — a node knows who it IS at construction,
         // so the backend is told here rather than waiting on
@@ -815,6 +825,7 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
+            trace_signers: Arc::from(Vec::new()),
         };
         // CIRISPersist#848 (I66) — see `with_signer`.
         if let Ok(id) = engine.local_derived_key_id().await {
@@ -896,6 +907,7 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
+            trace_signers: Arc::from(Vec::new()),
         };
         // CIRISPersist#848 (I66) — see `with_signer`.
         if let Ok(id) = engine.local_derived_key_id().await {
@@ -1008,6 +1020,7 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
+            trace_signers: Arc::from(Vec::new()),
         };
         engine.tell_shared_backend_its_node_key();
         engine
@@ -1034,6 +1047,7 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
+            trace_signers: Arc::from(Vec::new()),
         };
         engine.tell_shared_backend_its_node_key();
         engine
@@ -1165,6 +1179,21 @@ impl Engine {
         rx: tokio::sync::watch::Receiver<crate::federation::DiskPressureSnapshot>,
     ) -> Self {
         self.disk_pressure_state = Some(rx);
+        self
+    }
+
+    /// v62.0.0 (P7-fix6) — **carry an agent key for traces** on this Engine
+    /// view: a host whose Engine key is NOT its agent key (its node identity,
+    /// CC 3.4.7.3 Clause A: the node key is a separate key, never a re-typed
+    /// agent key) adds the agent's composite [`LocalSigner`] here, and
+    /// [`Self::seal_trace`] signs the trace row with it. Selection is by the
+    /// key's REGISTERED `identity_type` (its live `key:record` on this node),
+    /// never by position. Consumes `self` (Arc clones; cheap).
+    #[must_use]
+    pub fn with_trace_signer(mut self, signer: Arc<LocalSigner>) -> Self {
+        let mut all: Vec<Arc<LocalSigner>> = self.trace_signers.iter().cloned().collect();
+        all.push(signer);
+        self.trace_signers = Arc::from(all);
         self
     }
 
@@ -2147,9 +2176,11 @@ impl Engine {
     // ─── v8.0.0 — fountain content primitive (CIRISPersist#227) ─────
 
     /// v8.0.0 (CIRISPersist#227) — admit a fountain-coded content unit
-    /// (manifest + N+K symbols). Verify-before-mutation: the #225 hybrid
-    /// verify on the manifest + per-symbol SHA-256 auth run first; on any
-    /// failure NOTHING is written. Dispatches to the backend's
+    /// (manifest + N+K symbols). v62.0.0 (F0-cp6d): NODE-LOCAL — the
+    /// manifest must be this node's own (`pqc_key_id` = its identity); a
+    /// peer's is refused `fountain_manifest_not_cc_object`. Then the
+    /// structure and per-symbol SHA-256 auth; on any failure NOTHING is
+    /// written. Dispatches to the backend's
     /// [`Backend::put_fountain_content`](crate::store::Backend::put_fountain_content).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn put_fountain_content(
@@ -10861,13 +10892,18 @@ impl Engine {
     ///    ITS digest (the bytes exactly as stored and served). Any other
     ///    trace's blob is the scrubbed JSON itself.
     /// 3. The row payload over that blob ([`crate::ingest::trace_row_payload`])
-    ///    is signed once by this Engine's composite key.
+    ///    is signed once by the AGENT's composite key (P7-fix6; CC 3.1.5,
+    ///    key_roles R4): the held key whose registered kind is `agent`
+    ///    ([`Self::trace_signer_for`]), never the host's node or primitive key
+    ///    (which may carry the trace, never sign it).
     ///
     /// Returns the statement and the blob, for the batch event's
     /// `statement` / `trace_blob`.
     ///
     /// # Errors
-    /// No local signer ([`crate::ingest::IngestError::Sign`]); the scrubber's
+    /// No live agent-kind key held ([`crate::ingest::TRACE_AGENT_SIGNER_NOT_HELD`],
+    /// never a silent fallback to the host's key) or several
+    /// ([`crate::ingest::TRACE_AGENT_SIGNER_AMBIGUOUS`]); the scrubber's
     /// and the binding's refusals; a `family` trace without its
     /// `cohort_target_id`; the sealed write's failure.
     #[cfg(all(feature = "scrub", any(feature = "postgres", feature = "sqlite")))]
@@ -10876,16 +10912,138 @@ impl Engine {
         trace: &serde_json::Value,
         level: crate::schema::TraceLevel,
     ) -> Result<crate::ingest::SealedTrace, crate::ingest::IngestError> {
+        self.seal_trace_as(trace, level, None).await
+    }
+
+    /// v62.0.0 (P7-fix6; CC 3.1.5, key_roles R4) — **the trace's signer: the
+    /// AGENT's key, selected by its REGISTERED kind.** Among the composite
+    /// keys this Engine holds (its own [`Self::local_signer`] and every
+    /// [`Self::with_trace_signer`] key), the ones whose live `key:record` on
+    /// this node, at the trace's own instant (`at_ms`, the row's
+    /// `asserted_at`), is of the agent kind
+    /// ([`crate::ingest::trace_signer_is_agent`]). The host's node or
+    /// primitive key is never used: it may CARRY the trace, never sign it.
+    ///
+    /// - `named`: the identity-ref the caller names (an override, for a host
+    ///   holding more than one agent key); it must be one of the held agent
+    ///   keys.
+    /// - none named: the ONE held agent key.
+    ///
+    /// # Errors
+    /// [`crate::ingest::TRACE_AGENT_SIGNER_NOT_HELD`] (no held key is a live
+    /// agent key here, or the named one is not one of them),
+    /// [`crate::ingest::TRACE_AGENT_SIGNER_AMBIGUOUS`] (several, none named);
+    /// a key-plane read failure as `IngestError::Store`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn trace_signer_for(
+        &self,
+        at_ms: u64,
+        named: Option<&str>,
+    ) -> Result<(Arc<LocalSigner>, String), crate::ingest::IngestError> {
+        use crate::federation::edition2::liveness::Liveness;
         use crate::ingest::IngestError;
-        let local = self.local_signer.clone().ok_or_else(|| {
-            IngestError::Sign("seal_trace needs this Engine's composite LocalSigner".to_owned())
-        })?;
+        let refused =
+            |kind: &'static str, detail: String| IngestError::TraceRefused { kind, detail };
+        let dir = self.federation_directory();
+        let mut held: Vec<Arc<LocalSigner>> = Vec::new();
+        held.extend(self.local_signer.iter().cloned());
+        held.extend(self.trace_signers.iter().cloned());
+        let mut seen = std::collections::BTreeSet::new();
+        let mut agents: Vec<(Arc<LocalSigner>, String)> = Vec::new();
+        let mut kinds: Vec<String> = Vec::new();
+        for signer in held {
+            if signer.pqc_signer().is_none() {
+                continue;
+            }
+            let Ok((kid, iss)) =
+                crate::federation::edition2::produce::signer_identity(&signer).await
+            else {
+                continue;
+            };
+            if !seen.insert(kid) {
+                continue;
+            }
+            let keys = crate::federation::edition2::ingest::held_keys_for_kid(dir.as_ref(), &kid)
+                .await
+                .map_err(|e| {
+                    IngestError::Store(crate::store::Error::Backend(format!(
+                        "trace signer key plane: {e}"
+                    )))
+                })?;
+            let kind = match keys.liveness(&kid, at_ms) {
+                Liveness::Live(r) => r.identity_type.join(","),
+                _ => String::new(),
+            };
+            kinds.push(format!("{iss}={kind:?}"));
+            if crate::ingest::trace_signer_is_agent(&kind) {
+                agents.push((signer, iss));
+            }
+        }
+        match named {
+            Some(want) => agents
+                .into_iter()
+                .find(|(_, iss)| iss == want)
+                .ok_or_else(|| {
+                    refused(
+                        crate::ingest::TRACE_AGENT_SIGNER_NOT_HELD,
+                        format!(
+                        "seal_trace: {want} is not a live agent key this Engine holds (held: {})",
+                        kinds.join(", ")
+                    ),
+                    )
+                }),
+            None => {
+                let mut agents = agents;
+                match agents.len() {
+                    1 => Ok(agents.remove(0)),
+                    0 => Err(refused(
+                        crate::ingest::TRACE_AGENT_SIGNER_NOT_HELD,
+                        format!(
+                            "seal_trace: a trace is signed by the agent's key (CC 3.1.5, \
+                             key_roles R4) and this Engine holds no live agent key at {at_ms} \
+                             (held: {}); carry it with with_trace_signer",
+                            kinds.join(", ")
+                        ),
+                    )),
+                    _ => Err(refused(
+                        crate::ingest::TRACE_AGENT_SIGNER_AMBIGUOUS,
+                        format!(
+                            "seal_trace: this Engine holds {} agent keys ({}); name one \
+                             (seal_trace_as)",
+                            agents.len(),
+                            agents
+                                .iter()
+                                .map(|(_, iss)| iss.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    )),
+                }
+            }
+        }
+    }
+
+    /// v62.0.0 (P7-fix6) — [`Self::seal_trace`] signed by the agent key
+    /// `agent_key_id` names (an identity-ref), or, with `None`, by the ONE
+    /// agent-kind key this Engine holds ([`Self::trace_signer_for`]).
+    ///
+    /// # Errors
+    /// As [`Self::seal_trace`], and [`Self::trace_signer_for`]'s.
+    #[cfg(all(feature = "scrub", any(feature = "postgres", feature = "sqlite")))]
+    pub async fn seal_trace_as(
+        &self,
+        trace: &serde_json::Value,
+        level: crate::schema::TraceLevel,
+        agent_key_id: Option<&str>,
+    ) -> Result<crate::ingest::SealedTrace, crate::ingest::IngestError> {
+        use crate::ingest::IngestError;
         let plaintext = crate::ingest::scrubbed_trace_blob(trace, level)?;
         let parsed: crate::schema::CompleteTrace =
             serde_json::from_slice(&plaintext).map_err(|e| IngestError::Schema(e.into()))?;
-        let (_, iss) = crate::federation::edition2::produce::signer_identity(&local)
-            .await
-            .map_err(|e| IngestError::Sign(format!("trace row signer: {e}")))?;
+        // The row's `asserted_at` is the trace's `completed_at` (ms): the key
+        // is selected live at the instant the door will judge it at.
+        let at_ms = u64::try_from(parsed.completed_at.parsed().timestamp_millis()).unwrap_or(0);
+        let (local, iss) = self.trace_signer_for(at_ms, agent_key_id).await?;
         let store_err = |what: &str, e: String| {
             IngestError::Store(crate::store::Error::Backend(format!("{what}: {e}")))
         };
@@ -12949,185 +13107,172 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    /// v62.0.0 (P7 CP2 rewrite) — a one-component 2.7.0 trace as the JSON
+    /// object a LensClient seals: no signature members (a forward trace blob
+    /// carries none; its row is its signature).
+    fn p7_trace_json(
+        trace_id: &str,
+        agent_id_hash: &str,
+        started: chrono::DateTime<chrono::Utc>,
+        completed: chrono::DateTime<chrono::Utc>,
+    ) -> serde_json::Value {
+        let at = |t: chrono::DateTime<chrono::Utc>| {
+            t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        serde_json::json!({
+            "trace_id": trace_id,
+            "thought_id": "th-1",
+            "task_id": "task-1",
+            "agent_id_hash": agent_id_hash,
+            "started_at": at(started),
+            "completed_at": at(completed),
+            "trace_level": "generic",
+            "trace_schema_version": "2.7.0",
+            "components": [{
+                "component_type": "observation",
+                "event_type": "THOUGHT_START",
+                "timestamp": at(started),
+                "data": { "attempt_index": 0 },
+            }],
+        })
+    }
+
+    /// v62.0.0 (P7 CP2 rewrite) — wrap batch events in a v62 envelope.
+    fn p7_batch(events: Vec<serde_json::Value>) -> Vec<u8> {
+        serde_json::json!({
+            "events": events,
+            "batch_timestamp": crate::host::clock::now().to_rfc3339(),
+            "consent_timestamp": "2025-01-01T00:00:00Z",
+            "trace_level": "generic",
+            "trace_schema_version": "2.7.0",
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// v62.0.0 (P7 CP2 rewrite) — the edition-2 trace wire: `raw`'s blob
+    /// (its JCS bytes) and its `trace:complete:v1` row, signed once by
+    /// `signer`'s composite key, as one batch event
+    /// (`statement` + `trace_blob`, no inline `trace`). Returns the event
+    /// and the signer's identity-ref.
+    async fn p7_row_event(
+        signer: &LocalSigner,
+        raw: &serde_json::Value,
+    ) -> (serde_json::Value, String) {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let blob = crate::ingest::canonical_trace_blob(raw).expect("a trace object");
+        let trace: crate::schema::CompleteTrace =
+            serde_json::from_slice(&blob).expect("the fixture is a CompleteTrace");
+        let (_, iss) = crate::federation::edition2::produce::signer_identity(signer)
+            .await
+            .expect("a composite signer");
+        let payload = crate::ingest::trace_row_payload(&trace, &blob, &iss).expect("payload");
+        let statement = crate::federation::edition2::produce::sign_row(
+            signer,
+            &iss,
+            crate::ingest::TRACE_ROW_TYPE,
+            crate::ingest::TRACE_FAMILY_ID,
+            &payload,
+        )
+        .await
+        .expect("sign the trace row");
+        (
+            serde_json::json!({
+                "event_type": "complete_trace",
+                "trace_level": "generic",
+                "statement": B64.encode(statement),
+                "trace_blob": B64.encode(blob),
+            }),
+            iss,
+        )
+    }
+
+    /// v62.0.0 (P7 CP2 rewrite) — the `trace_events` rows of `trace_id`.
+    async fn p7_events_of<B: crate::store::Backend>(
+        b: &B,
+        trace_id: &str,
+    ) -> Vec<crate::store::TraceEventRow> {
+        b.fetch_trace_events_page(0, 1000, None)
+            .await
+            .expect("fetch rows")
+            .into_iter()
+            .filter(|(_, r)| r.trace_id == trace_id)
+            .map(|(_, r)| r)
+            .collect()
+    }
+
     /// v1.11.0 (CIRISPersist#89) — `receive_and_persist` round-trip on
     /// an in-memory SQLite Engine: a real signed batch + `NullScrubber`
     /// must land rows and report a populated `BatchSummary`.
+    ///
+    /// v62.0.0 (P7 CP2 rewrite) — on the edition-2 trace wire: the agent's
+    /// `trace:complete:v1` row (one composite statement under its live
+    /// `agent` key) plus the trace blob. The statement door verifies it; the
+    /// row's own write projects the one component (so the batch's own
+    /// `trace_events_inserted` counts 0 and the row is read back); a replay
+    /// is idempotent.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn receive_and_persist_round_trips_signed_batch() {
-        Box::pin(
-            crate::federation::edition2::fixture_switch::with_earlier_form_async(async move {
-                use crate::schema::{
-                    CompleteTrace, ComponentType, ReasoningEventType, SchemaVersion,
-                    TraceComponent, TraceLevel,
-                };
-                use crate::scrub::NullScrubber;
-                use crate::verify::{
-                    ed25519::canonical_payload_value, Canonicalizer, PythonJsonDumpsCanonicalizer,
-                };
-                use base64::engine::general_purpose::STANDARD as B64;
-                use base64::Engine as _;
-                use ed25519_dalek::{Signer as _, SigningKey};
+        use crate::scrub::NullScrubber;
+        let signer = test_signer();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        // The agent is this Engine's own composite key, registered live.
+        engine
+            .register_self_federation_key(
+                crate::federation::types::identity_type::AGENT,
+                None,
+                None,
+            )
+            .await
+            .expect("register the agent key");
+        // The trace completes after the key's record begins (the row is read
+        // at its own `asserted_at` = `completed_at`).
+        let now = crate::host::clock::now();
+        let raw = p7_trace_json(
+            "trace-engine-89",
+            "deadbeef",
+            now,
+            now + chrono::Duration::seconds(1),
+        );
+        let (event, _iss) = p7_row_event(&signer, &raw).await;
+        let bytes = p7_batch(vec![event]);
 
-                // Agent identity that signs the trace (distinct from the
-                // Engine's local scrub-signer identity).
-                let agent_sk = SigningKey::from_bytes(&[0x42; 32]);
-                let agent_key_id = "ciris-agent-key:engine-89";
+        let summary = engine
+            .receive_and_persist(&bytes, &NullScrubber)
+            .await
+            .expect("receive_and_persist succeeds");
+        assert_eq!(summary.envelopes_processed, 1);
+        assert_eq!(
+            summary.signatures_verified, 1,
+            "the statement door verified it"
+        );
+        assert_eq!(
+            summary.trace_events_inserted, 0,
+            "projected in the row's own write, not a second time from the batch"
+        );
+        assert_eq!(summary.scrubbed_fields, 0, "NullScrubber modifies nothing");
+        let sq = engine.sqlite_backend().expect("sqlite backend");
+        assert_eq!(
+            p7_events_of(sq.as_ref(), "trace-engine-89").await.len(),
+            1,
+            "one component → one row"
+        );
 
-                let mut trace = CompleteTrace {
-                    trace_id: "trace-engine-89".into(),
-                    thought_id: "th-1".into(),
-                    task_id: Some("task-1".into()),
-                    agent_id_hash: "deadbeef".into(),
-                    started_at: "2026-04-30T00:15:53.123456Z".parse().unwrap(),
-                    completed_at: "2026-04-30T00:16:12.789012Z".parse().unwrap(),
-                    trace_level: TraceLevel::Generic,
-                    trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
-                    components: vec![TraceComponent {
-                        component_type: ComponentType::Observation,
-                        event_type: ReasoningEventType::ThoughtStart,
-                        timestamp: "2026-04-30T00:15:53.123Z".parse().unwrap(),
-                        data: {
-                            let mut m = serde_json::Map::new();
-                            m.insert("attempt_index".into(), 0.into());
-                            m
-                        },
-                        agent_id_hash: None,
-                    }],
-                    deployment_profile: None,
-                    cohort_scope: "federation".into(),
-                    cohort_target_id: None,
-                    signature: String::new(),
-                    signature_key_id: agent_key_id.into(),
-                    signature_ml_dsa_65: None,
-                    pubkey_ml_dsa_65: None,
-                    pqc_key_id: None,
-                    run_kind: None,
-                };
-                // v7.2.0 (#225) — hybrid-sign so the Full-mode trace-tier hard
-                // cut admits: Ed25519 over canonical + ML-DSA-65 over the bound
-                // input (canonical || classical_sig), plus the asserted PQC
-                // pubkey. canonical_payload_value still computes the classical
-                // canonical the agent signs.
-                let payload = canonical_payload_value(&trace);
-                let canonical = PythonJsonDumpsCanonicalizer
-                    .canonicalize_value(&payload)
-                    .unwrap();
-                let ed_sig = agent_sk.sign(&canonical).to_bytes();
-                {
-                    use ciris_keyring::PqcSigner as _;
-                    let mldsa = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
-                        &[0x77; 32],
-                        "engine-89-mldsa",
-                    )
-                    .unwrap();
-                    let mut bound = Vec::with_capacity(canonical.len() + ed_sig.len());
-                    bound.extend_from_slice(&canonical);
-                    bound.extend_from_slice(&ed_sig);
-                    let pqc_sig = mldsa.sign(&bound).await.unwrap();
-                    let pqc_pk = mldsa.public_key().await.unwrap();
-                    trace.signature = B64.encode(ed_sig);
-                    trace.signature_ml_dsa_65 = Some(B64.encode(&pqc_sig));
-                    trace.pubkey_ml_dsa_65 = Some(B64.encode(&pqc_pk));
-                    trace.pqc_key_id = Some("engine-89-mldsa".to_owned());
-                }
-
-                let trace_json = serde_json::to_value(&trace).unwrap();
-                let envelope = serde_json::json!({
-                    "events": [{
-                        "event_type": "complete_trace",
-                        "trace_level": "generic",
-                        "trace": trace_json,
-                    }],
-                    "batch_timestamp": "2026-04-30T15:00:00+00:00",
-                    "consent_timestamp": "2025-01-01T00:00:00Z",
-                    "trace_level": "generic",
-                    "trace_schema_version": "2.7.0",
-                });
-                let bytes = envelope.to_string().into_bytes();
-
-                let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-                    .await
-                    .expect("construct engine");
-
-                // Register the agent's pubkey in the SQLite federation_keys
-                // directory so the verify step can resolve it. The federation
-                // ingest path is exercised elsewhere; here we seed the row
-                // directly through the public connection handle.
-                let sq = engine.sqlite_backend().expect("sqlite backend");
-                let conn = sq.conn_handle();
-                let agent_pk_b64 = B64.encode(agent_sk.verifying_key().to_bytes());
-                let key_id_owned = agent_key_id.to_owned();
-                // CIRISPersist#789 — the producer's ML-DSA-65 pubkey, resolved from
-                // the directory at admission rather than trusted off the payload.
-                let pqc_pk_b64 = {
-                    use ciris_keyring::PqcSigner as _;
-                    // Seed 0x77, matching the signer above — NOT 0x89, which the key
-                    // NAME suggests and which produced a valid-looking registration
-                    // whose pubkey simply did not verify the signature.
-                    let m = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
-                        &[0x77; 32],
-                        "engine-89-mldsa",
-                    )
-                    .expect("ml-dsa seed");
-                    B64.encode(m.public_key().await.expect("ml-dsa pk"))
-                };
-                tokio::task::spawn_blocking(move || {
-                    let conn = conn.lock();
-                    conn.execute(
-                        "INSERT INTO federation_keys (\
-                    key_id, pubkey_ed25519_base64, algorithm, \
-                    identity_type, identity_ref, valid_from, \
-                    registration_envelope, original_content_hash, \
-                    scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash, admitted_at\
-                 ) VALUES (?1, ?2, 'hybrid', 'agent', ?1, ?3, '{}', \
-                          x'00', '', ?1, ?3, '0', ?3)",
-                        rusqlite::params![key_id_owned, agent_pk_b64, "2026-04-30T00:00:00+00:00"],
-                    )
-                    .expect("seed federation key");
-                    // #789 — and the producer's PQC key. A fixture registering only
-                    // the classical half models a world that does not exist: the
-                    // fleet is 100% PQC, and admission resolves the ML-DSA pubkey
-                    // from `federation_keys` by `pqc_key_id`.
-                    conn.execute(
-                        "INSERT INTO federation_keys (\
-                    key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, \
-                    algorithm, identity_type, identity_ref, valid_from, \
-                    registration_envelope, original_content_hash, \
-                    scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash, admitted_at\
-                 ) VALUES ('engine-89-mldsa', '', ?1, 'hybrid', 'agent', \
-                          'engine-89-mldsa', ?2, '{}', x'00', '', \
-                          'engine-89-mldsa', ?2, '0', ?2)",
-                        rusqlite::params![pqc_pk_b64, "2026-04-30T00:00:00+00:00"],
-                    )
-                    .expect("seed producer PQC key");
-                })
-                .await
-                .expect("spawn_blocking join");
-
-                let summary = engine
-                    .receive_and_persist(&bytes, &NullScrubber)
-                    .await
-                    .expect("receive_and_persist succeeds");
-
-                assert_eq!(summary.envelopes_processed, 1);
-                assert_eq!(summary.signatures_verified, 1);
-                assert_eq!(summary.trace_events_inserted, 1, "one component → one row");
-                assert_eq!(summary.trace_events_conflicted, 0);
-                assert_eq!(summary.scrubbed_fields, 0, "NullScrubber modifies nothing");
-
-                // Idempotency: replaying the same bytes conflicts, inserts 0.
-                let replay = engine
-                    .receive_and_persist(&bytes, &NullScrubber)
-                    .await
-                    .expect("replay succeeds");
-                assert_eq!(replay.trace_events_inserted, 0);
-                assert_eq!(replay.trace_events_conflicted, 1);
-            }),
-        )
-        .await
+        // Idempotency: replaying the same bytes lands nothing new.
+        let replay = engine
+            .receive_and_persist(&bytes, &NullScrubber)
+            .await
+            .expect("replay succeeds");
+        assert_eq!(replay.trace_events_inserted, 0);
+        assert_eq!(
+            p7_events_of(sq.as_ref(), "trace-engine-89").await.len(),
+            1,
+            "a replay adds no row"
+        );
     }
 
     /// v2.6.0 (CIRISPersist#106) — `Engine::federation_directory()`
@@ -13159,160 +13304,139 @@ mod tests {
     /// v1.11.0 (CIRISPersist#89) — `receive_and_persist` rejects an
     /// unverifiable batch (unknown signing key) with a typed
     /// `IngestError::Verify` and writes nothing.
+    ///
+    /// v62.0.0 (P7 CP2 rewrite) — on the edition-2 trace wire: a row signed
+    /// by a composite key this node holds no `key:record` of is refused
+    /// `federation_attester_key_unknown` (retryable: the record may arrive),
+    /// and nothing is written. An empty `events[]` is still a schema reject.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn receive_and_persist_rejects_unknown_key() {
-        Box::pin(
-            crate::federation::edition2::fixture_switch::with_earlier_form_async(async move {
-                use crate::ingest::IngestError;
-                use crate::scrub::NullScrubber;
+        use crate::ingest::IngestError;
+        use crate::scrub::NullScrubber;
 
-                let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-                    .await
-                    .expect("construct engine");
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
 
-                // A syntactically valid envelope whose signing key was never
-                // registered. `from_json` parses, verify rejects.
-                let body = serde_json::json!({
-                    "events": [],
-                    "batch_timestamp": "2026-04-30T15:00:00+00:00",
-                    "consent_timestamp": "2025-01-01T00:00:00Z",
-                    "trace_level": "generic",
-                    "trace_schema_version": "2.7.0"
-                });
-                let err = engine
-                    .receive_and_persist(body.to_string().as_bytes(), &NullScrubber)
-                    .await
-                    .expect_err("empty events array must be rejected");
-                // Empty events[] is a schema reject — confirms the facade
-                // surfaces typed IngestError variants unchanged.
-                assert!(matches!(err, IngestError::Schema(_)), "got: {err:?}");
-            }),
-        )
-        .await
+        // A row signed by a key never registered here.
+        let stranger = crate::federation::tier_ingest::test_support::local_signer(
+            "engine-89-unregistered-agent",
+        );
+        let now = crate::host::clock::now();
+        let raw = p7_trace_json(
+            "trace-engine-89-unknown",
+            "deadbeef",
+            now,
+            now + chrono::Duration::seconds(1),
+        );
+        let (event, _) = p7_row_event(&stranger, &raw).await;
+        let err = engine
+            .receive_and_persist(&p7_batch(vec![event]), &NullScrubber)
+            .await
+            .expect_err("an unknown signer must be refused");
+        assert_eq!(
+            err.kind(),
+            "federation_attester_key_unknown",
+            "got: {err:?}"
+        );
+        let sq = engine.sqlite_backend().expect("sqlite backend");
+        assert!(
+            p7_events_of(sq.as_ref(), "trace-engine-89-unknown")
+                .await
+                .is_empty(),
+            "nothing written"
+        );
+
+        // Empty events[] is a schema reject — the facade surfaces typed
+        // IngestError variants unchanged.
+        let err = engine
+            .receive_and_persist(&p7_batch(Vec::new()), &NullScrubber)
+            .await
+            .expect_err("empty events array must be rejected");
+        assert!(matches!(err, IngestError::Schema(_)), "got: {err:?}");
     }
 
     /// v2.0 (CIRISPersist#91) — `Engine::receive_and_persist_pre_verified`
-    /// persists a signed batch whose signing key is NOT registered in
-    /// the federation directory — proving the relay skip-verify facade
-    /// bypasses the per-trace `lookup_public_key`. The same batch
-    /// through the default `receive_and_persist` is rejected
-    /// `UnknownKey`, and the persisted rows are recorded honestly as
-    /// not persist-verified.
+    /// persists a batch whose signer is NOT in the directory — the relay
+    /// skip-verify facade — and the rows are recorded honestly as not
+    /// persist-verified.
+    ///
+    /// v62.0.0 (P7 CP2 rewrite; the lead's ruling) — an UNSIGNED trace under
+    /// `TrustPreVerified` is the LOCAL-only form: accepted, rows attributed
+    /// to Edge, nothing verified. The control: the same unsigned batch
+    /// through the verifying door (`receive_and_persist`, Full) is the
+    /// earlier form, refused `earlier_form_object` once the doors are shut.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn receive_and_persist_pre_verified_skips_directory_lookup() {
-        Box::pin(
-            crate::federation::edition2::fixture_switch::with_earlier_form_async(async move {
-                use crate::ingest::IngestError;
-                use crate::schema::{
-                    CompleteTrace, ComponentType, ReasoningEventType, SchemaVersion,
-                    TraceComponent, TraceLevel,
-                };
-                use crate::scrub::NullScrubber;
-                use crate::store::Backend as _;
-                use crate::verify::{
-                    ed25519::canonical_payload_value, Canonicalizer, PythonJsonDumpsCanonicalizer,
-                };
-                use base64::engine::general_purpose::STANDARD as B64;
-                use base64::Engine as _;
-                use ed25519_dalek::{Signer as _, SigningKey};
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let sq = engine.sqlite_backend().expect("sqlite backend").clone();
+        Box::pin(p7_pre_verified_body(
+            &engine,
+            sq.as_ref(),
+            "trace-engine-91",
+            "deadbeef",
+        ))
+        .await;
+    }
 
-                let agent_sk = SigningKey::from_bytes(&[0x42; 32]);
-                let agent_key_id = "ciris-agent-key:engine-91";
+    /// The body of the two `receive_and_persist_pre_verified` witnesses.
+    async fn p7_pre_verified_body<B: crate::store::Backend>(
+        engine: &Engine,
+        backend: &B,
+        trace_id: &str,
+        agent_id_hash: &str,
+    ) {
+        use crate::scrub::NullScrubber;
+        let started: chrono::DateTime<chrono::Utc> = "2026-04-30T00:15:53.123Z".parse().unwrap();
+        let raw = p7_trace_json(
+            trace_id,
+            agent_id_hash,
+            started,
+            started + chrono::Duration::seconds(19),
+        );
+        let bytes = p7_batch(vec![serde_json::json!({
+            "event_type": "complete_trace",
+            "trace_level": "generic",
+            "trace": raw,
+        })]);
 
-                let mut trace = CompleteTrace {
-                    trace_id: "trace-engine-91".into(),
-                    thought_id: "th-1".into(),
-                    task_id: Some("task-1".into()),
-                    agent_id_hash: "deadbeef".into(),
-                    started_at: "2026-04-30T00:15:53.123456Z".parse().unwrap(),
-                    completed_at: "2026-04-30T00:16:12.789012Z".parse().unwrap(),
-                    trace_level: TraceLevel::Generic,
-                    trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
-                    components: vec![TraceComponent {
-                        component_type: ComponentType::Observation,
-                        event_type: ReasoningEventType::ThoughtStart,
-                        timestamp: "2026-04-30T00:15:53.123Z".parse().unwrap(),
-                        data: {
-                            let mut m = serde_json::Map::new();
-                            m.insert("attempt_index".into(), 0.into());
-                            m
-                        },
-                        agent_id_hash: None,
-                    }],
-                    deployment_profile: None,
-                    cohort_scope: "federation".into(),
-                    cohort_target_id: None,
-                    signature: String::new(),
-                    signature_key_id: agent_key_id.into(),
-                    signature_ml_dsa_65: None,
-                    pubkey_ml_dsa_65: None,
-                    pqc_key_id: None,
-                    run_kind: None,
-                };
-                let payload = canonical_payload_value(&trace);
-                let canonical = PythonJsonDumpsCanonicalizer
-                    .canonicalize_value(&payload)
-                    .unwrap();
-                trace.signature = B64.encode(agent_sk.sign(&canonical).to_bytes());
-                let trace_json = serde_json::to_value(&trace).unwrap();
-                let envelope = serde_json::json!({
-                    "events": [{
-                        "event_type": "complete_trace",
-                        "trace_level": "generic",
-                        "trace": trace_json,
-                    }],
-                    "batch_timestamp": "2026-04-30T15:00:00+00:00",
-                    "consent_timestamp": "2025-01-01T00:00:00Z",
-                    "trace_level": "generic",
-                    "trace_schema_version": "2.7.0",
-                });
-                let bytes = envelope.to_string().into_bytes();
+        let summary = engine
+            .receive_and_persist_pre_verified(&bytes, &NullScrubber)
+            .await
+            .expect("an unsigned pre-verified trace is kept, local only");
+        assert_eq!(summary.envelopes_processed, 1);
+        assert_eq!(summary.trace_events_inserted, 1, "one component → one row");
+        assert_eq!(summary.signatures_verified, 0, "persist verified nothing");
 
-                let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-                    .await
-                    .expect("construct engine");
+        // Honest row state: `signature_verified = true` (Edge attested it)
+        // with `verification_source = Edge`, not persist.
+        let mine = p7_events_of(backend, trace_id).await;
+        assert_eq!(mine.len(), 1, "the one component we ingested");
+        assert!(
+            mine[0].signature_verified,
+            "the trace is authentic — signature_verified stays true"
+        );
+        assert_eq!(
+            mine[0].verification_source,
+            crate::store::VerificationSource::Edge,
+            "skip-verify rows attribute authenticity to Edge"
+        );
 
-                // Note: the agent's pubkey is intentionally NOT seeded into
-                // federation_keys — a `Full`-mode ingest would fail UnknownKey.
-                let summary = engine
-                    .receive_and_persist_pre_verified(&bytes, &NullScrubber)
-                    .await
-                    .expect("pre-verified ingest persists without a registered key");
-                assert_eq!(summary.envelopes_processed, 1);
-                assert_eq!(summary.trace_events_inserted, 1, "one component → one row");
-                assert_eq!(summary.signatures_verified, 0, "persist verified nothing");
-
-                // Honest row state: the row round-trips `signature_verified =
-                // true` (the trace IS authentic) with `verification_source =
-                // Edge` (an upstream Edge verifier attested it, not persist).
-                let sq = engine.sqlite_backend().expect("sqlite backend");
-                let rows = sq
-                    .fetch_trace_events_page(0, 100, None)
-                    .await
-                    .expect("fetch rows");
-                assert_eq!(rows.len(), 1, "the one component we ingested");
-                assert!(
-                    rows[0].1.signature_verified,
-                    "the trace is authentic — signature_verified stays true"
-                );
-                assert_eq!(
-                    rows[0].1.verification_source,
-                    crate::store::VerificationSource::Edge,
-                    "skip-verify rows attribute authenticity to Edge"
-                );
-
-                // Control: the default facade (Full mode) rejects the same
-                // batch — proving skip-mode genuinely bypassed the lookup.
-                let err = engine
-                    .receive_and_persist(&bytes, &NullScrubber)
-                    .await
-                    .expect_err("Full mode must reject the unregistered key");
-                assert!(matches!(err, IngestError::Verify(_)), "got: {err:?}");
-            }),
-        )
-        .await
+        // Control: the verifying door refuses the same unsigned batch as the
+        // earlier form (the doors are shut at CP2, F0's flip).
+        let err = engine
+            .receive_and_persist(&bytes, &NullScrubber)
+            .await
+            .expect_err("Full mode must refuse an unsigned trace");
+        assert_eq!(
+            err.kind(),
+            crate::federation::edition2::token::EARLIER_FORM_OBJECT,
+            "got: {err:?}"
+        );
     }
 
     /// v1.11.0 (CIRISPersist#90) — `Engine::node_core_service` returns the
@@ -13504,129 +13628,75 @@ mod tests {
     /// v2.0 (CIRISPersist#91) — Postgres parity for
     /// `receive_and_persist_pre_verified_skips_directory_lookup`.
     /// Skips when `CIRIS_PERSIST_TEST_PG_URL` is unset.
+    ///
+    /// v62.0.0 (P7 CP2 rewrite) — the same body: an unsigned trace is the
+    /// local-only form under `TrustPreVerified`, refused by name on the
+    /// verifying door.
     #[cfg(feature = "postgres")]
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn receive_and_persist_pre_verified_postgres() {
-        Box::pin(
-            crate::federation::edition2::fixture_switch::with_earlier_form_async(async move {
-                use crate::ingest::IngestError;
-                use crate::schema::{
-                    CompleteTrace, ComponentType, ReasoningEventType, SchemaVersion,
-                    TraceComponent, TraceLevel,
-                };
-                use crate::scrub::NullScrubber;
-                use crate::store::Backend as _;
-                use crate::verify::{
-                    ed25519::canonical_payload_value, Canonicalizer, PythonJsonDumpsCanonicalizer,
-                };
-                use base64::engine::general_purpose::STANDARD as B64;
-                use base64::Engine as _;
-                use ed25519_dalek::{Signer as _, SigningKey};
-                use uuid::Uuid;
+        use uuid::Uuid;
+        let Some(dsn) = crate::test_pg::dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let engine = Engine::with_signer(test_signer(), &dsn)
+            .await
+            .expect("construct postgres engine");
+        let pg = engine.postgres_backend().expect("postgres backend").clone();
+        let trace_id = format!("trace-engine-91-pg-{}", Uuid::new_v4().simple());
+        let agent_id_hash = format!("hash-{}", Uuid::new_v4().simple());
+        Box::pin(p7_pre_verified_body(
+            &engine,
+            pg.as_ref(),
+            &trace_id,
+            &agent_id_hash,
+        ))
+        .await;
+    }
 
-                let Some(dsn) = crate::test_pg::dsn() else {
-                    eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-                    return;
-                };
-
-                let agent_sk = SigningKey::from_bytes(&[0x43; 32]);
-                // Unique key_id so this row is isolated from any prior run.
-                let agent_key_id =
-                    format!("ciris-agent-key:engine-91-pg-{}", Uuid::new_v4().simple());
-                let trace_id = format!("trace-engine-91-pg-{}", Uuid::new_v4().simple());
-
-                let mut trace = CompleteTrace {
-                    trace_id: trace_id.clone(),
-                    thought_id: "th-1".into(),
-                    task_id: Some("task-1".into()),
-                    agent_id_hash: format!("hash-{}", Uuid::new_v4().simple()),
-                    started_at: "2026-04-30T00:15:53.123456Z".parse().unwrap(),
-                    completed_at: "2026-04-30T00:16:12.789012Z".parse().unwrap(),
-                    trace_level: TraceLevel::Generic,
-                    trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
-                    components: vec![TraceComponent {
-                        component_type: ComponentType::Observation,
-                        event_type: ReasoningEventType::ThoughtStart,
-                        timestamp: "2026-04-30T00:15:53.123Z".parse().unwrap(),
-                        data: {
-                            let mut m = serde_json::Map::new();
-                            m.insert("attempt_index".into(), 0.into());
-                            m
-                        },
-                        agent_id_hash: None,
-                    }],
-                    deployment_profile: None,
-                    cohort_scope: "federation".into(),
-                    cohort_target_id: None,
-                    signature: String::new(),
-                    signature_key_id: agent_key_id.clone(),
-                    signature_ml_dsa_65: None,
-                    pubkey_ml_dsa_65: None,
-                    pqc_key_id: None,
-                    run_kind: None,
-                };
-                let payload = canonical_payload_value(&trace);
-                let canonical = PythonJsonDumpsCanonicalizer
-                    .canonicalize_value(&payload)
-                    .unwrap();
-                trace.signature = B64.encode(agent_sk.sign(&canonical).to_bytes());
-                let trace_json = serde_json::to_value(&trace).unwrap();
-                let envelope = serde_json::json!({
-                    "events": [{
-                        "event_type": "complete_trace",
-                        "trace_level": "generic",
-                        "trace": trace_json,
-                    }],
-                    "batch_timestamp": "2026-04-30T15:00:00+00:00",
-                    "consent_timestamp": "2025-01-01T00:00:00Z",
-                    "trace_level": "generic",
-                    "trace_schema_version": "2.7.0",
-                });
-                let bytes = envelope.to_string().into_bytes();
-
-                let engine = Engine::with_signer(test_signer(), &dsn)
-                    .await
-                    .expect("construct postgres engine");
-
-                // Agent pubkey intentionally NOT seeded — Full mode would
-                // fail UnknownKey.
-                let summary = engine
-                    .receive_and_persist_pre_verified(&bytes, &NullScrubber)
-                    .await
-                    .expect("pre-verified ingest persists without a registered key");
-                assert_eq!(summary.trace_events_inserted, 1);
-                assert_eq!(summary.signatures_verified, 0);
-
-                let pg = engine.postgres_backend().expect("postgres backend");
-                let rows = pg
-                    .fetch_trace_events_page(0, 1000, Some(&trace.agent_id_hash))
-                    .await
-                    .expect("fetch rows");
-                let mine: Vec<_> = rows
-                    .iter()
-                    .filter(|(_, r)| r.trace_id == trace_id)
-                    .collect();
-                assert_eq!(mine.len(), 1, "the one component we ingested");
-                assert!(
-                    mine[0].1.signature_verified,
-                    "the trace is authentic — signature_verified stays true"
-                );
-                assert_eq!(
-                    mine[0].1.verification_source,
-                    crate::store::VerificationSource::Edge,
-                    "skip-verify rows attribute authenticity to Edge"
-                );
-
-                // Control: Full mode rejects the unregistered key.
-                let err = engine
-                    .receive_and_persist(&bytes, &NullScrubber)
-                    .await
-                    .expect_err("Full mode must reject the unregistered key");
-                assert!(matches!(err, IngestError::Verify(_)), "got: {err:?}");
-            }),
-        )
-        .await
+    /// v62.0.0 (P7 CP2 rewrite) — Postgres parity for
+    /// `receive_and_persist_round_trips_signed_batch`: the edition-2 trace
+    /// wire (statement + trace_blob) admitted and projected on Postgres.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn receive_and_persist_round_trips_signed_batch_postgres() {
+        use crate::scrub::NullScrubber;
+        use uuid::Uuid;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let signer = test_signer();
+        let engine = Engine::with_signer(signer.clone(), &dsn)
+            .await
+            .expect("construct postgres engine");
+        engine
+            .register_self_federation_key(
+                crate::federation::types::identity_type::AGENT,
+                None,
+                None,
+            )
+            .await
+            .expect("register the agent key");
+        let trace_id = format!("trace-engine-89-pg-{}", Uuid::new_v4().simple());
+        let now = crate::host::clock::now();
+        let raw = p7_trace_json(
+            &trace_id,
+            "deadbeef",
+            now,
+            now + chrono::Duration::seconds(1),
+        );
+        let (event, _) = p7_row_event(&signer, &raw).await;
+        let summary = engine
+            .receive_and_persist(&p7_batch(vec![event]), &NullScrubber)
+            .await
+            .expect("receive_and_persist succeeds");
+        assert_eq!(summary.signatures_verified, 1);
+        let pg = engine.postgres_backend().expect("postgres backend");
+        assert_eq!(p7_events_of(pg.as_ref(), &trace_id).await.len(), 1);
     }
 
     // ── v2.12.0 (CIRISPersist#112) — Engine::sign_hybrid tests ───────
@@ -14070,10 +14140,7 @@ mod tests {
             .expect("I2685: the statement's signature verifies over the sig_structure");
 
         // (3) the earlier form, behind the switch.
-        let refused = crate::federation::edition2::door::with_earlier_form_doors_shut(
-            engine.sign_hybrid(message),
-        )
-        .await;
+        let refused = engine.sign_hybrid(message).await;
         assert!(
             matches!(refused, Err(SignError::EarlierFormShut)),
             "I2685: sign_hybrid is refused once the doors are shut: {refused:?}"
@@ -14211,9 +14278,9 @@ mod tests {
             canonical_bytes: canonical.to_vec(),
             ed25519_sig: vec![1u8; 64],
             ml_dsa_65_sig: vec![2u8; 3309],
-            // v62 (E3b r3): the detector key is held under its identity-ref
-            // (`register_hybrid_key_as` lands `kid(seed)`), so the row names it so.
-            signing_key_id: crate::federation::edition2::fixture_switch::kid("test-detector"),
+            // v62.0.0 (P8-fix11) — the conferred edition-2 detector
+            // (`detection_row::test_support`).
+            signing_key_id: crate::derived::detection_row::test_support::detector(),
             ts,
         }
     }
@@ -14301,28 +14368,23 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn get_detection_events_facade_dispatches_to_backend_sqlite() {
-        use crate::derived::{DerivedSchema, EventFilter};
+        use crate::derived::EventFilter;
 
         let signer = test_signer();
         let engine = Engine::with_signer(signer, "sqlite::memory:")
             .await
             .expect("construct engine");
         let sq = engine.sqlite_backend().expect("sqlite present");
-        // v57.0.0 (#988 item 3) — a detection row's attester is a held
-        // lenscore_detector key.
-        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
-            &**sq,
-            "test-detector",
-            "test-detector",
-            crate::federation::types::identity_type::LENSCORE_DETECTOR,
-        )
-        .await;
+        // v62.0.0 (P8-fix11) — a detection is its conferred detector's own
+        // edition-2 statement: this node accepts a root that confers
+        // `infra:detect` on the test detector.
+        crate::derived::detection_row::test_support::confer(&**sq).await;
 
         let base_ts = chrono::Utc::now() - chrono::Duration::minutes(10);
         let ev_a = de_event_fixture("tr-A", b"canon-A", base_ts);
         let ev_b = de_event_fixture("tr-B", b"canon-B", base_ts + chrono::Duration::minutes(1));
-        sq.put_detection_event(ev_a.clone()).await.unwrap();
-        sq.put_detection_event(ev_b.clone()).await.unwrap();
+        crate::derived::detection_row::test_support::state(&**sq, &ev_a).await;
+        crate::derived::detection_row::test_support::state(&**sq, &ev_b).await;
 
         // Empty filter → both rows.
         let all = engine
@@ -14500,27 +14562,22 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn subscribe_detection_events_yields_new_events_only_sqlite() {
-        use crate::derived::{DerivedSchema, EventFilter};
+        use crate::derived::EventFilter;
 
         let signer = test_signer();
         let engine = Engine::with_signer(signer, "sqlite::memory:")
             .await
             .expect("construct engine");
         let sq = engine.sqlite_backend().expect("sqlite present");
-        // v57.0.0 (#988 item 3) — a detection row's attester is a held
-        // lenscore_detector key.
-        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
-            &**sq,
-            "test-detector",
-            "test-detector",
-            crate::federation::types::identity_type::LENSCORE_DETECTOR,
-        )
-        .await;
+        // v62.0.0 (P8-fix11) — a detection is its conferred detector's own
+        // edition-2 statement: this node accepts a root that confers
+        // `infra:detect` on the test detector.
+        crate::derived::detection_row::test_support::confer(&**sq).await;
 
         // Seed a row BEFORE subscribing → must NOT be yielded.
         let before_ts = chrono::Utc::now() - chrono::Duration::seconds(10);
         let pre_ev = de_event_fixture("tr-PRE", b"canon-PRE", before_ts);
-        sq.put_detection_event(pre_ev.clone()).await.unwrap();
+        crate::derived::detection_row::test_support::state(&**sq, &pre_ev).await;
 
         // Subscribe; let the cursor latch on Utc::now().
         let mut stream = Box::pin(engine.subscribe_detection_events(EventFilter::default()));
@@ -14537,7 +14594,7 @@ mod tests {
         // with or without a delay. Removed rather than re-timed.
         let new_ts = chrono::Utc::now();
         let new_ev = de_event_fixture("tr-NEW", b"canon-NEW", new_ts);
-        sq.put_detection_event(new_ev.clone()).await.unwrap();
+        crate::derived::detection_row::test_support::state(&**sq, &new_ev).await;
 
         // The FIRST item the subscription produces is the assertion: if the
         // subscribe-time cursor did not latch, the pre-subscribe row (ts 10 s
@@ -14668,22 +14725,17 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn subscribe_detection_events_filter_scopes_yielded_rows_sqlite() {
-        use crate::derived::{DerivedSchema, EventFilter};
+        use crate::derived::EventFilter;
 
         let signer = test_signer();
         let engine = Engine::with_signer(signer, "sqlite::memory:")
             .await
             .expect("construct engine");
         let sq = engine.sqlite_backend().expect("sqlite present");
-        // v57.0.0 (#988 item 3) — a detection row's attester is a held
-        // lenscore_detector key.
-        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
-            &**sq,
-            "test-detector",
-            "test-detector",
-            crate::federation::types::identity_type::LENSCORE_DETECTOR,
-        )
-        .await;
+        // v62.0.0 (P8-fix11) — a detection is its conferred detector's own
+        // edition-2 statement: this node accepts a root that confers
+        // `infra:detect` on the test detector.
+        crate::derived::detection_row::test_support::confer(&**sq).await;
 
         let mut stream = Box::pin(engine.subscribe_detection_events(EventFilter {
             trace_id: Some("tr-MATCH".to_owned()),
@@ -14705,9 +14757,9 @@ mod tests {
             b"canon-SENTINEL",
             now + chrono::Duration::milliseconds(2),
         );
-        sq.put_detection_event(matching.clone()).await.unwrap();
-        sq.put_detection_event(nonmatching.clone()).await.unwrap();
-        sq.put_detection_event(sentinel.clone()).await.unwrap();
+        crate::derived::detection_row::test_support::state(&**sq, &matching).await;
+        crate::derived::detection_row::test_support::state(&**sq, &nonmatching).await;
+        crate::derived::detection_row::test_support::state(&**sq, &sentinel).await;
 
         // Drain until the sentinel. Every row that arrives before it must be a
         // `tr-MATCH` row — a `tr-OTHER` here is the filter leaking.
@@ -14749,7 +14801,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn get_detection_events_facade_dispatches_to_backend_postgres() {
-        use crate::derived::{DerivedSchema, EventFilter};
+        use crate::derived::EventFilter;
 
         let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -14760,14 +14812,10 @@ mod tests {
             .await
             .expect("construct PG engine");
         let pg = engine.postgres_backend().expect("pg backend");
-        // v57.0.0 (#988 item 3) — a detection row's attester is a held
-        // lenscore_detector key.
-        crate::federation::hard_case::test_support::hold_key_as(
-            &**pg,
-            "test-detector",
-            crate::federation::types::identity_type::LENSCORE_DETECTOR,
-        )
-        .await;
+        // v62.0.0 (P8-fix11) — a detection is its conferred detector's own
+        // edition-2 statement: this node accepts a root that confers
+        // `infra:detect` on the test detector.
+        crate::derived::detection_row::test_support::confer(&**pg).await;
 
         // Use a unique trace_id per run so concurrent runs don't share rows.
         let trace_a = format!("tr-A-{}", uuid::Uuid::new_v4().simple());
@@ -14775,8 +14823,8 @@ mod tests {
         let base_ts = chrono::Utc::now() - chrono::Duration::minutes(10);
         let ev_a = de_event_fixture(&trace_a, b"canon-A", base_ts);
         let ev_b = de_event_fixture(&trace_b, b"canon-B", base_ts + chrono::Duration::minutes(1));
-        pg.put_detection_event(ev_a.clone()).await.unwrap();
-        pg.put_detection_event(ev_b.clone()).await.unwrap();
+        crate::derived::detection_row::test_support::state(&**pg, &ev_a).await;
+        crate::derived::detection_row::test_support::state(&**pg, &ev_b).await;
 
         let only_b = engine
             .get_detection_events(EventFilter {
@@ -14889,7 +14937,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn subscribe_detection_events_yields_new_events_only_postgres() {
-        use crate::derived::{DerivedSchema, EventFilter};
+        use crate::derived::EventFilter;
 
         let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -14900,14 +14948,10 @@ mod tests {
             .await
             .expect("construct PG engine");
         let pg = engine.postgres_backend().expect("pg backend");
-        // v57.0.0 (#988 item 3) — a detection row's attester is a held
-        // lenscore_detector key.
-        crate::federation::hard_case::test_support::hold_key_as(
-            &**pg,
-            "test-detector",
-            crate::federation::types::identity_type::LENSCORE_DETECTOR,
-        )
-        .await;
+        // v62.0.0 (P8-fix11) — a detection is its conferred detector's own
+        // edition-2 statement: this node accepts a root that confers
+        // `infra:detect` on the test detector.
+        crate::derived::detection_row::test_support::confer(&**pg).await;
 
         // v31.0.0 (CIRISPersist#658) — ONE trace_id for both rows. The
         // per-run uuid keeps this test isolated from concurrent PG runs, but
@@ -14922,7 +14966,7 @@ mod tests {
         // Seed a row BEFORE subscribing.
         let before_ts = chrono::Utc::now() - chrono::Duration::seconds(10);
         let pre_ev = de_event_fixture(&trace, b"canon-PRE", before_ts);
-        pg.put_detection_event(pre_ev.clone()).await.unwrap();
+        crate::derived::detection_row::test_support::state(&**pg, &pre_ev).await;
 
         // Subscribe with a trace_id filter to isolate from concurrent runs.
         let mut stream = Box::pin(engine.subscribe_detection_events(EventFilter {
@@ -14935,7 +14979,7 @@ mod tests {
         // `subscribe_detection_events`, and `EventFilter.since` is inclusive.
         let new_ts = chrono::Utc::now();
         let new_ev = de_event_fixture(&trace, b"canon-NEW", new_ts);
-        pg.put_detection_event(new_ev.clone()).await.unwrap();
+        crate::derived::detection_row::test_support::state(&**pg, &new_ev).await;
 
         let yielded = next_detection_event(&mut stream)
             .await
@@ -15006,7 +15050,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn subscribe_detection_events_filter_scopes_yielded_rows_postgres() {
-        use crate::derived::{DerivedSchema, EventFilter};
+        use crate::derived::EventFilter;
 
         let Some(dsn) = crate::test_pg::dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -15017,14 +15061,10 @@ mod tests {
             .await
             .expect("construct PG engine");
         let pg = engine.postgres_backend().expect("pg backend");
-        // v57.0.0 (#988 item 3) — a detection row's attester is a held
-        // lenscore_detector key.
-        crate::federation::hard_case::test_support::hold_key_as(
-            &**pg,
-            "test-detector",
-            crate::federation::types::identity_type::LENSCORE_DETECTOR,
-        )
-        .await;
+        // v62.0.0 (P8-fix11) — a detection is its conferred detector's own
+        // edition-2 statement: this node accepts a root that confers
+        // `infra:detect` on the test detector.
+        crate::derived::detection_row::test_support::confer(&**pg).await;
 
         // Per-run uuids so concurrent PG runs cannot cross-contaminate.
         let want = format!("tr-MATCH-{}", uuid::Uuid::new_v4().simple());
@@ -15050,9 +15090,9 @@ mod tests {
             b"canon-SENTINEL",
             now + chrono::Duration::milliseconds(2),
         );
-        pg.put_detection_event(matching.clone()).await.unwrap();
-        pg.put_detection_event(nonmatching.clone()).await.unwrap();
-        pg.put_detection_event(sentinel.clone()).await.unwrap();
+        crate::derived::detection_row::test_support::state(&**pg, &matching).await;
+        crate::derived::detection_row::test_support::state(&**pg, &nonmatching).await;
+        crate::derived::detection_row::test_support::state(&**pg, &sentinel).await;
 
         let mut seen = Vec::new();
         loop {
@@ -15812,8 +15852,8 @@ mod tests {
         sq.put_live(sweeper_test_key(peer_key))
             .await
             .expect("seed peer key");
-        // v62 (E3): the holder is named by the peer key's identity-ref.
-        let peer = crate::federation::edition2::fixture_switch::kid(peer_key);
+        // v62 (E3): the holder is the peer key's identity-ref; v62.0.0
+        // (T2-fix11) its claim statement is signed by the peer's seed.
         let mut shas = Vec::with_capacity(n);
         for i in 0..n {
             // Distinct payloads from the local seed (offset the fill byte).
@@ -15824,20 +15864,20 @@ mod tests {
                 out.copy_from_slice(&Sha256::digest(&bytes));
                 out
             };
-            sq.put_blob(&sha, BlobBody::Inline(bytes), None, {
-                let now = chrono::Utc::now();
-                crate::federation::blobs::sealed_put_blob_attestation(
-                    &sha,
-                    &peer,
-                    &peer,
-                    &uuid::Uuid::new_v4().to_string(),
-                    now,
-                    now,
-                    1024,
-                )
-            })
-            .await
-            .expect("put_blob proxy");
+            // v62.0.0 (T2-fix11; CC 6.1.3) — the peer's holding claim is its
+            // composite edition-2 `custody` statement (the earlier
+            // `PutBlobAttestation` is deleted).
+            let claim = crate::federation::edition2::fixture_switch::custody_statement(
+                peer_key,
+                &sha,
+                Some(1024),
+                crate::federation::types::cohort_scope::FEDERATION,
+                None,
+                crate::federation::edition2::fixture_switch::ms(chrono::Utc::now()),
+            );
+            sq.put_blob(&sha, BlobBody::Inline(bytes), None, &claim)
+                .await
+                .expect("put_blob proxy");
             shas.push(sha);
         }
         shas
@@ -16881,6 +16921,30 @@ mod tests {
     // the tests here drive the ENGINE's one policy — who signs — and the
     // consent sweep over both verbs.
 
+    /// v62.0.0 (P7-fix6; CC 3.1.5, key_roles R4) — [`engine_with_registered_node`]
+    /// whose key is registered `agent`: the Agent's Engine, whose own key IS
+    /// its agent key (CIRISAgent: the bootstrap key, never re-typed, CC
+    /// 3.4.7.3 Clause A). A `trace:complete:v1` row is signed by the agent's
+    /// key and nothing else signs it, so every witness that states a trace
+    /// row (and widens it, a restatement under the same key) runs here.
+    #[cfg(feature = "sqlite")]
+    async fn engine_with_registered_agent(label: &str) -> (Engine, Arc<SqliteBackend>, String) {
+        let signer = crate::federation::tier_ingest::test_support::local_signer(label);
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let agent = engine
+            .register_self_federation_key(
+                crate::federation::types::identity_type::AGENT,
+                None,
+                None,
+            )
+            .await
+            .expect("register self");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        (engine, sq, agent)
+    }
+
     /// An engine over an in-memory sqlite whose composed signer is REGISTERED
     /// with its real pubkeys (the crossing verifies every signature it admits).
     #[cfg(feature = "sqlite")]
@@ -17422,14 +17486,16 @@ mod tests {
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::{attestation_tier, cohort_scope, identity_type};
         use crate::federation::{Community, CommunityMember, FederationDirectory};
-        let (engine, sq, node) = engine_with_registered_node("node-39f").await;
+        let (engine, sq, node) = engine_with_registered_agent("node-39f").await;
         assert_eq!(
             node,
             e2::kid("node-39f"),
             "fixture: the engine's key is `signing_key(\"node-39f\")`"
         );
         let actor = ts::local_signer("actor-39f");
-        let actor_id = e2::put_key_for_signer(&*sq, &actor, &[identity_type::NODE]).await;
+        // P7-fix6 — another AGENT (a trace is signed by an agent's key): a
+        // row this Engine did not author, so its widening waits on its actor.
+        let actor_id = e2::put_key_for_signer(&*sq, &actor, &[identity_type::AGENT]).await;
         // A real affiliation has a human in it: AV-9 refuses to federate a
         // reference to a room with no steward-bound authority, and a USER key
         // is steward-bound.
@@ -17550,7 +17616,7 @@ mod tests {
     #[tokio::test]
     async fn consent_sweep_awaits_a_roster_it_does_not_hold_797() {
         use crate::federation::edition2::fixture_switch as e2;
-        let (engine, sq, node) = engine_with_registered_node("node-797").await;
+        let (engine, sq, node) = engine_with_registered_agent("node-797").await;
         let signer = engine
             .composite_signer("e3b sweep witness")
             .expect("a composite signer");
@@ -17582,7 +17648,7 @@ mod tests {
         use crate::federation::edition2::fixture_switch as e2;
         use crate::federation::types::cohort_scope;
         use crate::federation::FederationDirectory;
-        let (engine, sq, node) = engine_with_registered_node("node-39g").await;
+        let (engine, sq, node) = engine_with_registered_agent("node-39g").await;
         let signer = engine
             .composite_signer("e3b sweep witness")
             .expect("a composite signer");
@@ -17641,7 +17707,7 @@ mod tests {
         use crate::federation::edition2::fixture_switch as e2;
         use crate::federation::types::cohort_scope;
         use crate::federation::FederationDirectory;
-        let (engine, sq, node) = engine_with_registered_node("node-39h").await;
+        let (engine, sq, node) = engine_with_registered_agent("node-39h").await;
         // A trace envelope's REQUIRED members (`agent_id_hash`, `trace_id`,
         // `trace`) are what the trace-dimension gate asks for and cannot be
         // stripped; a restriction strips an OPTIONAL member.
@@ -17885,7 +17951,7 @@ mod tests {
         use crate::federation::types::{attestation_tier, cohort_scope};
         use crate::federation::FederationDirectory;
 
-        let (engine, sq, node) = engine_with_registered_node("node-509a").await;
+        let (engine, sq, node) = engine_with_registered_agent("node-509a").await;
         let signer = engine
             .composite_signer("e3b sweep witness")
             .expect("a composite signer");
@@ -17950,7 +18016,7 @@ mod tests {
         // v62 (E3b r3; P8): an edition-2 LOCAL row (it crosses in place on its
         // own statement); the earlier unsigned `attestation_insert_local` row
         // has no in-place crossing.
-        let (engine, sq, node) = engine_with_registered_node("node-509v").await;
+        let (engine, sq, node) = engine_with_registered_agent("node-509v").await;
         let signer = engine
             .composite_signer("e3b visibility witness")
             .expect("a composite signer");
@@ -18003,7 +18069,7 @@ mod tests {
         use crate::federation::edition2::fixture_switch as e2;
         use crate::federation::FederationDirectory;
 
-        let (engine, sq, node) = engine_with_registered_node("node-509b").await;
+        let (engine, sq, node) = engine_with_registered_agent("node-509b").await;
         let signer = engine
             .composite_signer("e3b sweep witness")
             .expect("a composite signer");
@@ -18033,7 +18099,7 @@ mod tests {
         use crate::federation::edition2::fixture_switch as e2;
         use crate::federation::FederationDirectory;
 
-        let (engine, sq, node) = engine_with_registered_node("node-509c").await;
+        let (engine, sq, node) = engine_with_registered_agent("node-509c").await;
         let signer = engine
             .composite_signer("e3b sweep witness")
             .expect("a composite signer");
@@ -18076,7 +18142,7 @@ mod tests {
     async fn consent_sweep_no_grants_noop_509() {
         use crate::federation::FederationDirectory;
 
-        let (engine, sq, node) = engine_with_registered_node("node-509d").await;
+        let (engine, sq, node) = engine_with_registered_agent("node-509d").await;
         let signer = engine
             .composite_signer("e3b sweep witness")
             .expect("a composite signer");
@@ -23111,107 +23177,6 @@ mod tests {
             .serve_blob_range_to_peer(&local_sha, 0, 0, "some-peer")
             .await
             .expect("I90: a local blob serves by range at stop");
-    }
-
-    /// **I90, quarantine leg — a withheld local holder refuses the ranged
-    /// serve as it refuses the whole one.** This is the leak the #821 thread
-    /// named as worse than the pressure miss: a hoisted pressure-only
-    /// predicate would let a quarantined blob out one chunk at a time with
-    /// every read green.
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn i90_ranged_serve_honours_quarantine_sqlite() {
-        Box::pin(
-            crate::federation::edition2::fixture_switch::with_earlier_form_async(async move {
-                use crate::federation::BlobError;
-                let cfg = crate::federation::ReplicationConfig::default();
-                let (engine, local_shas) = sweeper_seed_blobs(cfg, 1).await;
-                let sha = local_shas[0];
-                let dir = engine.federation_directory();
-                let holders = engine.list_local_holders(&sha).await.expect("holders");
-                let holder = holders
-                    .first()
-                    .cloned()
-                    .expect("I90: the fixture blob has a holder");
-
-                // Serves before the marker — both doors.
-                engine
-                    .serve_blob_to_peer(&sha, "some-peer")
-                    .await
-                    .expect("I90: serves before withholding");
-                engine
-                    .serve_blob_range_to_peer(&sha, 0, 0, "some-peer")
-                    .await
-                    .expect("I90: serves by range before withholding");
-
-                // Withhold the holder: a FEDERATION-tier marker on the quarantine
-                // dimension, filed against the subject, which is what `is_withheld`
-                // folds (`list_attestations_for` reads `tier = 'federation'` only —
-                // a local-tier marker withholds nothing, by design). Seeded as a
-                // stored row, the way the login tests seed keys: I90 asks whether the
-                // ranged door CONSULTS the fold as the whole door does; how a marker
-                // is admitted (slash authority via a named moderator's delegation) is
-                // the quarantine gate's own witness, not this one's.
-                {
-                    let sq = engine.sqlite_backend().expect("sqlite");
-                    let conn = sq.conn_handle();
-                    let envelope = crate::federation::quarantine::withhold_envelope(
-                        &holder,
-                        "comm-i90",
-                        "att-deleg-i90",
-                        "spam",
-                    )
-                    .to_string();
-                    let holder = holder.clone();
-                    (move || {
-                        let conn = conn.lock();
-                        conn.execute(
-                            "INSERT INTO federation_attestations (\
-                        attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-                        weight, asserted_at, expires_at, attestation_envelope, \
-                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, tier, \
-                        cohort_scope, admitted_at\
-                     ) VALUES ('i90-withhold', ?1, ?1, 'scores', NULL, '2026-01-01T00:00:00Z', \
-                        NULL, ?2, x'00', 'c2ln', NULL, ?1, '2026-01-01T00:00:00Z', NULL, '0', \
-                        'federation', 'federation', '2026-01-01T00:00:00Z')",
-                            rusqlite::params![holder, envelope],
-                        )
-                        .expect("I90: the marker row is stored");
-                    })();
-                }
-                assert!(
-                    crate::federation::quarantine::is_withheld(
-                        dir.as_ref(),
-                        &holder,
-                        chrono::Utc::now()
-                    )
-                    .await
-                    .expect("fold"),
-                    "I90 precondition: the holder IS withheld after the marker"
-                );
-
-                // Whole-blob refuses — precondition, again so the next line is not vacuous.
-                let whole = engine
-                    .serve_blob_to_peer(&sha, "some-peer")
-                    .await
-                    .expect_err("I90 precondition: whole-blob serve refused while withheld");
-                assert!(
-                    matches!(whole, BlobError::QuarantineWithheld { .. }),
-                    "{whole:?}"
-                );
-                // Ranged refuses the SAME way.
-                let ranged = engine
-                    .serve_blob_range_to_peer(&sha, 0, 0, "some-peer")
-                    .await
-                    .expect_err("I90: the ranged serve is refused while withheld");
-                match ranged {
-                    BlobError::QuarantineWithheld { key_id } => assert_eq!(key_id, holder),
-                    other => panic!("I90: expected QuarantineWithheld, got {other:?}"),
-                }
-            }),
-        )
-        .await
     }
 }
 

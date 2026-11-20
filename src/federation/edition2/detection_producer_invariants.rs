@@ -23,9 +23,19 @@
 //! - **I3536** — a key that only DECLARES `lenscore_detector` is refused
 //!   (`ReservedPrefixEmitterMismatch`): standing is never a self-declared
 //!   type.
-//! - **I3537** — the earlier-form door (`put_detection_event`, a detection
-//!   hybrid-signed over its canonical bytes) refuses `earlier_form_object`
-//!   once the doors are shut.
+//! - **I3523** (v62 P8-fix10) — **the drafted pen, Lens's path**: the
+//!   detection drafted (`detection_row::draft_detection`, the parts a host
+//!   gets from `Engine.detection_draft`), its `sig_structure` signed by the
+//!   detector's composite key, the statement assembled (`Draft::assemble`,
+//!   what `Engine.sign_draft` returns) and put through the statement door:
+//!   the same row id as the locally produced statement; on a node holding
+//!   the `infra:detect` conferral it LANDS and projects; on a node without
+//!   it the row is HELD (`Pending`), reason `reserved_prefix_emitter_mismatch`,
+//!   and nothing projects. A draft whose `sig_structure` is signed by
+//!   another key is refused by the door.
+//! - **I3537** — DELETED in v62.0.0 (P8-fix11): it witnessed that the
+//!   earlier-form door (`put_detection_event`) refused once the doors were
+//!   shut; the door itself is deleted (ruling 4).
 
 use super::fixture_switch as e2;
 use super::ingest::{put_statement, INGEST_TIER};
@@ -268,39 +278,138 @@ where
         );
     }
 
-    // I3536 — a declared type confers nothing.
+    // I3536 — a declared type confers nothing. v62.0.0 (P8-fix10) — in
+    // edition 2 the type is not consulted (the rule's `conferred_only`) and a
+    // missing conferral is OTHER rows, a fold condition: the row is HELD
+    // `reserved_prefix_emitter_mismatch` (GC1), never seated.
     let rogue = "p8-rogue-detector";
     e2::put_key(a, rogue, &["lenscore_detector"]).await;
     let rogue_ev = event(&e2::kid(rogue));
-    let e = put_statement(a, &sign(rogue, &rogue_ev), None, INGEST_TIER)
+    let out = put_statement(a, &sign(rogue, &rogue_ev), None, INGEST_TIER)
         .await
-        .expect_err("I3536: a self-declared detector is refused");
-    assert!(
-        matches!(
-            e,
-            crate::federation::Error::ReservedPrefixEmitterMismatch { .. }
-        ),
-        "I3536: {e:?}"
+        .expect("I3536: a self-declared detector's detection is held, not an error");
+    let super::ingest::StatementOutcome::Pending { row_id, .. } = out else {
+        panic!("I3536: held, never seated: {out:?}");
+    };
+    assert_eq!(
+        super::fold::why_held(a, &row_id)
+            .await
+            .unwrap()
+            .map(|h| h.reason)
+            .as_deref(),
+        Some(super::fold::reason::gc1::RESERVED_PREFIX_EMITTER_MISMATCH),
+        "I3536: held for the missing infra:detect conferral"
     );
     assert!(
         projected(a, &rogue_ev).await.is_none(),
         "I3536: nothing projected"
     );
+}
 
-    // I3537 — the earlier-form door, shut.
-    let mut earlier = event(&e2::kid(det));
-    earlier.ed25519_sig = vec![1u8; 64];
-    earlier.ml_dsa_65_sig = vec![2u8; 3309];
-    let refused =
-        super::door::with_earlier_form_doors_shut(a.put_detection_event(earlier.clone())).await;
+/// I3523 — the drafted pen: `conferred` holds the `infra:detect`
+/// conferral, `bare` does not (both have this node's key set).
+async fn i3523_the_drafted_pen<B>(conferred: &B, bare: &B)
+where
+    B: FederationDirectory + DerivedSchema + Sync,
+{
+    Box::pin(super::standing_invariants::conferred_detector_body(
+        conferred,
+    ))
+    .await;
+    let det = "p4-detector";
+    e2::put_key(bare, det, &[crate::federation::types::identity_type::AGENT]).await;
+    let ev = event(&e2::kid(det));
+    let draft = crate::derived::detection_row::draft_detection(&ev, None)
+        .expect("I3523: the detection drafts");
+    assert_eq!(
+        draft.sig_structure,
+        ciris_verify_core::edition2::sig_structure(&draft.protected, &draft.payload),
+        "I3523: the Sig_structure of the drafted parts"
+    );
+    let signer = crate::federation::tier_ingest::test_support::local_signer(det);
+    let sig = signer
+        .sign_composite(&draft.sig_structure)
+        .await
+        .expect("I3523: the detector's pen signs");
+    let st = draft.assemble(sig);
+    let rid = super::names::RowId::of_statement(&st).expect("a row statement");
+    assert_eq!(
+        Some(rid),
+        super::names::RowId::of_statement(&sign(det, &ev)),
+        "I3523: the drafted statement names the same row as the produced one"
+    );
+
+    // With the conferral: it lands and projects.
+    let out = put_statement(conferred, &st, None, INGEST_TIER)
+        .await
+        .unwrap_or_else(|e| panic!("I3523: the conferred node admits it: {e:?}"));
     assert!(
-        matches!(&refused, Err(e) if e.to_string().contains("earlier_form_object")),
-        "I3537: {refused:?}"
+        matches!(out, super::ingest::StatementOutcome::Row { .. }),
+        "I3523: landed: {out:?}"
     );
     assert!(
-        projected(a, &earlier).await.is_none(),
-        "I3537: nothing written"
+        projected(conferred, &ev).await.is_some(),
+        "I3523: projected on the conferred node"
     );
+
+    // Without it: held by reason, nothing projected.
+    let out = put_statement(bare, &st, None, INGEST_TIER)
+        .await
+        .expect("I3523: an unconferred detection is held, not an error");
+    let super::ingest::StatementOutcome::Pending { row_id, .. } = out else {
+        panic!("I3523: held without the conferral: {out:?}");
+    };
+    assert_eq!(row_id, rid, "I3523: the same row");
+    assert_eq!(
+        super::fold::why_held(bare, &rid)
+            .await
+            .unwrap()
+            .map(|h| h.reason)
+            .as_deref(),
+        Some(super::fold::reason::gc1::RESERVED_PREFIX_EMITTER_MISMATCH),
+        "I3523: held for the missing conferral"
+    );
+    assert!(
+        projected(bare, &ev).await.is_none(),
+        "I3523: nothing projected without the conferral"
+    );
+
+    // Another key's signature over the draft is refused by the door.
+    let other = crate::federation::tier_ingest::test_support::local_signer("p8-not-the-detector");
+    let forged = draft.assemble(
+        other
+            .sign_composite(&draft.sig_structure)
+            .await
+            .expect("another key signs"),
+    );
+    assert!(
+        put_statement(conferred, &forged, None, INGEST_TIER)
+            .await
+            .is_err(),
+        "I3523: a draft signed by another key is refused"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn i3523_the_drafted_pen_sqlite() {
+    let (a, b) = (sqlite().await, sqlite().await);
+    a.set_node_key_id(super::fixture_switch::kid("p4-node"));
+    b.set_node_key_id(super::fixture_switch::kid("p4-node"));
+    Box::pin(i3523_the_drafted_pen(&a, &b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn i3523_the_drafted_pen_postgres() {
+    let (Some(a), Some(b)) = (postgres().await, postgres().await) else {
+        eprintln!("i3523 postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+        return;
+    };
+    a.set_node_key_id(super::fixture_switch::kid("p4-node"));
+    b.set_node_key_id(super::fixture_switch::kid("p4-node"));
+    Box::pin(i3523_the_drafted_pen(&a, &b)).await;
+    eprintln!("i3523 postgres: RAN");
 }
 
 #[cfg(feature = "sqlite")]

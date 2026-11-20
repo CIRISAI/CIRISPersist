@@ -182,7 +182,7 @@ pub enum VerifyError {
 
     /// v61.1.0 (CIRISPersist#1233, CC 5.3.2.4.3.1) — a caller handed a
     /// public verify door ([`verify_hybrid`], [`verify_hybrid_via_directory`],
-    /// [`crate::verify::ed25519::verify_trace_hybrid`], the PyO3 doors, the
+    /// `verify_trace_hybrid` (deleted v62.0.0), the PyO3 doors, the
     /// capsule op) a policy other than [`HybridPolicy::Strict`]. Refused by
     /// [`require_strict_policy`] before any decode, lookup or crypto. The
     /// message leads with [`VERIFY_POLICY_VIOLATION`].
@@ -225,7 +225,7 @@ impl VerifyError {
 /// [`HybridPolicy::Strict`] with this token BEFORE any decode, lookup or
 /// crypto runs: the public Rust [`verify_hybrid`],
 /// [`verify_hybrid_via_directory`] and
-/// [`crate::verify::ed25519::verify_trace_hybrid`] (which calls
+/// `verify_trace_hybrid` (deleted v62.0.0) (which calls
 /// `verify_hybrid`), `Engine.verify_hybrid`,
 /// `Engine.verify_hybrid_via_directory` and the three `verify_signed_*`
 /// methods that route through it, and the directory capsule's

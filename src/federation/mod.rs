@@ -32,11 +32,6 @@
 //! and the registry-side `docs/FEDERATION_CLIENT.md` for the consumer
 //! complement.
 
-/// v61 (CIRISPersist#934, S4a) — the accord evidence doors, decided
-/// once: the proposal, participation and decision plans and the per-backend
-/// `AccordStore` executor.
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
-pub(crate) mod accord_admit;
 pub mod accord_carriage;
 pub mod accord_quorum;
 /// v53.0.0 (CC 4.2.6) — an accord holder's recovery under a pre-committed key.
@@ -203,8 +198,11 @@ mod retain_by_principals_invariants;
 pub mod consent_scope_invariants;
 // CIRISPersist#870 — I113/I113b/I114: a holder claim's wire-index entry moves with the row.
 pub mod crossing;
+// v62.0.0 (wave P7; I14) — the trace blob's floor: the one floor caller
+// beside the sealing cascades (see the module doc).
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod holder_claim_index_invariants;
+pub(crate) mod trace_blob_floor;
 // CIRISPersist#871 (`FSD/MEDIA_SOURCE.md`) — I115–I120: the media Source struct, size on the
 // claim, the rendition index.
 #[cfg(any(test, feature = "test-anchor"))]
@@ -344,10 +342,6 @@ pub mod delegation_cycle_invariants;
 /// carries a bounded term; an affiliation's `role_term` bounds its walks.
 #[cfg(test)]
 mod delegation_term_invariants;
-/// v56.0.0 (CIRISPersist#934 step 1, door 6) — the genesis re-bake purge
-/// door refuses, at the store, an id the bundle does not carry (I954).
-#[cfg(test)]
-pub(crate) mod genesis_purge_door_invariants;
 /// v60.0.0 (CIRISPersist#988 item 4) — I1178–I1182, goals as rows.
 #[cfg(test)]
 mod goal_invariants;
@@ -1045,11 +1039,10 @@ pub use blobs::{
     BlobRange, BlobStorage, ChunkKeyRef, ChunkManifest, ChunkRef, ChunkSlice, DekKeyState,
     EpochBinding, EvictActorReport, EvictBlobReport, ExternalRef, GrantWrap, GroupDekRef,
     ManifestChildRef, ManifestChildRow, ManifestRowSpec, MemberGrant, NestedManifest,
-    ParsedManifest, PutBlobAttestation, PutBlobScopedResult, RosterPartition, ScopeBlobSymbol,
-    StorageFloor, StreamChunkRef, StreamChunks, StreamClaim, StreamDekRecord, StreamHead,
-    StreamKeySlot, StreamKeyState, CHUNK_KEYS_STREAM_EPOCH, CHUNK_MANIFEST_VERSION,
-    CHUNK_MANIFEST_VERSION_NESTED, CHUNK_MANIFEST_VERSION_SEALED, CHUNK_MANIFEST_VERSION_STREAM,
-    DEFAULT_INLINE_BYTES_CAP,
+    ParsedManifest, PutBlobScopedResult, RosterPartition, ScopeBlobSymbol, StorageFloor,
+    StreamChunkRef, StreamChunks, StreamClaim, StreamDekRecord, StreamHead, StreamKeySlot,
+    StreamKeyState, CHUNK_KEYS_STREAM_EPOCH, CHUNK_MANIFEST_VERSION, CHUNK_MANIFEST_VERSION_NESTED,
+    CHUNK_MANIFEST_VERSION_SEALED, CHUNK_MANIFEST_VERSION_STREAM, DEFAULT_INLINE_BYTES_CAP,
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};
 pub use consent::consent_role_of;
@@ -1060,16 +1053,14 @@ pub use crossing::{
 };
 pub use freshness::{coalesce_touch_ts, TouchApplyOutcome};
 pub use goal::{
-    canonicalize_goal_text, DeliberationRef, Goal, GoalInput, GoalRehome, GoalScope, GoalsFilter,
-    LegacyGoal, M1Dimension, MetaGoalAlignment,
+    canonicalize_goal_text, DeliberationRef, Goal, GoalInput, GoalScope, GoalsFilter, M1Dimension,
+    MetaGoalAlignment,
 };
 pub use hard_case::{
     check_admin_action_attribution, AdminActionRefusal, ConsentPromotionOverdueRow, ConsentState,
     ConsentWatchReport, HardCaseEvent, HardCaseFilter,
 };
-pub use holding_claim::{
-    emit_holding_claim, holding_claim_row, sign_holding_claim, ClaimScope, HoldingClaimOutcome,
-};
+pub use holding_claim::{emit_holding_claim, holding_claim_row, ClaimScope, HoldingClaimOutcome};
 // v25.1.0 (CIRISPersist#570 ask 5) — the quarantine marker plane. Exported
 // beside the refusal taxonomies above; downstream keys on the `as_str` tokens.
 pub use quarantine::{
@@ -5682,92 +5673,6 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
-    /// v31.1.0 (CIRISPersist#665) — **the re-bake's replacement half**: remove
-    /// ONE baked genesis delegation row so
-    /// [`seed_delegation_plane`](genesis::seed_delegation_plane) can install the
-    /// current ceremony's version of it under the same id.
-    ///
-    /// # Why this is not [`purge_attestation_v31`]
-    ///
-    /// It cannot be. Two of the three genesis delegation rows are
-    /// `delegates_to`, which
-    /// [`migration::is_exclusion_bearing`](migration::is_exclusion_bearing)
-    /// classifies `ExclusionClass::Delegation`, so
-    /// [`migration::check_purge_admission`](migration::check_purge_admission)
-    /// refuses them — correctly, and that gate must not be weakened: deleting a
-    /// delegation edge on the general purge path is unrecoverable, which is the
-    /// whole of CIRISPersist#650.
-    ///
-    /// # What authorizes it instead
-    ///
-    /// A far narrower rule, re-asked inside every implementation (AV-9,
-    /// verify-before-mutation) via
-    /// [`genesis::check_genesis_rebake_purge_admission`]:
-    ///
-    /// > `attestation_id` MUST be one of the ids the COMPILED-IN bundle carries.
-    ///
-    /// The door therefore cannot address any row that this binary is not
-    /// holding a replacement for. Its worst-case misuse — deleting a genesis
-    /// row and never re-inserting — leaves the delegation plane `Absent`, which
-    /// BOOTS and which the next start re-seeds; it can never remove a
-    /// conferral this node cannot re-create from its own artifact. That bounded
-    /// blast radius is what makes bypassing the exclusion gate defensible here
-    /// and nowhere else.
-    ///
-    /// The re-insert deliberately does NOT live in this door: the caller
-    /// follows it with an ordinary [`put_attestation`](Self::put_attestation),
-    /// so the replacement row pays the full admission stack — canonical-at-rest,
-    /// the #660 reservation, `persist_row_hash`, the V106 subject projection —
-    /// exactly as a first-boot install does. A second write path for genesis
-    /// rows would be a second thing to keep in step with the first.
-    ///
-    /// # COMPARE-AND-DELETE, because the decision was made against an earlier read
-    ///
-    /// v31.1.0 (CIRISPersist#665 review) — `expected_persist_row_hash` is the
-    /// `persist_row_hash` of the row the caller CLASSIFIED, and the delete only
-    /// fires if the stored row still carries it. Deleting by id alone was a
-    /// rolling-deployment hazard and the sharpest kind: the replacement decision
-    /// is made from a `get_attestation` taken earlier, so when two engine
-    /// versions initialize one postgres database — which is simply what a fleet
-    /// upgrade looks like — a stale initializer could delete a NEWER ceremony
-    /// row that landed in between and install its own older baked one. That is
-    /// exactly the rollback
-    /// [`candidate_is_strictly_newer`](genesis::candidate_is_strictly_newer)
-    /// exists to refuse, performed by the one caller that had already decided it
-    /// was allowed to write.
-    ///
-    /// The window is only dangerous on THIS door. The non-destructive paths
-    /// close it for free: an `INSERT` that races a newer row fails on the
-    /// primary key and is reported as
-    /// [`Raced`](genesis::DelegationRowOutcome::Raced), so the newer row stands.
-    /// Only the delete could destroy something, so only the delete needs the
-    /// compare.
-    ///
-    /// **The failure direction is RECLASSIFY, NEVER REMOVE.** `Ok(false)` means
-    /// the corpus moved under the caller's decision, and the honest response is
-    /// to re-read and decide again rather than to force a write derived from a
-    /// state that no longer exists.
-    ///
-    /// Returns whether a row was actually removed — `false` both when the id is
-    /// absent and when it is present with a different `persist_row_hash`.
-    /// Default `Unsupported`; sqlite/postgres/memory override.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidArgument`] if `attestation_id` is not a baked genesis
-    /// delegation id; [`Error::Backend`] on a backend failure.
-    async fn purge_genesis_delegation_row_v31(
-        &self,
-        attestation_id: &str,
-        expected_persist_row_hash: &str,
-        authority: &genesis::bundle::GenesisPurgeAuthority<'_>,
-    ) -> Result<bool, Error> {
-        let _ = (attestation_id, expected_persist_row_hash, authority);
-        Err(Error::Unsupported {
-            method: "purge_genesis_delegation_row_v31",
-        })
-    }
-
     /// v3.6.0 (CIRISPersist#134, CEG 0.3 §8.1.10 Policy J / §11.5.3)
     /// — return the chain of `content_rating:*` attestations rooted
     /// at a `trusted_publisher` identity_type that vouches for
@@ -10177,20 +10082,6 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
-    /// v60.0.0 — the pre-V204 `goals` rows no row backs (`attestation_id`
-    /// NULL), for [`Engine::rehome_legacy_goals`](crate::Engine::rehome_legacy_goals).
-    /// A store that never held a typed goal has none.
-    async fn legacy_goals(&self) -> Result<Vec<LegacyGoal>, Error> {
-        Ok(Vec::new())
-    }
-
-    /// v60.0.0 — remove the pre-V204 `goals` row `goal_id` (only a row with no
-    /// `attestation_id`; a projection row is never touched).
-    async fn delete_legacy_goal(&self, goal_id: &str) -> Result<(), Error> {
-        let _ = goal_id;
-        Ok(())
-    }
-
     // ── Peer-mutation surface (v3.1.0, CIRISPersist#117) ───────────
     //
     // Unblocks CIRISEdge v0.13.0's `PEER_MUTATION_FOLLOWUP` stubs in
@@ -11455,32 +11346,12 @@ pub trait FederationDirectory: Send + Sync {
         corpus_kind: &str,
     ) -> Result<u64, Error>;
 
-    // ── #302 (FSD-004) accord live-quorum storage ──────────────────────
+    // ── #302 (FSD-004) accord live-quorum records ──────────────────────
     //
-    // The durable substrate for the constitutional kill-switch's
-    // decimation-recovery live quorum (CIRISVerify#150 stateless machinery;
-    // CIRISServer#122 runtime writes through). Persist STORES the verify-core
-    // objects verbatim + dedups + verifies participations + holds nonce/halt
-    // state; the SERVER runs the tally. Recovery (H7) is absent (CIRISAccord#4
-    // gate). See [`crate::federation::accord_quorum`].
-
-    /// #302 — admit an `accord_proposal`. The digest is
-    /// derived via verify-core ([`AccordProposal::digest`](ciris_verify_core::accord_live_quorum::AccordProposal::digest));
-    /// the object is stored verbatim. Idempotent on a byte-identical re-PUT.
-    ///
-    /// v54.1.0 (CIRISPersist#1047, CIRISConstitution#146, verify 20) — the
-    /// `nonce` is minted by the PROPOSER, never issued by a server ("a server
-    /// is part of what a halt may need to stop, and no accord act depends on
-    /// one", CC 4.2.6). Verify checks its form; single use is this store's
-    /// dedup: a nonce names ONE proposal per family, so a different proposal
-    /// carrying a nonce already used in its family is [`Error::Conflict`]
-    /// and is not stored. The pre-v54.1 issued-nonce gate (M4) and its
-    /// `issue_accord_nonce` / `accord_nonce_issued` pair are gone.
-    async fn put_accord_proposal(
-        &self,
-        proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
-        authority_signature: Option<serde_json::Value>,
-    ) -> Result<(), Error>;
+    // v62.0.0 (JSON-cut slice F; CC rc20): read-only. The rc20 edition has
+    // no accord proposal, participation or decision object (a roster change
+    // is a later genesis bundle), so their write doors are gone and nothing
+    // writes these tables; the reads below serve what an upgraded store holds.
 
     /// #302 — the stored proposal for `proposal_digest`, or `None`.
     async fn get_accord_proposal(
@@ -11539,37 +11410,12 @@ pub trait FederationDirectory: Send + Sync {
             .collect())
     }
 
-    /// #302 — admit an `accord_participation`. Verify-before-mutation: the
-    /// proposal MUST exist, the member MUST be in `standing_roster` (C3), and
-    /// [`AccordParticipation::verify`](ciris_verify_core::accord_live_quorum::AccordParticipation::verify)
-    /// MUST pass (fail-closed). M6 durable dedup by PINNED pubkey: a second
-    /// participation by the same pinned key for the same proposal is an
-    /// idempotent no-op if byte-identical, else [`Error::Conflict`]
-    /// (one vote per holder per proposal). C2: persist stamps the
-    /// authoritative `server_arrival_at`.
-    async fn put_accord_participation(
-        &self,
-        participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
-        standing_roster: &[ciris_verify_core::threshold::ThresholdMember],
-    ) -> Result<(), Error>;
-
     /// #302 — all stored participations for a proposal (the server's tally
     /// input). Deduped by pinned pubkey at write time (M6).
     async fn list_accord_participations(
         &self,
         proposal_digest: &str,
     ) -> Result<Vec<accord_quorum::StoredParticipation>, Error>;
-
-    /// #302 — record the server's frozen-L decision (M2). IMMUTABLE: a
-    /// differing re-PUT for the same proposal is [`Error::Conflict`]; an
-    /// identical one is an idempotent no-op.
-    ///
-    /// v53.0.0 (CC 4.2.6 rc7, CIRISConstitution#139) — the steward-signature
-    /// argument is gone with the regional-steward backstop (H6) it carried.
-    async fn put_accord_decision(
-        &self,
-        decision: ciris_verify_core::accord_live_quorum::AccordDecision,
-    ) -> Result<(), Error>;
 
     /// #302 — the stored decision for `proposal_digest`, or `None`.
     async fn get_accord_decision(
@@ -12363,10 +12209,11 @@ pub enum Error {
     /// The rule is stated as AUTHORSHIP — federation-tier, attested by a seated
     /// accord holder — rather than as a door, because unlike the family plane
     /// the delegation plane has no second door: the ceremony, the host's boot
-    /// write and a peer's replication all arrive at `put_attestation`. See
-    /// [`check_genesis_attestation_reserved`](genesis::check_genesis_attestation_reserved),
-    /// including why pinning the baked CONTENT instead would have refused the
-    /// re-ceremony these ids exist for.
+    /// write and a peer's replication all arrive at `put_attestation`.
+    ///
+    /// v62.0.0 (C5-fix1): the baked ids and their reserve
+    /// (`check_genesis_attestation_reserved`) are deleted with the baked
+    /// genesis; nothing raises this variant any more. It stays for F's cut.
     #[error(
         "attestation_id {attestation_id:?} is a baked genesis delegation row and is reserved: \
          it is installed by the genesis ceremony, never by an ordinary write — this one's \
@@ -14406,6 +14253,17 @@ pub mod malformed_row {
     /// leads with Verify's detail: `custody_chain_invalid`, ...). Verify's
     /// token.
     pub const GENESIS_HOLDER_CUSTODY: &str = "genesis_holder_custody";
+    /// v62.0.0 (C4-fix2; CC rc21 ad52eb6, CC 4.2.3 "One device per holder")
+    /// — two holders a bundle seats name the same device in their
+    /// attestation leaves (for `YubiKey_5_FIPS`, the token serial in leaf
+    /// extension `1.3.6.1.4.1.41482.3.7`). A shared `f9` or intermediate is
+    /// not a shared device. The bundle is Invalid; nothing of it is stored.
+    pub const HOLDER_DEVICE_SHARED: &str = "holder_device_shared";
+    /// v62.0.0 (C4-fix2; CC 4.2.3) — a seated `YubiKey_5_FIPS` holder's
+    /// attestation leaf names no device: it carries no readable
+    /// `1.3.6.1.4.1.41482.3.7` serial, so one device per holder cannot be
+    /// judged. The bundle is refused; nothing of it is stored.
+    pub const HOLDER_DEVICE_UNNAMED: &str = "holder_device_unnamed";
     /// v62.0.0 (slice J0; CC 2.6.1.12) — an earlier-form verification (a
     /// JSON row, a JSON key registration, a plane object signed over its JCS
     /// image) whose signer is an edition-2 key: its `federation_keys` row is
@@ -14590,6 +14448,9 @@ pub mod malformed_row {
         // v62.0.0 (wave V1b) — appended.
         LICENCE_WITHDRAWAL_SHORT,
         LICENCE_WITHDRAWAL_NO_HEAD,
+        // v62.0.0 (C4-fix2; CC 4.2.3) — appended.
+        HOLDER_DEVICE_SHARED,
+        HOLDER_DEVICE_UNNAMED,
     ];
 }
 
@@ -14908,7 +14769,7 @@ impl Error {
     /// So the predicate stays a string test, and the point of putting it HERE
     /// is that there is exactly one of it. It was previously transcribed inline
     /// in `exercise_genesis_seed_installs` and NOT in
-    /// [`seed_delegation_plane`](super::federation::genesis::seed_delegation_plane) —
+    /// `seed_delegation_plane` (deleted in v62.0.0 with the baked genesis) —
     /// a second copy would have been the two-lists-that-disagree class, which is
     /// how the seed path came to treat a lost race as "still absent" and stop
     /// seeding half-way.

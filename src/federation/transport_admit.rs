@@ -190,19 +190,11 @@ pub(crate) async fn put_signed_transport_destination_planned<D: TransportStore>(
     // JCS(signed_envelope) against the pinned key of attesting_key_id, typed
     // projection ≡ envelope, signer_acts_for.
     super::admission::verify_signed_transport_destination(dir, signed).await?;
-    // v59.0.0 (CIRISPersist#1106, CC 5.3.4) — a seated serve node's
-    // bundle-pinned transit pair rotates by holder quorum, not alone.
-    // v62.0.0 (wave GC4; CC rc21 items 12, 13) — THIS node's own seat
-    // rotation (the binding is about this node's key) is the emitter's act:
-    // a plain refusal (`refuse_own_serve_rotation`). Any other node's
-    // rotation is a receipt: kept and not counted
-    // (`check_serve_rotation`, held inside a fold attempt).
-    if dir.node_key_id().as_deref() == Some(signed.transport_destination.occurrence_key_id.as_str())
-    {
-        super::transport_rebind::refuse_own_serve_rotation(dir, signed).await?;
-    } else {
-        super::transport_rebind::check_serve_rotation(dir, signed).await?;
-    }
+    // v62.0.0 (C5-fix1; ceremony gap 1): the earlier serve-rotation rule
+    // (a seated serve node's bundle-pinned transit pair rotates by holder
+    // quorum) is deleted with the baked v4 bundle it read. A seat's transit
+    // key is the ingested bundle/2 binding or an edition-2 counted re-bind
+    // (`edition2::transport_rebind`), never this earlier-form row.
     let d = &signed.transport_destination;
     let envelope_json = serde_json::to_string(&signed.signed_envelope)
         .map_err(|e| Error::Backend(format!("signed_envelope: {e}")))?;

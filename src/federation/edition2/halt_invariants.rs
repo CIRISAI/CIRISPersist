@@ -10,8 +10,9 @@
 //!   roster it names, gives the vector's token; a valid one its row id, and a
 //!   waiting one the keys it waits on.
 //! - I2362: every lifecycle case gives the vector's token under Verify's
-//!   counted reader. Persist has no lifecycle door yet
-//!   (TODO(cut-a-halt-lifecycle)); this pins the vector persist will read.
+//!   counted reader, the reader persist's lifecycle door
+//!   (`halt::put_lifecycle`, C2-fix) calls; the door's witnesses are
+//!   I2342–I2346 (`halt_lifecycle_invariants`).
 //! - I2363: no `not_a_holder` token survives in persist's source: a key the
 //!   roster does not place waits, never a refusal (CC 4.2.1.1).
 //! - I2103 / I2364, at the store door (sqlite + postgres):
@@ -21,7 +22,9 @@
 //!   - `iss_not_holder` is refused by name; a key the roster does not place
 //!     waits (retryable); a member fault is `accord_invocation_invalid`;
 //!   - (I2364) a holder re-seated at a new key by a later bundle: its halt
-//!     waits under the earlier roster and latches under the later one.
+//!     waits under the earlier roster and is valid under the later one
+//!     (v62.0.0 C2-fix: kept, but with A1's first halt in force it changes
+//!     nothing, Verify's latch: a second halt does not reset the fuse).
 //! - I2104, both backends: an invocation repeating a held invocation's
 //!   `invocation_id`, or its `nonce`, within that one's `valid_until` is
 //!   `accord_invocation_replayed`; past it, it is admitted.
@@ -333,15 +336,19 @@ pub(crate) async fn body(d: &dyn crate::federation::FederationDirectory) {
         "I2364 waits under the earlier roster"
     );
     let seated = by_id("halt_rotated_a1_seated");
+    let first = d.get_active_halt(ACCORD).await.unwrap().expect("I2364");
     let out = put_invocation(d, &seated, Some(rotated))
         .await
-        .expect("I2364 latches under the later roster");
-    assert!(out.latched, "I2364");
+        .expect("I2364 is valid under the later roster");
+    // v62.0.0 (C2-fix, CC 4.2.1.1; Verify's `HaltLatch`) — valid, kept, and
+    // it changes nothing: A1's first halt is still in force, and a second
+    // halt neither replaces it nor resets its fuse.
+    assert!(out.new && !out.latched && !out.held, "I2364: {out:?}");
     let active = d.get_active_halt(ACCORD).await.unwrap().expect("I2364");
     assert_eq!(
-        active.active_halt_id,
-        hex::encode(out.invocation.row_id()),
-        "I2364"
+        (active.active_halt_id, active.set_at),
+        (first.active_halt_id, first.set_at),
+        "I2364: the halt in force and its fuse are unchanged"
     );
     // The first key, under the later roster that no longer seats it, waits.
     let e = put_invocation(d, &by_id("halt_a1_first_key_under_rotated"), Some(rotated))

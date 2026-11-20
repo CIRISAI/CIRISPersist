@@ -373,7 +373,7 @@ pub(crate) mod bodies {
         let id = uuid::Uuid::new_v4().to_string();
         let mut env = env.clone();
         env["id"] = serde_json::json!(id);
-        let mut r = e2::with_earlier_form(|| ts::bare_attestation(&id, signer, attested, &env));
+        let mut r = ts::bare_attestation(&id, signer, attested, &env);
         r.attestation_type = crate::federation::types::attestation_type::SCORES.to_owned();
         r
     }
@@ -475,7 +475,10 @@ pub(crate) mod bodies {
                 -0.5,
                 "I1106 positive-only refuses a negative",
             ),
-            ("chat:leaf:v1", 1.5, "I1106 signed refuses a score above 1"),
+            // v62.0.0 (E0 fix 9; ruling 4) — `chat:leaf:v1` at 1.5 is gone: an
+            // edition-2 `score` is an integer in [-10^6, 10^6] (CC 2.6.1.5), so
+            // a score above 1 has no wire form; Verify's reader refuses it
+            // `malformed:score` before any polarity gate.
             (
                 "activity_tier:daily:v1",
                 0.5,

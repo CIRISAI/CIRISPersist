@@ -11,18 +11,14 @@
 //! reserved family (CC 3.4.8: `lenscore_detector`), so the dimension gate
 //! refuses any other emitter.
 //!
-//! Two doors write one:
-//!
-//! - **`put_detection_event`** (the LensCore path every host runs today): the
-//!   detector's hybrid signature over `canonical_bytes` is verified by the
-//!   caller (`Engine` / the PyO3 surface, `HybridPolicy::Strict`), then the
-//!   row is written at the local tier with its own signature deferred — the
-//!   `trace:complete:v1` precedent. It crosses to the federation tier when
-//!   the detector signs it as the actor (`enter_mesh`).
-//! - **`put_attestation`** (and the replicated apply): a detector that emits
-//!   the row itself, hybrid-signed, at the federation tier. It replicates like
-//!   any other row; the plan checks its body
-//!   ([`check_detection_body`]) and the executor projects it.
+//! One door writes one (v62.0.0, P8-fix11: the earlier-form
+//! `put_detection_event` / `put_detection_planned`, which refused at their
+//! first line once the earlier form was shut, are deleted): the detector's
+//! own edition-2 `detection:{detector}` statement, through the statement door
+//! ([`state_detection`]; a remote pen drafts with [`draft_detection`] and
+//! submits the assembled statement). It replicates like any other row; the
+//! plan checks its body ([`check_detection_body`]) and the executor projects
+//! it.
 //!
 //! # The Art. 17 tombstone (V080)
 //!
@@ -628,19 +624,6 @@ pub fn project_detection_row_under(
     })
 }
 
-/// A refusal of the detection door, in the `DerivedSchema` error tree: a
-/// conflict stays a conflict, a substrate failure stays `Backend`, and every
-/// admission refusal is the caller's (`InvalidArgument`, the type V008's
-/// shape refusals always had), its `kind()` token leading the message.
-pub(crate) fn derived_error(e: crate::federation::Error) -> super::Error {
-    use crate::federation::Error as F;
-    match e {
-        F::Conflict(m) => super::Error::Conflict(m),
-        F::Backend(m) => super::Error::Backend(m),
-        other => super::Error::InvalidArgument(format!("{}: {other}", other.kind())),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,5 +690,147 @@ mod tests {
             detection_attestation_id(&uuid::Uuid::new_v4())
         );
         assert_ne!(detection_attestation_id(&id), id.to_string());
+    }
+}
+
+/// v62.0.0 (v62 P8-fix11) — **test support: an edition-2 detection on a
+/// backend**, for the witnesses that used to seed rows through the deleted
+/// earlier-form door (`DerivedSchema::put_detection_event`). A detection is
+/// its detector's own statement ([`state_detection`]); its standing is the
+/// `infra:detect` conferral (P4's shape, `standing_invariants`): a key root
+/// [`ROOT`] charters itself, THIS node (its `node_key_id`; [`NODE`] when the
+/// caller lets [`confer`] declare one) accepts it, and it confers `infra:detect` on [`DETECTOR`], who voices
+/// the conferral (its second signer, CC 2.6.1.9).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod test_support {
+    use crate::federation::attestation_admit::AttestationStore;
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::hard_case::test_support::DeclaresNode;
+    use crate::federation::FederationDirectory;
+
+    /// The node seed (its kid is declared the backend's node key).
+    pub(crate) const NODE: &str = "p8-detect-node";
+    /// The key root's seed.
+    pub(crate) const ROOT: &str = "p8-detect-root";
+    /// The detector's seed (an `agent` key: the duty is the conferral's).
+    pub(crate) const DETECTOR: &str = "p8-detect-detector";
+
+    /// The detector's identity-ref (an event's `signing_key_id`).
+    #[must_use]
+    pub(crate) fn detector() -> String {
+        e2::kid(DETECTOR)
+    }
+
+    /// Declare [`NODE`] this backend's node key, then [`confer_here`].
+    pub(crate) async fn confer<B>(b: &B)
+    where
+        B: FederationDirectory + DeclaresNode,
+    {
+        e2::put_key(b, NODE, &["node"]).await;
+        b.declare_node_key_for_test(&e2::kid(NODE));
+        confer_here(b).await;
+    }
+
+    /// Confer `infra:detect` on [`DETECTOR`] from a root THIS node (the
+    /// directory's `node_key_id`, a fixture seed's key) accepts. A second call
+    /// states the edges again (new instants); the conferral stands.
+    ///
+    /// # Panics
+    /// A directory with no node key, or a node key no fixture seed made.
+    pub(crate) async fn confer_here<D>(b: &D)
+    where
+        D: FederationDirectory + ?Sized,
+    {
+        use crate::federation::trust_root::{
+            TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION, TRUST_CONFERS_DIMENSION,
+        };
+        use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
+        let node_kid = b
+            .node_key_id()
+            .expect("the caller set this node's key before conferring");
+        let node = e2::seed_of(&node_kid);
+        let node = node.as_str();
+        e2::put_key(b, ROOT, &["node"]).await;
+        e2::put_key(b, DETECTOR, &["agent"]).await;
+        let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&[format!(
+            "{ROOT}-successor"
+        )])
+        .expect("commitment");
+        for (from, to, envelope) in [
+            (
+                ROOT,
+                ROOT,
+                serde_json::json!({
+                    "dimension": TRUST_CHARTER_DIMENSION,
+                    "scope": ["infra:serve", "infra:attest"],
+                    "pre_rotation_commitment": commitment,
+                }),
+            ),
+            (
+                node,
+                ROOT,
+                serde_json::json!({"dimension": TRUST_ACCEPTS_DIMENSION, "scope": ["infra:serve"]}),
+            ),
+            (
+                ROOT,
+                DETECTOR,
+                serde_json::json!({
+                    "dimension": TRUST_CONFERS_DIMENSION,
+                    "scope": [crate::federation::types::delegation_scope::INFRA_DETECT],
+                }),
+            ),
+        ] {
+            let now = crate::host::clock::now();
+            let lit = crate::federation::Attestation {
+                attestation_id: String::new(),
+                attesting_key_id: e2::kid(from),
+                attested_key_id: e2::kid(to),
+                attestation_type: attestation_type::DELEGATES_TO.to_owned(),
+                weight: Some(1.0),
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: envelope.clone(),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: e2::kid(from),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: cohort_scope::FEDERATION.to_owned(),
+                tier: attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            };
+            let edge = e2::try_put_row(b, &lit, from)
+                .await
+                .unwrap_or_else(|e| panic!("the trust edge {from} -> {to} is admitted: {e:?}"));
+            // The conferral waits for its delegate's voice (CC 2.6.1.9).
+            if envelope
+                .get("dimension")
+                .and_then(serde_json::Value::as_str)
+                == Some(TRUST_CONFERS_DIMENSION)
+            {
+                let st = e2::carried_statement(&edge).expect("the conferral's statement");
+                e2::put_statement(b, &e2::voice_of(&st, to))
+                    .await
+                    .expect("the detector's own voice on its conferral");
+            }
+        }
+    }
+
+    /// State `ev` (its `signing_key_id` = [`detector`]) as [`DETECTOR`]'s own
+    /// statement through the door: its node-computed row id. The caller
+    /// [`confer`]red first.
+    pub(crate) async fn state<B: AttestationStore>(b: &B, ev: &super::DetectionEvent) -> String {
+        super::state_detection(
+            b,
+            &crate::federation::tier_ingest::test_support::local_signer(DETECTOR),
+            ev,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the conferred detector states its detection: {e}"))
     }
 }

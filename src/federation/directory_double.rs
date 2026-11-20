@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 174 delegations, generated. Every one: fault first, then delegate.
+// 170 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -1311,19 +1311,6 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.purge_execution(notice_id).await
     }
-    async fn purge_genesis_delegation_row_v31(
-        &self,
-        attestation_id: &str,
-        expected_persist_row_hash: &str,
-        authority: &genesis::bundle::GenesisPurgeAuthority<'_>,
-    ) -> Result<bool, Error> {
-        if let Some(e) = self.faulted("purge_genesis_delegation_row_v31") {
-            return Err(e);
-        }
-        self.inner
-            .purge_genesis_delegation_row_v31(attestation_id, expected_persist_row_hash, authority)
-            .await
-    }
     async fn purge_mark_finalized(
         &self,
         notice_id: &str,
@@ -1400,39 +1387,6 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.purge_trace_row_counts(trace_ids).await
-    }
-    async fn put_accord_decision(
-        &self,
-        decision: ciris_verify_core::accord_live_quorum::AccordDecision,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_accord_decision") {
-            return Err(e);
-        }
-        self.inner.put_accord_decision(decision).await
-    }
-    async fn put_accord_participation(
-        &self,
-        participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
-        standing_roster: &[ciris_verify_core::threshold::ThresholdMember],
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_accord_participation") {
-            return Err(e);
-        }
-        self.inner
-            .put_accord_participation(participation, standing_roster)
-            .await
-    }
-    async fn put_accord_proposal(
-        &self,
-        proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
-        authority_signature: Option<serde_json::Value>,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_accord_proposal") {
-            return Err(e);
-        }
-        self.inner
-            .put_accord_proposal(proposal, authority_signature)
-            .await
     }
     async fn put_attestation_with_origin(
         &self,

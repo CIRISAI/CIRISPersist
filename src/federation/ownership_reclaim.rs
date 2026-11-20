@@ -1757,7 +1757,7 @@ pub(crate) mod test_support {
         family: &str,
         at: DateTime<Utc>,
     ) -> Vec<u8> {
-        let mut shape = e2::with_earlier_form(|| ts::bare_attestation("", by, node, &envelope));
+        let mut shape = ts::bare_attestation("", by, node, &envelope);
         shape.attestation_type = attestation_type::WITHDRAWS.to_owned();
         shape.asserted_at = at;
         e2::statement_of_family(&shape, by, family)

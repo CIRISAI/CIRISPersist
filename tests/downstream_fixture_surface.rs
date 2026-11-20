@@ -74,7 +74,7 @@ async fn a_consumer_can_reach_the_row_signing_helpers_664() {
     let _key = e2::signing_key(signer);
     // The earlier-form-shaped row the codec reads (built with the switch off,
     // so the builder hands back the shape, not a mapped row).
-    let mut earlier = e2::with_earlier_form(|| {
+    let mut earlier = {
         ciris_persist::federation::tier_ingest::test_support::bare_attestation(
             "dsx-664",
             signer,
@@ -85,7 +85,7 @@ async fn a_consumer_can_reach_the_row_signing_helpers_664() {
                 "confidence": 0.9,
             }),
         )
-    });
+    };
     earlier.attestation_type = "scores".to_owned();
     let statement = e2::statement_of(&earlier, signer);
     assert!(!statement.is_empty(), "a signed statement");

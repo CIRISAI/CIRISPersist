@@ -592,11 +592,9 @@ pub(crate) mod engine_bodies {
                 &[7u8; 32],
             ),
             peer_key_id: me.clone(),
-            peer_pubkey_ed25519_base64: String::new(),
             received_at: chrono::Utc::now(),
             transport_id: crate::cirisnode::TransportMedium::Reticulum,
-            signature_classical_base64: crate::cirisnode::encode_signature_base64(&[0u8; 64]),
-            signature_pqc_base64: None,
+            signature_composite_base64: crate::cirisnode::encode_signature_base64(&[0u8; 3373]),
         };
         let put = |a: crate::cirisnode::DeliveryAttestation| async {
             match e.node_core_service() {
@@ -620,6 +618,108 @@ pub(crate) mod engine_bodies {
             "cirisnode_signature",
             "I1170: a held announcement passes the row rule; the forged signature does not"
         );
+
+        // v62.0.0 (F0-cp5) — **I2883: a delivery attestation is ONE composite
+        // by the peer's live edition-2 key**, named by its identity-ref: a
+        // lone Ed25519-length half is refused `verify_component_signature`; the
+        // composite lands and lists back as sent (both backends: this body
+        // runs on sqlite and postgres).
+        {
+            use crate::federation::edition2::composite_verify::VERIFY_COMPONENT_SIGNATURE;
+            use crate::federation::edition2::fixture_switch as e2;
+            const PEER: &str = "f0-cp5-delivery-peer";
+            let dir = e.federation_directory();
+            let peer = e2::put_key(dir.as_ref(), PEER, &["node"]).await;
+            let mut good = crate::cirisnode::DeliveryAttestation {
+                announcement_id: aid.clone(),
+                announcement_canonical_hash_base64: crate::cirisnode::encode_canonical_hash_base64(
+                    &[7u8; 32],
+                ),
+                peer_key_id: peer,
+                received_at: chrono::DateTime::from_timestamp_millis(1_780_272_000_000)
+                    .expect("a fixed instant"),
+                transport_id: crate::cirisnode::TransportMedium::Reticulum,
+                signature_composite_base64: String::new(),
+            };
+            let sig = e2::signing_key(PEER)
+                .sign(&good.canonical_bytes().expect("I2883: canonical bytes"))
+                .expect("composite sign");
+            let mut half = good.clone();
+            half.signature_composite_base64 = crate::cirisnode::encode_signature_base64(&sig[..64]);
+            let err = put(half).await.expect_err("I2883: a lone half is refused");
+            assert_eq!(err.kind(), "cirisnode_signature", "I2883: {err}");
+            assert!(
+                err.to_string().contains(VERIFY_COMPONENT_SIGNATURE),
+                "I2883: refused by name: {err}"
+            );
+            good.signature_composite_base64 = crate::cirisnode::encode_signature_base64(&sig);
+            put(good.clone())
+                .await
+                .unwrap_or_else(|e| panic!("I2883: the composite lands: {e}"));
+            let listed = match e.node_core_service() {
+                #[cfg(feature = "postgres")]
+                crate::engine::NodeCoreDispatch::Postgres(b) => {
+                    b.list_delivery_attestations(&aid).await
+                }
+                #[cfg(feature = "sqlite")]
+                crate::engine::NodeCoreDispatch::Sqlite(b) => {
+                    b.list_delivery_attestations(&aid).await
+                }
+            }
+            .expect("I2883: the list reads");
+            assert_eq!(listed, vec![good], "I2883: it lists back as sent");
+
+            // I2884 — a promotion record's signer is an identity-ref, its
+            // key read from the directory: a pubkey literal is refused
+            // `verify_not_identity_ref`; the peer's composite promotes.
+            let put_promotion = |a: crate::cirisnode::PromotionAttestation| async {
+                match e.node_core_service() {
+                    #[cfg(feature = "postgres")]
+                    crate::engine::NodeCoreDispatch::Postgres(b) => {
+                        b.put_promotion_attestation(a).await
+                    }
+                    #[cfg(feature = "sqlite")]
+                    crate::engine::NodeCoreDispatch::Sqlite(b) => {
+                        b.put_promotion_attestation(a).await
+                    }
+                }
+            };
+            let promotion = |by: &str| {
+                let mut att = crate::cirisnode::PromotionAttestation {
+                    attestation_id: uuid::Uuid::new_v4().to_string(),
+                    target_kind: crate::cirisnode::TargetRowKind::Contribution,
+                    target_ids: vec![aid.clone()],
+                    attested_by: by.to_owned(),
+                    aggregate_evidence: serde_json::json!({"q": "I2884"}),
+                    signature: crate::cirisnode::CompositeSignature {
+                        composite: String::new(),
+                        signed_at: chrono::Utc::now(),
+                    },
+                    attested_at: chrono::Utc::now(),
+                };
+                let bytes = crate::cirisnode::verify::canonical_bytes_for_envelope(&att)
+                    .expect("I2884: canonical bytes");
+                att.signature.composite = crate::cirisnode::encode_signature_base64(
+                    &e2::signing_key(PEER).sign(&bytes).expect("composite sign"),
+                );
+                att
+            };
+            let literal = crate::cirisnode::encode_signature_base64(
+                e2::signing_key(PEER).public_key().as_bytes(),
+            );
+            let err = put_promotion(promotion(&literal))
+                .await
+                .expect_err("I2884: a pubkey literal names no edition-2 key");
+            assert!(
+                err.to_string().contains(
+                    crate::federation::edition2::composite_verify::VERIFY_NOT_IDENTITY_REF
+                ),
+                "I2884: refused by name: {err}"
+            );
+            put_promotion(promotion(&e2::kid(PEER)))
+                .await
+                .unwrap_or_else(|e| panic!("I2884: the peer's composite promotes: {e}"));
+        }
         doors_return_their_rows(&e, &me, &alice.id, &aid, tag).await;
     }
 

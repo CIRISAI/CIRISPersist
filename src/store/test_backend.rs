@@ -121,41 +121,6 @@ impl SqliteBackend {
 /// consumer links carries a below-the-door writer it did not ask for.
 #[cfg(test)]
 impl SqliteBackend {
-    /// Fixture: attach an ML-DSA-65 half to a row [`Self::add_public_key`]
-    /// wrote. Panics when the row is absent.
-    #[cfg(feature = "server")]
-    pub(crate) fn set_pqc_pubkey(&self, key_id: &str, pubkey_ml_dsa_65_base64: &str) {
-        let n = self
-            .conn_handle()
-            .lock()
-            .execute(
-                "UPDATE federation_keys SET pubkey_ml_dsa_65_base64 = ?2 WHERE key_id = ?1",
-                rusqlite::params![key_id, pubkey_ml_dsa_65_base64],
-            )
-            .expect("fixture: set_pqc_pubkey");
-        assert_eq!(
-            n, 1,
-            "set_pqc_pubkey: key_id must exist via add_public_key first"
-        );
-    }
-
-    /// Fixture: grant `key_id` the role tags. Panics when the row is absent.
-    #[cfg(feature = "server")]
-    pub(crate) fn set_roles(&self, key_id: &str, roles: Vec<String>) {
-        let n = self
-            .conn_handle()
-            .lock()
-            .execute(
-                "UPDATE federation_keys SET roles = ?2 WHERE key_id = ?1",
-                rusqlite::params![key_id, serde_json::to_string(&roles).expect("roles json")],
-            )
-            .expect("fixture: set_roles");
-        assert_eq!(
-            n, 1,
-            "set_roles: key_id must exist via add_public_key first"
-        );
-    }
-
     /// Fixture: a `founder_only` community whose roster is
     /// `member_identity_key_ids` (replacing one already held).
     pub(crate) fn add_community_membership(

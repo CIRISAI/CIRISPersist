@@ -100,11 +100,32 @@ pub use crate::signing::{LocalSigner, LocalSignerConfig, LocalSignerError};
 
 // Verify primitives. The full surface edge needs to compose a
 // verify pipeline against persist instead of rebuilding it.
+// v62.0.0 (F0-cp6e) — `verify_trace` and `PublicKeyDirectory` are removed:
+// a trace is verified as its edition-2 `trace:complete:v1` statement through
+// the door.
 pub use crate::verify::{
     body_sha256, canonical_payload_value, canonicalize_envelope_for_signing,
-    ceg_produce_canonicalize, verify_hybrid, verify_hybrid_via_directory, verify_trace,
-    Canonicalizer, HybridPolicy, HybridVerifyError, PublicKeyDirectory,
-    PythonJsonDumpsCanonicalizer, VerifyOutcome,
+    ceg_produce_canonicalize, verify_hybrid, verify_hybrid_via_directory, Canonicalizer,
+    HybridPolicy, HybridVerifyError, PythonJsonDumpsCanonicalizer, VerifyOutcome,
+};
+
+// v62.0.0 (P7-fix8; Server / lens-core's ports off the removed
+// `verify_trace`) — TEST-ANCHOR ONLY: sign a trace as its edition-2
+// `trace:complete:v1` row under an AGENT key and admit it through the real
+// statement door (`ingest::trace_anchor`). Never in a production build.
+#[cfg(feature = "test-anchor")]
+pub use crate::ingest::trace_anchor::{
+    admit_trace_row, agent_trace_instant_ms, date_trace, put_agent_trace_key, sign_agent_trace,
+    sign_agent_trace_with, trace_row_event,
+};
+#[cfg(feature = "test-anchor")]
+pub use crate::ingest::SealedTrace;
+
+// v62.0.0 (F0-cp5; RULINGS "composite signatures only") — the one
+// directory-backed composite verifier: ONE composite signature under the
+// signer's LIVE edition-2 key, named by its identity-ref.
+pub use crate::federation::edition2::composite_verify::{
+    verify_composite_via_directory, CompositeVerifyError, LiveSigner,
 };
 
 // Outbound queue types — federation peers building dispatcher

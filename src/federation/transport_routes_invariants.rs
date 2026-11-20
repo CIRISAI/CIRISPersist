@@ -53,40 +53,64 @@ pub(crate) mod bodies {
         k
     }
 
-    /// I1122-A — **an agent announces no route.** The signed apply and the
-    /// unsigned local put both refuse a route at an `agent`-typed key, by
-    /// name; a node's route on the same destination is admitted.
+    /// I1122-A — **an agent announces no route.** v62.0.0 (O1 fix 10; CP2):
+    /// a route is the `transport_destination` member of an edition-2
+    /// `identity:occurrence` bind, projected after the bind commits
+    /// (`transport_routes::project_occurrence_route`). Under one node identity,
+    /// an AGENT key's bind carrying a destination lands but projects no
+    /// route. The unsigned local put refuses an agent route by name. A NODE
+    /// key's bind on the same destination projects it.
     pub(crate) async fn i1122_a_agent_routes_are_refused(d: &dyn FederationDirectory, tag: &str) {
-        let agent = format!("{tag}-agent");
-        let node = format!("{tag}-node");
-        ts::register_identity_key(d, &agent, AGENT).await;
-        ts::register_identity_key(d, &node, NODE).await;
-        let dest = format!("{tag}dest");
-        let a = route(&agent, &dest, 1, "2026-10-22T00:00:00.000Z");
-        let e = d
-            .put_signed_transport_destination(&signed(&a).await)
-            .await
-            .unwrap_err();
-        assert!(
-            e.to_string().contains(TRANSPORT_DESTINATION_AGENT_KEY),
-            "I1122-A: the signed apply refuses an agent route by name: {e}"
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::ingest::StatementOutcome;
+        use crate::federation::self_at_login::test_support::e2bind::transport;
+        let (id_s, agent_s, node_s) = (
+            format!("{tag}-id"),
+            format!("{tag}-agent"),
+            format!("{tag}-node"),
         );
+        e2::put_key(d, &id_s, &[NODE]).await;
+        e2::put_key(d, &agent_s, &[AGENT]).await;
+        e2::put_key(d, &node_s, &[NODE]).await;
+        let (agent, node) = (e2::kid(&agent_s), e2::kid(&node_s));
+        let (member, dest) = transport([0x31; 32], [0x32; 32]);
+        let at = e2::ms(chrono::Utc::now()) - 60_000;
+        let opts = e2::BindOptions {
+            asserted_at_ms: at,
+            extra: vec![("transport_destination", member)],
+            ..e2::BindOptions::default()
+        };
+        let out = e2::put_bind(d, &id_s, &id_s, &agent_s, "agent", &opts).await;
+        assert!(
+            matches!(out, Ok(StatementOutcome::Row { .. })),
+            "I1122-A: the agent's bind lands: {out:?}"
+        );
+        assert!(
+            d.list_transport_destinations_for_unfolded(&agent)
+                .await
+                .unwrap()
+                .is_empty(),
+            "I1122-A: an agent's bind projects no route"
+        );
+        let a = route(&agent, &dest, 1, "2026-10-22T00:00:00.000Z");
         let e = d.put_transport_destination(&a).await.unwrap_err();
         assert!(
             e.to_string().contains(TRANSPORT_DESTINATION_AGENT_KEY),
             "I1122-A: the local put refuses an agent route by name: {e}"
         );
-        let n = route(&node, &dest, 1, "2026-10-23T00:00:00.000Z");
-        d.put_signed_transport_destination(&signed(&n).await)
-            .await
-            .expect("I1122-A: a node's route is admitted");
+        let out = e2::put_bind(d, &id_s, &id_s, &node_s, "server", &opts).await;
+        assert!(
+            matches!(out, Ok(StatementOutcome::Row { .. })),
+            "I1122-A: the node's bind lands: {out:?}"
+        );
         assert_eq!(
             keys(
                 &d.list_transport_destinations_by_destination(&dest)
                     .await
                     .unwrap()
             ),
-            vec![node.clone()]
+            vec![node.clone()],
+            "I1122-A: only the node's route is listed"
         );
     }
 
@@ -306,13 +330,16 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let agent = format!("{tag}-lateagent");
+        // v62.0.0 — the key arrives as an edition-2 `key:record`, so the
+        // route names it by its kid (the id the directory types it under).
+        let agent_seed = format!("{tag}-lateagent");
+        let agent = crate::federation::edition2::fixture_switch::kid(&agent_seed);
         let dest = format!("{tag}late");
         let r = route(&agent, &dest, 1, "2026-10-22T00:00:00.000Z");
         d.put_transport_destination(&r)
             .await
             .expect("I1122-C: an untyped key's local route is admitted");
-        ts::register_identity_key(d, &agent, AGENT).await;
+        ts::register_identity_key(d, &agent_seed, AGENT).await;
         assert_eq!(
             crate::federation::transport_routes::sweep_agent_routes(d)
                 .await
@@ -342,17 +369,21 @@ pub(crate) mod bodies {
     {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
-        let identity = format!("{tag}-occid");
+        use crate::federation::edition2::fixture_switch as e2;
+        let identity_seed = format!("{tag}-occid");
         // v62.0.0 (wave O1) — a NODE identity: a node or agent key is never
         // an occurrence of a person (`occurrence_binds_machine_to_person`,
         // every occurrence door), so the two machine occurrences bind under a
-        // machine identity.
-        ts::register_identity_key(d, &identity, NODE).await;
-        for (occ, ty, want) in [
+        // machine identity. Each key is an edition-2 `key:record`: the local
+        // rows name it by its kid (the `federation_keys` id they reference).
+        ts::register_identity_key(d, &identity_seed, NODE).await;
+        let identity = e2::kid(&identity_seed);
+        for (occ_seed, ty, want) in [
             (format!("{tag}-occnode"), NODE, 1usize),
             (format!("{tag}-occagent"), AGENT, 0usize),
         ] {
-            ts::register_identity_key(d, &occ, ty).await;
+            ts::register_identity_key(d, &occ_seed, ty).await;
+            let occ = e2::kid(&occ_seed);
             let row = crate::federation::IdentityOccurrence {
                 identity_key_id: identity.clone(),
                 occurrence_key_id: occ.clone(),

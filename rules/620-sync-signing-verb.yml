@@ -1,6 +1,7 @@
 # #620 (ffi/pyo3.rs::no_sync_signing_verb_is_called_from_persists_own_tree):
 # persist never calls the sync signing verbs `local_sign` / `local_pqc_sign`
-# through `call_method*`; `local_sign_hybrid` is the one verb. pyo3.rs holds the
+# through `call_method*` (v62.0.0: rows are signed by the composite producers;
+# the bound-hybrid `local_sign_hybrid` verb is removed). pyo3.rs holds the
 # gate and documents the verbs. Expected 0.
 id: 620-sync-signing-verb
 language: rust

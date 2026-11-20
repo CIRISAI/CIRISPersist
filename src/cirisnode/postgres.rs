@@ -69,7 +69,7 @@ impl PostgresBackend {
 
 impl NodeCoreService for PostgresBackend {
     async fn put_promotion_attestation(&self, att: PromotionAttestation) -> Result<(), Error> {
-        super::verify::verify_envelope_signed(&att, &att.signature, &att.attested_by)?;
+        super::verify::verify_envelope_signed(self, &att, &att.signature, &att.attested_by).await?;
         let attestation_id = parse_id(&att.attestation_id)?;
         let target_uuids = att
             .target_ids
@@ -92,9 +92,9 @@ impl NodeCoreService for PostgresBackend {
                     &att.attested_by,
                     &att.aggregate_evidence,
                     &att.attested_at,
-                    &att.signature.ed25519,
+                    &att.signature.composite,
                     &att.attested_by,
-                    &att.signature.ed25519,
+                    &att.signature.composite,
                 ],
             )
             .await
@@ -288,24 +288,10 @@ impl NodeCoreService for PostgresBackend {
         attestation: DeliveryAttestation,
     ) -> Result<(), Error> {
         let canonical_hash = attestation.canonical_hash_bytes()?;
-        let sig_classical = attestation.signature_classical_bytes()?;
-        let pqc_bytes = attestation.signature_pqc_bytes()?;
         super::rows::check_announcement_held(self, &attestation.announcement_id).await?;
-        let canonical = attestation
-            .canonical_bytes()
-            .map_err(|e| Error::Signature(format!("canonical_bytes: {e}")))?;
-        crate::verify::verify_hybrid_via_directory(
-            self,
-            &canonical,
-            &attestation.peer_key_id,
-            &attestation.signature_classical_base64,
-            attestation.signature_pqc_base64.as_deref(),
-            // v37.0.0 — Strict, in lockstep with the sqlite twin.
-            crate::verify::hybrid::HybridPolicy::Strict,
-            None,
-        )
-        .await
-        .map_err(|e| Error::Signature(format!("delivery_attestation verify: {e}")))?;
+        // v62.0.0 (F0-cp5) — ONE composite under the peer's LIVE edition-2
+        // key, the shared check both backends call.
+        let sig_composite = super::verify::verify_delivery_attestation(self, &attestation).await?;
         let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation)
             .map_err(|e| Error::Internal(format!("persist_row_hash: {e}")))?;
         let client = self.cirisnode_client().await?;
@@ -314,19 +300,17 @@ impl NodeCoreService for PostgresBackend {
             .execute(
                 "INSERT INTO cirisnode.federation_delivery_attestations (\
                     announcement_id, announcement_canonical_hash, peer_key_id, \
-                    peer_pubkey_ed25519_base64, received_at, transport_id, \
-                    signature_classical, signature_pqc, signature_verified, persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9) \
+                    received_at, transport_id, \
+                    signature_composite, signature_verified, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7) \
                  ON CONFLICT (announcement_id, peer_key_id) DO NOTHING",
                 &[
                     &attestation.announcement_id,
                     &canonical_hash.as_slice(),
                     &attestation.peer_key_id,
-                    &attestation.peer_pubkey_ed25519_base64,
                     &attestation.received_at,
                     &attestation.transport_id.as_str(),
-                    &sig_classical.as_slice(),
-                    &pqc_bytes,
+                    &sig_composite.as_slice(),
                     &persist_row_hash,
                 ],
             )
@@ -343,8 +327,7 @@ impl NodeCoreService for PostgresBackend {
         let rows = client
             .query(
                 "SELECT announcement_id, announcement_canonical_hash, peer_key_id, \
-                        peer_pubkey_ed25519_base64, received_at, transport_id, \
-                        signature_classical, signature_pqc \
+                        received_at, transport_id, signature_composite \
                  FROM cirisnode.federation_delivery_attestations \
                  WHERE announcement_id = $1 \
                  ORDER BY received_at DESC",
@@ -355,9 +338,8 @@ impl NodeCoreService for PostgresBackend {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let hash_bytes: Vec<u8> = row.get(1);
-            let sig_classical: Vec<u8> = row.get(6);
-            let sig_pqc_opt: Option<Vec<u8>> = row.get(7);
-            let transport_str: &str = row.get(5);
+            let sig_composite: Vec<u8> = row.get(5);
+            let transport_str: &str = row.get(4);
             let transport_id = TransportMedium::from_wire_str(transport_str).ok_or_else(|| {
                 Error::Backend(format!("unknown transport_id from DB: {transport_str}"))
             })?;
@@ -370,14 +352,11 @@ impl NodeCoreService for PostgresBackend {
                         })?,
                     ),
                 peer_key_id: row.get(2),
-                peer_pubkey_ed25519_base64: row.get(3),
-                received_at: row.get(4),
+                received_at: row.get(3),
                 transport_id,
-                signature_classical_base64: super::federation_announcement::encode_signature_base64(
-                    &sig_classical,
+                signature_composite_base64: super::federation_announcement::encode_signature_base64(
+                    &sig_composite,
                 ),
-                signature_pqc_base64: sig_pqc_opt
-                    .map(|b| super::federation_announcement::encode_signature_base64(&b)),
             });
         }
         Ok(out)

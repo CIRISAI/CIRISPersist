@@ -249,7 +249,7 @@ pub(crate) mod bodies {
     ) -> (Attestation, Vec<Vec<u8>>) {
         // The skeleton only: the switch is off while it is built, so the
         // statement below is the one signing step.
-        let mut w = e2::with_earlier_form(|| ts::bare_attestation("", signers[0], signers[0], env));
+        let mut w = ts::bare_attestation("", signers[0], signers[0], env);
         w.attestation_type = kind.to_owned();
         w.weight = None;
         w.cohort_scope = scope.to_owned();

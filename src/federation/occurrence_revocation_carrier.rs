@@ -45,8 +45,9 @@
 //!
 //! Without that quorum the carrier is refused `federation_malformed_row` /
 //! [`malformed_row::CARRIER_WITHOUT_ROSTER_QUORUM`](super::malformed_row::CARRIER_WITHOUT_ROSTER_QUORUM),
-//! and the open's migration count line names the pair for its owner to
-//! re-propose through the two-path door. Once admitted, the carrier is an
+//! and its owner re-proposes it through the two-path door. (v62.0.0: the
+//! v59 open-time carrier migration is gone; a V300 store holds no legacy
+//! framed revocation.) Once admitted, the carrier is an
 //! ordinary attestation row: it replicates, and every node that admits it
 //! projects the revocation (`federation_identity_occurrence_revocations`).
 
@@ -493,79 +494,4 @@ where
     verify_framed(dir, &framed).await?;
     check_carrier_admission(dir, row, &framed).await?;
     Ok(true)
-}
-
-/// v59.0.0 (CIRISPersist#1104) — what the open's carrier migration did.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CarrierMigration {
-    /// Carriers minted and admitted (or already held).
-    pub minted: u64,
-    /// User-self legacy revocations without the roster quorum, by
-    /// `(identity, occurrence)`: they stay the local legacy projection, and
-    /// their owner re-proposes through the door.
-    pub without_quorum: Vec<(String, String)>,
-    /// Legacy revocations that could not be carried for another reason (an
-    /// unheld signer, a signature that does not verify), by pair.
-    pub not_carried: Vec<(String, String)>,
-}
-
-/// The framed objects a backend's legacy projection rows hold, from their
-/// `(attesting_key_id, signed_envelope, signature)` columns (JSON text). A
-/// row whose columns do not parse is skipped (it is counted as legacy by the
-/// open, never carried).
-#[must_use]
-pub fn framed_of_columns(rows: Vec<(String, String, String)>) -> Vec<FramedOccurrenceRevocation> {
-    rows.into_iter()
-        .filter_map(|(attesting_key_id, envelope, signature)| {
-            Some(FramedOccurrenceRevocation {
-                attesting_key_id,
-                signed_envelope: serde_json::from_str(&envelope).ok()?,
-                signature: serde_json::from_str(&signature).ok()?,
-            })
-        })
-        .collect()
-}
-
-/// v59.0.0 (CIRISPersist#1104) — **the migration**: mint the carrier of each
-/// held legacy framed occurrence revocation through the attestation door
-/// (where the structural rule admits it), and name the rest. Nothing held is
-/// rewritten: the legacy projection rows stay as they are.
-///
-/// # Errors
-///
-/// A backend failure; a refusal is counted, never raised.
-pub async fn migrate_legacy_framed<D>(
-    dir: &D,
-    legacy: Vec<FramedOccurrenceRevocation>,
-) -> Result<CarrierMigration, Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    let mut out = CarrierMigration::default();
-    for framed in legacy {
-        let Ok(revocation) = framed.revocation() else {
-            continue;
-        };
-        let pair = (revocation.identity_key_id, revocation.occurrence_key_id);
-        let row = match carrier_row(&framed) {
-            Ok(r) => r,
-            Err(_) => {
-                out.not_carried.push(pair);
-                continue;
-            }
-        };
-        match dir
-            .put_attestation(super::SignedAttestation { attestation: row })
-            .await
-        {
-            Ok(_) => out.minted += 1,
-            Err(Error::MalformedRow {
-                reason: super::malformed_row::CARRIER_WITHOUT_ROSTER_QUORUM,
-                ..
-            }) => out.without_quorum.push(pair),
-            Err(Error::Backend(e)) => return Err(Error::Backend(e)),
-            Err(_) => out.not_carried.push(pair),
-        }
-    }
-    Ok(out)
 }

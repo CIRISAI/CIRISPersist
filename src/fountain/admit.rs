@@ -1,27 +1,29 @@
 //! Admission validation for `put_fountain_content` (CIRISPersist#227).
 //!
+//! **v62.0.0 (F0-cp6d; CC's answer) — fountain coding is NODE-LOCAL.** The
+//! fountain was cut from the Constitution (rc10, the residue gone at rc17):
+//! `FountainManifestV1` is not a CC object, and CC 6.1.3's list is closed. In
+//! v62 a blob crosses nodes only by descriptor (`{digest, size}`) plus the
+//! composite holding claim. So this door admits only THIS node's own
+//! fountain coding of its own blobs (`pqc_key_id` = this node's identity),
+//! unpinned (CC 1.13.4: no other node verifies it); a manifest produced by
+//! another node is refused by name ([`FOUNTAIN_MANIFEST_NOT_CC_OBJECT`]).
+//!
 //! Verify-BEFORE-mutation (AV-9): every check here runs and must pass
-//! before any backend insert. The order mirrors the trace-tier #225 hard
-//! cut:
+//! before any backend insert:
 //!
-//! 1. Manifest hybrid signature (`verify_hybrid`, [`HybridPolicy::Strict`])
-//!    over the LOCKED canonical bytes — classical-only (missing
-//!    ML-DSA-65) → REJECT, same shape as the trace path's
-//!    `HybridRequired`.
-//! 2. Structural invariants: `symbol_hashes.len() == n_source + k_repair`,
-//!    `manifest_version == 1`, provided symbol_ids in range + no dups.
-//! 3. Each provided symbol's SHA-256 == `symbol_hashes[symbol_id]`. Any
-//!    mismatch → reject the WHOLE admission (a Tier-3 partial that isn't
-//!    manifest-checked is unauthenticated bytes).
+//! 1. the producer is this node ([`require_node_local_producer`]);
+//! 2. structural invariants: `manifest_version == 1`,
+//!    `symbol_hashes.len() == n_source + k_repair`, provided symbol_ids in
+//!    range + no dups;
+//! 3. each provided symbol's SHA-256 == `symbol_hashes[symbol_id]`. Any
+//!    mismatch → reject the WHOLE admission.
 //!
-//! Pure / backend-agnostic so all three backends share one gate.
+//! Pure / backend-agnostic so every backend shares one gate.
 
 use std::collections::HashSet;
 
 use sha2::{Digest, Sha256};
-
-use crate::verify::canonical::Canonicalizer;
-use crate::verify::{verify_hybrid, HybridPolicy};
 
 use super::types::{FountainManifestV1, FountainSymbolV1, MANIFEST_VERSION_V1};
 
@@ -30,21 +32,12 @@ use super::types::{FountainManifestV1, FountainSymbolV1, MANIFEST_VERSION_V1};
 /// the trace-tier error tokens.
 #[derive(Debug, thiserror::Error)]
 pub enum FountainAdmitError {
-    /// The manifest carried no (or an empty) ML-DSA-65 signature, OR the
-    /// hybrid verify rejected the hybrid-pending row under Strict — the
-    /// #225 hard cut. No classical-only fountain manifests.
-    #[error("fountain manifest classical-only / hybrid-pending rejected (Strict) — #225 hard cut")]
-    HybridRequired,
-
-    /// The manifest hybrid signature failed to verify (a half mismatched,
-    /// a malformed PQC field, a bad length, etc.). Carries the verify
-    /// error's stable token.
-    #[error("fountain manifest hybrid verify failed: {0}")]
-    HybridVerify(String),
-
-    /// Canonicalizing the manifest's signed value failed.
-    #[error("fountain manifest canonicalization failed: {0}")]
-    Canonicalization(String),
+    /// v62.0.0 (F0-cp6d) — the manifest was produced by another node (its
+    /// `pqc_key_id` is not this node's identity), or this node has no
+    /// identity to compare: fountain coding is node-local, and a fountain
+    /// manifest is not a CC object. Refused by name, nothing written.
+    #[error("fountain_manifest_not_cc_object: {0}")]
+    NotCcObject(String),
 
     /// `manifest_version` was not the supported V1 value.
     #[error("unsupported fountain manifest_version {got} (this build supports {supported})")]
@@ -106,9 +99,7 @@ impl FountainAdmitError {
     /// Stable string-token for telemetry / structured logging.
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::HybridRequired => "fountain_admit_hybrid_required",
-            Self::HybridVerify(_) => "fountain_admit_hybrid_verify",
-            Self::Canonicalization(_) => "fountain_admit_canonicalization",
+            Self::NotCcObject(_) => FOUNTAIN_MANIFEST_NOT_CC_OBJECT,
             Self::UnsupportedManifestVersion { .. } => "fountain_admit_unsupported_version",
             Self::SymbolHashesLenMismatch { .. } => "fountain_admit_symbol_hashes_len",
             Self::SymbolIdOutOfRange { .. } => "fountain_admit_symbol_id_range",
@@ -131,68 +122,67 @@ pub fn symbol_sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Run the full admission gate. On `Ok(())` every check passed and the
-/// caller may insert. On `Err`, NOTHING must be written.
+/// The stable token of a refused peer manifest (a core-list spelling).
+pub const FOUNTAIN_MANIFEST_NOT_CC_OBJECT: &str = "fountain_manifest_not_cc_object";
+
+/// **The node-local rule.** `manifest` is admissible only as THIS node's own
+/// fountain coding: its `pqc_key_id` (the producer) is `node_identity`, this
+/// node's identity (`FederationDirectory::node_key_id`). A manifest produced
+/// by another node, or one offered to a node with no identity, is refused
+/// [`FOUNTAIN_MANIFEST_NOT_CC_OBJECT`]: no other node's fountain coding
+/// crosses into this one (CC: a blob crosses by descriptor plus the composite
+/// holding claim).
 ///
-/// `ed25519_pubkey_b64` is the producer's Ed25519 verifying key (b64).
-/// The producer's ML-DSA-65 pubkey rides the manifest envelope and the
-/// caller resolves it; per the locked contract the manifest itself
-/// carries `signature_ml_dsa_65` + `pqc_key_id` but NOT the PQC pubkey
-/// as a top-level field — so the caller passes it in (typically read off
-/// `manifest.envelope`, mirroring the trace path where the producer PQC
-/// pubkey rides the trace envelope). Pass `ml_dsa_65_pubkey_b64 = None`
-/// to force the hard-cut rejection deterministically.
-pub fn check_admission<C>(
+/// # Errors
+/// [`FountainAdmitError::NotCcObject`].
+pub fn require_node_local_producer(
+    manifest: &FountainManifestV1,
+    node_identity: Option<&str>,
+) -> Result<(), FountainAdmitError> {
+    match node_identity {
+        Some(me) if manifest.pqc_key_id.trim() == me => Ok(()),
+        Some(me) => Err(FountainAdmitError::NotCcObject(format!(
+            "manifest {} was produced by {:?}, not this node ({me}): fountain coding is \
+             node-local in v62 (not a CC object); a blob crosses nodes by descriptor and \
+             the composite holding claim",
+            manifest.content_id, manifest.pqc_key_id
+        ))),
+        None => Err(FountainAdmitError::NotCcObject(format!(
+            "manifest {}: this node has no identity (node_key_id unset), so no manifest \
+             can be its own",
+            manifest.content_id
+        ))),
+    }
+}
+
+/// Run the full admission gate. On `Ok(())` every check passed and the
+/// caller may insert. On `Err`, NOTHING must be written. Unpinned (CC
+/// 1.13.4): the manifest's signature fields are this node's own bookkeeping
+/// and are not verified.
+///
+/// # Errors
+/// [`FountainAdmitError`].
+pub fn check_admission(
     manifest: &FountainManifestV1,
     symbols: &[FountainSymbolV1],
-    canonicalizer: &C,
-    ed25519_pubkey_b64: &str,
-    ml_dsa_65_pubkey_b64: Option<&str>,
-) -> Result<(), FountainAdmitError>
-where
-    C: Canonicalizer + ?Sized,
-{
-    // (0) Version gate — this build only knows V1.
+    node_identity: Option<&str>,
+) -> Result<(), FountainAdmitError> {
+    require_node_local_producer(manifest, node_identity)?;
     if manifest.manifest_version != MANIFEST_VERSION_V1 {
         return Err(FountainAdmitError::UnsupportedManifestVersion {
             got: manifest.manifest_version,
             supported: MANIFEST_VERSION_V1,
         });
     }
+    check_structure(manifest, symbols)
+}
 
-    // (1) Hybrid signature over the LOCKED canonical bytes. The #225 hard
-    //     cut: a manifest carrying no ML-DSA-65 SIGNATURE is classical-only
-    //     ⇒ REJECTED outright (`HybridRequired`), BEFORE any pubkey
-    //     pairing. The PQC pubkey on the envelope is irrelevant to that
-    //     determination — the load-bearing condition is the presence of
-    //     the PQC signature half (mirrors the trace-tier gate, where
-    //     `signature_ml_dsa_65 == None` is the rejection trigger). This
-    //     also avoids `verify_hybrid`'s both-or-neither `PqcFieldsMustBeBoth`
-    //     when a producer ships a PQC pubkey but no PQC sig.
-    if manifest.signature_ml_dsa_65.is_empty() {
-        return Err(FountainAdmitError::HybridRequired);
-    }
-    let canonical = manifest
-        .canonical_bytes(canonicalizer)
-        .map_err(|e| FountainAdmitError::Canonicalization(format!("{e}")))?;
-    match verify_hybrid(
-        &canonical,
-        &manifest.signature,
-        Some(manifest.signature_ml_dsa_65.as_str()),
-        ed25519_pubkey_b64,
-        ml_dsa_65_pubkey_b64,
-        HybridPolicy::Strict,
-        None,
-    ) {
-        Ok(_outcome) => {}
-        Err(crate::verify::HybridVerifyError::HybridPendingRejected) => {
-            return Err(FountainAdmitError::HybridRequired);
-        }
-        Err(e) => {
-            return Err(FountainAdmitError::HybridVerify(e.kind().to_owned()));
-        }
-    }
-
+/// Steps (2)–(3) of the admission: the structural invariants and the
+/// per-symbol SHA-256 auth against the signed `symbol_hashes`.
+fn check_structure(
+    manifest: &FountainManifestV1,
+    symbols: &[FountainSymbolV1],
+) -> Result<(), FountainAdmitError> {
     // (2) Structural invariants.
     let total = manifest.total_symbols();
     if manifest.symbol_hashes.len() as u64 != total {
@@ -238,39 +228,6 @@ where
     }
 
     Ok(())
-}
-
-/// Run [`check_admission`] resolving the producer pubkeys off the
-/// manifest envelope by convention: `envelope.pubkey_ed25519` (REQUIRED,
-/// string) + `envelope.pubkey_ml_dsa_65` (the PQC half; absent ⇒ the
-/// hard-cut [`FountainAdmitError::HybridRequired`] rejection). Both
-/// pubkeys are bound into the hybrid verify — a forged pubkey fails the
-/// signature, so asserting them on the envelope cannot grant trust by
-/// itself (same argument the V083 trace migration makes for the PQC
-/// pubkey riding the trace envelope).
-///
-/// The single entry point the three backends call so the gate is
-/// byte-identical across PG / SQLite / memory.
-pub fn check_admission_via_envelope<C>(
-    manifest: &FountainManifestV1,
-    symbols: &[FountainSymbolV1],
-    canonicalizer: &C,
-) -> Result<(), FountainAdmitError>
-where
-    C: Canonicalizer + ?Sized,
-{
-    let ed_pubkey = manifest
-        .envelope
-        .get("pubkey_ed25519")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            FountainAdmitError::HybridVerify("manifest envelope missing pubkey_ed25519".to_owned())
-        })?;
-    let pqc_pubkey = manifest
-        .envelope
-        .get("pubkey_ml_dsa_65")
-        .and_then(|v| v.as_str());
-    check_admission(manifest, symbols, canonicalizer, ed_pubkey, pqc_pubkey)
 }
 
 #[cfg(test)]

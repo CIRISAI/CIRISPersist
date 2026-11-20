@@ -596,9 +596,9 @@ where
 ///   leaves it off: `GET` answers 403 `serve_listing_disabled`, serving
 ///   nothing, until an audience filter exists.
 /// - **I2496 (the trust-root route follows the switch).** With the
-///   earlier-form doors forced shut, `GET /v1/trust-root/bundle` serves the
-///   edition-2 body (`{"statements": [...]}`), never the earlier-form
-///   bundle; with the switch off it serves the earlier-form body as before.
+///   earlier-form doors shut (v62.0.0: always), `GET /v1/trust-root/bundle`
+///   serves the edition-2 body (`{"statements": [...]}`), never the
+///   earlier-form bundle. (The switch-off leg went with the flip.)
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod tests {
     use super::*;
@@ -830,7 +830,7 @@ mod tests {
         Box::pin(body(Arc::new(b))).await;
     }
 
-    /// The trust-root route over `b`, under the forced switch and not.
+    /// The trust-root route over `b`, with the doors shut.
     async fn trust_root_follows_the_switch<F>(b: Arc<F>)
     where
         F: FederationDirectory + crate::store::Backend + 'static,
@@ -860,24 +860,13 @@ mod tests {
             journal,
             directory: b,
         });
-        let shut = crate::federation::edition2::door::with_earlier_form_doors_shut(send(
-            &app,
-            get(crate::server::TRUST_ROOT_BUNDLE_PATH),
-        ))
-        .await;
+        let shut = send(&app, get(crate::server::TRUST_ROOT_BUNDLE_PATH)).await;
         assert_eq!(shut.0, StatusCode::OK, "I2496");
         let v: serde_json::Value = serde_json::from_slice(&shut.1).expect("I2496: body");
         assert_eq!(
             v,
             serde_json::json!({ "statements": [] }),
             "I2496: the edition-2 body, nothing held"
-        );
-        let (st, b) = send(&app, get(crate::server::TRUST_ROOT_BUNDLE_PATH)).await;
-        assert_eq!(st, StatusCode::OK, "I2496: switch off");
-        let v: serde_json::Value = serde_json::from_slice(&b).expect("I2496: body");
-        assert!(
-            v.get("bundle").is_some() && v.get("statements").is_none(),
-            "I2496: the earlier-form body while the switch is off: {v}"
         );
     }
 

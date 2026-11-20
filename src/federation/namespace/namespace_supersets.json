@@ -14575,7 +14575,7 @@
     "decimal_id": "4.4.3.34",
     "claim_id": "CLM-trust-root",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/canonical_community.rs#pin_trust_from_bundle_response",
+    "path#symbol": "src/federation/edition2/genesis.rs#put_genesis_bundle",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "backfill-1052"
    },
@@ -14668,7 +14668,7 @@
     "decimal_id": "5.3.4",
     "claim_id": "CLM-bundle-seeds-transit-pairs",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/canonical_community.rs#trust_root_bundle_response",
+    "path#symbol": "src/server/edition2.rs#trust_root_statements",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "backfill-1052"
    },
@@ -16267,7 +16267,7 @@
     "decimal_id": "3.4.8",
     "claim_id": "CLM-detection-on-base",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/attestation_admit.rs#plan_detection_row",
+    "path#symbol": "src/derived/detection_row.rs#check_detection_body",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v57-988",
     "witness": "I961 (memory, sqlite, postgres)"
@@ -16415,15 +16415,6 @@
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v61-991",
     "witness": "I1486 (sqlite, postgres)"
-   },
-   {
-    "decimal_id": "3.1.3",
-    "claim_id": "CLM-planes-as-rows",
-    "repo": "CIRISPersist",
-    "path#symbol": "src/federation/group_plane.rs#rehome_group_records",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "manifest_round": "v61-991",
-    "witness": "I1489 (sqlite, postgres)"
    },
    {
     "decimal_id": "2.4",
@@ -17037,7 +17028,7 @@
     "decimal_id": "5.3.4",
     "claim_id": "CLM-bundle-seeds-transit-pairs",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/genesis/bundle.rs#check_serve_transport_destinations",
+    "path#symbol": "src/federation/edition2/transport_rebind.rs#seat_transit_key",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc9-1106"
    },
@@ -17045,7 +17036,7 @@
     "decimal_id": "5.3.4",
     "claim_id": "CLM-bundle-seeds-transit-pairs",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/genesis/mod.rs#seed_serve_transport_destinations",
+    "path#symbol": "src/federation/self_at_login.rs#transit_xwing_pubkey_for",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc9-1106"
    },
@@ -17053,7 +17044,7 @@
     "decimal_id": "5.3.4",
     "claim_id": "CLM-bundle-seeds-transit-pairs",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/transport_rebind.rs#check_serve_rotation",
+    "path#symbol": "src/federation/edition2/transport_rebind.rs#put_rebind_voice",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc9-1106"
    },
@@ -17061,7 +17052,7 @@
     "decimal_id": "3.1.5",
     "claim_id": "CLM-canonical-rebind",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/transport_rebind.rs#check_rebind_admission",
+    "path#symbol": "src/federation/edition2/transport_rebind.rs#put_rebind_voice",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc9-1106"
    },
@@ -17069,7 +17060,7 @@
     "decimal_id": "3.1.5",
     "claim_id": "CLM-canonical-rebind",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/transport_rebind.rs#check_serve_rotation",
+    "path#symbol": "src/federation/edition2/transport_rebind.rs#seat_transit_key",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc9-1106"
    },
