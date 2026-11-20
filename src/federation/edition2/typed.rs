@@ -203,6 +203,17 @@ pub fn fill_context_from_bytes(
         if ctx.seats.is_none() && ctx.group.is_none() {
             ctx.seats = Some(0);
         }
+    } else if family == namespace_match::family_id(crate::federation::quarantine::NAMESPACE_FAMILY)
+        && ctx.group.is_none()
+        && ctx.seats.is_none()
+        && payload.get_text("author").is_some()
+    {
+        // v62.0.0 (K2-fix13) — a re-admission of a held AUTHORED marker,
+        // with no directory: an `author` is the authored arm's own column
+        // (the counted arm has none), so the one-seat-affiliation test reads
+        // false. A counted marker's context needs the held community
+        // ([`family_context`]).
+        ctx.seats = Some(0);
     } else if family == namespace_match::family_id(OCCURRENCE_REVOCATION_PREFIX)
         && ctx.identity.is_none()
     {
@@ -229,6 +240,10 @@ pub fn fill_context_from_bytes(
 ///   at no group has no deciding seats (`seats = 0`), so the affiliation arm
 ///   reads false rather than unknown; an `affiliations` notice's seats are
 ///   the held head's members.
+/// - v62.0.0 (K2-fix13) `quarantine:{state}` (the same cell as a takedown
+///   notice's affiliation arm): `group` = the cohort of the held record of
+///   the marker's `community_id`; `seats` = an affiliation's members; a
+///   community not held reads `seats = 0`.
 /// - every other family: the default (the door derives `act`).
 ///
 /// # Errors
@@ -282,6 +297,33 @@ where
             },
             Some(_) => None,
         };
+    } else if family == namespace_match::family_id(crate::federation::quarantine::NAMESPACE_FAMILY)
+    {
+        // v62.0.0 (K2-fix13; CC rc21 family model, `quarantine:{state}`:
+        // `group=affiliations & seats=one => counted ; authored`) — `group`
+        // is the cohort the held record of the marker's `community_id`
+        // declares, and `seats` an affiliation's members at that head. A
+        // community this node does not hold is no group here: no deciding
+        // seats (`seats = 0`), so the affiliation arm reads false, as for a
+        // takedown notice placed at no group.
+        let held = match text_of(&payload, crate::federation::quarantine::field::COMMUNITY_ID) {
+            Some(c) => dir.lookup_community(c).await?,
+            None => None,
+        };
+        match held {
+            Some(head) => {
+                let affiliations = crate::federation::affiliation_config::declared_cohort(&head)?
+                    == crate::federation::cohort::Cohort::Affiliations;
+                ctx.group = Some(if affiliations {
+                    Group::Affiliations
+                } else {
+                    Group::Community
+                });
+                ctx.seats =
+                    affiliations.then(|| u64::try_from(head.members.len()).unwrap_or(u64::MAX));
+            }
+            None => ctx.seats = Some(0),
+        }
     }
     Ok(ctx)
 }

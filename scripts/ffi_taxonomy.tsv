@@ -537,7 +537,6 @@ Engine	reachable_under_scope_with_reasons	deontic
 Engine	read_blob_as	deontic	
 Engine	read_blob_for_community_viewer	deontic	
 Engine	read_blob_range_as	deontic	
-Engine	put_lineage_head_cosign_json	deontic	
 Engine	lineage_head_json	epistemic	
 Engine	seal_descriptor_for_blob	deontic	
 Engine	open_descriptor_for_blob	deontic	
@@ -621,6 +620,7 @@ Engine	set_trust_threshold	deontic
 Engine	sign_draft	procedural	
 Engine	sign_composite	ontological	
 Engine	verify_accord_manifest_v2	deontic	
+Engine	signer_standing	deontic	
 Engine	accord_manifest_v2_message	nomological	
 Engine	audit_seal_entry	procedural	
 Engine	signer_ops_capsule	structural	

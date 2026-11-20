@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 170 delegations, generated. Every one: fault first, then delegate.
+// 169 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -1706,15 +1706,6 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.store_invalid_replaced_key_record(record).await
-    }
-    async fn store_lineage_head_cosign(
-        &self,
-        cosign: &lineage_witness::LineageHeadCosign,
-    ) -> Result<bool, Error> {
-        if let Some(e) = self.faulted("store_lineage_head_cosign") {
-            return Err(e);
-        }
-        self.inner.store_lineage_head_cosign(cosign).await
     }
     async fn store_projected_trust(&self, row: TrustRow) -> Result<bool, Error> {
         if let Some(e) = self.faulted("store_projected_trust") {

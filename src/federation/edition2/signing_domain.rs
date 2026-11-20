@@ -39,6 +39,9 @@ pub const DOMAIN_PREIMAGE_PREFIX: &[u8] = b"ciris.signing_domain/v1\0";
 /// Refusal token: a tag the closed registry does not hold.
 pub const SIGNING_DOMAIN_UNKNOWN: &str = "signing_domain_unknown";
 
+/// Refusal token: a retired tag (it keeps its registry position).
+pub const SIGNING_DOMAIN_RETIRED: &str = "signing_domain_retired";
+
 /// Refusal token: an accord manifest signed by a key that is not a holder of
 /// the genesis bundle in force.
 pub const ACCORD_MANIFEST_SIGNER_NOT_HOLDER: &str = "accord_manifest_signer_not_holder";
@@ -61,11 +64,19 @@ pub enum SigningDomain {
     AgentExternalDataSql,
     /// The Agent's verification-route response.
     AgentVerificationRoute,
+    /// An identity template's signature (its signer is an accord holder).
+    IdentityTemplate,
+    /// An emergency-shutdown command (F0-cp10; ruling: no raw-key
+    /// exception): signed by a person's own composite key — the agent's
+    /// owner, a Wise Authority or an accord holder (ROOT) — verified by
+    /// identity-ref through the directory; the authority is the signer's
+    /// standing ([`signer_standing`]), never a key list.
+    EmergencyShutdown,
 }
 
 impl SigningDomain {
     /// Every domain, in registry order (pinned by position).
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::AuditEntry,
         Self::AccordManifest,
         Self::AgentSystemTask,
@@ -73,6 +84,34 @@ impl SigningDomain {
         Self::AgentDsarProof,
         Self::AgentExternalDataSql,
         Self::AgentVerificationRoute,
+        Self::IdentityTemplate,
+        Self::EmergencyShutdown,
+    ];
+
+    /// The registry's positions in order, the RETIRED ones included (`None`):
+    /// a retired tag keeps its position and is never reused or re-admitted
+    /// (I2060).
+    pub const POSITIONS: [(&'static str, Option<Self>); 10] = [
+        ("ciris.audit_entry.v1", Some(Self::AuditEntry)),
+        ("ciris.accord_manifest.v2", Some(Self::AccordManifest)),
+        ("ciris.agent.system_task.v1", Some(Self::AgentSystemTask)),
+        (
+            "ciris.agent.deferral_resolution.v1",
+            Some(Self::AgentDeferralResolution),
+        ),
+        ("ciris.agent.dsar_proof.v1", Some(Self::AgentDsarProof)),
+        (
+            "ciris.agent.external_data_sql.v1",
+            Some(Self::AgentExternalDataSql),
+        ),
+        (
+            "ciris.agent.verification_route.v1",
+            Some(Self::AgentVerificationRoute),
+        ),
+        ("ciris.identity_template.v1", Some(Self::IdentityTemplate)),
+        // F0-cp10: RETIRED (the carried-key WA domain, ruled out).
+        ("ciris.wa.emergency_shutdown.v1", None),
+        ("ciris.emergency_shutdown.v1", Some(Self::EmergencyShutdown)),
     ];
 
     /// The domain's tag, the bytes framed into its preimage.
@@ -86,6 +125,8 @@ impl SigningDomain {
             Self::AgentDsarProof => "ciris.agent.dsar_proof.v1",
             Self::AgentExternalDataSql => "ciris.agent.external_data_sql.v1",
             Self::AgentVerificationRoute => "ciris.agent.verification_route.v1",
+            Self::IdentityTemplate => "ciris.identity_template.v1",
+            Self::EmergencyShutdown => "ciris.emergency_shutdown.v1",
         }
     }
 
@@ -94,6 +135,14 @@ impl SigningDomain {
     /// # Errors
     /// [`Error::InvalidArgument`] leading with [`SIGNING_DOMAIN_UNKNOWN`].
     pub fn from_tag(tag: &str) -> Result<Self, Error> {
+        if Self::POSITIONS
+            .iter()
+            .any(|(t, live)| *t == tag && live.is_none())
+        {
+            return Err(Error::InvalidArgument(format!(
+                "{SIGNING_DOMAIN_RETIRED}: {tag:?} is a retired signing domain"
+            )));
+        }
         Self::ALL
             .into_iter()
             .find(|d| d.tag() == tag)
@@ -241,6 +290,105 @@ where
     }
 }
 
+/// v62.0.0 (F0-cp10; ruling: authority from standing, not a key list) —
+/// **what standing a signer has over an agent**, the check an emergency
+/// shutdown needs after its composite verifies
+/// ([`verify_domain_composite_via_directory`] in
+/// [`SigningDomain::EmergencyShutdown`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignerStanding {
+    /// An accord holder of the genesis bundle in force.
+    Root,
+    /// A Wise Authority: an ACTIVE member of the named WA body (a family,
+    /// the conferred seat) whose record also carries the `wise_authority`
+    /// card (CC 4.3). The card alone is self-declared at registration
+    /// (`ConferralMode::DerivedFromVerifiedState`) and confers nothing.
+    WiseAuthority,
+    /// The agent's one counted owner.
+    Owner,
+    /// None of the above.
+    None,
+}
+
+impl SignerStanding {
+    /// The wire token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::WiseAuthority => "wise_authority",
+            Self::Owner => "owner",
+            Self::None => "none",
+        }
+    }
+}
+
+/// **The signer's standing over `agent_ref`, at `at_ms`** — built on the
+/// existing reads, no new rule, first match wins:
+///
+/// 1. [`SignerStanding::Root`] — `identity_ref` is a holder of the genesis
+///    bundle in force
+///    ([`genesis_in_force`](super::genesis::genesis_in_force) +
+///    [`GenesisInForce::is_holder`](super::genesis::GenesisInForce::is_holder));
+/// 2. [`SignerStanding::WiseAuthority`] — `wa_body` names a WA body (a family;
+///    never the accord's own roster), `identity_ref` is one of its ACTIVE
+///    members ([`FederationDirectory::active_family_members`], the conferred
+///    seat), and its key read model carries the `wise_authority` card
+///    ([`FederationDirectory::lookup_public_key`]): the same two reads
+///    ownership reclaim counts a WA by (`ownership_reclaim::wa_quorum_over_body`).
+///    With no `wa_body`, nobody is a Wise Authority: the card is self-declared
+///    at registration and is never standing by itself;
+/// 3. [`SignerStanding::Owner`] — `identity_ref` is the agent's one counted
+///    owner ([`agent_owner_of`](crate::federation::admission::agent_owner_of)
+///    at `at_ms`); two counted owners resolve fail-closed to no owner;
+/// 4. [`SignerStanding::None`].
+///
+/// It reads standing only: the caller verifies the signature first.
+///
+/// # Errors
+/// Directory reads.
+pub async fn signer_standing<F>(
+    dir: &F,
+    identity_ref: &str,
+    agent_ref: &str,
+    wa_body: Option<&str>,
+    at_ms: u64,
+) -> Result<SignerStanding, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use crate::federation::types::identity_type;
+    if super::genesis::genesis_in_force(dir)
+        .await?
+        .is_holder(identity_ref)
+    {
+        return Ok(SignerStanding::Root);
+    }
+    if let Some(body) = wa_body.filter(|b| {
+        !b.trim().is_empty()
+            && *b != ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
+    }) {
+        let seated = match dir.active_family_members(body).await {
+            Ok(members) => members.iter().any(|m| m.key_id == identity_ref),
+            Err(Error::Unsupported { .. }) => false,
+            Err(e) => return Err(e),
+        };
+        if seated {
+            if let Some(rec) = dir.lookup_public_key(identity_ref).await? {
+                if identity_type::set_contains(&rec.identity_type, identity_type::WISE_AUTHORITY) {
+                    return Ok(SignerStanding::WiseAuthority);
+                }
+            }
+        }
+    }
+    match crate::federation::admission::agent_owner_of(dir, agent_ref, at_ms).await {
+        Ok(Some(owner)) if owner == identity_ref => Ok(SignerStanding::Owner),
+        Ok(_) | Err(Error::AmbiguousNodeOwner { .. }) => Ok(SignerStanding::None),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +408,8 @@ mod tests {
                 "ciris.agent.dsar_proof.v1",
                 "ciris.agent.external_data_sql.v1",
                 "ciris.agent.verification_route.v1",
+                "ciris.identity_template.v1",
+                "ciris.emergency_shutdown.v1",
             ],
             "I2899: appended only, pinned by position"
         );
@@ -292,5 +442,46 @@ mod tests {
             "I2899: the accord manifest preimage stays small"
         );
         assert!(accord_manifest_v2_message("AB", 10, "urn:x").is_err());
+
+        // I2060 — the registry's positions, the retired one included, pinned.
+        let positions: Vec<(&str, bool)> = SigningDomain::POSITIONS
+            .iter()
+            .map(|(t, live)| (*t, live.is_some()))
+            .collect();
+        assert_eq!(
+            positions,
+            [
+                ("ciris.audit_entry.v1", true),
+                ("ciris.accord_manifest.v2", true),
+                ("ciris.agent.system_task.v1", true),
+                ("ciris.agent.deferral_resolution.v1", true),
+                ("ciris.agent.dsar_proof.v1", true),
+                ("ciris.agent.external_data_sql.v1", true),
+                ("ciris.agent.verification_route.v1", true),
+                ("ciris.identity_template.v1", true),
+                ("ciris.wa.emergency_shutdown.v1", false),
+                ("ciris.emergency_shutdown.v1", true),
+            ],
+            "I2060: appended only, a retired position kept, never reused"
+        );
+        for (t, live) in SigningDomain::POSITIONS {
+            if let Some(d) = live {
+                assert_eq!(d.tag(), t, "I2060: the position names its tag");
+            }
+        }
+        assert_eq!(
+            SigningDomain::POSITIONS
+                .iter()
+                .filter(|(_, l)| l.is_some())
+                .count(),
+            SigningDomain::ALL.len(),
+            "I2060: every live domain has one position"
+        );
+        match SigningDomain::from_tag("ciris.wa.emergency_shutdown.v1") {
+            Err(Error::InvalidArgument(m)) => {
+                assert!(m.starts_with(SIGNING_DOMAIN_RETIRED), "I2060: {m}");
+            }
+            other => panic!("I2060: a retired tag is refused by name: {other:?}"),
+        }
     }
 }

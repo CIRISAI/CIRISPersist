@@ -145,7 +145,6 @@ deontic	binding	181	Engine	put_family_json
 deontic	binding	181	Engine	put_fountain_content	
 deontic	binding	181	Engine	put_genesis_bundle	
 deontic	binding	181	Engine	put_identity_occurrence_json	
-deontic	binding	181	Engine	put_lineage_head_cosign_json	
 deontic	binding	181	Engine	put_plaintext_dag_chunk	
 deontic	binding	181	Engine	put_public_key	
 deontic	binding	181	Engine	put_revocation	
@@ -205,6 +204,7 @@ deontic	binding	181	Engine	set_retention
 deontic	binding	181	Engine	set_storage_budget_bytes	
 deontic	binding	181	Engine	set_trust_threshold	
 deontic	binding	181	Engine	sign_stream_sth_json	
+deontic	binding	181	Engine	signer_standing	
 deontic	binding	181	Engine	steward_bind	
 deontic	binding	181	Engine	steward_bind_incapacity	
 deontic	binding	181	Engine	storage_budget_supersedes	

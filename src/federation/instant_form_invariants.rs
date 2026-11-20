@@ -9,6 +9,9 @@
 //! seam reaches the connection). The pass then runs at the next open, and the
 //! result is counted from disk.
 
+// v62 BF13: the bodies' callers are `_pyffi`-gated; a non-pyffi lib-test
+// build (the CI lib lane's `postgres,sqlite`) reads them as dead.
+#[cfg_attr(not(feature = "_pyffi"), allow(dead_code, unused_imports))]
 pub(crate) mod bodies {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{attestation_type, cohort_scope, identity_type as it};

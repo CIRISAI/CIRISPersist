@@ -37,6 +37,10 @@
 //!   blob, by the projection-time check; a component `qa` lands.
 //! - **I3471 (pure, effective kind)** a component-only mock seals as
 //!   `manifest.run_kind == "mock"`; a non-mock manifest is unchanged.
+//! - **P7-fix11:** `"3.1.1"` (CIRISAgent 2.23.2) rides the same path: I3471
+//!   checks it; I3470 runs a 3.1.1 batch whose `context_manifest` carries
+//!   `facts` (four booleans) through the same assertions, plus the run_kind
+//!   mock rule at 3.1.1 (`exercise_mock_rule_at`).
 //! - **I3471 (pure, mock)** `CompleteTrace::signs_mock_run` and
 //!   `steward_purge::trace_signs_mock` agree on a table of signed places.
 
@@ -129,6 +133,17 @@ fn context_manifest(segments: usize) -> serde_json::Value {
              "detail": {"rule": "token_budget", "matched": 0}},
         ],
         "assembled_by": {"component": "context_builder", "version": "3.1.0"},
+    })
+}
+
+/// v62.0.0 (P7-fix11; CC 3.1.5, CIRISAgent 2.23.2) — the `facts` member a
+/// 3.1.1 agent adds to the LLM_CALL's `context_manifest`: four booleans.
+fn manifest_facts() -> serde_json::Value {
+    serde_json::json!({
+        "signed_guidance_in_force": true,
+        "amendment_in_force": false,
+        "id_scoped": true,
+        "advisory_rule": false,
     })
 }
 
@@ -307,11 +322,23 @@ fn i3471_3_1_0_is_a_jcs_epoch_label_on_the_3_0_0_path() {
         "3.1.0"
     );
     assert_eq!(canon_version_for_trace_schema("3.1.0"), CanonVersion::V2Jcs);
+    // v62.0.0 (P7-fix11) — "3.1.1", the label CIRISAgent 2.23.2 stamps.
+    assert!(
+        crate::schema::SUPPORTED_VERSIONS.contains(&"3.1.1"),
+        "I3471"
+    );
+    assert_eq!(
+        crate::schema::SchemaVersion::parse("3.1.1")
+            .unwrap()
+            .as_str(),
+        "3.1.1"
+    );
+    assert_eq!(canon_version_for_trace_schema("3.1.1"), CanonVersion::V2Jcs);
 
     // from_json: the 3.0.0 path (no deployment_profile demanded, unlike
     // 2.7.9), at both versions, with the manifest and the unknown members.
     let manifest = context_manifest(13);
-    for v in ["3.0.0", "3.1.0"] {
+    for v in ["3.0.0", "3.1.0", "3.1.1"] {
         let mut trace = trace_at(
             v,
             "i3471",
@@ -353,10 +380,14 @@ fn i3471_3_1_0_is_a_jcs_epoch_label_on_the_3_0_0_path() {
     let v310: serde_json::Value = serde_json::from_slice(&b310).unwrap();
     v300["trace_schema_version"] = serde_json::json!("3.1.0");
     assert_eq!(v300, v310, "I3471: the 3.0.0 canonical layout");
+    let b311 = canonical_bytes_for_trace(&at("3.1.1"), c).expect("3.1.1 dispatches");
+    let v311: serde_json::Value = serde_json::from_slice(&b311).unwrap();
+    v300["trace_schema_version"] = serde_json::json!("3.1.1");
+    assert_eq!(v300, v311, "I3471: 3.1.1 on the 3.0.0 canonical layout");
 
     // The typed llm_call projection ignores the manifest and the unknown
     // member, at both versions.
-    for v in ["3.0.0", "3.1.0"] {
+    for v in ["3.0.0", "3.1.0", "3.1.1"] {
         let with = llm_rows(&trace_at(
             v,
             "i3471",
@@ -379,7 +410,11 @@ where
     let agent = unique("agent");
     let kid = e2::put_key(d, &agent, &["agent"]).await;
     let at = dated_ms(&agent);
-    let manifest = context_manifest(segments);
+    let mut manifest = context_manifest(segments);
+    // v62.0.0 (P7-fix11) — a 3.1.1 agent's manifest carries `facts`.
+    if version == "3.1.1" {
+        manifest["facts"] = manifest_facts();
+    }
     let size = jcs(&manifest).len();
     assert!(
         (6_000..=12_288).contains(&size),
@@ -471,6 +506,17 @@ where
     // member, `run_kind`, both `egress_alterations` entries — with and
     // without `sha256` — included) and the THOUGHT_START's (`run_kind`, no
     // `egress_alterations`).
+    //
+    // P7-fix10 — "as sent" is the trace BLOB: the bytes the agent signed and
+    // the wire carried (JCS), not the in-memory fixture value. JCS writes an
+    // integral float as an integer (`weight: 1.0` → `1`), so the fixture's
+    // `Number::Float(1.0)` and the wire's `Number::PosInt(1)` are different
+    // `serde_json` values for the SAME member; comparing against the fixture
+    // compared the wrong thing. The stored data is compared WHOLE against the
+    // data in the sent bytes (value equality, every member), and byte for
+    // byte (JCS) against both the sent bytes' data and the fixture.
+    let sent_trace: serde_json::Value =
+        serde_json::from_slice(&blob).expect("the sent blob is JSON");
     for (i, event_type) in [
         (0, crate::schema::ReasoningEventType::ThoughtStart),
         (1, crate::schema::ReasoningEventType::LlmCall),
@@ -479,19 +525,49 @@ where
             .iter()
             .find(|r| r.event_type == event_type)
             .expect("the component's row");
-        let sent = trace["components"][i]["data"]
+        let sent = sent_trace["components"][i]["data"]
             .as_object()
             .expect("the data object");
         assert_eq!(
             &row.payload, sent,
             "I3470 {version}: component {i}'s data reads back whole"
         );
+        let fixture = trace["components"][i]["data"]
+            .as_object()
+            .expect("the fixture's data object");
         assert_eq!(
-            jcs(&serde_json::Value::Object(row.payload.clone())),
+            row.payload
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+            fixture.keys().collect::<std::collections::BTreeSet<_>>(),
+            "I3470 {version}: component {i}: every member the producer set is stored"
+        );
+        let stored_jcs = jcs(&serde_json::Value::Object(row.payload.clone()));
+        assert_eq!(
+            stored_jcs,
             jcs(&serde_json::Value::Object(sent.clone())),
-            "I3470 {version}: component {i}'s data, byte for byte (JCS)"
+            "I3470 {version}: component {i}'s data, byte for byte (JCS) as sent"
+        );
+        assert_eq!(
+            stored_jcs,
+            jcs(&serde_json::Value::Object(fixture.clone())),
+            "I3470 {version}: component {i}'s data, byte for byte (JCS) as produced"
         );
     }
+    // An unknown member is IGNORED, not refused (every version, 3.1.1 included):
+    // the batch above landed with an unknown member in the LLM_CALL's data
+    // and one at the trace's top level; the data member is stored as sent,
+    // and the typed projection (below) never reads it.
+    assert_eq!(
+        llm.payload.get("x_future_member"),
+        Some(&serde_json::json!({"note": "a member this build has never seen", "n": 3})),
+        "I3470 {version}: an unknown data member is kept, not refused"
+    );
+    assert_eq!(
+        sent_trace.get("x_future_trace_member"),
+        Some(&serde_json::json!("ignored, not refused")),
+        "I3470 {version}: the landed trace carried an unknown top-level member"
+    );
     assert_eq!(
         llm.payload.get("egress_alterations"),
         Some(&egress_alterations()),
@@ -793,6 +869,57 @@ where
     );
 }
 
+/// **I3470 (3.1.1 mock leg; P7-fix11)** — the run_kind mock rule holds at
+/// `version`: a trace whose ONLY `mock` is a component's signed
+/// `data.run_kind`, its manifest carrying `facts`, is refused
+/// `trace_run_kind_mock` at the batch door (its row's manifest says `mock`,
+/// and the federation tier refuses it on any node), and nothing lands; the
+/// same trace with a component `qa` lands.
+async fn exercise_mock_rule_at<D>(d: &D, version: &str)
+where
+    D: Backend + FederationDirectory + BlobStorage,
+{
+    let agent = unique("agent-mock-at");
+    e2::put_key(d, &agent, &["agent"]).await;
+    let at = dated_ms(&agent);
+    let mut manifest = context_manifest(13);
+    manifest["facts"] = manifest_facts();
+    let row_batch = |trace_id: &str, kinds: [&str; 2]| {
+        let blob = canonical_trace_blob(&trace_at(
+            version,
+            trace_id,
+            at,
+            Some(&manifest),
+            Some(kinds),
+        ))
+        .expect("a trace object");
+        batch_of(version, &row_of(&agent, &blob), &blob)
+    };
+    let t1 = unique("mock-at");
+    let e = ingest(d, &row_batch(&t1, ["production", "mock"]))
+        .await
+        .expect_err("I3470 mock: a component-only mock");
+    assert_eq!(
+        e.kind(),
+        crate::federation::steward_purge::TRACE_RUN_KIND_MOCK,
+        "I3470 {version} mock: by name"
+    );
+    assert_eq!(
+        events_count(d, &t1).await,
+        0,
+        "I3470 {version} mock: nothing lands"
+    );
+    let t2 = unique("qa-at");
+    ingest(d, &row_batch(&t2, ["production", "qa"]))
+        .await
+        .unwrap_or_else(|e| panic!("I3470 {version}: a qa run lands: {} ({e})", e.kind()));
+    assert_eq!(
+        events_count(d, &t2).await,
+        2,
+        "I3470 {version}: the qa trace lands"
+    );
+}
+
 #[cfg(feature = "sqlite")]
 mod sqlite {
     use super::*;
@@ -833,6 +960,19 @@ mod sqlite {
             ["prod-managed", "battery"],
         ))
         .await;
+    }
+
+    #[tokio::test]
+    async fn i3470_context_manifest_3_1_1_sqlite() {
+        let b = backend().await;
+        Box::pin(exercise_context_manifest(
+            &b,
+            "3.1.1",
+            16,
+            ["production", "qa"],
+        ))
+        .await;
+        Box::pin(exercise_mock_rule_at(&b, "3.1.1")).await;
     }
 }
 
@@ -877,5 +1017,18 @@ mod postgres {
             ["prod-managed", "battery"],
         ))
         .await;
+    }
+
+    #[tokio::test]
+    async fn i3470_context_manifest_3_1_1_postgres() {
+        let Some(b) = backend().await else { return };
+        Box::pin(exercise_context_manifest(
+            &b,
+            "3.1.1",
+            16,
+            ["production", "qa"],
+        ))
+        .await;
+        Box::pin(exercise_mock_rule_at(&b, "3.1.1")).await;
     }
 }

@@ -4050,11 +4050,14 @@ pub async fn dispatch_directory_op(
             Ok(o) => DirectoryOpResult::ReplicatedAttestationOutcome(o),
             Err(e) => op_err(&e),
         },
+        // v62.0.0 (F0-cp9) — RETIRED: the lineage-head cosign door was the
+        // earlier form (a bound-hybrid witness signature) with no edition-2
+        // form (CC: OPEN). The op keeps its fields (ABI 14); it refuses.
         DirectoryOp::PutLineageHeadCosign { cosign } => {
-            match dir.put_lineage_head_cosign(cosign).await {
-                Ok(o) => DirectoryOpResult::LineageCosignOutcome(o),
-                Err(e) => op_err(&e),
-            }
+            let _ = cosign;
+            op_err(&crate::federation::Error::Unsupported {
+                method: "put_lineage_head_cosign",
+            })
         }
         DirectoryOp::WithdrawsAdmissionDepth { attestation_id } => {
             match dir.withdraws_admission_depth(&attestation_id).await {
@@ -5106,23 +5109,6 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::WireHashes(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v51.0.0 (CIRISPersist#938) — the lineage-head cosign door, proxied.
-    async fn put_lineage_head_cosign(
-        &self,
-        cosign: crate::federation::lineage_witness::LineageHeadCosign,
-    ) -> Result<crate::federation::lineage_witness::LineageCosignOutcome, Error> {
-        match self
-            .run_op(&DirectoryOp::PutLineageHeadCosign { cosign })
-            .await?
-        {
-            DirectoryOpResult::LineageCosignOutcome(o) => Ok(o),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -12757,7 +12743,6 @@ mod tests {
         ("reseal_attestation_v31", INHERITED_DEFAULT),
         ("list_expired_attestation_ids", INHERITED_DEFAULT),
         ("purge_attestation_v31", INHERITED_DEFAULT),
-        ("store_lineage_head_cosign", INHERITED_DEFAULT),
         ("note_self_roster_proposal", INHERITED_DEFAULT),
         ("list_open_self_roster_proposals", INHERITED_DEFAULT),
         ("settle_self_roster_proposal", INHERITED_DEFAULT),
@@ -13092,6 +13077,13 @@ mod proxy_gate {
         // v62.0.0 (round 6) — the accord proposal / participation / decision
         // trait doors are deleted (JSON-cut slice F; a roster change is a later
         // genesis bundle); their append-only ops stay as refusing arms.
+        // v62.0.0 (F0-cp9r) — the lineage-head cosign trait door is deleted;
+        // the op keeps its fields (ABI 14) and refuses `Unsupported`.
+        (
+            "PutLineageHeadCosign",
+            "retired at v62.0.0 (F0-cp9r): its trait door is deleted; the op stays so an \
+             old consumer's call is refused by name, never issued by a current proxy",
+        ),
         (
             "PutAccordDecision",
             "retired at v62.0.0 (slice F): its trait door is deleted; the op stays so an \

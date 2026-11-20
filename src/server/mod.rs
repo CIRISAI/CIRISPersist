@@ -375,7 +375,7 @@ mod tests {
         // the JCS-cutover schema. v62.0.0 (P7-fix9) — 3.1.0, its label.
         assert_eq!(
             h.schema_versions_supported,
-            vec!["2.7.0", "2.7.9", "2.7.legacy", "3.0.0", "3.1.0"]
+            vec!["2.7.0", "2.7.9", "2.7.legacy", "3.0.0", "3.1.0", "3.1.1"]
         );
         assert!(h.queue_capacity_remaining > 0);
     }

@@ -1038,15 +1038,10 @@ where
             identity_key_id,
             ..
         } => {
-            // The generic rule (a `withdraws` is never a minted row).
-            super::tier_ingest::verify_envelope_signed_row(dir, row).await?;
-            super::admission::check_signer_acts_for(
-                dir,
-                &row.attesting_key_id,
-                identity_key_id,
-                "self_roster",
-            )
-            .await
+            // v62.0.0 (F0-cp9) — the generic rule (a `withdraws` is never a
+            // minted row) is the earlier form: deleted, refused by name.
+            let _ = (row, identity_key_id);
+            Err(super::edition2::door::earlier_form_signature("self_roster"))
         }
     }
 }

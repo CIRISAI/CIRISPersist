@@ -766,6 +766,15 @@ class Engine:
         "manifest_size", "signer_identity"})). A holder signs it in the
         "ciris.accord_manifest.v2" domain."""
 
+    def signer_standing(self, identity_ref: str, agent_ref: str, wa_body: str | None = None) -> str:
+        """v62.0.0 — the signer's standing over the agent, now: "root" (an
+        accord holder of the genesis in force), "wise_authority" (an active
+        member of the WA body family `wa_body` names, carrying the
+        wise_authority card; the card alone is self-declared and never
+        standing; no wa_body → never), "owner" (the
+        agent's one counted owner) or "none"; first match wins. Verify the
+        shutdown's composite first (domain "ciris.emergency_shutdown.v1")."""
+
     def verify_accord_manifest_v2(self, manifest_sha256_hex: str, manifest_size: int, signer_identity: str, composite_sig: bytes) -> None:
         """v62.0.0 — verify an accord manifest signature (v2): the signer must
         be an accord holder of the genesis bundle in force
@@ -1264,9 +1273,6 @@ class Engine:
 
     def put_identity_occurrence_json(self, payload_json: str) -> None:
         """(derived) deontic — v3.12.0 (CIRISPersist#153 Ask 1, CEG 0.7 §5.6.8.8) — admit an identity_occurrence binding (this occurrence_key_id IS also identity_key_id)."""
-
-    def put_lineage_head_cosign_json(self, payload_json: str) -> str:
-        """(derived) deontic — v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) — the lineage-head cosign door: payload_json is a ciris.lineage_head_cosign.v1 object (lineage_key_id, he..."""
 
     def put_plaintext_dag_chunk(self, chunk_sha256_hex: str, size: int, body: bytes, author_key_id: str) -> str:
         """(derived) deontic — v55.0.0 (CIRISPersist#952, CIRISEdge#734) — store ONE chunk of a plaintext chunk DAG ahead of its manifest (Engine::put_plaintext_dag_chunk). chunk..."""

@@ -283,9 +283,6 @@ pub(crate) mod held_settle_invariants;
 /// licence's signed instant by ONE function the gate and the fold share.
 #[cfg(test)]
 pub mod licensure_chain_invariants;
-/// v53.1.2 (CIRISPersist#984 row 16) — withdrawing a location proof (I519).
-#[cfg(test)]
-mod location_proof_withdraw_invariants;
 /// v52.0.0 (CIRISPersist#955) — the joiner's signed acceptance.
 pub mod membership_acceptance;
 /// v52.0.0 (CIRISPersist#955) — I210–I219.
@@ -1147,8 +1144,7 @@ pub use tier_ingest::{
     verify_community_admission, verify_community_membership_revocation_admission,
     verify_community_membership_widening_admission, verify_family_admission,
     verify_family_membership_revocation_admission, verify_family_membership_widening_admission,
-    verify_federation_tier_ingest, verify_location_proof_admission, verify_revocation_admission,
-    verify_row_hybrid_signature,
+    verify_federation_tier_ingest, verify_revocation_admission, verify_row_hybrid_signature,
 };
 pub use topology::{
     build_delegation_graph, build_trust_topology, effective_delegation_depth, AuditChainEntry,
@@ -6690,35 +6686,6 @@ pub trait FederationDirectory: Send + Sync {
         Err(Error::Unsupported {
             method: "lookup_signed_community",
         })
-    }
-
-    /// v51.0.0 (CIRISPersist#938, CC 3.2 T6) — store one admitted lineage-head
-    /// cosign (the witness plane, V159). The DOOR — every refusal of FSD
-    /// `TRUST_ROOT_RC6.md` §2.1 — is [`lineage_witness::admit_lineage_head_cosign`];
-    /// this is the raw store it ends in. Returns `true` when inserted, `false`
-    /// when the identical row was already held. Default `Unsupported`; every
-    /// real backend overrides.
-    async fn store_lineage_head_cosign(
-        &self,
-        cosign: &lineage_witness::LineageHeadCosign,
-    ) -> Result<bool, Error> {
-        let _ = cosign;
-        Err(Error::Unsupported {
-            method: "store_lineage_head_cosign",
-        })
-    }
-
-    /// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) — **the lineage-head cosign
-    /// door**: [`lineage_witness::admit_lineage_head_cosign`] over this
-    /// directory at the door's one clock read. A trait method so the capsule
-    /// proxies it (a replication bridge forwards cosigns) and every backend
-    /// runs the same door; the default body IS the door — no backend
-    /// overrides it.
-    async fn put_lineage_head_cosign(
-        &self,
-        cosign: lineage_witness::LineageHeadCosign,
-    ) -> Result<lineage_witness::LineageCosignOutcome, Error> {
-        lineage_witness::admit_lineage_head_cosign(self, &cosign, crate::host::clock::now()).await
     }
 
     /// v51.0.0 (CIRISPersist#938) — every cosign held for `lineage_key_id`,

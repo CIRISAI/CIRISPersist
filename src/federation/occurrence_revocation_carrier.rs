@@ -268,23 +268,16 @@ where
     if is_single_signer_identity(dir, &identity).await? {
         return Ok(());
     }
-    let mut offered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    offered.insert(framed.attesting_key_id.clone());
-    for (i, scrub) in row.additional_scrubs.iter().enumerate() {
-        crate::federation::edition2::group::vouched_envelope(
-            &scrub.scrub_key_id,
-            &row.attestation_envelope,
-            &scrub.scrub_signature_classical,
+    // v62.0.0 (F0-cp9) — a cosignature on the carrier is an earlier-form
+    // scrub (its envelope verify is deleted): refused by name. The carrier's
+    // own signer counts alone.
+    if !row.additional_scrubs.is_empty() {
+        return Err(super::edition2::door::earlier_form_signature(
             "occurrence_revocation_carrier",
-        )
-        .map_err(|e| {
-            Error::SignatureInvalid(format!(
-                "occurrence revocation carrier {}: cosignature [{i}] by {} does not verify: {e}",
-                row.attestation_id, scrub.scrub_key_id
-            ))
-        })?;
-        offered.insert(scrub.scrub_key_id.clone());
+        ));
     }
+    let offered: std::collections::BTreeSet<String> =
+        std::iter::once(framed.attesting_key_id.clone()).collect();
     let count = roster_majority(dir, &identity, &offered).await?;
     if !count.met() {
         return Err(super::edition2::fold::hold(

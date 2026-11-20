@@ -749,15 +749,19 @@ pub async fn record_quarantine_marker(
         return refused(QuarantineRefusalReason::SubjectKeyUnknown);
     }
 
-    // The author's own signature, re-verified against pubkeys resolved from
-    // this node's directory (#377 — never pubkeys carried on the row).
-    if crate::federation::edition2::group::vouched_envelope(
-        &marker.attesting_key_id,
-        &marker.attestation_envelope,
-        &marker.scrub_signature_classical,
-        "quarantine_marker",
-    )
-    .is_err()
+    // The author's own signature, re-verified against this node's directory
+    // (#377 — never pubkeys carried on the row).
+    //
+    // v62.0.0 (F0-cp9; the one verify path, as `mesh_config`'s E6-fix8) — the
+    // ROW's verify: a v62 marker is the projection of the edition-2 statement
+    // it carries, proven by that statement's composite under the author's
+    // live key (`tier_ingest::verify_row_hybrid_signature` →
+    // `ingest::verify_carried`). cp8's envelope-only `vouched_envelope` could
+    // never pass one; a row carrying no statement meets the earlier-form
+    // arms, which refuse it by name.
+    if super::tier_ingest::verify_row_hybrid_signature(directory, marker)
+        .await
+        .is_err()
     {
         return refused(QuarantineRefusalReason::UnverifiableSignature);
     }
@@ -1409,8 +1413,9 @@ pub(crate) mod test_support {
         scopes: &[&str],
         at: DateTime<Utc>,
     ) -> Attestation {
+        // K2-fix13: no `dimension` (`delegation:duty:v1` is no registered
+        // dimension of `self:delegates_to`: `dimension_unregistered`).
         let mut envelope = serde_json::json!({
-            "dimension": "delegation:duty:v1",
             "scope": scopes,
         });
         // v60.0.0 (#1048) — a duty edge carries a term (CC 2.4).
@@ -1439,33 +1444,76 @@ pub(crate) mod test_support {
             .any(|r| r.attestation_id == id)
     }
 
-    /// v62.0.0 (K2-fix11) — the shared minor/adult fixture: a `witness` key
-    /// conferred `infra:attest_assurance` from `root`, accepted by THIS node
-    /// (`node_seed`, the identity the runner gave the backend), the three
-    /// conferral rows dated at `at` (a key-window instant, never today's
-    /// midnight). Returns the witness seed.
+    /// v62.0.0 (K2-fix11, K2-fix13) — the shared minor/adult fixture: a
+    /// `witness` key conferred `infra:attest_assurance` by W1b's ROOTED
+    /// edition-2 trust root (`fixture_trust_root::rooted_trust_root`: an
+    /// `infrastructure` community founded by the bundle's holders, its
+    /// charter, and THIS node's acceptance naming the held head), through
+    /// the root's `trust:confers:v1` grant and the witness's own second voice
+    /// (CC 2.6.1.9). Returns the witness seed.
+    ///
+    /// K2-fix13: the earlier fixture (`confer_scope_from_trusted_root_at`: a
+    /// bare key chartering itself) stands up no rooted trust root, so since
+    /// the pinned bundle's deletion (C5-fix1) its grant roots nowhere, the
+    /// age row is held `reserved_prefix_emitter_mismatch`, and no band
+    /// resolves. The grant is dated as W1b dates its own
+    /// (`put_conferral`): the bundle in force's newest tip + 90 s.
+    ///
+    /// # Panics
+    /// The node is not `node_seed`, a refusal, or the grant does not root at
+    /// the root through this node (`capability_roots_to_trusted_root`).
     async fn confer_age_witness(
         dir: &dyn FederationDirectory,
         node_seed: &str,
         tag: &str,
-        at: DateTime<Utc>,
     ) -> String {
-        let (witness, root) = (format!("{tag}-witness"), format!("{tag}-root"));
+        use crate::federation::edition2::fixture_genesis::HOLDER_SEEDS;
+        use crate::federation::edition2::fixture_trust_root::confers_statement;
+        use crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE;
+        let node = e2::kid(node_seed);
+        assert_eq!(
+            dir.node_key_id().as_deref(),
+            Some(node.as_str()),
+            "confer_age_witness: the runner gives the backend `node_seed`'s identity"
+        );
+        let witness = format!("{tag}-witness");
         register_key(
             dir,
             &witness,
             crate::federation::types::identity_type::WITNESS,
         )
         .await;
-        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root_at(
+        let r = e2::rooted_trust_root(dir, &HOLDER_SEEDS, "quorum:2/3").await;
+        let at = crate::federation::edition2::genesis::genesis_in_force(dir)
+            .await
+            .expect("the bundle in force")
+            .tips()
+            .iter()
+            .map(|t| t.asserted_at)
+            .max()
+            .expect("a bundle tip")
+            + 90_000;
+        let grant = confers_statement(&r, &e2::kid(&witness), &[INFRA_ATTEST_ASSURANCE], at);
+        e2::put_statement(dir, &grant)
+            .await
+            .unwrap_or_else(|e| panic!("confer_age_witness: the root's grant: {e}"));
+        e2::put_statement(dir, &e2::voice_of(&grant, &witness))
+            .await
+            .unwrap_or_else(|e| panic!("confer_age_witness: the witness's voice: {e}"));
+        let rooted = crate::federation::trust_root::capability_roots_to_trusted_root(
             dir,
-            node_seed,
-            &root,
+            &node,
             &e2::kid(&witness),
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
-            at,
+            INFRA_ATTEST_ASSURANCE,
         )
-        .await;
+        .await
+        .expect("capability_roots_to_trusted_root");
+        assert!(
+            rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
+            "confer_age_witness: the witness's {INFRA_ATTEST_ASSURANCE} roots at {} through this \
+             node: {rooted:?}",
+            r.root
+        );
         witness
     }
 
@@ -1530,8 +1578,9 @@ pub(crate) mod test_support {
         scope: &str,
         at: DateTime<Utc>,
     ) -> Attestation {
+        // K2-fix13: no `dimension` (a `delegates_to` duty edge names its
+        // duty by `scope`; an invented dimension is `dimension_unregistered`).
         let mut envelope = serde_json::json!({
-            "dimension": "delegation:duty:v1",
             "scope": [scope],
             "community_id": community_k,
         });
@@ -1647,7 +1696,7 @@ pub(crate) mod test_support {
             );
         let min = chrono::Duration::minutes(1);
         let hour = chrono::Duration::hours(1);
-        let witness = confer_age_witness(dir, node_seed, &k("age"), late).await;
+        let witness = confer_age_witness(dir, node_seed, &k("age")).await;
         put_age_row(
             dir,
             &witness,
@@ -1823,7 +1872,7 @@ pub(crate) mod test_support {
             );
         let min = chrono::Duration::minutes(1);
         let hour = chrono::Duration::hours(1);
-        let witness = confer_age_witness(dir, node_seed, &k("age"), late).await;
+        let witness = confer_age_witness(dir, node_seed, &k("age")).await;
         put_age_row(
             dir,
             &witness,
@@ -2180,8 +2229,8 @@ pub(crate) mod test_support {
         // The founder's duty edge onto `grantee`, naming C; `custody` adds
         // the owner-binding purpose (a custody claim).
         let edge = |grantee: &str, custody: bool, at: DateTime<Utc>| {
+            // K2-fix13: no `dimension` (`dimension_unregistered`).
             let mut envelope = serde_json::json!({
-                "dimension": "delegation:duty:v1",
                 "scope": [DELEGATION_SCOPE_SLASH],
                 "community_id": community_k,
             });
@@ -2280,7 +2329,7 @@ pub(crate) mod test_support {
         // of an adult; none is attested here, so `target_is_self_sovereign`).
         let adult = format!("q11-adult-{suffix}");
         register_user_key(dir, &adult).await;
-        let witness = confer_age_witness(dir, node_seed, &format!("q11-age-{suffix}"), late).await;
+        let witness = confer_age_witness(dir, node_seed, &format!("q11-age-{suffix}")).await;
         put_age_row(
             dir,
             &witness,

@@ -21,7 +21,6 @@ trait	put_family	refuses	federation/family_admit.rs::put_family_planned	-
 trait	put_family_membership_revocation	refuses	federation/family_admit.rs::put_family_membership_revocation_planned	-
 trait	put_family_membership_widening	refuses	federation/family_admit.rs::put_family_membership_widening_planned	-
 trait	put_identity_occurrence	refuses	federation/occurrence_admit.rs::put_identity_occurrence_planned	-
-trait	put_lineage_head_cosign	refuses	federation/lineage_witness.rs::admit_lineage_head_cosign	-
 trait	put_location_proof	refuses	federation/evidence_admit.rs::put_location_proof_planned	-
 trait	put_public_key	refuses	federation/key_plane.rs::key_record_write_planned	-
 trait	put_revocation	refuses	federation/key_plane.rs::put_revocation_planned	-
@@ -31,7 +30,6 @@ trait	put_wholeness_witness	composite	federation/evidence_admit.rs::put_wholenes
 trait	revoke_member	refuses	trait:*	-
 trait	revoke_trust	refuses	federation/consent_admit.rs::revoke_trust_planned	-
 trait	store_invalid_replaced_key_record	refuses	federation/key_plane.rs::key_record_write_planned	-
-trait	store_lineage_head_cosign	refuses	federation/lineage_witness.rs::plan_store_lineage_head_cosign	the store leaf is a trait door too; both backends refuse on the shared plan first (E8-fix4)
 trait	store_rebound_key_record	refuses	federation/key_plane.rs::key_record_write_planned	-
 trait	supersede_affiliations	refuses	federation/group_amendment.rs::supersede_community_signed	-
 trait	supersede_affiliations_with_quorum	refuses	federation/group_amendment.rs::supersede_community_signed	-
@@ -106,7 +104,6 @@ pyo3	put_edge_detection_event	exempt	-	an adjacent signed plane (edge detection)
 pyo3	put_family_json	refuses	-	refuses in its own body, before any decode (D1)
 pyo3	put_fountain_content	node_local	store/sqlite.rs::put_fountain_content > store/backend_plan.rs::put_fountain_content_planned > fountain/admit.rs::check_admission | store/postgres.rs::put_fountain_content > store/backend_plan.rs::put_fountain_content_planned > fountain/admit.rs::check_admission	NODE-LOCAL (CC: the fountain is not a CC object): a manifest produced by another node is refused fountain_manifest_not_cc_object; this node's own coding is unpinned (CC 1.13.4)
 pyo3	put_identity_occurrence_json	refuses	-	refuses in its own body, before any decode (D1)
-pyo3	put_lineage_head_cosign_json	refuses	-	refuses in its own body, before any decode (D1)
 pyo3	put_public_key	refuses	-	refuses in its own body, before any decode (D1)
 pyo3	put_revocation	refuses	-	refuses in its own body, before any decode (D1)
 pyo3	put_scope_blob	exempt	-	node-local bytes or tier data under this node's own signer; no signed object is admitted
@@ -149,7 +146,7 @@ capsule	PutFamilyMembershipRevocation	refuses	trait:*	-
 capsule	PutFamilyMembershipWidening	refuses	trait:*	-
 capsule	PutIdentityOccurrence	refuses	trait:*	-
 capsule	PutIdentityOccurrenceRevocation	retired	-	-
-capsule	PutLineageHeadCosign	refuses	trait:*	-
+capsule	PutLineageHeadCosign	retired	-	F0-cp9: the lineage-head cosign door (earlier form, no edition-2 form: CC OPEN) is deleted; the append-only op refuses Unsupported
 capsule	PutLocationProof	refuses	trait:*	-
 capsule	PutPublicKey	refuses	trait:*	-
 capsule	PutRevocation	refuses	trait:*	-

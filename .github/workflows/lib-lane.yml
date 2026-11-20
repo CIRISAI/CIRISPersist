@@ -1,0 +1,301 @@
+name: lib lane (partitioned lib suite on runners)
+
+# v62 — the full `--features postgres,sqlite --lib` suite, built ONCE into a
+# nextest archive and run as N hash partitions on GitHub runners, so the shared
+# build box is not the bottleneck for an integration branch's red list.
+#
+# This is a TRIAGE lane, not a gate: the tree it runs on is known-red. The
+# `test` jobs go red when their partition has failures; the `summary` job never
+# does, and prints one page (total run, failed, the failed names) plus a merged
+# `fails.tsv` artifact.
+#
+# `push` is the trigger because a workflow file that exists only on a branch
+# cannot be dispatched (`workflow_dispatch` resolves against the default
+# branch). Once this file is on main:
+#   gh workflow run lib-lane.yml --ref <branch> -f partitions=8
+
+on:
+  push:
+    branches:
+      - 'v62-int*'
+      - 'release/62'
+  workflow_dispatch:
+    inputs:
+      partitions:
+        description: "Number of hash partitions (1-32)"
+        required: false
+        default: "8"
+
+permissions:
+  contents: read
+  packages: read   # ghcr.io/cirisai/postgres:16 + the CIRISCache restore; this lane never saves
+
+# A new push on the same ref supersedes the running one.
+concurrency:
+  group: lib-lane-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONUTF8: "1"
+  # Same as ci.yml, deliberately: RUSTFLAGS is part of every unit's
+  # fingerprint, so a different value here would turn the CIRISCache restore
+  # into a cold compile. The build step falls back to no `-D warnings` if the
+  # tree does not build under it (a triage lane wants results either way).
+  RUSTFLAGS: -D warnings
+  CARGO_NET_RETRY: '10'
+  CARGO_HTTP_MULTIPLEXING: 'false'
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      n: ${{ steps.m.outputs.n }}
+    steps:
+      - id: m
+        env:
+          PARTITIONS: ${{ inputs.partitions || '8' }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          n = int(os.environ["PARTITIONS"])
+          if not 1 <= n <= 32:
+              raise SystemExit(f"partitions must be 1-32, got {n}")
+          print("n=" + str(n))
+          print("matrix=" + json.dumps({"p": list(range(1, n + 1))}))
+          EOF
+
+  build:
+    name: build (nextest archive, postgres+sqlite --lib)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - name: Free runner disk (reclaim unused preinstalled toolchains)
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          echo "after:"; df -h / | tail -1
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
+      - name: install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: cargo nextest archive
+        run: |
+          set -uo pipefail
+          archive() {
+            cargo nextest archive --features postgres,sqlite --lib \
+              --archive-file lib.tar.zst
+          }
+          if ! archive; then
+            echo "::warning::the tree did not build under RUSTFLAGS='-D warnings'; rebuilding without it (cold: the cache does not apply)"
+            rm -f lib.tar.zst
+            export RUSTFLAGS=""
+            archive
+          fi
+          ls -l lib.tar.zst
+          df -h / | tail -1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lib-lane-archive
+          path: lib.tar.zst
+          retention-days: 1
+          compression-level: 0   # already zstd
+          if-no-files-found: error
+
+  test:
+    name: lib p${{ matrix.p }}/${{ needs.plan.outputs.n }}
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    services:
+      postgres:
+        image: ghcr.io/cirisai/postgres:16
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          POSTGRES_USER: ciris
+          POSTGRES_PASSWORD: ciris
+          POSTGRES_DB: ciris_persist_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ciris"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      # The source tree is needed at RUN time: the lib carries from-disk gates
+      # that read src/, scripts/, .github/ and migrations through
+      # `env!("CARGO_MANIFEST_DIR")`. That path is baked at compile time as the
+      # build runner's $GITHUB_WORKSPACE, which is the same path on this runner,
+      # so a default-path checkout serves both the baked paths and
+      # `--workspace-remap .`.
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - uses: actions/download-artifact@v8
+        with:
+          name: lib-lane-archive
+          path: .
+      - name: cargo nextest run (partition hash:${{ matrix.p }}/${{ needs.plan.outputs.n }})
+        timeout-minutes: 60
+        env:
+          # Same single variable ci.yml sets. `src/test_pg.rs` treats it as the
+          # BASE DSN and provisions one templated database per test process.
+          CIRIS_PERSIST_TEST_PG_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
+          CARGO_TERM_COLOR: never   # the log is an artifact; keep it greppable
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          cargo nextest run --archive-file lib.tar.zst --workspace-remap . \
+            --profile lib-lane --no-fail-fast \
+            --partition 'hash:${{ matrix.p }}/${{ needs.plan.outputs.n }}' \
+            2>&1 | tee out/nextest.log
+      - name: collect junit
+        if: always()
+        run: |
+          mkdir -p out
+          # store.dir is target/nextest under the (remapped) workspace root;
+          # search the temp dirs too in case it lands beside the extracted archive.
+          J="$(find "$GITHUB_WORKSPACE/target" "$RUNNER_TEMP" /tmp -path '*nextest/lib-lane/junit.xml' 2>/dev/null | head -1)"
+          if [ -n "$J" ]; then cp "$J" out/junit.xml; echo "junit: $J"; else echo "::warning::no junit.xml for partition ${{ matrix.p }}"; fi
+          ls -l out
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: lib-lane-p${{ matrix.p }}
+          path: out/
+          retention-days: 14
+
+  summary:
+    name: summary (one page; never red on test failures)
+    needs: [plan, test]
+    if: ${{ always() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: lib-lane-p*
+          path: parts/
+      - name: merge junit
+        env:
+          N: ${{ needs.plan.outputs.n }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          python3 - <<'EOF'
+          import os, re, sys
+          import xml.etree.ElementTree as ET
+
+          n = int(os.environ["N"])
+          rows, fails, missing = [], [], []
+          tot_run = tot_fail = 0
+
+          def first_line(case, node):
+              body = "\n".join(
+                  t for t in [node.text or ""]
+                  + [(e.text or "") for e in case.findall("system-err")]
+                  + [(e.text or "") for e in case.findall("system-out")]
+              )
+              lines = [l.strip() for l in body.splitlines()]
+              for i, l in enumerate(lines):
+                  if "panicked at" in l:
+                      nxt = next((x for x in lines[i + 1:] if x), "")
+                      loc = l.split("panicked at", 1)[1].strip().rstrip(":")
+                      return f"{loc}: {nxt}" if nxt else loc
+              msg = (node.get("message") or "").strip()
+              if msg:
+                  return msg.splitlines()[0]
+              return next((l for l in lines if l), node.get("type") or node.tag)
+
+          for p in range(1, n + 1):
+              path = f"parts/lib-lane-p{p}/junit.xml"
+              if not os.path.exists(path):
+                  missing.append(p)
+                  rows.append((p, "-", "-", "NO JUNIT (build failed, job cancelled, or timed out)"))
+                  continue
+              try:
+                  root = ET.parse(path).getroot()
+              except ET.ParseError as e:
+                  missing.append(p)
+                  rows.append((p, "-", "-", f"UNPARSEABLE junit: {e}"))
+                  continue
+              run = bad = 0
+              for case in root.iter("testcase"):
+                  run += 1
+                  node = case.find("failure")
+                  if node is None:
+                      node = case.find("error")
+                  if node is None:
+                      continue
+                  bad += 1
+                  msg = re.sub(r"[\t\r\n]+", " ", first_line(case, node))[:400]
+                  fails.append((case.get("name") or "?", msg, p))
+              tot_run += run
+              tot_fail += bad
+              rows.append((p, run, bad, ""))
+
+          fails.sort()
+          with open("fails.tsv", "w", encoding="utf-8") as f:
+              f.write("test\tfirst_failure_line\tpartition\n")
+              for name, msg, p in fails:
+                  f.write(f"{name}\t{msg}\t{p}\n")
+
+          out = []
+          out.append(f"## lib lane: {tot_run} run, {tot_fail} failed"
+                     + (f", {len(missing)} of {n} partitions WITHOUT results" if missing else ""))
+          out.append("")
+          out.append(f"`--features postgres,sqlite --lib`, {n} hash partitions. "
+                     f"test jobs: `{os.environ.get('TEST_RESULT', '?')}`. "
+                     "Counts are tests that RAN; a partition without junit ran an unknown number.")
+          out.append("")
+          out.append("| partition | run | failed | note |")
+          out.append("|---|---:|---:|---|")
+          for p, run, bad, note in rows:
+              out.append(f"| {p}/{n} | {run} | {bad} | {note} |")
+          out.append(f"| **total** | **{tot_run}** | **{tot_fail}** | |")
+          out.append("")
+          if fails:
+              out.append("### failed tests")
+              out.append("")
+              out.append("```")
+              budget = 900_000  # the step summary is capped at 1 MiB
+              shown = 0
+              for name, _msg, _p in fails:
+                  budget -= len(name) + 1
+                  if budget < 0:
+                      break
+                  out.append(name)
+                  shown += 1
+              out.append("```")
+              if shown < len(fails):
+                  out.append(f"({len(fails) - shown} more in the `lib-lane-fails` artifact)")
+              out.append("")
+              out.append("First failure line per test: artifact `lib-lane-fails` (`fails.tsv`).")
+          elif not missing:
+              out.append("No failures.")
+          text = "\n".join(out) + "\n"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write(text)
+          sys.stdout.write(text)
+          EOF
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: lib-lane-fails
+          path: fails.tsv
+          retention-days: 30

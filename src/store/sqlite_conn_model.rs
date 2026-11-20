@@ -518,9 +518,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // transaction inside). v62.0.0 (E1-fix2): the accord executors' rows
     // (`last_accord_*`, `store_planned_accord_*`) are deleted with their fns
     // (F0's CP2 cut, pass 4d: the earlier-form accord doors).
-    ("held_location_proof", ConnClass::Read),
-    ("store_planned_location_proof", ConnClass::Write),
-    ("store_planned_location_proof_withdrawal", ConnClass::Write),
     ("store_planned_touch_claim", ConnClass::Write),
     ("store_planned_touch_claim_local", ConnClass::Write),
     ("store_planned_witness", ConnClass::Write),
@@ -776,7 +773,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("lookup_signed_community", ConnClass::Read),
     // v51.0.0 (CIRISPersist#938) — the witness plane (V159).
     ("list_lineage_head_cosigns_for", ConnClass::Read),
-    ("store_lineage_head_cosign", ConnClass::Write),
     ("lookup_signed_record_by_content_hash", ConnClass::Read),
     ("lookup_trust", ConnClass::Read),
     ("mark_ack_received", ConnClass::Write),
@@ -970,9 +966,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // connection. v62.0.0 (P8-fix11) — the detection door's executor
     // (`store_planned_detection`) is deleted with the earlier-form door.
     ("store_planned_hard_case", ConnClass::Write),
-    // v62.0.0 (P8-fix14) — the restatement key, beside the row (a helper
-    // write inside the caller's transaction).
-    ("sqlite_stamp_restatement_key", ConnClass::HelperWrite),
+    // v62.0.0 (P8-fix14) — `sqlite_stamp_restatement_key` writes inside the
+    // caller's transaction and names no connection token of its own (as
+    // `sqlite_insert_plane_row`), so it has no row here.
     ("trace_agent_id_hash", ConnClass::Read),
     ("detection_row_ids_for_agent", ConnClass::Read),
     ("projection_rebuild", ConnClass::Write),

@@ -319,7 +319,7 @@ pub fn is_admin_action(kind: &str) -> bool {
 /// admin-action record is *evidence*, and a node that has not yet received the
 /// delegation row would then destroy the evidence of an act it did observe —
 /// the same mistake
-/// [`record_objection`](crate::federation::reverse_quorum::record_objection)
+/// `record_objection` (deleted v62.0.0, F0-cp9)
 /// deliberately does not make with a late objection. Store everything, adjudicate
 /// carefully.
 ///

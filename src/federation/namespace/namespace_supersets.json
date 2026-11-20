@@ -14756,17 +14756,19 @@
     "decimal_id": "3.1.9.2",
     "claim_id": "CLM-reverse-quorum-objection",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/reverse_quorum.rs#record_objection",
+    "path#symbol": "src/federation/reverse_quorum.rs#fold_reverse_quorum_over",
     "tsv_target": "evidence/cc_impl.tsv",
-    "manifest_round": "backfill-1052"
+    "manifest_round": "v62-f0-cp10",
+    "witness": "reverse_quorum::tests (silence_is_its_own_outcome_and_suppresses_nothing, an_upholding_ruling_closes_escalation, a_moderator_cannot_rule_on_their_own_objection, a_persons_rows_are_one_voice_or_none_and_no_instant_decides, no_permutation_of_the_rows_changes_the_count): v62.0.0 (F0-cp10) — an objection is counted by the fold over the held rows (fold_reverse_quorum_over); the earlier-form writers record_objection / record_objection_dismissal (bound-hybrid scrubs) are deleted (F0-cp9), so no earlier-form writer feeds the fold"
    },
    {
     "decimal_id": "3.1.9.2",
     "claim_id": "CLM-reverse-quorum-dismissal",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/reverse_quorum.rs#record_objection_dismissal",
+    "path#symbol": "src/federation/reverse_quorum.rs#fold_reverse_quorum_over",
     "tsv_target": "evidence/cc_impl.tsv",
-    "manifest_round": "backfill-1052"
+    "manifest_round": "v62-f0-cp10",
+    "witness": "reverse_quorum::tests (silence_is_its_own_outcome_and_suppresses_nothing, an_upholding_ruling_closes_escalation, a_moderator_cannot_rule_on_their_own_objection, a_persons_rows_are_one_voice_or_none_and_no_instant_decides, no_permutation_of_the_rows_changes_the_count): v62.0.0 (F0-cp10) — a dismissal counts distinct roster voices in the same fold (fold_reverse_quorum_over); the earlier-form writers record_objection / record_objection_dismissal (bound-hybrid scrubs) are deleted (F0-cp9), so no earlier-form writer feeds the fold"
    },
    {
     "decimal_id": "3.4.5",
@@ -15502,14 +15504,6 @@
     "claim_id": "CLM-attach-freshness",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/envelope.rs#ATTACH_WINDOW_SECS",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "manifest_round": "backfill-1052"
-   },
-   {
-    "decimal_id": "3.2",
-    "claim_id": "CLM-witnessed-lineage",
-    "repo": "CIRISPersist",
-    "path#symbol": "src/federation/lineage_witness.rs#admit_lineage_head_cosign",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "backfill-1052"
    },
@@ -17144,19 +17138,6 @@
     "decimal_id": "8.11.9",
     "claim_id": "CLM-signed-object",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/tier_ingest.rs#check_content_hash",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "manifest_round": "v60-1114",
-    "tsv_comment_before": [
-     "# v60.0.0 (CIRISPersist#1114; CC 2.6.1.7, rc10 99bf187) — three signed-object refusals",
-     "# carry their own federation_malformed_row reasons."
-    ],
-    "witness": "I1309 (memory, sqlite, postgres): content_hash_mismatch"
-   },
-   {
-    "decimal_id": "8.11.9",
-    "claim_id": "CLM-signed-object",
-    "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#check_row_mirror_members_closed",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v60-1114",
@@ -17410,7 +17391,7 @@
     "path#symbol": "src/federation/edition2/signing_domain.rs#verify_domain_composite_via_directory",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v62-f0-cp8",
-    "witness": "I2899 (registry pin; sqlite, postgres): v62.0.0 (F0-cp8; CC 2.6.1.7) — a host artefact is signed with ONE composite over domain_preimage(domain, message) (b\"ciris.signing_domain/v1\\0\" ‖ u32le-framed tag ‖ message) in a CLOSED registry of signing domains (SigningDomain, appended and pinned by position; an unregistered tag is signing_domain_unknown); a composite made in one domain verifies in no other and not as a raw signature over the message, a lone Ed25519 half is verify_component_signature; the accord manifest (v2) verifies only for a holder of the genesis bundle in force (accord_manifest_signer_not_holder otherwise); the host lone-half signers sign / local_sign / local_pqc_sign are removed for Engine.sign_composite(domain, message)"
+    "witness": "I2899 (registry pin; sqlite, postgres): v62.0.0 (F0-cp8; CC 2.6.1.7) — a host artefact is signed with ONE composite over domain_preimage(domain, message) (b\"ciris.signing_domain/v1\\0\" ‖ u32le-framed tag ‖ message) in a CLOSED registry of signing domains (SigningDomain, appended and pinned by position; an unregistered tag is signing_domain_unknown); a composite made in one domain verifies in no other and not as a raw signature over the message, a lone Ed25519 half is verify_component_signature; the accord manifest (v2) verifies only for a holder of the genesis bundle in force (accord_manifest_signer_not_holder otherwise); F0-cp10: an emergency shutdown (ciris.emergency_shutdown.v1) by a person's own composite verifies by identity-ref through the directory (I2061), its authority read by signer_standing (root / wise_authority / owner / none, I2062), the retired ciris.wa.emergency_shutdown.v1 position is refused signing_domain_retired (I2060); the host lone-half signers sign / local_sign / local_pqc_sign are removed for Engine.sign_composite(domain, message)"
    },
    {
     "decimal_id": "5.3.2.8",

@@ -2565,39 +2565,25 @@ pub async fn verify_caller_signed_local_row<F>(
 where
     F: super::FederationDirectory + ?Sized,
 {
-    let sig_classical = match (disposition, input.scrub_signature_classical.as_deref()) {
-        (LocalTierDisposition::Durable, None) => return Ok(None),
-        (LocalTierDisposition::Durable | LocalTierDisposition::TransitRevocation, Some(s)) => s,
-        (LocalTierDisposition::TransitRevocation, None) => {
-            return Err(Error::InvalidArgument(
-                "a subject-side revocation transiting the local tier requires a bound-hybrid \
-                 signature (§10.1.3, AV-61): scrub_signature_classical + scrub_signature_pqc \
-                 must be present and verify against the attester's registered pubkeys"
-                    .to_string(),
+    match (disposition, input.scrub_signature_classical.as_deref()) {
+        (LocalTierDisposition::Durable, None) => Ok(None),
+        (LocalTierDisposition::TransitRevocation, None) => Err(Error::InvalidArgument(
+            "a subject-side revocation transiting the local tier requires a bound-hybrid \
+             signature (§10.1.3, AV-61): scrub_signature_classical + scrub_signature_pqc \
+             must be present and verify against the attester's registered pubkeys"
+                .to_string(),
+        )),
+        // v62.0.0 (F0-cp9) — a caller-signed local row (sign at write, or a
+        // transiting revocation) carries the earlier bound-hybrid pair: its
+        // verify is deleted, the row refused by name. A local row is written
+        // unsigned (deferred) or as an edition-2 statement.
+        (LocalTierDisposition::Durable | LocalTierDisposition::TransitRevocation, Some(_)) => {
+            let _ = directory;
+            Err(super::edition2::door::earlier_form_signature(
+                "local_attestation",
             ))
         }
-    };
-    // v62.0.0 (slice J0; CC 2.6.1.12) — the cross-form refusal: a local row's
-    // earlier-form signature never verifies under an edition-2 key's
-    // projected row.
-    super::edition2::projection::refuse_edition2_signer(
-        directory,
-        "local_attestation",
-        &[input.attesting_key_id.as_str()],
-    )
-    .await?;
-    let sig_pqc = input.scrub_signature_pqc.as_deref();
-    let hash = crate::federation::edition2::group::vouched_envelope(
-        &input.attesting_key_id,
-        &input.attestation_envelope.to_value(),
-        sig_classical,
-        "local_attestation",
-    )?;
-    Ok(Some((
-        hash,
-        sig_classical.to_string(),
-        sig_pqc.map(str::to_string),
-    )))
+    }
 }
 
 /// v12.6.0 (CIRISPersist#171, CEG §10.1.3 transit-not-rest) — how a

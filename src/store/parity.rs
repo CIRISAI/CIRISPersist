@@ -133,7 +133,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("refuse_earlier_form_row", Class::Gate),
     // v62.0.0 (E8-fix4) — the lineage-head cosign store's one gate (the
     // earlier-form refusal), decided once for both backends (#934).
-    ("plan_store_lineage_head_cosign", Class::Plan),
     // v62.0.0 (E8-fix4) — P8's crossing: an edition-2 row's statements
     // move to the next serve position inside the crossing's transaction.
     // It refuses nothing about the caller; it fails only on the substrate's
@@ -315,9 +314,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("put_touch_claim_local_planned", Class::Plan),
     ("put_wholeness_witness_planned", Class::Plan),
     // The executors (storage only; compared across backends as the `EvidenceStore` trait): each fails only on the store's terms, and reports what it found for the plan to judge (`HeldRow`, a held proof, an advanced floor).
-    ("held_location_proof", Class::Plumbing),
-    ("store_planned_location_proof_withdrawal", Class::Plumbing),
-    ("rival_location_proof_withdrawal", Class::Plumbing),
     ("store_planned_touch_claim", Class::Plumbing),
     ("store_planned_touch_claim_local", Class::Plumbing),
     // v58.0.0 (CIRISPersist#991) — the key plane. The revocation door is one
@@ -812,11 +808,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // presented lineage head is absent, stale or unwitnessed under an armed
     // charter (`trust_root_head_stale`).
     ("check_attach_freshness", Class::Gate),
-    // v53.1.3 (CIRISPersist#986) — Plumbing: the `cfg(test)` rival withdrawal
-    // I524 arms between the withdraw door's held read and its compare-and-set
-    // write (`store::test_hooks::arm_rival_location_proof_withdrawal`); never
-    // armed outside a test, so it adds nothing to the door's production
-    // sequence.
     // v50.0.0 (CIRISPersist#926) — Gate: refuses a trust-root-grade community
     // row (the reserved `ciris-canonical` id, or one declaring
     // `infrastructure_constraint`) whose shape, founders or chain fails — the
@@ -997,7 +988,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("execute", Class::Plumbing),
     ("filter_withheld_rows", Class::Gate),
     ("fountain_manifest_row", Class::Delegates),
-    ("from_bytes", Class::Plumbing),
     ("from_manifest_bytes", Class::Plumbing),
     ("from_run", Class::Plumbing),
     ("from_str", Class::Plumbing),
@@ -1406,7 +1396,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("validate_envelope_against_schema", Class::Gate),
     ("validate_family_members", Class::Gate),
     ("validate_grant_admission", Class::Gate),
-    ("validate_location_cell", Class::Gate),
     ("validate_registration_pubkey", Class::Gate),
     // v38.0.0 (CIRISPersist#721) — validate_trust_grant is SHAPE validation
     // (malformed input), not authority: classifying it Gate was the parity
@@ -1448,15 +1437,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // family twins of the three room gates above).
     ("verify_family_membership_widening_admission", Class::Gate),
     ("reject_future_dated_family_widening", Class::Gate),
-    // v53.1.2 (#984 row 16) — the withdrawal check every backend's
-    // `withdraw_location_proof` runs after the admission gate.
-    ("check_location_proof_withdrawal", Class::Gate),
     ("verify_consent_record_transit_ingest", Class::Gate),
     ("verify_family_admission", Class::Gate),
     ("verify_family_membership_revocation_admission", Class::Gate),
     ("verify_federation_tier_ingest", Class::Gate),
     ("verify_for_admission", Class::Gate),
-    ("verify_location_proof_admission", Class::Gate),
     ("verify_revocation_admission", Class::Gate),
     ("verify_signed_identity_occurrence", Class::Gate),
     ("verify_signed_touch_claim", Class::Gate),
@@ -1648,7 +1633,7 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 70] = [
+    const SHARED_PLANS: [(&str, &str); 69] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance.
         (
             "src/federation/transport_admit.rs",
@@ -1697,11 +1682,6 @@ mod tests {
         ("src/federation/blob_admit.rs", "store_blob_local_planned"),
         // v62.0.0 (E8-fix2) — the sealed-floor announce (I27 / I28).
         ("src/federation/blob_admit.rs", "announce_held_blob_planned"),
-        // v62.0.0 (E8-fix4) — the lineage-head cosign store's gate.
-        (
-            "src/federation/lineage_witness.rs",
-            "plan_store_lineage_head_cosign",
-        ),
         ("src/federation/blob_admit.rs", "adopt_sealed_blob_planned"),
         ("src/federation/blob_admit.rs", "put_blob_chunks_planned"),
         (
@@ -1910,7 +1890,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 76] = [
+    const SHARED_DOORS: [(&str, &str, &str); 75] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance,
         // decoded by the row mapper both doors read through.
         (
@@ -1980,12 +1960,6 @@ mod tests {
             "BlobStorage",
             "announce_held_blob",
             "announce_held_blob_planned",
-        ),
-        // v62.0.0 (E8-fix4) — the lineage-head cosign store (#934).
-        (
-            "FederationDirectory",
-            "store_lineage_head_cosign",
-            "plan_store_lineage_head_cosign",
         ),
         (
             "BlobStorage",

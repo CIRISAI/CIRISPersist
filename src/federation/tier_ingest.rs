@@ -125,26 +125,6 @@ where
     verify_row_hybrid_signature(directory, row).await
 }
 
-/// v60.0.0 (CIRISPersist#1114; CC 2.6.1.7, rc10 `99bf187`) — the row's
-/// declared `original_content_hash` must be the SHA-256 of JCS(its envelope)
-/// (canonicalizer agreement, fail-secure). Terminal for these bytes:
-/// `federation_malformed_row` / `content_hash_mismatch`, the Python type
-/// (ValueError) of the `FederationTierUnverified` arm it replaces.
-pub(crate) fn check_content_hash(row: &Attestation, computed_hash: &str) -> Result<(), Error> {
-    if computed_hash == row.original_content_hash {
-        return Ok(());
-    }
-    Err(Error::malformed_row(
-        "attestation",
-        super::malformed_row::CONTENT_HASH_MISMATCH,
-        format!(
-            "attestation {}: original_content_hash mismatch: envelope canonicalizes to \
-             {computed_hash}, row declares {}",
-            row.attestation_id, row.original_content_hash
-        ),
-    ))
-}
-
 /// v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — verify an
 /// [`Attestation`] row's envelope bound-hybrid signature **regardless of
 /// tier**. This is the tier-agnostic core [`verify_federation_tier_ingest`]
@@ -209,90 +189,10 @@ where
     if super::occurrence_revocation_carrier::verify_carrier_row(directory, row).await? {
         return Ok(());
     }
-    verify_envelope_signed_row(directory, row).await
-}
-
-/// v59.0.0 (CIRISPersist#1099) — [`verify_row_hybrid_signature`]'s generic
-/// rule alone: the row's own scrubs over its own canonical envelope, for a row
-/// that is not a minted one. The self-roster door verifies the `withdraws` a
-/// proposal carries with it (that row is never minted).
-///
-/// v62.0.0 (F0-cp8) — each scrub is admitted only as a vouched voice
-/// ([`vouched_envelope`](super::edition2::group::vouched_envelope)): the
-/// earlier envelope verify is deleted, so `_directory` reads nothing and an
-/// unvouched row is refused by name (`earlier_form_object`).
-pub(crate) async fn verify_envelope_signed_row<F>(
-    _directory: &F,
-    row: &Attestation,
-) -> Result<(), Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let reject = |reason: String| Error::FederationTierUnverified {
-        attestation_id: row.attestation_id.clone(),
-        attesting_key_id: row.attesting_key_id.clone(),
-        reason,
-    };
-    let computed_hash = crate::federation::edition2::group::vouched_envelope(
-        &row.attesting_key_id,
-        &row.attestation_envelope,
-        &row.scrub_signature_classical,
-        "attestation",
-    )
-    .map_err(|e| match e {
-        // Re-stamp the row's attestation_id onto the typed error (the
-        // envelope-level helper has no row id).
-        Error::FederationTierUnverified { reason, .. } => reject(reason),
-        other => other,
-    })?;
-
-    // Cross-check the declared original_content_hash matches the envelope's
-    // canonical SHA-256 (canonicalizer agreement, fail-secure).
-    check_content_hash(row, &computed_hash)?;
-
-    // v24.0.0 (CIRISPersist#556) — EVERY scrub, not just the first.
-    //
-    // **The preserve set must equal the verified set** (#541). `additional_scrubs`
-    // is the evidence a family trust root's charter is quorum-signed; if the
-    // verifier looked only at scrub #1, the co-signatures would be
-    // stored-but-unverified — a writer could append garbage or drop the real
-    // ones and the row would still verify, silently downgrading a 2-of-3
-    // charter to one seat. That is the exact class this substrate keeps
-    // re-learning, so the extra scrubs are verified HERE, at the same
-    // admission boundary, over the SAME canonical bytes.
-    //
-    // Fail-secure, and no new denial-of-service surface: an unverifiable
-    // co-signature refuses the row exactly as an unverifiable BASE signature
-    // already does, and anyone able to mangle the co-signatures in flight could
-    // equally mangle the base one. An unresolvable co-signer is likewise a
-    // refusal, for the same reason `attesting_key_id` must resolve — a verifier
-    // that cannot check a signature must not pretend the signature is absent.
-    //
-    // Consequence, stated rather than discovered later: a co-signed row
-    // replicates only to peers that know its co-signers. For accord holders —
-    // the co-signers this field exists for — that is every node, because the
-    // holder records are baked into the genesis seed.
-    for (i, scrub) in row.additional_scrubs.iter().enumerate() {
-        let scrub_hash = crate::federation::edition2::group::vouched_envelope(
-            &scrub.scrub_key_id,
-            &row.attestation_envelope,
-            &scrub.scrub_signature_classical,
-            "attestation",
-        )
-        .map_err(|e| match e {
-            Error::FederationTierUnverified { reason, .. } => reject(format!(
-                "additional_scrubs[{i}] by {}: {reason}",
-                scrub.scrub_key_id
-            )),
-            other => other,
-        })?;
-        // Every scrub is over the SAME preimage — the rule `ScrubSig` is
-        // documented with. Re-asserted rather than assumed: the helper
-        // canonicalizes the envelope we handed it, so a mismatch here would
-        // mean the canonicalizer disagreed with itself.
-        debug_assert_eq!(scrub_hash, computed_hash);
-    }
-    Ok(())
+    // v62.0.0 (F0-cp9) — the generic rule (the row's own scrubs over its own
+    // envelope) is the earlier form: deleted, refused by name. No vouch
+    // reaches an attestation row's scrubs.
+    Err(super::edition2::door::earlier_form_signature("attestation"))
 }
 
 /// v21.0.0 (CIRISPersist#502 E1) — mechanistic admission for a replicated
@@ -898,106 +798,6 @@ where
 /// delegate-arm tokens (`location_authority_no_delegation_edge`,
 /// `_delegation_retracted`, `_delegation_expired`), removed with the arm.
 pub const LOCATION_AUTHORITY_RULE_NOT_SUBJECT: &str = "location_authority_not_subject";
-
-/// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
-/// [`SignedLocationProof`](super::SignedLocationProof). Structural mirror of
-/// [`verify_family_admission`]; verifies over
-/// [`super::types::LocationProof::signing_envelope`].
-///
-/// # v37.0.0 (CIRISPersist#734) — WHOSE signature, not just whether there is one
-///
-/// E4 gave this door one leg: the scrub signature must verify against
-/// `authority_key_id`'s REGISTERED pubkeys. It never asked whether that
-/// authority had any standing to speak about `subject_key_id`, and
-/// [`SignedLocationProof::authority_key_id`](super::SignedLocationProof)
-/// documented the gap as deliberate scope. The consequence was that **any**
-/// registered key in the federation could assert a location for **any**
-/// subject and produce a perfectly valid, admitted, wrong row.
-///
-/// The operator's ruling — *"the key is the subject itself or its delegates, no
-/// one else could know where the subject is"* — closes it, and the
-/// justification is epistemic rather than administrative, which is what makes
-/// the rule tight instead of arbitrary. Location is SELF-KNOWLEDGE. A third
-/// party asserting where a subject is has no source for the claim, so a
-/// signature from one proves only that they signed it. The admissible
-/// authority set is exactly
-///
-/// ```text
-/// {location_proof.subject_key_id} ∪ {live delegates of subject_key_id}
-/// ```
-///
-/// Note this is the ONE `authority_key_id` plane where that reasoning holds.
-/// The family / community / membership-revocation siblings admit others BY
-/// DESIGN — an authority legitimately speaks about parties who are not itself
-/// — so the same tightening is NOT applied to them, and must not be by
-/// analogy.
-///
-/// # Leg order is load-bearing
-///
-/// The signature runs FIRST, unchanged. A forged or unregistered authority
-/// still fails as [`Error::SignatureInvalid`] exactly as it did before, which
-/// keeps every pre-existing refusal stable and means the new refusal is only
-/// ever reached by a genuinely registered key holding a genuinely valid
-/// signature — precisely the hole, and precisely what E4 already covered on
-/// the other side.
-///
-/// # This is the chokepoint
-///
-/// All three backends call this function as the sole gate on
-/// [`FederationDirectory::put_location_proof`](super::FederationDirectory::put_location_proof),
-/// and `store::parity` pins that the three call sequences agree. The
-/// `ffi::directory_capsule` and `federation::directory_double` implementations
-/// forward to an inner backend rather than writing, so they inherit the gate;
-/// there is no `put_location_proof_local` bypass. Gating here therefore gates
-/// every writer, which a gate on a per-backend helper would not.
-pub async fn verify_location_proof_admission<F>(
-    directory: &F,
-    signed: &super::SignedLocationProof,
-) -> Result<(), Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    crate::federation::edition2::group::vouched_envelope(
-        &signed.authority_key_id,
-        &signed.location_proof.signing_envelope(),
-        &signed.scrub_signature_classical,
-        "location_proof",
-    )?;
-    check_location_authority(
-        directory,
-        &signed.location_proof.subject_key_id,
-        &signed.authority_key_id,
-    )
-    .await
-}
-
-/// v37.0.0 (CIRISPersist#734) — the authority leg of
-/// [`verify_location_proof_admission`], split out so the rule has one name and
-/// one body.
-///
-/// v62.0.0 (wave GC8; CC 4.5.9.1 rc21, ruling 10) — **the subject alone.** A
-/// location is self-knowledge, and "no delegation mints one" (CC 4.5.9.1): a
-/// proof whose attester is not its subject is Invalid at the door, read from
-/// the row's own bytes. The delegate arm (a live `delegates_to(subject →
-/// authority)` admitting a third party's proof) is REMOVED: it was a fold the
-/// text forbids. Nothing here reads another row.
-async fn check_location_authority<F>(
-    _directory: &F,
-    subject: &str,
-    authority: &str,
-) -> Result<(), Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    if authority == subject {
-        return Ok(());
-    }
-    Err(Error::LocationAuthorityUnauthorized {
-        subject_key_id: subject.to_owned(),
-        offered_authority_key_id: authority.to_owned(),
-        rule: LOCATION_AUTHORITY_RULE_NOT_SUBJECT,
-    })
-}
 
 /// v9.0.0 (CIRISPersist#237) — shared test-support for the
 /// federation-tier ingest gate. Mirrors

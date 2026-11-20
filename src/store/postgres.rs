@@ -130,18 +130,6 @@ impl PostgresBackend {
         }
         Ok(())
     }
-
-    /// v53.1.3 (#986) — the test-only rival WITHDRAWAL armed for the point
-    /// between a withdrawal's held read and its write, applied through this
-    /// backend's own withdraw door. Never armed outside a test.
-    #[cfg(test)]
-    async fn test_rival_location_proof_withdrawal(&self) -> Result<(), crate::federation::Error> {
-        if let Some(rival) = self.test_hooks.take_rival_location_proof_withdrawal() {
-            Box::pin(crate::federation::FederationDirectory::withdraw_location_proof(self, rival))
-                .await?;
-        }
-        Ok(())
-    }
 }
 
 /// v60.0.0 (CIRISPersist#934 step 4) — a shared plan's rendered binds as
@@ -3390,140 +3378,6 @@ impl crate::federation::family_admit::FamilyStore for PostgresBackend {
 /// `federation::evidence_admit`'s.
 #[async_trait::async_trait]
 impl crate::federation::evidence_admit::EvidenceStore for PostgresBackend {
-    async fn held_location_proof(
-        &self,
-        subject_key_id: &str,
-        asserted_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Option<crate::federation::SignedLocationProof>, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        client
-            .query_opt(
-                "SELECT * FROM cirislens.federation_location_proofs \
-                  WHERE subject_key_id = $1 AND asserted_at = $2",
-                &[&subject_key_id, &asserted_at],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("held location proof: {e}")))?
-            .map(pg_row_to_signed_location_proof)
-            .transpose()
-    }
-
-    async fn store_planned_location_proof(
-        &self,
-        planned: crate::federation::evidence_admit::PlannedLocationProof,
-    ) -> Result<(), crate::federation::Error> {
-        let crate::federation::evidence_admit::PlannedLocationProof {
-            proof,
-            wire_index_key,
-        } = planned;
-        let row = &proof.location_proof;
-        let resolution = i16::from(row.cell_resolution);
-        {
-            let client = self
-                .get_client()
-                .await
-                .map_err(crate::store::Error::into_federation)?;
-            // v36.0.0 (#668) — THIS node's serve position (V130).
-            let admitted_at = self
-                .next_plane_position(&client, "federation_location_proofs")
-                .await?;
-            client
-                .execute(
-                    "INSERT INTO cirislens.federation_location_proofs (\
-                        subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
-                        attestation_evidence, withdrawn_at, persist_row_hash, \
-                        authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                        admitted_at\
-                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-                    &[
-                        &row.subject_key_id,
-                        &row.cell_id,
-                        &resolution,
-                        &row.asserted_at,
-                        &row.valid_until,
-                        &row.attestation_evidence,
-                        &row.withdrawn_at,
-                        &row.persist_row_hash,
-                        &proof.authority_key_id,
-                        &proof.scrub_signature_classical,
-                        &proof.scrub_signature_pqc,
-                        &admitted_at,
-                    ],
-                )
-                .await
-                .map_err(map_revocation_pg_err(
-                    "location_proof",
-                    &[row.subject_key_id.as_str()],
-                ))?;
-        }
-        // The pooled client is released before the re-index takes its own.
-        self.index_stored_record("LocationProof", &wire_index_key)
-            .await
-    }
-
-    async fn store_planned_location_proof_withdrawal(
-        &self,
-        planned: crate::federation::evidence_admit::PlannedLocationProof,
-    ) -> Result<bool, crate::federation::Error> {
-        let crate::federation::evidence_admit::PlannedLocationProof {
-            proof,
-            wire_index_key,
-        } = planned;
-        let row = &proof.location_proof;
-        let written = {
-            let client = self
-                .get_client()
-                .await
-                .map_err(crate::store::Error::into_federation)?;
-            // The row moves to a fresh serve position (V130) so a peer past
-            // its cursor is served the withdrawal.
-            let admitted_at = self
-                .next_plane_position(&client, "federation_location_proofs")
-                .await?;
-            // v53.1.3 (#986) — a COMPARE-AND-SET: a rival withdrawal can land
-            // between the plan's read and this write; the loser writes
-            // nothing.
-            client
-                .execute(
-                    "UPDATE cirislens.federation_location_proofs \
-                        SET withdrawn_at = $3, persist_row_hash = $4, authority_key_id = $5, \
-                            scrub_signature_classical = $6, scrub_signature_pqc = $7, \
-                            admitted_at = $8 \
-                      WHERE subject_key_id = $1 AND asserted_at = $2 AND withdrawn_at IS NULL",
-                    &[
-                        &row.subject_key_id,
-                        &row.asserted_at,
-                        &row.withdrawn_at,
-                        &row.persist_row_hash,
-                        &proof.authority_key_id,
-                        &proof.scrub_signature_classical,
-                        &proof.scrub_signature_pqc,
-                        &admitted_at,
-                    ],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!("withdraw_location_proof: {e}"))
-                })?
-        };
-        if written == 0 {
-            return Ok(false);
-        }
-        // v53.1.3 (#986) — the row's bytes changed, so the signed wire index
-        // learns the new content hash, the pooled client released first.
-        self.index_stored_record("LocationProof", &wire_index_key)
-            .await?;
-        Ok(true)
-    }
-
-    #[cfg(test)]
-    async fn rival_location_proof_withdrawal(&self) -> Result<(), crate::federation::Error> {
-        self.test_rival_location_proof_withdrawal().await
-    }
-
     async fn store_planned_touch_claim(
         &self,
         planned: crate::federation::evidence_admit::PlannedTouchClaim<'_>,
@@ -11691,45 +11545,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
     ) -> Option<&crate::federation::canonical_community::StandingCache> {
         Some(&self.trust_root_standing_cache)
-    }
-
-    async fn store_lineage_head_cosign(
-        &self,
-        cosign: &crate::federation::lineage_witness::LineageHeadCosign,
-    ) -> Result<bool, crate::federation::Error> {
-        // v62.0.0 (JSON-cut slice F; E8-fix4, #934) — the earlier-form
-        // refusal, on the shared plan.
-        crate::federation::lineage_witness::plan_store_lineage_head_cosign(cosign)?;
-        // v51.0.0 (#938) — V159; insert-or-hold, never delete (evidence).
-        let admitted_at = crate::host::clock::now();
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        let n = client
-            .execute(
-                "INSERT INTO cirislens.federation_lineage_head_cosigns \
-                 (lineage_key_id, head_digest_sha256_hex, witness_key_id, head_asserted_at, \
-                  prior_head_digest_sha256_hex, signed_at, signature_classical, signature_pqc, \
-                  admitted_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
-                &[
-                    &cosign.lineage_key_id,
-                    &cosign.head_digest_sha256_hex,
-                    &cosign.witness_key_id,
-                    &cosign.head_asserted_at,
-                    &cosign.prior_head_digest_sha256_hex,
-                    &cosign.signed_at,
-                    &cosign.signature_classical,
-                    &cosign.signature_pqc,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("store lineage head cosign: {e}"))
-            })?;
-        Ok(n == 1)
     }
 
     async fn list_lineage_head_cosigns_for(

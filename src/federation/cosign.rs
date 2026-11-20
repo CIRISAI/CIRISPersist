@@ -538,8 +538,8 @@ pub fn read_row(row: &Attestation) -> Result<Option<CosignRowRead>, Error> {
 /// verify** (`tier_ingest::verify_row_hybrid_signature`): the row is exactly
 /// what its object mints, and its one statement verifies — the primary's over
 /// the event's signing bytes (the event's own door verification, with no
-/// cosignature), or the cosigner's over the same bytes. `Ok(false)` for a row
-/// that is not a cosign row.
+/// cosignature). A cosignature row is the earlier form (F0-cp9). `Ok(false)`
+/// for a row that is not a cosign row.
 pub(crate) async fn verify_row<D>(dir: &D, row: &Attestation) -> Result<bool, Error>
 where
     D: FederationDirectory + ?Sized,
@@ -553,21 +553,12 @@ where
         CosignRow::Pending => {
             super::group_plane::verify_signed_object(dir, &read.event).await?;
         }
+        // v62.0.0 (F0-cp9) — a cosignature row is minted only by
+        // `cosign::hold`, which a vouched door never reaches
+        // (`edition2::group::vouched`): its earlier-form cosignature is refused
+        // by name.
         CosignRow::Signature => {
-            let c = read
-                .cosignature
-                .as_ref()
-                .ok_or_else(|| malformed(row, "no cosignature"))?;
-            let envelope = read
-                .event
-                .plane_signing_envelope()
-                .ok_or_else(|| malformed(row, "a record carries no cosignature"))?;
-            crate::federation::edition2::group::vouched_envelope(
-                &c.authority_key_id,
-                &envelope,
-                &c.scrub_signature_classical,
-                "cosign",
-            )?;
+            return Err(super::edition2::door::earlier_form_signature("cosign"));
         }
     }
     Ok(true)

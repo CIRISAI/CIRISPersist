@@ -1840,7 +1840,7 @@ mod tests {
         // pin of 402 (counted from the file by the predicate below).
         // v62.0.0 (X2 pass 4d.2): set ONCE from the registry on the merged tree
         // (402 src/ rows), not from any single patch's value.
-        const EXPECTED: usize = 402;
+        const EXPECTED: usize = 400;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

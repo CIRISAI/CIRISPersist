@@ -6775,6 +6775,45 @@ impl PyEngine {
         })
     }
 
+    /// v62.0.0 (F0-cp10) — **the signer's standing over an agent**, now
+    /// (`edition2::signing_domain::signer_standing`): `"root"` (an accord
+    /// holder of the genesis in force), `"wise_authority"` (an active member
+    /// of the WA body `wa_body` names, carrying the `wise_authority` card; no
+    /// `wa_body` → never), `"owner"` (the agent's one
+    /// counted owner) or `"none"`; first match wins. Reads standing only — an
+    /// emergency shutdown verifies its composite first
+    /// (`verify_composite_via_directory("ciris.emergency_shutdown.v1", …)`).
+    #[pyo3(signature = (identity_ref, agent_ref, wa_body=None))]
+    fn signer_standing(
+        &self,
+        py: Python<'_>,
+        identity_ref: &str,
+        agent_ref: &str,
+        wa_body: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let (who, agent) = (identity_ref.to_owned(), agent_ref.to_owned());
+            let wa_body = wa_body.map(str::to_owned);
+            py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::edition2::signing_domain::signer_standing(
+                        dir.as_ref(),
+                        &who,
+                        &agent,
+                        wa_body.as_deref(),
+                        crate::federation::edition2::composite_verify::now_ms(),
+                    )
+                    .await
+                    .map(|s| s.as_str().to_owned())
+                    .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
     /// v62.0.0 (F0-cp8) — verify an accord manifest signature (v2), now:
     /// `signer_identity` must be an accord holder of the genesis bundle in
     /// force (`accord_manifest_signer_not_holder` otherwise), and
@@ -11566,60 +11605,6 @@ impl PyEngine {
                     }
                 })
             })
-        })
-    }
-
-    /// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) — **the lineage-head cosign
-    /// door**: `payload_json` is a `ciris.lineage_head_cosign.v1` object
-    /// (`lineage_key_id`, `head_digest_sha256_hex`, `head_asserted_at`,
-    /// `prior_head_digest_sha256_hex?`, `signed_at`, `witness_key_id`,
-    /// `signature_classical`, `signature_pqc`). Returns the typed outcome as
-    /// JSON: `{"outcome": "inserted" | "unchanged" | "held_for_unknown_head" |
-    /// "kept_not_counted" | "refused", "reason"?: <rule>}` (v62.0.0, CC 2.7
-    /// rc21 item 15: a cosign whose rule reads other rows is kept and does
-    /// not count). Nothing is ever deleted.
-    fn put_lineage_head_cosign_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
-        self.ensure_usable()?;
-        // v62.0.0 (JSON-cut slice D) — an earlier-form object, refused by name
-        // before it is decoded once the switch is on (inert until slice F).
-        crate::federation::edition2::door::refuse_earlier_form("lineage_head_cosign")
-            .map_err(federation_err_to_py)?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let cosign: crate::federation::lineage_witness::LineageHeadCosign =
-                serde_json::from_str(payload_json).map_err(|e| {
-                    PyValueError::new_err(format!("lineage head cosign decode: {e}"))
-                })?;
-            let backend = self.backend.clone();
-            let outcome = py.detach(move || {
-                let now = chrono::Utc::now();
-                match &backend {
-                    #[cfg(feature = "postgres")]
-                    BackendDispatch::Postgres(b) => {
-                        let b = b.clone();
-                        runtime.block_on(async move {
-                            crate::federation::lineage_witness::admit_lineage_head_cosign(
-                                &*b, &cosign, now,
-                            )
-                            .await
-                            .map_err(federation_err_to_py)
-                        })
-                    }
-                    #[cfg(feature = "sqlite")]
-                    BackendDispatch::Sqlite(b) => {
-                        let b = b.clone();
-                        runtime.block_on(async move {
-                            crate::federation::lineage_witness::admit_lineage_head_cosign(
-                                &*b, &cosign, now,
-                            )
-                            .await
-                            .map_err(federation_err_to_py)
-                        })
-                    }
-                }
-            })?;
-            serde_json::to_string(&outcome)
-                .map_err(|e| PyRuntimeError::new_err(format!("outcome encode: {e}")))
         })
     }
 

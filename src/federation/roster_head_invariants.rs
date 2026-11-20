@@ -962,16 +962,10 @@ mod pure {
             check < b.find("supersede_group_row(").expect("writes"),
             "I458: the chain apply judges before it writes"
         );
+        // v62.0.0 (F0-cp9) — the cosign door (`admit_lineage_head_cosign`) is
+        // deleted with the earlier form; the witnessed-head fold keeps the
+        // shared lag predicate.
         let lw = code_of("src/federation/lineage_witness.rs");
-        let b = body(&lw, "pub async fn admit_lineage_head_cosign");
-        // v62.0.0 (wave GC3; rc21 item 15) — the door keeps a lagging head's
-        // cosign uncounted, through the predicate the witnessed-head fold
-        // shares.
-        assert!(
-            b.contains("head_lags_roster_at(")
-                && b.contains("LineageCosignRefusal::HeadLagsRoster"),
-            "I458: the cosign door keeps a lagging head's cosign uncounted"
-        );
         let h = body(&lw, "pub async fn head_lags_roster_at");
         assert!(
             h.contains("roster_head::roster_lag("),

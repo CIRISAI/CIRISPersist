@@ -373,7 +373,9 @@ pub(crate) struct CanonicalDiagnostic {
     /// the spec canonical form at the trace's signed schema version, signed
     /// `run_kind` included). The `9field` name is the v0.1.18 wire key.
     pub(crate) nine_field_sha256: String,
-    /// Hex sha256 of the legacy 2-field canonical form.
+    /// Hex sha256 of the legacy 2-field canonical form. Read only by the
+    /// PyO3 `debug_canonicalize` breadcrumb (v62 BF13: allowed dead without it).
+    #[cfg_attr(not(feature = "_pyffi"), allow(dead_code))]
     pub(crate) two_field_sha256: String,
     /// Raw 9-field canonical bytes (for `Engine.debug_canonicalize`
     /// to base64-expose). Not logged.
@@ -405,7 +407,7 @@ where
     let mut canonical = match wire {
         "2.7.0" => canonical_payload_value(trace),
         "2.7.9" => canonical_payload_value_v279(trace),
-        "3.0.0" | "3.1.0" => canonical_payload_value_v279(trace),
+        "3.0.0" | "3.1.0" | "3.1.1" => canonical_payload_value_v279(trace),
         "2.7.legacy" => canonical_payload_value_legacy(trace),
         other => return Err(Error::UnsupportedSchemaVersion(other.to_owned())),
     };
@@ -487,6 +489,7 @@ mod tests {
             ("1.0.0", V1Python),
             ("3.0.0", V2Jcs),
             ("3.1.0", V2Jcs),
+            ("3.1.1", V2Jcs),
             ("3.5.2", V2Jcs),
             ("10.0.0", V2Jcs),
             ("garbage", V1Python),
@@ -505,7 +508,7 @@ mod tests {
     fn i699_the_diagnostic_hashes_the_verifiers_preimage() {
         use sha2::{Digest, Sha256};
         let sk = fixed_signing_key();
-        for wire in ["2.7.0", "2.7.9", "3.0.0", "3.1.0", "2.7.legacy"] {
+        for wire in ["2.7.0", "2.7.9", "3.0.0", "3.1.0", "3.1.1", "2.7.legacy"] {
             let mut trace = make_trace(&sk, "agent-i699");
             trace.trace_schema_version = SchemaVersion::parse(wire).unwrap();
             trace.run_kind = Some("production".into());

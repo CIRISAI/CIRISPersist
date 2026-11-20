@@ -31,7 +31,10 @@
 //!
 //! ## Custody — the three-key model made mechanical
 //!
-//! [`TierPromotionCustody`] is the caller's answer to "who signs the crossing":
+//! [`TierPromotionCustody`] is the caller's answer to "who signs the crossing".
+//! v62.0.0 (F0-cp9): only [`TierPromotionCustody::Statement`] crosses; the
+//! two JCS custodies below are the earlier form, refused by name
+//! (`earlier_form_object`, plane `enter_mesh`).
 //!
 //! * [`TierPromotionCustody::ActorSigned`] — the actor's own hybrid signature
 //!   over `JCS(envelope)`, minted now or at local write. Becomes the base
@@ -642,141 +645,10 @@ pub async fn plan_enter_mesh(
     // caller offering a JCS custody is refused here, by name, on every
     // backend.
     super::edition2::door::refuse_earlier_form("enter_mesh")?;
-    let mut row = current.clone();
-    // Canonical at rest: the local door stores the producer's tokens verbatim
-    // (`1.0` vs `1`); JCS(x) == JCS(canonical(x)), so this is not a preimage
-    // move — it makes the stored column sha256 to `original_content_hash`.
-    let (_bytes, computed_hash) = canonical_bytes(&mut row.attestation_envelope)?;
-
-    let applied = match custody {
-        TierPromotionCustody::ActorSigned(reseal) => {
-            if reseal.scrub_key_id != row.attesting_key_id {
-                return Err(Error::CustodyIsNotTheActor {
-                    attestation_id: row.attestation_id.clone(),
-                    attesting_key_id: row.attesting_key_id.clone(),
-                    scrub_key_id: reseal.scrub_key_id.clone(),
-                });
-            }
-            let mut offered = reseal.attestation_envelope.clone();
-            let (_offered_bytes, offered_hash) = canonical_bytes(&mut offered)?;
-            if offered_hash != computed_hash {
-                return Err(Error::PromotionMovedThePreimage {
-                    attestation_id: row.attestation_id.clone(),
-                    stored_hash: computed_hash,
-                    offered_hash,
-                });
-            }
-            // The actor's signature verifies against the actor's REGISTERED
-            // pubkeys, Strict — exactly what every peer's ingest will ask.
-            crate::federation::edition2::group::vouched_envelope(
-                &row.attesting_key_id,
-                &row.attestation_envelope,
-                &reseal.scrub_signature_classical,
-                "promotion_reseal",
-            )?;
-            row.original_content_hash = computed_hash.clone();
-            row.scrub_signature_classical = reseal.scrub_signature_classical.clone();
-            row.scrub_signature_pqc = reseal.scrub_signature_pqc.clone();
-            row.scrub_key_id = reseal.scrub_key_id.clone();
-            row.scrub_timestamp = reseal.scrub_timestamp;
-            Custody::ActorSigned
-        }
-        // Answered above: an edition-2 row returns before the JCS arms.
-        TierPromotionCustody::Statement(_) => {
-            return Err(Error::InvalidArgument(format!(
-                "attestation {}: a statement custody reached the JCS arms",
-                row.attestation_id
-            )))
-        }
-        TierPromotionCustody::NodeCoScrub(scrub) => {
-            if row.scrub_signature_classical.is_empty() {
-                return Err(Error::NoActorSignature {
-                    attestation_id: row.attestation_id.clone(),
-                    attesting_key_id: row.attesting_key_id.clone(),
-                });
-            }
-            if scrub.scrub_key_id == row.attesting_key_id {
-                return Err(Error::InvalidArgument(format!(
-                    "attestation {}: a co-scrub by the attester {} is a re-sign, not custody — \
-                     pass TierPromotionCustody::ActorSigned",
-                    row.attestation_id, row.attesting_key_id
-                )));
-            }
-            if row.original_content_hash != computed_hash {
-                return Err(Error::PromotionMovedThePreimage {
-                    attestation_id: row.attestation_id.clone(),
-                    stored_hash: row.original_content_hash.clone(),
-                    offered_hash: computed_hash,
-                });
-            }
-            // The base scrub the row already carries is the actor's; it is
-            // verified here because a signed local row was stored on the
-            // producer's word and this is the door where that word is checked.
-            crate::federation::edition2::group::vouched_envelope(
-                &row.attesting_key_id,
-                &row.attestation_envelope,
-                &row.scrub_signature_classical,
-                "promotion_reseal",
-            )?;
-            crate::federation::edition2::group::vouched_envelope(
-                &scrub.scrub_key_id,
-                &row.attestation_envelope,
-                &scrub.scrub_signature_classical,
-                "promotion_reseal",
-            )?;
-            // `cosigned_at` is the co-signer's own stamp, already verified
-            // parseable by `crossing_at` above; it rides OUTSIDE the preimage,
-            // so appending it cannot disturb the bytes the actor signed.
-            let cosigned_at = admission::render_signed_instant(now);
-            row.additional_scrubs.push(ScrubSig {
-                cosigned_at: Some(cosigned_at.clone()),
-                ..scrub.clone()
-            });
-            Custody::ActorSignedNodeCoScrubbed { cosigned_at }
-        }
-    };
-    // Pre-existing co-scrubs: the preserve set must equal the verified set
-    // (#541/#556). Verified at THIS door, over the same bytes; refused if
-    // unverifiable — never cleared.
-    let inherited = match &applied {
-        Custody::ActorSigned => row.additional_scrubs.len(),
-        Custody::ActorSignedNodeCoScrubbed { .. } => row.additional_scrubs.len() - 1,
-    };
-    for (i, scrub) in row.additional_scrubs.iter().take(inherited).enumerate() {
-        crate::federation::edition2::group::vouched_envelope(
-            &scrub.scrub_key_id,
-            &row.attestation_envelope,
-            &scrub.scrub_signature_classical,
-            "promotion_reseal",
-        )
-        .map_err(|e| match e {
-            Error::FederationTierUnverified {
-                attestation_id: _,
-                attesting_key_id,
-                reason,
-            } => Error::FederationTierUnverified {
-                attestation_id: row.attestation_id.clone(),
-                attesting_key_id,
-                reason: format!("additional_scrubs[{i}] at the crossing: {reason}"),
-            },
-            other => other,
-        })?;
-    }
-
-    row.tier = attestation_tier::FEDERATION.to_owned();
-    row.promoted_at = Some(now);
-    // Strict verification above guarantees the PQC half is present.
-    row.pqc_completed_at = Some(now);
-
-    check_promotion_admission(dir, &row, self_key_id).await?;
-    check_contextual_integrity(dir, &row, &row, ci, &row.cohort_scope.clone(), false, now).await?;
-
-    let mut for_hash = row.clone();
-    for_hash.persist_row_hash = String::new();
-    row.persist_row_hash = super::types::compute_persist_row_hash(&for_hash)?;
-
-    let crossing = report(&row, applied, now);
-    Ok(Some(EnterPlan { row, crossing }))
+    // v62.0.0 (F0-cp9) — the JCS arms themselves are deleted with their
+    // bound-hybrid verify: every JCS custody is refused by name.
+    let _ = ci;
+    Err(super::edition2::door::earlier_form_signature("enter_mesh"))
 }
 
 /// v62.0.0 (v62 P8) — **the [`EnterPlan`] of an edition-2 row**: the row's

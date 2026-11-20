@@ -248,18 +248,6 @@ impl SqliteBackend {
         Ok(())
     }
 
-    /// v53.1.3 (#986) — the test-only rival WITHDRAWAL armed for the point
-    /// between a withdrawal's held read and its write, applied through this
-    /// backend's own withdraw door. Never armed outside a test.
-    #[cfg(test)]
-    async fn test_rival_location_proof_withdrawal(&self) -> Result<(), crate::federation::Error> {
-        if let Some(rival) = self.test_hooks.take_rival_location_proof_withdrawal() {
-            Box::pin(crate::federation::FederationDirectory::withdraw_location_proof(self, rival))
-                .await?;
-        }
-        Ok(())
-    }
-
     /// #848 (`BLOB_REPLICATION.md` §16, I66) — **resolve the V145 minter
     /// sentinel to this node's own key.**
     ///
@@ -5640,40 +5628,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
     ) -> Option<&crate::federation::canonical_community::StandingCache> {
         Some(&self.trust_root_standing_cache)
-    }
-
-    async fn store_lineage_head_cosign(
-        &self,
-        cosign: &crate::federation::lineage_witness::LineageHeadCosign,
-    ) -> Result<bool, crate::federation::Error> {
-        // v62.0.0 (JSON-cut slice F; E8-fix4, #934) — the earlier-form
-        // refusal, on the shared plan.
-        crate::federation::lineage_witness::plan_store_lineage_head_cosign(cosign)?;
-        // v51.0.0 (#938) — V159; insert-or-hold, never delete (evidence).
-        let c = cosign.clone();
-        let admitted_at = crate::host::clock::now().to_rfc3339();
-        self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let n = conn.execute(
-                "INSERT OR IGNORE INTO federation_lineage_head_cosigns \
-                 (lineage_key_id, head_digest_sha256_hex, witness_key_id, head_asserted_at, \
-                  prior_head_digest_sha256_hex, signed_at, signature_classical, signature_pqc, \
-                  admitted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                rusqlite::params![
-                    c.lineage_key_id,
-                    c.head_digest_sha256_hex,
-                    c.witness_key_id,
-                    c.head_asserted_at,
-                    c.prior_head_digest_sha256_hex,
-                    c.signed_at,
-                    c.signature_classical,
-                    c.signature_pqc,
-                    admitted_at,
-                ],
-            )?;
-            Ok(n == 1)
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("store lineage head cosign: {e}")))
     }
 
     async fn list_lineage_head_cosigns_for(
@@ -26596,140 +26550,6 @@ impl crate::federation::family_admit::FamilyStore for SqliteBackend {
 /// `federation::evidence_admit`'s.
 #[async_trait::async_trait]
 impl crate::federation::evidence_admit::EvidenceStore for SqliteBackend {
-    async fn held_location_proof(
-        &self,
-        subject_key_id: &str,
-        asserted_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Option<crate::federation::SignedLocationProof>, crate::federation::Error> {
-        let (s, a) = (subject_key_id.to_owned(), asserted_at.to_rfc3339());
-        self.read(
-            move |conn| -> Result<Option<crate::federation::SignedLocationProof>, rusqlite::Error> {
-                conn.query_row(
-                    "SELECT * FROM federation_location_proofs \
-                      WHERE subject_key_id = ?1 AND asserted_at = ?2",
-                    rusqlite::params![s, a],
-                    sqlite_row_to_signed_location_proof,
-                )
-                .optional()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("held location proof: {e}")))
-    }
-
-    async fn store_planned_location_proof(
-        &self,
-        planned: crate::federation::evidence_admit::PlannedLocationProof,
-    ) -> Result<(), crate::federation::Error> {
-        let crate::federation::evidence_admit::PlannedLocationProof {
-            proof,
-            wire_index_key,
-        } = planned;
-        let row = proof.location_proof;
-        let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = (
-            proof.authority_key_id,
-            proof.scrub_signature_classical,
-            proof.scrub_signature_pqc,
-        );
-        let fk_links = vec![row.subject_key_id.clone(), authority_key_id.clone()];
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // v36.0.0 (#668) — THIS node's serve position (V130).
-            let admitted_at =
-                sqlite_next_plane_position(conn, "federation_location_proofs", POS_ASSERTED)?;
-            conn.execute(
-                "INSERT INTO federation_location_proofs (\
-                    subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
-                    attestation_evidence, withdrawn_at, persist_row_hash, \
-                    authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                rusqlite::params![
-                    row.subject_key_id,
-                    row.cell_id,
-                    i64::from(row.cell_resolution),
-                    row.asserted_at.to_rfc3339(),
-                    row.valid_until.map(|t| t.to_rfc3339()),
-                    row.attestation_evidence,
-                    row.withdrawn_at.map(|t| t.to_rfc3339()),
-                    row.persist_row_hash,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                    admitted_at.to_rfc3339(),
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(map_revocation_sqlite_err("location_proof", fk_links))?;
-        self.index_stored_record("LocationProof", &wire_index_key)
-            .await
-    }
-
-    async fn store_planned_location_proof_withdrawal(
-        &self,
-        planned: crate::federation::evidence_admit::PlannedLocationProof,
-    ) -> Result<bool, crate::federation::Error> {
-        let crate::federation::evidence_admit::PlannedLocationProof {
-            proof,
-            wire_index_key,
-        } = planned;
-        let row = proof.location_proof;
-        let s = row.subject_key_id;
-        let a = row.asserted_at.to_rfc3339();
-        let withdrawn_at = row.withdrawn_at.map(|t| t.to_rfc3339());
-        let persist_row_hash = row.persist_row_hash;
-        let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = (
-            proof.authority_key_id,
-            proof.scrub_signature_classical,
-            proof.scrub_signature_pqc,
-        );
-        let written = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                // The row moves to a fresh serve position (V130) so a peer
-                // past its cursor is served the withdrawal.
-                let admitted_at =
-                    sqlite_next_plane_position(conn, "federation_location_proofs", POS_ASSERTED)?;
-                // v53.1.3 (#986) — a COMPARE-AND-SET: a rival withdrawal can
-                // land between the plan's read and this write; the loser
-                // writes nothing.
-                conn.execute(
-                    "UPDATE federation_location_proofs \
-                        SET withdrawn_at = ?3, persist_row_hash = ?4, authority_key_id = ?5, \
-                            scrub_signature_classical = ?6, scrub_signature_pqc = ?7, \
-                            admitted_at = ?8 \
-                      WHERE subject_key_id = ?1 AND asserted_at = ?2 AND withdrawn_at IS NULL",
-                    rusqlite::params![
-                        s,
-                        a,
-                        withdrawn_at,
-                        persist_row_hash,
-                        authority_key_id,
-                        scrub_signature_classical,
-                        scrub_signature_pqc,
-                        admitted_at.to_rfc3339(),
-                    ],
-                )
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("withdraw_location_proof: {e}"))
-            })?;
-        if written == 0 {
-            return Ok(false);
-        }
-        // v53.1.3 (#986) — the row's bytes changed, so the signed wire index
-        // learns the new content hash exactly as the put path teaches it.
-        self.index_stored_record("LocationProof", &wire_index_key)
-            .await?;
-        Ok(true)
-    }
-
-    #[cfg(test)]
-    async fn rival_location_proof_withdrawal(&self) -> Result<(), crate::federation::Error> {
-        self.test_rival_location_proof_withdrawal().await
-    }
-
     async fn store_planned_touch_claim(
         &self,
         planned: crate::federation::evidence_admit::PlannedTouchClaim<'_>,

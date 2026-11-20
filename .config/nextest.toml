@@ -133,3 +133,18 @@ slow-timeout = { period = "60s", terminate-after = 20 }
 [profile.mutants]
 slow-timeout = { period = "20s", terminate-after = 3 }
 fail-fast = false
+
+# v62 — THE LIB LANE'S JUNIT.
+#
+# `.github/workflows/lib-lane.yml` runs the lib suite as N hash partitions on
+# GitHub runners with `--profile lib-lane`; its summary job merges the junit
+# files into one page. A profile of its own so the default profile writes no
+# junit file. Everything else is inherited from `profile.default`, including
+# its overrides (the postgres test-group, the substrate_machine leash).
+[profile.lib-lane]
+fail-fast = false
+
+[profile.lib-lane.junit]
+path = "junit.xml"
+store-failure-output = true
+store-success-output = false

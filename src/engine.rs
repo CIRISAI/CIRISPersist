@@ -2925,6 +2925,31 @@ impl Engine {
         .await
     }
 
+    /// v62.0.0 (F0-cp10) — the signer's standing over `agent_ref`, now
+    /// ([`signer_standing`](crate::federation::edition2::signing_domain::signer_standing));
+    /// `wa_body` names the WA body (a family) whose active seat confers
+    /// `wise_authority`.
+    ///
+    /// # Errors
+    /// Directory reads.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn signer_standing(
+        &self,
+        identity_ref: &str,
+        agent_ref: &str,
+        wa_body: Option<&str>,
+    ) -> Result<crate::federation::edition2::signing_domain::SignerStanding, crate::federation::Error>
+    {
+        crate::federation::edition2::signing_domain::signer_standing(
+            self.federation_directory().as_ref(),
+            identity_ref,
+            agent_ref,
+            wa_body,
+            crate::federation::edition2::composite_verify::now_ms(),
+        )
+        .await
+    }
+
     /// v62.0.0 (v62 P8) — **sign a drafted statement** with this engine's
     /// composite key: the `COSE_Sign1` statement over the draft's
     /// `sig_structure` ([`crate::federation::edition2::emit::Draft`]), ready
@@ -7764,32 +7789,6 @@ impl Engine {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(arc) => {
                 read_any_for_viewer(arc.as_ref(), at_rest_sha256, viewer_key_id, aad).await
-            }
-        }
-    }
-
-    /// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6; `TRUST_ROOT_RC6.md` §2.1) —
-    /// **the lineage-head cosign door**: admit one witness's cosignature over a
-    /// conferring lineage's head (`ciris.lineage_head_cosign.v1`). The eight
-    /// typed refusals of the door come back as `Refused { reason }`; a cosign
-    /// for a head this node does not hold is stored as evidence
-    /// (`HeldForUnknownHead`). Nothing is ever deleted.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn put_lineage_head_cosign(
-        &self,
-        cosign: crate::federation::lineage_witness::LineageHeadCosign,
-    ) -> Result<crate::federation::lineage_witness::LineageCosignOutcome, crate::federation::Error>
-    {
-        use crate::federation::lineage_witness::admit_lineage_head_cosign;
-        let now = crate::host::clock::now();
-        match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(arc) => {
-                admit_lineage_head_cosign(arc.as_ref(), &cosign, now).await
-            }
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(arc) => {
-                admit_lineage_head_cosign(arc.as_ref(), &cosign, now).await
             }
         }
     }
