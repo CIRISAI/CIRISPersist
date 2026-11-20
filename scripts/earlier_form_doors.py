@@ -197,10 +197,6 @@ COMPOSITE_ENTRIES = (
     # a transparency head's composite under its producer's key (CC 2.6.1.7)
     "verify_sth_signature",
 )
-# v62.0.0 (F0-cp6) — a CC 6.1.3 substrate plane: its chain ends in a body
-# whose first word is the one predicate (`substrate_form`), called
-# unconditionally at the body's top level, so the one predicate decides its form.
-SUBSTRATE_ENTRIES = ("substrate_form",)
 # v62.0.0 (F0-cp6c) — `pending`: a KNOWN earlier-form door routed to an owner
 # for migration. `check` allows it (the note must name the owner);
 # `release-check` is red while any remains, like a rewrite-pending test.
@@ -208,8 +204,9 @@ SUBSTRATE_ENTRIES = ("substrate_form",)
 # its chain ends in a body that calls the node-local rule unconditionally, so
 # another node's object is refused by name.
 NODE_LOCAL_ENTRIES = ("require_node_local_producer",)
-VERDICTS = ("refuses", "edition2", "retired", "exempt", "composite", "substrate", "pending",
-            "node_local")
+# v62.0.0 (F0-cp8) — `substrate` is gone: its one plane (the audit entry) is
+# `composite`, so no plane keeps its own signature form.
+VERDICTS = ("refuses", "edition2", "retired", "exempt", "composite", "pending", "node_local")
 SURFACES = ("trait", "pyo3", "capsule", "http")
 
 
@@ -903,7 +900,6 @@ def check_chain(tree: Tree, where: str, body: str, verdict: str, hops: list[str]
     anywhere in it; every later hop is held to the top-level rule."""
     terminals = REFUSALS if verdict == "refuses" \
         else COMPOSITE_ENTRIES if verdict == "composite" \
-        else SUBSTRATE_ENTRIES if verdict == "substrate" \
         else NODE_LOCAL_ENTRIES if verdict == "node_local" else EDITION2_ENTRIES
     cur_where, cur_bodies = where, [body]
 
@@ -952,7 +948,7 @@ def check_chain(tree: Tree, where: str, body: str, verdict: str, hops: list[str]
             return False
         cur_where, cur_bodies = f"{rel}::{fn}", nxt
     for b in cur_bodies:
-        if verdict in ("refuses", "substrate", "node_local"):
+        if verdict in ("refuses", "node_local"):
             # the refusal itself is never relaxed: a host door that refuses in
             # its own body refuses before its closure, not inside a branch
             ok = calls_at_top_level(b, terminals)
@@ -961,8 +957,6 @@ def check_chain(tree: Tree, where: str, body: str, verdict: str, hops: list[str]
         if not ok:
             what = "call `refuse_earlier_form(_row)(` unconditionally (at its body's top level)" \
                 if verdict == "refuses" \
-                else "call `substrate_form(` unconditionally (at its body's top level)" \
-                if verdict == "substrate" \
                 else "call `require_node_local_producer(` unconditionally (at its body's top level)" \
                 if verdict == "node_local" else f"call one of {', '.join(terminals)}"
             errors.append(f"{label}: {cur_where} does not {what}")
@@ -1170,7 +1164,9 @@ def unignore(base: Path) -> int:
 # `CompositePublicKey::verify` (`composite_verify`, `sig19`) and is not matched.
 LONE_VERIFY = re.compile(
     r"\b(?:verify_hybrid|verify_hybrid_via_directory|verify_hybrid_with_policy|"
-    r"verify_trace_hybrid|verify_ed25519_only_with_policy)\s*\("
+    r"verify_trace_hybrid|verify_ed25519_only_with_policy|"
+    # v62.0.0 (F0-cp8) — the earlier envelope verify, deleted with its 24 sites
+    r"verify_envelope_hybrid_signature)\s*\("
     r"|\b(?:HybridVerifier|Ed25519Verifier|MlDsa65Verifier|MlDsa65SoftwareVerifier)\b"
     r"|\.verify_strict\s*\("
     r"|\bed25519_dalek::Verifier\b"
@@ -1178,10 +1174,6 @@ LONE_VERIFY = re.compile(
 # The deliberate standalone verifies, each with why. Nothing else may verify a
 # lone component (the media chunk trailer, CC 5.3.3.5, is Edge's).
 LONE_VERIFY_ALLOWED = {
-    "src/audit/verify.rs":
-        "an audit entry's INNER Ed25519 signature by a local actor whose actor_id IS the "
-        "Ed25519 key, over bytes no other node verifies (CC 1.13.4; the served gate is the "
-        "composite-signed head); not an edition-2 key's half",
     "src/federation/edition2/receipts.rs":
         "SCITT receipts (RFC 9942) under a trusted transparency service's own COSE key; not a "
         "CIRIS identity's component",
@@ -1264,7 +1256,7 @@ def _check(base: Path) -> tuple[list[str], dict]:
                 ok = bool(door.bodies) and all(
                     check_chain(tree, w, b, verdict, chain, verified, trait_names, errors, f"trait `{key[1]}`")
                     for w, b in door.bodies for chain in (hops or [[]]))
-            verified[key[1]] = ok and verdict in ("refuses", "edition2", "retired", "composite", "substrate",
+            verified[key[1]] = ok and verdict in ("refuses", "edition2", "retired", "composite",
                                                   "node_local")
         if not progressed:
             break
@@ -1414,7 +1406,6 @@ pub fn router() -> Router {
     Router::new()
         .route("/a", post(post_ingest::<F>))
         .route("/s", post(post_signed::<F>))
-        .route("/u", post(post_substrate::<F>))
         .route("/l", post(post_local::<F>))
         .route("/h", get(get_health::<F>))
 }
@@ -1423,10 +1414,6 @@ async fn post_signed(body: Bytes) -> Response { verify_composite_via_directory(d
 async fn post_local(body: Bytes) -> Response {
     fountain::require_node_local_producer(&m, me)?;
     store(body)
-}
-async fn post_substrate(body: Bytes) -> Response {
-    let form = substrate::substrate_form(SubstratePlane::AuditEntry);
-    verify_inner(body)
 }
 """
 FIX_SWITCH = "pub const EARLIER_FORM_DOORS_SHUT: bool = {};\n"
@@ -1451,7 +1438,6 @@ capsule\tPutFamily\trefuses\ttrait:put_family\t-
 capsule\tApplyReplicatedKeyRecord\tretired\t-\t-
 http\tpost_ingest\texempt\t-\trequest auth, not a CEG row
 http\tpost_signed\tcomposite\t-\t-
-http\tpost_substrate\tsubstrate\t-\t-
 http\tpost_local\tnode_local\t-\t-
 """
 
@@ -1634,15 +1620,6 @@ def self_test() -> int:
          {"src/server/mod.rs": FIX_SERVER.replace("verify_composite_via_directory(d, &body, k, &s, 0).await",
                                                   "{ verify_hybrid_via_directory(d, &body); verify_composite_via_directory(d, &body, k, &s, 0).await }")},
          "is `composite` but still calls an earlier-form verifier (verify_hybrid_via_directory)"),
-        ("a substrate door whose gate moved under an `if` is red",
-         {"src/server/mod.rs": FIX_SERVER.replace(
-             "    let form = substrate::substrate_form(SubstratePlane::AuditEntry);",
-             "    if big(&body) { let form = substrate::substrate_form(SubstratePlane::AuditEntry); }")},
-         "post_substrate does not call `substrate_form(` unconditionally"),
-        ("a substrate door without the gate is red",
-         {"src/server/mod.rs": FIX_SERVER.replace(
-             "    let form = substrate::substrate_form(SubstratePlane::AuditEntry);\n", "")},
-         "post_substrate does not call `substrate_form(`"),
         ("a second door trait (BlobStorage) is inventoried: an object door with no row is red",
          {"src/federation/blobs.rs": FIX_BLOBS,
           "src/store/sqlite.rs": FIX_SQLITE + FIX_BLOBS_IMPL,
@@ -1670,11 +1647,14 @@ def self_test() -> int:
         ("the bound-hybrid verify returning is red (F0-cp7)",
          {"src/federation/w.rs": "pub fn v() { let _ = crate::verify::hybrid::verify_hybrid_via_directory(d, m, k, e, p, s, None); }\n"},
          "a standalone component verify (`verify_hybrid_via_directory"),
+        ("the earlier envelope verify returning is red (F0-cp8)",
+         {"src/federation/w.rs": "pub async fn v() { let _ = verify_envelope_hybrid_signature(d, k, e, c, p).await; }\n"},
+         "a standalone component verify (`verify_envelope_hybrid_signature"),
         ("a standalone verify in test code is not production (F0-cp7)",
          {"src/federation/w.rs": "#[cfg(test)]\nmod tests {\n    fn v(k: &[u8], m: &[u8], s: &[u8]) { let _ = ciris_crypto::Ed25519Verifier.verify_strict(k, m, s); }\n}\n"},
          None),
         ("an allow-listed standalone verify passes, and a stale entry is red (F0-cp7)",
-         {"src/audit/verify.rs": "fn f() {}\n"},
+         {"src/federation/edition2/receipts.rs": "fn f() {}\n"},
          "in LONE_VERIFY_ALLOWED but holds no standalone verify"),
         ("a door's whole test-gated module file is not production",
          {"src/federation/some_invariants.rs": "pub fn plan_family() { refuse_earlier_form(\"x\"); }\n",

@@ -48,6 +48,11 @@ pub enum ProduceError {
     /// The payload is not a map, or carries no `asserted_at` (POSIX ms).
     #[error("edition2_payload_invalid: {0}")]
     Payload(&'static str),
+    /// v62.0.0 (E2-fix10) — the door's own payload validator
+    /// (`payloads::check_by_id`) refuses the payload: the producer never
+    /// signs what its own door would refuse. The refusal's text as raised.
+    #[error("{0}")]
+    Rejected(String),
     /// The signer could not sign the composite (no PQC half, no
     /// context-sign, a half failed).
     #[error(transparent)]
@@ -83,6 +88,90 @@ pub async fn signer_identity(signer: &LocalSigner) -> Result<(Digest32, String),
     Ok((kid, identity_ref(&kid)))
 }
 
+/// v62.0.0 (E2-fix10; `signed_object_v2.cddl` `refs`, CC 2.6.1.3 / 2.6.1.2)
+/// — **`refs` as Verify's reader checks it** (`edition2::check_refs`, run in
+/// every `verify_row_statement` since 23.0.0), so a statement persist signs
+/// is one the door admits. The members are closed (`head`, `prev`,
+/// `answers`, `target` one row-ref; `further_heads`, `trusted_through` a
+/// row-ref-set; `also` a non-empty map over `ack` | `cites`, each a
+/// row-ref-set), and every set is sorted by encoding with no duplicate.
+/// The error is Verify's label, as `door::invalid_label` spells it:
+/// `unexpected:refs`, `unexpected:also`, `malformed:<member>`,
+/// `set_order:<member>`.
+///
+/// # Errors
+/// The label of the first rule broken, in Verify's order.
+pub fn check_refs(v: &Value) -> Result<(), &'static str> {
+    let m = v
+        .as_map()
+        .filter(|m| !m.is_empty())
+        .ok_or("malformed:refs")?;
+    for (k, x) in m {
+        match k.as_text() {
+            Some("head") => row_ref_ok(x, "malformed:head")?,
+            Some("prev") => row_ref_ok(x, "malformed:prev")?,
+            Some("answers") => row_ref_ok(x, "malformed:answers")?,
+            Some("target") => row_ref_ok(x, "malformed:target")?,
+            Some("further_heads") => {
+                row_ref_set_ok(x, "malformed:further_heads", "set_order:further_heads")?;
+            }
+            Some("trusted_through") => {
+                row_ref_set_ok(x, "malformed:trusted_through", "set_order:trusted_through")?;
+            }
+            Some("also") => {
+                let roles = x
+                    .as_map()
+                    .filter(|r| !r.is_empty())
+                    .ok_or("malformed:also")?;
+                for (role, set) in roles {
+                    match role.as_text() {
+                        Some("ack" | "cites") => {
+                            row_ref_set_ok(set, "malformed:also", "set_order:also")?;
+                        }
+                        _ => return Err("unexpected:also"),
+                    }
+                }
+            }
+            _ => return Err("unexpected:refs"),
+        }
+    }
+    Ok(())
+}
+
+/// `row-ref = [2, [-16, bstr .size 32]]` (Verify's `check_row_ref`).
+fn row_ref_ok(v: &Value, malformed: &'static str) -> Result<(), &'static str> {
+    match v.as_array() {
+        Some([ed, id]) if ed.as_u64() == Some(EDITION) => match id.as_array() {
+            Some([alg, d])
+                if alg.as_i64() == Some(-16) && d.as_bytes().is_some_and(|b| b.len() == 32) =>
+            {
+                Ok(())
+            }
+            _ => Err(malformed),
+        },
+        _ => Err(malformed),
+    }
+}
+
+/// A non-empty `row-ref-set`, sorted by encoding, no duplicate (Verify's
+/// `check_row_ref_set`).
+fn row_ref_set_ok(
+    v: &Value,
+    malformed: &'static str,
+    set_order: &'static str,
+) -> Result<(), &'static str> {
+    let a = v.as_array().filter(|a| !a.is_empty()).ok_or(malformed)?;
+    for r in a {
+        row_ref_ok(r, malformed)?;
+    }
+    let enc: Vec<Vec<u8>> = a.iter().map(cde::encode).collect();
+    if enc.windows(2).all(|w| w[0] < w[1]) {
+        Ok(())
+    } else {
+        Err(set_order)
+    }
+}
+
 /// The protected header of a row statement, as Verify's minter builds it:
 /// `iat` / `nbf` / `exp` are the payload's `asserted_at` / `valid_from` /
 /// `valid_until` in seconds.
@@ -100,6 +189,16 @@ pub fn row_protected(
     if payload.as_map().is_none() {
         return Err(ProduceError::Payload("the payload is not a map"));
     }
+    // v62.0.0 (E2-fix10) — never sign a statement Verify's reader refuses:
+    // `refs` is checked as Verify checks it, with Verify's labels.
+    if let Some(refs) = payload.get_text("refs") {
+        check_refs(refs).map_err(ProduceError::Payload)?;
+    }
+    // ... and never what persist's own door refuses: the same payload
+    // validator `door::pure_statement_gates` runs (`payloads::check_by_id`:
+    // the family's closed map, or the composer rule), before signing.
+    super::payloads::check_by_id(family, row_type, payload)
+        .map_err(|e| ProduceError::Rejected(e.to_string()))?;
     let ms = |k: &str| payload.get_text(k).and_then(Value::as_u64);
     let asserted_at = ms("asserted_at").ok_or(ProduceError::Payload("no asserted_at"))?;
     let mut claims = vec![

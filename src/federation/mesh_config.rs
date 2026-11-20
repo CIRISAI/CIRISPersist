@@ -1967,15 +1967,18 @@ where
 
     // ── The author's own signature, against pubkeys from THIS node's
     // directory (#377 — never pubkeys carried on the row).
-    if super::verify_envelope_hybrid_signature(
-        directory,
-        &row.attesting_key_id,
-        &row.attestation_envelope,
-        &row.scrub_signature_classical,
-        row.scrub_signature_pqc.as_deref(),
-    )
-    .await
-    .is_err()
+    //
+    // v62.0.0 (E6-fix8; CC 2.6.1.7) — the ROW's verify, not the envelope's: a
+    // v62 config row is the projection of the edition-2 statement it carries,
+    // proven by that statement's composite under the author's live key
+    // (`tier_ingest::verify_row_hybrid_signature` → `ingest::verify_carried`).
+    // The envelope-only earlier-form verify could never pass one (its scrub
+    // is not a bound-hybrid pair), so the root's own relief was refused
+    // `unverifiable_signature`. A row carrying no statement still meets the
+    // earlier-form arms, which refuse it by name.
+    if super::tier_ingest::verify_row_hybrid_signature(directory, row)
+        .await
+        .is_err()
     {
         return refused(R::UnverifiableSignature);
     }
@@ -3624,7 +3627,25 @@ mod tests {
         let node = register(dir, &node).await;
         let root_a = register(dir, &root_a).await;
         let root_b = register(dir, &root_b).await;
-        let delegate = register(dir, &delegate).await;
+        // v62.0.0 (E6-fix8) — the delegate is a PERSON's key: a `trust:confers`
+        // grant counts with the delegate's own voice (CC 2.6.1.9), and a
+        // machine delegate also needs its owner's (`delegate_owner`), which an
+        // unowned agent key cannot give. A person delegate is what CC 4.2.1's
+        // "a key the root has conferred to" needs here.
+        let delegate_seed = delegate.clone();
+        let delegate = {
+            let k = crate::federation::edition2::fixture_switch::put_key(
+                dir,
+                &delegate_seed,
+                &[crate::federation::types::identity_type::USER],
+            )
+            .await;
+            seeds()
+                .lock()
+                .expect("seed map")
+                .insert(k.clone(), delegate_seed.clone());
+            k
+        };
         let stranger = register(dir, &stranger).await;
         let outsider = register(dir, &outsider).await;
 
@@ -3659,11 +3680,23 @@ mod tests {
         );
         // v62.0.0 — the id the row is stored under is computed.
         let conferral_id = conferral.attestation_id.clone();
-        dir.put_attestation(super::super::SignedAttestation {
-            attestation: conferral,
-        })
+        // v62.0.0 (E6-fix8) — the root's grant, then the delegate's own voice
+        // (`land_with_voices`): the counted row lands only with both.
+        let landed = crate::federation::edition2::fixture_switch::land_with_voices(
+            dir,
+            &conferral,
+            &[&delegate_seed],
+        )
         .await
         .unwrap_or_else(|e| panic!("[{tag}] conferral must admit: {e}"));
+        assert!(
+            matches!(
+                landed,
+                crate::federation::edition2::ingest::StatementOutcome::Row { .. }
+                    | crate::federation::edition2::ingest::StatementOutcome::Voice { .. }
+            ),
+            "[{tag}] the conferral lands with the delegate's voice: {landed:?}"
+        );
 
         let now = Utc::now();
         let base = MeshConfigBaseline::owner_defaults();

@@ -3015,8 +3015,13 @@ mod tests {
             signer_key_id: &signer_key_id,
         };
 
-        let summary = pipeline.receive_and_persist(&bytes).await.unwrap();
-        assert_eq!(summary.signatures_verified, 1, "signature still verifies");
+        // v62 (E4-fix6; CP2): a statement-less trace is the earlier form,
+        // refused under `Full`; under `TrustPreVerified` it is the LOCAL path
+        // (kept, never served; I3482), where this gate still runs.
+        pipeline
+            .receive_and_persist_with(&bytes, VerifyMode::TrustPreVerified)
+            .await
+            .unwrap();
 
         let snap = backend.snapshot_events();
         assert!(!snap.is_empty());
@@ -3050,6 +3055,9 @@ mod tests {
             "i3716-someone-else",
         )
         .await;
+        // v62 (E4-fix6): the keyless room's id is `e2::kid(comm)` (E12's
+        // `community_of`); the trace names it by that id.
+        let comm = crate::federation::edition2::fixture_switch::kid(&comm);
         assert!(
             crate::federation::FederationDirectory::lookup_community(d, &comm)
                 .await
@@ -3115,7 +3123,13 @@ mod tests {
             signer: &*signer,
             signer_key_id: &signer_key_id,
         };
-        let err = pipeline.receive_and_persist(&bytes).await.unwrap_err();
+        // v62 (E4-fix6; CP2): a statement-less trace is the earlier form,
+        // refused under `Full`; under `TrustPreVerified` it is the LOCAL path
+        // (kept, never served; I3482), where this gate still runs.
+        let err = pipeline
+            .receive_and_persist_with(&bytes, VerifyMode::TrustPreVerified)
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -3152,8 +3166,13 @@ mod tests {
             signer_key_id: &signer_key_id,
         };
 
-        let summary = pipeline.receive_and_persist(&bytes).await.unwrap();
-        assert_eq!(summary.signatures_verified, 1);
+        // v62 (E4-fix6; CP2): a statement-less trace is the earlier form,
+        // refused under `Full`; under `TrustPreVerified` it is the LOCAL path
+        // (kept, never served; I3482), where this gate still runs.
+        pipeline
+            .receive_and_persist_with(&bytes, VerifyMode::TrustPreVerified)
+            .await
+            .unwrap();
         let snap = backend.snapshot_events();
         assert!(
             !snap.is_empty(),
@@ -3190,7 +3209,13 @@ mod tests {
             signer_key_id: &signer_key_id,
         };
 
-        pipeline.receive_and_persist(&bytes).await.unwrap();
+        // v62 (E4-fix6; CP2): a statement-less trace is the earlier form,
+        // refused under `Full`; under `TrustPreVerified` it is the LOCAL path
+        // (kept, never served; I3482), where this gate still runs.
+        pipeline
+            .receive_and_persist_with(&bytes, VerifyMode::TrustPreVerified)
+            .await
+            .unwrap();
 
         let snap = backend.snapshot_events();
         assert!(!snap.is_empty());
@@ -3242,7 +3267,13 @@ mod tests {
             signer_key_id: &signer_key_id,
         };
 
-        pipeline.receive_and_persist(&bytes).await.unwrap();
+        // v62 (E4-fix6; CP2): a statement-less trace is the earlier form,
+        // refused under `Full`; under `TrustPreVerified` it is the LOCAL path
+        // (kept, never served; I3482), where this gate still runs.
+        pipeline
+            .receive_and_persist_with(&bytes, VerifyMode::TrustPreVerified)
+            .await
+            .unwrap();
 
         let snap = backend.snapshot_events();
         assert!(!snap.is_empty());
@@ -3258,275 +3289,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn happy_path_full_pipeline() {
-        // Mission category §4: end-to-end across schema + verify +
-        // scrub (null) + decompose + backend (memory). Every layer
-        // must succeed with mission-aligned outcome counts.
-        let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
-        let backend = crate::store::test_backend::test_backend();
-        backend.add_public_key(&key_id, vkey);
-        seed_test_pqc_key(&backend).await;
+    // v62 (E4-fix6; CP2, ruling 4): `happy_path_full_pipeline` DELETED: it asserted the earlier-
+    // form `Full` verify of a statement-less JCS-signed trace (signatures_verified,
+    // verification_source Persist); its v62 twin is I3472 (`ingest/trace_statement_invariants`).
 
-        let (signer, signer_key_id) = make_test_signer().await;
-        let pipeline = IngestPipeline {
-            backend: &backend,
-            canonicalizer: &PythonJsonDumpsCanonicalizer,
-            scrubber: &NullScrubber,
-            signer: &*signer,
-            signer_key_id: &signer_key_id,
-        };
-
-        let summary = pipeline
-            .receive_and_persist(&bytes)
-            .await
-            .expect("happy path must succeed");
-
-        assert_eq!(summary.envelopes_processed, 1);
-        assert_eq!(summary.signatures_verified, 1);
-        assert_eq!(
-            summary.trace_events_inserted, 2,
-            "two components → two rows"
-        );
-        assert_eq!(summary.trace_events_conflicted, 0);
-        assert_eq!(summary.trace_llm_calls_inserted, 0);
-        assert_eq!(summary.scrubbed_fields, 0);
-
-        // Snapshot: ACTION_RESULT row carries the audit anchor (FSD §3.2).
-        let snap = backend.snapshot_events();
-        let action = snap
-            .iter()
-            .find(|e| e.event_type == crate::schema::ReasoningEventType::ActionResult)
-            .unwrap();
-        assert_eq!(action.cost_llm_calls, Some(0));
-        assert_eq!(action.cost_tokens, Some(100));
-
-        // THREAT_MODEL.md AV-24 regression: every row carries a
-        // populated scrub envelope. Always present; key never null.
-        for row in &snap {
-            assert!(
-                row.original_content_hash.is_some(),
-                "every v0.1.3+ row populates original_content_hash"
-            );
-            assert!(row.scrub_signature.is_some(), "scrub_signature populated");
-            assert_eq!(
-                row.scrub_key_id.as_deref(),
-                Some(signer_key_id.as_str()),
-                "scrub_key_id matches the signer's id"
-            );
-            assert!(row.scrub_timestamp.is_some(), "scrub_timestamp populated");
-            // CIRISPersist#91 — Full-mode rows attribute authenticity
-            // to persist's own `verify_trace`.
-            assert!(row.signature_verified, "Full-mode row is verified");
-            assert_eq!(
-                row.verification_source,
-                crate::store::VerificationSource::Persist,
-                "Full-mode rows attribute authenticity to persist"
-            );
-        }
-
-        // THREAT_MODEL.md AV-24 verification: ed25519_verify the first row's
-        // scrub_signature against the signer's public key — proving a peer with
-        // the published public key can verify the deployment's attestation.
-        //
-        // v17.7.0 (#470 arc, crypto-DRY closure) — strict-verify through the
-        // canonical `ciris_crypto::Ed25519Verifier::verify_strict` (v10.4.0)
-        // instead of reaching for `ed25519_dalek` directly: ONE Ed25519
-        // acceptance rule in the repo, not two.
-        //
-        // v32.0.0 (CIRISPersist#690) — **the preimage is rebuilt from the
-        // STORED ROW**, not from the envelope the pipeline just handed us.
-        //
-        // That distinction is the entire value of this test, and it is what
-        // caught the defect this version fixes. #690 widened the preimage from
-        // `canonical(post_scrub)` to the whole envelope, and initially shipped
-        // WITHOUT the three treatment columns — so `scrub_signature` covered
-        // three values that were persisted nowhere. It verified once, at
-        // signing time, and was unverifiable by anyone forever after: strictly
-        // worse than the ambiguity #690 set out to remove.
-        //
-        // A test that rebuilt the preimage from the in-memory envelope would
-        // have passed throughout, because the envelope holds fields the row
-        // does not. Reading only what a peer can read is what makes this an
-        // instrument rather than a restatement.
-        let pubkey_bytes = signer.public_key().await.expect("signer.public_key");
-
-        let row0 = &snap[0];
-        let payload_value = serde_json::Value::Object(row0.payload.clone());
-        let canonical = PythonJsonDumpsCanonicalizer
-            .canonicalize_value(&payload_value)
-            .unwrap();
-        let post_sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&canonical));
-
-        // Every component of the preimage comes off the row. If any of these is
-        // `None`, this `expect` fires and names the column — which is the
-        // failure mode worth having, because the alternative is a signature
-        // that silently cannot be checked.
-        let preimage = scrub_preimage(
-            &post_sha,
-            row0.original_content_hash
-                .as_deref()
-                .expect("original_content_hash persisted"),
-            row0.scrub_ner_ran
-                .expect("scrub_ner_ran persisted — it is inside the signature preimage"),
-            row0.scrub_applied_trace_level
-                .as_deref()
-                .expect("scrub_applied_trace_level persisted — inside the preimage"),
-            row0.scrub_model_digest.as_deref(),
-            row0.scrub_key_id
-                .as_deref()
-                .expect("scrub_key_id persisted"),
-            row0.scrub_timestamp.expect("scrub_timestamp persisted"),
-        );
-
-        let sig_b64 = row0.scrub_signature.as_ref().unwrap();
-        let sig_bytes = BASE64.decode(sig_b64).expect("base64 decode");
-        let verified = ciris_crypto::Ed25519Verifier
-            .verify_strict(&pubkey_bytes, &preimage, &sig_bytes)
-            .expect("verify_strict parse");
-        assert!(
-            verified,
-            "scrub_signature must verify against a preimage rebuilt ENTIRELY \
-             from persisted columns — if it does not, some field of the \
-             preimage is not being stored and no peer can ever check this \
-             signature"
-        );
-
-        // And the treatment claims are the ones the pipeline actually made,
-        // not defaults that happen to hash correctly. This batch is `generic`,
-        // which by design carries no content text (TRACE_WIRE_FORMAT.md §7), so
-        // the honest triple is "treated at generic, no NER pass, no model" —
-        // and the #690 door does not refuse it, because the label and the
-        // treatment agree.
-        assert_eq!(
-            row0.scrub_applied_trace_level.as_deref(),
-            Some("generic"),
-            "the level TREATED is persisted, and for a generic batch that is \
-             `generic` — not the pipeline's default and not the label of some \
-             other batch"
-        );
-        assert_eq!(
-            row0.scrub_ner_ran,
-            Some(false),
-            "Some(false) — a CLAIM that no pass ran, which is not the same as \
-             None (a pre-v32.0.0 row that made no claim at all). Collapsing \
-             those two is how an unscrubbed row would read as attested"
-        );
-        assert!(
-            row0.scrub_model_digest.is_none(),
-            "no model ran, so none may be named"
-        );
-    }
-
-    /// **CIRISPersist#705 / CIRISServer#418 — the record keeps what the wire
-    /// does not.**
-    ///
-    /// #690 scrubbed inside `receive_and_persist`, which is how an agent
-    /// captures ITS OWN traces — so the original was redacted before it was
-    /// ever stored and the unscrubbed record existed nowhere. Server wired a
-    /// real scrubber, watched self-scoped content change under it, reverted,
-    /// and held their pin.
-    ///
-    /// The privacy boundary is not ingest. `trace_events` is a LOCAL
-    /// projection (`Projection::TraceEvents` — derived on a receiver from an
-    /// admitted attestation) and is never replicated; the ATTESTATION embeds
-    /// the whole trace and is the wire object. So the stored rows come from the
-    /// original envelope and the attestation is minted from a scrubbed copy.
-    ///
-    /// **The assertion is the DISAGREEMENT between them.** Checking only the
-    /// row would pass on a no-op scrubber; checking only the attestation would
-    /// pass on the old both-scrubbed behaviour. Only the pair distinguishes
-    /// this fix from either.
-    #[tokio::test]
-    async fn the_record_keeps_what_the_wire_does_not_705() {
-        const MARKER: &str = "SECRET-MARKER-705";
-
-        /// Redacts the marker and honestly claims a pass, so the #690
-        /// publication gate is satisfied and this test isolates WHERE the
-        /// scrub lands rather than whether the gate fires.
-        struct MarkerScrubber;
-        impl crate::scrub::Scrubber for MarkerScrubber {
-            fn scrub_batch(
-                &self,
-                env: &mut BatchEnvelope,
-            ) -> Result<crate::scrub::ScrubOutcome, crate::scrub::ScrubError> {
-                let mut n = 0usize;
-                for event in &mut env.events {
-                    // `BatchEvent` is single-variant today; an `else` arm
-                    // would be unreachable, so this destructures directly and
-                    // will fail to compile if a variant is ever added — which
-                    // is the right prompt to decide what a scrubber does with it.
-                    let BatchEvent::CompleteTrace { trace, .. } = event;
-                    for c in &mut trace.components {
-                        // Stamps a sentinel instead of redacting a planted one:
-                        // planting would require re-signing the fixture, and the
-                        // property under test is "the copy differs from the
-                        // record", which a stamp witnesses exactly as well.
-                        c.data
-                            .insert(MARKER.to_owned(), serde_json::Value::Bool(true));
-                        n += 1;
-                    }
-                }
-                let lvl = env.trace_level.as_str().to_owned();
-                Ok(crate::scrub::ScrubOutcome {
-                    fields_modified: n,
-                    ner_ran: true,
-                    applied_trace_level: lvl,
-                    scrubber_model_digest: Some("test-model-705".to_owned()),
-                })
-            }
-        }
-
-        let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
-        let backend = crate::store::test_backend::test_backend();
-        backend.add_public_key(&key_id, vkey);
-        seed_test_pqc_key(&backend).await;
-        let (signer, signer_key_id) = make_test_signer().await;
-        let pipeline = IngestPipeline {
-            backend: &backend,
-            canonicalizer: &PythonJsonDumpsCanonicalizer,
-            scrubber: &MarkerScrubber,
-            signer: signer.as_ref(),
-            signer_key_id: &signer_key_id,
-        };
-        pipeline
-            .receive_and_persist(&bytes)
-            .await
-            .expect("ingest succeeds");
-
-        // THE RECORD: the stored row still carries the marker. This is the node's
-        // own capture and must retain full fidelity.
-        let rows = backend.snapshot_events();
-        let stored = serde_json::to_string(&rows).expect("serialize rows");
-        assert!(
-            !stored.contains(MARKER),
-            "the STORED row must be the UNTOUCHED original — if the scrubber's \
-             mark is here, ingest is still redacting the node's own record, \
-             which is exactly what CIRISServer#418 reverted over"
-        );
-
-        // THE WIRE: the minted attestation does not.
-        // The mint lands local-tier; this is the only reader for it, and it is
-        // the same one `promote_consented_backlog` walks before publishing.
-        let atts = {
-            use crate::federation::FederationDirectory as _;
-            backend
-                .list_local_tier_attestations(None, 64)
-                .await
-                .expect("list local-tier attestations")
-        };
-        let published = serde_json::to_string(&atts).expect("serialize attestations");
-        assert!(
-            !published.is_empty(),
-            "a trace attestation must be minted, or this test proves nothing"
-        );
-        assert!(
-            published.contains(MARKER),
-            "the ATTESTATION is the wire object and must carry the SCRUBBED \
-             copy — if the scrubber's mark is absent here, nothing was \
-             scrubbed on the way out and unredacted content ships to federation"
-        );
-    }
+    // v62 (E4-fix6; CP2, ruling 4): `the_record_keeps_what_the_wire_does_not_705` DELETED: its
+    // wire half is the minted earlier-form trace attestation; the v62 wire object is the statement
+    // plus blob, whose scrub is I3483 (`ingest/trace_statement_invariants`).
 
     #[tokio::test]
     async fn idempotent_replay() {
@@ -3546,89 +3315,26 @@ mod tests {
             signer_key_id: &signer_key_id,
         };
 
-        let s1 = pipeline.receive_and_persist(&bytes).await.unwrap();
+        // v62 (E4-fix6; CP2): a statement-less trace is the earlier form,
+        // refused under `Full`; under `TrustPreVerified` it is the LOCAL path
+        // (kept, never served; I3482), where this gate still runs.
+        let s1 = pipeline
+            .receive_and_persist_with(&bytes, VerifyMode::TrustPreVerified)
+            .await
+            .unwrap();
         assert_eq!(s1.trace_events_inserted, 2);
-        let s2 = pipeline.receive_and_persist(&bytes).await.unwrap();
+        let s2 = pipeline
+            .receive_and_persist_with(&bytes, VerifyMode::TrustPreVerified)
+            .await
+            .unwrap();
         assert_eq!(s2.trace_events_inserted, 0);
         assert_eq!(s2.trace_events_conflicted, 2);
     }
 
-    /// v18.0.0 (CIRISPersist#473) — ENVELOPE-NATIVE witness: an ingested
-    /// trace's canonical home is a local-tier `scores` attestation, visible
-    /// through the REALIZED consumer read (`list_scores`, tier=Local), with
-    /// a deterministic id making replays idempotent.
-    #[tokio::test]
-    async fn envelope_native_trace_mints_scores_attestation_and_replays_idempotently() {
-        use crate::federation::FederationDirectory as _;
-        let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
-        let backend = crate::store::test_backend::test_backend();
-        backend.add_public_key(&key_id, vkey);
-        seed_test_pqc_key(&backend).await;
-
-        // NOTE: memory's `add_public_key` seeds BOTH the legacy verify
-        // store AND a minimal federation_keys row — the mint's FK holds.
-
-        let (signer, signer_key_id) = make_test_signer().await;
-        let pipeline = IngestPipeline {
-            backend: &backend,
-            canonicalizer: &PythonJsonDumpsCanonicalizer,
-            scrubber: &NullScrubber,
-            signer: &*signer,
-            signer_key_id: &signer_key_id,
-        };
-
-        // First ingest: events land AND the attestation mints.
-        let s1 = pipeline.receive_and_persist(&bytes).await.unwrap();
-        assert_eq!(s1.trace_attestations_minted, 1, "one trace, one mint");
-        assert_eq!(s1.trace_attestations_skipped, 0);
-
-        // The realized consumer read: list_scores, tier=Local, exact dimension.
-        let filter: crate::read::AttestationFilter = serde_json::from_value(serde_json::json!({
-            "dimension_exact": TRACE_ATTESTATION_DIMENSION,
-            "tier": "Local",
-        }))
-        .unwrap();
-        let page = backend
-            .list_scores(&key_id, filter.clone(), None, 10)
-            .await
-            .expect("list_scores");
-        assert_eq!(page.items.len(), 1, "the trace IS a scores attestation");
-        let att = &page.items[0];
-        assert_eq!(att.attesting_key_id, key_id);
-        assert_eq!(
-            att.subject_key_ids,
-            vec![key_id.clone()],
-            "self-subject (#461)"
-        );
-        assert_eq!(
-            att.attestation_envelope
-                .get("dimension")
-                .and_then(|v| v.as_str()),
-            Some(TRACE_ATTESTATION_DIMENSION)
-        );
-        assert!(
-            att.attestation_envelope.get("trace").is_some(),
-            "small trace rides WHOLE (inline envelope, no manifest)"
-        );
-        let minted_id = att.attestation_id.clone();
-
-        // Replay: same bytes → same deterministic id → still exactly ONE row.
-        let s2 = pipeline.receive_and_persist(&bytes).await.unwrap();
-        assert_eq!(
-            s2.trace_events_inserted, 0,
-            "events dedup (pre-18 behavior)"
-        );
-        assert_eq!(s2.trace_attestations_minted, 1, "mint is replay-idempotent");
-        let page2 = backend
-            .list_scores(&key_id, filter, None, 10)
-            .await
-            .unwrap();
-        assert_eq!(page2.items.len(), 1, "NO duplicate attestation on replay");
-        assert_eq!(
-            page2.items[0].attestation_id, minted_id,
-            "same deterministic id"
-        );
-    }
+    // v62 (E4-fix6; CP2, ruling 4):
+    // `envelope_native_trace_mints_scores_attestation_and_replays_idempotently` DELETED: it
+    // asserted the earlier-form minted `scores` trace attestation; in v62 the `trace:complete:v1`
+    // row is the trace's home and nothing is minted beside it (I3472).
 
     // v62 (E4, wave 5): `replicated_trace_attestation_materializes_scorer_corpus_501`
     // is DELETED. It re-signed a minted trace attestation under the agent's
@@ -3723,7 +3429,7 @@ mod tests {
     /// persist here proves the `lookup_public_key` was bypassed.
     #[tokio::test]
     async fn skip_verify_persists_without_directory_lookup() {
-        let (bytes, key_id, _vkey) = make_signed_batch_bytes().await;
+        let (bytes, _key_id, _vkey) = make_signed_batch_bytes().await;
         let backend = crate::store::test_backend::test_backend();
         // Intentionally register NO public key: a `Full`-mode ingest
         // would fail at step 2 with `UnknownKey`.
@@ -3774,17 +3480,19 @@ mod tests {
             assert!(row.scrub_signature.is_some());
         }
 
-        // Control: the SAME batch in `Full` mode is rejected because
-        // no key is registered — proving skip-mode genuinely bypassed
-        // the directory lookup rather than the key being optional.
+        // Control (v62, E4-fix6; CP2): the SAME statement-less batch in
+        // `Full` mode is the earlier form and is refused by name, so the
+        // skip-mode rows above came from the local path alone. (Was:
+        // `UnknownKey`, the earlier-form verify's refusal.)
         let err = pipeline
             .receive_and_persist_with(&bytes, VerifyMode::Full)
             .await
             .unwrap_err();
-        match err {
-            IngestError::Verify(VerifyError::UnknownKey(id)) => assert_eq!(id, key_id),
-            other => panic!("expected UnknownKey in Full mode, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, IngestError::TraceRefused { kind, .. }
+                if *kind == "earlier_form_object"),
+            "expected the earlier-form refusal in Full mode, got {err:?}"
+        );
     }
 
     /// v0.4.6 (CIRISPersist#22) — decompose's schema-layer rejects
@@ -3876,8 +3584,14 @@ mod tests {
             signer_key_id: &signer_key_id,
         };
 
+        // v62 (E4-fix6; CP2): a statement-less trace is the earlier form,
+        // refused under `Full`; under `TrustPreVerified` it is the LOCAL path
+        // (kept, never served; I3482), where this gate still runs.
         let err = pipeline
-            .receive_and_persist(envelope.to_string().as_bytes())
+            .receive_and_persist_with(
+                envelope.to_string().as_bytes(),
+                VerifyMode::TrustPreVerified,
+            )
             .await
             .unwrap_err();
 

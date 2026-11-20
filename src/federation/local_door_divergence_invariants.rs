@@ -79,7 +79,7 @@ pub(crate) mod bodies {
     pub(crate) async fn i951_observe(d: &dyn FederationDirectory, tag: &str) -> Observed {
         // v62.0.0 (JSON cut, E7) — the attester is an edition-2 key: its
         // `key:record` is live, and its key id is the identity-ref.
-        let a = e2::put_key(d, &format!("{tag}-a"), &[identity_type::STEWARD]).await;
+        let a = e2::put_key(d, &format!("a-{tag}"), &[identity_type::STEWARD]).await;
         let id = |n: &str| {
             uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, format!("{tag}-{n}").as_bytes())
                 .to_string()
@@ -96,7 +96,7 @@ pub(crate) mod bodies {
         let same_dimension_weight = d.get_attestation(&x).await.unwrap().and_then(|r| r.weight);
 
         // (B) a held row of another dimension's id, re-used by an upsert.
-        let b = e2::put_key(d, &format!("{tag}-b"), &[identity_type::STEWARD]).await;
+        let b = e2::put_key(d, &format!("b-{tag}"), &[identity_type::STEWARD]).await;
         let (y, z) = (id("y"), id("z"));
         d.attestation_insert_local(input(&y, &b, CAPABILITY, 1.0))
             .await

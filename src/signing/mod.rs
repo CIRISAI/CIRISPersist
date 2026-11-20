@@ -9,9 +9,10 @@
 //! without going through Python.
 //!
 //! [`LocalSigner`] lifts the construction + sign primitives to a
-//! Rust-public struct. PyO3 `Engine.local_sign` /
-//! `local_pqc_sign` are now thin wrappers — one implementation,
-//! both surfaces (CIRISPersist#7 single-source-of-truth pattern).
+//! Rust-public struct. v62.0.0 (F0-cp8): the host surface signs only a
+//! composite (PyO3 `Engine.sign_composite(domain, message)` over
+//! [`LocalSigner::sign_composite`]); the lone-half verbs `local_sign` /
+//! `local_pqc_sign` are removed from it.
 //!
 //! # Construction
 //!
@@ -190,8 +191,7 @@ pub enum LocalSignerError {
 /// Both variants cache the 32-byte Ed25519 public key at construction
 /// (the `HardwareSigner::public_key` read is async; capturing it once
 /// keeps [`LocalSigner::public_key_b64`] a synchronous accessor — its
-/// existing contract, exercised on hot paths across `federation::emit`
-/// / `federation::read`).
+/// existing contract).
 enum ClassicalSigner {
     /// Plaintext in-process Ed25519 key (the software-identity path —
     /// [`LocalSigner::from_config`] / [`LocalSigner::from_parts`]).
@@ -440,7 +440,8 @@ impl LocalSigner {
     }
 
     /// Ed25519 sign canonical bytes. Returns the 64-byte signature.
-    /// Hot-path; no async. Mirrors PyO3 `engine.local_sign(message)`.
+    /// Hot-path; no async. Rust-internal (v62.0.0: no host verb exposes a
+    /// lone Ed25519 half).
     ///
     /// v7.1.0 (CIRISPersist#224): this synchronous accessor signs only
     /// for the plaintext classical half. A hardware-custodied classical
@@ -448,9 +449,8 @@ impl LocalSigner {
     /// [`HardwareSigner`] trait, so it returns
     /// [`LocalSignerError::ClassicalSign`] here — use
     /// [`Self::sign_hybrid`] (the deliverable path for a hardware-hybrid
-    /// signer). The software-identity callers that use this hot path
-    /// (`federation::emit` trust grants, the secrets client) always hold
-    /// a plaintext signer.
+    /// signer). The software-identity caller that uses this hot path (the
+    /// secrets client) always holds a plaintext signer.
     pub fn sign_ed25519(&self, message: &[u8]) -> Result<[u8; 64], LocalSignerError> {
         match &self.classical {
             ClassicalSigner::Plaintext(sk) => Ok(sk.sign(message).to_bytes()),

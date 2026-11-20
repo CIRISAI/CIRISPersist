@@ -856,6 +856,55 @@ pub(crate) fn lifecycle_predicate(
             format!("c2.attestation_envelope::jsonb->>'{path}'"),
         ),
     };
+    // v62.0.0 (v62 P8-fix14; lead ruling (a)) — **a restatement hides its
+    // prior.** An edition-2 widening restates the claim as a new row (no
+    // composer names the prior: CC's only supersede link, `refs.target`, is
+    // a composer's, and a composer cannot carry the claim at a new scope).
+    // Both rows carry the restatement key their statements derive
+    // (`crossing::restatement_key`, V300's generated `restatement_key`); a
+    // row is hidden, in every view that hides `supersedes`, while a LIVE row
+    // by the same attester with the same key holds an audience that strictly
+    // CONTAINS its own: `self` is contained by every other scope, and every
+    // scope but `federation` by `federation`. The scoped audiences (family,
+    // community, affiliations, species, biosphere) are incomparable, so two
+    // rooms both stay live (I1506). "Live" is the restating row not hidden by
+    // its own author's hiding composer: a narrowing withdraws the wider row,
+    // and the narrower prior is served again.
+    let restated = if hide.contains(&crate::federation::types::attestation_type::SUPERSEDES) {
+        let (w_ref, w_id, outer_id, w_pin) = match dialect {
+            Dialect::Sqlite => (
+                format!("json_extract(cw.attestation_envelope, '$.{path}')"),
+                "+w.attestation_id".to_owned(),
+                format!("{outer}.attestation_id"),
+                " INDEXED BY federation_attestations_restatement",
+            ),
+            Dialect::Postgres => (
+                format!("cw.attestation_envelope::jsonb->>'{path}'"),
+                "w.attestation_id::text".to_owned(),
+                format!("{outer}.attestation_id::text"),
+                "",
+            ),
+        };
+        let w_attestation_id = match dialect {
+            Dialect::Sqlite => "w.attestation_id".to_owned(),
+            Dialect::Postgres => "w.attestation_id::text".to_owned(),
+        };
+        format!(
+            " AND NOT EXISTS (SELECT 1 FROM {table} w{w_pin} \
+               WHERE {outer}.restatement_key IS NOT NULL \
+                 AND w.restatement_key = {outer}.restatement_key \
+                 AND w.attesting_key_id = {outer}.attesting_key_id \
+                 AND {w_attestation_id} <> {outer_id} \
+                 AND (({outer}.cohort_scope = 'self' AND w.cohort_scope <> 'self') \
+                      OR (w.cohort_scope = 'federation' AND {outer}.cohort_scope <> 'federation')) \
+                 AND NOT EXISTS (SELECT 1 FROM {table} cw{pin} \
+                   WHERE cw.attesting_key_id = w.attesting_key_id \
+                     AND cw.attestation_type IN ({list}) \
+                     AND {w_ref} = {w_id}))"
+        )
+    } else {
+        String::new()
+    };
     Some((
         format!(
             "NOT EXISTS (SELECT 1 FROM {table} c{pin} \
@@ -877,7 +926,7 @@ pub(crate) fn lifecycle_predicate(
                  AND {rank_ref} = {outer_ref} \
                  AND r.cohort_scope = {outer}.cohort_scope \
                  AND {null_eq} \
-                 AND {older})",
+                 AND {older}){restated}",
             rules = CARVED_OUT_ADMITTING_RULES
                 .iter()
                 .map(u8::to_string)

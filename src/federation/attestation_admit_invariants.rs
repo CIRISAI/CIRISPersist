@@ -89,7 +89,9 @@ pub(crate) mod bodies {
         D: AttestationStore + 'static,
     {
         let dd = d as &dyn FederationDirectory;
-        let k = |n: &str| format!("{tag}-{n}");
+        // v62.0.0 (E2-fix7): the role FIRST, the tag after it — a test key seeds
+        // from the first 32 bytes of its name.
+        let k = |n: &str| format!("{n}-{tag}");
         for n in ["a", "b", "c", "e"] {
             ts::register_hybrid_key_as(dd, &k(n), &k(n), identity_type::AGENT).await;
         }

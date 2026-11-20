@@ -491,14 +491,18 @@ pub(crate) mod bodies {
         assert!(active_e2(d, &f, &d5).await);
         // {f, d2, d3, d5}: d4 needs 3 — d2, then d3 and d5. d2's first
         // proposal stood on the head d1's eviction succeeded, so it is VOID
-        // here (CC 2.7.8); d2 proposes d4 again on the current head.
-        assert!(!landed(&bind_at(d, &f, &d4, &[&d2], t4).await));
+        // here (CC 2.7.8); d2 proposes d4 again on the current head, at a
+        // NEW instant: d5 can sign as f only once its own bind (t5) is live
+        // (way (d) of the key-of-issuer check reads the occurrence at the
+        // statement's instant), so the re-proposal and its assents are at t6.
+        let t6 = ms_now();
+        assert!(!landed(&bind_at(d, &f, &d4, &[&d2], t6).await));
         assert!(!landed(
-            &put_st(d, &occ_voice_at(d, &d3, &f, &f, &d4, t4).await).await
+            &put_st(d, &occ_voice_at(d, &d3, &f, &f, &d4, t6).await).await
         ));
         assert!(!active_e2(d, &f, &d4).await, "I1134: 2 of 4 is no majority");
         assert!(landed(
-            &put_st(d, &occ_voice_at(d, &d5, &f, &f, &d4, t4).await).await
+            &put_st(d, &occ_voice_at(d, &d5, &f, &f, &d4, t6).await).await
         ));
         assert!(active_e2(d, &f, &d4).await, "I1134: live assents land it");
     }
@@ -983,15 +987,18 @@ pub(crate) mod bodies {
         ts::seal_row_in_place(&d1, &mut stale_bind);
         // v62 (E3b, round 3): through the edition-2 door, where the roster W
         // bound (`check_owner_binding_roster_fresh`) runs before the count.
-        let e = e2::put_signed(d, &stale_bind)
-            .await
-            .expect_err("I1142: the evicted d1's backdated owner-binding");
-        assert!(
-            matches!(e, Error::AssertedAtStale { .. })
-                && e.kind() == "federation_invalid_argument"
-                && e.to_string().starts_with(sr::ASSERTED_AT_STALE),
-            "I1142: {e}"
-        );
+        // v62 (E3, round 6; CC 2.7, ruling 5): the roster W bound is a fold
+        // condition, so the stale binding is HELD (`Pending`, concluding
+        // nothing) or refused `asserted_at_stale`; either way it does not land.
+        match e2::put_signed(d, &stale_bind).await {
+            Ok(StatementOutcome::Pending { .. }) => {}
+            Err(e) => assert!(
+                matches!(e, Error::AssertedAtStale { .. })
+                    && e.to_string().starts_with(sr::ASSERTED_AT_STALE),
+                "I1142: {e}"
+            ),
+            other => panic!("I1142: the evicted d1's backdated owner-binding landed: {other:?}"),
+        }
 
         // A live roster key inside W passes, and counts.
         let mut fresh = grant(&d2, &peer, &node_k);

@@ -96,10 +96,12 @@ pub mod second_signer_voice;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod second_signer_voice_invariants;
 pub mod serve;
+// v62.0.0 (F0-cp8) — the closed registry of signing domains (CC 2.6.1.7).
+pub mod signing_domain;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod signing_domain_invariants;
 pub mod standing;
 pub mod store;
-// v62.0.0 (F0-cp6) — the CC 6.1.3 substrate planes and their one predicate.
-pub mod substrate;
 pub mod transport_rebind;
 pub mod trust_root_group;
 pub mod typed;

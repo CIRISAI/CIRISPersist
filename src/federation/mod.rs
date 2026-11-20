@@ -111,8 +111,6 @@ pub(crate) mod transport_admit;
 pub mod attestation_query;
 #[cfg(test)]
 mod attestation_query_invariants;
-#[cfg(feature = "cirisaudit")]
-pub mod backfill;
 pub mod blackhole;
 #[cfg(test)]
 mod blob_surface_gates;
@@ -313,6 +311,10 @@ pub(crate) mod owner_binding_audience_invariants;
 /// v61 S2 (CIRISPersist#1148) — I1509: a replicated write needs the audience.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod put_audience_invariants;
+/// v62.0.0 (v62 P8-fix14) — I3540, I3548: an edition-2 restatement hides
+/// the prior it widens (the restatement key, read-time containment).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod restatement_supersede_invariants;
 /// v53.1.2 (CIRISPersist#984 row 12) — who may retract what (I516).
 #[cfg(test)]
 mod retraction_invariants;
@@ -429,7 +431,7 @@ pub(crate) mod stream_sth_producer_invariants;
 /// v50.0.0 (CIRISPersist#919) — I186: the consent sweep never widens a placed row.
 #[cfg(test)]
 pub mod sweep_placement_invariants;
-/// v47.3.0 (CIRISPersist#901) — I154–I158: a root is as attested as its holders.
+/// v47.3.0 (CIRISPersist#901) — I158 (I154–I156 deleted at v62): a root is as attested as its holders.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod trust_root_hardware_invariants;
 /// v51.0.0 — the backend-door invariants of the v51 cut (I125 …).
@@ -458,8 +460,6 @@ pub(crate) mod canonical_community_invariants;
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.
 pub mod content_class;
-#[cfg(feature = "cirisaudit")]
-pub mod emit;
 // (CIRISPersist#519 / #520) — the family-rule INVENTORY: every namespace family
 // persist states an emitter/composition rule about, derived from each ruling
 // surface at its own source, plus the pinned gap where the vendored registry
@@ -606,8 +606,6 @@ pub use operational::test_support as accord_test_support;
 pub mod ownership_reclaim;
 pub mod perceptual_hash;
 pub mod precedence;
-#[cfg(feature = "cirisaudit")]
-pub mod read;
 // v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the single
 // canonical federation-key registration admission gate (hybrid-verify
 // the registration + §7 reserved-prefix identity rules + fail-secure).
@@ -680,9 +678,11 @@ pub struct ConsentSweepReport {
     /// `skipped` "not a member".
     #[serde(default)]
     pub awaiting_roster: u64,
-    /// v62.0.0 (v62 P8-fix5) — crossings whose restatement is HELD for its
-    /// second signers' voices (`MeshCrossingOutcome::Held`). Like
-    /// `awaiting_actor` these wait; they are not errors.
+    /// v62.0.0 (v62 P8-fix5, fix15) — crossings whose restatement is HELD
+    /// (`MeshCrossingOutcome::Held`) for its second signers' voices or
+    /// another fold condition; a hold on an absent roster counts
+    /// `awaiting_roster` instead. Like `awaiting_actor` these wait; they are
+    /// not errors.
     #[serde(default)]
     pub awaiting_voices: u64,
     /// Rows on which a crossing returned an error (logged via
@@ -989,7 +989,6 @@ pub mod topology;
 // strip implementation); see the module doc for the live-vs-declared-only
 // opcode split and the TRANSFORM_ALGEBRA_HASH pin.
 pub mod transform;
-pub mod trust_grant;
 pub mod types;
 pub mod verify_coord;
 
@@ -1146,10 +1145,10 @@ pub use stream_sth::{
 pub(crate) use tier_ingest::{attestation_reput_verdict, community_reput_verdict};
 pub use tier_ingest::{
     verify_community_admission, verify_community_membership_revocation_admission,
-    verify_community_membership_widening_admission, verify_envelope_hybrid_signature,
-    verify_family_admission, verify_family_membership_revocation_admission,
-    verify_family_membership_widening_admission, verify_federation_tier_ingest,
-    verify_location_proof_admission, verify_revocation_admission, verify_row_hybrid_signature,
+    verify_community_membership_widening_admission, verify_family_admission,
+    verify_family_membership_revocation_admission, verify_family_membership_widening_admission,
+    verify_federation_tier_ingest, verify_location_proof_admission, verify_revocation_admission,
+    verify_row_hybrid_signature,
 };
 pub use topology::{
     build_delegation_graph, build_trust_topology, effective_delegation_depth, AuditChainEntry,

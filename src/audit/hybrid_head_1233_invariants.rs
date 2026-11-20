@@ -247,7 +247,7 @@ pub(crate) mod bodies {
     }
 
     /// I1565, the service leg — `AuditService::current_sth` (what
-    /// `trust_grant_inclusion_proof` and `audit_chain_proof` serve) refuses
+    /// `audit_chain_proof` serves) refuses
     /// the same stored earlier-form head by name.
     pub(crate) fn assert_current_sth_serves_the_stored_head(
         got: Result<Option<SignedTreeHead>, crate::audit::Error>,

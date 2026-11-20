@@ -5646,10 +5646,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         cosign: &crate::federation::lineage_witness::LineageHeadCosign,
     ) -> Result<bool, crate::federation::Error> {
-        // v62.0.0 (JSON-cut slice F) — a cosign of the earlier form is a
-        // JSON object; this leaf is a trait door too, so it refuses by name
-        // itself and not only behind `admit_lineage_head_cosign`.
-        crate::federation::edition2::door::refuse_earlier_form("lineage_head_cosign")?;
+        // v62.0.0 (JSON-cut slice F; E8-fix4, #934) — the earlier-form
+        // refusal, on the shared plan.
+        crate::federation::lineage_witness::plan_store_lineage_head_cosign(cosign)?;
         // v51.0.0 (#938) — V159; insert-or-hold, never delete (evidence).
         let c = cosign.clone();
         let admitted_at = crate::host::clock::now().to_rfc3339();
@@ -16283,10 +16282,13 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                         admitted_at.to_rfc3339(),
                     ],
                 )?;
+                // v62.0.0 (P8-fix14) — the restatement key, beside the row.
+                let fresh = tx.changes() != 0;
+                sqlite_stamp_restatement_key(&tx, &row)?;
                 // v38.5.0 (#771) — zero rows means the id was already
                 // occupied: the projections were derived from these bytes when
                 // the row first landed.
-                if tx.changes() == 0 {
+                if !fresh {
                     return Ok(false);
                 }
                 // v17.4.0 (V106) — the subject projection.
@@ -18112,6 +18114,26 @@ fn sqlite_row_to_hard_case_event(
     })
 }
 
+/// v62.0.0 (v62 P8-fix14; lead ruling (a)) — store an edition-2 row's
+/// restatement key ([`crate::federation::crossing::restatement_key_of_row`])
+/// in V300's plain `restatement_key` column, beside the row, in the writer's
+/// transaction. Never an envelope member: no content hash sees it. A row
+/// that carries no statement keeps `NULL`; an already-stamped row is left
+/// as it is.
+fn sqlite_stamp_restatement_key(
+    tx: &rusqlite::Connection,
+    row: &crate::federation::Attestation,
+) -> Result<(), rusqlite::Error> {
+    if let Some(key) = crate::federation::crossing::restatement_key_of_row(row) {
+        tx.execute(
+            "UPDATE federation_attestations SET restatement_key = ?1 \
+             WHERE attestation_id = ?2 AND restatement_key IS NULL",
+            rusqlite::params![key, row.attestation_id],
+        )?;
+    }
+    Ok(())
+}
+
 /// v58.0.0 (CIRISPersist#991) — insert a key-plane row (federation tier,
 /// minted by `federation::key_plane` from the signed object it carries) in
 /// the caller's transaction, with its serve position. `INSERT OR IGNORE`: one
@@ -18128,7 +18150,7 @@ pub(crate) fn sqlite_insert_plane_row(
     // co-signatures; a key-plane row carries none (`[]`).
     let additional_scrubs = serde_json::to_string(&row.additional_scrubs).map_err(to_sql_err)?;
     let admitted_at = sqlite_next_plane_position(tx, "federation_attestations", POS_ATTESTATION)?;
-    tx.execute(
+    let n = tx.execute(
         "INSERT OR IGNORE INTO federation_attestations (\
             attestation_id, attesting_key_id, attested_key_id, attestation_type, \
             weight, asserted_at, expires_at, attestation_envelope, \
@@ -18157,7 +18179,9 @@ pub(crate) fn sqlite_insert_plane_row(
             admitted_at.to_rfc3339(),
             additional_scrubs,
         ],
-    )
+    )?;
+    sqlite_stamp_restatement_key(tx, row)?;
+    Ok(n)
 }
 
 /// v58.0.0 (CIRISPersist#991) — is V198 applied? A schema before it (only a
@@ -18522,6 +18546,7 @@ fn sqlite_insert_local_attestation_row(
             admitted_at.to_rfc3339(),
         ],
     )?;
+    sqlite_stamp_restatement_key(tx, row)?;
     // v17.4.0 (V106) — maintain the subject projection at `local` tier.
     // On the upsert-replace path the prior row's projection entries were
     // already dropped by the DELETE above (FK ON DELETE CASCADE), so no
@@ -28242,38 +28267,22 @@ mod tests {
         // an edition-2 statement, the node's voice a further statement over
         // it.)
         put_owner_binding(&backend, "cfg-amb-owner1", "cfg-amb-node").await;
-        // …owner2's is the anomaly, raw-inserted exactly as the sibling test
-        // above does (the state a pre-v12.6.0 corpus can hold).
-        {
-            let anomaly = ts::owner_binding_attestation(
+        // …and owner2's is a second COUNTED owner (v62.0.0, E1-fix2; I2840 /
+        // I2841, KERNEL_SEAMS B1 / C557): a second, distinct owner's binding
+        // is held, not refused, and the node voices it too, so the owner seat
+        // counts two owners (`AmbiguousNodeOwner`). The earlier raw JSON row
+        // (a pre-v12.6.0 corpus) is a row no edition-2 read counts.
+        crate::federation::edition2::fixture_switch::land_owner_binding(
+            &backend,
+            &ts::owner_binding_attestation(
                 &uuid::Uuid::new_v4().to_string(),
                 "cfg-amb-owner2",
                 "cfg-amb-node",
-            );
-            let env_text = serde_json::to_string(&anomaly.attestation_envelope).unwrap();
-            let conn = backend.conn_handle();
-            let conn = conn.lock();
-            conn.execute(
-                "INSERT INTO federation_attestations (\
-                    attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-                    asserted_at, attestation_envelope, original_content_hash, \
-                    scrub_signature_classical, scrub_key_id, scrub_timestamp, \
-                    persist_row_hash, admitted_at, additional_scrubs\
-                 ) VALUES (?1, ?4, ?5, 'delegates_to', \
-                    '2026-05-01T00:00:00+00:00', ?2, x'00', 'c2ln', ?4, \
-                    '2026-05-01T00:00:00+00:00', '0', '2026-05-01T00:00:00+00:00', ?3)",
-                rusqlite::params![
-                    anomaly.attestation_id,
-                    env_text,
-                    // v62.0.0 — the node's co-scrub (CC 3.2, the first binding)
-                    serde_json::to_string(&anomaly.additional_scrubs).unwrap(),
-                    // v62.0.0 (E1) — the stored key ids are identity-refs.
-                    e2::kid("cfg-amb-owner2"),
-                    e2::kid("cfg-amb-node"),
-                ],
-            )
-            .unwrap();
-        }
+            ),
+            "cfg-amb-node",
+        )
+        .await
+        .expect("a second owner's binding is not refused");
 
         let config_row = |id: &str, author: &str| {
             let now = chrono::Utc::now();
@@ -28530,6 +28539,83 @@ mod tests {
             .await
             .expect("an earlier-form test key is admitted (held test)");
         }
+    }
+
+    /// v62.0.0 (E1-fix2; CC 2.7.3, CC 2.7.5, CC 4.4.3.19) — **a
+    /// `delegates_to` row put as it lands** (edition 2 only): the row sealed
+    /// ([`e2_row`]), then the author's statement and each second-signer voice
+    /// its resolved model names ([`e2::land_delegation`]: the delegate, and a
+    /// machine delegate's bound owner). An owner-binding-purpose row (a
+    /// custody claim) lands through [`e2::land_owner_binding`] (the bound
+    /// key's voice). Returns the sealed row and the last outcome: `Pending`
+    /// while a role is unvoiced (a machine delegate with no bound owner),
+    /// `Row` once it seats. The postgres twin is `pg_land_delegation`.
+    async fn land_delegation_any<D>(
+        dir: &D,
+        row: Attestation,
+    ) -> Result<
+        (
+            Attestation,
+            crate::federation::edition2::ingest::StatementOutcome,
+        ),
+        crate::federation::Error,
+    >
+    where
+        D: FederationDirectory + ?Sized,
+    {
+        let owner_binding = row
+            .attestation_envelope
+            .get("delegation_purpose")
+            .and_then(serde_json::Value::as_str)
+            == Some(crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE);
+        let sealed = e2_row(row);
+        let out = if owner_binding {
+            let node = e2::seed_of(&sealed.attested_key_id);
+            e2::land_owner_binding(dir, &sealed, &node).await?
+        } else {
+            e2::land_delegation(dir, &sealed).await?.0
+        };
+        Ok((sealed, out))
+    }
+
+    /// [`land_delegation_any`] that must SEAT (`Row`); the earlier form (a
+    /// HELD test) puts the row through `put_attestation`. Returns the stored
+    /// row. A delegation to a machine key seats only once its owner is bound
+    /// (`bind_machine_owner`).
+    async fn put_delegation<D>(dir: &D, row: Attestation) -> Attestation
+    where
+        D: FederationDirectory + ?Sized,
+    {
+        if !e2::emit_edition2() {
+            dir.put_attestation(SignedAttestation {
+                attestation: row.clone(),
+            })
+            .await
+            .expect("the delegation is admitted (held test)");
+            return row;
+        }
+        let (sealed, out) = land_delegation_any(dir, row)
+            .await
+            .unwrap_or_else(|e| panic!("the delegation lands: {e:?}"));
+        assert!(
+            matches!(
+                out,
+                crate::federation::edition2::ingest::StatementOutcome::Row { .. }
+            ),
+            "the delegation {} seats, got {out:?}",
+            sealed.attestation_id
+        );
+        sealed
+    }
+
+    /// v62.0.0 (E1-fix2; CC 4.4.3.19, E4-fix4) — `owner` binds the machine
+    /// key `machine` (the owner binding, the machine's voice included), so a
+    /// delegation to `machine` can seat and `machine` is steward-bound.
+    async fn bind_machine_owner(dir: &dyn FederationDirectory, owner: &str, machine: &str) {
+        crate::federation::admission::steward_liveness_test_support::bind_machine_owner(
+            dir, owner, machine,
+        )
+        .await;
     }
 
     /// v62.0.0 (E1) — a key's stored id in the form the test runs under:
@@ -29500,8 +29586,11 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let tid = format!("t-{}", uuid::Uuid::new_v4());
         let prod = format!("prod-{}", uuid::Uuid::new_v4());
-        // canonical-hash subject (no federation_keys row — valid per §4.2.2)
-        let canon = format!("sha256:{}", "a".repeat(64));
+        // v62.0.0 (E1-fix2; CC 2.7.3) — a delegation seats only once its
+        // delegate voices it, so the terminal subject is the Ask-6 rebinding
+        // case named below: a subject that acquired a key, named by that
+        // key's identity-ref (a key-less `sha256:` subject cannot voice).
+        let canon = format!("canon-a-{}", uuid::Uuid::new_v4());
         let proxy = format!("proxy-{}", uuid::Uuid::new_v4());
         let mid = format!("mid-{}", uuid::Uuid::new_v4());
         ensure_key(&backend, &proxy).await;
@@ -29517,29 +29606,22 @@ mod tests {
         // proxy -> mid -> canon, both edges scoped consent_revocation
         // (array form on the first edge, bare-string on the second).
         let d1 = format!("d-{}", uuid::Uuid::new_v4());
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(delegates_to(
-                    &d1,
-                    &proxy,
-                    &mid,
-                    serde_json::json!(["retain", "consent_revocation"]),
-                )),
-            })
-            .await
-            .unwrap();
+        put_delegation(
+            &backend,
+            delegates_to(
+                &d1,
+                &proxy,
+                &mid,
+                serde_json::json!(["retain", "consent_revocation"]),
+            ),
+        )
+        .await;
         let d2 = format!("d-{}", uuid::Uuid::new_v4());
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(delegates_to(
-                    &d2,
-                    &mid,
-                    &canon,
-                    serde_json::json!("consent_revocation"),
-                )),
-            })
-            .await
-            .unwrap();
+        put_delegation(
+            &backend,
+            delegates_to(&d2, &mid, &canon, serde_json::json!("consent_revocation")),
+        )
+        .await;
 
         let wid = format!("w-{}", uuid::Uuid::new_v4());
         let wid_row = e2_row(withdraws_against(&wid, &proxy, &tid));
@@ -29568,7 +29650,11 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let tid = format!("t-{}", uuid::Uuid::new_v4());
         let prod = format!("prod-{}", uuid::Uuid::new_v4());
-        let canon = format!("sha256:{}", "b".repeat(64));
+        // v62.0.0 (E1-fix2; CC 2.7.3) — a delegation seats only once its
+        // delegate voices it, so the terminal subject is the Ask-6 rebinding
+        // case named below: a subject that acquired a key, named by that
+        // key's identity-ref (a key-less `sha256:` subject cannot voice).
+        let canon = format!("canon-b-{}", uuid::Uuid::new_v4());
         let proxy = format!("proxy-{}", uuid::Uuid::new_v4());
         ensure_key(&backend, &proxy).await;
         ensure_key(&backend, &canon).await;
@@ -29576,17 +29662,11 @@ mod tests {
 
         // proxy -> canon but scoped only `retain` — no revocation right.
         let d1 = format!("d-{}", uuid::Uuid::new_v4());
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(delegates_to(
-                    &d1,
-                    &proxy,
-                    &canon,
-                    serde_json::json!(["retain"]),
-                )),
-            })
-            .await
-            .unwrap();
+        put_delegation(
+            &backend,
+            delegates_to(&d1, &proxy, &canon, serde_json::json!(["retain"])),
+        )
+        .await;
 
         let wid = format!("w-{}", uuid::Uuid::new_v4());
         let wid_row = e2_row(withdraws_against(&wid, &proxy, &tid));
@@ -29624,17 +29704,11 @@ mod tests {
         let tid = put_target_t(&backend, &tid, &prod, &[]).await;
 
         let d1 = format!("d-{}", uuid::Uuid::new_v4());
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(delegates_to(
-                    &d1,
-                    &agent,
-                    &prod,
-                    serde_json::json!("consent_revocation"),
-                )),
-            })
-            .await
-            .unwrap();
+        put_delegation(
+            &backend,
+            delegates_to(&d1, &agent, &prod, serde_json::json!("consent_revocation")),
+        )
+        .await;
 
         let wid = format!("w-{}", uuid::Uuid::new_v4());
         let wid_row = e2_row(withdraws_against(&wid, &agent, &tid));
@@ -32690,13 +32764,16 @@ mod tests {
                 .unwrap();
 
         // retain_past_epochs = 0 ⇒ keep only the current epoch.
+        // v62.0.0 (E1-fix2) — the row is keyed by the room's stored id, its
+        // identity-ref (`kid_any("comm")`); the literal seed matched nothing,
+        // so no policy was set and nothing was evicted.
         {
             let conn = backend.conn_handle();
             let conn = conn.lock();
             conn.execute(
                 "UPDATE federation_community_dek_epoch SET retain_past_epochs = 0 \
-                 WHERE community_key_id = 'comm'",
-                [],
+                 WHERE community_key_id = ?1",
+                rusqlite::params![kid_any("comm")],
             )
             .unwrap();
         }
@@ -35414,44 +35491,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn sqlite_put_attestation_accepts_accord_dimension_from_accord_holder() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        put_fed_key(
-            &backend,
-            &fed_key("registry-steward", "registry", "registry-steward"),
-        )
-        .await;
-        put_fed_key(
-            &backend,
-            &fed_key_with_identity_type(
-                "accord-holder-1",
-                "humanity-accord-1",
-                "registry-steward",
-                crate::federation::types::identity_type::ACCORD_HOLDER,
-            ),
-        )
-        .await;
-        put_fed_key(&backend, &fed_key("k-a", "primitive-a", "registry-steward")).await;
-        let att = scores_attestation_with_dimension(
-            "att-accord-2",
-            "accord-holder-1",
-            "k-a",
-            "registry-steward",
-            "accord:human_dignity:v1",
-        );
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(att),
-            })
-            .await
-            .unwrap();
-        let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, &e2::kid("k-a"))
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-    }
+    // v62.0.0 (E1-fix2; ruling 4, the postgres twin's deletion by E8) —
+    // DELETED `sqlite_put_attestation_accepts_accord_dimension_from_accord_holder`:
+    // it asserted that a self-declared `accord_holder` LABEL admits an
+    // `accord:*` row, the earlier form. CC rc20 3.4.7: the accord's holders
+    // are fixed by its charter, and the label is never read
+    // (`edition2::standing`, P4). The edition-2 witnesses are I3082 (a label
+    // alone is HELD) and I3084 (a holder the bundle in force places).
 
     #[tokio::test]
     async fn sqlite_put_attestation_rejects_morally_charged_dimension() {
@@ -36657,7 +36703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_scores_tier_local_hidden_then_shown_and_promote() {
+    async fn sqlite_scores_tier_local_hidden_then_shown() {
         use crate::federation::FederationDirectory;
         let be = fresh_backend_with_occurrence("occ").await;
         // a local self-scores row (producer authority, tier=local)
@@ -36706,29 +36752,12 @@ mod tests {
         };
         assert_eq!(proj_tier, "local");
         assert_eq!(dim.as_deref(), Some("trust:demo:v1"));
-        // promote → projection flips to federation, now visible at default tier
-        // v31.0.0 (CIRISPersist#649) — the promotion RE-STAMPS the mirror it
-        // re-signs; `reseal_for_scope` is the fixture twin of
-        // `Engine::reseal_for_scope`.
-        let local_row = be.get_attestation(&local_id).await.unwrap().unwrap();
-        // v39.0.0 — the crossing is over the same bytes: the row lands at
-        // `(federation, self)`, visible to its producing occurrence.
-        let ci = crate::federation::tier_ingest::test_support::describe_own(
-            &local_row,
-            crate::federation::CrossingBasis::ProducerAuthority,
-        );
-        be.enter_mesh(
-            &local_id,
-            &ci,
-            &crate::federation::tier_ingest::test_support::actor_reseal(&local_row),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            occ_ids(scores_filter("subj")).await,
-            vec![local_id],
-            "the crossed row is federation-tier and visible to its producer"
-        );
+        // v62.0.0 (E1-fix2; ruling 4, P8-fix13, CC 2.6.1.12) — the promote leg
+        // is DELETED: it crossed this unsigned local row on a JCS custody
+        // (`actor_reseal`), which `plan_enter_mesh` now refuses at the shut
+        // doors (`earlier_form_object`). The edition-2 crossings are witnessed
+        // by I3520 (a local statement crosses in place) and I3524 (an
+        // earlier-form local row is restated by its actor).
     }
 
     #[tokio::test]
@@ -36916,8 +36945,10 @@ mod tests {
         // (withdrawn, still present) + hid (self-cohort, ungated) + live — but
         // NOT the subjectless 'wd' composer (no subject to seek on) nor the
         // 'loc' local-tier draft.
+        // v62.0.0 (E1-fix2) — the seek names the subject as stored: its
+        // identity-ref (the rows above carry `e2::kid("subj")`).
         let log = be
-            .list_attestation_log(Some("subj"), None, 100)
+            .list_attestation_log(Some(&e2::kid("subj")), None, 100)
             .await
             .unwrap();
         let mut ids: Vec<_> = log
@@ -37479,7 +37510,9 @@ mod tests {
         // ([`crate::federation::precedence::is_dedup_match`]), so re-sealing
         // does not soften what this witness measures.
         w2.asserted_at = "2026-05-02T00:00:00Z".parse().unwrap();
-        crate::federation::tier_ingest::test_support::reseal(&mut w2);
+        // v62.0.0 (E1-fix2) — ONE seal, `e2_row`'s, over the finished row: a
+        // row resealed first already carries its statement, so `e2_row`
+        // returned it as is and never recorded the chosen id `w-2`.
         backend
             .put_attestation(SignedAttestation {
                 attestation: e2_row(w1.clone()),
@@ -39035,6 +39068,43 @@ mod tests {
         edge
     }
 
+    /// v62.0.0 (E1-fix2; CC 3.2, `trust_root::check_trust_charter_admission`)
+    /// — **`seed`'s self `trust:accepts` edge as a valid ROOT CHARTER**: a
+    /// self-loop `delegates_to` with an `infra:*` scope IS the root charter, and
+    /// a root charter carries its `pre_rotation_commitment` (the pre-committed
+    /// successor key, as W1's `fixture_trust_root::charter_statement` commits
+    /// it). The successor seed leads with its distinguishing part (seeds are
+    /// cut at 32 bytes). The postgres (`pg_self_trust_charter_edge`) twin is the same.
+    fn self_trust_charter_edge(seed: &str) -> Vec<u8> {
+        use ciris_verify_core::cde::Value;
+        let Value::Map(mut m) = crate::federation::edition2::typed::trust_accepts_payload(
+            &e2::kid_or_keep(seed),
+            &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
+            &[],
+            None,
+            crate::federation::types::cohort_scope::FEDERATION,
+            e2::ms(chrono::Utc::now()),
+        ) else {
+            unreachable!("trust_accepts_payload is a map")
+        };
+        let successor = e2::signing_key(&format!("succ-{seed}"));
+        let commitment = ciris_verify_core::edition2::recovery::recovery_commitment(&[successor
+            .public_key()
+            .clone()]);
+        m.push((
+            Value::Text(crate::federation::trust_root::CHARTER_PRE_ROTATION_FIELD.to_owned()),
+            Value::Bytes(commitment.to_vec()),
+        ));
+        m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
+        e2::typed_statement_as(
+            seed,
+            "delegates_to",
+            seed,
+            crate::federation::edition2::typed::TRUST_PREFIX,
+            &Value::Map(m),
+        )
+    }
+
     /// The granter's `withdraws` of `edge` (the projected row expires);
     /// returns the withdraws statement.
     async fn withdraw_trust_edge(
@@ -39086,9 +39156,9 @@ mod tests {
         assert!(row.expires_at.is_none());
     }
 
-    /// Shape 2 (M1): self-trust. v62.0.0 (T2.api §6) — the self edge is
-    /// ADMITTED as an edge (it stays for `trust_root.rs`'s walk) but the v1.3
-    /// shape refuses it, so it is NOT projected: no trust row, no refusal.
+    /// Shape 2 (M1): self-trust. v62.0.0 (T2.api §6; E1-fix2) — the self edge
+    /// is the root charter: ADMITTED as an edge (with its pre-rotation
+    /// commitment), but NOT projected: no trust row.
     #[tokio::test]
     async fn trust_grant_rejects_self_trust() {
         let backend = trust_test_backend().await;
@@ -39097,7 +39167,12 @@ mod tests {
             &fed_key("k-self", "primitive-self", "registry-steward"),
         )
         .await;
-        put_trust_edge(&backend, "k-self", "k-self", &[]).await;
+        // v62.0.0 (E1-fix2; CC 3.2) — a self `trust:accepts` edge IS the root
+        // charter, so it carries the charter's pre-rotation commitment
+        // (`self_trust_charter_edge`); it is admitted as an edge but projects no trust row.
+        e2::put_statement(&backend, &self_trust_charter_edge("k-self"))
+            .await
+            .expect("the self trust:accepts edge (a root charter) is admitted");
         assert!(
             backend
                 .lookup_trust(&e2::kid("k-self"))
@@ -41768,7 +41843,10 @@ mod tests {
             let mut a = fed_attestation(id, attesting, attested, "emit-a");
             a.asserted_at = at.parse().unwrap();
             a.cohort_scope = scope.to_string();
-            crate::federation::tier_ingest::test_support::reseal(&mut a);
+            // v62.0.0 (E1-fix2) — ONE seal, `e2_row`'s: a row resealed first
+            // already carries its statement, so `e2_row` returned it as is and
+            // never recorded the test's chosen id (`e2_chosen_of` then read
+            // back row ids, not `a1`..`a3`).
             SignedAttestation {
                 attestation: e2_row(a),
             }
@@ -42999,11 +43077,11 @@ mod tests {
             detection_id,
             trace_id: trace_id.to_owned(),
             body_sha256: vec![7u8; 32],
-            detector: "manifold_conformity_outlier".to_owned(),
+            detector: "hash_chain_integrity".to_owned(),
             severity: DetectionSeverity::Warning,
             cohort_cell: serde_json::json!({"deployment_domain": "legal"}),
             conformity_variant: ConformityVariant::Numeric,
-            conformity_payload: serde_json::json!({"score": 3.1}),
+            conformity_payload: serde_json::json!({"score": 3}),
             lens_core_version: "lc-1.0.0".to_owned(),
             ratchet_calibration_version: 4,
             canonical_bytes: canonical.to_vec(),
@@ -43819,22 +43897,21 @@ mod tests {
             put_fed_key(&backend, &fed_key(k, ident, k)).await;
         }
         let when = chrono::Utc::now();
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(topo_attestation(
-                    "del-root",
-                    "del-child",
-                    attestation_type::DELEGATES_TO,
-                    None,
-                    Some("manifest:bundle-x"),
-                    // v62.0.0 (E1) — `evidence_refs` are digests in an edition-2 payload.
-                    &["ab".repeat(32).as_str(), "cd".repeat(32).as_str()],
-                    None,
-                    when,
-                )),
-            })
-            .await
-            .unwrap();
+        put_delegation(
+            &backend,
+            topo_attestation(
+                "del-root",
+                "del-child",
+                attestation_type::DELEGATES_TO,
+                None,
+                Some("manifest:bundle-x"),
+                // v62.0.0 (E1) — `evidence_refs` are digests in an edition-2 payload.
+                &["ab".repeat(32).as_str(), "cd".repeat(32).as_str()],
+                None,
+                when,
+            ),
+        )
+        .await;
         let graph =
             crate::federation::build_delegation_graph(&backend, &e2::kid("del-root"), Some(4))
                 .await
@@ -43898,19 +43975,17 @@ mod tests {
             "node-key",
             &[ds::INFRA_NETWORK_PRESENCE, ds::INFRA_SERVE],
         );
-        let id = att.attestation_id.clone();
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(att),
-            })
-            .await
-            .unwrap();
+        // v62.0.0 (E1-fix2; CC 4.4.3.19) — a delegation to a machine key waits
+        // for its owner's voice, so the owner binds `node-key` first: the key
+        // then holds two rows, the binding and this delegation.
+        bind_machine_owner(&backend, "owner", "node-key").await;
+        let id = put_delegation(&backend, att).await.attestation_id;
         let stored =
             crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, &e2::kid("node-key"))
                 .await
                 .unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].attestation_id, e2_rid_of(&id));
+        assert_eq!(stored.len(), 2, "the owner binding and the delegation");
+        assert!(stored.iter().any(|a| a.attestation_id == id));
     }
 
     /// (b) delegates_to → node key carrying agency:* → REJECTED + not
@@ -44005,19 +44080,17 @@ mod tests {
             "agent-key",
             &[ds::AGENCY_ACT_ON_BEHALF, ds::AGENCY_DECIDE],
         );
-        let id = att.attestation_id.clone();
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(att),
-            })
-            .await
-            .unwrap();
+        // v62.0.0 (E1-fix2; CC 4.4.3.19) — a delegation to a machine key waits
+        // for its owner's voice, so the owner binds `agent-key` first: the key
+        // then holds two rows, the binding and this delegation.
+        bind_machine_owner(&backend, "owner", "agent-key").await;
+        let id = put_delegation(&backend, att).await.attestation_id;
         let stored =
             crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, &e2::kid("agent-key"))
                 .await
                 .unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].attestation_id, e2_rid_of(&id));
+        assert_eq!(stored.len(), 2, "the owner binding and the delegation");
+        assert!(stored.iter().any(|a| a.attestation_id == id));
     }
 
     /// SecReview F1 (sqlite parity): a DUPLICATE / whitespace node token
@@ -44276,16 +44349,19 @@ mod tests {
     async fn community_steward_bound_node_member_admitted_sqlite() {
         use crate::federation::types::delegation_scope as ds;
         let backend = bootstrap_node_agency_sqlite().await;
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(node_delegates_to_sqlite(
-                    "owner",
-                    "node-key",
-                    &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
-                )),
-            })
-            .await
-            .unwrap();
+        // v62.0.0 (E1-fix2; CC 4.4.3.19) — a delegation to a machine key waits
+        // for its owner's voice: the owner binds the node, then the delegation
+        // seats.
+        bind_machine_owner(&backend, "owner", "node-key").await;
+        put_delegation(
+            &backend,
+            node_delegates_to_sqlite(
+                "owner",
+                "node-key",
+                &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+            ),
+        )
+        .await;
         put_community_ob_sqlite(&backend, "comm-ob-3", vec!["node-key"], None)
             .await
             .expect("steward-bound node admitted");
@@ -44767,113 +44843,6 @@ mod tests {
         assert_eq!(anchors, vec![e2::kid("si-B")], "adult auto-re-sovereigns");
     }
 
-    /// SecReview F3: a WITHDRAWN `delegates_to(user → node)` no longer
-    /// confers steward-binding (sqlite parity) — admitted while live, REJECTED
-    /// after the granter withdraws the edge.
-    #[tokio::test]
-    async fn community_steward_binding_withdrawn_delegation_not_live_sqlite() {
-        use crate::federation::types::{attestation_type, delegation_scope as ds};
-        let backend = bootstrap_node_agency_sqlite().await;
-        let d = node_delegates_to_sqlite(
-            "owner",
-            "node-key",
-            &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
-        );
-        let d_id = d.attestation_id.clone();
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(d),
-            })
-            .await
-            .unwrap();
-        put_community_ob_sqlite(&backend, "comm-ob-wd-live", vec!["node-key"], None)
-            .await
-            .expect("steward-bound (live) node admitted");
-
-        // owner withdraws the edge (issuer-against-recipient: attested = node-key).
-        let mut w = topo_attestation(
-            "owner",
-            "node-key",
-            attestation_type::WITHDRAWS,
-            None,
-            None,
-            &[],
-            None,
-            chrono::Utc::now(),
-        );
-        w.attestation_envelope = serde_json::json!({"references_attestation_id": d_id});
-        resign_fed(&mut w);
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(w),
-            })
-            .await
-            .expect("owner withdraws own delegation edge");
-
-        // v62.0.0 (E1, round 3; CC 2.7) — steward binding reads OTHER rows
-        // (the delegation edges), so an unstewarded member is HELD, not
-        // refused: the community concludes nothing and is not stored. A
-        // refusal, where one is still raised, must be this one. The G-wave
-        // rewrites the hold's assertion (G0.api.md).
-        let r = put_community_ob_sqlite(&backend, "comm-ob-wd-dead", vec!["node-key"], None).await;
-        assert!(
-            matches!(
-                r,
-                Ok(()) | Err(crate::federation::Error::UnstewardedCommunityMember { .. })
-            ),
-            "an unstewarded member is held or refused by name, got {r:?}"
-        );
-        assert!(backend
-            .lookup_community(&kid_any("comm-ob-wd-dead"))
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    /// SecReview F3: an EXPIRED `delegates_to(user → node)` does NOT confer
-    /// steward-binding (sqlite parity) — unstewarded node REJECTED.
-    #[tokio::test]
-    async fn community_steward_binding_expired_delegation_not_live_sqlite() {
-        use crate::federation::types::delegation_scope as ds;
-        let backend = bootstrap_node_agency_sqlite().await;
-        let mut d = node_delegates_to_sqlite(
-            "owner",
-            "node-key",
-            &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
-        );
-        d.expires_at = Some("2020-01-01T00:00:00Z".parse().unwrap());
-        // v31.0.0 (CIRISPersist#598) — `expires_at` is bound in BOTH directions
-        // now (envelope absent ⇔ column None), so setting the column is a
-        // re-sign trigger. That is this fixture's own premise from the other
-        // side: the expiry is what kills the delegation's liveness, and an
-        // expiry a writer could set ALONE would be an unsigned mute button.
-        resign_fed(&mut d);
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(d),
-            })
-            .await
-            .unwrap();
-        // v62.0.0 (E1, round 3; CC 2.7) — steward binding reads OTHER rows
-        // (the delegation edges), so an unstewarded member is HELD, not
-        // refused: the community concludes nothing and is not stored. A
-        // refusal, where one is still raised, must be this one. The G-wave
-        // rewrites the hold's assertion (G0.api.md).
-        let r = put_community_ob_sqlite(&backend, "comm-ob-exp", vec!["node-key"], None).await;
-        assert!(
-            matches!(
-                r,
-                Ok(()) | Err(crate::federation::Error::UnstewardedCommunityMember { .. })
-            ),
-            "an unstewarded member is held or refused by name, got {r:?}"
-        );
-        assert!(backend
-            .lookup_community(&kid_any("comm-ob-exp"))
-            .await
-            .unwrap()
-            .is_none());
-    }
-
     /// STEWARD-BOUND agent member (live CUSTODY `delegates_to(user → agent)`)
     /// → ADMITTED.
     ///
@@ -44888,17 +44857,16 @@ mod tests {
     #[tokio::test]
     async fn community_steward_bound_agent_member_admitted_sqlite() {
         let backend = bootstrap_node_agency_sqlite().await;
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(delegates_to_custody(
-                    "ob-d-agent",
-                    "owner",
-                    "agent-key",
-                    serde_json::json!(["share"]),
-                )),
-            })
-            .await
-            .unwrap();
+        put_delegation(
+            &backend,
+            delegates_to_custody(
+                "ob-d-agent",
+                "owner",
+                "agent-key",
+                serde_json::json!(["share"]),
+            ),
+        )
+        .await;
         put_community_ob_sqlite(&backend, "comm-ob-4", vec!["agent-key"], None)
             .await
             .expect("steward-bound agent admitted");
@@ -44920,17 +44888,27 @@ mod tests {
     #[tokio::test]
     async fn community_agent_member_with_only_a_conferral_is_refused_811_sqlite() {
         let backend = bootstrap_node_agency_sqlite().await;
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(delegates_to(
-                    "ob-d-agent-plain",
-                    "owner",
-                    "agent-key",
-                    serde_json::json!(["share"]),
-                )),
-            })
-            .await
-            .unwrap();
+        // v62.0.0 (E1-fix2; CC 4.4.3.19) — the conferral to an agent with no
+        // bound owner WAITS for that owner's voice: it is held, never seated,
+        // so it cannot steward-bind the agent.
+        let (_, out) = land_delegation_any(
+            &backend,
+            delegates_to(
+                "ob-d-agent-plain",
+                "owner",
+                "agent-key",
+                serde_json::json!(["share"]),
+            ),
+        )
+        .await
+        .expect("the conferral is held, not refused");
+        assert!(
+            matches!(
+                out,
+                crate::federation::edition2::ingest::StatementOutcome::Pending { .. }
+            ),
+            "a conferral to an unbound agent waits for its owner, got {out:?}"
+        );
         let err = put_community_ob_sqlite(&backend, "comm-ob-4b", vec!["agent-key"], None)
             .await
             .expect_err("a conferral is not custody — the roster must be refused");
@@ -45107,59 +45085,55 @@ mod tests {
             put_fed_key(&backend, &fed_key(k, ident, k)).await;
         }
         let when = chrono::Utc::now();
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(topo_attestation(
-                    "cyc-a",
-                    "cyc-b",
-                    attestation_type::DELEGATES_TO,
-                    None,
-                    Some("*"),
-                    &[],
-                    None,
-                    when,
-                )),
-            })
-            .await
-            .unwrap();
+        put_delegation(
+            &backend,
+            topo_attestation(
+                "cyc-a",
+                "cyc-b",
+                attestation_type::DELEGATES_TO,
+                None,
+                Some("*"),
+                &[],
+                None,
+                when,
+            ),
+        )
+        .await;
         // v54.0.0 (CIRISPersist#1031, CC 4.1.1) refused the cycle-closing edge
         // at the door. v62.0.0 (slice C): CC 4.4.3.34, "Cycles are visited
         // once" — the kernel's walk visits a cycle once, so the closing edge is held and the two-key cycle is stored.
-        let closing = backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(topo_attestation(
-                    "cyc-b",
-                    "cyc-a",
-                    attestation_type::DELEGATES_TO,
-                    None,
-                    Some("*"),
-                    &[],
-                    None,
-                    when,
-                )),
-            })
-            .await;
-        assert!(
-            closing.is_ok(),
-            "the cycle-closing edge is admitted (v62): {closing:?}"
-        );
+        // v62.0.0 (E1-fix2; CC 2.7.3) — each edge seats with its delegate's
+        // voice (`put_delegation` asserts `Row`), the closing one included.
+        put_delegation(
+            &backend,
+            topo_attestation(
+                "cyc-b",
+                "cyc-a",
+                attestation_type::DELEGATES_TO,
+                None,
+                Some("*"),
+                &[],
+                None,
+                when,
+            ),
+        )
+        .await;
         // The walk's visited guard still meets a cycle: a self-edge (the root
         // charter shape, admitted) re-enters cyc-b.
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(topo_attestation(
-                    "cyc-b",
-                    "cyc-b",
-                    attestation_type::DELEGATES_TO,
-                    None,
-                    Some("*"),
-                    &[],
-                    None,
-                    when,
-                )),
-            })
-            .await
-            .unwrap();
+        put_delegation(
+            &backend,
+            topo_attestation(
+                "cyc-b",
+                "cyc-b",
+                attestation_type::DELEGATES_TO,
+                None,
+                Some("*"),
+                &[],
+                None,
+                when,
+            ),
+        )
+        .await;
         let graph = crate::federation::build_delegation_graph(&backend, &e2::kid("cyc-a"), Some(8))
             .await
             .unwrap();
@@ -45194,22 +45168,22 @@ mod tests {
             put_fed_key(&backend, &fed_key(k, ident, k)).await;
         }
         let when = chrono::Utc::now();
-        let edge = e2_row(topo_attestation(
-            "w-root",
-            "w-child",
-            attestation_type::DELEGATES_TO,
-            None,
-            Some("*"),
-            &[],
-            None,
-            when,
-        ));
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: edge.clone(),
-            })
-            .await
-            .unwrap();
+        // v62.0.0 (E1-fix2; CC 2.7.3) — the edge seats with its delegate's
+        // voice (`put_delegation`).
+        let edge = put_delegation(
+            &backend,
+            topo_attestation(
+                "w-root",
+                "w-child",
+                attestation_type::DELEGATES_TO,
+                None,
+                Some("*"),
+                &[],
+                None,
+                when,
+            ),
+        )
+        .await;
         // v62.0.0 (E1) — the retraction names the edge it recants.
         let mut recants = topo_attestation(
             "w-root",
@@ -48232,19 +48206,12 @@ mod tests {
         .is_err());
     }
 
-    /// v31.0.0 (CIRISPersist#654) — roster growth is AUTHORIZED, on sqlite.
-    /// One shared body across memory / sqlite / postgres; see
-    /// [`crate::federation::cohort::test_support::exercise_roster_growth_is_authorized`].
-    #[tokio::test]
-    async fn roster_growth_is_authorized_sqlite_654() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        crate::federation::cohort::test_support::exercise_roster_growth_is_authorized(
-            &backend, "sq654",
-        )
-        .await
-        .expect("654 roster-growth authorization exercise");
-    }
+    // v62.0.0 (E1-fix2; ruling 4, the postgres twin's deletion by E8) —
+    // `roster_growth_is_authorized_sqlite_654` DELETED: its body
+    // (`cohort::test_support::exercise_roster_growth_is_authorized`) asserts
+    // the earlier-form `put_family` / `add_family_member` AdmitSpec
+    // authorship legs, which have no edition-2 form (a voice is a statement
+    // the door verifies; I3004/I2999 witness the edition-2 growth).
 
     /// moderators_of: founder (authority root) + `delegates_to(moderate)`
     /// founder → deputy → {founder, deputy}; outsider excluded.
@@ -48271,16 +48238,11 @@ mod tests {
         )
         .await
         .unwrap();
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(node_delegates_to_sqlite(
-                    "mod-founder",
-                    "mod-deputy",
-                    &[DELEGATION_SCOPE_MODERATE],
-                )),
-            })
-            .await
-            .unwrap();
+        put_delegation(
+            &backend,
+            node_delegates_to_sqlite("mod-founder", "mod-deputy", &[DELEGATION_SCOPE_MODERATE]),
+        )
+        .await;
         let mods = crate::federation::admission::moderators_of(
             &backend,
             &kid_any("mod-comm"),
@@ -48298,7 +48260,6 @@ mod tests {
     /// [owner]; unbound → empty.
     #[tokio::test]
     async fn steward_bindings_of_returns_user_anchors_sqlite() {
-        use crate::federation::types::delegation_scope as ds;
         let backend = bootstrap_node_agency_sqlite().await;
         assert!(
             crate::federation::admission::steward_bindings_of(&backend, &e2::kid("node-key"))
@@ -48306,16 +48267,11 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(node_delegates_to_sqlite(
-                    "owner",
-                    "node-key",
-                    &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
-                )),
-            })
-            .await
-            .unwrap();
+        // v62.0.0 (E1-fix2; CC 3.2, CC 4.4.3.19) — a machine key's steward
+        // binding is its OWNER BINDING (a `delegates_to(owner → node)` scoped
+        // infra:*, the node's voice included); a plain delegation to an
+        // unbound node waits for that owner's voice and seats nothing.
+        bind_machine_owner(&backend, "owner", "node-key").await;
         assert_eq!(
             crate::federation::admission::steward_bindings_of(&backend, &e2::kid("node-key"))
                 .await
@@ -48332,7 +48288,6 @@ mod tests {
     #[tokio::test]
     async fn nodes_stewarded_by_is_inverse_of_steward_bindings_sqlite() {
         use crate::federation::admission::{nodes_stewarded_by, steward_bindings_of};
-        use crate::federation::types::delegation_scope as ds;
         let backend = bootstrap_node_agency_sqlite().await;
         // Pre-delegation: owner owns only itself (user-role self-binding).
         assert_eq!(
@@ -48347,16 +48302,11 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(node_delegates_to_sqlite(
-                    "owner",
-                    "node-key",
-                    &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
-                )),
-            })
-            .await
-            .unwrap();
+        // v62.0.0 (E1-fix2; CC 3.2, CC 4.4.3.19) — a machine key's steward
+        // binding is its OWNER BINDING (a `delegates_to(owner → node)` scoped
+        // infra:*, the node's voice included); a plain delegation to an
+        // unbound node waits for that owner's voice and seats nothing.
+        bind_machine_owner(&backend, "owner", "node-key").await;
 
         // Post-delegation: owns node-key + self (deduped, sorted).
         assert_eq!(
@@ -48382,7 +48332,6 @@ mod tests {
     /// [user, node]; unbound → empty (sqlite parity).
     #[tokio::test]
     async fn steward_binding_chain_returns_audit_path_sqlite() {
-        use crate::federation::types::delegation_scope as ds;
         let backend = bootstrap_node_agency_sqlite().await;
         assert!(crate::federation::admission::steward_binding_chain(
             &backend,
@@ -48397,16 +48346,11 @@ mod tests {
                 .unwrap(),
             vec![e2::kid("owner")]
         );
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(node_delegates_to_sqlite(
-                    "owner",
-                    "node-key",
-                    &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
-                )),
-            })
-            .await
-            .unwrap();
+        // v62.0.0 (E1-fix2; CC 3.2, CC 4.4.3.19) — a machine key's steward
+        // binding is its OWNER BINDING (a `delegates_to(owner → node)` scoped
+        // infra:*, the node's voice included); a plain delegation to an
+        // unbound node waits for that owner's voice and seats nothing.
+        bind_machine_owner(&backend, "owner", "node-key").await;
         assert_eq!(
             crate::federation::admission::steward_binding_chain(&backend, &e2::kid("node-key"))
                 .await
@@ -48447,18 +48391,8 @@ mod tests {
             resign_fed(&mut d);
             d
         };
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(delegate("rk-root", "rk-mid", true)),
-            })
-            .await
-            .unwrap();
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(delegate("rk-mid", "rk-leaf", false)),
-            })
-            .await
-            .unwrap();
+        put_delegation(&backend, delegate("rk-root", "rk-mid", true)).await;
+        put_delegation(&backend, delegate("rk-mid", "rk-leaf", false)).await;
         let depth = MAX_MODERATION_DELEGATION_DEPTH;
         assert!(reachable_under_scope(
             &backend,
@@ -48523,13 +48457,9 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        // v62.0.0 (E1-fix2; CC 2.7.3) — each edge seats with its delegate's voice.
         for g in ["dt-g1", "dt-g2"] {
-            backend
-                .put_attestation(SignedAttestation {
-                    attestation: e2_row(node_delegates_to_sqlite(g, "dt-k", &["share"])),
-                })
-                .await
-                .unwrap();
+            put_delegation(&backend, node_delegates_to_sqlite(g, "dt-k", &["share"])).await;
         }
         // A non-delegation (scores) inbound edge must not appear.
         backend
@@ -48710,32 +48640,6 @@ mod tests {
         .await;
     }
 
-    /// #649 B11 — a PROMOTED row is accepted by a DIFFERENT directory's
-    /// `put_attestation`, on sqlite. Two independent in-memory databases are
-    /// two genuinely separate corpora. Shared exercise body with memory +
-    /// postgres.
-    #[tokio::test]
-    async fn promoted_row_crosses_to_a_peer_sqlite_649() {
-        let origin = SqliteBackend::open_in_memory().await.unwrap();
-        origin.run_migrations().await.unwrap();
-        let peer = SqliteBackend::open_in_memory().await.unwrap();
-        peer.run_migrations().await.unwrap();
-        crate::federation::bootstrap_admission::test_support::exercise_promoted_row_crosses_to_a_peer(
-            &origin, &peer, "sq649",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn owner_binding_widening_is_not_visible_to_a_peer_807() {
-        let peer = SqliteBackend::open_in_memory().await.unwrap();
-        peer.run_migrations().await.unwrap();
-        crate::federation::bootstrap_admission::test_support::exercise_owner_binding_widening_not_visible_to_a_peer_807(
-            &peer, "sq807",
-        )
-        .await;
-    }
-
     /// v42.0.0 (CIRISPersist#814 part 1) — the sqlite leg of the duty gate.
     #[tokio::test]
     async fn duty_rides_only_its_own_permission_814_sqlite() {
@@ -48802,15 +48706,6 @@ mod tests {
             &dir,
             "sq804-self",
             "sq804",
-        )
-        .await;
-    }
-    #[tokio::test]
-    async fn actor_signature_survives_the_crossing_sqlite_v39() {
-        let dir = SqliteBackend::open_in_memory().await.unwrap();
-        dir.run_migrations().await.unwrap();
-        crate::federation::bootstrap_admission::test_support::exercise_actor_signature_survives_the_crossing(
-            &dir, "sq39",
         )
         .await;
     }
@@ -48945,8 +48840,8 @@ mod tests {
     /// does: it takes the `SignedFamily` the origin SERVES from
     /// `list_signed_families_since` and feeds it to a SECOND directory's
     /// `put_family`, whose `verify_family_admission` is the same gate every
-    /// real peer runs. Same discipline as
-    /// `promoted_row_crosses_to_a_peer_*_649`; the peer is a second in-memory
+    /// real peer runs (the discipline of the deleted earlier-form #649
+    /// witness, kept here); the peer is a second in-memory
     /// SQLite (`test_backend`) because the property is backend-independent and
     /// the point is that the two corpora are genuinely separate.
     #[tokio::test]

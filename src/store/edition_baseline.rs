@@ -67,6 +67,33 @@ pub(crate) const KEYS_EDITION_TWO_SQLITE: &[&str] = &[
     "ALTER TABLE federation_keys ADD COLUMN kid BLOB CHECK (kid IS NULL OR (typeof(kid) = 'blob' AND length(kid) = 32)) CHECK (edition <> 2 OR (record_row_id IS NOT NULL AND kid IS NOT NULL));",
 ];
 
+/// v62.0.0 (P8-fix14; lead ruling (a)) — the column edition 2 adds to edition
+/// 1's `federation_attestations` (an edition-2 row's restatement key,
+/// `crossing::restatement_key_of_row`, written by the row writers beside the
+/// row and never in the envelope), appended with ALTER as the
+/// `federation_keys` columns are; and its index, an edition-2 object on an
+/// edition-1 table. The I1950 witness applies the ALTER to the frozen
+/// catalog's DDL and expects the index beside it.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const ATTESTATIONS_EDITION_TWO_SQLITE: &[&str] =
+    &["ALTER TABLE federation_attestations ADD COLUMN restatement_key TEXT;"];
+/// The index [`ATTESTATIONS_EDITION_TWO_SQLITE`]'s column is read through
+/// (its name, and its SQLite DDL as `sqlite_schema` stores it).
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const ATTESTATIONS_RESTATEMENT_INDEX: (&str, &str) = (
+    "federation_attestations_restatement",
+    "CREATE INDEX federation_attestations_restatement ON federation_attestations (attesting_key_id, restatement_key) WHERE restatement_key IS NOT NULL",
+);
+/// The PostgreSQL twin: the column and the index, as V300 states them.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const ATTESTATIONS_EDITION_TWO_POSTGRES: &[&str] = &[
+    "ALTER TABLE cirislens.federation_attestations ADD COLUMN restatement_key text;",
+    "CREATE INDEX federation_attestations_restatement ON cirislens.federation_attestations USING btree (attesting_key_id, restatement_key) WHERE (restatement_key IS NOT NULL);",
+];
+/// The column [`ATTESTATIONS_EDITION_TWO_POSTGRES`] adds.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const ATTESTATIONS_EDITION_TWO_COLUMNS: &[&str] = &["restatement_key"];
+
 /// The PostgreSQL twin of [`KEYS_EDITION_TWO_SQLITE`], one statement.
 #[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
 pub(crate) const KEYS_EDITION_TWO_POSTGRES: &str = "ALTER TABLE cirislens.federation_keys\n    ADD COLUMN edition smallint DEFAULT 1 NOT NULL CONSTRAINT federation_keys_edition_check CHECK (edition IN (1, 2)),\n    ADD COLUMN record_row_id bytea CONSTRAINT federation_keys_record_row_id_check CHECK (octet_length(record_row_id) = 32),\n    ADD COLUMN kid bytea CONSTRAINT federation_keys_kid_check CHECK (octet_length(kid) = 32),\n    ADD CONSTRAINT federation_keys_edition_two_ids CHECK (edition <> 2 OR (record_row_id IS NOT NULL AND kid IS NOT NULL));";
@@ -386,7 +413,13 @@ mod tests {
         let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
         #[cfg(feature = "sqlite")]
         if dialect == "sqlite" {
-            for (table, alters) in [("federation_keys", super::KEYS_EDITION_TWO_SQLITE)] {
+            for (table, alters) in [
+                ("federation_keys", super::KEYS_EDITION_TWO_SQLITE),
+                (
+                    "federation_attestations",
+                    super::ATTESTATIONS_EDITION_TWO_SQLITE,
+                ),
+            ] {
                 let head = format!("object\ttable\t{table}\t{table}\t");
                 let line = lines
                     .iter_mut()
@@ -422,6 +455,14 @@ mod tests {
                 "the frozen edition-1 delivery DDL differs from edition 2's"
             );
             *line = format!("{head}{}", esc(super::DELIVERY_SQLITE_DDL));
+            // v62.0.0 (P8-fix14) — the restatement index, an edition-2 object
+            // on an edition-1 table.
+            let (name, ddl) = super::ATTESTATIONS_RESTATEMENT_INDEX;
+            lines.push(format!(
+                "object\tindex\t{name}\tfederation_attestations\t{}",
+                esc(ddl)
+            ));
+            lines.sort();
         }
         lines
     }
@@ -471,6 +512,20 @@ mod tests {
         let pg = std::fs::read_to_string(root.join("postgres/lens/V300__edition2_baseline.sql"))
             .unwrap();
         assert_eq!(pg.matches(super::KEYS_EDITION_TWO_POSTGRES).count(), 1);
+        // v62.0.0 (P8-fix14) — the restatement column and index, verbatim.
+        for a in super::ATTESTATIONS_EDITION_TWO_SQLITE {
+            assert_eq!(sqlite.matches(a).count(), 1, "I1950: {a}");
+        }
+        assert_eq!(
+            sqlite
+                .matches(&format!("{};", super::ATTESTATIONS_RESTATEMENT_INDEX.1))
+                .count(),
+            1,
+            "I1950: the restatement index is V300's own text"
+        );
+        for a in super::ATTESTATIONS_EDITION_TWO_POSTGRES {
+            assert_eq!(pg.matches(a).count(), 1, "I1950: {a}");
+        }
         // The PostgreSQL delivery table carries the composite, not the
         // earlier columns (its edition-1 DDL edited in place).
         let at = pg
@@ -573,6 +628,24 @@ mod tests {
                 .iter()
                 .any(|k| l.starts_with(&format!("con\tcirislens.federation_keys\t{k}\t")))
         };
+        // v62.0.0 (P8-fix14) — the restatement column and its index.
+        let restatement = |l: &String| {
+            (l.starts_with("col\tcirislens.federation_attestations\t")
+                && super::ATTESTATIONS_EDITION_TWO_COLUMNS
+                    .iter()
+                    .any(|col| l.split('\t').nth(3) == Some(col)))
+                || (l.starts_with("idx\t")
+                    && l.contains(&format!(
+                        "INDEX {} ON cirislens.federation_attestations",
+                        super::ATTESTATIONS_RESTATEMENT_INDEX.0
+                    )))
+        };
+        assert_eq!(
+            all.iter().filter(|l| restatement(l)).count(),
+            super::ATTESTATIONS_EDITION_TWO_COLUMNS.len() + 1,
+            "I1950: the restatement column and index are there"
+        );
+        let all: Vec<String> = all.into_iter().filter(|l| !restatement(l)).collect();
         let n_added = all.iter().filter(|l| added(l)).count();
         assert_eq!(
             n_added,

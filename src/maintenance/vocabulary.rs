@@ -1065,8 +1065,11 @@ mod sweep_tests {
     ) where
         D: FederationDirectory + Sync + ?Sized,
     {
-        let mine = signer.derived_key_id();
-        let _theirs = foreign.derived_key_id();
+        // v62 (E3, round 6): a producer signs as its composite key's
+        // identity-ref (`federation_id`, cut B), so "ours" is that id, not
+        // the earlier derived one.
+        let mine = signer.federation_id().await;
+        let _theirs = foreign.federation_id().await;
         // v62 (E3): each signer's key is live as an edition-2 `key:record`
         // under its own seed (the `local_signer` alias), so an emitted row
         // resolves its signer at the door.

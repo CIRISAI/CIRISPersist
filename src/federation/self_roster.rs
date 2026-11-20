@@ -1268,6 +1268,13 @@ where
     }
     let rows = answer_rows(dir, identity).await?;
     let mut with_answers = Vec::with_capacity(held.len());
+    // O1 fix 12: in `decide_all`'s order (signed instant, then id), the
+    // proposers of the entries ahead; a later edition-2 entry prefers a
+    // proposer outside them (`one_open_per_proposer`).
+    held.sort_by(|a, b| {
+        (a.0.asserted_at, a.0.id.as_str()).cmp(&(b.0.asserted_at, b.0.id.as_str()))
+    });
+    let mut ahead_proposers: BTreeSet<String> = BTreeSet::new();
     for (mut p, mut c) in held {
         // T2's I3187: an edition-2 proposal's proposer is chosen among the
         // voices by keys on the roster at its named heads; with none, it is
@@ -1289,6 +1296,7 @@ where
                     identity,
                     &at_heads,
                     exclude.as_deref(),
+                    &ahead_proposers,
                 )
                 .await?
                 {
@@ -1300,6 +1308,7 @@ where
                 }
             }
         }
+        ahead_proposers.insert(p.proposer.clone());
         let mut a = answers_for(dir, identity, &p, &rows).await?;
         // v62.0.0 (wave O1, S1) — an edition-2 bind's further author
         // statements (roster keys signing as the self over the same payload)
@@ -1705,6 +1714,7 @@ where
         &identity,
         &roster,
         exclude.as_deref(),
+        &BTreeSet::new(),
     )
     .await?
     else {

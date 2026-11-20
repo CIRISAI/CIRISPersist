@@ -302,6 +302,20 @@ pub mod bodies {
             .map(|_| ())
     }
 
+    /// v62 (E3, round 6): `owner` owns the agent `agent`: the
+    /// `ownership:responsible_party:agent` binding, the owner's statement plus
+    /// the agent's own (O1). Dated a minute back: inside the agent key's
+    /// default record window, before every edge the witness then puts.
+    async fn own_agent(d: &dyn FederationDirectory, owner: &str, agent: &str) {
+        crate::federation::edition2::fixture_occurrence::put_agent_owner_binding(
+            d,
+            owner,
+            agent,
+            e2::ms(chrono::Utc::now() - chrono::Duration::minutes(1)),
+        )
+        .await;
+    }
+
     fn assert_not_delegated(r: Result<(), Error>, what: &str) {
         match r {
             Err(Error::InvalidArgument(m))
@@ -322,6 +336,14 @@ pub mod bodies {
         ts::register_identity_key(d, &o, AGENT).await;
         ts::register_identity_key(d, &n, NODE).await;
         let now = chrono::Utc::now();
+        // v62 (E3, round 6; CC 2.6.1.9, E0.api v1.15): a delegation to a
+        // MACHINE key counts only with its owner's voice too, so each agent
+        // delegate is owned by alice (the person whose data it consents
+        // over) before any edge is put. Unowned, every edge below stays
+        // `Pending` and the positive arm (3) never sees a live chain.
+        for agent in [&m, &o] {
+            own_agent(d, &alice, agent).await;
+        }
 
         // (1) no delegation: the existing refusal, now by name.
         assert_not_delegated(
@@ -432,6 +454,8 @@ pub mod bodies {
         for (i, (what, from, until, admits)) in arms.into_iter().enumerate() {
             let m = k(&format!("m{i}"));
             ts::register_identity_key(d, &m, AGENT).await;
+            // v62 (E3, round 6): the machine delegate's owner (see I591).
+            own_agent(d, &alice, &m).await;
             // v60.0.0 (#1048) — a term past the ceiling is refused at the door.
             match try_put_grant_with_term(d, &alice, &m, at, from, until).await {
                 Err(Error::DelegationTermRequired { rule, .. }) if i == 2 => {
@@ -465,9 +489,9 @@ pub mod key_grant_arms {
     use crate::federation::at_rest_cascade::blob_invariants::node_signer;
     use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
     use crate::federation::edition2::fixture_switch as e2;
-    use crate::federation::key_grant::{admit_replicated_key_grant, KeyGrantAxis, KeyGrantRow};
+    use crate::federation::key_grant::{KeyGrantAxis, KeyGrantRow};
     use crate::federation::key_grant_invariants::two_node::{
-        seed_community_everywhere, sign_row_unstored, Node,
+        admit_replicated, seed_community_everywhere, sign_row_unstored, Node,
     };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::SELF;
@@ -573,11 +597,8 @@ pub mod key_grant_arms {
             wrap: wrap(recipient),
         };
         let r1 = recipient_of(a, &owner_k, &format!("{tag}-r1-{run}")).await;
-        let r = admit_replicated_key_grant(
-            a.backend,
-            sign_row_unstored(&delegate, &set_for(&r1)).await,
-        )
-        .await;
+        let r =
+            admit_replicated(a.backend, sign_row_unstored(&delegate, &set_for(&r1)).await).await;
         assert_eq!(
             reason(&r),
             "signer_not_author",
@@ -596,11 +617,8 @@ pub mod key_grant_arms {
             None,
         )
         .await;
-        let r = admit_replicated_key_grant(
-            a.backend,
-            sign_row_unstored(&delegate, &set_for(&r1)).await,
-        )
-        .await;
+        let r =
+            admit_replicated(a.backend, sign_row_unstored(&delegate, &set_for(&r1)).await).await;
         assert_eq!(
             reason(&r),
             "signer_not_author",
@@ -617,12 +635,10 @@ pub mod key_grant_arms {
             None,
         )
         .await;
-        let admitted = admit_replicated_key_grant(
-            a.backend,
-            sign_row_unstored(&delegate, &set_for(&r1)).await,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{tag} I591b (3): the author's `grant` delegate: {e}"));
+        let admitted =
+            admit_replicated(a.backend, sign_row_unstored(&delegate, &set_for(&r1)).await)
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I591b (3): the author's `grant` delegate: {e}"));
         assert!(
             !admitted.pending && admitted.projected,
             "{tag} I591b (3): admitted AND projected: {admitted:?}"
@@ -638,11 +654,8 @@ pub mod key_grant_arms {
 
         withdraw(dir, &owner, &owner, &d_key, &edge).await;
         let r2 = recipient_of(a, &owner_k, &format!("{tag}-r2-{run}")).await;
-        let r = admit_replicated_key_grant(
-            a.backend,
-            sign_row_unstored(&delegate, &set_for(&r2)).await,
-        )
-        .await;
+        let r =
+            admit_replicated(a.backend, sign_row_unstored(&delegate, &set_for(&r2)).await).await;
         assert_eq!(
             reason(&r),
             "signer_not_author",
@@ -762,7 +775,7 @@ pub mod key_grant_arms {
                 ),
             }
             let recipient = recipient_of(a, &owner_k, &format!("{tag}-i596-r{i}-{run}")).await;
-            let r = admit_replicated_key_grant(
+            let r = admit_replicated(
                 a.backend,
                 sign_row_unstored(&delegate, &set_for(&recipient)).await,
             )
@@ -864,7 +877,7 @@ pub mod key_grant_arms {
         )
         .await;
         let r0 = recipient_of(a, &owner_k, &format!("{tag}-i1221-r0-{run}")).await;
-        admit_replicated_key_grant(
+        admit_replicated(
             a.backend,
             sign_row_unstored_at(&delegate, &set_for(&r0), now - chrono::Duration::days(4)).await,
         )
@@ -872,7 +885,7 @@ pub mod key_grant_arms {
         .unwrap_or_else(|e| panic!("{tag} I1221: an old row whose chain stands: {e}"));
         withdraw(dir, &owner, &owner, &d_key, &edge).await;
         let r1 = recipient_of(a, &owner_k, &format!("{tag}-i1221-r1-{run}")).await;
-        let admitted = admit_replicated_key_grant(
+        let admitted = admit_replicated(
             a.backend,
             sign_row_unstored_at(&delegate, &set_for(&r1), now - chrono::Duration::hours(1)).await,
         )
@@ -888,7 +901,7 @@ pub mod key_grant_arms {
             "{tag} I1221: the projection judges at the signed instant too: {admitted:?}"
         );
         let r2 = recipient_of(a, &owner_k, &format!("{tag}-i1221-r2-{run}")).await;
-        let e = admit_replicated_key_grant(
+        let e = admit_replicated(
             a.backend,
             sign_row_unstored_at(&delegate, &set_for(&r2), now - chrono::Duration::days(4)).await,
         )
@@ -953,11 +966,8 @@ pub mod key_grant_arms {
         };
         let r1 = recipient_of(b, &bob, &format!("{tag}-r1-{run}")).await;
         // (1) B's own member occurrence signs A's counter: not the minter.
-        let r = admit_replicated_key_grant(
-            b.backend,
-            sign_row_unstored(&b.signer, &set_for(&r1)).await,
-        )
-        .await;
+        let r =
+            admit_replicated(b.backend, sign_row_unstored(&b.signer, &set_for(&r1)).await).await;
         assert_eq!(
             reason(&r),
             "signer_not_minter",
@@ -976,11 +986,8 @@ pub mod key_grant_arms {
             None,
         )
         .await;
-        let r = admit_replicated_key_grant(
-            b.backend,
-            sign_row_unstored(&b.signer, &set_for(&r1)).await,
-        )
-        .await;
+        let r =
+            admit_replicated(b.backend, sign_row_unstored(&b.signer, &set_for(&r1)).await).await;
         assert_eq!(
             reason(&r),
             "signer_not_minter",
@@ -997,7 +1004,7 @@ pub mod key_grant_arms {
             None,
         )
         .await;
-        admit_replicated_key_grant(b.backend, sign_row_unstored(&b.signer, &set_for(&r1)).await)
+        admit_replicated(b.backend, sign_row_unstored(&b.signer, &set_for(&r1)).await)
             .await
             .unwrap_or_else(|e| panic!("{tag} I591c (3): the minter's `grant` delegate: {e}"));
         assert!(
@@ -1010,11 +1017,8 @@ pub mod key_grant_arms {
 
         withdraw(dir, &a.key, a_alias, &b.key, &edge).await;
         let r2 = recipient_of(b, &bob, &format!("{tag}-r2-{run}")).await;
-        let r = admit_replicated_key_grant(
-            b.backend,
-            sign_row_unstored(&b.signer, &set_for(&r2)).await,
-        )
-        .await;
+        let r =
+            admit_replicated(b.backend, sign_row_unstored(&b.signer, &set_for(&r2)).await).await;
         assert_eq!(
             reason(&r),
             "signer_not_minter",

@@ -17394,6 +17394,28 @@
     "decimal_id": "5.3.2.8",
     "claim_id": "CLM-admission-pqc",
     "repo": "CIRISPersist",
+    "path#symbol": "src/audit/verify.rs#verify_entry_signature",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-f0-cp8",
+    "tsv_comment_before": [
+     "",
+     "# v62.0.0 (F0-cp8) — an audit entry carries ONE composite under its signer's identity-ref."
+    ],
+    "witness": "I2894 (preimage layout), I2895–I2898 (sqlite, postgres): v62.0.0 (F0-cp8) — an audit entry's signature is ONE ML-DSA-65-Ed25519 composite over its binary, domain-separated preimage (the ciris.audit_entry.v1 signing domain, edition2::signing_domain::domain_preimage, over u32le-framed tenant_id and actor_id ‖ i64le sequence_number ‖ prev_hash ‖ entry_hash; CC 6.1.3), verified under the live edition-2 key:record of the identity-ref actor_id names (verify_composite_via_directory) at record_entry / try_claim_event (now) and verify_chain (the stored recorded_at); the earlier lone Ed25519 entry, a lone Ed25519 under an identity-ref, and the composite's own Ed25519 half are refused verify_component_signature at both doors; another key's composite or a composite over the earlier JSON bytes is verify_composite_invalid; an unheld signer verify_unknown_key; a non-identity-ref actor verify_not_identity_ref; the Merkle leaf keeps stripping the signature; the CC 1.13.4 own-form exemption (edition2::substrate) and scripts/earlier_form_doors.py's `substrate` verdict are deleted"
+   },
+   {
+    "decimal_id": "5.3.2.8",
+    "claim_id": "CLM-admission-pqc",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/signing_domain.rs#verify_domain_composite_via_directory",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-f0-cp8",
+    "witness": "I2899 (registry pin; sqlite, postgres): v62.0.0 (F0-cp8; CC 2.6.1.7) — a host artefact is signed with ONE composite over domain_preimage(domain, message) (b\"ciris.signing_domain/v1\\0\" ‖ u32le-framed tag ‖ message) in a CLOSED registry of signing domains (SigningDomain, appended and pinned by position; an unregistered tag is signing_domain_unknown); a composite made in one domain verifies in no other and not as a raw signature over the message, a lone Ed25519 half is verify_component_signature; the accord manifest (v2) verifies only for a holder of the genesis bundle in force (accord_manifest_signer_not_holder otherwise); the host lone-half signers sign / local_sign / local_pqc_sign are removed for Engine.sign_composite(domain, message)"
+   },
+   {
+    "decimal_id": "5.3.2.8",
+    "claim_id": "CLM-admission-pqc",
+    "repo": "CIRISPersist",
     "path#symbol": "src/audit/merkle_store.rs#require_hybrid_sth",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v61.1-1233",

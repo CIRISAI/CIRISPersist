@@ -389,6 +389,27 @@ async fn i2848_body(d: &dyn FederationDirectory, s: &str) {
         held,
         "I2848 (surfaces): still held, still in no read surface"
     );
+    // I2031 (K2-fix12) — the door admits a voice in the `delegate_owner`
+    // role from the statement alone (Verify cannot resolve `owner_of_sub`),
+    // so the gate is what decides: a voice by a key that is NOT the node's
+    // owner fills no role, and the row stays held for the owner.
+    let stranger = format!("i2848-stranger-{s}");
+    e2::put_key(d, &stranger, &[identity_type::USER]).await;
+    let out = e2::put_statement(d, &e2::voice_of(&st, &stranger))
+        .await
+        .expect("I2031: a stranger's voice is kept, never refused at the door");
+    assert!(
+        matches!(out, StatementOutcome::Pending { .. }),
+        "I2031: a voice by a key that is not the machine sub's owner seats nothing: {out:?}"
+    );
+    let why = fold::why_held(d, &row_id)
+        .await
+        .expect("I2031: read the hold")
+        .expect("I2031: still held");
+    assert!(
+        why.reason == reason::COUNT_SHORT && why.detail.contains("delegate_owner"),
+        "I2031: still waiting for the owner's voice: {why:?}"
+    );
     let out = e2::put_statement(d, &e2::voice_of(&st, &o))
         .await
         .expect("I2848 (b): the owner's voice");

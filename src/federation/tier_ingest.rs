@@ -83,11 +83,8 @@
 //!
 //! [CC 3.1.2.1]: the bound-payload form `JCS(envelope) ‖ ed25519_sig`.
 
-use sha2::{Digest, Sha256};
-
 use super::types::attestation_tier;
 use super::{Attestation, Error, FederationDirectory};
-use crate::verify::canonical::ceg_produce_canonicalize;
 
 /// Verify a federation-tier [`Attestation`]'s envelope hybrid signature
 /// against the §CC 5.3.2.4.3.1 ingest gate, BEFORE any store. Generic
@@ -219,8 +216,13 @@ where
 /// rule alone: the row's own scrubs over its own canonical envelope, for a row
 /// that is not a minted one. The self-roster door verifies the `withdraws` a
 /// proposal carries with it (that row is never minted).
+///
+/// v62.0.0 (F0-cp8) — each scrub is admitted only as a vouched voice
+/// ([`vouched_envelope`](super::edition2::group::vouched_envelope)): the
+/// earlier envelope verify is deleted, so `_directory` reads nothing and an
+/// unvouched row is refused by name (`earlier_form_object`).
 pub(crate) async fn verify_envelope_signed_row<F>(
-    directory: &F,
+    _directory: &F,
     row: &Attestation,
 ) -> Result<(), Error>
 where
@@ -231,14 +233,12 @@ where
         attesting_key_id: row.attesting_key_id.clone(),
         reason,
     };
-    let computed_hash = verify_envelope_hybrid_signature(
-        directory,
+    let computed_hash = crate::federation::edition2::group::vouched_envelope(
         &row.attesting_key_id,
         &row.attestation_envelope,
         &row.scrub_signature_classical,
-        row.scrub_signature_pqc.as_deref(),
+        "attestation",
     )
-    .await
     .map_err(|e| match e {
         // Re-stamp the row's attestation_id onto the typed error (the
         // envelope-level helper has no row id).
@@ -273,14 +273,12 @@ where
     // the co-signers this field exists for — that is every node, because the
     // holder records are baked into the genesis seed.
     for (i, scrub) in row.additional_scrubs.iter().enumerate() {
-        let scrub_hash = verify_envelope_hybrid_signature(
-            directory,
+        let scrub_hash = crate::federation::edition2::group::vouched_envelope(
             &scrub.scrub_key_id,
             &row.attestation_envelope,
             &scrub.scrub_signature_classical,
-            scrub.scrub_signature_pqc.as_deref(),
+            "attestation",
         )
-        .await
         .map_err(|e| match e {
             Error::FederationTierUnverified { reason, .. } => reject(format!(
                 "additional_scrubs[{i}] by {}: {reason}",
@@ -330,90 +328,13 @@ where
 {
     crate::federation::admission::check_revocation_envelope_binding(row)?;
     crate::federation::admission::check_revocation_subject(directory, row).await?;
-    verify_envelope_hybrid_signature(
-        directory,
+    crate::federation::edition2::group::vouched_envelope(
         &row.revoking_key_id,
         &row.revocation_envelope,
         &row.scrub_signature_classical,
-        row.scrub_signature_pqc.as_deref(),
+        "revocation",
     )
-    .await
     .map(|_| ())
-}
-
-/// v12.6.0 (CIRISPersist#171) — the envelope-level bound-hybrid verify
-/// primitive shared by [`verify_row_hybrid_signature`] (row form) and the
-/// §10.1.3 transit revocation local-write path (which has no assembled row
-/// yet — it verifies before building one). Canonicalizes `envelope` through
-/// the CEG produce gate, resolves `attesting_key_id`'s REGISTERED pubkeys via
-/// the directory (unknown attester ⇒ reject, fail-secure), and runs
-/// `verify_hybrid` (deleted v62.0.0) under `HybridPolicy::Strict` (deleted v62.0.0) (both halves REQUIRED,
-/// PQC-mandatory per CC 5.3.2.4.3.1). On success returns the hex-encoded
-/// `SHA-256(canonical)` (the row's `original_content_hash`); on a signature
-/// failure returns [`Error::FederationTierUnverified`] with an empty
-/// `attestation_id` (the caller re-stamps its own where one exists). An
-/// attester this node holds no Key row for is [`Error::AttesterKeyUnknown`]
-/// instead (v54.1.0, CIRISPersist#1042): an ordering gap, retryable. A
-/// backend failure of the attester lookup propagates as that backend error.
-pub async fn verify_envelope_hybrid_signature<F>(
-    directory: &F,
-    attesting_key_id: &str,
-    envelope: &serde_json::Value,
-    scrub_signature_classical: &str,
-    scrub_signature_pqc: Option<&str>,
-) -> Result<String, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let reject = |reason: String| Error::FederationTierUnverified {
-        attestation_id: String::new(),
-        attesting_key_id: attesting_key_id.to_string(),
-        reason,
-    };
-
-    // (1) Canonicalize through the CEG produce gate — the same canonical
-    // form the producer signed — and compute its SHA-256.
-    let canonical = ceg_produce_canonicalize(envelope)
-        .map_err(|e| reject(format!("attestation_envelope canonicalize: {e}")))?;
-    let computed_hash = hex::encode(Sha256::digest(&canonical));
-
-    // v62.0.0 (wave T1) — an edition-2 group statement's typed record: the
-    // edition-2 door verified each voice's statement when it arrived, and
-    // vouches for exactly this envelope, this signer and this marker
-    // (`edition2::group::vouched_signature`). Any other signature, in the
-    // same task or not, is verified below as before.
-    if super::edition2::group::vouched_signature(
-        attesting_key_id,
-        &computed_hash,
-        scrub_signature_classical,
-    ) {
-        return Ok(computed_hash);
-    }
-
-    // (2) Resolve the attester's REGISTERED pubkeys — never pubkeys carried
-    // on the row alone. Unknown/unregistered attester ⇒ reject (fail-secure).
-    // v54.1.0 (CIRISPersist#1042) — typed as the ORDERING gap it is
-    // (`Error::AttesterKeyUnknown`, retryable once the Key row lands), not as
-    // the terminal `FederationTierUnverified` a bad signature is.
-    //
-    // v54.1.0 (CIRISPersist#1042 follow-up, CIRISEdge#858) — a BACKEND failure
-    // of the lookup propagates as itself, as `register::verify_key_registration`'s
-    // twin does: a transient storage error is not a verdict on the row, and
-    // folding it into `FederationTierUnverified` made it read as terminal.
-    let _attester = directory
-        .lookup_public_key(attesting_key_id)
-        .await?
-        .ok_or_else(|| Error::unknown_signer(attesting_key_id, "signed_envelope"))?;
-
-    // (3) v62.0.0 (F0-cp7; RULINGS "composite signatures only, no standalone
-    // component signers") — the bound-hybrid verify (an Ed25519 half and an
-    // ML-DSA-65 half checked against the attester's registered component
-    // halves) is DELETED. A signature that is not the edition-2 door's vouch
-    // above is the earlier form: refused by name, whatever the switch says.
-    let _ = (reject, scrub_signature_classical, scrub_signature_pqc);
-    Err(super::edition2::door::earlier_form_signature(
-        "signed_envelope",
-    ))
 }
 
 /// v53.0.0 (CC 3.2 T6, operator ruling B-1 on CIRISConstitution#136) — **the
@@ -644,14 +565,12 @@ where
             .await?;
     }
     let envelope = signed.family.signing_envelope();
-    verify_envelope_hybrid_signature(
-        directory,
+    crate::federation::edition2::group::vouched_envelope(
         &signed.authority_key_id,
         &envelope,
         &signed.scrub_signature_classical,
-        signed.scrub_signature_pqc.as_deref(),
-    )
-    .await?;
+        "family",
+    )?;
     // v52.0.0 (CIRISPersist#955, Q1) — a founding member's consent is their
     // co-signature; one that does not verify is refused, never counted.
     verify_roster_cosignatures(
@@ -757,14 +676,12 @@ where
     F: FederationDirectory + ?Sized,
 {
     let envelope = signed.community.signing_envelope();
-    verify_envelope_hybrid_signature(
-        directory,
+    crate::federation::edition2::group::vouched_envelope(
         &signed.authority_key_id,
         &envelope,
         &signed.scrub_signature_classical,
-        signed.scrub_signature_pqc.as_deref(),
-    )
-    .await?;
+        "community",
+    )?;
     // v50.0.0 (CIRISPersist#926) — the co-signatures a trust-root row carries
     // are verified at the door exactly as a roster row's are: one that does
     // not verify is refused, never stored as decoration.
@@ -782,7 +699,7 @@ where
 /// membership row's co-signatures, AFTER its primary signature has verified.
 ///
 /// Every co-signature is a hybrid scrub over the SAME `envelope` the primary
-/// signed, verified by [`verify_envelope_hybrid_signature`] exactly as the
+/// signed, verified by `verify_envelope_hybrid_signature` (deleted v62.0.0, F0-cp8) exactly as the
 /// primary is — so a co-signature that does not verify fails exactly as a bad
 /// primary does. A co-signer equal to `primary_key_id`, or one that appears
 /// twice, is refused with [`Error::InvalidArgument`] before any co-signature
@@ -841,14 +758,12 @@ where
     }
     for c in cosignatures {
         if !counted.contains(&c.authority_key_id) {
-            verify_envelope_hybrid_signature(
-                directory,
+            crate::federation::edition2::group::vouched_envelope(
                 &c.authority_key_id,
                 envelope,
                 &c.scrub_signature_classical,
-                c.scrub_signature_pqc.as_deref(),
-            )
-            .await?;
+                "roster_cosignature",
+            )?;
         }
     }
     Err(Error::InvalidArgument(format!(
@@ -868,14 +783,12 @@ where
     F: FederationDirectory + ?Sized,
 {
     let envelope = signed.family_membership_revocation.signing_envelope();
-    verify_envelope_hybrid_signature(
-        directory,
+    crate::federation::edition2::group::vouched_envelope(
         &signed.authority_key_id,
         &envelope,
         &signed.scrub_signature_classical,
-        signed.scrub_signature_pqc.as_deref(),
-    )
-    .await?;
+        "family_membership_revocation",
+    )?;
     // v49.0.0 (CIRISPersist#908) — every co-signature, over the same envelope.
     verify_roster_cosignatures(
         directory,
@@ -902,14 +815,12 @@ where
     F: FederationDirectory + ?Sized,
 {
     let envelope = signed.community_membership_revocation.signing_envelope();
-    verify_envelope_hybrid_signature(
-        directory,
+    crate::federation::edition2::group::vouched_envelope(
         &signed.authority_key_id,
         &envelope,
         &signed.scrub_signature_classical,
-        signed.scrub_signature_pqc.as_deref(),
-    )
-    .await?;
+        "community_membership_revocation",
+    )?;
     // v49.0.0 (CIRISPersist#908) — every co-signature, over the same envelope.
     verify_roster_cosignatures(
         directory,
@@ -933,14 +844,12 @@ where
     F: FederationDirectory + ?Sized,
 {
     let envelope = signed.community_membership_widening.signing_envelope();
-    verify_envelope_hybrid_signature(
-        directory,
+    crate::federation::edition2::group::vouched_envelope(
         &signed.authority_key_id,
         &envelope,
         &signed.scrub_signature_classical,
-        signed.scrub_signature_pqc.as_deref(),
-    )
-    .await?;
+        "community_membership_widening",
+    )?;
     // v49.0.0 (CIRISPersist#908) — every co-signature, over the same envelope.
     verify_roster_cosignatures(
         directory,
@@ -965,14 +874,12 @@ where
     F: FederationDirectory + ?Sized,
 {
     let envelope = signed.family_membership_widening.signing_envelope();
-    verify_envelope_hybrid_signature(
-        directory,
+    crate::federation::edition2::group::vouched_envelope(
         &signed.authority_key_id,
         &envelope,
         &signed.scrub_signature_classical,
-        signed.scrub_signature_pqc.as_deref(),
-    )
-    .await?;
+        "family_membership_widening",
+    )?;
     verify_roster_cosignatures(
         directory,
         "SignedFamilyMembershipWidening",
@@ -1050,14 +957,12 @@ pub async fn verify_location_proof_admission<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    verify_envelope_hybrid_signature(
-        directory,
+    crate::federation::edition2::group::vouched_envelope(
         &signed.authority_key_id,
         &signed.location_proof.signing_envelope(),
         &signed.scrub_signature_classical,
-        signed.scrub_signature_pqc.as_deref(),
-    )
-    .await?;
+        "location_proof",
+    )?;
     check_location_authority(
         directory,
         &signed.location_proof.subject_key_id,
@@ -1132,9 +1037,11 @@ where
 #[allow(dead_code)]
 pub mod test_support {
     use super::*;
+    use crate::verify::canonical::ceg_produce_canonicalize;
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
     use ciris_crypto::{ClassicalSigner as _, Ed25519Signer, MlDsa65Signer, PqcSigner as _};
+    use sha2::{Digest, Sha256};
 
     /// Deterministic 32-byte seed for `key_id` — the first ≤32 bytes of
     /// the key_id over a `0x11` fill. Same shape as
@@ -1941,7 +1848,20 @@ pub mod test_support {
     /// hybrid signature over `JCS(envelope)` of the row as stored (canonical at
     /// rest, so the bytes are the ones `crossing::plan_enter_mesh`
     /// recomputes). Never re-stamps anything.
+    ///
+    /// v62.0.0 (E0 fix 11; CP2) — a row that carries its edition-2 statement
+    /// crosses on that statement (`TierPromotionCustody::Statement`, v62 P8):
+    /// the actor's signature IS the statement, and the crossing refuses a JCS
+    /// custody for it. Its instant is the row's own `asserted_at` + 1 s (the
+    /// actor's signed instant, so inside the signer's key window; never the
+    /// wall clock).
     pub fn actor_reseal(row: &Attestation) -> crate::federation::TierPromotionCustody {
+        if let Some(c) = crate::federation::TierPromotionCustody::of_statement(
+            row,
+            row.asserted_at + chrono::Duration::seconds(1),
+        ) {
+            return c;
+        }
         let mut envelope = row.attestation_envelope.clone();
         crate::federation::canonical_at_rest::canonicalize_in_place(&mut envelope)
             .expect("fixture envelope canonicalizes");
@@ -3839,6 +3759,19 @@ pub mod test_support {
         dir: &dyn crate::federation::FederationDirectory,
         key_id: &str,
     ) {
+        // v62.0.0 (E2-fix7; CP2) — the earlier-form `put_public_key` door is
+        // shut (`earlier_form_object`): under the switch the key goes live as
+        // its edition-2 `key:record` (`user`), as `register_hybrid_key_as`
+        // does; only a HELD test registers the earlier-form record.
+        if crate::federation::edition2::fixture_switch::emit_edition2() {
+            let _ = crate::federation::edition2::fixture_switch::put_key(
+                dir,
+                key_id,
+                &[crate::federation::types::identity_type::USER],
+            )
+            .await;
+            return;
+        }
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
         let now = {
             use chrono::Timelike as _;

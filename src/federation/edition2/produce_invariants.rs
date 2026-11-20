@@ -337,3 +337,246 @@ fn i2013_the_kernel_reads_an_edition2_rows_own_id_and_refs() {
         "I2013: the earlier form, until the cut"
     );
 }
+
+// ---- E2-fix10: the producer never signs a `refs` Verify refuses (I2632) ----
+
+/// The `refs` cases `(what, refs, Verify's label or None for a valid one)`.
+fn refs_cases() -> Vec<(&'static str, Value, Option<&'static str>)> {
+    use super::door_invariants::fixture::ref2;
+    let set = |ds: &[u8]| Value::Array(ds.iter().map(|d| ref2(&[*d; 32])).collect());
+    vec![
+        (
+            "a valid refs: answers and a sorted also set",
+            map(vec![
+                ("answers", ref2(&[0xa5; 32])),
+                ("also", map(vec![("cites", set(&[0xa9, 0xaa]))])),
+            ]),
+            None,
+        ),
+        (
+            "an unknown refs member",
+            map(vec![("wa_adjudication_ref", ref2(&[0xb1; 32]))]),
+            Some("unexpected:refs"),
+        ),
+        (
+            "an unknown also role",
+            map(vec![("also", map(vec![("thread", set(&[0xb2]))]))]),
+            Some("unexpected:also"),
+        ),
+        ("an empty refs", map(vec![]), Some("malformed:refs")),
+        (
+            "an empty also",
+            map(vec![("also", map(vec![]))]),
+            Some("malformed:also"),
+        ),
+        (
+            "an empty set",
+            map(vec![("further_heads", Value::Array(vec![]))]),
+            Some("malformed:further_heads"),
+        ),
+        (
+            "an unsorted set",
+            map(vec![("further_heads", set(&[0xb4, 0xb3]))]),
+            Some("set_order:further_heads"),
+        ),
+        (
+            "a repeated set element",
+            map(vec![("trusted_through", set(&[0xb5, 0xb5]))]),
+            Some("set_order:trusted_through"),
+        ),
+        (
+            "an unsorted also set",
+            map(vec![("also", map(vec![("cites", set(&[0xb7, 0xb6]))]))]),
+            Some("set_order:also"),
+        ),
+        (
+            "a set where one row-ref stands",
+            map(vec![("head", set(&[0xb8]))]),
+            Some("malformed:head"),
+        ),
+    ]
+}
+
+/// **I2632 (each member)** — the producer's `refs` check admits each CDDL
+/// member in its own shape, and both also roles.
+#[test]
+fn i2632_the_producer_admits_each_refs_member() {
+    use super::door_invariants::fixture::ref2;
+    use super::produce::check_refs;
+    let set = |ds: &[u8]| Value::Array(ds.iter().map(|d| ref2(&[*d; 32])).collect());
+    for (member, value) in [
+        ("head", ref2(&[0xa1; 32])),
+        ("further_heads", set(&[0xa2, 0xa3])),
+        ("prev", ref2(&[0xa4; 32])),
+        ("answers", ref2(&[0xa5; 32])),
+        ("target", ref2(&[0xa6; 32])),
+        ("trusted_through", set(&[0xa7])),
+        (
+            "also",
+            map(vec![("ack", set(&[0xa8])), ("cites", set(&[0xa9, 0xaa]))]),
+        ),
+    ] {
+        check_refs(&map(vec![(member, value)]))
+            .unwrap_or_else(|l| panic!("I2632: `refs.{member}` is a CDDL member, refused {l}"));
+    }
+}
+
+/// A score row of `iss` carrying `refs`.
+fn with_refs(iss: &str, refs: Value) -> Value {
+    let Value::Map(mut m) = score_payload(iss, 5_000) else {
+        unreachable!()
+    };
+    m.push((Value::Text("refs".into()), refs));
+    map(m
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                &*Box::leak(k.as_text().unwrap_or("?").to_owned().into_boxed_str()),
+                v,
+            )
+        })
+        .collect())
+}
+
+/// **I2632** (v62.0.0, E2-fix10; `signed_object_v2.cddl` `refs`, CC 2.6.1.3 /
+/// 2.6.1.2) — **persist's producer never signs a `refs` Verify's reader
+/// refuses, and it names the refusal by Verify's label.** For each broken
+/// case `sign_row` refuses `edition2_payload_invalid: <label>`, and the same
+/// payload minted by Verify's own `sign_row_statement` is refused at the
+/// door (`admit_row`) with that same label: the two readers agree. The valid
+/// case (every member in its shape) signs and the door admits it. Kills:
+/// dropping the producer check (the broken statement signs); a label that
+/// differs from Verify's.
+#[tokio::test]
+async fn i2632_the_producer_refuses_a_refs_verify_refuses() {
+    let k = key(81);
+    let signer = local(81);
+    let (_, iss) = signer_identity(&signer).await.unwrap();
+    let mut keys = HeldKeys::new();
+    keys.insert_record(key_record(&k, &["user"], 0, None));
+    for (what, refs, label) in refs_cases() {
+        let payload = with_refs(&iss, refs);
+        let ours = sign_row(&signer, &iss, "scores", EVIDENCE_ROWS, &payload).await;
+        match label {
+            None => {
+                let st = ours.unwrap_or_else(|e| panic!("I2632 {what}: refused: {e}"));
+                admit_row(&st, &keys, None, SelectContext::default())
+                    .unwrap_or_else(|e| panic!("I2632 {what}: the door refuses it: {e}"));
+            }
+            Some(label) => {
+                match ours {
+                    Err(ProduceError::Payload(l)) => {
+                        assert_eq!(l, label, "I2632 {what}: Verify's label");
+                    }
+                    other => panic!("I2632 {what}: expected the refusal {label}, got {other:?}"),
+                }
+                if let Ok(minted) =
+                    sign_row_statement(&k, &iss, &iss, "scores", EVIDENCE_ROWS, &payload, vec![])
+                {
+                    let e = admit_row(&minted, &keys, None, SelectContext::default())
+                        .expect_err("I2632: Verify's reader refuses it");
+                    assert!(
+                        e.to_string().contains(label),
+                        "I2632 {what}: the door's refusal names {label}: {e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// **I2632 (the door's validator on the produce path)** — the producer runs
+/// the payload validator its own door runs (`payloads::check_by_id`) before
+/// it signs: a composer naming no `refs.target` (the composer rule) is
+/// refused `Rejected`, never signed; with its target it signs.
+#[tokio::test]
+async fn i2632_the_producer_runs_the_doors_payload_validator() {
+    use super::door_invariants::fixture::ref2;
+    let signer = local(82);
+    let (_, iss) = signer_identity(&signer).await.unwrap();
+    let bare = map(vec![
+        ("asserted_at", Value::Uint(5_000)),
+        ("author", Value::Text(iss.clone())),
+    ]);
+    match sign_row(&signer, &iss, "withdraws", EVIDENCE_ROWS, &bare).await {
+        Err(ProduceError::Rejected(why)) => assert!(
+            why.contains("refs.target is required"),
+            "I2632: the composer rule's refusal: {why}"
+        ),
+        other => panic!("I2632: a target-less composer must not sign, got {other:?}"),
+    }
+    let named = map(vec![
+        ("asserted_at", Value::Uint(5_000)),
+        ("author", Value::Text(iss.clone())),
+        ("refs", map(vec![("target", ref2(&[0xd1; 32]))])),
+    ]);
+    sign_row(&signer, &iss, "withdraws", EVIDENCE_ROWS, &named)
+        .await
+        .expect("I2632: a composer naming its target signs");
+}
+
+/// **I2632 (sqlite + pg)** — a producer-signed statement with a valid `refs`
+/// goes through the door of a real store and is not refused (it lands, or
+/// waits on the rows it names); a broken one is never signed.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+async fn refs_through_a_store(dir: &dyn crate::federation::FederationDirectory) {
+    use crate::federation::tier_ingest::test_support as ts;
+    let seed = "producer-refs-i2632";
+    let _ = super::fixture_switch::put_key(dir, seed, &["user"]).await;
+    let signer = ts::local_signer(seed);
+    let (_, iss) = signer_identity(&signer).await.unwrap();
+    for (what, refs, label) in refs_cases() {
+        let payload = with_refs(&iss, refs);
+        let ours = sign_row(&signer, &iss, "scores", EVIDENCE_ROWS, &payload).await;
+        match label {
+            None => {
+                let st = ours.unwrap_or_else(|e| panic!("I2632 {what}: refused: {e}"));
+                // It lands or waits on the rows it names; whatever else the
+                // family's gates say, the door does not refuse its `refs`.
+                if let Err(e) = super::ingest::put_statement(dir, &st, None, INGEST_TIER).await {
+                    let t = e.to_string();
+                    assert!(
+                        ![
+                            "unexpected:refs",
+                            "unexpected:also",
+                            "malformed:",
+                            "set_order:"
+                        ]
+                        .iter()
+                        .any(|l| t.contains(l)),
+                        "I2632 {what}: the store's door refuses its refs: {e}"
+                    );
+                }
+            }
+            Some(label) => assert!(
+                matches!(ours, Err(ProduceError::Payload(l)) if l == label),
+                "I2632 {what}: never signed ({label})"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2632_refs_through_a_store_sqlite() {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    refs_through_a_store(&b).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2632_refs_through_a_store_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::empty_dsn() else {
+        return;
+    };
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    refs_through_a_store(&b).await;
+}

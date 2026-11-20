@@ -46,6 +46,7 @@ pub(crate) mod bodies {
         delegate, key_as, notice, Claimant,
     };
     use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::ingest::StatementOutcome;
     use crate::federation::room_roster_authority_invariants::bodies::make_group;
     use crate::federation::steward_purge::purge_withheld;
     use crate::federation::takedown_reversal_invariants::bodies::{ruling, sha_bytes, sha_hex};
@@ -390,19 +391,38 @@ pub(crate) mod bodies {
             .notice_attestation_id
             .clone()
             .expect("a notice row");
-        let e = e2::put_signed(
-            b,
-            &ruling(
-                plain,
-                &notice_row,
-                "reversed",
-                cohort_scope::COMMUNITY,
-                &room,
-            ),
-        )
-        .await
-        .expect_err("I1746: a plain member does not rule");
-        assert_eq!(e.kind(), "federation_delegated_scope_unauthorized", "{e}");
+        // v62.0.0 (E12-fix3; CC 2.7.3) — the `review` duty reads OTHER rows
+        // (the room's seats, the delegation chains), so a plain member's
+        // ruling is HELD at the door, never refused: it is kept, has no row,
+        // and reverses nothing.
+        let plain_ruling = ruling(
+            plain,
+            &notice_row,
+            "reversed",
+            cohort_scope::COMMUNITY,
+            &room,
+        );
+        let held = e2::put_signed(b, &plain_ruling)
+            .await
+            .expect("I1746: a plain member's ruling is kept, not refused");
+        assert!(
+            matches!(held, StatementOutcome::Pending { .. }),
+            "I1746: a plain member does not rule (held): {held:?}"
+        );
+        assert!(
+            b.get_attestation(&e2::rid(&plain_ruling))
+                .await
+                .unwrap()
+                .is_none(),
+            "I1746: the held ruling concludes nothing"
+        );
+        assert!(
+            td::takedown_reversal(b, &by_founder.notice_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "I1746: no reversal yet"
+        );
         e2::put_signed(
             b,
             &ruling(

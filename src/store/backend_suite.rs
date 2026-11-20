@@ -295,6 +295,22 @@ mod tests {
     /// default windows (node/agent: today − 180 days … + 365 days; others from
     /// 0, no end): every row this suite signs under the edition 2 is
     /// now-relative (`fix_attestation`), so no key here starts at a fixed date.
+    /// E5-fix2 (round 6; K2-fix6 / E0-fix6, CC 2.6.1.9 / 2.7.5) — **a row put
+    /// with every second-signer voice its resolved family model names**
+    /// (`e2::land_delegation`: a `trust:confers` grant's delegate, a
+    /// delegation's delegate and a machine delegate's owner). A row whose
+    /// family names none (a score, an age row, a charter self-edge) is its
+    /// author's statement alone, exactly `e2::put_signed`. The gates judge
+    /// it as before; only the voices a counted row waits for are supplied
+    /// (ruling 5: supply the dependency). Every suite put goes through it.
+    async fn put_voiced<D: FederationDirectory + ?Sized>(
+        d: &D,
+        row: &Attestation,
+    ) -> Result<crate::federation::edition2::ingest::StatementOutcome, crate::federation::Error>
+    {
+        e2::land_delegation(d, row).await.map(|(out, _)| out)
+    }
+
     async fn put_e2_key(backend: &SqliteBackend, key_id: &str, identity_type: &str) -> String {
         e2::put_key(backend, key_id, &e2::identity_types_of(identity_type)).await
     }
@@ -510,8 +526,8 @@ mod tests {
     /// The owner-binding case CIRISServer measured: setup writes
     /// `delegates_to(owner → node)` at `self`, and the announce publishes a
     /// FRESH `delegates_to` at federation scope rather than a `supersedes`
-    /// (which is correct — see `owner_binding_widening_is_not_visible_to_a_peer_807`
-    /// for why a `supersedes` announce would be invisible to every peer). The
+    /// (which is correct: a `supersedes` announce would be invisible to every
+    /// peer, and an edition-2 composer carries no binding body at all). The
     /// `self` row therefore never acquires a referencing `supersedes`, and the
     /// sweep reported `awaiting_actor` on every announced node, every tick,
     /// forever: "1 row(s) are stuck awaiting their author's signer" — false on
@@ -695,7 +711,7 @@ mod tests {
             let mut row = fix_attestation(&id, "adv-a", "adv-b", "adv-a");
             row.attestation_type = crate::federation::types::attestation_type::SCORES.into();
             resign_fix(&mut row);
-            e2::put_signed(&backend, &row).await.expect("seed");
+            put_voiced(&backend, &row).await.expect("seed");
             // v62.0.0 (E5) — the stored id is the computed row id.
             ids.push(e2::rid(&row));
         }
@@ -795,7 +811,7 @@ mod tests {
         );
 
         for row in [&live, &expired, &expired_withdraws] {
-            e2::put_signed(&backend, row).await.expect("seed");
+            put_voiced(&backend, row).await.expect("seed");
         }
 
         // The sweep only ever offers rows past their stated expiry.
@@ -868,9 +884,7 @@ mod tests {
         resign_fix(&mut behind);
         let (blocker_id, behind_id) = (e2::rid(&blocker), e2::rid(&behind));
         for row in [blocker, behind] {
-            e2::put_signed(&backend, &row)
-                .await
-                .expect("seed blocked pair");
+            put_voiced(&backend, &row).await.expect("seed blocked pair");
         }
         // A batch of ONE: the oldest expired row is the immovable withdrawal.
         let (p2, r2) = backend
@@ -908,9 +922,7 @@ mod tests {
         granted.attestation_type = crate::federation::types::attestation_type::SCORES.into();
         granted.expires_at = Some(past);
         resign_fix(&mut granted);
-        e2::put_signed(&backend, &granted)
-            .await
-            .expect("seed granted");
+        put_voiced(&backend, &granted).await.expect("seed granted");
         // v62.0.0 (E5) — keyed by the identity-refs and the computed row id.
         let granted_id = e2::rid(&granted);
         let (ka, kb) = (e2::kid("reap-a"), e2::kid("reap-b"));
@@ -1428,98 +1440,59 @@ mod tests {
         d
     }
 
-    /// v18.2.0 (CIRISPersist#481) — the pluggable-trust-root witnesses, all
-    /// four asks through the REAL write + walk surfaces:
+    /// v18.2.0 (CIRISPersist#481) — the pluggable-trust-root witnesses
+    /// through the REAL write + walk surfaces:
     /// 1. self-root `attestation(user → user)` ADMITS;
-    /// 2. self-referential `delegates_to(root → root, scope:[infra:*])`
-    ///    ADMITS (a root roots to itself) — and note the TWO-PLANES rule:
-    ///    these are delegation SCOPE tokens in an envelope, not the
-    ///    accord-conferred `infra:attest` key ROLE (which stays co-scrub
-    ///    gated; see admission set-path tests);
-    /// 3. `trust_root_valid` evaluates the full predicate (edge +
-    ///    self-declaration + fresh heartbeat + halt latch);
-    /// 4. the `withdraws` tombstone on the trust edge makes the walk treat
-    ///    it as ABSENT (nuclear un-trust; base self-root untouched).
+    /// 2. a root that charters itself (`trust:charter:v1`) and a user's own
+    ///    `trust:accepts` edge to it;
+    /// 3. `trust_root_valid` evaluates the predicate (edge + self-declaration
+    ///    + recovery + holders; the drill and halt latch are reported only);
+    /// 4. the user's `withdraws` of its edge makes the walk treat it as ABSENT
+    ///    (nuclear un-trust; base self-root untouched).
+    ///
+    /// E5-fix2 (round 6; CP2) — PORTED to an edition-2 root (E9's twins): a
+    /// key-arm root hand-chartered by a fixture key is never valid under
+    /// edition 2 (its holder's custody evidence, CC 4.2.2.1). The "(3) fresh
+    /// drill reads Green" leg is not carried: no edition-2 producer states an
+    /// accord heartbeat about a fixture root (its signer needs accord
+    /// standing); the drill's band is #551's witness below and the edition-2
+    /// "undrilled ⇒ Red, still valid" is `operational`'s ceremony walk.
     #[tokio::test]
     async fn trust_root_walk_and_tombstone_481() {
+        use crate::federation::operational::test_support::{
+            accept_e2_root, stand_up_e2_root, withdraw_e2,
+        };
         use crate::federation::trust_root::{trust_root_valid, TrustRootVerdict};
         let backend = test_backend();
-        for (k, it) in [
-            ("tr-user", "user"),
-            ("tr-root", "node"),
-            ("tr-la", "accord_holder"),
-        ] {
-            // v62.0.0 (E5) — an edition-2 `key:record` (hardware evidence is not
-            // carried by the fixture record).
-            put_e2_key(&backend, k, it).await;
-        }
+        let user = put_e2_key(&backend, "tr-user", "user").await;
 
         // Ask 1 — the self-root base admits (attesting == attested == self).
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_attestation("tr-self", "tr-user", "tr-user", "tr-user"),
         )
         .await
         .expect("(1) self-root attestation(user→user) must admit");
 
-        // Ask 2 — the self-referential root declaration admits.
-        e2::put_signed(
-            &backend,
-            &fix_charter(
-                "tr-rootdecl",
-                "tr-root",
-                serde_json::json!(["infra:attest", "infra:serve"]),
-            ),
-        )
-        .await
-        .expect("(2) delegates_to(root→root, infra:*) must admit");
-
-        // The user's trust edge.
-        let edge = fix_accepts(
-            "tr-edge",
-            "tr-user",
-            "tr-root",
-            serde_json::json!(["infra:attest", "infra:serve"]),
-        );
-        e2::put_signed(&backend, &edge)
+        // Ask 2 — the root charters itself; the user's own edge.
+        let r = stand_up_e2_root(&backend, "tr-root")
             .await
-            .expect("delegates_to(user→root) must admit");
-
-        // Fresh heartbeat about the root (accord:* attester must be
-        // an accord_holder — the constitutional asymmetry holds here too).
-        let mut lc = fix_attestation("tr-lc", "tr-la", "tr-root", "tr-la");
-        lc.attestation_envelope = serde_json::json!({
-            "id": "tr-lc",
-            "dimension": "accord:lifecycle:v1",
-            "score": 1.0,
-            "confidence": 0.9,
-        });
-        lc.asserted_at = chrono::Utc::now();
-        resign_fix(&mut lc);
-        e2::put_signed(&backend, &lc)
+            .expect("(2) the root stands up and charters itself");
+        let edge = accept_e2_root(&backend, "tr-user", &r.root)
             .await
-            .expect("the heartbeat from an accord_holder must admit");
+            .expect("the user's trust edge must admit");
 
-        // Ask 3 — the walk: every leg green.
-        let v: TrustRootVerdict =
-            trust_root_valid(&backend, &e2::kid("tr-user"), &e2::kid("tr-root"))
-                .await
-                .expect("walk");
-        assert!(v.edge_exists, "(3) live user→root edge");
-        assert!(
-            v.root_self_declares,
-            "(3) root self-declares w/ infra scope"
-        );
-        assert_eq!(
-            v.drill_freshness,
-            crate::federation::trust_root::DrillFreshness::Green,
-            "(3) fresh drill reads Green — reported, not gated on"
-        );
+        // Ask 3 — the walk: every hard leg green.
+        let v: TrustRootVerdict = trust_root_valid(&backend, &user, &r.root)
+            .await
+            .expect("walk");
+        assert!(v.edge_exists, "(3) live user→root edge: {v:?}");
+        assert!(v.root_self_declares, "(3) root self-declares: {v:?}");
         assert_ne!(v.halt_latched, Some(true), "(3) no halt latched");
-        assert!(v.valid, "(3) all legs ⇒ valid");
+        assert!(v.valid, "(3) all legs ⇒ valid: {v:?}");
 
         // A self-root is the immutable BASE, never a valid EXTERNAL root.
-        let v0 = trust_root_valid(&backend, &e2::kid("tr-user"), &e2::kid("tr-user"))
+        let v0 = trust_root_valid(&backend, &user, &user)
             .await
             .expect("walk self");
         assert!(
@@ -1528,126 +1501,48 @@ mod tests {
         );
 
         // Ask 4 — nuclear un-trust: withdraw the edge; the walk folds it
-        // ABSENT. The base self-root is untouched (the app never bricks).
-        e2::put_signed(&backend, &fix_withdraws("tr-w", "tr-user", &e2::rid(&edge)))
+        // ABSENT. The root's own declaration stands.
+        withdraw_e2(&backend, "tr-user", &r.root, &edge)
             .await
             .expect("(4) withdraws on own edge must admit");
-        let v2 = trust_root_valid(&backend, &e2::kid("tr-user"), &e2::kid("tr-root"))
+        let v2 = trust_root_valid(&backend, &user, &r.root)
             .await
             .expect("walk post-tombstone");
         assert!(!v2.edge_exists, "(4) tombstoned edge is ABSENT to the walk");
         assert!(!v2.valid, "(4) un-trust revokes validity");
         assert!(
-            v2.root_self_declares
-                && v2.drill_freshness == crate::federation::trust_root::DrillFreshness::Green,
-            "(4) only the EDGE died — the root's own declarations stand"
+            v2.root_self_declares,
+            "(4) only the EDGE died — the root's own declaration stands"
         );
     }
 
-    /// v23.0.0 (CIRISPersist#551 item 4, the REAL half) — **the drill is a
-    /// trust SIGNAL, not a functionality gate.**
+    /// v23.0.0 (CIRISPersist#551 item 4) — **the drill is a trust SIGNAL, not
+    /// a functionality gate.** `valid` never consults the drill; an undrilled
+    /// root still serves, and says so (`Red`, `last_drill_at: None`). The hard
+    /// gates are untouched: the user's un-trust still collapses validity.
     ///
-    /// A genesis root is valid until revoked, halted, or un-trusted:
-    /// tombstones and the halt latch ARE the revocation mechanism, so a
-    /// deadman on top of them gave the artifact a shelf life nobody intended
-    /// — three months after the mint every node darkens together, with no
-    /// error at the point of use. What the drill actually tells you is
-    /// whether the root is GOVERNED or ABANDONED, and that is a thing to
-    /// report, not a thing to withhold service over.
-    ///
-    /// So: `valid` no longer consults the drill at all, and the freshness
-    /// rides a band — the same band-not-float discipline as every other
-    /// score in the system. The hard gates (edge, charter, recovery, halt
-    /// latch) are untouched: the kill switch and the operator's un-trust
-    /// lever still work exactly as before.
+    /// E5-fix2 (round 6; CP2) — PORTED to edition-2 roots (E9's twins). The
+    /// Green / Yellow band legs are not carried: they need a heartbeat about
+    /// the root from a signer with accord standing, which no edition-2 fixture
+    /// produces for a fixture root (the banding itself is the private
+    /// `DrillFreshness::of`).
     #[tokio::test]
     async fn drill_freshness_is_a_signal_not_a_gate_551() {
-        use crate::federation::trust_root::{
-            trust_root_valid, DrillFreshness, TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION,
+        use crate::federation::operational::test_support::{
+            accept_e2_root, stand_up_e2_root, withdraw_e2,
         };
+        use crate::federation::trust_root::{trust_root_valid, DrillFreshness};
         let backend = test_backend();
-        for (k, it) in [
-            ("drill-user", "user"),
-            ("drill-green", "node"),
-            ("drill-yellow", "node"),
-            ("drill-never", "node"),
-            ("drill-la", "accord_holder"),
-        ] {
-            // v62.0.0 (E5) — an edition-2 `key:record` (hardware evidence is not
-            // carried by the fixture record).
-            put_e2_key(&backend, k, it).await;
-        }
-        let scope = || serde_json::json!(["infra:attest", "infra:serve"]);
-        let stamp = |mut a: Attestation, dimension: &str| {
-            a.attestation_envelope["dimension"] = serde_json::json!(dimension);
-            resign_fix(&mut a);
-            a
-        };
-        // A drill row about `root`, asserted `days_ago` days back.
-        let drill = |id: &str, about: &str, days_ago: i64| {
-            let mut d = fix_attestation(id, "drill-la", about, "drill-la");
-            d.attestation_envelope = serde_json::json!({
-                "id": id,
-                "dimension": crate::federation::trust_root::ACCORD_HEARTBEAT_DIMENSION,
-                "score": 1.0,
-                "confidence": 0.9,
-            });
-            d.asserted_at = chrono::Utc::now() - chrono::Duration::days(days_ago);
-            resign_fix(&mut d);
-            d
-        };
-        // Stand up the HARD legs for each root: charter + the user's edge.
-        // v62.0.0 (E5) — each edge is kept by its computed row id.
-        let mut edges = std::collections::BTreeMap::new();
-        for root in ["drill-green", "drill-yellow", "drill-never"] {
-            for a in [
-                stamp(
-                    fix_charter(&format!("{root}-charter"), root, scope()),
-                    TRUST_CHARTER_DIMENSION,
-                ),
-                stamp(
-                    fix_delegates_to(&format!("{root}-edge"), "drill-user", root, scope()),
-                    TRUST_ACCEPTS_DIMENSION,
-                ),
-            ] {
-                e2::put_signed(&backend, &a).await.expect("hard legs admit");
-                if a.attested_key_id != a.attesting_key_id {
-                    edges.insert(root, e2::rid(&a));
-                }
-            }
-        }
-        // Drills: fresh / aged into the yellow band / none at all.
-        for a in [
-            drill("dg-lc", "drill-green", 1),
-            drill("dy-lc", "drill-yellow", 120),
-        ] {
-            e2::put_signed(&backend, &a).await.expect("drill admits");
-        }
-
-        let green = trust_root_valid(&backend, &e2::kid("drill-user"), &e2::kid("drill-green"))
+        let user = put_e2_key(&backend, "drill-user", "user").await;
+        let r = stand_up_e2_root(&backend, "drill-never")
             .await
-            .expect("walk");
-        assert!(green.valid, "fresh drill + hard legs ⇒ valid: {green:?}");
-        assert_eq!(green.drill_freshness, DrillFreshness::Green, "{green:?}");
-        assert!(green.last_drill_at.is_some(), "the drill date is reported");
-
-        // THE ASSERTION THIS TEST EXISTS FOR — a root drilled 120 days ago
-        // still SERVES. Its trust card reads yellow; nothing is withheld.
-        let yellow = trust_root_valid(&backend, &e2::kid("drill-user"), &e2::kid("drill-yellow"))
+            .expect("the root stands up");
+        let edge = accept_e2_root(&backend, "drill-user", &r.root)
             .await
-            .expect("walk");
-        assert!(
-            yellow.valid,
-            "a stale-drilled root MUST still serve — the deadman is gone: {yellow:?}"
-        );
-        assert_eq!(yellow.drill_freshness, DrillFreshness::Yellow, "{yellow:?}");
+            .expect("the user's edge");
 
-        // Never drilled: valid, and RED. `last_drill_at: None` is what
-        // distinguishes "never" from "long ago" — the band does not need a
-        // fourth variant to say it.
-        let never = trust_root_valid(&backend, &e2::kid("drill-user"), &e2::kid("drill-never"))
-            .await
-            .expect("walk");
+        // Never drilled: valid, and RED.
+        let never = trust_root_valid(&backend, &user, &r.root).await.unwrap();
         assert!(
             never.valid,
             "an undrilled root still serves — governance signal, not a gate: {never:?}"
@@ -1655,178 +1550,20 @@ mod tests {
         assert_eq!(never.drill_freshness, DrillFreshness::Red, "{never:?}");
         assert_eq!(never.last_drill_at, None, "never drilled, and it says so");
 
-        // The HARD gates are untouched: withdraw the one edge and trust
-        // collapses, drill or no drill.
-        e2::put_signed(
-            &backend,
-            &fix_withdraws("dg-w", "drill-user", &edges["drill-green"]),
-        )
-        .await
-        .expect("withdraws admits");
-        let unrooted = trust_root_valid(&backend, &e2::kid("drill-user"), &e2::kid("drill-green"))
+        // The HARD gate still works: the user un-trusts → invalid.
+        withdraw_e2(&backend, "drill-user", &r.root, &edge)
             .await
-            .expect("walk");
+            .expect("the user withdraws its edge");
+        let unrooted = trust_root_valid(&backend, &user, &r.root).await.unwrap();
         assert!(
-            !unrooted.valid && !unrooted.edge_exists,
-            "the un-trust lever still works: {unrooted:?}"
+            !unrooted.valid,
+            "un-trust still collapses validity: {unrooted:?}"
         );
         assert_eq!(
             unrooted.drill_freshness,
-            DrillFreshness::Green,
+            DrillFreshness::Red,
             "…and the drill signal is reported independently of the gate"
         );
-    }
-
-    /// v23.0.0 (CIRISPersist#551 item 2) — the three `delegates_to` jobs are
-    /// NAMED, and a mislabeled lever is refused.
-    ///
-    /// One wire type, three opposite jobs, discriminated only by direction:
-    /// charter (R→R), conferral (R→subject), trust edge (node→R). #551 cost a
-    /// session four wrong statements about the trust root, every one a "which
-    /// `delegates_to` is this?" failure made while reading the source. So the
-    /// job now rides the envelope `dimension`, and each predicate reads its
-    /// own name instead of doing direction-arithmetic.
-    ///
-    /// Three properties, in the order that makes the design legible:
-    /// 1. correctly-dimensioned rows walk exactly as before (PREFERRED);
-    /// 2. an UNDIMENSIONED row still walks (direction-inference retained —
-    ///    additive, no wire break, every pre-v23 row keeps working);
-    /// 3. a row whose dimension CONTRADICTS its direction is REFUSED by the
-    ///    predicate reading it. A mislabeled lever is worse than an
-    ///    unlabeled one: unlabeled, the reader must look at direction and
-    ///    gets it right; mislabeled, the label invites the reader to trust it.
-    #[tokio::test]
-    async fn trust_job_dimensions_named_and_contradictions_refused_551() {
-        use crate::federation::trust_root::{
-            trust_root_valid, TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION,
-        };
-        let backend = test_backend();
-        for (k, it) in [
-            ("d551-user", "user"),
-            ("d551-root", "node"),
-            ("d551-plain", "node"),
-            ("d551-bad", "node"),
-            ("d551-la", "accord_holder"),
-        ] {
-            // v62.0.0 (E5) — an edition-2 `key:record` (hardware evidence is not
-            // carried by the fixture record).
-            put_e2_key(&backend, k, it).await;
-        }
-        // A fresh liveness witness about `root`, so the other legs are green.
-        let lifecycle = |id: &str, about: &str| {
-            let mut lc = fix_attestation(id, "d551-la", about, "d551-la");
-            lc.attestation_envelope = serde_json::json!({
-                "id": id,
-                "dimension": crate::federation::trust_root::ACCORD_HEARTBEAT_DIMENSION,
-                "score": 1.0,
-                "confidence": 0.9,
-            });
-            lc.asserted_at = chrono::Utc::now();
-            resign_fix(&mut lc);
-            lc
-        };
-        // Stamp a job dimension onto a row built by the shared fixtures.
-        let stamp = |mut a: Attestation, dimension: &str| {
-            a.attestation_envelope["dimension"] = serde_json::json!(dimension);
-            resign_fix(&mut a);
-            a
-        };
-        let scope = || serde_json::json!(["infra:attest", "infra:serve"]);
-
-        // ── (1) CORRECTLY dimensioned: charter says charter, edge says
-        //    accepts. Every leg green.
-        for a in [
-            stamp(
-                fix_charter("d551-charter", "d551-root", scope()),
-                TRUST_CHARTER_DIMENSION,
-            ),
-            stamp(
-                fix_delegates_to("d551-edge", "d551-user", "d551-root", scope()),
-                TRUST_ACCEPTS_DIMENSION,
-            ),
-            lifecycle("d551-lc", "d551-root"),
-        ] {
-            e2::put_signed(&backend, &a)
-                .await
-                .expect("(1) a job-dimensioned trust row must ADMIT — item 2 is additive");
-        }
-        let v = trust_root_valid(&backend, &e2::kid("d551-user"), &e2::kid("d551-root"))
-            .await
-            .expect("walk");
-        assert!(
-            v.edge_exists && v.root_self_declares && v.valid,
-            "(1) correctly-named rows walk: {v:?}"
-        );
-
-        // ── (2) UNDIMENSIONED rows. #973 (CC 3.2 T4a): a NEW unlabelled row
-        //    is no charter and gives no acceptance; the rows a node HELD when
-        //    that rule arrived still walk by direction — no wire break and no
-        //    re-signing for every row written before v23.0.0.
-        let unlabelled = |mut a: Attestation| {
-            a.attestation_envelope
-                .as_object_mut()
-                .unwrap()
-                .remove("dimension");
-            resign_fix(&mut a);
-            a
-        };
-        for a in [
-            unlabelled(fix_charter("d551-plaincharter", "d551-plain", scope())),
-            fix_delegates_to("d551-plainedge", "d551-user", "d551-plain", scope()),
-            lifecycle("d551-plainlc", "d551-plain"),
-        ] {
-            e2::put_signed(&backend, &a)
-                .await
-                .expect("(2) an undimensioned trust row admits as it always did");
-        }
-        let plain = trust_root_valid(&backend, &e2::kid("d551-user"), &e2::kid("d551-plain"))
-            .await
-            .expect("walk");
-        assert!(
-            !plain.edge_exists && !plain.root_self_declares && !plain.valid,
-            "(2) a NEW unlabeled row is neither charter nor acceptance: {plain:?}"
-        );
-        for id in ["d551-plaincharter", "d551-plainedge"] {
-            backend.mark_trust_direction_held(id);
-        }
-        let plain = trust_root_valid(&backend, &e2::kid("d551-user"), &e2::kid("d551-plain"))
-            .await
-            .expect("walk");
-        assert!(
-            plain.edge_exists && plain.root_self_declares && plain.valid,
-            "(2) direction inference still decides a HELD unlabeled row: {plain:?}"
-        );
-
-        // ── (3) CONTRADICTION: same shapes, labels swapped. The charter
-        //    (R→R) claims to be a trust edge; the edge (user→R) claims to be
-        //    a charter. Neither predicate may accept the row that lies to it.
-        for a in [
-            stamp(
-                fix_charter("d551-badcharter", "d551-bad", scope()),
-                TRUST_ACCEPTS_DIMENSION,
-            ),
-            stamp(
-                fix_delegates_to("d551-badedge", "d551-user", "d551-bad", scope()),
-                TRUST_CHARTER_DIMENSION,
-            ),
-            lifecycle("d551-badlc", "d551-bad"),
-        ] {
-            e2::put_signed(&backend, &a)
-                .await
-                .expect("a mislabeled row still WRITES — refusal is the walk's job, not ingest's");
-        }
-        let bad = trust_root_valid(&backend, &e2::kid("d551-user"), &e2::kid("d551-bad"))
-            .await
-            .expect("walk");
-        assert!(
-            !bad.root_self_declares,
-            "(3) a self-loop labeled `{TRUST_ACCEPTS_DIMENSION}` is NOT a charter: {bad:?}"
-        );
-        assert!(
-            !bad.edge_exists,
-            "(3) a user→root edge labeled `{TRUST_CHARTER_DIMENSION}` is NOT a trust edge: {bad:?}"
-        );
-        assert!(!bad.valid, "(3) a mislabeled lever confers nothing");
     }
 
     /// v21.0.0 (CIRISPersist#502 E5) — a LOCAL-tier delegates_to/charter
@@ -1855,7 +1592,7 @@ mod tests {
         );
         charter.tier = crate::federation::types::attestation_tier::LOCAL.to_string();
         resign_fix(&mut charter);
-        e2::put_signed(&backend, &charter).await.unwrap();
+        put_voiced(&backend, &charter).await.unwrap();
 
         let mut edge = fix_delegates_to(
             "e5-e",
@@ -1865,7 +1602,7 @@ mod tests {
         );
         edge.tier = crate::federation::types::attestation_tier::LOCAL.to_string();
         resign_fix(&mut edge);
-        e2::put_signed(&backend, &edge).await.unwrap();
+        put_voiced(&backend, &edge).await.unwrap();
 
         let mut lc = fix_attestation("e5-lc", "e5-la", "e5-root", "e5-la");
         lc.attestation_envelope = serde_json::json!({
@@ -1874,7 +1611,7 @@ mod tests {
         lc.asserted_at = chrono::Utc::now();
         lc.tier = crate::federation::types::attestation_tier::LOCAL.to_string();
         resign_fix(&mut lc);
-        e2::put_signed(&backend, &lc).await.unwrap();
+        put_voiced(&backend, &lc).await.unwrap();
 
         let v = trust_root_valid(&backend, &e2::kid("e5-user"), &e2::kid("e5-root"))
             .await
@@ -1911,24 +1648,30 @@ mod tests {
         // (1) commitment-less charter REFUSES with the typed kind.
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(
-                &backend,
-                &fix_delegates_to(
+            put_voiced(&backend, &{
+                // E5-fix2 (round 6) — a CHARTER names its job (#973: an
+                // unlabelled self-loop is no charter, so the charter gate never
+                // reads it): `trust:charter:v1`, with the commitment removed.
+                let mut bare = fix_charter(
                     "rc-bare",
                     "rc-root",
-                    "rc-root",
                     serde_json::json!(["infra:serve", "infra:attest"]),
-                ),
-            )
+                );
+                if let Some(o) = bare.attestation_envelope.as_object_mut() {
+                    o.remove("pre_rotation_commitment");
+                }
+                resign_fix(&mut bare);
+                bare
+            })
             .await,
             "(1) charter without pre-rotation commitment must refuse",
         )
         .await;
-        assert_eq!(err.kind(), "federation_charter_invalid");
+        assert_eq!(err.kind(), "federation_charter_invalid", "{err:?}");
 
         // (2) serve-only charter admits (it is a valid delegates_to) but is
         // NOT a root to the walk — the AND-minimum.
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_charter(
                 "rc-serveonly",
@@ -1938,7 +1681,7 @@ mod tests {
         )
         .await
         .expect("serve-only self-loop admits (charter-shaped, commitment present)");
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_accepts(
                 "rc-edge2",
@@ -1967,7 +1710,7 @@ mod tests {
         );
         expired.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
         resign_fix(&mut expired);
-        e2::put_signed(&backend, &expired).await.unwrap();
+        put_voiced(&backend, &expired).await.unwrap();
         let v3 = trust_root_valid(&backend, &e2::kid("rc-user"), &e2::kid("rc-root"))
             .await
             .unwrap();
@@ -1994,7 +1737,7 @@ mod tests {
             "pre_rotation_commitment": commitment,
         });
         resign_fix(&mut pred);
-        e2::put_signed(&backend, &pred)
+        put_voiced(&backend, &pred)
             .await
             .expect("predecessor charter admits");
 
@@ -2014,7 +1757,7 @@ mod tests {
         });
         succ.attestation_envelope = succ_env;
         resign_fix(&mut succ);
-        e2::put_signed(&backend, &succ)
+        put_voiced(&backend, &succ)
             .await
             .expect("(1b) BOUND recovery charter admits");
 
@@ -2025,7 +1768,7 @@ mod tests {
         resign_fix(&mut bad);
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(&backend, &bad).await,
+            put_voiced(&backend, &bad).await,
             "(1b) non-binding successor set must refuse",
         )
         .await;
@@ -2039,38 +1782,29 @@ mod tests {
     /// edge#386's trace-serve gate: serve only under a COMMON valid root.
     #[tokio::test]
     async fn capability_roots_to_trusted_root_483() {
+        // E5-fix2 (round 6; CP2) — PORTED to an edition-2 trust root (E9's
+        // twins, `operational::test_support`): a key-arm root hand-chartered by
+        // a fixture key is never valid under edition 2 (its holder's custody
+        // evidence, CC 4.2.2.1), so the walk this test exists for could not
+        // start. The root is founded by the bundle's holders and chartered
+        // (`stand_up_e2_root`); the USER's own `trust:accepts` edge is its
+        // row; the root confers on the peer with the peer's voice
+        // (`confer_e2`); the user un-trusts with its own `withdraws`.
+        use crate::federation::operational::test_support::{
+            accept_e2_root, confer_e2, stand_up_e2_root, withdraw_e2,
+        };
         use crate::federation::trust_root::{capability_roots_to_trusted_root, trust_root_valid};
         let backend = test_backend();
-        for (k, it) in [
-            ("cr-user", "user"),
-            ("cr-root", "node"),
-            ("cr-peer", "node"),
-            ("cr-la", "accord_holder"),
-        ] {
-            // v62.0.0 (E5) — an edition-2 `key:record` (hardware evidence is not
-            // carried by the fixture record).
-            put_e2_key(&backend, k, it).await;
-        }
-        let infra = || serde_json::json!(["infra:attest", "infra:serve"]);
-
-        // Root self-declares + user trusts it + fresh lifecycle (the full
-        // valid-root fixture, mirroring the 481 witness).
-        e2::put_signed(&backend, &fix_charter("cr-rootdecl", "cr-root", infra()))
+        let user = put_e2_key(&backend, "cr-user", "user").await;
+        let peer = put_e2_key(&backend, "cr-peer", "node").await;
+        let r = stand_up_e2_root(&backend, "cr-root")
             .await
-            .unwrap();
-        // v62.0.0 (E5) — the edge and the grant are kept: they are named by
-        // their computed row ids.
-        let edge = fix_accepts("cr-edge", "cr-user", "cr-root", infra());
-        e2::put_signed(&backend, &edge).await.unwrap();
-        let mut lc = fix_attestation("cr-lc", "cr-la", "cr-root", "cr-la");
-        lc.attestation_envelope = serde_json::json!({
-            "id": "cr-lc", "dimension": "accord:lifecycle:v1", "score": 1.0, "confidence": 0.9,
-        });
-        lc.asserted_at = chrono::Utc::now();
-        resign_fix(&mut lc);
-        e2::put_signed(&backend, &lc).await.unwrap();
+            .expect("the edition-2 root stands up");
+        let edge = accept_e2_root(&backend, "cr-user", &r.root)
+            .await
+            .expect("the user accepts the root");
         assert!(
-            trust_root_valid(&backend, &e2::kid("cr-user"), &e2::kid("cr-root"))
+            trust_root_valid(&backend, &user, &r.root)
                 .await
                 .unwrap()
                 .valid,
@@ -2078,56 +1812,37 @@ mod tests {
         );
 
         // The root grants the PEER infra:serve.
-        let granted = fix_delegates_to(
-            "cr-grant",
-            "cr-root",
-            "cr-peer",
-            serde_json::json!(["infra:serve"]),
-        );
-        e2::put_signed(&backend, &granted).await.unwrap();
+        let granted = confer_e2(&backend, "cr-root", "cr-peer", &["infra:serve"])
+            .await
+            .expect("the root confers on the peer");
 
         // #483 — the peer's infra:serve roots to a root the user trusts.
-        let grant = capability_roots_to_trusted_root(
-            &backend,
-            &e2::kid("cr-user"),
-            &e2::kid("cr-peer"),
-            "infra:serve",
-        )
-        .await
-        .expect("walk")
-        .expect("peer serves under a root the user trusts");
-        assert_eq!(grant.root_key_id, e2::kid("cr-root"));
-        assert_eq!(grant.grant_attestation_id, e2::rid(&granted));
+        let grant = capability_roots_to_trusted_root(&backend, &user, &peer, "infra:serve")
+            .await
+            .expect("walk")
+            .expect("peer serves under a root the user trusts");
+        assert_eq!(grant.root_key_id, r.root);
+        assert_eq!(grant.grant_attestation_id, granted.hex());
         assert!(grant.verdict.valid);
 
         // A scope the peer was NOT granted → None.
         assert!(
-            capability_roots_to_trusted_root(
-                &backend,
-                &e2::kid("cr-user"),
-                &e2::kid("cr-peer"),
-                "infra:store"
-            )
-            .await
-            .unwrap()
-            .is_none(),
+            capability_roots_to_trusted_root(&backend, &user, &peer, "infra:store")
+                .await
+                .unwrap()
+                .is_none(),
             "ungranted scope roots nowhere"
         );
 
         // Un-trust the root: the peer's grant now roots to nothing.
-        e2::put_signed(&backend, &fix_withdraws("cr-w", "cr-user", &e2::rid(&edge)))
+        withdraw_e2(&backend, "cr-user", &r.root, &edge)
             .await
-            .unwrap();
+            .expect("the user withdraws its edge");
         assert!(
-            capability_roots_to_trusted_root(
-                &backend,
-                &e2::kid("cr-user"),
-                &e2::kid("cr-peer"),
-                "infra:serve"
-            )
-            .await
-            .unwrap()
-            .is_none(),
+            capability_roots_to_trusted_root(&backend, &user, &peer, "infra:serve")
+                .await
+                .unwrap()
+                .is_none(),
             "un-trusting the root stops the peer serving immediately (edge#386)"
         );
     }
@@ -2321,7 +2036,7 @@ mod tests {
         // moderator of comm-1, so this is refused (was the spoof: admitted).
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_scores_report(
                     "r-self",
@@ -2346,7 +2061,7 @@ mod tests {
         // subject never held review authority (it is not a moderator), so it
         // cannot delegate it — the delegation row is admissible, but the
         // delegate's reconsideration is not (#517).
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_delegates_to(
                 "d-rev",
@@ -2359,7 +2074,7 @@ mod tests {
         .unwrap();
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_scores_report(
                     "r-deleg",
@@ -2391,7 +2106,7 @@ mod tests {
             crate::federation::types::identity_type::PRIMITIVE,
         )
         .await;
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_delegates_to(
                 "d-frev",
@@ -2402,7 +2117,7 @@ mod tests {
         )
         .await
         .unwrap();
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_scores_report(
                 "r-fdeleg",
@@ -2422,7 +2137,7 @@ mod tests {
 
         // (b2) named-moderator: community founder (steward-bound authority)
         // → ADMIT as-self (community-moderation case #95 unblocked).
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_scores_report(
                 "r-mod",
@@ -2443,7 +2158,7 @@ mod tests {
         // (c) no authority (rando, claims subject target) → REJECT.
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_scores_report(
                     "r-rando",
@@ -2468,7 +2183,7 @@ mod tests {
         // bypass-closed regression guard: absence is never an admit.
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_scores_report("r-nothing", "rando", "reconsideration:case42:v1", &[], None),
             )
@@ -2488,7 +2203,7 @@ mod tests {
 
         // (d) scope isolation — a consent_revocation-only delegation from
         // the subject MUST NOT drive a `review`.
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_delegates_to(
                 "d-wrongscope",
@@ -2501,7 +2216,7 @@ mod tests {
         .unwrap();
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_scores_report(
                     "r-wrongscope",
@@ -2548,7 +2263,7 @@ mod tests {
         )
         .await;
         // `review`-scoped delegation → cannot drive a `moderation:*` report.
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_delegates_to(
                 "d-rev2",
@@ -2561,7 +2276,7 @@ mod tests {
         .unwrap();
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_scores_report(
                     "m-wrongscope",
@@ -2578,7 +2293,7 @@ mod tests {
         assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
 
         // `moderate`-scoped delegation → ADMIT.
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_delegates_to(
                 "d-mod",
@@ -2589,7 +2304,7 @@ mod tests {
         )
         .await
         .unwrap();
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_scores_report(
                 "m-ok",
@@ -2629,7 +2344,7 @@ mod tests {
         // Every edge `review`-scoped + sub_delegation so only the depth
         // cap (not the deputization gate) is what rejects.
         for i in 0..(n - 1) {
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_delegates_to_sub(
                     &format!("d{i}"),
@@ -2645,7 +2360,7 @@ mod tests {
         // The signer is the too-deep tail key; the root k0 is the subject.
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_scores_report(
                     "r-toodeep",
@@ -2693,7 +2408,7 @@ mod tests {
         // (g) deputization without sub_delegation: subject → mid (review,
         // sub_delegation=false), mid → leaf (review). mid may exercise the
         // duty but MUST NOT deputize leaf → leaf REJECT.
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_delegates_to_sub(
                 "g-1",
@@ -2705,7 +2420,7 @@ mod tests {
         )
         .await
         .unwrap();
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_delegates_to_sub("g-2", "mid", "leaf", serde_json::json!(["review"]), true),
         )
@@ -2713,7 +2428,7 @@ mod tests {
         .unwrap();
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_scores_report(
                     "g-rep",
@@ -2733,7 +2448,7 @@ mod tests {
             "(g) deputization without sub_delegation must reject downstream"
         );
         // But `mid` itself (the direct delegate) IS admitted.
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_scores_report(
                 "g-mid",
@@ -2749,7 +2464,7 @@ mod tests {
         // (i) non-steward-bound root: agentroot (NOT user-role) → agdel
         // (review). agentroot reaches agdel, but is NOT steward-bound, and is
         // not in any community authority set → agdel REJECT under (b).
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_delegates_to("i-1", "agentroot", "agdel", serde_json::json!(["review"])),
         )
@@ -2757,7 +2472,7 @@ mod tests {
         .unwrap();
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_scores_report(
                     "i-rep",
@@ -2788,7 +2503,7 @@ mod tests {
             )
             .await;
         }
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_delegates_to_sub(
                 "h-1",
@@ -2800,7 +2515,7 @@ mod tests {
         )
         .await
         .unwrap();
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_delegates_to_sub(
                 "h-2",
@@ -2813,7 +2528,7 @@ mod tests {
         .await
         .unwrap();
         // h_leaf admitted BEFORE the withdraws.
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_scores_report(
                 "h-pre",
@@ -2826,7 +2541,7 @@ mod tests {
         .await
         .expect("(h) chain valid before withdraws");
         // subject withdraws the subject→h_mid edge (issuer-against-recipient).
-        e2::put_signed(&backend, &{
+        put_voiced(&backend, &{
             let mut w = fix_attestation("h-w", "founder", "h_mid", "founder");
             w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
             w.attestation_envelope = serde_json::json!({"references_attestation_id": "h-1"});
@@ -2837,7 +2552,7 @@ mod tests {
         .expect("founder withdraws own delegation edge");
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_scores_report(
                     "h-post",
@@ -2877,7 +2592,7 @@ mod tests {
             .await;
         }
         // subject → mid grants {review} (sub_delegation).
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_delegates_to_sub(
                 "att-1",
@@ -2892,7 +2607,7 @@ mod tests {
         // mid → leaf grants {review, moderate} — EXPANDS beyond parent's
         // {review}; the review-scoped edge is present but the scope-set is
         // not ⊆ parent → attenuation rejects the traversal to leaf.
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_delegates_to_sub(
                 "att-2",
@@ -2906,7 +2621,7 @@ mod tests {
         .unwrap();
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_scores_report(
                     "att-rep",
@@ -3022,7 +2737,7 @@ mod tests {
         );
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(&backend, &row).await,
+            put_voiced(&backend, &row).await,
             "the row does not land",
         )
         .await;
@@ -3053,7 +2768,7 @@ mod tests {
         row.tier = crate::federation::types::attestation_tier::LOCAL.into();
         row.cohort_scope = crate::federation::types::cohort_scope::SELF.to_string();
         resign_fix(&mut row); // envelope changed → re-sign
-        e2::put_signed(&backend, &row)
+        put_voiced(&backend, &row)
             .await
             .expect("crypto-valid bare subject-side revocation transits at local tier");
         // E5-fix1 (round 3) — the forged-`scrub_signature_classical` leg is
@@ -3073,7 +2788,7 @@ mod tests {
             crate::federation::types::attestation_tier::FEDERATION,
             true,
         );
-        e2::put_signed(&backend, &row)
+        put_voiced(&backend, &row)
             .await
             .expect("revoked/federation consent_record admits");
     }
@@ -3090,7 +2805,7 @@ mod tests {
         );
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(&backend, &row).await,
+            put_voiced(&backend, &row).await,
             "the row does not land",
         )
         .await;
@@ -3701,35 +3416,33 @@ mod tests {
             let mut d = fix_attestation(id, granter, grantee, granter);
             d.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
             crate::federation::tier_ingest::test_support::reseal(&mut d);
+            // E5-fix2 (round 6) — no self-naming `references_attestation_id`:
+            // an edition-2 row cannot name its own (node-computed) id.
             d.attestation_envelope = serde_json::json!({
-                "references_attestation_id": id,
                 "scope": [DELEGATION_SCOPE_MODERATE],
                 "sub_delegation": true,
             });
             resign_fix(&mut d);
             d
         };
-        // A `withdraws` keyed on the recipient (the scoped walk's edge-
-        // retraction model — `attested_key_id == recipient`).
-        let withdraw_edge = |id: &str, granter: &str, recipient: &str| {
-            let mut w = fix_attestation(id, granter, recipient, granter);
-            w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
-            resign_fix(&mut w);
-            w
-        };
+        // E5-fix2 (round 6) — the retraction is the granter's `withdraws`
+        // composer naming the edge by its row id (`refs.target`, CC 2.6.1.7).
+        let br_d = delegate("br-d", "br-root", "br-tgt");
+        let br_w = fix_withdraws("br-w", "br-root", &e2::rid(&br_d));
         for a in [
             delegate("ar-d", "ar-root", "ar-tgt"), // Reachable / MissingScope pair
-            delegate("br-d", "br-root", "br-tgt"), // RetractedAtRoot pair
-            withdraw_edge("br-w", "br-root", "br-tgt"), // … retracted
+            br_d,                                  // RetractedAtRoot pair
+            br_w,                                  // … retracted
             delegate("cr-d", "cr-root", "cr-mid"), // SignerUnreached: edge, but not to tgt
         ] {
-            e2::put_signed(&backend, &a).await.unwrap();
+            put_voiced(&backend, &a).await.unwrap();
         }
         let depth = MAX_MODERATION_DELEGATION_DEPTH;
         let verdict = |issuer: &'static str, tgt: &'static str, scope: &'static str| {
             let b = &backend;
             async move {
-                reachable_under_scope_with_reasons(b, issuer, tgt, scope, depth)
+                // E5-fix2 (round 6) — keys are named by their identity-refs.
+                reachable_under_scope_with_reasons(b, &e2::kid(issuer), &e2::kid(tgt), scope, depth)
                     .await
                     .unwrap()
             }
@@ -3742,8 +3455,8 @@ mod tests {
         );
         assert!(reachable_under_scope(
             &backend,
-            "ar-root",
-            "ar-tgt",
+            &e2::kid("ar-root"),
+            &e2::kid("ar-tgt"),
             DELEGATION_SCOPE_MODERATE,
             depth
         )
@@ -3817,12 +3530,11 @@ mod tests {
             e.kind(),
             "federation_accord_dimension_requires_accord_holder"
         );
-        check_reserved_prefix_admission(
-            &backend,
-            &row("accord:invoke:notify:x", "rp-accord", "rp-accord"),
-        )
-        .await
-        .expect("accord_holder may emit accord:*");
+        // E5-fix2 (round 6) — the "an `accord_holder` key may emit accord:*"
+        // leg is DELETED (ruling 4): under edition 2 accord standing is held at
+        // the named accord root (`edition2::standing::holds_accord_standing`,
+        // CC 3.4.1), never an identity-type claim on a key record, so the leg
+        // asserted the earlier form. The agent refusal above stands.
 
         // capacity:* — self-emission REJECTED (CC 3.4.5); non-self OK (any id).
         let e = check_reserved_prefix_admission(
@@ -3939,7 +3651,7 @@ mod tests {
         crate::federation::tier_ingest::test_support::reseal(&mut row);
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(&backend, &row).await,
+            put_voiced(&backend, &row).await,
             "oversize federation put must refuse",
         )
         .await;
@@ -4032,7 +3744,7 @@ mod tests {
         );
         let err = NotLanded::of(
             &backend,
-            e2::put_signed(&backend, &att).await,
+            put_voiced(&backend, &att).await,
             "a self-asserted witness must NOT be able to assert an age rung about a \
                  third party — that is CIRISPersist#607",
         )
@@ -4058,98 +3770,37 @@ mod tests {
     /// The negative case (claim present, conferral absent) is
     /// `a_self_asserted_witness_is_refused_607`.
     async fn put_conferred_key(backend: &SqliteBackend, key_id: &str, it: &str, scope: &str) {
-        use crate::federation::trust_root::{
-            TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION, TRUST_CONFERS_DIMENSION,
-        };
-        let node = "n607-node";
-        let root = "n607-root";
-        // v62.0.0 (E5) — this node's key id is its record's identity-ref.
-        backend.set_node_key_id(e2::kid(node));
-        for k in [node, root] {
-            put_typed_key(backend, k, "node").await;
+        // E5-fix2 (round 6; CP2) — PORTED to an edition-2 trust root. The
+        // earlier fixture chartered a KEY root (`n607-root`) by hand; under
+        // edition 2 a key-arm root is as attested as its holder's custody
+        // evidence (CC 4.2.2.1, `trust_root::holder_hardware`), which no
+        // fixture key can carry, so that root never validated and every
+        // conferral it made rooted nowhere. The shared rooted root (W1:
+        // founded by the bundle's holders, chartered, accepted by THIS node)
+        // confers `scope` on `key_id` with the subject's own voice
+        // (`put_conferral`). The reserved-prefix rule is satisfied by that
+        // delegation ALONE; the signer's identity type is not read for it
+        // (`admission::check_reserved_prefix_admission`), so `put_conferral`'s
+        // `user` record stands in for `it`.
+        let _ = it;
+        if crate::federation::FederationDirectory::node_key_id(backend).is_none() {
+            let node = e2::put_key(backend, "n607-node", &["node"]).await;
+            backend.set_node_key_id(node);
         }
-        put_typed_key(backend, key_id, it).await;
-        // The root charters itself (key root), this node accepts it, and it
-        // confers `scope` on the emitter.
-        //
-        // v38.5.0 (#771) — rows already placed by an earlier conferral in
-        // this test are SKIPPED below, not re-offered: their ids are derived
-        // and stable while `asserted_at` is not.
-        for (id, from, to, dim, sc) in [
-            // The root charters ITSELF (key root). It must carry a
-            // pre_rotation_commitment: without a pre-committed successor set,
-            // root-key compromise is unrecoverable by construction.
-            // The charter's job dimension is trust:CHARTER:v1 — not
-            // trust:confers. A charter is a root declaring itself, which is a
-            // different job from conferring on someone else.
-            (
-                "n607-charter",
-                root,
-                root,
-                TRUST_CHARTER_DIMENSION,
-                "infra:serve",
-            ),
-            (
-                "n607-accept",
-                node,
-                root,
-                TRUST_ACCEPTS_DIMENSION,
-                "infra:serve",
-            ),
-            ("n607-confer", root, key_id, TRUST_CONFERS_DIMENSION, scope),
-        ] {
-            // Sign the envelope we actually ship. Building the row first and
-            // overwriting the envelope afterwards invalidates the signature —
-            // the row then fails hybrid verify at the door, which is the door
-            // working correctly on a fixture that lied.
-            // A KEY-ROOT charter must carry BOTH infra:serve AND infra:attest
-            // (the RC3 AND-minimum, #488) — one alone is not a charter.
-            let mut envelope = if id == "n607-charter" {
-                serde_json::json!({"dimension": dim, "scope": ["infra:serve", "infra:attest"]})
-            } else {
-                serde_json::json!({"dimension": dim, "scope": [sc]})
-            };
-            if id == "n607-charter" {
-                envelope["pre_rotation_commitment"] =
-                    serde_json::json!(crate::federation::trust_root::test_pre_rotation_commitment(
-                        &["n607-root-successor".to_owned()]
-                    )
-                    .expect("commitment"));
-            }
-            let envelope = envelope;
-            let mut a = fix_attestation(id, from, to, from);
-            a.attestation_type =
-                crate::federation::types::attestation_type::DELEGATES_TO.to_owned();
-            a.attestation_envelope = envelope;
-            a.scrub_key_id = from.to_owned();
-            // v31.2.0 (CIRISPersist#670) — the seal has ONE home. This used to
-            // call `sign_envelope` and assign the hash and both signature
-            // halves by hand, and then call `reseal`, which recomputed all
-            // three from the same signer — the hand-rolled copy was dead the
-            // moment it was written. Dead is the lucky outcome of that shape;
-            // #643's `pg_resign` is the same code that was NOT overwritten,
-            // and it signed every postgres fixture without its instants.
-            crate::federation::tier_ingest::test_support::reseal(&mut a);
-            // v38.5.0 (#771) — skip what an earlier conferral in this test
-            // already placed. v62.0.0 (E5): by the row's computed id (the same
-            // payload at the fixture's fixed instant is the same row).
-            if crate::federation::FederationDirectory::get_attestation(backend, &e2::rid(&a))
-                .await
-                .ok()
-                .flatten()
-                .is_some()
-            {
-                continue;
-            }
-            match e2::put_signed(backend, &a).await {
-                Ok(_) => {}
-                // v38.5.0 (CIRISPersist#771) — see the twin in
-                // `admission.rs`: this "idempotence" was a DIFFERENT row
-                // (fresh `asserted_at`) under a derived id, silently
-                // discarded. The fixture now skips what it already placed.
-                Err(e) => panic!("conferral edge must admit: {e}"),
-            }
-        }
+        let r = e2::rooted_trust_root(
+            backend,
+            &crate::federation::edition2::fixture_genesis::HOLDER_SEEDS,
+            "quorum:2/3",
+        )
+        .await;
+        crate::federation::edition2::fixture_trust_root::put_conferral(
+            backend,
+            &r,
+            key_id,
+            &[scope],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the root confers {scope} on {key_id}: {e}"));
     }
 
     /// Register a key with a chosen `identity_type` (e.g. `user` / `witness` /
@@ -4198,7 +3849,7 @@ mod tests {
 
         // Self-declared adult alone → Unknown (the one-way ratchet ignores a
         // self-declared adult).
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_age_attestation(
                 "ab-self-adult",
@@ -4216,7 +3867,7 @@ mod tests {
         );
 
         // Add a self-declared MINOR → Minor (a subject may ratchet DOWN).
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_age_attestation(
                 "ab-self-minor",
@@ -4233,7 +3884,7 @@ mod tests {
         );
 
         // A witness ADULT attestation OUTRANKS the self-declared minor → Adult.
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_age_attestation(
                 "ab-witness-adult",
@@ -4267,7 +3918,7 @@ mod tests {
         put_typed_key(&backend, "abe-subj", "user").await;
 
         // Witness minor → Minor.
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_age_attestation(
                 "abe-w-minor",
@@ -4292,7 +3943,7 @@ mod tests {
         );
         expired.expires_at = Some("2020-01-01T00:00:00Z".parse().unwrap());
         resign_fix(&mut expired);
-        e2::put_signed(&backend, &expired).await.unwrap();
+        put_voiced(&backend, &expired).await.unwrap();
         assert_eq!(
             age_band(&backend, &e2::kid("abe-subj")).await.unwrap(),
             AgeBand::Minor,
@@ -4328,7 +3979,7 @@ mod tests {
             ("uw-A", "ut-A", "age_assurance:provider:adult:v1"),
             ("uw-M", "ut-M", "age_assurance:provider:minor:v1"),
         ] {
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_age_attestation(id, "ut-witness", subj, token),
             )
@@ -4343,7 +3994,7 @@ mod tests {
         // S(adult user) → A(adult user) : REJECTED (target_is_self_sovereign).
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(&backend, &deleg("utd-A", "ut-S", "ut-A")).await,
+            put_voiced(&backend, &deleg("utd-A", "ut-S", "ut-A")).await,
             "the row does not land",
         )
         .await;
@@ -4353,14 +4004,14 @@ mod tests {
         // S(adult) → U(no age = Unknown) : REJECTED (target_age_unverified).
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(&backend, &deleg("utd-U", "ut-S", "ut-U")).await,
+            put_voiced(&backend, &deleg("utd-U", "ut-S", "ut-U")).await,
             "the row does not land",
         )
         .await;
         assert!(e.reason_is("target_age_unverified"), "{e:?}");
 
         // S(adult user) → M(witness minor) : ADMITTED (legal guardianship).
-        e2::put_signed(&backend, &deleg("utd-M", "ut-S", "ut-M"))
+        put_voiced(&backend, &deleg("utd-M", "ut-S", "ut-M"))
             .await
             .expect("adult-user steward → witness-minor ward is admitted");
         // (The granter-not-adult-user leg + node-target no-op are covered by
@@ -4385,7 +4036,7 @@ mod tests {
         put_typed_key(&backend, "ug-M", "user").await; // witness-minor ward
         put_typed_key(&backend, "ug-N", "node").await; // node target
 
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_age_attestation(
                 "ugw-M",
@@ -4400,7 +4051,7 @@ mod tests {
         // U(unknown-age user) → M(minor) : REJECTED (granter not proven adult).
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_owner_binding_delegates_to(
                     "ugd-UM",
@@ -4418,7 +4069,7 @@ mod tests {
 
         // U(unknown-age user) → N(node) : the user-target gate is a no-op for a
         // node target (infra:* scope clears the node-agency gate) → ADMITTED.
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_owner_binding_delegates_to("ugd-UN", "ug-U", "ug-N", "ug-U", &[ds::INFRA_SERVE]),
         )
@@ -4456,7 +4107,7 @@ mod tests {
 
         // Baseline: T self-declares MINOR (the non-reserved self rung still
         // admits attester==attested — it is subject-signed by design).
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_age_attestation(
                 "wts-self-minor",
@@ -4474,7 +4125,7 @@ mod tests {
 
         // CROSS-SUBJECT witness graduation: W attests T adult — ADMITTED, and
         // T's band graduates (witness outranks T's own self-declared minor).
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_age_attestation(
                 "wts-w-adult",
@@ -4501,7 +4152,7 @@ mod tests {
         // `age_assurance:`"). The witness identity_type does NOT bypass.
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_age_attestation(
                     "wts-w-self",
@@ -4525,7 +4176,7 @@ mod tests {
         // still refused (reserved prefix requires a witness emitter).
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_age_attestation(
                     "wts-p-cross",
@@ -4671,7 +4322,7 @@ mod tests {
         put_typed_key(backend, &format!("{p}-S"), "user").await;
         put_typed_key(backend, &format!("{p}-A"), "user").await;
         for who in ["S", "A"] {
-            e2::put_signed(
+            put_voiced(
                 backend,
                 &fix_age_attestation(
                     &format!("{p}w-{who}"),
@@ -4693,7 +4344,7 @@ mod tests {
         ward: &str,
         token: &str,
     ) {
-        e2::put_signed(backend, &fix_age_attestation(id, attester, ward, token))
+        put_voiced(backend, &fix_age_attestation(id, attester, ward, token))
             .await
             .unwrap_or_else(|e| panic!("capacity attestation {token} rejected: {e:?}"));
     }
@@ -4715,7 +4366,7 @@ mod tests {
         put_typed_key(&backend, "cap-subj", "user").await;
 
         // A witness assessor CAN attest another's capacity.
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_age_attestation(
                 "cap-ok",
@@ -4730,7 +4381,7 @@ mod tests {
         // A non-witness (plain user) may NOT emit capacity_assurance.
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_age_attestation(
                     "cap-nonwit",
@@ -4756,7 +4407,7 @@ mod tests {
         .await;
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_age_attestation(
                     "cap-self",
@@ -4789,7 +4440,7 @@ mod tests {
         // self-sovereign (the CC 3.2 un-stewardable default reasserts).
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_incapacity_binding(
                     "ai-0",
@@ -4829,7 +4480,7 @@ mod tests {
         // (1) missing legitimacy source → naked self-appointment refused.
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_incapacity_binding(
                     "ai-1",
@@ -4851,7 +4502,7 @@ mod tests {
         // (2) missing valid_until → no fail-to-liberty expiry.
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_incapacity_binding(
                     "ai-2",
@@ -4875,7 +4526,7 @@ mod tests {
             crate::federation::admission::render_signed_instant(Utc::now() + Duration::days(200));
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_incapacity_binding(
                     "ai-3",
@@ -4897,7 +4548,7 @@ mod tests {
         // (4) scope exceeds the attested-incapacitated domains.
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_incapacity_binding(
                     "ai-4",
@@ -4927,7 +4578,7 @@ mod tests {
         .await;
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_incapacity_binding(
                     "ai-5",
@@ -4948,7 +4599,7 @@ mod tests {
 
         // (6) ADMIT — scope ⊆ attested loss, reversible excluded, prior-will
         // legitimacy, bounded valid_until, independent assessor.
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_incapacity_binding(
                 "ai-6",
@@ -5007,7 +4658,7 @@ mod tests {
         // Standard path (no T1 tier) with only `pending` → rejected.
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_incapacity_binding(
                     "t1-std",
@@ -5027,7 +4678,7 @@ mod tests {
         assert_forbidden(&e, "capacity_reversible_not_excluded");
 
         // T1 acute path → admitted.
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_incapacity_binding(
                 "t1-ok",
@@ -5071,7 +4722,7 @@ mod tests {
         .await;
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_incapacity_binding(
                     "pd-b",
@@ -5120,7 +4771,7 @@ mod tests {
         // petitioner == the assessor → conflicted.
         let e = NotLanded::of(
             &backend,
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_incapacity_binding(
                     "cf-b",
@@ -5167,7 +4818,7 @@ mod tests {
             ("mlw-A", "ml-A", "age_assurance:provider:adult:v1"),
             ("mlw-M", "ml-M", "age_assurance:provider:minor:v1"),
         ] {
-            e2::put_signed(
+            put_voiced(
                 &backend,
                 &fix_age_attestation(id, "ml-witness", subj, token),
             )
@@ -5188,7 +4839,7 @@ mod tests {
         );
 
         // Bind the minor to the adult steward (live edge) → steward-bound.
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_owner_binding_delegates_to("ml-bind", "ml-S", "ml-M", "ml-S", &[ds::INFRA_SERVE]),
         )
@@ -5208,7 +4859,7 @@ mod tests {
         w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
         w.attestation_envelope = serde_json::json!({ "id": "ml-withdraw" });
         resign_fix(&mut w);
-        e2::put_signed(&backend, &w).await.unwrap();
+        put_voiced(&backend, &w).await.unwrap();
         assert!(
             !is_steward_bound(&backend, &e2::kid("ml-M")).await.unwrap(),
             "a minor whose only adult steward was withdrawn must be steward-less (fail-secure)",
@@ -5220,7 +4871,7 @@ mod tests {
 
         // Control: a node bound then withdrawn is unchanged (bound→true,
         // withdrawn→false) — the node path never used clauses (1)/(2).
-        e2::put_signed(
+        put_voiced(
             &backend,
             &fix_owner_binding_delegates_to("ml-nbind", "ml-S", "ml-N", "ml-S", &[ds::INFRA_SERVE]),
         )
@@ -5231,7 +4882,7 @@ mod tests {
         wn.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
         wn.attestation_envelope = serde_json::json!({ "id": "ml-nwithdraw" });
         resign_fix(&mut wn);
-        e2::put_signed(&backend, &wn).await.unwrap();
+        put_voiced(&backend, &wn).await.unwrap();
         assert!(
             !is_steward_bound(&backend, &e2::kid("ml-N")).await.unwrap(),
             "the node/agent fail-secure path is unchanged by the minor gate",

@@ -33,7 +33,7 @@
 //! the one signing envelope the record maps to and, for each voice, its
 //! signer and a marker (the voice's composite signature). The earlier-form
 //! verifier admits exactly those signer/marker pairs over exactly that
-//! envelope (`tier_ingest::verify_envelope_hybrid_signature`), and the
+//! envelope (`tier_ingest::verify_envelope_hybrid_signature`, deleted v62.0.0; now `vouched_envelope`), and the
 //! supersede quorum counts exactly those signers over exactly the change
 //! envelope built here (`FederationDirectory::verify_membership_quorum`).
 //! Nothing else is vouched: a held row's own signature, read by any gate in
@@ -261,6 +261,36 @@ pub(crate) fn vouched_signature(key_id: &str, envelope_hash: &str, classical: &s
             v.envelope_hash == envelope_hash && v.voices.get(key_id).is_some_and(|m| m == classical)
         })
         .unwrap_or(false)
+}
+
+/// v62.0.0 (F0-cp8; RULINGS "composite signatures only") — **the one
+/// row-signature check left on an earlier-form plane**: the signature columns
+/// `key_id` / `marker` over `envelope` are admitted exactly when the vouch in
+/// scope names them ([`vouched_signature`]) — the edition-2 door verified
+/// that voice's composite statement when it arrived. On success returns the
+/// envelope's canonical SHA-256 (hex), the row's `original_content_hash`.
+///
+/// It replaces the earlier envelope verify (an Ed25519 half and an ML-DSA-65
+/// half checked against the signer's registered component halves), deleted
+/// with its 24 call sites: a signature that is not the door's vouch is the
+/// earlier form, refused by name (`earlier_form_object`, `plane`), whatever
+/// the switch says.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] for an envelope that does not canonicalize;
+/// the earlier-form refusal for any unvouched signature.
+pub(crate) fn vouched_envelope(
+    key_id: &str,
+    envelope: &serde_json::Value,
+    marker: &str,
+    plane: &'static str,
+) -> Result<String, Error> {
+    let hash = envelope_hash(envelope)?;
+    if vouched_signature(key_id, &hash, marker) {
+        Ok(hash)
+    } else {
+        Err(super::door::earlier_form_signature(plane))
+    }
 }
 
 /// **The supersede quorum's vouch**: the voices' signers, when the vouch in

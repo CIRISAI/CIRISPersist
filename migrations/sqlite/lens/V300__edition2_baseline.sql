@@ -2864,3 +2864,13 @@ CREATE TABLE ceg_roster_proposals (
 CREATE INDEX ceg_roster_proposals_open
     ON ceg_roster_proposals (identity_key_id, received_at)
     WHERE settled_at IS NULL;
+
+-- v62.0.0 (P8-fix14; CC 4.4.3.3.1 / 8.1.5, lead ruling (a)): an edition-2
+-- row's restatement key (crossing::restatement_key_of_row), derived from its
+-- statement on every node and written by the row writer beside the row,
+-- never in the envelope (no content hash sees it). The Live read hides a row
+-- that a live, same-attester row with this key and a strictly containing
+-- audience restates. Appended with ALTER, so edition 1's DDL stays as it was
+-- (store::edition_baseline::ATTESTATIONS_EDITION_TWO_SQLITE).
+ALTER TABLE federation_attestations ADD COLUMN restatement_key TEXT;
+CREATE INDEX federation_attestations_restatement ON federation_attestations (attesting_key_id, restatement_key) WHERE restatement_key IS NOT NULL;

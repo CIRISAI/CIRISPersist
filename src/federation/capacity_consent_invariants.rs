@@ -130,14 +130,32 @@ pub(crate) mod bodies {
 
     /// The gate's verdict (`put_attestation` of the score) and the precheck's
     /// stance, side by side. A refusal must be the consent gate's own.
+    /// E5-fix2 (round 6; GC1, CC 2.7.3) — a score put through the door: `None`
+    /// when it landed, else the fold reason and detail it is HELD with (the
+    /// subject's consent is other rows, so a score short of it is held
+    /// `consent_gate_refused`, never refused).
+    async fn held(d: &dyn FederationDirectory, row: Attestation) -> Option<(String, String)> {
+        use crate::federation::edition2::{fold, ingest::StatementOutcome};
+        match e2::put_signed(d, &row).await.expect("the score is offered") {
+            StatementOutcome::Pending { row_id, .. } => {
+                let h = fold::why_held(d, &row_id)
+                    .await
+                    .expect("why held")
+                    .expect("a held row carries its reason");
+                Some((h.reason, h.detail))
+            }
+            _ => None,
+        }
+    }
+
     async fn verdicts(d: &dyn FederationDirectory, p: &Parties, id: &str) -> (bool, ConsentState) {
-        let gate = match put(d, capacity_score(id, &p.canonical, &p.agent)).await {
-            Ok(()) => true,
-            Err(e) => {
+        let gate = match held(d, capacity_score(id, &p.canonical, &p.agent)).await {
+            None => true,
+            Some((reason, detail)) => {
                 assert_eq!(
-                    e.kind(),
-                    "federation_consent_gate_refused",
-                    "I548: refused by the consent gate, not another one: {e}"
+                    reason,
+                    crate::federation::edition2::fold::reason::gc1::CONSENT_GATE_REFUSED,
+                    "I548: held by the consent gate, not another one: {detail}"
                 );
                 false
             }
@@ -427,6 +445,12 @@ pub(crate) mod bodies {
                 "granted",
                 "analyze",
                 Some(&p.agent),
+                // E5-fix3 (CC 2.6.2) — the grant lapses BEFORE the sweeping
+                // node's key record begins (`shift`: base − 211 days; a default
+                // node record starts today − 180): the record is stamped when
+                // the node SIGNS it, so a node newer than the lapse records it.
+                // Before E5-fix3 it was stated at the lapse and could never be
+                // signed (`skipped: 1`).
                 "2026-01-01T00:00:00Z",
                 Some("2026-01-02T00:00:00Z"),
             ),
@@ -461,6 +485,18 @@ pub(crate) mod bodies {
             .filter(|a| a.attesting_key_id == node_kid)
             .collect();
         assert_eq!(expired.len(), 1, "I548f precondition: one substrate record");
+        // E5-fix3 — the record's instant is its signer's: inside the node's
+        // key window, after the lapse it records.
+        let window_start = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            i64::try_from(e2::key_window_start_ms(&alias)).expect("ms"),
+        )
+        .expect("an instant");
+        assert!(
+            expired[0].asserted_at >= window_start
+                && expired[0].asserted_at >= at(&shift("2026-01-02T00:00:00Z")),
+            "I548f: the record is stamped when the node signs it: {}",
+            expired[0].asserted_at
+        );
         assert_eq!(
             cbh::for_key_id_of(&expired[0].attestation_envelope),
             None,
@@ -478,13 +514,12 @@ pub(crate) mod bodies {
     /// **I548d — the refusal names the scope it asked.**
     pub async fn i548d_the_refusal_names_the_asked_scope(d: &dyn FederationDirectory, s: &str) {
         let p = parties(d, &format!("d-{s}")).await;
-        let err = put(
+        let (_, msg) = held(
             d,
             capacity_score(&format!("i548d-score-{s}"), &p.canonical, &p.agent),
         )
         .await
-        .expect_err("I548d: no consent, no score");
-        let msg = err.to_string();
+        .expect("I548d: no consent, no score (held)");
         assert!(
             msg.contains("\"analyze:capacity\" scope"),
             "I548d: the refusal names `analyze:capacity`: {msg}"

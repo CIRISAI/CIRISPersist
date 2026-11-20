@@ -24,13 +24,22 @@
 //! edition-2 replicated door**: T1.md ("`apply_replicated_community`'s
 //! `not_in_audience` / degrade outcomes are not applied to statements") and
 //! base `edition2/` run no `may_receive`. Those asserts are marked
-//! "DEPENDS ON THE EDITION-2 AUDIENCE GATE"; they are red until it exists.
+//! "DEPENDS ON THE EDITION-2 AUDIENCE GATE". v62.0.0 (E6-fix8) — that gate
+//! is the SERVE plane (`edition2::serve::statements_served_to`), and
+//! [`sync`] now delivers through it.
 
-/// Deliver every statement `from` holds to `to`, in `from`'s admission
-/// order, through the replicated statement door (`apply_replicated_statement`
-/// under each statement's computed row id). A statement waiting on a key
-/// `to` does not yet hold is retried on the next pass; a refusal is the
-/// receiving door's verdict and is left as it is.
+/// Deliver to `to` what `from` SERVES it, in `from`'s admission order,
+/// through the replicated statement door (`apply_replicated_statement` under
+/// each statement's computed row id). A statement waiting on a key `to` does
+/// not yet hold is retried on the next pass; a refusal is the receiving
+/// door's verdict and is left as it is.
+///
+/// v62.0.0 (E6-fix8) — the delivery goes through the SERVE plane
+/// (`edition2::serve::statements_served_to`, requester = `to`'s node key),
+/// as a peer's pull does: a group's record reaches the nodes of its members
+/// and live invitees (`group_serve`), never a stranger's. Pushing every held
+/// statement past the serve gate witnessed a transport no node runs, and
+/// left the "a stranger's node does not" legs red.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) async fn sync(
     from: &dyn crate::federation::FederationDirectory,
@@ -38,16 +47,21 @@ pub(crate) async fn sync(
 ) {
     use crate::federation::edition2::ingest::apply_replicated_statement;
     use crate::federation::edition2::names::RowId;
+    let requester = to.node_key_id();
     let mut statements = Vec::new();
     let mut cursor = None;
     loop {
-        let page = from
-            .edition2_statements_since(cursor.as_ref(), 1000)
-            .await
-            .expect("the source serves its statements");
-        let Some(last) = page.last() else { break };
-        cursor = Some(last.cursor);
-        statements.extend(page.into_iter().map(|s| s.bytes));
+        let page = crate::federation::edition2::serve::statements_served_to(
+            from,
+            cursor.as_ref(),
+            1000,
+            requester.as_deref(),
+        )
+        .await
+        .expect("the source serves its statements");
+        statements.extend(page.statements.into_iter().map(|s| s.bytes));
+        let Some(next) = page.next else { break };
+        cursor = Some(next);
     }
     for _ in 0..3 {
         let mut waiting = Vec::new();
@@ -145,8 +159,25 @@ pub(crate) mod bodies {
         // attacker-chosen data. v62.0.0: the envelope no longer matches its
         // carried statement, whatever the token; it is an error, never the
         // audience refusal, and nothing is stored.
+        //
+        // v62.0.0 (E6-fix8) — the bytes that count are the STATEMENT the row
+        // carries (the replicated door applies that statement; the JSON
+        // envelope is its projection). So the tamper is to the statement: its
+        // last byte (inside the composite signature) flipped, which no key
+        // verifies. An edit to the projected envelope alone is not a forgery
+        // of anything the door applies.
         let mut forged = content.clone();
-        forged.attestation_envelope["score"] = serde_json::json!(-1.0);
+        {
+            use crate::federation::edition2::ingest::STATEMENT_MEMBER;
+            let hex_st = forged.attestation_envelope[STATEMENT_MEMBER]
+                .as_str()
+                .expect("I1509: the row carries its statement")
+                .to_owned();
+            let mut bytes = hex::decode(&hex_st).expect("I1509: the statement is hex");
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0x01;
+            forged.attestation_envelope[STATEMENT_MEMBER] = serde_json::json!(hex::encode(bytes));
+        }
         for (door, e) in [
             (
                 "apply_replicated_attestation",

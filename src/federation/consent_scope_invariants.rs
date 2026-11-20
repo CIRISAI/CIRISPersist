@@ -697,6 +697,68 @@ mod run {
         uuid::Uuid::new_v4().simple().to_string()
     }
 
+    /// E5-fix3 (round 6; CP2) — **a LOCAL-tier `trace:complete:v1` as an
+    /// edition-2 statement**, the setup row the sweep witnesses promote. The
+    /// earlier fixture wrote an unsigned row through `attestation_insert_local`;
+    /// at the shut doors an unsigned trace never crosses
+    /// (`ingest::refuse_unsigned_trace_crossing`, P7's ruling), so the sweep
+    /// skipped it. This one is signed by an `agent` key (a trace is authored by
+    /// its agent, CC 3.1.5 R4), names its blob by `manifest` (the
+    /// `trace:{form}:{version}` payload), is dated inside the agent key's
+    /// window, and crosses on its own statement
+    /// (`TierPromotionCustody::of_statement`). Returns its row id.
+    async fn e2_local_trace(
+        d: &dyn crate::federation::FederationDirectory,
+        agent_seed: &str,
+        trace_id: &str,
+    ) -> String {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
+        let agent = e2::put_key(d, agent_seed, &["agent"]).await;
+        let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            i64::try_from(e2::key_window_start_ms(agent_seed) + 150 * 86_400_000).expect("ms"),
+        )
+        .expect("an instant");
+        let literal = crate::federation::Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: agent.clone(),
+            attested_key_id: agent.clone(),
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: None,
+            asserted_at: at,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": "trace:complete:v1",
+                "trace_id": trace_id,
+                "agent_id_hash": format!("agent-hash-{trace_id}"),
+                "manifest": {
+                    "schema": "trace_manifest:v1",
+                    "content_hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "byte_len": 2_000_000,
+                    "component_count": 16,
+                },
+            }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: agent.clone(),
+            scrub_timestamp: at,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: vec![agent.clone()],
+            withdraws_admission_rule: None,
+            cohort_scope: cohort_scope::SELF.to_owned(),
+            tier: attestation_tier::LOCAL.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        let row = e2::row_of(&literal, agent_seed);
+        e2::put_signed(d, &row)
+            .await
+            .unwrap_or_else(|e| panic!("the local trace {trace_id} lands: {e}"));
+        e2::rid(&row)
+    }
+
     /// **I105 — the covering rule, per kind.**
     #[test]
     fn i105_the_covering_rule() {
@@ -963,22 +1025,13 @@ mod run {
             .await
             .unwrap();
         let sq = engine.sqlite_backend().unwrap().clone();
-        let local = crate::federation::types::LocalAttestationInput {
-            attestation_id: None,
-            attesting_key_id: node.clone(),
-            attested_key_id: None,
-            attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
-            weight: None,
-            expires_at: None,
-            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
-                "dimension": "trace:complete:v1", "trace_id": format!("i108-{run}"), "agent_id_hash": "agent-hash-i108", "trace": {},
-            })).unwrap(),
-            subject_key_ids: vec![node.clone()],
-            cohort_scope: cohort_scope::SELF.to_owned(),
-            scrub_signature_classical: None,
-            scrub_signature_pqc: None,
-        };
-        let row_id = sq.attestation_insert_local(local).await.unwrap();
+        let _ = &node;
+        let row_id = e2_local_trace(
+            sq.as_ref(),
+            &format!("i108-agent-{run}"),
+            &format!("i108-{run}"),
+        )
+        .await;
         // One grant per PEER: the V109 projection keys `(node, peer)`, so a
         // second grant to the same peer replaces the first and it is no longer
         // live — the two principles must name different peers to coexist.
@@ -1024,6 +1077,13 @@ mod run {
         // row stays local, `Crossed` names the stated row), so the witness is
         // the sweep's own count, not the local row's tier.
         assert_eq!(report.promoted, 1, "I108: `share` propagates: {report:?}");
+        // E5-fix3 — the setup row is an edition-2 local statement, so it
+        // crosses on its own statement, in place.
+        assert_eq!(
+            sq.get_attestation(&row_id).await.unwrap().unwrap().tier,
+            attestation_tier::FEDERATION,
+            "I108: `share` propagates the row itself"
+        );
     }
 
     /// **v50.0.0 (CIRISPersist#924 review, MEDIUM-3) — a grant-covered row on
@@ -1049,37 +1109,24 @@ mod run {
             .await
             .unwrap();
         let sq = engine.sqlite_backend().unwrap().clone();
-        let local = |dim: &str, tag: &str| crate::federation::types::LocalAttestationInput {
-            attestation_id: None,
-            attesting_key_id: node.clone(),
-            attested_key_id: None,
-            attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
-            weight: None,
-            expires_at: None,
-            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                serde_json::json!({
-                    "dimension": dim, "trace_id": format!("u924-{tag}-{run}"),
-                    "agent_id_hash": "agent-hash-u924", "trace": {},
-                }),
-            )
-            .unwrap(),
-            subject_key_ids: vec![node.clone()],
-            cohort_scope: cohort_scope::SELF.to_owned(),
-            scrub_signature_classical: None,
-            scrub_signature_pqc: None,
-        };
-        // A row stored BEFORE v50 on a pre-rc5 shape: v50's own local door
-        // refuses the unversioned shape, so the row is written conformant and
-        // its stored dimension rewritten underneath, as a v49 store holds it.
-        let old_id = sq
-            .attestation_insert_local(local("trace:complete:v1", "old"))
-            .await
-            .unwrap();
+        let _ = &node;
+        // A row stored BEFORE v50 on a pre-rc5 shape: v50's own door refuses
+        // the unversioned shape, so the row is written conformant and its
+        // stored dimension rewritten underneath, as a v49 store holds it.
+        // E5-fix3 — both rows are edition-2 local statements (`e2_local_trace`).
+        let old_id = e2_local_trace(
+            sq.as_ref(),
+            &format!("u924-agent-o-{run}"),
+            &format!("u924-old-{run}"),
+        )
+        .await;
         sq.rewrite_dimension_for_test(&old_id, "trace:complete");
-        let _new_id = sq
-            .attestation_insert_local(local("trace:complete:v1", "new"))
-            .await
-            .unwrap();
+        let new_id = e2_local_trace(
+            sq.as_ref(),
+            &format!("u924-agent-n-{run}"),
+            &format!("u924-new-{run}"),
+        )
+        .await;
         let envelope = crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
             "dimension": crate::federation::consent_peer_set::DIMENSION,
             "subject_key_ids": [format!("u924-peer-{run}")],
@@ -1107,9 +1154,14 @@ mod run {
             attestation_tier::LOCAL,
             "the old-shape row is not promoted"
         );
-        // E5-fix1 (round 3) — as I108: the conformant sibling CROSSES (in
-        // place, or restated as a new federation row under v62 P8).
+        // E5-fix3 — the conformant sibling CROSSES on its own statement, in
+        // place.
         assert_eq!(report.promoted, 1, "its conformant sibling is: {report:?}");
+        assert_eq!(
+            sq.get_attestation(&new_id).await.unwrap().unwrap().tier,
+            attestation_tier::FEDERATION,
+            "its conformant sibling is"
+        );
     }
 
     /// **I109 — the sweep records a lapsed grant as `consent:state:expired`
@@ -1198,10 +1250,14 @@ mod run {
             "I109: the scope is carried over"
         );
         assert_eq!(e.attestation_envelope["content_class"], "medical");
-        assert_eq!(
-            e.asserted_at,
-            at("2026-05-02T00:00:00Z"),
-            "I109: asserted AT the lapse instant, not at the sweep"
+        // E5-fix3 (CC 2.6.2) — the record's instant is its SIGNER's (the node
+        // signs when it saw the lapse), never the lapse itself, which precedes
+        // this node's key; the fold binds it only when asserted at or after
+        // the lapse.
+        assert!(
+            e.asserted_at >= at("2026-05-02T00:00:00Z"),
+            "I109: asserted when the node signed, at or after the lapse: {}",
+            e.asserted_at
         );
         assert_eq!(
             e.subject_key_ids,

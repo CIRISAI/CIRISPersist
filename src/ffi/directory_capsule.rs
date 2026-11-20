@@ -8499,8 +8499,10 @@ mod tests {
                 },
             },
         ) {
+            // v62.0.0 (round 6, CP2) — the doors are shut, so the op is
+            // refused by its form before its retired arm runs.
             DirectoryOpResult::Err(e) => assert!(
-                e.starts_with("federation_envelope_kind_retired: key "),
+                e.starts_with("federation_malformed_row: key_record: earlier_form_object: "),
                 "I1146: {e}"
             ),
             other => panic!("I1146: the framed key-record op: {other:?}"),
@@ -8519,7 +8521,9 @@ mod tests {
             },
         ) {
             DirectoryOpResult::Err(e) => assert!(
-                e.starts_with("federation_envelope_kind_retired: identity_occurrence_revocation"),
+                e.starts_with(
+                    "federation_malformed_row: identity_occurrence_revocation: earlier_form_object: "
+                ),
                 "I1146: {e}"
             ),
             other => panic!("I1146: the framed occurrence-revocation op: {other:?}"),
@@ -8646,23 +8650,31 @@ mod tests {
         unsafe { (directory.vtable.drop)(directory.data) };
     }
 
+    /// v62.0.0 (round 6, CP2) — the earlier-form `PutTransportDestination`
+    /// op is refused by its plane at the capsule, and stores nothing; the
+    /// route listing crosses the ABI intact (every field, #397/#411/#413/
+    /// #443) over a route seeded through the directory.
     #[test]
     fn put_then_list_transport_destinations_round_trips() {
+        use crate::federation::edition2::fixture_switch as e2;
         let rt = test_runtime();
         let (dir, directory) = test_directory();
-
-        // A transport destination needs its occurrence key on file (an FK);
-        // the key is not registered here, so we assert the round-trip shape
-        // either way.
+        // A node key the route names (the occurrence key is an FK).
+        let occ = rt.block_on(e2::put_key(dir.as_ref(), "occ-roundtrip-node", &["node"]));
         let dest = self_at_login::TransportDestination {
-            occurrence_key_id: "occ-1".into(),
+            occurrence_key_id: occ.clone(),
             transport_kind: "reticulum".into(),
             destination: "abcd".into(),
-            // v61 (CC 2.6.2) — a signed member crosses the ABI `.sssZ`.
+            // v61 (CC 2.6.2) — a signed member crosses the ABI `.sssZ`. A
+            // node key's window is now-relative, so the route is too.
             asserted_at: crate::federation::admission::truncate_to_substrate_resolution(
-                chrono::Utc::now(),
+                crate::host::clock::now(),
             ),
-            last_seen_at: Some(chrono::Utc::now()),
+            last_seen_at: Some(
+                crate::federation::admission::truncate_to_substrate_resolution(
+                    crate::host::clock::now(),
+                ),
+            ),
             // #397/#411 — the transport-tier Ed25519 + X25519 (KEX) must cross
             // the ABI intact (prime + re-seal after restart).
             transport_ed25519_pubkey_base64: Some("dHJhbnNwb3J0LWVkMjU1MTk=".into()),
@@ -8675,34 +8687,45 @@ mod tests {
             retired_at: None,
         };
 
-        let put = run_op(
+        match run_op(
             &rt,
             &directory,
             &DirectoryOp::PutTransportDestination {
                 destination: dest.clone(),
             },
-        );
-        // The backend may accept (Unit) or refuse (Err) — either is a
-        // valid ABI round-trip; the point is the bytes made it back.
-        let direct_put = rt.block_on(dir.put_transport_destination(&dest));
-        match (&put, &direct_put) {
-            (DirectoryOpResult::Unit, Ok(())) => {}
-            (DirectoryOpResult::Err(_), Err(_)) => {}
-            (a, b) => panic!("capsule/direct put mismatch: {a:?} vs {b:?}"),
+        ) {
+            DirectoryOpResult::Err(e) => assert!(
+                e.starts_with(
+                    "federation_malformed_row: transport_destination: earlier_form_object: "
+                ),
+                "the earlier-form put is refused by its plane: {e}"
+            ),
+            other => panic!("the earlier-form put is refused, got {other:?}"),
         }
+        assert!(
+            rt.block_on(dir.list_transport_destinations_for(&occ))
+                .expect("direct list")
+                .is_empty(),
+            "nothing stored behind the refusal"
+        );
 
-        let listed = run_op(
+        rt.block_on(dir.put_transport_destination(&dest))
+            .expect("seed the route through the directory");
+        let via_direct = rt
+            .block_on(dir.list_transport_destinations_for(&occ))
+            .expect("direct list");
+        assert_eq!(via_direct.len(), 1, "the seed is listed");
+        match run_op(
             &rt,
             &directory,
             &DirectoryOp::ListTransportDestinationsFor {
-                occurrence_key_id: "occ-1".into(),
+                occurrence_key_id: occ.clone(),
             },
-        );
-        let via_direct = rt.block_on(dir.list_transport_destinations_for("occ-1"));
-        match (listed, via_direct) {
-            (DirectoryOpResult::TransportDestinations(v), Ok(w)) => assert_eq!(v, w),
-            (DirectoryOpResult::Err(_), Err(_)) => {}
-            (a, b) => panic!("capsule/direct list mismatch: {a:?} vs {b:?}"),
+        ) {
+            DirectoryOpResult::TransportDestinations(v) => {
+                assert_eq!(v, via_direct, "the listing crosses intact")
+            }
+            other => panic!("capsule list: {other:?}"),
         }
 
         // SAFETY: single-drop, matched vtable.
@@ -8837,9 +8860,10 @@ mod tests {
                 row_age: None,
             },
         ) {
-            DirectoryOpResult::TypedErr(e) => assert!(
-                format!("{e:?}").contains("verify_hybrid_via_directory"),
-                "I2885: refused by name: {e:?}"
+            // `run_op` flattens a typed failure to its text.
+            DirectoryOpResult::Err(e) => assert!(
+                e.contains("verify_hybrid_via_directory"),
+                "I2885: refused by name: {e}"
             ),
             other => panic!("I2885: the retired op is refused, got {other:?}"),
         }
@@ -8952,9 +8976,25 @@ mod tests {
             ts::reseal(&mut row);
             // v62.0.0 (round 3, E7) — through the one entry (a mapped row is
             // not routed to the statement store by `put_attestation`).
-            crate::federation::edition2::fixture_switch::put_signed(dir.as_ref(), &row)
+            // v62.0.0 (round 6, CC 2.6.1.9) — a delegation seats only with
+            // its second signers' voices (the delegate's): without them it is
+            // held `count_short` and the root delegates nothing. Supply them.
+            use crate::federation::edition2::fixture_switch as e2;
+            let (seeds, unvoiced) = e2::second_signer_voices(dir.as_ref(), &row)
+                .await
+                .expect("second signers");
+            assert!(unvoiced.is_empty(), "zc-root: unvoiced roles {unvoiced:?}");
+            let seeds: Vec<&str> = seeds.iter().map(String::as_str).collect();
+            let landed = e2::land_with_voices(dir.as_ref(), &row, &seeds)
                 .await
                 .expect("edge");
+            assert!(
+                matches!(
+                    landed,
+                    crate::federation::edition2::ingest::StatementOutcome::Row { .. }
+                ),
+                "zc-root: the edge lands: {landed:?}"
+            );
         });
         for (root, want) in [
             (
@@ -9618,14 +9658,18 @@ mod tests {
         // `{tag}-owner` / `{tag}-node-N` were ONE key (the binding's target
         // was the `user` owner itself: `target_age_unverified`).
         let owner = format!("owner-{tag}");
-        let nodes = vec![format!("node-1-{tag}"), format!("node-2-{tag}")];
+        let nodes = [format!("node-1-{tag}"), format!("node-2-{tag}")];
         rt.block_on(async {
             ts::register_identity_key(dir, &owner, USER).await;
             for (i, n) in nodes.iter().enumerate() {
                 ts::register_identity_key(dir, n, NODE).await;
                 ts::put_owner_binding(dir, &owner, n).await;
+                // v62.0.0 (round 6) — the route names the node's KEY, its
+                // identity-ref (the store keys it `kid(seed)`): the fold ties
+                // two routes through the owner binding OF THAT KEY, and a
+                // seed-named route was nobody's, so the fold kept both.
                 let r = self_at_login::TransportDestination {
-                    occurrence_key_id: n.clone(),
+                    occurrence_key_id: crate::federation::edition2::fixture_switch::kid(n),
                     transport_kind: "reticulum".into(),
                     destination: dest.clone(),
                     asserted_at: "2026-10-22T00:00:00.000Z".parse().unwrap(),
@@ -9639,13 +9683,24 @@ mod tests {
                 dir.put_transport_destination(&r).await.expect("seed route");
             }
         });
+        // Sorted, as `route_keys_1244` answers them.
+        let mut nodes: Vec<String> = nodes
+            .iter()
+            .map(|n| crate::federation::edition2::fixture_switch::kid(n))
+            .collect();
+        nodes.sort();
         (dest, nodes)
     }
 
     fn route_keys_1244(v: &[self_at_login::TransportDestination], tag: &str) -> Vec<String> {
+        // The two node keys `seed_tied_routes_1244` seeds under `tag`.
+        let mine: Vec<String> = [format!("node-1-{tag}"), format!("node-2-{tag}")]
+            .iter()
+            .map(|n| crate::federation::edition2::fixture_switch::kid(n))
+            .collect();
         let mut k: Vec<String> = v
             .iter()
-            .filter(|r| r.occurrence_key_id.contains(tag))
+            .filter(|r| mine.contains(&r.occurrence_key_id))
             .map(|r| r.occurrence_key_id.clone())
             .collect();
         k.sort();
@@ -9674,7 +9729,10 @@ mod tests {
             .expect("folded");
         assert_eq!(
             route_keys_1244(&folded, tag),
-            vec![nodes[1].clone()],
+            // The newer epoch's: `node-2`'s key.
+            vec![crate::federation::edition2::fixture_switch::kid(&format!(
+                "node-2-{tag}"
+            ))],
             "I1756 seed: the fold keeps one"
         );
         let directory = build_persist_directory(dir.clone());
@@ -11594,6 +11652,34 @@ mod tests {
         let mut red = Vec::new();
         for (method, fault, write, op, call) in table {
             let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // v62.0.0 (round 6, CP2) — an op that carries an earlier-form
+                // signed object is refused by its plane at the capsule, before
+                // any directory read, once the doors are shut: through the
+                // vtable and through the proxy alike, never `Unsupported`.
+                if let Some(plane) = earlier_form_op_plane(&op)
+                    .filter(|_| crate::federation::edition2::door::earlier_form_doors_shut())
+                {
+                    let refused = format!("federation_malformed_row: {plane}: earlier_form_object");
+                    let directory = build_persist_directory(inner.clone());
+                    match run_op(rt, &directory, &op) {
+                        DirectoryOpResult::Err(e) => {
+                            assert!(e.starts_with(&refused), "I1890 {method} vtable: {e}")
+                        }
+                        other => panic!("I1890 {method}: the vtable answered {other:?}"),
+                    }
+                    // SAFETY: single-drop, matched vtable.
+                    unsafe { (directory.vtable.drop)(directory.data) };
+                    let proxy = proxy_1244(rt, inner.clone());
+                    match rt.block_on(call(proxy as Arc<dyn FederationDirectory>)) {
+                        Err(e) => assert!(
+                            e.to_string().contains("earlier_form_object")
+                                && e.to_string().contains(plane),
+                            "I1890 {method} proxy: {e}"
+                        ),
+                        Ok(v) => panic!("I1890 {method}: the proxy answered Ok({v})"),
+                    }
+                    return;
+                }
                 let want = format!("injected backend failure: {fault}");
                 let faulty: Arc<dyn FederationDirectory> = Arc::new(
                     crate::federation::directory_double::FaultInjectingDirectory::new(
@@ -11656,12 +11742,14 @@ mod tests {
 
     /// **I1891 — group-plane writes through the capsule land as direct ones
     /// would.** A keyless room (alice founds, bob seated); THROUGH THE PROXY
-    /// carol is added (`add_community_member`, after her consent) and bob
-    /// is revoked (`put_community_membership_revocation`). The direct
-    /// backend then holds both rows, and every group read — the two planes,
-    /// `list_group_versions`, `list_communities_for_member`,
+    /// carol's widening and bob's revocation arrive as their edition-2
+    /// statements (`submit_voice`, the statement door run in persist's
+    /// `.so`). The direct backend then holds both rows, and every group read
+    /// — the two planes, `list_group_versions`, `list_communities_for_member`,
     /// `lookup_keys_for_identity` — answers the same through the proxy as
-    /// directly, non-empty.
+    /// directly, non-empty. The earlier-form doors (`add_community_member`,
+    /// `put_community_membership_revocation`) are shut (CP2): through the
+    /// proxy they answer the host's own refusal, byte for byte.
     fn exercise_i1891(
         rt: &Arc<tokio::runtime::Runtime>,
         dir: Arc<dyn FederationDirectory>,
@@ -11701,6 +11789,17 @@ mod tests {
                 persist_row_hash: String::new(),
             },
         );
+        let widening = ts::sign_community_membership_widening(
+            &alice,
+            types::CommunityMembershipWidening {
+                community_key_id: room.clone(),
+                member_key_id: carol.clone(),
+                joined_at: joined,
+                effective_at: joined,
+                role: None,
+                persist_row_hash: String::new(),
+            },
+        );
         let proxy = proxy_1244(rt, dir.clone());
         rt.block_on(async {
             let d: &dyn FederationDirectory = dir.as_ref();
@@ -11715,17 +11814,42 @@ mod tests {
             e2::put_signed(d, &acceptance_row(&carol, &proposal, joined))
                 .await
                 .expect("I1891: the acceptance lands");
-            assert!(
-                proxy
-                    .add_community_member(&room, seat, &spec)
-                    .await
-                    .expect("I1891: add_community_member routes"),
-                "I1891: carol is a genuine add"
-            );
-            proxy
-                .put_community_membership_revocation(revocation)
+            // v62.0.0 (round 6, CP2) — the earlier-form doors are shut: the
+            // proxy answers exactly the host's refusal, never `Unsupported`.
+            let via = proxy
+                .add_community_member(&room, seat.clone(), &spec)
                 .await
-                .expect("I1891: put_community_membership_revocation routes");
+                .expect_err("I1891: the earlier-form add is refused");
+            let direct = d
+                .add_community_member(&room, seat, &spec)
+                .await
+                .expect_err("I1891: refused directly too");
+            assert_eq!(
+                via.to_string(),
+                direct.to_string(),
+                "I1891: the host's own refusal"
+            );
+            assert_eq!(via.kind(), direct.kind(), "I1891: the kind crosses");
+            assert!(
+                via.to_string().contains("earlier form"),
+                "I1891: refused by form: {via}"
+            );
+            // The writes as they cross now: each statement through the
+            // proxy's statement door, naming the room's held head.
+            let head = e2::held_head(d, &room).await.map(|(h, _)| h);
+            for st in e2::community_widening_voices(&widening, head.as_ref()) {
+                proxy
+                    .submit_voice(&st)
+                    .await
+                    .expect("I1891: the widening crosses the capsule");
+            }
+            let head = e2::held_head(d, &room).await.map(|(h, _)| h);
+            for st in e2::community_revocation_voices(&revocation, head.as_ref()) {
+                proxy
+                    .submit_voice(&st)
+                    .await
+                    .expect("I1891: the revocation crosses the capsule");
+            }
         });
         let ws = rt
             .block_on(dir.list_community_membership_widenings_for(&room))
@@ -11850,16 +11974,22 @@ mod tests {
         let direct_refusal = rt
             .block_on(dir.submit_voice(b"not a statement"))
             .expect_err("direct refusal");
-        // ABI 14: a host `Backend` crosses as `Backend` carrying the host's
-        // text; any other failure as `Relayed`, whose text is the host's.
+        // ABI 14: `SubmitVoice` answers with `op_err_typed`, so the text that
+        // crosses is the host error's TYPED reading
+        // (`{kind}: {plane}: {reason}: {message}`), and its kind crosses too.
         let crossed = match &refused {
             Error::Backend(m) => m.clone(),
             other => other.to_string(),
         };
         assert_eq!(
             crossed,
-            direct_refusal.to_string(),
+            typed_error_string(&direct_refusal),
             "I1894: the host's own refusal"
+        );
+        assert_eq!(
+            refused.kind(),
+            direct_refusal.kind(),
+            "I1894: the kind crosses"
         );
     }
 
@@ -12959,6 +13089,24 @@ mod proxy_gate {
             "retired at v62.0.0 (F0-cp5): kept so an old consumer's op is answered with \
              `Unsupported`, never issued by a current proxy",
         ),
+        // v62.0.0 (round 6) — the accord proposal / participation / decision
+        // trait doors are deleted (JSON-cut slice F; a roster change is a later
+        // genesis bundle); their append-only ops stay as refusing arms.
+        (
+            "PutAccordDecision",
+            "retired at v62.0.0 (slice F): its trait door is deleted; the op stays so an \
+             old consumer's call is refused by name, never issued by a current proxy",
+        ),
+        (
+            "PutAccordParticipation",
+            "retired at v62.0.0 (slice F): its trait door is deleted; the op stays so an \
+             old consumer's call is refused by name, never issued by a current proxy",
+        ),
+        (
+            "PutAccordProposal",
+            "retired at v62.0.0 (slice F): its trait door is deleted; the op stays so an \
+             old consumer's call is refused by name, never issued by a current proxy",
+        ),
         (
             "VerifyCompositeViaDirectory",
             "the verify runs inside persist's .so against its own vtable, by design: a \
@@ -13141,8 +13289,8 @@ mod proxy_gate {
 ///   forced on, `PutAttestation` (a JSON row with no statement) and
 ///   `PutIdentityOccurrenceRevocation` answer
 ///   `federation_malformed_row: {plane}: earlier_form_object` before any
-///   parse, nothing is stored; with the switch off neither is refused by
-///   that name.
+///   parse, and nothing is stored. (v62.0.0 CP2: the switch is shut for
+///   good; the switch-off leg is deleted.)
 /// - **I2487 (every inbound op is classified).** Every `Put*` /
 ///   `ApplyReplicated*` op is classified earlier-form by
 ///   [`earlier_form_op_plane`], or is named here with why.
@@ -13471,17 +13619,6 @@ mod edition2_ops {
                 .is_none(),
             "I2486: nothing stored behind the refusal"
         );
-        for op in [put_row(), put_occ_rev()] {
-            if let DirectoryOpResult::Err(e) = rt
-                .block_on(dispatch_directory_op(dir.as_ref(), op))
-                .into_flattened()
-            {
-                assert!(
-                    !e.contains("earlier_form_object"),
-                    "I2486: the switch is off, so no earlier-form refusal: {e}"
-                );
-            }
-        }
     }
 
     #[cfg(feature = "sqlite")]

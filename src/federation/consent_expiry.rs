@@ -23,8 +23,12 @@
 //!   only through this edge, and only when the row is asserted at or after the
 //!   grant's own lapse ([`super::consent`], `substrate_expiry_bound_to_subject`):
 //!   no node can expire a consent early, or someone else's, by emitting one.
-//! - `asserted_at` = the lapse instant, not the sweep's wall clock. The record
-//!   says WHEN the consent lapsed; the sweep merely noticed.
+//! - `asserted_at` = the instant the NODE signs it (v62.0.0, E5-fix3; CC
+//!   2.6.2: a stamped instant belongs to its signer), stamped by the signing
+//!   door. When the consent lapsed is the named grant's own end; the record
+//!   says that the node saw it lapse, and it is always asserted after the
+//!   lapse. (It was the lapse instant, a past instant a node whose key began
+//!   later could never sign.)
 //! - `scope`, `content_class` copied from the grant, so the record folds in
 //!   exactly the scope the grant covered. `for_key_id` is deliberately NOT
 //!   copied: a machine author may name only itself (#857), and the edge —
@@ -97,16 +101,25 @@ fn already_recorded(rows: &[Attestation], grant_id: &str) -> bool {
     })
 }
 
-/// The expired row the sweep emits for `grant`, lapsed at `lapse`. Pure, so
-/// the shape is testable without a directory.
-pub fn expiry_record_for(
-    grant: &Attestation,
-    lapse: DateTime<Utc>,
-) -> Result<EmitAttestationInput, Error> {
+/// The expired row the sweep emits for `grant`. Pure, so the shape is
+/// testable without a directory.
+///
+/// v62.0.0 (E5-fix3; CC 2.6.2, CC 3.3.1) — **the record's instant is its
+/// signer's.** It states no `asserted_at`, so the node's signing door stamps
+/// the instant it signs (`edition2::emit::payload_from_envelope`). It used to
+/// be stated AT the lapse: a signer-chosen past instant that a node whose key
+/// record began after the lapse could never sign (its key was not yet its
+/// key then, `kid_not_of_iss`), so such a node could never record the lapse.
+/// What the record observes is named by `consent_supersedes` (the grant), and
+/// the lapse is that grant's own end (`grant_lapse_instant`). The CC row
+/// grammar carries no lapse member, so none is invented. The fold binds the
+/// record only when it was asserted at or after that lapse
+/// (`consent::substrate_expiry_bound_to_subject`), which a record signed when
+/// the node saw the lapse always is.
+pub fn expiry_record_for(grant: &Attestation) -> Result<EmitAttestationInput, Error> {
     let mut env = serde_json::json!({
         paths::DIMENSION: format!("{}:v1", consent_dimension::STATE_EXPIRED_PREFIX),
         paths::CONSENT_SUPERSEDES: grant.attestation_id,
-        paths::ASSERTED_AT: super::admission::render_signed_instant(lapse),
     });
     for member in [paths::SCOPE, "content_class"] {
         if let Some(v) = grant.attestation_envelope.get(member) {
@@ -191,7 +204,7 @@ where
                 report.already_recorded += 1;
                 continue;
             }
-            match emit(expiry_record_for(grant, lapse)?).await {
+            match emit(expiry_record_for(grant)?).await {
                 Ok(id) => {
                     report.emitted += 1;
                     // Keep this pass's own view current so a second lapsed

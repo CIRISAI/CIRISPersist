@@ -10,15 +10,12 @@
 
 use std::sync::Arc;
 
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine as _;
 use chrono::{DateTime, TimeZone, Utc};
-use ed25519_dalek::{Signer as _, SigningKey};
+use ed25519_dalek::SigningKey;
 use uuid::Uuid;
 
 use super::service::AuditService;
 use super::types::AuditEntry;
-use super::verify::compute_entry_hash;
 use super::GENESIS_PREV_HASH;
 use crate::host::clock::{self, FixedClock};
 
@@ -42,12 +39,13 @@ fn merkle_signer(seed: u8) -> Arc<crate::signing::LocalSigner> {
     ))
 }
 
-fn signed_entry(key: &SigningKey, tenant: &str) -> AuditEntry {
-    let mut entry = AuditEntry {
+/// v62.0.0 (F0-cp8) — an entry sealed by `seed` (ONE composite).
+fn signed_entry(seed: &str, tenant: &str) -> AuditEntry {
+    let entry = AuditEntry {
         entry_id: Uuid::new_v4().to_string(),
         sequence_number: 1,
         tenant_id: tenant.to_owned(),
-        actor_id: B64.encode(key.verifying_key().to_bytes()),
+        actor_id: String::new(),
         action_type: "handler_action_task_complete".to_owned(),
         subject_kind: "task".into(),
         subject_id: "subj-1".into(),
@@ -57,19 +55,22 @@ fn signed_entry(key: &SigningKey, tenant: &str) -> AuditEntry {
         recorded_at: super::verify::truncate_to_micros(chrono::Utc::now()),
         signature: String::new(),
     };
-    entry.entry_hash = compute_entry_hash(&entry).unwrap().to_vec();
-    let canonical = super::verify::canonical_bytes_for_entry(&entry).unwrap();
-    entry.signature = B64.encode(key.sign(&canonical).to_bytes());
-    entry
+    crate::audit::test_support::seal(seed, entry)
 }
 
 /// The shared body: record one entry with the Merkle hook on, then read the
 /// head back. The head must exist, cover the one leaf, and carry the
 /// installed clock's instant.
-async fn record_and_read_head<A: AuditService>(audit: &A, seed: u8, backend: &str) {
+async fn record_and_read_head<A: AuditService, D: crate::federation::FederationDirectory>(
+    audit: &A,
+    dir: &D,
+    seed: u8,
+    backend: &str,
+) {
     let at = fixed_instant();
     let tenant = format!("i1794-{backend}-{}", Uuid::new_v4().simple());
-    let key = SigningKey::from_bytes(&[seed; 32]);
+    let key = format!("i1794-actor-{seed:02x}");
+    crate::audit::test_support::put_actor(dir, &key).await;
     clock::install(Arc::new(FixedClock::new(at)));
     let recorded = audit.record_entry(signed_entry(&key, &tenant)).await;
     let head = audit.current_sth(&tenant).await;
@@ -116,7 +117,7 @@ mod sqlite {
             backend.run_migrations().await.unwrap();
             let audit = crate::audit::sqlite::SqliteAuditBackend::new(backend.conn_handle());
             audit.set_merkle_signer(Some(merkle_signer(0x94)));
-            record_and_read_head(&audit, 0x94, "sqlite").await;
+            record_and_read_head(&audit, &backend, 0x94, "sqlite").await;
         });
         crate::host::rt::uninstall();
         assert_eq!(
@@ -135,8 +136,7 @@ mod postgres {
     use crate::store::Backend as _;
 
     fn leaf(entry_id: &str, chain_event_id: i64) -> AuditLeaf {
-        let key = SigningKey::from_bytes(&[0x95; 32]);
-        let mut e = signed_entry(&key, "i1795-leaf");
+        let mut e = signed_entry("i1795-leaf-actor", "i1795-leaf");
         e.entry_id = entry_id.to_owned();
         AuditLeaf::with_chain_event_id(e, chain_event_id)
     }
@@ -207,7 +207,7 @@ mod postgres {
 
         // The ingest path over the async store, stamped by the clock.
         backend.set_merkle_signer(Some(merkle_signer(0x96)));
-        record_and_read_head(backend.as_ref(), 0x96, "postgres").await;
+        record_and_read_head(backend.as_ref(), backend.as_ref(), 0x96, "postgres").await;
         backend.set_merkle_signer(None);
         eprintln!("I1795 postgres: RAN");
     }

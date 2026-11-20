@@ -65,6 +65,7 @@ The gates below still cut test code out of a file by text before they scan. Each
 | `namespace/supersets.rs::test_regions` | `every_cited_processor_has_a_non_test_caller` | the symbol set is read from the evidence manifest at test time (data-driven); a rule file is static |
 | `sqlite_conn_model.rs::production_text` | the four connection-class gates and the direct-lock gate | per-fn classification from a table in the test (AST-STRUCT, data-driven) |
 | `ffi/pyo3.rs` (`#[cfg(test)]\nmod` spans) | `no_block_on_reaches_the_pyo3_boundary_holding_the_gil` | span containment of `block_on` inside `py.detach(…)` (AST-STRUCT) |
+| `store/restatement_key_gate.rs::production_text` | I3523b (every production `federation_attestations` writer stores the restatement key) | relational: each body holding the insert must call its dialect's stamp helper (AST-STRUCT); items removed wherever they stand (a column-0 test `impl` precedes production in `postgres.rs`) |
 
 Comment-only strippers (`observe/tests.rs::strip_comments`, `durability_invariants.rs::strip_comments`, `store/parity.rs::strip_file`, the line-prefix `//` skips in the I-number invariants) cut no test code; their gates are in the inventory below.
 

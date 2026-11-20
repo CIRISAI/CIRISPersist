@@ -239,7 +239,10 @@ pub(crate) mod bodies {
             dir,
             ruling(
                 &moderator.id,
-                &uuid::Uuid::new_v4().to_string(),
+                // v62.0.0 (E0 fix 11) — an unheld target is named by a row id
+                // no row has (64 hex): an edition-2 `refs.target` is a digest,
+                // never a uuid.
+                &sha_hex(&format!("i1366-another-notice-{tag}")),
                 "reversed",
                 cohort_scope::COMMUNITY,
                 &comm,

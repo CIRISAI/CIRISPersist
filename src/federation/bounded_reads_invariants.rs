@@ -73,8 +73,7 @@ pub(crate) mod bodies {
     }
 
     /// v62.0.0 (JSON cut, E7) — a flipped row through the one entry
-    /// (`e2::put_signed`); an owner binding also takes the node's own voice
-    /// (C557).
+    /// (`e2::put_signed`); a delegation through `e2::land_delegation`.
     async fn put(d: &dyn FederationDirectory, a: Attestation) -> Result<(), Error> {
         // A held (earlier-form) body's row carries no statement: the JSON door.
         if e2::carried_statement(&a).is_none() {
@@ -83,13 +82,15 @@ pub(crate) mod bodies {
                 .await
                 .map(|_| ());
         }
-        e2::put_signed(d, &a).await?;
-        if a.attestation_type == attestation_type::DELEGATES_TO
-            && admission::is_owner_binding_envelope(&a.attestation_envelope)
-        {
-            let st = e2::carried_statement(&a).expect("the binding carries its statement");
-            e2::put_statement(d, &e2::voice_of(&st, &a.attested_key_id)).await?;
+        // v62.0.0 (round 6, E7) — a delegation lands with every voice its
+        // family's model names (E0's `land_delegation`: an owner binding's
+        // bound key, a conferral's delegate; CC 2.6.1.9 / 2.7.3). Short of
+        // one, the row is held and concludes nothing.
+        if a.attestation_type == attestation_type::DELEGATES_TO {
+            e2::land_delegation(d, &a).await?;
+            return Ok(());
         }
+        e2::put_signed(d, &a).await?;
         Ok(())
     }
 
@@ -128,13 +129,16 @@ pub(crate) mod bodies {
 
     /// A structural composer of `kind` by `author`, attested to `attested`,
     /// naming `target`.
-    fn composer(author: &str, attested: &str, kind: &str, target_id: &str) -> Attestation {
-        let id = uuid::Uuid::new_v4().to_string();
-        let env = serde_json::json!({ "id": id, "references_attestation_id": target_id });
-        let mut r = ts::bare_attestation(&id, author, attested, &env);
-        r.attestation_type = kind.to_owned();
-        ts::seal_row_in_place(author, &mut r);
-        r
+    ///
+    /// v62.0.0 (round 6, E7) — E0's `composer_of`: `refs.target` names the
+    /// TARGET's row id and the row carries the target's family (CC 2.4.1.1),
+    /// about the target's subject. The earlier literal (an `id` member and a
+    /// bare `references_attestation_id`) is not a composer payload, so the
+    /// door could not determine its authorship. The subject is the target's
+    /// subject as `composer_of` takes it; `_attested` is the earlier call
+    /// shape's subject, unused (kept so the call sites read as before).
+    fn composer(author: &str, _attested: &str, kind: &str, target: &Attestation) -> Attestation {
+        e2::composer_of(kind, target, author)
     }
 
     // ── I540 ─────────────────────────────────────────────────────────────
@@ -311,12 +315,7 @@ pub(crate) mod bodies {
         rab::put(d, &withdrawn).await.unwrap();
         put(
             d,
-            composer(
-                &o1,
-                &o1,
-                attestation_type::WITHDRAWS,
-                &withdrawn.attestation_id,
-            ),
+            composer(&o1, &o1, attestation_type::WITHDRAWS, &withdrawn),
         )
         .await
         .expect("o1 withdraws its list");
@@ -533,12 +532,9 @@ pub(crate) mod bodies {
         // Withdrawn: a invites w, then withdraws the proposal.
         let pw = mab::proposal(&a, cs::COMMUNITY, &room, &w, None, now, ttl);
         mab::put(d, &pw).await.expect("a → w");
-        put(
-            d,
-            composer(&a, &a, attestation_type::WITHDRAWS, &pw.attestation_id),
-        )
-        .await
-        .expect("a withdraws");
+        put(d, composer(&a, &a, attestation_type::WITHDRAWS, &pw))
+            .await
+            .expect("a withdraws");
         // Another room's proposal by the same inviter, and a family one.
         mab::put(
             d,
@@ -707,20 +703,14 @@ pub(crate) mod bodies {
         put(d, conferral(&u1, &agent)).await.expect("u1 → agent");
         let e2 = conferral(&u2, &agent);
         put(d, e2.clone()).await.expect("u2 → agent");
-        put(
-            d,
-            composer(&u2, &agent, attestation_type::WITHDRAWS, &e2.attestation_id),
-        )
-        .await
-        .expect("u2 withdraws");
+        put(d, composer(&u2, &agent, attestation_type::WITHDRAWS, &e2))
+            .await
+            .expect("u2 withdraws");
         let e3 = conferral(&u3, &agent);
         put(d, e3.clone()).await.expect("u3 → agent");
-        put(
-            d,
-            composer(&u3, &agent, attestation_type::RECANTS, &e3.attestation_id),
-        )
-        .await
-        .expect("u3 recants");
+        put(d, composer(&u3, &agent, attestation_type::RECANTS, &e3))
+            .await
+            .expect("u3 recants");
         put(d, conferral(&peer, &agent))
             .await
             .expect("peer → agent");
@@ -739,12 +729,7 @@ pub(crate) mod bodies {
             .expect("u4 → agent, naming the agent");
         put(
             d,
-            composer(
-                &agent,
-                &agent,
-                attestation_type::WITHDRAWS,
-                &e4.attestation_id,
-            ),
+            composer(&agent, &agent, attestation_type::WITHDRAWS, &e4),
         )
         .await
         .expect("the agent withdraws u4's edge");
@@ -756,17 +741,9 @@ pub(crate) mod bodies {
             .expect("u1 owns the node");
         let ob2 = owner_binding(&u2, &node2);
         put(d, ob2.clone()).await.expect("u2 owns node2");
-        put(
-            d,
-            composer(
-                &u2,
-                &node2,
-                attestation_type::WITHDRAWS,
-                &ob2.attestation_id,
-            ),
-        )
-        .await
-        .expect("u2 withdraws its binding");
+        put(d, composer(&u2, &node2, attestation_type::WITHDRAWS, &ob2))
+            .await
+            .expect("u2 withdraws its binding");
         // Noise about the agent: its own self-reports.
         for i in 0..5 {
             let env = serde_json::json!({ "dimension": format!("config:i542-{i}:v1"), "n": i });
@@ -910,25 +887,14 @@ pub(crate) mod bodies {
         put(d, self_report(&t, "live")).await.expect("live");
         let recanted = self_report(&t, "recanted");
         put(d, recanted.clone()).await.expect("recanted");
-        put(
-            d,
-            composer(&t, &t, attestation_type::RECANTS, &recanted.attestation_id),
-        )
-        .await
-        .expect("t recants");
+        put(d, composer(&t, &t, attestation_type::RECANTS, &recanted))
+            .await
+            .expect("t recants");
         let withdrawn = self_report(&t, "withdrawn");
         put(d, withdrawn.clone()).await.expect("withdrawn");
-        put(
-            d,
-            composer(
-                &t,
-                &t,
-                attestation_type::WITHDRAWS,
-                &withdrawn.attestation_id,
-            ),
-        )
-        .await
-        .expect("t withdraws");
+        put(d, composer(&t, &t, attestation_type::WITHDRAWS, &withdrawn))
+            .await
+            .expect("t withdraws");
         // Noise: consent rows and community-unrelated rows about t by others
         // are not needed — the leaf read excludes them by construction.
         let mut candidates = vec![
@@ -942,12 +908,7 @@ pub(crate) mod bodies {
         ts::reseal(&mut foreign);
         candidates.push(("another attester, same leaf", foreign, false));
         // v62.0.0 (JSON cut, E7) — an edition-2 composer names a HELD row.
-        let w = composer(
-            &t,
-            &t,
-            attestation_type::WITHDRAWS,
-            &withdrawn.attestation_id,
-        );
+        let w = composer(&t, &t, attestation_type::WITHDRAWS, &withdrawn);
         candidates.push(("a withdraws is exempt", w, false));
 
         let _ = read_probe::take();
@@ -1022,7 +983,12 @@ pub(crate) mod bodies {
         cab::report(d, &dev, &blobs[0], CustodyState::Here, minute(2)).await;
         cab::report(d, &dev, &blobs[1], CustodyState::None, minute(3)).await;
         let r2 = cab::report(d, &dev, &blobs[2], CustodyState::Here, minute(4)).await;
-        put(d, composer(&dev, &dev, attestation_type::RECANTS, &r2))
+        let r2_row = d
+            .get_attestation(&r2)
+            .await
+            .unwrap()
+            .expect("dev's report is held");
+        put(d, composer(&dev, &dev, attestation_type::RECANTS, &r2_row))
             .await
             .expect("dev recants");
         cab::report(d, &other, &blobs[3], CustodyState::Here, minute(5)).await;
@@ -1183,12 +1149,9 @@ pub(crate) mod bodies {
         // u1 binds n3, then recants it.
         let b3 = owner_binding(&u1, &n[2]);
         put(d, b3.clone()).await.expect("u1 → n3");
-        put(
-            d,
-            composer(&u1, &n[2], attestation_type::RECANTS, &b3.attestation_id),
-        )
-        .await
-        .expect("u1 recants n3");
+        put(d, composer(&u1, &n[2], attestation_type::RECANTS, &b3))
+            .await
+            .expect("u1 recants n3");
         // u1's plain delegation to n4 naming n4; n4 withdraws it (a subject
         // may withdraw a row naming it — u1 retracted nothing). Plain, because
         // a node withdrawing its OWNER binding is a reclaim, refused at the
@@ -1197,36 +1160,22 @@ pub(crate) mod bodies {
         b4.subject_key_ids = vec![n[3].clone()];
         ts::reseal(&mut b4);
         put(d, b4.clone()).await.expect("u1 → n4, naming n4");
-        put(
-            d,
-            composer(
-                &n[3],
-                &n[3],
-                attestation_type::WITHDRAWS,
-                &b4.attestation_id,
-            ),
-        )
-        .await
-        .expect("n4 withdraws u1's binding");
+        put(d, composer(&n[3], &n[3], attestation_type::WITHDRAWS, &b4))
+            .await
+            .expect("n4 withdraws u1's binding");
         // u1 binds n5, then withdraws it.
         let b5 = owner_binding(&u1, &n[4]);
         put(d, b5.clone()).await.expect("u1 → n5");
-        put(
-            d,
-            composer(&u1, &n[4], attestation_type::WITHDRAWS, &b5.attestation_id),
-        )
-        .await
-        .expect("u1 withdraws n5");
+        put(d, composer(&u1, &n[4], attestation_type::WITHDRAWS, &b5))
+            .await
+            .expect("u1 withdraws n5");
         // u1 binds n6, then supersedes that binding (whatever the fold makes
         // of a superseded edge, both bodies must make the same of it).
         let b6 = owner_binding(&u1, &n[5]);
         put(d, b6.clone()).await.expect("u1 → n6");
-        put(
-            d,
-            composer(&u1, &n[5], attestation_type::SUPERSEDES, &b6.attestation_id),
-        )
-        .await
-        .expect("u1 supersedes n6's binding");
+        put(d, composer(&u1, &n[5], attestation_type::SUPERSEDES, &b6))
+            .await
+            .expect("u1 supersedes n6's binding");
         // u1's plain (unmarked) delegation to n7: a node has no agency, so it
         // is a steward binding but not an ownership.
         put(d, plain_delegation(&u1, &n[6]))
@@ -1444,12 +1393,7 @@ pub(crate) mod bodies {
             put(d, r.clone()).await.expect("bystander report");
             put(
                 d,
-                composer(
-                    &bystander,
-                    &bystander,
-                    attestation_type::RECANTS,
-                    &r.attestation_id,
-                ),
+                composer(&bystander, &bystander, attestation_type::RECANTS, &r),
             )
             .await
             .expect("bystander recants");
@@ -1733,7 +1677,14 @@ pub(crate) mod bodies {
         for fam in [&ra.root, &rb.root] {
             let _ = tr::trust_root_valid(d, &u1, fam).await.unwrap();
             let log = read_probe::take();
-            let typed = rows_of(&log, "list_attestations_for_types", fam);
+            // v62.0.0 (round 6, E7) — the charter legs are read by the
+            // root's OWN rows (`AttestationQuery::by(root)` excluding every
+            // job but `trust:charter:v1`, door `list_attestations_by_types`),
+            // and only a family arm also reads its about-slice
+            // (`list_attestations_for_types`, the same exclusion). Either
+            // way only charters come back: never a bystander's acceptance.
+            let typed = rows_of(&log, "list_attestations_for_types", fam)
+                + rows_of(&log, "list_attestations_by_types", fam);
             assert!(
                 (1..=2).contains(&typed),
                 "I547: {fam}'s typed read returns its charters only ({typed} rows): {log:?}"

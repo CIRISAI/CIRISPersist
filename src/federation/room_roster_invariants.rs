@@ -407,7 +407,9 @@ pub mod bodies {
         let t4 = at("2026-03-04T00:00:00Z");
         let mut rooms = Vec::new();
         for (i, d) in dirs.iter().enumerate() {
-            let tg = format!("{tag}-{i}");
+            // v62.0.0 (E2-fix7): the role FIRST, the tag after it — a test key seeds
+            // from the first 32 bytes of its name.
+            let tg = format!("{i}-{tag}");
             let (room, alice, _bob) = keyless_room_dir(*d, &tg).await;
             // v62 (E4, flip wave 2): carol is an edition-2 key; each event is
             // its signers' `membership:{stage}` voices naming the roster's

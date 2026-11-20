@@ -439,15 +439,22 @@ where
 /// # Errors
 /// A statement whose `ceg_statement` member is not hex; the statement door's
 /// errors (its door refusals: the statement's bytes, its signer's key plane).
+///
+/// v62.0.0 (E6-fix9; CIRISPersist#804) — `origin` is the caller's write
+/// origin, carried to the statement door
+/// ([`apply_replicated_statement_with_origin`](super::edition2::ingest::apply_replicated_statement_with_origin)),
+/// so a cohort mate's sync keeps `WriteOrigin::Sync` and its budget.
 async fn apply_as_statement<D>(
     dir: &D,
     row: &Attestation,
+    origin: super::replication::admission::WriteOrigin,
 ) -> Result<Option<ReplicatedAttestationOutcome>, Error>
 where
     D: super::FederationDirectory + ?Sized,
 {
     use super::edition2::ingest::{
-        apply_replicated_statement, ReplicatedStatementOutcome, StatementOutcome, STATEMENT_MEMBER,
+        apply_replicated_statement_with_origin, ReplicatedStatementOutcome, StatementOutcome,
+        STATEMENT_MEMBER,
     };
     let Some(member) = row.attestation_envelope.get(STATEMENT_MEMBER) else {
         return Ok(None);
@@ -471,7 +478,11 @@ where
         _ => ReplicatedAttestationOutcome::Unchanged,
     };
     Ok(Some(
-        match Box::pin(apply_replicated_statement(dir, &bytes, &row_id.0)).await? {
+        match Box::pin(apply_replicated_statement_with_origin(
+            dir, &bytes, &row_id.0, origin,
+        ))
+        .await?
+        {
             ReplicatedStatementOutcome::Admitted(o) => kept(&o, true),
             ReplicatedStatementOutcome::Unchanged(o) => kept(&o, false),
             ReplicatedStatementOutcome::Refused { reason } => {
@@ -502,7 +513,13 @@ where
     // computed from the statement's bytes, so two different rows under one id
     // cannot arise here. What is left below is the earlier form, which the
     // shut doors refuse above.
-    if let Some(outcome) = Box::pin(apply_as_statement(dir, &attestation.attestation)).await? {
+    if let Some(outcome) = Box::pin(apply_as_statement(
+        dir,
+        &attestation.attestation,
+        origin.clone(),
+    ))
+    .await?
+    {
         return Ok(outcome);
     }
     use super::precedence;

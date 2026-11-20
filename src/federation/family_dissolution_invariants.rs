@@ -105,7 +105,7 @@ pub mod bodies {
             }
         }
         let mut w = World {
-            id: e2::kid(&format!("{tag}-fam")),
+            id: e2::kid(&format!("fam-{tag}")),
             keys,
             founding_hash: String::new(),
         };
@@ -251,7 +251,7 @@ pub mod bodies {
         );
         // A founding record that arrives dissolved.
         let fresh = World {
-            id: e2::kid(&format!("{tag}-born-dissolved")),
+            id: e2::kid(&format!("born-dissolved-{tag}")),
             keys: w.keys.clone(),
             founding_hash: String::new(),
         };
@@ -368,10 +368,13 @@ pub mod bodies {
                 persist_row_hash: String::new(),
             },
         );
-        let e = e2::put_voices(a, &e2::family_revocation_voices(&rev, Some(&head)))
-            .await
-            .expect_err("no roster row names a dissolved family");
-        assert!(is_dissolved_refusal(&e), "{tag} I282: {e:?}");
+        // v62 (E4-fix6; CC 2.7.3): read against the held (dissolved) head,
+        // the revocation is held or refused by name; it concludes nothing.
+        match e2::put_voices(a, &e2::family_revocation_voices(&rev, Some(&head))).await {
+            Ok(StatementOutcome::Pending { .. }) => {}
+            Err(e) => assert!(is_dissolved_refusal(&e), "{tag} I282: {e:?}"),
+            Ok(other) => panic!("{tag} I282: no roster row names a dissolved family: {other:?}"),
+        }
         assert_eq!(held(a, &w.id).await.dissolved_at, Some(at(DISSOLVED)));
     }
 

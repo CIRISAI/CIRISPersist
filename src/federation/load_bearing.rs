@@ -1462,11 +1462,13 @@ pub(crate) mod test_support {
         let root = format!("lb-root-{suffix}");
         register_hybrid_key(dir, &node).await;
         // v61 (CIRISPersist#1122) — a node: an agent key announces no route.
+        // E5-fix2 (round 6) — and an AGENT too: the retained row is a REAL
+        // trace, which only its agent's key authors (CC 3.1.5, key_roles R4).
         crate::federation::tier_ingest::test_support::register_hybrid_key_as(
             dir,
             &live_peer,
             &live_peer,
-            crate::federation::types::identity_type::NODE,
+            "node,agent",
         )
         .await;
         register_hybrid_key(dir, &root).await;

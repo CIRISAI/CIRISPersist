@@ -995,9 +995,7 @@ pub(crate) mod two_node {
     };
     use crate::federation::edition2::names::RowId;
     use crate::federation::epoch_minter_invariants::bodies::{ladder, Pick};
-    use crate::federation::key_grant::{
-        is_key_grant_row, KeyGrantAxis, KeyGrantRow, SignedKeyGrantRow,
-    };
+    use crate::federation::key_grant::{is_key_grant_row, KeyGrantAxis, KeyGrantRow};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::COMMUNITY;
     use crate::federation::types::identity_type::NODE;
@@ -1287,10 +1285,16 @@ pub(crate) mod two_node {
         let b_set = set_carrying(b, &l.comm, &l.node_b, 0, &l.node_a)
             .await
             .expect("B emitted its row to A");
-        l.engine_a
-            .apply_replicated_key_grant(SignedKeyGrantRow { attestation: b_set })
-            .await
-            .unwrap_or_else(|e| panic!("A admits B's row: {e}"));
+        // v62.0.0 (E13 fix2; CP2) — the row is delivered as its edition-2
+        // statement (B's filtered serve, A's replicated statement door); the
+        // earlier-form `apply_replicated_key_grant` object is refused at the
+        // shut doors.
+        let a_dyn0: &dyn FederationDirectory = a;
+        deliver(
+            a_dyn0,
+            &served(b, &l.node_a, &[RowId(e2::rid_digest(&b_set))]).await,
+        )
+        .await;
         // And an epoch A holds a self-retention for under a FOREIGN minter's
         // name: the door may re-wrap it locally, never sign a set for it.
         let foreign = format!("fm-{run}");
@@ -1475,10 +1479,14 @@ pub(crate) mod two_node {
             let row = set_carrying(a, &l.comm, &l.node_a, *e, &l.node_b)
                 .await
                 .unwrap_or_else(|| panic!("(T) A's row for epoch {e} to bob's node"));
-            l.engine_b
-                .apply_replicated_key_grant(SignedKeyGrantRow { attestation: row })
-                .await
-                .unwrap_or_else(|e| panic!("(T) B admits A's row: {e:?}"));
+            // v62.0.0 (E13 fix2; CP2) — as a statement (A's filtered serve,
+            // B's replicated statement door).
+            let b_dyn: &dyn FederationDirectory = b;
+            deliver(
+                b_dyn,
+                &served(a, &l.node_b, &[RowId(e2::rid_digest(&row))]).await,
+            )
+            .await;
         }
         for e in &own {
             for d in [&d1, &d2, &d3, &d6, &d7] {

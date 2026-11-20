@@ -12,8 +12,11 @@
 #[cfg(test)]
 pub(crate) mod bodies {
     use crate::federation::key_grant::SignedKeyGrantRow;
+    // v62 (E4-fix6; CP2): a replicated key-grant row crosses as its
+    // statement through the replicated statement door (E11's
+    // `admit_replicated`); the engine's earlier-form key-grant door is shut.
     use crate::federation::key_grant_invariants::two_node::{
-        introduce_as, seed_community_everywhere, Node,
+        admit_replicated, introduce_as, seed_community_everywhere, Node,
     };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
@@ -202,9 +205,7 @@ pub(crate) mod bodies {
         assert!(matches!(err, BlobError::NotGranted { .. }), "I126: {err}");
 
         // (b) the product path: set carried, then the bytes.
-        let admission = l
-            .engine_b
-            .apply_replicated_key_grant(set)
+        let admission = admit_replicated(l.bb.as_ref(), set)
             .await
             .expect("B admits A's row");
         assert!(admission.projected, "{admission:?}");
@@ -246,7 +247,7 @@ pub(crate) mod bodies {
     {
         let l = ladder(dsn_a, dsn_b, run, pick).await;
         let (sha, bytes, set) = seal_and_set(&l, b"explicit").await;
-        l.engine_b.apply_replicated_key_grant(set).await.unwrap();
+        admit_replicated(l.bb.as_ref(), set).await.unwrap();
         let err = l
             .engine_b
             .adopt_sealed_blob(
@@ -293,7 +294,7 @@ pub(crate) mod bodies {
     {
         let l = ladder(dsn_a, dsn_b, run, pick).await;
         let (_sha, _bytes, set) = seal_and_set(&l, b"derived").await;
-        l.engine_b.apply_replicated_key_grant(set).await.unwrap();
+        admit_replicated(l.bb.as_ref(), set).await.unwrap();
         let b = l.bb.clone();
         assert_eq!(
             b.community_dek_minters_granting(&l.comm, 0, &l.node_b)
@@ -525,7 +526,7 @@ pub(crate) mod bodies {
             .await
             .is_err());
         // The set lands: the stranded binding rebinds and the body opens.
-        l.engine_b.apply_replicated_key_grant(set).await.unwrap();
+        admit_replicated(l.bb.as_ref(), set).await.unwrap();
         let (_c, minter, _e) = b.community_dek_blob_epoch(&sha).await.unwrap().unwrap();
         assert_eq!(minter, l.node_a, "I129: rebound to the set's minter");
         assert_eq!(
@@ -589,7 +590,7 @@ pub(crate) mod bodies {
         // A correct binding is NOT rebound by a later set from elsewhere.
         let l2 = ladder(dsn_a, dsn_b, &format!("{run}y"), pick).await;
         let (sha2, bytes2, set2) = seal_and_set(&l2, b"already right").await;
-        l2.engine_b.apply_replicated_key_grant(set2).await.unwrap();
+        admit_replicated(l2.bb.as_ref(), set2).await.unwrap();
         l2.engine_b
             .adopt_sealed_blob(
                 &bytes2,
@@ -704,7 +705,7 @@ pub(crate) mod bodies {
             "I131: by member: {err}"
         );
         // And the derived provenance carries the adopt end to end.
-        l.engine_b.apply_replicated_key_grant(set).await.unwrap();
+        admit_replicated(l.bb.as_ref(), set).await.unwrap();
         l.engine_b
             .adopt_sealed_blob(&bytes, p, None, AdoptDisposition::LocalOnly)
             .await
@@ -837,7 +838,7 @@ pub(crate) mod bodies {
             p.minter_key_id.is_none(),
             "I132: the minter is still derived"
         );
-        l.engine_b.apply_replicated_key_grant(set).await.unwrap();
+        admit_replicated(l.bb.as_ref(), set).await.unwrap();
         l.engine_b
             .adopt_sealed_blob(&bytes, p, None, AdoptDisposition::LocalOnly)
             .await
@@ -1247,8 +1248,11 @@ mod run {
 pub(crate) mod room_1271 {
     use super::bodies::Pick;
     use crate::federation::key_grant::SignedKeyGrantRow;
+    // v62 (E4-fix6; CP2): a replicated key-grant row crosses as its
+    // statement through the replicated statement door (E11's
+    // `admit_replicated`); the engine's earlier-form key-grant door is shut.
     use crate::federation::key_grant_invariants::two_node::{
-        introduce_as, seed_community_everywhere, Node,
+        admit_replicated, introduce_as, seed_community_everywhere, Node,
     };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
@@ -1486,8 +1490,7 @@ pub(crate) mod room_1271 {
             &r.node_c,
         )
         .await;
-        r.carol_engine
-            .apply_replicated_key_grant(b_to_c)
+        admit_replicated(r.bc.as_ref(), b_to_c)
             .await
             .expect("Carol admits Bob's epoch-0 row");
         assert_eq!(
@@ -1522,8 +1525,7 @@ pub(crate) mod room_1271 {
     {
         let r = room(dsns, run, pick).await;
         let (sha_a, _bytes, a_to_c) = bob_first(&r).await;
-        r.carol_engine
-            .apply_replicated_key_grant(a_to_c)
+        admit_replicated(r.bc.as_ref(), a_to_c)
             .await
             .expect("Carol admits Alice's epoch-0 row");
         assert_eq!(
@@ -1642,8 +1644,7 @@ pub(crate) mod room_1271 {
             vec![(sha_a, r.alice.clone(), Some(r.alice.clone()))],
             "I1778: the stranded row is listed with its author"
         );
-        r.carol_engine
-            .apply_replicated_key_grant(b_to_c)
+        admit_replicated(r.bc.as_ref(), b_to_c)
             .await
             .expect("Carol admits Bob's epoch-0 row");
         assert_eq!(
@@ -1651,8 +1652,7 @@ pub(crate) mod room_1271 {
             r.alice,
             "I1778: Bob's set does not claim a row Alice authored"
         );
-        r.carol_engine
-            .apply_replicated_key_grant(a_to_c)
+        admit_replicated(r.bc.as_ref(), a_to_c)
             .await
             .expect("Carol admits Alice's epoch-0 row");
         assert_eq!(
@@ -1708,10 +1708,7 @@ pub(crate) mod room_1271 {
             &r.node_c,
         )
         .await;
-        r.carol_engine
-            .apply_replicated_key_grant(b_to_c)
-            .await
-            .unwrap();
+        admit_replicated(r.bc.as_ref(), b_to_c).await.unwrap();
         r.carol_engine
             .adopt_sealed_blob(
                 &bytes_a,
@@ -1760,10 +1757,7 @@ pub(crate) mod room_1271 {
             "I1779: a failed heal rebinds nothing"
         );
 
-        r.carol_engine
-            .apply_replicated_key_grant(a_to_c)
-            .await
-            .unwrap();
+        admit_replicated(r.bc.as_ref(), a_to_c).await.unwrap();
         assert_eq!(
             bound(&r.bc, &sha_a).await,
             r.node_b,
@@ -1890,10 +1884,7 @@ pub(crate) mod room_1271 {
             )
             .await
             .unwrap();
-        r.carol_engine
-            .apply_replicated_key_grant(b_to_c)
-            .await
-            .unwrap();
+        admit_replicated(r.bc.as_ref(), b_to_c).await.unwrap();
         // NEGATIVE: only Bob grants Carol; his DEK does not open Alice's
         // bytes. NotGranted, as before, and the row is untouched.
         let err = r
@@ -1911,10 +1902,7 @@ pub(crate) mod room_1271 {
             .expect_err("a stranger");
         assert!(matches!(err, BlobError::NotGranted { .. }), "{err}");
 
-        r.carol_engine
-            .apply_replicated_key_grant(a_to_c)
-            .await
-            .unwrap();
+        admit_replicated(r.bc.as_ref(), a_to_c).await.unwrap();
         assert_eq!(
             bound(&r.bc, &sha_a).await,
             ghost,
@@ -1986,10 +1974,7 @@ pub(crate) mod room_1271 {
         )
         .await;
         for row in [a_to_c, b_to_c] {
-            r.carol_engine
-                .apply_replicated_key_grant(row)
-                .await
-                .unwrap();
+            admit_replicated(r.bc.as_ref(), row).await.unwrap();
         }
         r.carol_engine
             .adopt_sealed_blob(
@@ -2082,9 +2067,7 @@ pub(crate) mod room_1271 {
             &r.node_c,
         )
         .await;
-        let err = r
-            .carol_engine
-            .apply_replicated_key_grant(a_to_c.clone())
+        let err = admit_replicated(r.bc.as_ref(), a_to_c.clone())
             .await
             .expect_err("I1782: an unresolved node's epoch row is not admitted");
         assert!(
@@ -2130,8 +2113,7 @@ pub(crate) mod room_1271 {
         })
         .await
         .unwrap();
-        r.carol_engine
-            .apply_replicated_key_grant(a_to_c)
+        admit_replicated(r.bc.as_ref(), a_to_c)
             .await
             .expect("I1782: re-offered after the occurrence, admitted");
         assert_eq!(

@@ -5129,63 +5129,14 @@ pub mod blob_invariants {
              withdrawn — a retry after a partial failure double-retracts"
         );
 
-        // (b) announce again under a NEW epoch; make the withdraws inadmissible
-        //     by handing the sweep a `now` far outside the admission skew; the
-        //     bytes and binding must survive and the error must surface.
-        let sealed2 = encrypt_and_cascade_community(backend, &comm, b"newer", None, Some(&minter))
-            .await
-            .unwrap();
-        let Some(BlobBody::Inline(bytes2)) =
-            backend.get_blob(&sealed2.at_rest_sha256).await.unwrap()
-        else {
-            panic!("{tag} I18: sealed blob is inline");
-        };
-        backend
-            .put_blob_signing_at(
-                crate::federation::types::cohort_scope::COMMUNITY,
-                crate::federation::StorageFloor::resolved(
-                    crate::federation::types::cohort_scope::CryptoTier::CommunityDek,
-                ),
-                &sealed2.at_rest_sha256,
-                BlobBody::Inline(bytes2),
-                None,
-                &signer.federation_id().await,
-                &signer,
-                crate::host::clock::now(),
-                uuid::Uuid::new_v4(),
-                None,
-            )
-            .await
-            .unwrap();
-        backend
-            .community_dek_bump_epoch(&comm, &minter)
-            .await
-            .unwrap();
-        let far_future = crate::host::clock::now() + chrono::Duration::days(3650);
-        let res = backend
-            .community_dek_evict_epoch_objects(&comm, &minter, sealed2.epoch, &signer, far_future)
-            .await;
-        assert!(
-            res.is_err(),
-            "{tag} I18(b): the withdraws could not be admitted and the eviction reported SUCCESS"
-        );
-        assert!(
-            backend
-                .get_blob(&sealed2.at_rest_sha256)
-                .await
-                .unwrap()
-                .is_some(),
-            "{tag} I18(b): the bytes were DELETED although the retraction failed — \
-             list_holders will name this node for content it cannot serve"
-        );
-        assert_eq!(
-            backend
-                .community_dek_epoch_object_count(&comm, &minter, sealed2.epoch)
-                .await
-                .unwrap(),
-            1,
-            "{tag} I18(b): the binding survives a failed eviction"
-        );
+        // E5-fix2 (round 6) — leg (b) is DELETED (ruling 4). It made the
+        // withdraws inadmissible by handing the sweep a `now` far outside the
+        // admission skew; under edition 2 the withdraws is a statement whose
+        // instant its SIGNER stamps (`blobs::emit_withdraws_attestation_helper`:
+        // "`now` is no longer read", CC 2.6.2), so a caller's clock cannot make
+        // it fail and the leg asserted the earlier form. A failed retraction
+        // still aborts the eviction (the helper's `?`); a witness of it needs a
+        // signer the door refuses, not a skewed clock.
     }
 
     // ── I19 ──────────────────────────────────────────────────────────────

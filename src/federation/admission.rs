@@ -1267,12 +1267,6 @@ pub const TRUST_PLANE_OPS: &[(&str, &str, &str)] = &[
          ownership enforced against the STORED trusted_by inside every backend",
         "check_trust_revocation_authority",
     ),
-    (
-        "emit::grant_trust (V021 audit-chained twin)",
-        "unilateral-signed by construction: the granter IS the LocalSigner, self-grant \
-         structurally refused, landed via the audit chain",
-        "grant_trust",
-    ),
 ];
 
 /// Reason token for [`check_ledger_binding_admission`] refusals. A token on
@@ -2593,14 +2587,12 @@ where
     )
     .await?;
     let sig_pqc = input.scrub_signature_pqc.as_deref();
-    let hash = crate::federation::verify_envelope_hybrid_signature(
-        directory,
+    let hash = crate::federation::edition2::group::vouched_envelope(
         &input.attesting_key_id,
         &input.attestation_envelope.to_value(),
         sig_classical,
-        sig_pqc,
-    )
-    .await?;
+        "local_attestation",
+    )?;
     Ok(Some((
         hash,
         sig_classical.to_string(),
@@ -21942,7 +21934,9 @@ mod tests {
     ///
     /// The ADMISSION rows are what stops this becoming "dimensions must be
     /// lowercase" — a `value` segment is caller identity and CC's own worked
-    /// example (`licensure:CA_medical_board`) must stay legal.
+    /// example (a licensing authority, `licensure:{authority_id}`; since rc21
+    /// the segment is the authority key's bare thumbprint, mixed case) must
+    /// stay legal.
     #[test]
     fn dimension_case_rule_is_per_segment_815() {
         let mk = |dim: &str| {
@@ -21971,6 +21965,18 @@ mod tests {
                 additional_scrubs: Vec::new(),
             }
         };
+        // v62.0.0 (E12-fix3; rc21 re-vendor) — `licensure:{authority_id}`'s
+        // segment is now a key's bare thumbprint (base64url, mixed case): CC's
+        // worked example is a licensing authority's thumbprint, and its case
+        // is preserved (the `CA_medical_board` spelling matches no thumbprint).
+        let licence = format!(
+            "licensure:{}",
+            crate::federation::edition2::fixture_switch::kid_thumb("dcr815-ca-medical-board")
+        );
+        assert!(
+            licence.bytes().any(|b| b.is_ascii_uppercase()),
+            "the worked example carries upper case, or it witnesses nothing: {licence}"
+        );
         for (dim, refused, why) in [
             (
                 "config:Admission:v1",
@@ -21990,11 +21996,11 @@ mod tests {
                 "the operational leaf still travels",
             ),
             (
-                "licensure:CA_medical_board",
+                licence.as_str(),
                 false,
-                "CC's OWN worked example — `{authority_id}` is a `value` segment \
-                 and its case is preserved; refusing it would be the vocabulary \
-                 change persist must not make",
+                "CC's OWN worked example — `{authority_id}` is a thumbprint \
+                 segment and its case is preserved; refusing it would be the \
+                 vocabulary change persist must not make",
             ),
             ("duty:attribute:v1", false, "the v42.0.0 family, conformant"),
         ] {
@@ -24773,6 +24779,16 @@ mod tests {
         // gate is `cosign::admit_row` (and `cosign::read_row`'s canonical-row
         // rule); the audience is `cosign::may_receive`.
         "cosign:",
+        // rc20 re-vendor (v62.0.0; CC 3.3.3, CC 4.5.9) — "subject-only
+        // (attesting_key_id is the subject; no delegation mints one)": the
+        // rule asks whether the signer IS the row's subject, which no identity
+        // type expresses. A location proof is an edition-2 row only (the JSON
+        // door, `evidence_admit`, is shut: `refuse_earlier_form`), and the
+        // edition-2 door enforces it: Verify's family model states the
+        // family's authorship `subject` (`family_authorship.json`,
+        // `location_proof:{version}`), refused before any persist gate.
+        // (E12-fix3.)
+        "location_proof:",
         // rc21 re-vendor (v62.0.0 R1c, CC 3.1.3 / CC 2.7.11) — reserved
         // `substrate-self-report` (CC 3.4.3), and the rule CC 2.7.11 states is
         // "every signer is a person": no program's key admits a unit, which no
@@ -25122,8 +25138,10 @@ mod tests {
     /// row naming a gate that does not exist is #590's free-text pin.
     #[test]
     fn trust_plane_ops_are_classified_and_their_gates_resolve_721() {
-        assert!(TRUST_PLANE_OPS.len() >= 4, "vacuous table");
-        let sources = [include_str!("admission.rs"), include_str!("emit.rs")];
+        // v62.0.0 (F0-cp8) — three ops: the V021 audit-chained twin
+        // (`emit::grant_trust`) is deleted.
+        assert_eq!(TRUST_PLANE_OPS.len(), 3, "the trust-plane ops");
+        let sources = [include_str!("admission.rs")];
         for (op, classification, gate) in TRUST_PLANE_OPS {
             assert!(
                 classification.len() > 40,
@@ -26097,7 +26115,7 @@ mod tests {
         // enough to speak for anyone.
         let node = e2::put_key(dir, &node_s, &[identity_type::NODE]).await;
         let owner = e2::put_key(dir, &owner_s, &[identity_type::USER]).await;
-        let stranger = e2::put_key(dir, &stranger_s, &[identity_type::AGENT]).await;
+        e2::put_key(dir, &stranger_s, &[identity_type::AGENT]).await;
 
         // The live owner-binding `delegates_to(owner → node)` — the edge
         // `owner_of` walks — the owner's statement and the node's own voice
@@ -26187,23 +26205,22 @@ mod tests {
             "(2) the owner-authored row must be STORED"
         );
 
-        // (3) THIRD-PARTY — the rumour. Refused, BY THIS GATE.
+        // (3) THIRD-PARTY — the rumour. v62.0.0 (E12-fix3; CC 2.7.3): whether
+        // the author is the subject's owner reads OTHER rows (the owner
+        // binding), so the rumour is HELD at the door, never refused: the
+        // statement is kept, `Pending`, and concludes nothing (4). The
+        // earlier arm that read the refusal's text is gone with the refusal.
         let rumour = row(&id_of("rumour"), &stranger_s, &node_s, "config:load:v1");
         let rumour_id = e2::rid(&e2::row_of(&rumour, &stranger_s));
-        let err = e2::try_put_row(dir, &rumour, &stranger_s)
+        let held = e2::put_statement(dir, &e2::statement_of(&rumour, &stranger_s))
             .await
-            .expect_err("a third-party config:* row must be REFUSED (CC 3.4.5 self-or-owner)");
-        let msg = err.to_string();
+            .expect("a third-party config:* row is kept (held), not refused");
         assert!(
-            msg.contains("SELF-REPORT") && msg.contains("CC 3.4.5"),
-            "(3) the refusal must come from the config self-or-owner gate, not a \
-             neighbour that happened to refuse first: {msg}"
-        );
-        assert!(
-            msg.contains(&stranger) && msg.contains(&node) && msg.contains(&owner),
-            "(3) the refusal must name the author, the subject and the owner the walk \
-             actually resolved — a refusal a reader cannot act on sends them to the \
-             wrong layer: {msg}"
+            matches!(
+                held,
+                crate::federation::edition2::ingest::StatementOutcome::Pending { .. }
+            ),
+            "(3) a third-party config:* row is HELD (CC 3.4.5 self-or-owner): {held:?}"
         );
 
         // (4) VERIFY-BEFORE-MUTATION (AV-9) — and the reason it is asserted
@@ -26268,8 +26285,16 @@ mod tests {
         };
         let staged = dir.get_attestation(&staged_id).await.unwrap().unwrap();
         let ci = ts::describe_own(&staged, crate::federation::CrossingBasis::ProducerAuthority);
+        // v62.0.0 (E12-fix3; P8) — an edition-2 row crosses on its own
+        // statement (`TierPromotionCustody::Statement`); an actor reseal of it
+        // is refused before the promotion gate is asked.
+        let custody = crate::federation::crossing::TierPromotionCustody::of_statement(
+            &staged,
+            chrono::Utc::now(),
+        )
+        .expect("(6) the staged row carries its statement");
         let err = dir
-            .enter_mesh(&staged_id, &ci, &ts::actor_reseal(&staged))
+            .enter_mesh(&staged_id, &ci, &custody)
             .await
             .expect_err("(6) crossing a third-party config:* row must be REFUSED");
         assert!(
@@ -26843,12 +26868,128 @@ pub(crate) mod r2_test_support {
         // The rows are deterministic (today's UTC midnight, inside an agent
         // key's default window), so re-asserting the shared charter / accept
         // row is the same statement.
-        let now = {
+        //
+        // v62.0.0 (E12-fix4) — DATED FROM THE KEY WINDOWS: a row asserted
+        // before its signer's (or, for a voice, its voicer's) `key:record`
+        // starts is outside that key's window, so the instant is the latest of
+        // midnight and every signer's record start (plus one second). A
+        // caller whose keys were registered today (an engine's own key, a
+        // `put_key_with` start) is no longer dated before them; a default
+        // window (180 days back) keeps today's midnight, unchanged.
+        ensure_conferral_keys(dir, node, root).await;
+        let midnight = {
             use chrono::TimeZone as _;
             let today = chrono::Utc::now().date_naive();
             chrono::Utc.from_utc_datetime(&today.and_hms_opt(0, 0, 0).expect("midnight"))
         };
+        let mut now = midnight;
+        for k in [node, root, subject] {
+            let held = dir
+                .lookup_public_key(&crate::federation::edition2::fixture_switch::kid_or_keep(k))
+                .await
+                .ok()
+                .flatten();
+            if let Some(rec) = held {
+                let after = rec.valid_from + chrono::Duration::seconds(1);
+                if after > now {
+                    now = after;
+                }
+            }
+        }
+        let now = crate::federation::admission::truncate_to_substrate_resolution(now);
         confer_scope_from_trusted_root_at(dir, node, root, subject, scope, now).await;
+    }
+
+    /// v62.0.0 (E12-fix4; CC 4.4.3.19, K2's second-signer gate) — when
+    /// `subject` is a MACHINE key (`node` / `agent` in its held record) with
+    /// no owner bound, bind one: a fixture person `own-<subject seed>` (a
+    /// seed that differs from the subject's in its first 32 bytes), live as a
+    /// `user` key, bound at `at` — an agent through O1's edition-2 agent
+    /// owner binding (`agent_owner_of` reads it), a node through
+    /// `steward_liveness_test_support::bind_machine_owner` (the node's voice
+    /// included). A person's key, or a machine already owned, is left alone.
+    async fn bind_owner_if_machine(
+        dir: &dyn FederationDirectory,
+        subject: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::types::identity_type as it;
+        let sub = e2::kid_or_keep(subject);
+        let Some(agent) = machine_kind(dir, &sub).await else {
+            return;
+        };
+        if machine_owner_of(dir, &sub, at).await.is_some() {
+            return;
+        }
+        let at_ms = e2::ms(at);
+        let owner_seed = format!("own-{}", e2::seed_of(&sub));
+        e2::put_key(dir, &owner_seed, &[it::USER]).await;
+        if agent {
+            e2::put_agent_owner_binding(dir, &owner_seed, &sub, at_ms).await;
+        } else {
+            super::steward_liveness_test_support::bind_machine_owner(
+                dir,
+                &owner_seed,
+                &e2::seed_of(&sub),
+            )
+            .await;
+        }
+    }
+
+    /// `Some(true)` for an `agent` key, `Some(false)` for a `node` key, `None`
+    /// for anything else (a person's key, or no record held).
+    async fn machine_kind(dir: &dyn FederationDirectory, key: &str) -> Option<bool> {
+        use crate::federation::types::identity_type as it;
+        let rec = dir.lookup_public_key(key).await.ok().flatten()?;
+        if it::set_contains(&rec.identity_type, it::AGENT) {
+            Some(true)
+        } else if it::set_contains(&rec.identity_type, it::NODE) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// The bound owner of a MACHINE `key` at `at` (K2's `owner_of_sub`
+    /// reading: an agent's edition-2 agent owner binding, else the owner
+    /// binding); `None` for a person's key or an unowned machine.
+    async fn machine_owner_of(
+        dir: &dyn FederationDirectory,
+        key: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Option<String> {
+        use crate::federation::edition2::fixture_switch as e2;
+        let key = e2::kid_or_keep(key);
+        let agent = machine_kind(dir, &key).await?;
+        if agent {
+            if let Some(o) = super::agent_owner_of(dir, &key, e2::ms(at))
+                .await
+                .ok()
+                .flatten()
+            {
+                return Some(o);
+            }
+        }
+        super::owner_of(dir, &key).await.ok().flatten()
+    }
+
+    /// The node's and the root's keys, live as edition-2 `agent` keys unless
+    /// already held (a caller may pass the node's own engine key, whose
+    /// record is already held). Ids are identity-refs (`e2::kid_or_keep`).
+    async fn ensure_conferral_keys(dir: &dyn FederationDirectory, node: &str, root: &str) {
+        use crate::federation::edition2::fixture_switch as e2;
+        for k in [node, root] {
+            if dir
+                .lookup_public_key(&e2::kid_or_keep(k))
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                e2::put_key(dir, k, &[crate::federation::types::identity_type::AGENT]).await;
+            }
+        }
     }
 
     /// v62.0.0 (K2-fix11) — [`confer_scope_from_trusted_root`] with the three
@@ -26871,17 +27012,12 @@ pub(crate) mod r2_test_support {
         // when missing (a caller may pass the node's own engine key, whose
         // record is already held). Ids are identity-refs (`e2::kid_or_keep`).
         use crate::federation::edition2::fixture_switch as e2;
-        for k in [node, root] {
-            if dir
-                .lookup_public_key(&e2::kid_or_keep(k))
-                .await
-                .ok()
-                .flatten()
-                .is_none()
-            {
-                e2::put_key(dir, k, &[crate::federation::types::identity_type::AGENT]).await;
-            }
-        }
+        ensure_conferral_keys(dir, node, root).await;
+        // v62.0.0 (E12-fix4; CC 4.4.3.19) — a MACHINE subject's grant waits
+        // for its owner's voice, so an unowned machine subject is given one
+        // first ([`bind_owner_if_machine`]); `land_delegation` below then
+        // lands the owner's voice with the subject's.
+        bind_owner_if_machine(dir, subject, now).await;
         // The same instant for the same arguments is the same statement — the
         // node computes the same id, and the fixture skips a row it already
         // holds.
@@ -26946,17 +27082,55 @@ pub(crate) mod r2_test_support {
             }
             let confers = row.attestation_envelope.get("dimension")
                 == Some(&serde_json::Value::from(TRUST_CONFERS_DIMENSION));
-            e2::put_signed(dir, &row)
-                .await
-                .unwrap_or_else(|e| panic!("conferral row must admit: {e}"));
             // v62 (E4 round 3; CC 2.6.1.9): Verify's `confers` rule asks the
-            // subject for a second voice (`delegate: sub`); without it the
-            // grant is held and confers nothing.
-            if confers {
-                let st = e2::carried_statement(&row).expect("the grant carries its statement");
-                e2::put_statement(dir, &e2::voice_of(&st, to))
+            // subject for a second voice (`delegate: sub`), and a MACHINE
+            // subject's owner for another (`delegate_owner: owner_of_sub`,
+            // CC 4.4.3.19); without them the grant is held and confers
+            // nothing. v62.0.0 (E12-fix4): E0's `land_delegation` gives exactly
+            // those voices (the author's statement, the subject's voice, and a
+            // machine subject's bound owner's), as every own-act grant lands.
+            let out = if confers {
+                // The voices `land_delegation` gives, with an AGENT subject's
+                // owner read from its edition-2 agent owner binding
+                // (`agent_owner_of`, which `land_delegation`'s `owner_of`
+                // does not read).
+                let mut voices = vec![to.to_owned()];
+                if let Some(owner) = machine_owner_of(dir, to, now).await {
+                    voices.push(owner);
+                }
+                let refs: Vec<&str> = voices.iter().map(String::as_str).collect();
+                e2::land_with_voices(dir, &row, &refs)
                     .await
-                    .unwrap_or_else(|e| panic!("the subject's voice on the conferral: {e}"));
+                    .unwrap_or_else(|e| panic!("the conferral and its voices must admit: {e}"))
+            } else {
+                e2::put_signed(dir, &row)
+                    .await
+                    .unwrap_or_else(|e| panic!("conferral row must admit: {e}"))
+            };
+            // v62.0.0 (E12-fix4) — a HELD edge confers nothing, and a caller's
+            // "conferred" leg then fails far from the cause (#611's chain
+            // comes back empty; a detector's row is refused
+            // `ReservedPrefixEmitterMismatch`). Name the held edge and the
+            // fold's reason here.
+            if let crate::federation::edition2::ingest::StatementOutcome::Pending {
+                row_id, ..
+            } = &out
+            {
+                let why = crate::federation::edition2::fold::why_held(dir, row_id)
+                    .await
+                    .ok()
+                    .flatten();
+                panic!(
+                    "confer_scope_from_trusted_root: the {:?} edge {from} -> {to} at {now} is HELD, \
+                     not landed: {why:?}{}",
+                    row.attestation_envelope.get("dimension"),
+                    if confers {
+                        " (a machine subject needs its owner bound before the grant: \
+                         `steward_liveness_test_support::bind_machine_owner`)"
+                    } else {
+                        ""
+                    }
+                );
             }
         }
     }
@@ -27210,29 +27384,30 @@ pub(crate) mod r2_test_support {
             }
         };
 
-        // ── (1) ABOUT ANOTHER PARTY, no conferral — REFUSED ───────────────
+        // ── (1) ABOUT ANOTHER PARTY, no conferral — HELD ──────────────────
+        // v62.0.0 (E12-fix3; CC 2.7.3) — whether the author holds an
+        // `infra:record_hard_case` conferral from this node's trust root
+        // reads OTHER rows (the conferral chain), so the row is HELD at the
+        // door, never refused: kept, `Pending`, and not persisted. The arms
+        // that read the refusal's kind and text are gone with the refusal.
         let forged_row = row("forged", &victim);
         let forged = e2::try_row_of(&forged_row, &author)
             .map(|r| e2::rid(&r))
             .unwrap_or_default();
-        let err = e2::try_put_row(dir, &forged_row, &author).await.expect_err(
-            "a self-asserted substrate_persist must NOT file a hard_case record about a \
-                 third party — that is CIRISPersist#607",
-        );
-        assert_eq!(
-            err.kind(),
-            "federation_reserved_prefix_emitter_mismatch",
-            "must refuse at the reserved-prefix door, not incidentally elsewhere: {err}"
-        );
+        let held = e2::put_statement(dir, &e2::statement_of(&forged_row, &author))
+            .await
+            .expect("a third-party hard_case row is kept (held), not refused");
         assert!(
-            err.to_string()
-                .contains(delegation_scope::INFRA_RECORD_HARD_CASE),
-            "the refusal must NAME the missing conferral (#565) — an is_err() check alone would \
-             pass on an unregistered key or a bad signature. Got: {err}"
+            matches!(
+                held,
+                crate::federation::edition2::ingest::StatementOutcome::Pending { .. }
+            ),
+            "a self-asserted substrate_persist must NOT file a hard_case record about a \
+             third party — that is CIRISPersist#607: {held:?}"
         );
         assert!(
             dir.get_attestation(&forged).await.expect("get").is_none(),
-            "a row refused by the #607 gate must not be persisted"
+            "a row held by the #607 gate must not be persisted"
         );
 
         // ── (2) ABOUT ITSELF, no conferral — ADMITTED ─────────────────────
@@ -27458,6 +27633,16 @@ pub(crate) mod steward_liveness_test_support {
                 "references_attestation_id": target_attestation_id,
             }),
         )
+    }
+
+    /// v62.0.0 (E12-fix3) — the granter's `withdraws` of its OWN edge `edge`,
+    /// naming it (`refs.target`; the codec resolves the id the fixture gave
+    /// the sealed edge to its row id). Every edition-2 composer names its
+    /// target (`payloads::check_composer`: `refs.target` is required), so the
+    /// BARE shape below has no edition-2 statement; this is the retraction
+    /// the granter can state.
+    pub(crate) fn edge_retraction(granter: &str, edge: &Attestation) -> Attestation {
+        withdraws_of(granter, &edge.attested_key_id, &edge.attestation_id)
     }
 
     /// The §11.10 **edge-retraction** shape: a granter's `withdraws` naming
@@ -27768,17 +27953,16 @@ pub(crate) mod steward_liveness_test_support {
             "the inverse projection must not keep listing a node whose only edge is dead"
         );
 
-        // ── the granter-scoped arm still works (no regression) ───────────
-        // Deliberately the BARE §11.10 edge-retraction, with no
-        // `references_attestation_id`: the new clause cannot see it, so this
-        // step fails if the granter-scoped clause is ever dropped as
-        // "subsumed". (It is not subsumed — the two clauses read different
-        // rows.)
+        // ── the granter's own retraction still works (no regression) ─────
+        // v62.0.0 (E12-fix3): the earlier BARE §11.10 edge-retraction (no
+        // target) has no edition-2 statement (a composer names its target),
+        // so the arm that kept the granter-scoped clause load-bearing BY ITS
+        // SHAPE is gone; the granter's retraction now names the edge.
         let node2 = e2::kid(&format!("sb-node2-{suffix}"));
         let edge2 = delegates_to(&granter, &node2, &[ds::INFRA_SERVE], &[]);
         store(dir, &edge2).await.expect("second edge admitted");
         assert_biconditional(dir, &node2, true, "second live edge").await;
-        store(dir, &bare_edge_retraction(&granter, &node2))
+        store(dir, &edge_retraction(&granter, &edge2))
             .await
             .expect("the granter's own edge-retraction lands");
         assert!(
@@ -27862,7 +28046,8 @@ pub(crate) mod steward_liveness_test_support {
 
         // THE #811 STATE: the sole custody edge is withdrawn by its granter
         // while the conferral stays live.
-        let custody_gone = bare_edge_retraction(&custodian, &agent);
+        // v62.0.0 (E12-fix3): the custodian's retraction names its edge.
+        let custody_gone = edge_retraction(&custodian, &custody);
         store(dir, &custody_gone)
             .await
             .expect("the custodian's edge retraction must be admitted");
@@ -27908,7 +28093,7 @@ pub(crate) mod steward_liveness_test_support {
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod moderation_walk_liveness_test_support {
     use super::steward_liveness_test_support::{
-        bare_edge_retraction, register, signed_row, store, store_row, withdraws_of,
+        edge_retraction, register, signed_row, store, store_row, withdraws_of,
     };
     use super::*;
     use crate::federation::tier_ingest::test_support::sign_community;
@@ -28197,10 +28382,10 @@ pub(crate) mod moderation_walk_liveness_test_support {
             );
         }
 
-        // ── the granter-scoped arm is NOT subsumed ───────────────────────
-        // A BARE §11.10 edge-retraction carries no `references_attestation_id`,
-        // so the new incoming clause cannot see it. This step goes red if the
-        // granter-scoped clause is ever deleted as redundant.
+        // ── the granter's own retraction ─────────────────────────────────
+        // v62.0.0 (E12-fix3): the earlier BARE §11.10 edge-retraction (no
+        // target) has no edition-2 statement (a composer names its target);
+        // the granter's retraction names its edge, and the chain dies.
         let d2 = e2::kid(&format!("mw-deputy2-{suffix}"));
         let c2 = e2::kid(&format!("mw-commons2-{suffix}"));
         let f2 = e2::kid(&format!("mw-founder2-{suffix}"));
@@ -28209,15 +28394,14 @@ pub(crate) mod moderation_walk_liveness_test_support {
         }
         register(dir, &d2, &[identity_type::PRIMITIVE]).await;
         commons(dir, &c2, &f2, suffix).await;
-        store(dir, &moderation_edge(&f2, &d2, &[duty], &[], true))
-            .await
-            .expect("second chain admitted");
+        let edge_f2 = moderation_edge(&f2, &d2, &[duty], &[], true);
+        store(dir, &edge_f2).await.expect("second chain admitted");
         assert_moderator_agreement(dir, &c2, duty, &[&f2, &d2], "second live chain").await;
         assert_eq!(
             assert_reach_agreement(dir, &f2, &d2, duty, "second live chain").await,
             ReachabilityVerdict::Reachable
         );
-        store(dir, &bare_edge_retraction(&f2, &d2))
+        store(dir, &edge_retraction(&f2, &edge_f2))
             .await
             .expect("the granter's own edge-retraction lands");
         assert_eq!(
@@ -28283,10 +28467,9 @@ pub(crate) mod moderation_walk_liveness_test_support {
         };
 
         // ── clause (a): the GRANTER retracts its own edge ────────────────
-        // The #594 core. `bare_edge_retraction` carries NO
-        // `references_attestation_id` — it is the §11.10 edge-retraction
-        // shape, granter-against-recipient — so ONLY the granter-scoped gate
-        // can see it. If that gate is dropped this goes red.
+        // The #594 core. v62.0.0 (E12-fix3): the granter's retraction names
+        // its edge (`edge_retraction`; the earlier bare shape has no edition-2
+        // statement).
         let cr_from = e2::kid(&format!("mw-cr-from-{suffix}"));
         let cr_to = e2::kid(&format!("mw-cr-to-{suffix}"));
         register(dir, &cr_from, &[identity_type::USER]).await;
@@ -28311,7 +28494,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             .expect("consent-revocation walk"),
             "the live consent-revocation edge confers proxy authority"
         );
-        store(dir, &bare_edge_retraction(&cr_from, &cr_to))
+        store(dir, &edge_retraction(&cr_from, &cr_edge))
             .await
             .expect("the granter's own edge-retraction lands");
         assert!(
@@ -28918,8 +29101,9 @@ pub(crate) mod moderation_walk_liveness_test_support {
     ///  1. a capability conferral on an age-UNVERIFIED adult human is ADMITTED —
     ///     the case that was refused `target_age_unverified` and blocked
     ///     delegating moderation duties to people;
-    ///  2. an OWNER-BINDING on that same human is still REFUSED — CC 3.2 /
-    ///     CC 1.15.6 survive untouched; steward-binding an adult stays forbidden;
+    ///  2. an OWNER-BINDING on that same human still never lands (v62, CC
+    ///     2.7.3: HELD, concluding nothing) — CC 3.2 / CC 1.15.6 survive
+    ///     untouched; steward-binding an adult stays forbidden;
     ///  3. the fold does NOT count the conferral as stewardship;
     ///  4. the fold DOES still count an owner-binding.
     ///
@@ -28972,17 +29156,28 @@ pub(crate) mod moderation_walk_liveness_test_support {
         // v62 (E4 round 3; CC 2.7, C557): an owner-binding counts the owner's
         // and the bound key's voices (K2's `land_owner_binding`), so the CC
         // 3.2 gate, which runs after the count, is reached.
-        let err = e2::land_owner_binding(dir, &e2::row_of(&binding, &owner), &human)
+        // v62.0.0 (E12-fix3; CC 2.7.3) — the target's age band is ANOTHER
+        // row's fact, so the CC 3.2 gate HOLDS the binding (never refuses it):
+        // kept, `Pending`, and it concludes nothing — no stewardship of the
+        // human is established, which is the rule's whole content.
+        let held = e2::land_owner_binding(dir, &e2::row_of(&binding, &owner), &human)
             .await
-            .expect_err(
-                "steward-binding an age-unverified adult must STILL be refused — CC 3.2 / CC \
-                 1.15.6 are untouched by CIRISConstitution#87, and if this ever admits the \
-                 ruling has been read as a licence rather than a distinction",
-            );
-        assert_eq!(
-            err.kind(),
-            "federation_user_target_steward_binding_forbidden",
-            "must be refused by the CC 3.2 gate specifically, not incidentally elsewhere: {err}"
+            .expect("a steward-binding of an age-unverified adult is kept (held), not refused");
+        assert!(
+            matches!(
+                held,
+                crate::federation::edition2::ingest::StatementOutcome::Pending { .. }
+            ),
+            "steward-binding an age-unverified adult must STILL not land — CC 3.2 / CC 1.15.6 \
+             are untouched by CIRISConstitution#87, and if this ever lands the ruling has been \
+             read as a licence rather than a distinction: {held:?}"
+        );
+        assert!(
+            !steward_bindings_of(dir, &human)
+                .await
+                .expect("fold")
+                .contains(&owner),
+            "the held owner-binding establishes no stewardship of the human"
         );
 
         // ── (3) the FOLD does not count the conferral ────────────────────

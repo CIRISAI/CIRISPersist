@@ -754,8 +754,31 @@ class Engine:
         bundle it is counted over.
         """
 
-    def verify_composite_via_directory(self, message: bytes, composite_sig: bytes, identity_ref: str) -> str:
-        """v62.0.0 (F0-cp5) — verify ONE composite signature over message under identity_ref's live edition-2 key; returns the signer's identity-ref, or raises ValueError led by the refusal token."""
+    def sign_composite(self, domain: str, message: bytes) -> bytes:
+        """v62.0.0 — this engine's ONE composite (ML-DSA-65-Ed25519, 3373
+        bytes) over `message` in the registered signing domain `domain`.
+        Replaces `sign`, `local_sign` and `local_pqc_sign` (removed). Raises
+        `ValueError` for an unregistered domain or with no local signer."""
+
+    def accord_manifest_v2_message(self, manifest_sha256_hex: str, manifest_size: int, signer_identity: str) -> bytes:
+        """v62.0.0 — the 32-byte accord manifest message (v2):
+        sha256(JCS({"domain": "ciris.accord_manifest.v2", "manifest_sha256",
+        "manifest_size", "signer_identity"})). A holder signs it in the
+        "ciris.accord_manifest.v2" domain."""
+
+    def verify_accord_manifest_v2(self, manifest_sha256_hex: str, manifest_size: int, signer_identity: str, composite_sig: bytes) -> None:
+        """v62.0.0 — verify an accord manifest signature (v2): the signer must
+        be an accord holder of the genesis bundle in force
+        (`accord_manifest_signer_not_holder`), and the composite must verify
+        under that holder's live edition-2 key. Raises on refusal."""
+
+    def verify_composite_via_directory(self, domain: str, message: bytes, composite_sig: bytes, identity_ref: str) -> str:
+        """v62.0.0 — verify ONE composite over the signing domain's preimage
+        (`domain` a registered tag, e.g. "ciris.agent.system_task.v1";
+        `signing_domain_unknown` otherwise) under the LIVE edition-2 key of
+        `identity_ref`, now. Returns the signer's identity-ref; a refusal raises
+        `ValueError` leading with its token (`verify_component_signature` for a
+        lone half). The producer is `sign_composite(domain, message)`."""
 
     def put_edition2_statement(self, statement: bytes, offered_row_id: str | None = None) -> str:
         """v62.0.0 (CC 2.6.1, 2.6.1.12) — the edition-2 statement door, local
@@ -1020,32 +1043,6 @@ class Engine:
 
     def grant_delegation(self, delegate_key_id: str, scopes: list[str], sub_delegation: bool, delegation_purpose: str | None = None, delegation_valid_from: str | None = None, delegation_valid_until: str | None = None) -> str:
         """(derived) deontic — v9.3.0 (#249) — emit a general delegates_to edge: authorize delegate_key_id within scopes (a list of scope tokens), with an explicit sub_delegation..."""
-
-    def grant_trust(
-        self,
-        tenant_id: str,
-        grantee_key: str,
-        purpose: str,
-        scope: str,
-        expires_at: str | None,
-        rationale: str,
-    ) -> str:
-        """Emit a signed TrustGrant audit-chain entry (FSD §4.1).
-
-        ``purpose`` must be one of ``"technical" | "deferral" |
-        "contribution" | "service"``. ``expires_at`` is ISO-8601 or
-        ``None``. Requires a steward key configured on the Engine
-        (``local_key_id`` + ``local_key_path``).
-
-        Returns a JSON-encoded ``TrustGrantReceipt`` string with
-        ``{ grant_id, chain_event_id, chain_event_hash, tenant_id,
-        tree_size_at_emit, sth }``.
-
-        Raises:
-            ValueError: malformed purpose / expires_at, self-grant,
-                or no steward signer configured.
-            RuntimeError: signing or backend failure.
-        """
 
     def has_accord_conferred_role(self, key_id: str, role: str) -> bool:
         """(derived) deontic — v17.0.0 (CIRISPersist#440, CC 3.4.9) — does key_id hold role effectively? True iff the stored federation_keys row claims role on either role surfac..."""
@@ -1570,17 +1567,6 @@ class Engine:
     def revoke_delegation(self, target_attestation_id: str, delegate_key_id: str) -> str:
         """(derived) deontic — v9.3.0 (#249, §3.2.3) — revoke a prior delegates_to (target_attestation_id) by emitting a withdraws. delegate_key_id is the key the revoked edge de..."""
 
-    def revoke_trust_grant(
-        self,
-        tenant_id: str,
-        grantee_key: str,
-        purpose: str,
-        scope: str,
-    ) -> str:
-        """Revoke a trust grant per FSD §3.4 (re-issuance with
-        ``expires_at = now()``, rationale = ``"revocation"``). Returns
-        a JSON-encoded ``TrustGrantReceipt`` for the revocation event."""
-
     def rewrap_own_epochs_to_member_devices_json(self, member_key_id: str | None = None, device_key_id: str | None = None) -> str:
         """(derived) deontic — v50.0.0 (CIRISPersist#916, FSD/SECOND_DEVICE.md §3) — the minter side of the second device, on demand: re-wrap every retained epoch THIS node minte..."""
 
@@ -1911,8 +1897,11 @@ class Engine:
         """Record a verified audit entry into the hash chain.
 
         The entry must carry a valid ``entry_hash`` (matching canonical
-        bytes) and ``signature`` (Ed25519 over canonical signing bytes).
-        Persist re-derives both and rejects on mismatch (AV-49).
+        bytes) and ``signature``: v62.0.0, ONE ML-DSA-65-Ed25519 composite
+        over ``audit_signing_preimage`` under the identity-ref ``actor_id``
+        (``audit_seal_entry`` produces both). A lone Ed25519 is refused
+        ``audit_signature: verify_component_signature``. Persist re-derives
+        the hash and verifies the composite (AV-49).
 
         Raises:
             ValueError: hash / signature / chain integrity failure.
@@ -2078,26 +2067,6 @@ class Engine:
     def sweep_ttl_expired(self) -> int:
         """(derived) testimonial — v0.4.0 — Sweep TTL-expired rows."""
 
-    def trust_grant_consistency_proof(
-        self,
-        tenant_id: str,
-        old_size: int,
-        new_size: int,
-    ) -> str:
-        """Generate an RFC 6962 §2.1.2 consistency proof between two
-        tree sizes for a tenant. Returns a JSON-encoded
-        ``ConsistencyProof``."""
-
-    def trust_grant_inclusion_proof(self, grant_id: str) -> str:
-        """Generate the full inclusion-proof bundle for a trust grant.
-        Returns a JSON object with ``{ sth, merkle_proof,
-        leaf_canonical_bytes (base64) }``.
-
-        Raises:
-            KeyError: grant_id has no projection row, the tenant has
-                no STH, or the merkle leaf is missing.
-        """
-
     def tsdb_prune_summaries(
         self,
         level: str,
@@ -2187,14 +2156,8 @@ class Engine:
     def local_pqc_public_key_b64(self) -> str:
         """(derived) ontological — v1.4.0 (CIRISPersist#51) — Return the local-process ML-DSA-65 public key (base64) for publishing to consumers (federation_keys.pubkey_ml_dsa_65_bas..."""
 
-    def local_pqc_sign(self, message: bytes) -> bytes:
-        """(derived) ontological — v1.4.0 (CIRISPersist#51) — Sign arbitrary bytes with the local ML-DSA-65 signing key. Returns the 3309-byte raw signature (FIPS 204 final)."""
-
     def local_public_key_b64(self) -> str:
         """(derived) ontological — v1.4.0 (CIRISPersist#51) — Return the local-process Ed25519 public key (base64) for publishing to consumers (registry pinning, federation_keys.pubk..."""
-
-    def local_sign(self, message: bytes) -> bytes:
-        """(derived) ontological — v1.4.0 (CIRISPersist#51) — Sign arbitrary bytes with the local Ed25519 signing key. Returns the 64-byte raw signature."""
 
     def lookup_identity_for_occurrence_json(self, occurrence_key_id: str) -> str | None:
         """(derived) ontological — v3.12.0 — reverse lookup: which identity does this occurrence_key_id speak for? Returns JSON IdentityOccurrence object or None (null) if the key is..."""
@@ -2276,10 +2239,6 @@ class Engine:
     def set_self_key_id(self, key_id: str | None) -> None:
         """(derived) ontological — v22.0.0 (CIRISPersist#543 / AV-77) — declare THIS NODE'S OWN federation key id, which is what activates the peer de-admission gate. Call it once at..."""
 
-    def sign(self, message: bytes) -> bytes:
-        """(derived) ontological — v0.2.1 — Sign arbitrary bytes with the deployment's Ed25519 signing key (the hot-path signature in the hybrid writer contract). Returns the 64-byte..."""
-
-
     # ==============================================================
     # NOMOLOGICAL  (descriptive)
     # Varying one of these changes the model every other symbol reasons under.
@@ -2298,21 +2257,18 @@ class Engine:
         `entry_hash` and `signature` are zeroed pre-canonicalization;
         canonicalization is PythonJsonDumpsCanonicalizer (sorted keys,
         no whitespace, ensure_ascii=True). Companion of
-        `audit_canonicalize_for_signing`.
+        `audit_signing_preimage` / `audit_seal_entry`.
         """
 
-    def audit_canonicalize_for_signing(self, entry_json: str) -> bytes:
-        """v1.5.4 — Return the exact canonical bytes the audit entry's
-        Ed25519 `signature` covers.
-
-        Workflow:
-        4. `cs = engine.audit_canonicalize_for_signing(json.dumps(entry))`
-        5. `entry["signature"] = base64(your_signer.sign_ed25519(cs))`
-        6. `engine.audit_record_entry(json.dumps(entry))`
-
-        Rule: only `signature` is stripped — `entry_hash` participates
-        in the signed body so a chain rewrite that flips a subsequent
-        entry's `prev_hash` invalidates this entry's signature too.
+    def audit_signing_preimage(self, entry_json: str) -> bytes:
+        """v62.0.0 — Return the exact bytes the audit entry's ONE composite
+        `signature` covers (CC 6.1.3): `b"ciris-audit-entry/v1"`, then
+        u32-LE-length-framed `tenant_id` and `actor_id` (the signer's
+        identity-ref), the i64-LE `sequence_number`, `prev_hash` (32 bytes)
+        and `entry_hash` (32 bytes). `entry_hash` must already be filled
+        (`audit_canonicalize_for_hash`). For a caller that signs with its
+        composite key outside this engine; `audit_seal_entry` is the
+        one-call form. Raises `ValueError` for a malformed entry.
         """
 
     def canonicalize_envelope(self, envelope_json: str) -> bytes:
@@ -3141,10 +3097,6 @@ class Engine:
     def get_trace_summary(self, trace_id: str, caller_occurrence_key_id: str | None = None) -> str | None:
         """(derived) empirical — Single-trace summary lookup. Returns JSON-encoded TraceSummary or None."""
 
-    def get_trust_grant(self, grant_id: str) -> str | None:
-        """Point lookup by canonical UUID ``grant_id``. Returns a
-        JSON-encoded ``TrustGrantRow`` or ``None``."""
-
     def has_blob_json(self, sha256_hex: str) -> bool:
         """(derived) empirical — Federation blob storage: existence check by SHA-256 (hex)."""
 
@@ -3317,27 +3269,11 @@ class Engine:
     def list_trace_summaries(self, filter_json: str, cursor_json: str | None = None, limit: int = 100, caller_occurrence_key_id: str | None = None) -> str:
         """(derived) empirical — Lens-bleeding endpoint /repository/traces driver. Returns a JSON string of TraceListPage."""
 
-    def list_trust_grants(self, filter_json: str) -> str:
-        """Filter query over ``federation_trust_grants``. ``filter_json``
-        deserializes into ``TrustGrantFilter``. Returns a JSON-array
-        string of ``TrustGrantRow`` objects."""
-
     def lookup_community_json(self, community_key_id: str) -> str | None:
         """(derived) empirical — #249 Cut A — fetch a single community by community_key_id. Returns JSON Community object or None (null). Structural mirror of [Self::lookup_family_..."""
 
     def lookup_family_json(self, family_key_id: str) -> str | None:
         """(derived) empirical — v3.12.0 — fetch a single family by family_key_id. Returns JSON Family object or None (null)."""
-
-    def lookup_trust_grant(
-        self,
-        grantee_key: str,
-        purpose: str,
-        scope: str,
-    ) -> str:
-        """Look up live (non-revoked, non-expired) trust grants for
-        ``(grantee_key, purpose, scope)``. Returns a JSON-array string
-        of ``TrustGrantRow`` objects. Wildcard scope grants (``"*"``)
-        surface alongside exact matches per FSD §3.3."""
 
     def minter_of_blob_json(self, sha256_hex: str) -> str:
         """(derived) empirical — v46.3.0 (CIRISPersist#884, §3 R4) — who sealed these bytes: for a community_dek blob the epoch binding's minter (#876); for a self / family blob th..."""
@@ -3887,11 +3823,18 @@ class Engine:
     # Varying one of these changes orchestration — when and by whom, not what is true.
     # ==============================================================
 
+    def audit_seal_entry(self, entry_json: str) -> str:
+        """v62.0.0 — Seal an audit entry with this engine's composite key:
+        sets `actor_id` to the engine's identity-ref, truncates
+        `recorded_at` to µs, fills `entry_hash`, and signs the entry's
+        preimage (`audit_signing_preimage`) with ONE ML-DSA-65-Ed25519
+        composite. Returns the sealed entry JSON for `audit_record_entry`.
+        Raises `ValueError` with no local signer, for a malformed entry, an
+        `actor_id` naming another signer, or a signer with no ML-DSA-65 half.
+        """
+
     def backfill_trace_attestations(self) -> str:
         """(derived) procedural — v19.2.0 (CIRISPersist#494) — the trace-summary extraction-path contract: {"manifest_json": …, "sha256": …}. CIRISServer serves the hash on /v1/heal... [build-conditional: #[cfg(any(feature = "postgres", feature = "sqlite"))]]"""
-
-    def backfill_v020_trust_rows(self, tenant_id: str) -> str:
-        """(derived) procedural — v1.5.0 Phase I (FSD §6.2) — One-shot V020 → V021 backfill for the supplied tenant. Walks federation_keys for rows where trusted_by equals this Engi... [build-conditional: #[cfg(feature = "cirisaudit")]]"""
 
     def cancel_outbound(self, queue_id: str) -> None:
         """(derived) procedural — v0.4.0 — Operator-driven cancellation. Idempotent."""

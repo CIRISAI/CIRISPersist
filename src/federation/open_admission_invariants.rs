@@ -455,10 +455,14 @@ pub(crate) mod bodies {
         );
         assert!(active(d, &cid, &joiner).await, "I1502: the joiner is in");
         // Without their acceptance a self-signed widening is still no consent.
-        let e = widen(d, &cid, &[&late], &late, None, at + Duration::seconds(4))
-            .await
-            .expect_err("I1502: no acceptance");
-        assert_eq!(rule(&e), RULE_ACCEPTANCE_UNRESOLVED, "I1502: {e}");
+        // v62.0.0 (E13 fix2; CC 2.7.3) — the missing acceptance is another
+        // row: the widening is HELD (or, outside a fold, refused by the rule).
+        not_admitted(
+            widen(d, &cid, &[&late], &late, None, at + Duration::seconds(4)).await,
+            &[RULE_ACCEPTANCE_UNRESOLVED],
+            "I1502: no acceptance",
+        );
+        assert!(!active(d, &cid, &late).await, "I1502: late is not in");
         // A seated member's self-promotion is a role change: two voices.
         not_admitted(
             widen(
@@ -762,12 +766,21 @@ pub(crate) mod two_node {
             b.lookup_community(&cid).await.unwrap().is_some(),
             "I1504: B takes the room"
         );
+        // v62.0.0 (E13 fix2) — on a miss, say why B holds it (the fold's
+        // reason), so a red here names its own cause.
+        let why = crate::federation::edition2::fold::why_held(
+            b,
+            &crate::federation::edition2::names::RowId(e2::rid_digest(&p)),
+        )
+        .await
+        .unwrap()
+        .map(|h| h.reason);
         assert!(
             b.get_attestation(&p.attestation_id)
                 .await
                 .unwrap()
                 .is_some(),
-            "I1504: the requester's node stores the proposal"
+            "I1504: the requester's node stores the proposal (held for {why:?})"
         );
         // The requester accepts on their own node; the member's node admits
         // the acceptance and the requester's own widening.
@@ -865,19 +878,28 @@ pub(crate) mod two_node {
 
         // A public room under quorum:1/1, its founder's standing proposal held
         // before the room was: not an open room, so none is served.
+        // v62.0.0 (E13 fix2; CC 2.7.3) — a proposal for a room not held yet
+        // WAITS (kept, concluding nothing); once the room lands it is judged
+        // against it, and a room that is not open never concludes it. The
+        // read serves none either way.
         let early = standing(&f, &quorum_room, at);
-        put(d, &early)
+        e2::put_signed(d, &early)
             .await
-            .expect("I1624: a proposal for a group not held here is stored");
+            .expect("I1624: a proposal for a group not held here is kept");
         found_public_room(d, &quorum_room, "quorum:1/1", &[&f], &[])
             .await
             .expect("I1624: a public room under quorum:1/1");
+        let early_id = crate::federation::edition2::names::RowId(e2::rid_digest(&early));
         assert!(
             d.get_attestation(&early.attestation_id)
                 .await
                 .unwrap()
-                .is_some(),
-            "I1624: the founder's standing proposal is held"
+                .is_none()
+                && crate::federation::edition2::fold::why_held(d, &early_id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+            "I1624: the founder's standing proposal for a room that is not open is held"
         );
         assert!(
             live_standing_proposal(d, &quorum_room)

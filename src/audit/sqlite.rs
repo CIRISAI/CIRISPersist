@@ -33,8 +33,9 @@ use super::types::{
     AuditCursor, AuditEntry, AuditEventRef, AuditFilter, AuditListPage, ChainBreakReason,
     ChainVerification, ChainVerifyOutcome, CorrelationQuery, CORRELATION_QUERY_MAX_LIMIT,
 };
-use super::verify::{compute_entry_hash, verify_entry_signature};
+use super::verify::{compute_entry_hash, stored_entry_instant_ms, verify_entry_signature};
 use super::{Error, GENESIS_PREV_HASH};
+use crate::federation::edition2::composite_verify::now_ms;
 use crate::ClaimResult;
 
 /// SQLite-backed [`AuditService`] impl. Wraps an
@@ -87,6 +88,14 @@ impl SqliteAuditBackend {
     /// from `&self`.
     pub(crate) fn conn_handle(&self) -> Arc<Mutex<Connection>> {
         self.conn.clone()
+    }
+
+    /// v62.0.0 (F0-cp8) — the directory an entry's signer's `key:record` is
+    /// read from: a view over the same connection (no pragmas, no readers),
+    /// as `cirisnode::sqlite` builds one. Never built while the connection is
+    /// locked.
+    fn directory(&self) -> crate::store::sqlite::SqliteBackend {
+        crate::store::sqlite::SqliteBackend::from_conn_handle(self.conn.clone())
     }
 }
 
@@ -166,111 +175,6 @@ async fn merkle_hook_sqlite(
         .await
         .map_err(|e| Error::Merkle(format!("store_sth join: {e}")))?
         .map_err(|e| Error::Merkle(format!("store_sth: {e}")))?;
-
-    Ok(())
-}
-
-/// v1.5.0 Phase D — TrustGrant projection hook (SQLite parity with
-/// `project_trust_grant_pg`). UPSERTs `federation_trust_grants` keyed
-/// by `(grantee_key, granter_key, purpose, scope)` per FSD §3.6. On
-/// SQLite the table is bare (no `cirislens.` schema prefix). Same
-/// out-of-transaction stance as the Merkle hook (option (b) from
-/// Phase C).
-async fn project_trust_grant_sqlite(
-    backend: &SqliteAuditBackend,
-    entry: &AuditEntry,
-    chain_event_id: i64,
-) -> Result<(), Error> {
-    use crate::federation::trust_grant::TrustGrantPayload;
-    use rusqlite::params;
-    use uuid::Uuid;
-
-    let payload: TrustGrantPayload = serde_json::from_value(entry.payload.clone())
-        .map_err(|e| Error::TrustGrant(format!("payload deserialize: {e}")))?;
-
-    let granter_key = entry.actor_id.clone();
-    let grantee_key = payload.grantee_key.clone();
-
-    if granter_key == grantee_key {
-        return Err(Error::TrustGrant(
-            "self-grant rejected (granter == grantee)".into(),
-        ));
-    }
-
-    let purpose_str = payload.purpose.as_str().to_string();
-    let scope = payload.scope.clone();
-    let chain_event_hash = entry.entry_hash.clone();
-    let granted_at = fmt_datetime(entry.recorded_at);
-    let expires_at_str = payload.expires_at.map(fmt_datetime);
-    let tenant_id = entry.tenant_id.clone();
-    // SQLite has no gen_random_uuid(); the V021 SQLite schema marks
-    // grant_id as TEXT PRIMARY KEY with caller-generated UUID. On
-    // re-issuance we don't actually need the new uuid (UPSERT keeps
-    // the existing row's grant_id), but we still need a value to
-    // attempt the INSERT half of `INSERT … ON CONFLICT DO UPDATE`.
-    let new_grant_id = Uuid::new_v4().to_string();
-
-    let conn = backend.conn_handle();
-    (move || -> Result<(), Error> {
-        let guard = conn.lock();
-        // Emulate the Postgres revocation rule:
-        //   revoked_at = CASE WHEN expires_at <= NOW() THEN NOW()
-        //                ELSE NULL END
-        //   revoked_by = CASE WHEN expires_at <= NOW() THEN granter
-        //                ELSE NULL END
-        // SQLite's strftime returns the format we use for the column
-        // (RFC 3339-ish TEXT). `expires_at` is text; lexical
-        // comparison works because all timestamps are normalized to
-        // UTC `Z`-suffixed RFC 3339 (see `fmt_datetime`).
-        // We compute the projected revoked_at / revoked_by values in
-        // Rust to keep the SQL portable. `now` is captured once so
-        // CHECK (`revoked_at IS NULL OR revoked_by IS NOT NULL`) is
-        // satisfied transactionally.
-        let now_str = fmt_datetime(crate::host::clock::now());
-        let is_revocation = expires_at_str
-            .as_deref()
-            .map(|e| e <= now_str.as_str())
-            .unwrap_or(false);
-        let (revoked_at_param, revoked_by_param): (Option<String>, Option<String>) =
-            if is_revocation {
-                (Some(now_str.clone()), Some(granter_key.clone()))
-            } else {
-                (None, None)
-            };
-
-        guard
-            .execute(
-                "INSERT INTO federation_trust_grants (\
-                    grant_id, grantee_key, granter_key, purpose, scope, \
-                    granted_at, expires_at, revoked_at, revoked_by, \
-                    chain_event_id, chain_event_hash, tenant_id\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
-                 ON CONFLICT (grantee_key, granter_key, purpose, scope) DO UPDATE SET \
-                    granted_at = excluded.granted_at, \
-                    expires_at = excluded.expires_at, \
-                    chain_event_id = excluded.chain_event_id, \
-                    chain_event_hash = excluded.chain_event_hash, \
-                    tenant_id = excluded.tenant_id, \
-                    revoked_at = excluded.revoked_at, \
-                    revoked_by = excluded.revoked_by",
-                params![
-                    new_grant_id,
-                    grantee_key,
-                    granter_key,
-                    purpose_str,
-                    scope,
-                    granted_at,
-                    expires_at_str,
-                    revoked_at_param,
-                    revoked_by_param,
-                    chain_event_id,
-                    chain_event_hash,
-                    tenant_id,
-                ],
-            )
-            .map_err(|e| Error::TrustGrant(format!("UPSERT federation_trust_grants: {e}")))?;
-        Ok(())
-    })()?;
 
     Ok(())
 }
@@ -377,7 +281,9 @@ impl AuditService for SqliteAuditBackend {
             ));
         }
 
-        verify_entry_signature(&entry)?;
+        // v62.0.0 (F0-cp8) — the entry's ONE composite, under its signer's
+        // live edition-2 key at this node's now.
+        verify_entry_signature(&self.directory(), &entry, now_ms()).await?;
 
         let payload_str = serde_json::to_string(&entry.payload)
             .map_err(|e| Error::Internal(format!("payload serialize: {e}")))?;
@@ -482,12 +388,6 @@ impl AuditService for SqliteAuditBackend {
         // is projection (see `merkle_hook_sqlite` rustdoc + the PG
         // sibling helper).
         merkle_hook_sqlite(self, &entry, entry.sequence_number).await?;
-
-        // v1.5.0 Phase D — TrustGrant projection (SQLite parity with
-        // `project_trust_grant_pg`). Gated on subject_kind.
-        if entry.subject_kind == crate::federation::trust_grant::TRUST_GRANT_SUBJECT_KIND {
-            project_trust_grant_sqlite(self, &entry, entry.sequence_number).await?;
-        }
 
         Ok(())
     }
@@ -605,7 +505,13 @@ impl AuditService for SqliteAuditBackend {
         }
         let conn = self.conn.clone();
         let tenant_id = tenant_id.to_owned();
-        (move || -> Result<ChainVerification, Error> {
+        // v62.0.0 (F0-cp8) — the rows are read under the lock and walked
+        // after it is released: an entry's signature is verified through the
+        // directory (its signer's `key:record`), which reads the same
+        // connection. The PG walk holds the scanned rows the same way.
+        let tenant_for_read = tenant_id.clone();
+        let (to_seq_resolved, entries) = (move || -> Result<(i64, Vec<AuditEntry>), Error> {
+            let tenant_id = tenant_for_read;
             let guard = conn.lock();
 
             let to_seq_resolved: i64 = match to_sequence {
@@ -628,13 +534,7 @@ impl AuditService for SqliteAuditBackend {
             };
 
             if to_seq_resolved < from_sequence {
-                return Ok(ChainVerification {
-                    tenant_id: tenant_id.clone(),
-                    from_sequence,
-                    to_sequence: to_seq_resolved,
-                    entries_walked: 0,
-                    outcome: ChainVerifyOutcome::Ok,
-                });
+                return Ok((to_seq_resolved, Vec::new()));
             }
 
             let mut stmt = guard
@@ -653,118 +553,106 @@ impl AuditService for SqliteAuditBackend {
                     Ok(decode_entry_row(row))
                 })
                 .map_err(|e| map_sqlite_error(e, "verify_chain query"))?;
-
-            let mut prior_hash: Option<Vec<u8>> = None;
-            let mut prior_seq: Option<i64> = None;
-            let mut walked = 0usize;
+            let mut entries = Vec::new();
             for r in rows_iter {
-                let entry = r.map_err(|e| map_sqlite_error(e, "verify_chain row"))??;
-                walked += 1;
-
-                match prior_seq {
-                    None => {
-                        if entry.sequence_number == 1
-                            && entry.prev_hash.as_slice() != GENESIS_PREV_HASH.as_slice()
-                        {
-                            return Ok(ChainVerification {
-                                tenant_id: tenant_id.clone(),
-                                from_sequence,
-                                to_sequence: to_seq_resolved,
-                                entries_walked: walked,
-                                outcome: ChainVerifyOutcome::Break {
-                                    at_sequence: 1,
-                                    reason: ChainBreakReason::GenesisPrevHashNotZero,
-                                    detail: "genesis entry must have prev_hash = all zeros".into(),
-                                },
-                            });
-                        }
-                    }
-                    Some(prev_n) => {
-                        if entry.sequence_number != prev_n + 1 {
-                            return Ok(ChainVerification {
-                                tenant_id: tenant_id.clone(),
-                                from_sequence,
-                                to_sequence: to_seq_resolved,
-                                entries_walked: walked,
-                                outcome: ChainVerifyOutcome::Break {
-                                    at_sequence: entry.sequence_number,
-                                    reason: ChainBreakReason::SequenceGap,
-                                    detail: format!(
-                                        "expected {} got {}",
-                                        prev_n + 1,
-                                        entry.sequence_number
-                                    ),
-                                },
-                            });
-                        }
-                        if let Some(ph) = &prior_hash {
-                            if entry.prev_hash.as_slice() != ph.as_slice() {
-                                return Ok(ChainVerification {
-                                    tenant_id: tenant_id.clone(),
-                                    from_sequence,
-                                    to_sequence: to_seq_resolved,
-                                    entries_walked: walked,
-                                    outcome: ChainVerifyOutcome::Break {
-                                        at_sequence: entry.sequence_number,
-                                        reason: ChainBreakReason::PrevHashMismatch,
-                                        detail: format!(
-                                            "prev_hash at seq {} did not match prior entry's entry_hash",
-                                            entry.sequence_number
-                                        ),
-                                    },
-                                });
-                            }
-                        }
-                    }
-                }
-
-                let derived = compute_entry_hash(&entry)?;
-                if derived.as_slice() != entry.entry_hash.as_slice() {
-                    return Ok(ChainVerification {
-                        tenant_id: tenant_id.clone(),
-                        from_sequence,
-                        to_sequence: to_seq_resolved,
-                        entries_walked: walked,
-                        outcome: ChainVerifyOutcome::Break {
-                            at_sequence: entry.sequence_number,
-                            reason: ChainBreakReason::EntryHashMismatch,
-                            detail: format!(
-                                "entry_hash at seq {} does not match canonical-bytes derivation",
-                                entry.sequence_number
-                            ),
-                        },
-                    });
-                }
-
-                if let Err(e) = verify_entry_signature(&entry) {
-                    return Ok(ChainVerification {
-                        tenant_id: tenant_id.clone(),
-                        from_sequence,
-                        to_sequence: to_seq_resolved,
-                        entries_walked: walked,
-                        outcome: ChainVerifyOutcome::Break {
-                            at_sequence: entry.sequence_number,
-                            reason: ChainBreakReason::SignatureFailure,
-                            detail: format!(
-                                "signature failed at seq {}: {e}",
-                                entry.sequence_number
-                            ),
-                        },
-                    });
-                }
-
-                prior_hash = Some(entry.entry_hash.clone());
-                prior_seq = Some(entry.sequence_number);
+                entries.push(r.map_err(|e| map_sqlite_error(e, "verify_chain row"))??);
             }
+            Ok((to_seq_resolved, entries))
+        })()?;
 
-            Ok(ChainVerification {
+        let directory = self.directory();
+        let brk = |walked: usize, at_sequence: i64, reason: ChainBreakReason, detail: String| {
+            ChainVerification {
                 tenant_id: tenant_id.clone(),
                 from_sequence,
                 to_sequence: to_seq_resolved,
                 entries_walked: walked,
-                outcome: ChainVerifyOutcome::Ok,
-            })
-        })()
+                outcome: ChainVerifyOutcome::Break {
+                    at_sequence,
+                    reason,
+                    detail,
+                },
+            }
+        };
+        let mut prior_hash: Option<Vec<u8>> = None;
+        let mut prior_seq: Option<i64> = None;
+        let mut walked = 0usize;
+        for entry in entries {
+            walked += 1;
+
+            match prior_seq {
+                None => {
+                    if entry.sequence_number == 1
+                        && entry.prev_hash.as_slice() != GENESIS_PREV_HASH.as_slice()
+                    {
+                        return Ok(brk(
+                            walked,
+                            1,
+                            ChainBreakReason::GenesisPrevHashNotZero,
+                            "genesis entry must have prev_hash = all zeros".into(),
+                        ));
+                    }
+                }
+                Some(prev_n) => {
+                    if entry.sequence_number != prev_n + 1 {
+                        return Ok(brk(
+                            walked,
+                            entry.sequence_number,
+                            ChainBreakReason::SequenceGap,
+                            format!("expected {} got {}", prev_n + 1, entry.sequence_number),
+                        ));
+                    }
+                    if let Some(ph) = &prior_hash {
+                        if entry.prev_hash.as_slice() != ph.as_slice() {
+                            return Ok(brk(
+                                walked,
+                                entry.sequence_number,
+                                ChainBreakReason::PrevHashMismatch,
+                                format!(
+                                    "prev_hash at seq {} did not match prior entry's entry_hash",
+                                    entry.sequence_number
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            let derived = compute_entry_hash(&entry)?;
+            if derived.as_slice() != entry.entry_hash.as_slice() {
+                return Ok(brk(
+                    walked,
+                    entry.sequence_number,
+                    ChainBreakReason::EntryHashMismatch,
+                    format!(
+                        "entry_hash at seq {} does not match canonical-bytes derivation",
+                        entry.sequence_number
+                    ),
+                ));
+            }
+
+            if let Err(e) =
+                verify_entry_signature(&directory, &entry, stored_entry_instant_ms(&entry)).await
+            {
+                return Ok(brk(
+                    walked,
+                    entry.sequence_number,
+                    ChainBreakReason::SignatureFailure,
+                    format!("signature failed at seq {}: {e}", entry.sequence_number),
+                ));
+            }
+
+            prior_hash = Some(entry.entry_hash.clone());
+            prior_seq = Some(entry.sequence_number);
+        }
+
+        Ok(ChainVerification {
+            tenant_id: tenant_id.clone(),
+            from_sequence,
+            to_sequence: to_seq_resolved,
+            entries_walked: walked,
+            outcome: ChainVerifyOutcome::Ok,
+        })
     }
 
     async fn try_claim_event(
@@ -803,7 +691,9 @@ impl AuditService for SqliteAuditBackend {
                     .into(),
             ));
         }
-        verify_entry_signature(&entry)?;
+        // v62.0.0 (F0-cp8) — the entry's ONE composite, under its signer's
+        // live edition-2 key at this node's now.
+        verify_entry_signature(&self.directory(), &entry, now_ms()).await?;
 
         let payload_str = serde_json::to_string(&entry.payload)
             .map_err(|e| Error::Internal(format!("payload serialize: {e}")))?;
@@ -992,16 +882,8 @@ impl AuditService for SqliteAuditBackend {
         // (same gating rule as the PG impl). On `AlreadyClaimed` the
         // existing row's Merkle leaf already landed at the original
         // call; re-appending here would double-count.
-        //
-        // v1.5.0 Phase D — TrustGrant projection same gating: only
-        // on the newly-stored path. AlreadyClaimed → the prior call
-        // already ran the projection (or, if Phase D wasn't deployed
-        // at that prior time, Phase I's backfill will fill it in).
         if let ClaimResult::Stored(_) = &result {
             merkle_hook_sqlite(self, &entry, entry.sequence_number).await?;
-            if entry.subject_kind == crate::federation::trust_grant::TRUST_GRANT_SUBJECT_KIND {
-                project_trust_grant_sqlite(self, &entry, entry.sequence_number).await?;
-            }
         }
 
         Ok(result)
@@ -1129,474 +1011,6 @@ impl AuditService for SqliteAuditBackend {
             .map_err(|e| Error::Merkle(format!("latest_sth: {e}")))?;
         Ok(res)
     }
-
-    async fn lookup_grant_id_by_chain_event(
-        &self,
-        tenant_id: &str,
-        chain_event_id: i64,
-    ) -> Result<Option<uuid::Uuid>, Error> {
-        // Lookup is tenant-scoped — matches the Postgres impl. SQLite
-        // tests historically passed because each test gets a fresh
-        // in-memory DB; cross-tenant collisions are still possible in
-        // production once multiple tenants share a SQLite file. The
-        // V045 SQLite migration mirrors the PG UNIQUE constraint.
-        let conn = self.conn_handle();
-        let tenant_owned = tenant_id.to_owned();
-        let jh: crate::host::rt::BlockingTask<Result<Option<String>, rusqlite::Error>> =
-            crate::host::rt::try_dispatch_blocking(move || {
-                let guard = conn.lock();
-                guard
-                    .query_row(
-                        "SELECT grant_id FROM federation_trust_grants \
-                         WHERE tenant_id = ?1 AND chain_event_id = ?2",
-                        rusqlite::params![tenant_owned, chain_event_id],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .map(Some)
-                    .or_else(|e| match e {
-                        rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                        other => Err(other),
-                    })
-            });
-        let opt_str = jh
-            .await
-            .map_err(|e| Error::Backend(format!("lookup_grant_id join: {e}")))?
-            .map_err(|e| Error::Backend(format!("lookup_grant_id: {e}")))?;
-        match opt_str {
-            None => Ok(None),
-            Some(s) => uuid::Uuid::parse_str(&s)
-                .map(Some)
-                .map_err(|e| Error::Backend(format!("decode grant_id: {e}"))),
-        }
-    }
-
-    // ── v1.5.0 Phase F+G — projection reads + Merkle proofs ─────────
-
-    async fn get_trust_grant(
-        &self,
-        grant_id: uuid::Uuid,
-    ) -> Result<Option<crate::federation::trust_grant::TrustGrantRow>, Error> {
-        let conn = self.conn_handle();
-        let grant_id_str = grant_id.to_string();
-        let jh: crate::host::rt::BlockingTask<
-            Result<Option<crate::federation::trust_grant::TrustGrantRow>, Error>,
-        > = crate::host::rt::try_dispatch_blocking(move || {
-            let guard = conn.lock();
-            let mut stmt = guard
-                .prepare(
-                    "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
-                            granted_at, expires_at, revoked_at, revoked_by, \
-                            chain_event_id, chain_event_hash, tenant_id \
-                     FROM federation_trust_grants \
-                     WHERE grant_id = ?1",
-                )
-                .map_err(|e| Error::Backend(format!("prepare get_trust_grant: {e}")))?;
-            let row_opt = stmt
-                .query_row(
-                    rusqlite::params![grant_id_str],
-                    decode_trust_grant_row_sqlite,
-                )
-                .optional()
-                .map_err(|e| Error::Backend(format!("query get_trust_grant: {e}")))?;
-            match row_opt {
-                None => Ok(None),
-                Some(r) => Ok(Some(r?)),
-            }
-        });
-        jh.await
-            .map_err(|e| Error::Backend(format!("get_trust_grant join: {e}")))?
-    }
-
-    async fn lookup_trust_grant(
-        &self,
-        grantee_key: &str,
-        purpose: crate::federation::trust_grant::TrustPurpose,
-        scope: &str,
-        include_revoked: bool,
-        include_expired: bool,
-    ) -> Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error> {
-        let conn = self.conn_handle();
-        let grantee = grantee_key.to_owned();
-        let purpose_str = purpose.as_str().to_owned();
-        let scope = scope.to_owned();
-        // Lexical comparison against an UTC-Z RFC3339 string is monotonic
-        // — see fmt_datetime + parse_datetime locked above.
-        let now_str = fmt_datetime(crate::host::clock::now());
-        let jh: crate::host::rt::BlockingTask<
-            Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error>,
-        > = crate::host::rt::try_dispatch_blocking(move || {
-            let mut sql = String::from(
-                "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
-                        granted_at, expires_at, revoked_at, revoked_by, \
-                        chain_event_id, chain_event_hash, tenant_id \
-                 FROM federation_trust_grants \
-                 WHERE grantee_key = ?1 AND purpose = ?2 \
-                   AND (scope = ?3 OR scope = '*')",
-            );
-            if !include_revoked {
-                sql.push_str(" AND revoked_at IS NULL");
-            }
-            if !include_expired {
-                sql.push_str(" AND (expires_at IS NULL OR expires_at > ?4)");
-            }
-            sql.push_str(" ORDER BY granted_at DESC, grant_id");
-
-            let guard = conn.lock();
-            let mut stmt = guard
-                .prepare(&sql)
-                .map_err(|e| Error::Backend(format!("prepare lookup_trust_grant: {e}")))?;
-            let mut out = Vec::new();
-            if include_expired {
-                let rows = stmt
-                    .query_map(
-                        rusqlite::params![grantee, purpose_str, scope],
-                        decode_trust_grant_row_sqlite,
-                    )
-                    .map_err(|e| Error::Backend(format!("query lookup_trust_grant: {e}")))?;
-                for r in rows {
-                    out.push(
-                        r.map_err(|e| Error::Backend(format!("row lookup_trust_grant: {e}")))??,
-                    );
-                }
-            } else {
-                let rows = stmt
-                    .query_map(
-                        rusqlite::params![grantee, purpose_str, scope, now_str],
-                        decode_trust_grant_row_sqlite,
-                    )
-                    .map_err(|e| Error::Backend(format!("query lookup_trust_grant: {e}")))?;
-                for r in rows {
-                    out.push(
-                        r.map_err(|e| Error::Backend(format!("row lookup_trust_grant: {e}")))??,
-                    );
-                }
-            }
-            Ok(out)
-        });
-        jh.await
-            .map_err(|e| Error::Backend(format!("lookup_trust_grant join: {e}")))?
-    }
-
-    async fn list_trust_grants(
-        &self,
-        filter: crate::federation::trust_grant::TrustGrantFilter,
-    ) -> Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error> {
-        let conn = self.conn_handle();
-        let now_str = fmt_datetime(crate::host::clock::now());
-        let jh: crate::host::rt::BlockingTask<
-            Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error>,
-        > = crate::host::rt::try_dispatch_blocking(move || {
-            let mut sql = String::from(
-                "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
-                        granted_at, expires_at, revoked_at, revoked_by, \
-                        chain_event_id, chain_event_hash, tenant_id \
-                 FROM federation_trust_grants",
-            );
-            let mut where_clauses: Vec<String> = Vec::new();
-            let mut params: Vec<SqlValue> = Vec::new();
-            if let Some(g) = filter.grantee_key.as_ref() {
-                where_clauses.push(format!("grantee_key = ?{}", params.len() + 1));
-                params.push(SqlValue::Text(g.clone()));
-            }
-            if let Some(g) = filter.granter_key.as_ref() {
-                where_clauses.push(format!("granter_key = ?{}", params.len() + 1));
-                params.push(SqlValue::Text(g.clone()));
-            }
-            if let Some(p) = filter.purpose {
-                where_clauses.push(format!("purpose = ?{}", params.len() + 1));
-                params.push(SqlValue::Text(p.as_str().to_owned()));
-            }
-            if let Some(prefix) = filter.scope_prefix.as_ref() {
-                where_clauses.push(format!("scope LIKE ?{}", params.len() + 1));
-                params.push(SqlValue::Text(format!("{prefix}%")));
-            }
-            if !filter.include_revoked {
-                where_clauses.push("revoked_at IS NULL".to_owned());
-            }
-            if !filter.include_expired {
-                where_clauses.push(format!(
-                    "(expires_at IS NULL OR expires_at > ?{})",
-                    params.len() + 1
-                ));
-                params.push(SqlValue::Text(now_str.clone()));
-            }
-            if !where_clauses.is_empty() {
-                sql.push_str(" WHERE ");
-                sql.push_str(&where_clauses.join(" AND "));
-            }
-            sql.push_str(" ORDER BY granted_at DESC, grant_id");
-
-            let guard = conn.lock();
-            let mut stmt = guard
-                .prepare(&sql)
-                .map_err(|e| Error::Backend(format!("prepare list_trust_grants: {e}")))?;
-            let rows = stmt
-                .query_map(params_from_iter(params), decode_trust_grant_row_sqlite)
-                .map_err(|e| Error::Backend(format!("query list_trust_grants: {e}")))?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r.map_err(|e| Error::Backend(format!("row list_trust_grants: {e}")))??);
-            }
-            Ok(out)
-        });
-        jh.await
-            .map_err(|e| Error::Backend(format!("list_trust_grants join: {e}")))?
-    }
-
-    async fn leaf_canonical_bytes_for_chain_event(
-        &self,
-        tenant_id: &str,
-        chain_event_id: i64,
-    ) -> Result<Option<Vec<u8>>, Error> {
-        if tenant_id.is_empty() {
-            return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
-        }
-        let conn = self.conn_handle();
-        let tenant = tenant_id.to_owned();
-        let jh: crate::host::rt::BlockingTask<Result<Option<Vec<u8>>, rusqlite::Error>> =
-            crate::host::rt::try_dispatch_blocking(move || {
-                let guard = conn.lock();
-                guard
-                    .query_row(
-                        "SELECT canonical_bytes FROM merkle_leaves \
-                         WHERE tenant_id = ?1 AND chain_event_id = ?2",
-                        rusqlite::params![tenant, chain_event_id],
-                        |row| row.get::<_, Vec<u8>>(0),
-                    )
-                    .optional()
-            });
-        jh.await
-            .map_err(|e| Error::Backend(format!("leaf_canonical_bytes join: {e}")))?
-            .map_err(|e| Error::Backend(format!("leaf_canonical_bytes: {e}")))
-    }
-
-    async fn inclusion_proof_for_chain_event(
-        &self,
-        tenant_id: &str,
-        chain_event_id: i64,
-    ) -> Result<ciris_verify_core::transparency::MerkleProof, Error> {
-        use super::merkle_leaf::AuditLeaf;
-        use super::merkle_store::SqliteMerkleStore;
-        use ciris_verify_core::transparency::{TransparencyLog, TransparencyStore};
-
-        if tenant_id.is_empty() {
-            return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
-        }
-        // Resolve chain_event_id → leaf_index.
-        let conn = self.conn_handle();
-        let tenant = tenant_id.to_owned();
-        let tenant_for_lookup = tenant.clone();
-        let leaf_idx_opt: crate::host::rt::BlockingTask<Result<Option<i64>, rusqlite::Error>> =
-            crate::host::rt::try_dispatch_blocking(move || {
-                let guard = conn.lock();
-                guard
-                    .query_row(
-                        "SELECT leaf_index FROM merkle_leaves \
-                         WHERE tenant_id = ?1 AND chain_event_id = ?2",
-                        rusqlite::params![tenant_for_lookup, chain_event_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()
-            });
-        let leaf_idx_i: i64 = leaf_idx_opt
-            .await
-            .map_err(|e| Error::Backend(format!("leaf_index lookup join: {e}")))?
-            .map_err(|e| Error::Backend(format!("leaf_index lookup: {e}")))?
-            .ok_or_else(|| {
-                Error::NotFound(format!(
-                    "no merkle_leaves row for tenant={tenant} chain_event_id={chain_event_id}"
-                ))
-            })?;
-        let leaf_index =
-            u64::try_from(leaf_idx_i).map_err(|_| Error::Backend("leaf_index negative".into()))?;
-
-        let conn = self.conn_handle();
-        let store: Arc<dyn TransparencyStore<AuditLeaf>> =
-            Arc::new(SqliteMerkleStore::new(conn, tenant.clone()));
-        let log_id = super::merkle_store::log_id_for_tenant(&tenant);
-        let jh: crate::host::rt::BlockingTask<
-            Result<
-                ciris_verify_core::transparency::MerkleProof,
-                ciris_verify_core::transparency::TransparencyError,
-            >,
-        > = crate::host::rt::try_dispatch_blocking(move || {
-            let log = TransparencyLog::<AuditLeaf>::for_log(log_id, store);
-            log.inclusion_proof(leaf_index)
-        });
-        jh.await
-            .map_err(|e| Error::Merkle(format!("inclusion_proof join: {e}")))?
-            .map_err(|e| Error::Merkle(format!("inclusion_proof: {e}")))
-    }
-
-    async fn consistency_proof(
-        &self,
-        tenant_id: &str,
-        old_size: u64,
-        new_size: u64,
-    ) -> Result<ciris_verify_core::transparency::ConsistencyProof, Error> {
-        use super::merkle_leaf::AuditLeaf;
-        use super::merkle_store::SqliteMerkleStore;
-        use ciris_verify_core::transparency::{TransparencyLog, TransparencyStore};
-
-        if tenant_id.is_empty() {
-            return Err(Error::InvalidArgument("tenant_id must be non-empty".into()));
-        }
-        let conn = self.conn_handle();
-        let tenant_owned = tenant_id.to_owned();
-        let store: Arc<dyn TransparencyStore<AuditLeaf>> =
-            Arc::new(SqliteMerkleStore::new(conn, tenant_owned.clone()));
-        let log_id = super::merkle_store::log_id_for_tenant(&tenant_owned);
-        let jh: crate::host::rt::BlockingTask<
-            Result<
-                ciris_verify_core::transparency::ConsistencyProof,
-                ciris_verify_core::transparency::TransparencyError,
-            >,
-        > = crate::host::rt::try_dispatch_blocking(move || {
-            let log = TransparencyLog::<AuditLeaf>::for_log(log_id, store);
-            log.consistency_proof(old_size, new_size)
-        });
-        jh.await
-            .map_err(|e| Error::Merkle(format!("consistency_proof join: {e}")))?
-            .map_err(|e| Error::Merkle(format!("consistency_proof: {e}")))
-    }
-
-    // ── v1.5.0 Phase I — V020 → V021 backfill source ────────────────
-
-    async fn read_v020_trust_rows_for_local(
-        &self,
-        local_pubkey: &str,
-    ) -> Result<Vec<crate::federation::trust_grant::V020TrustRow>, Error> {
-        use crate::federation::trust_grant::V020TrustRow;
-
-        if local_pubkey.is_empty() {
-            return Err(Error::InvalidArgument(
-                "local_pubkey must be non-empty".into(),
-            ));
-        }
-        let conn = self.conn_handle();
-        let local_pubkey = local_pubkey.to_owned();
-        let jh: crate::host::rt::BlockingTask<Result<Vec<V020TrustRow>, Error>> =
-            crate::host::rt::try_dispatch_blocking(move || {
-                let guard = conn.lock();
-                let mut stmt = guard
-                    .prepare(
-                        "SELECT key_id, pubkey_ed25519_base64, trust_type, \
-                                trust_relationship, trust_domains, \
-                                trusted_at, expires_at \
-                         FROM federation_keys \
-                         WHERE trusted_by = ?1 \
-                           AND trust_relationship IS NOT NULL \
-                         ORDER BY trusted_at ASC, key_id ASC",
-                    )
-                    .map_err(|e| Error::Backend(format!("prepare v020 rows: {e}")))?;
-                let rows = stmt
-                    .query_map(
-                        rusqlite::params![local_pubkey],
-                        decode_v020_trust_row_sqlite,
-                    )
-                    .map_err(|e| Error::Backend(format!("query v020 rows: {e}")))?;
-                let mut out: Vec<V020TrustRow> = Vec::new();
-                for r in rows {
-                    let inner = r.map_err(|e| Error::Backend(format!("row v020 rows: {e}")))??;
-                    out.push(inner);
-                }
-                Ok(out)
-            });
-        jh.await
-            .map_err(|e| Error::Backend(format!("v020 rows join: {e}")))?
-    }
-}
-
-/// Decode one V020-shape row from `federation_keys` into a
-/// [`V020TrustRow`]. Used by [`SqliteAuditBackend::read_v020_trust_rows_for_local`].
-///
-/// `trust_domains` is stored as a JSON-array string per V020 SQLite
-/// dialect notes; `Some("")` and `None` both map to `None`. Empty
-/// arrays map to `Some(vec![])` (legal per the SQLite schema, though
-/// the API-layer `grant_trust` guard rejects Registry+empty).
-fn decode_v020_trust_row_sqlite(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<Result<crate::federation::trust_grant::V020TrustRow, Error>> {
-    use crate::federation::trust_grant::V020TrustRow;
-
-    let key_id: String = row.get("key_id")?;
-    let grantee_pubkey: String = row.get("pubkey_ed25519_base64")?;
-    let trust_type: String = row.get("trust_type")?;
-    let trust_relationship: String = row.get("trust_relationship")?;
-    let trust_domains_text: Option<String> = row.get("trust_domains")?;
-    let trusted_at_text: String = row.get("trusted_at")?;
-    let expires_at_text: Option<String> = row.get("expires_at")?;
-
-    Ok((|| {
-        let trust_domains: Option<Vec<String>> = match trust_domains_text.as_deref() {
-            None | Some("") => None,
-            Some(s) => Some(
-                serde_json::from_str::<Vec<String>>(s)
-                    .map_err(|e| Error::Backend(format!("trust_domains decode: {e}")))?,
-            ),
-        };
-        let trusted_at = parse_datetime(&trusted_at_text)?;
-        let expires_at = expires_at_text.as_deref().map(parse_datetime).transpose()?;
-        Ok(V020TrustRow {
-            key_id,
-            grantee_pubkey,
-            trust_type,
-            trust_relationship,
-            trust_domains,
-            trusted_at,
-            expires_at,
-        })
-    })())
-}
-
-/// Decode one `federation_trust_grants` row into a [`TrustGrantRow`].
-/// Used by `get_trust_grant`, `lookup_trust_grant`, `list_trust_grants`.
-///
-/// Wraps the outer `Result<T, Error>` inside the rusqlite row callback's
-/// `Result<T, rusqlite::Error>` — the rusqlite callback can only fail
-/// with rusqlite errors, but parse failures (TrustPurpose, UUID,
-/// timestamp) are domain-level. We return `Ok(Err(Error))` so the
-/// outer call site can `?` the inner error.
-fn decode_trust_grant_row_sqlite(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<Result<crate::federation::trust_grant::TrustGrantRow, Error>> {
-    use crate::federation::trust_grant::{TrustGrantRow, TrustPurpose};
-    let grant_id_str: String = row.get("grant_id")?;
-    let grantee_key: String = row.get("grantee_key")?;
-    let granter_key: String = row.get("granter_key")?;
-    let purpose_str: String = row.get("purpose")?;
-    let scope: String = row.get("scope")?;
-    let granted_at_str: String = row.get("granted_at")?;
-    let expires_at_str: Option<String> = row.get("expires_at")?;
-    let revoked_at_str: Option<String> = row.get("revoked_at")?;
-    let revoked_by: Option<String> = row.get("revoked_by")?;
-    let chain_event_id: i64 = row.get("chain_event_id")?;
-    let chain_event_hash: Vec<u8> = row.get("chain_event_hash")?;
-    let tenant_id: String = row.get("tenant_id")?;
-
-    Ok((|| {
-        let grant_id = uuid::Uuid::parse_str(&grant_id_str)
-            .map_err(|e| Error::Backend(format!("decode grant_id: {e}")))?;
-        let purpose = TrustPurpose::parse_str(&purpose_str)
-            .ok_or_else(|| Error::Backend(format!("unknown purpose: {purpose_str}")))?;
-        let granted_at = parse_datetime(&granted_at_str)?;
-        let expires_at = expires_at_str.as_deref().map(parse_datetime).transpose()?;
-        let revoked_at = revoked_at_str.as_deref().map(parse_datetime).transpose()?;
-        Ok(TrustGrantRow {
-            grant_id,
-            grantee_key,
-            granter_key,
-            purpose,
-            scope,
-            granted_at,
-            expires_at,
-            revoked_at,
-            revoked_by,
-            chain_event_id,
-            chain_event_hash,
-            tenant_id,
-        })
-    })())
 }
 
 #[cfg(test)]
@@ -1605,9 +1019,7 @@ mod tests {
     use crate::audit::verify::truncate_to_micros;
     use crate::store::sqlite::SqliteBackend;
     use crate::store::Backend;
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine as _;
-    use ed25519_dalek::{Signer as _, SigningKey};
+    use ed25519_dalek::SigningKey;
     use uuid::Uuid;
 
     async fn fresh_backend() -> (SqliteBackend, SqliteAuditBackend) {
@@ -1617,22 +1029,26 @@ mod tests {
         (backend, audit)
     }
 
-    fn pubkey_b64(key: &SigningKey) -> String {
-        B64.encode(key.verifying_key().to_bytes())
+    /// v62.0.0 (F0-cp8) — an actor whose `key:record` the audit backend's
+    /// directory holds: the seed [`crate::audit::test_support::seal`] signs as.
+    async fn audit_seed(audit: &SqliteAuditBackend, byte: u8) -> String {
+        let seed = format!("audit-sqlite-{byte:02x}");
+        crate::audit::test_support::put_actor(&audit.directory(), &seed).await;
+        seed
     }
 
     fn build_and_sign(
-        key: &SigningKey,
+        key: &str,
         tenant_id: &str,
         sequence_number: i64,
         prev_hash: Vec<u8>,
         action_type: &str,
     ) -> AuditEntry {
-        let mut entry = AuditEntry {
+        let entry = AuditEntry {
             entry_id: Uuid::new_v4().to_string(),
             sequence_number,
             tenant_id: tenant_id.to_owned(),
-            actor_id: pubkey_b64(key),
+            actor_id: String::new(),
             action_type: action_type.to_owned(),
             subject_kind: "task".into(),
             subject_id: format!("subj-{sequence_number}"),
@@ -1642,12 +1058,7 @@ mod tests {
             recorded_at: truncate_to_micros(chrono::Utc::now()),
             signature: String::new(),
         };
-        let hash = compute_entry_hash(&entry).unwrap();
-        entry.entry_hash = hash.to_vec();
-        let canonical = crate::audit::verify::canonical_bytes_for_entry(&entry).unwrap();
-        let sig = key.sign(&canonical);
-        entry.signature = B64.encode(sig.to_bytes());
-        entry
+        crate::audit::test_support::seal(key, entry)
     }
 
     /// v10.2.0 (CIRISPersist#281) — `next_chain_position` exposes the
@@ -1659,7 +1070,7 @@ mod tests {
     #[tokio::test]
     async fn next_chain_position_genesis_then_increment() {
         let (_b, audit) = fresh_backend().await;
-        let key = SigningKey::from_bytes(&[0xC2; 32]);
+        let key = audit_seed(&audit, 0xC2).await;
         let tenant = format!("ncp-{}", Uuid::new_v4().simple());
 
         // Fresh chain → (1, GENESIS_PREV_HASH).
@@ -1698,7 +1109,7 @@ mod tests {
     #[tokio::test]
     async fn audit_admits_lensaudit_consent_and_wbd_283_sqlite() {
         let (_b, audit) = fresh_backend().await;
-        let key = SigningKey::from_bytes(&[0xC3; 32]);
+        let key = audit_seed(&audit, 0xC3).await;
         let tenant = format!("audit-283-{}", Uuid::new_v4().simple());
 
         let e1 = build_and_sign(
@@ -1725,7 +1136,7 @@ mod tests {
     async fn cirisaudit_sqlite_round_trip_full_lifecycle() {
         let (_b, audit) = fresh_backend().await;
 
-        let key = SigningKey::from_bytes(&[0xA1; 32]);
+        let key = audit_seed(&audit, 0xA1).await;
         let tenant = format!("audit-test-{}", Uuid::new_v4().simple());
 
         // 1. Genesis insert.
@@ -1879,7 +1290,7 @@ mod tests {
     #[tokio::test]
     async fn list_entries_empty_cursor_returns_first_page() {
         let (_b, audit) = fresh_backend().await;
-        let key = SigningKey::from_bytes(&[0xB2; 32]);
+        let key = audit_seed(&audit, 0xB2).await;
         let tenant = format!("audit-cursor-{}", Uuid::new_v4().simple());
 
         let e1 = build_and_sign(
@@ -1929,7 +1340,7 @@ mod tests {
         let a = std::sync::Arc::new(SqliteAuditBackend::new(conn_handle.clone()));
         let b = std::sync::Arc::new(SqliteAuditBackend::new(conn_handle.clone()));
 
-        let key = SigningKey::from_bytes(&[0xC3; 32]);
+        let key = audit_seed(&b, 0xC3).await;
         let tenant = format!("audit-race-{}", Uuid::new_v4().simple());
 
         // Both callers must build IDENTICAL signed entries — the
@@ -2015,17 +1426,17 @@ mod tests {
     /// payload, used by the v1.0.0 query_by_correlation_id tests
     /// (CIRISAgent#756 Q4 — graph-node side collapse into persist).
     fn build_with_correlation(
-        key: &SigningKey,
+        key: &str,
         tenant_id: &str,
         sequence_number: i64,
         prev_hash: Vec<u8>,
         correlation_id: &str,
     ) -> AuditEntry {
-        let mut entry = AuditEntry {
+        let entry = AuditEntry {
             entry_id: Uuid::new_v4().to_string(),
             sequence_number,
             tenant_id: tenant_id.to_owned(),
-            actor_id: pubkey_b64(key),
+            actor_id: String::new(),
             action_type: "handler_action_task_complete".into(),
             subject_kind: "task".into(),
             subject_id: format!("subj-{sequence_number}"),
@@ -2035,12 +1446,7 @@ mod tests {
             recorded_at: truncate_to_micros(chrono::Utc::now()),
             signature: String::new(),
         };
-        let hash = compute_entry_hash(&entry).unwrap();
-        entry.entry_hash = hash.to_vec();
-        let canonical = crate::audit::verify::canonical_bytes_for_entry(&entry).unwrap();
-        let sig = key.sign(&canonical);
-        entry.signature = B64.encode(sig.to_bytes());
-        entry
+        crate::audit::test_support::seal(key, entry)
     }
 
     /// v1.0.0 (CIRISAgent#756 Q4): `query_by_correlation_id` returns
@@ -2049,7 +1455,7 @@ mod tests {
     #[tokio::test]
     async fn query_by_correlation_id() {
         let (_b, audit) = fresh_backend().await;
-        let key = SigningKey::from_bytes(&[0xD4; 32]);
+        let key = audit_seed(&audit, 0xD4).await;
         let tenant = format!("audit-corr-{}", Uuid::new_v4().simple());
 
         // 3 entries on the same chain: corr-A, corr-A, corr-B.
@@ -2164,7 +1570,7 @@ mod tests {
     #[tokio::test]
     async fn merkle_hook_disabled_when_signer_absent() {
         let (_b, audit) = fresh_backend().await;
-        let key = SigningKey::from_bytes(&[0xC0; 32]);
+        let key = audit_seed(&audit, 0xC0).await;
         let tenant = format!("audit-merk-off-{}", Uuid::new_v4().simple());
 
         let e1 = build_and_sign(
@@ -2197,7 +1603,7 @@ mod tests {
     async fn merkle_hook_enabled_appends_and_signs() {
         let (_b, audit) = fresh_backend().await;
         audit.set_merkle_signer(Some(merkle_test_signer(0xD1)));
-        let key = SigningKey::from_bytes(&[0xD1; 32]);
+        let key = audit_seed(&audit, 0xD1).await;
         let tenant = format!("audit-merk-on-{}", Uuid::new_v4().simple());
 
         let e1 = build_and_sign(
@@ -2261,8 +1667,8 @@ mod tests {
         let (_b, audit) = fresh_backend().await;
         audit.set_merkle_signer(Some(merkle_test_signer(0xE2)));
 
-        let key_a = SigningKey::from_bytes(&[0xEA; 32]);
-        let key_b = SigningKey::from_bytes(&[0xEB; 32]);
+        let key_a = audit_seed(&audit, 0xEA).await;
+        let key_b = audit_seed(&audit, 0xEB).await;
         let tenant_a = format!("audit-merk-iso-A-{}", Uuid::new_v4().simple());
         let tenant_b = format!("audit-merk-iso-B-{}", Uuid::new_v4().simple());
 
@@ -2306,7 +1712,7 @@ mod tests {
     #[tokio::test]
     async fn merkle_hook_install_mid_chain_only_affects_subsequent() {
         let (_b, audit) = fresh_backend().await;
-        let key = SigningKey::from_bytes(&[0xF3; 32]);
+        let key = audit_seed(&audit, 0xF3).await;
         let tenant = format!("audit-merk-mid-{}", Uuid::new_v4().simple());
 
         // 2 entries with signer OFF.
@@ -2366,7 +1772,7 @@ mod tests {
     async fn merkle_hook_does_not_weaken_chain_integrity() {
         let (_b, audit) = fresh_backend().await;
         audit.set_merkle_signer(Some(merkle_test_signer(0xA9)));
-        let key = SigningKey::from_bytes(&[0xA9; 32]);
+        let key = audit_seed(&audit, 0xA9).await;
         let tenant = format!("audit-merk-int-{}", Uuid::new_v4().simple());
 
         let e1 = build_and_sign(
@@ -2388,552 +1794,5 @@ mod tests {
         let (l, s) = count_merkle_rows(&audit, &tenant).await;
         assert_eq!(l, 1, "exactly one leaf — replay was chain-rejected");
         assert_eq!(s, 1);
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // v1.5.0 Phase D — TrustGrant projection tests (SQLite)
-    // ────────────────────────────────────────────────────────────────
-
-    /// Seed a row in `federation_keys` for the given `key_id` so the
-    /// FK constraints on `federation_trust_grants` (grantee / granter
-    /// / revoked_by all reference `federation_keys(key_id)`) are
-    /// satisfied. The pubkey + envelope columns get throwaway values;
-    /// only the FK shape matters for Phase D's projection tests.
-    async fn seed_federation_key(audit: &SqliteAuditBackend, key_id: &str) {
-        let conn = audit.conn_handle();
-        let key_id = key_id.to_owned();
-        (move || {
-            let conn = conn.lock();
-            conn.execute(
-                "INSERT OR IGNORE INTO federation_keys (\
-                    key_id, pubkey_ed25519_base64, algorithm, \
-                    identity_type, identity_ref, valid_from, \
-                    registration_envelope, original_content_hash, \
-                    scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash, admitted_at\
-                 ) VALUES (?1, 'AAAA', 'hybrid', 'agent', ?1, \
-                          '2026-01-01T00:00:00Z', '{}', \
-                          x'00', '', ?1, '2026-01-01T00:00:00Z', '0', \
-                          '2026-01-01T00:00:00Z')",
-                rusqlite::params![key_id],
-            )
-            .unwrap();
-        })();
-    }
-
-    /// Build + sign a trust_grant audit entry. Mirrors `build_and_sign`
-    /// but parameterizes the payload + sets `subject_kind="trust_grant"`.
-    #[allow(clippy::too_many_arguments)]
-    fn build_trust_grant_entry(
-        granter_key: &SigningKey,
-        tenant_id: &str,
-        sequence_number: i64,
-        prev_hash: Vec<u8>,
-        grantee_key_b64: &str,
-        purpose: crate::federation::trust_grant::TrustPurpose,
-        scope: &str,
-        expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> AuditEntry {
-        let payload = serde_json::json!({
-            "grantee_key": grantee_key_b64,
-            "purpose": purpose.as_str(),
-            "scope": scope,
-            "expires_at": expires_at.map(|t| t.to_rfc3339()),
-            "rationale": "phase-D-test",
-        });
-        let mut entry = AuditEntry {
-            entry_id: Uuid::new_v4().to_string(),
-            sequence_number,
-            tenant_id: tenant_id.to_owned(),
-            actor_id: pubkey_b64(granter_key),
-            action_type: "trust_granted".into(),
-            subject_kind: crate::federation::trust_grant::TRUST_GRANT_SUBJECT_KIND.into(),
-            subject_id: grantee_key_b64.to_owned(),
-            payload,
-            prev_hash,
-            entry_hash: vec![],
-            recorded_at: truncate_to_micros(chrono::Utc::now()),
-            signature: String::new(),
-        };
-        let hash = compute_entry_hash(&entry).unwrap();
-        entry.entry_hash = hash.to_vec();
-        let canonical = crate::audit::verify::canonical_bytes_for_entry(&entry).unwrap();
-        let sig = granter_key.sign(&canonical);
-        entry.signature = B64.encode(sig.to_bytes());
-        entry
-    }
-
-    #[derive(Debug, Clone)]
-    struct ProjectedGrantRow {
-        grant_id: String,
-        grantee_key: String,
-        granter_key: String,
-        purpose: String,
-        scope: String,
-        granted_at: String,
-        expires_at: Option<String>,
-        revoked_at: Option<String>,
-        revoked_by: Option<String>,
-        chain_event_id: i64,
-        tenant_id: String,
-    }
-
-    async fn fetch_grant(
-        audit: &SqliteAuditBackend,
-        grantee: &str,
-        granter: &str,
-        purpose: &str,
-        scope: &str,
-    ) -> Option<ProjectedGrantRow> {
-        let conn = audit.conn_handle();
-        let grantee = grantee.to_owned();
-        let granter = granter.to_owned();
-        let purpose = purpose.to_owned();
-        let scope = scope.to_owned();
-        (move || {
-            let conn = conn.lock();
-            conn.query_row(
-                "SELECT grant_id, grantee_key, granter_key, purpose, scope, \
-                        granted_at, expires_at, revoked_at, revoked_by, \
-                        chain_event_id, tenant_id \
-                 FROM federation_trust_grants \
-                 WHERE grantee_key = ?1 AND granter_key = ?2 \
-                   AND purpose = ?3 AND scope = ?4",
-                rusqlite::params![grantee, granter, purpose, scope],
-                |row| {
-                    Ok(ProjectedGrantRow {
-                        grant_id: row.get(0)?,
-                        grantee_key: row.get(1)?,
-                        granter_key: row.get(2)?,
-                        purpose: row.get(3)?,
-                        scope: row.get(4)?,
-                        granted_at: row.get(5)?,
-                        expires_at: row.get(6)?,
-                        revoked_at: row.get(7)?,
-                        revoked_by: row.get(8)?,
-                        chain_event_id: row.get(9)?,
-                        tenant_id: row.get(10)?,
-                    })
-                },
-            )
-            .optional()
-            .unwrap()
-        })()
-    }
-
-    async fn count_grants(audit: &SqliteAuditBackend, tenant: &str) -> i64 {
-        let conn = audit.conn_handle();
-        let tenant = tenant.to_owned();
-        (move || {
-            let conn = conn.lock();
-            conn.query_row(
-                "SELECT COUNT(*) FROM federation_trust_grants WHERE tenant_id = ?1",
-                rusqlite::params![tenant],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap()
-        })()
-    }
-
-    /// v1.5.0 Phase D — Non-trust-grant entries do NOT touch
-    /// federation_trust_grants. The projection is gated on
-    /// `subject_kind == "trust_grant"`; an entry with
-    /// `subject_kind="task"` (the default for `build_and_sign`)
-    /// must leave the projection empty.
-    #[tokio::test]
-    async fn project_skips_non_trust_grant_subject_kinds() {
-        let (_b, audit) = fresh_backend().await;
-        let key = SigningKey::from_bytes(&[0x10; 32]);
-        let tenant = format!("audit-pd-skip-{}", Uuid::new_v4().simple());
-
-        let e1 = build_and_sign(
-            &key,
-            &tenant,
-            1,
-            GENESIS_PREV_HASH.to_vec(),
-            "handler_action_task_complete",
-        );
-        audit.record_entry(e1.clone()).await.unwrap();
-        let e2 = build_and_sign(&key, &tenant, 2, e1.entry_hash.clone(), "config_change");
-        audit.record_entry(e2.clone()).await.unwrap();
-
-        assert_eq!(count_grants(&audit, &tenant).await, 0);
-    }
-
-    /// v1.5.0 Phase D — A trust_grant entry materializes one row in
-    /// federation_trust_grants with the expected values.
-    #[tokio::test]
-    async fn project_new_grant_materializes_row() {
-        use crate::federation::trust_grant::TrustPurpose;
-        let (_b, audit) = fresh_backend().await;
-
-        let granter_signing = SigningKey::from_bytes(&[0x11; 32]);
-        let granter_b64 = pubkey_b64(&granter_signing);
-        let grantee_b64 = pubkey_b64(&SigningKey::from_bytes(&[0x12; 32]));
-        let tenant = format!("audit-pd-new-{}", Uuid::new_v4().simple());
-
-        seed_federation_key(&audit, &granter_b64).await;
-        seed_federation_key(&audit, &grantee_b64).await;
-
-        let entry = build_trust_grant_entry(
-            &granter_signing,
-            &tenant,
-            1,
-            GENESIS_PREV_HASH.to_vec(),
-            &grantee_b64,
-            TrustPurpose::Contribution,
-            "proposal:registry_vouch",
-            None,
-        );
-        audit.record_entry(entry.clone()).await.unwrap();
-
-        let row = fetch_grant(
-            &audit,
-            &grantee_b64,
-            &granter_b64,
-            "contribution",
-            "proposal:registry_vouch",
-        )
-        .await
-        .expect("grant row materialized");
-        assert_eq!(row.grantee_key, grantee_b64);
-        assert_eq!(row.granter_key, granter_b64);
-        assert_eq!(row.purpose, "contribution");
-        assert_eq!(row.scope, "proposal:registry_vouch");
-        assert_eq!(row.chain_event_id, 1);
-        assert_eq!(row.tenant_id, tenant);
-        assert!(row.revoked_at.is_none());
-        assert!(row.revoked_by.is_none());
-        assert!(row.expires_at.is_none());
-        // granted_at follows entry.recorded_at (modulo micro
-        // truncation). The exact string match isn't useful; sanity-
-        // check that the column is populated.
-        assert!(!row.granted_at.is_empty());
-
-        assert_eq!(count_grants(&audit, &tenant).await, 1);
-    }
-
-    /// v1.5.0 Phase D — Re-issuance of the same (grantee, granter,
-    /// purpose, scope) tuple updates the existing row in place. Row
-    /// count stays 1; chain_event_id refreshes to the latest entry's
-    /// sequence_number.
-    #[tokio::test]
-    async fn project_re_issuance_updates_existing_row() {
-        use crate::federation::trust_grant::TrustPurpose;
-        let (_b, audit) = fresh_backend().await;
-
-        let granter_signing = SigningKey::from_bytes(&[0x21; 32]);
-        let granter_b64 = pubkey_b64(&granter_signing);
-        let grantee_b64 = pubkey_b64(&SigningKey::from_bytes(&[0x22; 32]));
-        let tenant = format!("audit-pd-reissue-{}", Uuid::new_v4().simple());
-
-        seed_federation_key(&audit, &granter_b64).await;
-        seed_federation_key(&audit, &grantee_b64).await;
-
-        // Future expiry (well past now).
-        let far_future = chrono::Utc::now() + chrono::Duration::hours(48);
-
-        let e1 = build_trust_grant_entry(
-            &granter_signing,
-            &tenant,
-            1,
-            GENESIS_PREV_HASH.to_vec(),
-            &grantee_b64,
-            TrustPurpose::Technical,
-            "manifest:stable",
-            None,
-        );
-        audit.record_entry(e1.clone()).await.unwrap();
-
-        // Re-issue with an explicit future expiry — row updates in
-        // place. Capture grant_id BEFORE the re-issuance.
-        let original = fetch_grant(
-            &audit,
-            &grantee_b64,
-            &granter_b64,
-            "technical",
-            "manifest:stable",
-        )
-        .await
-        .expect("first grant row");
-        let original_grant_id = original.grant_id.clone();
-
-        // Force a recorded_at delta so the granted_at column changes.
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-
-        let e2 = build_trust_grant_entry(
-            &granter_signing,
-            &tenant,
-            2,
-            e1.entry_hash.clone(),
-            &grantee_b64,
-            TrustPurpose::Technical,
-            "manifest:stable",
-            Some(far_future),
-        );
-        audit.record_entry(e2.clone()).await.unwrap();
-
-        assert_eq!(
-            count_grants(&audit, &tenant).await,
-            1,
-            "re-issuance does not insert a new row"
-        );
-        let row = fetch_grant(
-            &audit,
-            &grantee_b64,
-            &granter_b64,
-            "technical",
-            "manifest:stable",
-        )
-        .await
-        .expect("row still present");
-        assert_eq!(
-            row.grant_id, original_grant_id,
-            "grant_id is stable across re-issuance (UPSERT keeps PK)"
-        );
-        assert_eq!(row.chain_event_id, 2, "chain_event_id refreshed");
-        assert!(
-            row.expires_at.is_some(),
-            "expires_at populated by re-issuance"
-        );
-        assert!(row.revoked_at.is_none(), "future expiry → not revocation");
-        assert!(row.revoked_by.is_none());
-    }
-
-    /// v1.5.0 Phase D — Revocation per FSD §3.4 is a re-issuance with
-    /// `expires_at <= NOW()`. The projection detects this and sets
-    /// `revoked_at` + `revoked_by`.
-    #[tokio::test]
-    async fn project_revocation_sets_revoked_at() {
-        use crate::federation::trust_grant::TrustPurpose;
-        let (_b, audit) = fresh_backend().await;
-
-        let granter_signing = SigningKey::from_bytes(&[0x31; 32]);
-        let granter_b64 = pubkey_b64(&granter_signing);
-        let grantee_b64 = pubkey_b64(&SigningKey::from_bytes(&[0x32; 32]));
-        let tenant = format!("audit-pd-revoke-{}", Uuid::new_v4().simple());
-
-        seed_federation_key(&audit, &granter_b64).await;
-        seed_federation_key(&audit, &grantee_b64).await;
-
-        // Initial grant: no expiry.
-        let e1 = build_trust_grant_entry(
-            &granter_signing,
-            &tenant,
-            1,
-            GENESIS_PREV_HASH.to_vec(),
-            &grantee_b64,
-            TrustPurpose::Deferral,
-            "medical_deferral",
-            None,
-        );
-        audit.record_entry(e1.clone()).await.unwrap();
-
-        // Revocation: re-issuance with expires_at = past timestamp.
-        let past = chrono::Utc::now() - chrono::Duration::seconds(60);
-        let e2 = build_trust_grant_entry(
-            &granter_signing,
-            &tenant,
-            2,
-            e1.entry_hash.clone(),
-            &grantee_b64,
-            TrustPurpose::Deferral,
-            "medical_deferral",
-            Some(past),
-        );
-        audit.record_entry(e2.clone()).await.unwrap();
-
-        let row = fetch_grant(
-            &audit,
-            &grantee_b64,
-            &granter_b64,
-            "deferral",
-            "medical_deferral",
-        )
-        .await
-        .expect("grant row");
-        assert!(row.revoked_at.is_some(), "revocation populates revoked_at");
-        assert_eq!(
-            row.revoked_by.as_deref(),
-            Some(granter_b64.as_str()),
-            "revoked_by = granter (author-only per §3.4)"
-        );
-        assert_eq!(count_grants(&audit, &tenant).await, 1);
-    }
-
-    /// v1.5.0 Phase D — Self-grant (granter == grantee) is rejected
-    /// with Error::TrustGrant. Mirrors the V021 CHECK constraint AND
-    /// FSD §3.6 integrity rule.
-    #[tokio::test]
-    async fn project_self_grant_rejected() {
-        use crate::federation::trust_grant::TrustPurpose;
-        let (_b, audit) = fresh_backend().await;
-
-        let granter_signing = SigningKey::from_bytes(&[0x41; 32]);
-        let granter_b64 = pubkey_b64(&granter_signing);
-        let tenant = format!("audit-pd-self-{}", Uuid::new_v4().simple());
-
-        seed_federation_key(&audit, &granter_b64).await;
-
-        let entry = build_trust_grant_entry(
-            &granter_signing,
-            &tenant,
-            1,
-            GENESIS_PREV_HASH.to_vec(),
-            &granter_b64, // grantee = granter
-            TrustPurpose::Service,
-            "service:llm",
-            None,
-        );
-        let err = audit.record_entry(entry).await.unwrap_err();
-        assert!(
-            matches!(err, Error::TrustGrant(_)),
-            "expected Error::TrustGrant, got {err:?}"
-        );
-        assert_eq!(
-            count_grants(&audit, &tenant).await,
-            0,
-            "no projection row materialized on self-grant"
-        );
-    }
-
-    /// v1.5.0 Phase D — Multi-tenant isolation. The UNIQUE constraint
-    /// on `(grantee_key, granter_key, purpose, scope)` intentionally
-    /// omits `tenant_id` per FSD §3.6 — the grant identity is the
-    /// relationship + purpose + scope, not the audit log location.
-    /// So a same-tuple grant under tenant-B UPDATES the tenant-A row
-    /// (treating gossip cross-emission as re-issuance), keeping a
-    /// single canonical projection per relationship globally.
-    ///
-    /// This test verifies that semantic: two tenants emitting the
-    /// same logical grant resolve to one row whose `tenant_id`
-    /// reflects the latest emit.
-    #[tokio::test]
-    async fn project_cross_tenant_collapses_per_unique_constraint() {
-        use crate::federation::trust_grant::TrustPurpose;
-        let (_b, audit) = fresh_backend().await;
-
-        let granter_signing = SigningKey::from_bytes(&[0x51; 32]);
-        let granter_b64 = pubkey_b64(&granter_signing);
-        let grantee_b64 = pubkey_b64(&SigningKey::from_bytes(&[0x52; 32]));
-        let tenant_a = format!("audit-pd-mt-A-{}", Uuid::new_v4().simple());
-        let tenant_b = format!("audit-pd-mt-B-{}", Uuid::new_v4().simple());
-
-        seed_federation_key(&audit, &granter_b64).await;
-        seed_federation_key(&audit, &grantee_b64).await;
-
-        let a1 = build_trust_grant_entry(
-            &granter_signing,
-            &tenant_a,
-            1,
-            GENESIS_PREV_HASH.to_vec(),
-            &grantee_b64,
-            TrustPurpose::Contribution,
-            "proposal:registry_vouch",
-            None,
-        );
-        audit.record_entry(a1.clone()).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let b1 = build_trust_grant_entry(
-            &granter_signing,
-            &tenant_b,
-            1,
-            GENESIS_PREV_HASH.to_vec(),
-            &grantee_b64,
-            TrustPurpose::Contribution,
-            "proposal:registry_vouch",
-            None,
-        );
-        audit.record_entry(b1.clone()).await.unwrap();
-
-        let row = fetch_grant(
-            &audit,
-            &grantee_b64,
-            &granter_b64,
-            "contribution",
-            "proposal:registry_vouch",
-        )
-        .await
-        .expect("grant row");
-        // Tenant B emit landed last → row.tenant_id == tenant_b.
-        assert_eq!(row.tenant_id, tenant_b);
-        // The grants table should hold one row TOTAL across both
-        // tenants (UNIQUE constraint per FSD §3.6).
-        let total: i64 = {
-            let conn = audit.conn_handle();
-            (move || {
-                let conn = conn.lock();
-                conn.query_row("SELECT COUNT(*) FROM federation_trust_grants", [], |r| {
-                    r.get::<_, i64>(0)
-                })
-                .unwrap()
-            })()
-        };
-        assert_eq!(
-            total, 1,
-            "cross-tenant same-tuple emits collapse via UPSERT"
-        );
-    }
-
-    /// v1.5.0 Phase D — A malformed trust_grant payload (subject_kind
-    /// is "trust_grant" but the payload doesn't parse as a
-    /// TrustGrantPayload) surfaces as Error::TrustGrant. The chain
-    /// row already landed at this point — that's the documented
-    /// option-(b) atomicity stance (Phase I will reconcile).
-    #[tokio::test]
-    async fn project_malformed_payload_surfaces_error() {
-        let (_b, audit) = fresh_backend().await;
-        let granter_signing = SigningKey::from_bytes(&[0x61; 32]);
-        let tenant = format!("audit-pd-malformed-{}", Uuid::new_v4().simple());
-
-        let mut entry = AuditEntry {
-            entry_id: Uuid::new_v4().to_string(),
-            sequence_number: 1,
-            tenant_id: tenant.clone(),
-            actor_id: pubkey_b64(&granter_signing),
-            action_type: "trust_granted".into(),
-            subject_kind: crate::federation::trust_grant::TRUST_GRANT_SUBJECT_KIND.into(),
-            subject_id: "irrelevant".into(),
-            // Missing required fields — won't deserialize.
-            payload: serde_json::json!({"junk": "value"}),
-            prev_hash: GENESIS_PREV_HASH.to_vec(),
-            entry_hash: vec![],
-            recorded_at: truncate_to_micros(chrono::Utc::now()),
-            signature: String::new(),
-        };
-        let hash = compute_entry_hash(&entry).unwrap();
-        entry.entry_hash = hash.to_vec();
-        let canonical = crate::audit::verify::canonical_bytes_for_entry(&entry).unwrap();
-        let sig = granter_signing.sign(&canonical);
-        entry.signature = B64.encode(sig.to_bytes());
-
-        let err = audit.record_entry(entry).await.unwrap_err();
-        assert!(
-            matches!(err, Error::TrustGrant(_)),
-            "expected Error::TrustGrant, got {err:?}"
-        );
-
-        // The chain entry DID land (option-(b)): list_entries finds it.
-        let page = audit
-            .list_entries(
-                AuditFilter {
-                    tenant_id: tenant.clone(),
-                    action_type: None,
-                    actor_id: None,
-                    subject_kind: None,
-                    subject_id: None,
-                    recorded_after: None,
-                    recorded_before: None,
-                },
-                None,
-                100,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            page.items.len(),
-            1,
-            "chain row stands even when projection fails (FSD §4.2)"
-        );
     }
 }

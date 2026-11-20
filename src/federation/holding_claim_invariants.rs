@@ -511,21 +511,45 @@ pub(crate) mod dyn_bodies {
             ts::seal_row_in_place(by, &mut p);
             p
         };
-        let e = e2::put_signed(d, &standing(&founder, &shut))
-            .await
-            .unwrap_err();
+        // v62.0.0 (E13 fix2; CC 2.7.3) — both are judged against OTHER rows
+        // (the room's protocol, its roster): HELD, concluding nothing, not
+        // refused. A held statement keeps no row.
+        let held = |p: crate::federation::Attestation, what: &'static str| async move {
+            let out = e2::put_signed(d, &p).await;
+            let row = match out {
+                Ok(crate::federation::edition2::ingest::StatementOutcome::Pending {
+                    row_id,
+                    ..
+                }) => row_id,
+                other => panic!("I713 {what}: expected HELD (Pending), got {other:?}"),
+            };
+            assert!(
+                d.get_attestation(&p.attestation_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "I713 {what}: concludes nothing"
+            );
+            crate::federation::edition2::fold::why_held(d, &row)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("I713 {what}: held with a reason"))
+                .reason
+        };
         assert_eq!(
-            rule_of(&e),
+            held(
+                standing(&founder, &shut),
+                "a public room that is not open: its standing proposal"
+            )
+            .await,
             RULE_OPEN_PROPOSAL_NOT_OPEN,
-            "I713 a public room that is not open: its standing proposal is held: {e}"
+            "I713 the reason"
         );
-        let e = e2::put_signed(d, &standing(&stranger, &id))
-            .await
-            .unwrap_err();
-        assert!(
-            !e.to_string().is_empty(),
-            "I713 a non-member's standing proposal is held (out of scope): {e}"
-        );
+        let _ = held(
+            standing(&stranger, &id),
+            "a non-member's standing proposal (out of scope)",
+        )
+        .await;
         let p = standing(&founder, &id);
         e2::put_signed(d, &p)
             .await
@@ -1809,12 +1833,35 @@ pub(crate) mod blob_bodies {
         let core: crate::federation::envelope::EnvelopeCore = serde_json::from_value(env).unwrap();
         let input =
             crate::federation::EmitAttestationInput::with_envelope("scores", core, cs::FEDERATION);
-        let e = crate::federation::attestation_emit::emit_with_local_signer(b, &n.signer, input)
-            .await
-            .unwrap_err();
+        // v62.0.0 (E13 fix2; CC 2.7.3) — the claim's scope is judged against
+        // the blob's held scope (another row): the claim is HELD for
+        // `custody_ack_scope_mismatch`, concluding nothing, not refused.
+        let emitted =
+            crate::federation::attestation_emit::emit_with_local_signer(b, &n.signer, input)
+                .await
+                .expect("I717 the claim is kept");
         assert!(
-            e.to_string().contains("custody_ack_scope_mismatch"),
-            "I717 the attestation door: {e}"
+            b.get_attestation(&emitted.attestation_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "I717 a claim at the wrong scope concludes nothing"
+        );
+        let id: [u8; 32] = hex::decode(&emitted.attestation_id)
+            .ok()
+            .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+            .expect("I717 a 64-hex row id");
+        let why = crate::federation::edition2::fold::why_held(
+            b,
+            &crate::federation::edition2::names::RowId(id),
+        )
+        .await
+        .unwrap()
+        .map(|h| h.reason);
+        assert_eq!(
+            why.as_deref(),
+            Some(crate::federation::holding_claim::CUSTODY_ACK_SCOPE_MISMATCH),
+            "I717 the attestation door holds it for its scope"
         );
     }
 

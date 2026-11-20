@@ -1663,6 +1663,68 @@ pub(crate) mod test_support {
         }
     }
 
+    /// **I2631** (v62.0.0, E2-fix9; CC rc21 994b4f5 ruling (c): CC 3.2 "the
+    /// recovery gate", CC 8.10 the `ownership:*` card's withdraw guard,
+    /// `wa_adjudication_ref` a logical name for `refs.also.cites`) — **the
+    /// gated `withdraws` names its WA finding as its ONE `refs.also.cites`
+    /// row, beside `refs.target`**, and carries no other refs member. The draft passes the composer rule (no
+    /// non-composer member: `wa_adjudication_ref` is never a payload member),
+    /// and the mapping reads the finding back as the envelope member the
+    /// reclaim gate reads. Kills: stating the reference as a payload member
+    /// (the composer rule refuses the row); the target replacing the roles the
+    /// envelope stated (the finding is lost, the gate reads it missing).
+    #[test]
+    fn i2631_the_reclaim_withdraws_names_its_finding_in_refs() {
+        use crate::federation::edition2::names::{names_of, single};
+        let (binding, finding) = ("11".repeat(32), "22".repeat(32));
+        let family = ciris_verify_core::namespace_match::family_id(
+            "ownership:{relation}:{target_kind}:{version}",
+        );
+        let (kid, iss) = signer("i2631-node");
+        let draft = draft_reclaim_withdraws(
+            (&kid, &iss),
+            &e2::kid("i2631-node"),
+            &binding,
+            &family,
+            &finding,
+            e2::ms(chrono::Utc::now()),
+        )
+        .expect("I2631: the reclaim withdraws drafts");
+        let payload =
+            ciris_verify_core::cde::decode(&draft.payload).expect("I2631: the payload decodes");
+        crate::federation::edition2::payloads::check_composer("withdraws", &payload)
+            .expect("I2631: the composer rule admits the reclaim withdraws");
+        assert!(
+            payload.get_text(field::WA_ADJUDICATION_REF).is_none(),
+            "I2631: the reference is no payload member"
+        );
+        let names = names_of(&payload).expect("I2631: refs read");
+        assert_eq!(
+            single(&names, "target").map(|r| r.hex()),
+            Some(binding.clone()),
+            "I2631: refs.target names the binding"
+        );
+        assert_eq!(
+            single(&names, "also:cites").map(|r| r.hex()),
+            Some(finding.clone()),
+            "I2631: refs.also.cites names the finding, exactly one row"
+        );
+        assert!(
+            names
+                .iter()
+                .all(|n| n.role == "target" || n.role == "also:cites"),
+            "I2631: no refs member beyond target and also.cites: {names:?}"
+        );
+        let row = row_of(&signed("i2631-node", draft));
+        assert_eq!(
+            row.attestation_envelope
+                .get(field::WA_ADJUDICATION_REF)
+                .and_then(serde_json::Value::as_str),
+            Some(finding.as_str()),
+            "I2631: the gate's member reads back from refs"
+        );
+    }
+
     /// The row a statement maps to (its row id is `attestation_id`).
     fn row_of(statement: &[u8]) -> Attestation {
         e2::row_of_statement(statement, attestation_tier::FEDERATION)
@@ -1944,6 +2006,26 @@ pub(crate) mod test_support {
         assert!(
             refused_or_held(dir, &bare).await,
             "({suffix}) and the real put gate must refuse it too — the gate is not advisory"
+        );
+
+        // ══ RED 1b (E2-fix9; CC rc21 994b4f5 ruling (c)) — `cites` holds
+        //    EXACTLY ONE row, the finding: a withdraws whose `refs.also.cites`
+        //    names the finding AND another row names no finding, so it
+        //    concludes nothing (the gate reads no `wa_adjudication_ref`).
+        let mut two_env = build_reclaim_withdraws_envelope(&binding_id, &finding_id);
+        two_env.as_object_mut().expect("object").insert(
+            field::WA_ADJUDICATION_REF.to_owned(),
+            serde_json::json!([finding_id.clone(), petition_id.clone()]),
+        );
+        let two = withdraws_of_envelope(&node, &node, two_env, &binding_family, now);
+        assert_eq!(
+            check(two.clone(), Some(policy.clone())).await.refusal(),
+            Some(ReclaimRefusal::WaAdjudicationRefMissing),
+            "({suffix}) a cites of two rows names no single finding: it concludes nothing"
+        );
+        assert!(
+            refused_or_held(dir, &two).await,
+            "({suffix}) …and the real put gate does not land it"
         );
 
         // ══ RED 2 — a wa_adjudication_ref that resolves to nothing.

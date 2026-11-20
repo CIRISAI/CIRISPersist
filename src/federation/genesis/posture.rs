@@ -875,46 +875,12 @@ pub(crate) async fn exercise_seedless_gate_refusals(dir: &dyn FederationDirector
         "[{tag}] no charter ⇒ the constitutional root is NOT valid"
     );
 
-    // ── and the constitutional family id cannot be claimed at the peer door,
-    //    which is the hole that opening the seedless boot would otherwise have
-    //    created: sole seat + `founder_only` ⇒ a 1-of-1 charter threshold.
-    let squat = crate::federation::SignedFamily {
-        family: crate::federation::types::Family {
-            prev_head_digest: String::new(),
-            charter_digest: String::new(),
-            family_key_id: "humanity-accord".to_owned(),
-            family_name: "MINE".to_owned(),
-            members: vec![crate::federation::types::FamilyMember {
-                key_id: rogue.clone(),
-                joined_at: ts,
-                role: Some("founder".to_owned()),
-            }],
-            founded_at: ts,
-            consensus_protocol: "founder_only".to_owned(),
-            consensus_protocol_entrenched: false,
-            dissolved_at: None,
-            persist_row_hash: String::new(),
-        },
-        authority_key_id: rogue.clone(),
-        scrub_signature_classical: "AA==".to_owned(),
-        scrub_signature_pqc: None,
-        supersede_proof: None,
-        cosignatures: Vec::new(),
-    };
-    let err = dir
-        .put_family(squat)
-        .await
-        .expect_err("the constitutional family id must not be claimable by a peer");
-    assert_eq!(
-        err.kind(),
-        "federation_constitutional_family_reserved",
-        "[{tag}] and the refusal names the reservation"
-    );
-    assert!(
-        dir.lookup_family("humanity-accord")
-            .await
-            .expect("lookup")
-            .is_none(),
-        "[{tag}] a refused squat writes NOTHING"
-    );
+    // v62.0.0 (E12-fix3; CP2) — the squat arm is DELETED: it offered a
+    // `SignedFamily` claiming the constitutional family id at the earlier-form
+    // `put_family` door, which CP2 shuts (every such object is refused as the
+    // earlier form before any reservation is read). In edition 2 a peer's
+    // claim is a `group:roster` statement whose `group` is an identity-ref,
+    // so the keyless accord id cannot be named at all; the reservation on the
+    // version path is GC8's fold (`federation_constitutional_family_reserved`,
+    // `tier_ingest::verify_family_admission`).
 }

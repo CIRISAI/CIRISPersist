@@ -116,9 +116,12 @@ async fn body(d: &dyn FederationDirectory) {
     assert_eq!(e.token(), VERIFY_SIGNER_REVOKED, "I2880: {e}");
     assert!(!e.is_retryable(), "I2880: final");
 
-    // ── I2881: a record waiting on a key not held, and an instant no record
-    //    covers, are retryable waits ──
-    e2::put_statement(
+    // ── I2881: a record by a signer this node does not hold is never filed
+    //    (F0-cp8, round-6 red: the statement door refuses it first as the
+    //    retryable ordering gap, so no held record can wait); the verifier then
+    //    knows no key for it. The wait's own retryability is the error's
+    //    (below). An instant no record covers is a retryable wait. ──
+    match e2::put_statement(
         d,
         &e2::key_record_with(
             WAITING,
@@ -130,11 +133,25 @@ async fn body(d: &dyn FederationDirectory) {
         ),
     )
     .await
-    .expect("I2881: a record by an unheld signer is filed");
+    {
+        Err(e @ crate::federation::Error::AttesterKeyUnknown { .. }) => {
+            assert_eq!(
+                e.kind(),
+                "federation_attester_key_unknown",
+                "I2881: the retryable ordering gap: {e}"
+            );
+        }
+        other => panic!("I2881: a record by an unheld signer is refused, not filed: {other:?}"),
+    }
     let waiting = e2::kid(WAITING);
     let e = refusal(d, &waiting, &sign(WAITING, MSG), now(), "I2881").await;
-    assert_eq!(e.token(), VERIFY_SIGNER_WAITING, "I2881 waiting: {e}");
-    assert!(e.is_retryable(), "I2881 waiting: retryable");
+    assert_eq!(e.token(), VERIFY_UNKNOWN_KEY, "I2881 nothing filed: {e}");
+    let wait = CompositeVerifyError::Waiting {
+        identity_ref: waiting.clone(),
+        missing: 1,
+    };
+    assert_eq!(wait.token(), VERIFY_SIGNER_WAITING, "I2881");
+    assert!(wait.is_retryable(), "I2881 waiting: retryable");
 
     let node = e2::put_key(d, NODE, &["node"]).await;
     verify_composite_via_directory(d, MSG, &node, &sign(NODE, MSG), now())
@@ -161,9 +178,9 @@ async fn body(d: &dyn FederationDirectory) {
         DirectoryOpResult::CompositeVerify(Ok(who)) => assert_eq!(who, live, "I2885"),
         other => panic!("I2885: a live key's composite verifies through the op: {other:?}"),
     }
-    match dispatch_directory_op(d, op(sign(WAITING, MSG), &waiting, now())).await {
+    match dispatch_directory_op(d, op(sign(NODE, MSG), &node, 1)).await {
         DirectoryOpResult::CompositeVerify(Err(r)) => {
-            assert_eq!(r.token, VERIFY_SIGNER_WAITING, "I2885: {r:?}");
+            assert_eq!(r.token, VERIFY_SIGNER_NOT_COVERED, "I2885: {r:?}");
             assert!(r.retryable, "I2885: a wait crosses the capsule as a wait");
         }
         other => panic!("I2885: the wait rides inside CompositeVerify: {other:?}"),
@@ -434,26 +451,25 @@ async fn calibration(d: &dyn FederationDirectory) {
 
 /// v62.0.0 (F0-cp7) — **I2893: no door verifies a lone component of an
 /// edition-2 key.** The edition-2 key's projected `federation_keys` row
-/// carries its composite's halves; the earlier row-signature verify
-/// (`tier_ingest::verify_envelope_hybrid_signature`), handed a genuine
-/// separate Ed25519 + ML-DSA-65 pair from that key's own component seeds, no
-/// longer verifies it against those halves: refused by name
-/// (`earlier_form_object`). The bound-hybrid verify family is deleted
-/// (`scripts/earlier_form_doors.py`'s LONE_VERIFY scan keeps it out).
+/// carries its composite's halves; the one row-signature check left on the
+/// earlier-form planes (`edition2::group::vouched_envelope`, F0-cp8: the
+/// earlier envelope verify and its 24 call sites are deleted), handed a
+/// genuine separate Ed25519 + ML-DSA-65 pair from that key's own component
+/// seeds outside a vouch, refuses it by name (`earlier_form_object`). The
+/// bound-hybrid verify family is deleted (`scripts/earlier_form_doors.py`'s
+/// LONE_VERIFY scan keeps it out).
 async fn no_lone_half(d: &dyn FederationDirectory) {
     const SIGNER: &str = "f0-cp7-pair-signer";
     let who = e2::put_key(d, SIGNER, &["user"]).await;
     let envelope = serde_json::json!({"dimension": "scores:f0cp7:v1", "x": 1});
     let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope).unwrap();
     let pair = crate::federation::tier_ingest::test_support::threshold_sign(SIGNER, &canonical);
-    let got = crate::federation::tier_ingest::verify_envelope_hybrid_signature(
-        d,
+    let got = super::group::vouched_envelope(
         &who,
         &envelope,
         &pair.ed25519_signature_base64,
-        pair.mldsa65_signature_base64.as_deref(),
-    )
-    .await;
+        "signed_envelope",
+    );
     match got {
         Err(crate::federation::Error::MalformedRow { reason, .. }) => assert_eq!(
             reason,

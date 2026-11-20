@@ -633,6 +633,15 @@ pub async fn plan_enter_mesh(
     if let TierPromotionCustody::Statement(c) = custody {
         return plan_statement_crossing(dir, current, ci, c, self_key_id, now).await;
     }
+    // v62.0.0 (v62 P8-fix13; CC 2.6.1.12, E3's round-6 finding) — the JCS
+    // arms below (an actor's reseal, the node's co-scrub over a JCS image) are
+    // the earlier form: once its doors are shut they would mint a
+    // federation-tier row no edition-2 peer can verify (the bound-hybrid
+    // verify is gone, F0-cp7). The Engine never reaches them (it restates an
+    // earlier-form local row, `Engine::restate_local_row`); a directory
+    // caller offering a JCS custody is refused here, by name, on every
+    // backend.
+    super::edition2::door::refuse_earlier_form("enter_mesh")?;
     let mut row = current.clone();
     // Canonical at rest: the local door stores the producer's tokens verbatim
     // (`1.0` vs `1`); JCS(x) == JCS(canonical(x)), so this is not a preimage
@@ -659,14 +668,12 @@ pub async fn plan_enter_mesh(
             }
             // The actor's signature verifies against the actor's REGISTERED
             // pubkeys, Strict — exactly what every peer's ingest will ask.
-            super::verify_envelope_hybrid_signature(
-                dir,
+            crate::federation::edition2::group::vouched_envelope(
                 &row.attesting_key_id,
                 &row.attestation_envelope,
                 &reseal.scrub_signature_classical,
-                reseal.scrub_signature_pqc.as_deref(),
-            )
-            .await?;
+                "promotion_reseal",
+            )?;
             row.original_content_hash = computed_hash.clone();
             row.scrub_signature_classical = reseal.scrub_signature_classical.clone();
             row.scrub_signature_pqc = reseal.scrub_signature_pqc.clone();
@@ -705,22 +712,18 @@ pub async fn plan_enter_mesh(
             // The base scrub the row already carries is the actor's; it is
             // verified here because a signed local row was stored on the
             // producer's word and this is the door where that word is checked.
-            super::verify_envelope_hybrid_signature(
-                dir,
+            crate::federation::edition2::group::vouched_envelope(
                 &row.attesting_key_id,
                 &row.attestation_envelope,
                 &row.scrub_signature_classical,
-                row.scrub_signature_pqc.as_deref(),
-            )
-            .await?;
-            super::verify_envelope_hybrid_signature(
-                dir,
+                "promotion_reseal",
+            )?;
+            crate::federation::edition2::group::vouched_envelope(
                 &scrub.scrub_key_id,
                 &row.attestation_envelope,
                 &scrub.scrub_signature_classical,
-                scrub.scrub_signature_pqc.as_deref(),
-            )
-            .await?;
+                "promotion_reseal",
+            )?;
             // `cosigned_at` is the co-signer's own stamp, already verified
             // parseable by `crossing_at` above; it rides OUTSIDE the preimage,
             // so appending it cannot disturb the bytes the actor signed.
@@ -740,14 +743,12 @@ pub async fn plan_enter_mesh(
         Custody::ActorSignedNodeCoScrubbed { .. } => row.additional_scrubs.len() - 1,
     };
     for (i, scrub) in row.additional_scrubs.iter().take(inherited).enumerate() {
-        super::verify_envelope_hybrid_signature(
-            dir,
+        crate::federation::edition2::group::vouched_envelope(
             &scrub.scrub_key_id,
             &row.attestation_envelope,
             &scrub.scrub_signature_classical,
-            scrub.scrub_signature_pqc.as_deref(),
+            "promotion_reseal",
         )
-        .await
         .map_err(|e| match e {
             Error::FederationTierUnverified {
                 attestation_id: _,
@@ -1224,7 +1225,10 @@ pub(crate) fn scope_rank(s: &str) -> Option<usize> {
 /// `requested` must be strictly wider than the prior's `cohort_scope` in the
 /// closed widening order ([`cohort_scope::ALL`]); else
 /// [`Error::AudienceNotWider`]. Pure and free, so callers ask it before they
-/// sign anything.
+/// sign anything. "Wider" here is a LINEAR ladder, not containment: the Live
+/// read hides a restated prior by audience CONTAINMENT
+/// (`attestation_query::lifecycle_predicate`, P8-fix14), so e.g. a family row
+/// restated into a community leaves both live, each served to its own audience.
 pub fn check_strictly_wider(prior: &Attestation, requested: &str) -> Result<(), Error> {
     match (scope_rank(&prior.cohort_scope), scope_rank(requested)) {
         (Some(from), Some(to)) if to > from => Ok(()),
@@ -1534,6 +1538,66 @@ pub struct Restatement {
     pub row_type: String,
     /// The prior's payload at the new placement.
     pub payload: ciris_verify_core::cde::Value,
+}
+
+/// v62.0.0 (v62 P8-fix14; lead ruling (a), CC 4.4.3.3.1 / 8.1.5) — **the
+/// restatement key**: the identity of a claim across its placements. SHA-256
+/// (lowercase hex) over the deterministic encoding of `[iss, sub, row type,
+/// family, payload]`, the payload with its placement members
+/// ([`is_restatement_placement_member`]: `cohort_scope` and the cohort
+/// target) removed. Everything else the statement signs is in it,
+/// `asserted_at`, `author` and every claim member included, so two distinct
+/// acts never share a key; a prior and every [`restate_at_audience`] of it
+/// share one. Computed from the statement alone, so every node derives the
+/// same key; each backend's row writer stores it in V300's plain
+/// `restatement_key` column ([`restatement_key_of_row`]), never in the
+/// envelope, so no content hash sees it. The Live read hides a
+/// row a live, same-`iss` row with its key and a strictly containing
+/// audience restates (`attestation_query::lifecycle_predicate`).
+#[must_use]
+pub fn restatement_key(
+    iss: &str,
+    sub: &str,
+    row_type: &str,
+    family: &str,
+    payload: &ciris_verify_core::cde::Value,
+) -> Option<String> {
+    use ciris_verify_core::cde::Value;
+    use sha2::Digest as _;
+    let members = payload.as_map()?;
+    let claim: Vec<(Value, Value)> = members
+        .iter()
+        .filter(|(k, _)| !k.as_text().is_some_and(is_restatement_placement_member))
+        .cloned()
+        .collect();
+    let preimage = Value::Array(vec![
+        Value::Text(iss.to_owned()),
+        Value::Text(sub.to_owned()),
+        Value::Text(row_type.to_owned()),
+        Value::Text(family.to_owned()),
+        Value::Map(claim),
+    ]);
+    Some(hex::encode(sha2::Sha256::digest(
+        ciris_verify_core::cde::encode(&preimage),
+    )))
+}
+
+/// v62.0.0 (v62 P8-fix14) — [`restatement_key`] of a stored row, from the
+/// statement it carries (its `iss`, `sub`, row type, family and payload): the
+/// value each backend's row writer stores in V300's plain `restatement_key`
+/// column beside the row. It is NEVER an envelope member, so no content hash
+/// (`original_content_hash`, `persist_row_hash`) sees it. `None` for a row
+/// that carries no edition-2 statement.
+#[must_use]
+pub fn restatement_key_of_row(row: &Attestation) -> Option<String> {
+    use ciris_verify_core::cde::Value;
+    let statement = super::edition2::emit::carried_statement(row)?;
+    let (family, row_type) = super::edition2::emit::family_of_statement(&statement)?;
+    let (protected, payload) = super::edition2::liveness::statement_parts(&statement)?;
+    let claims = protected.get_int(15)?;
+    let iss = claims.get_int(1).and_then(Value::as_text)?;
+    let sub = claims.get_int(2).and_then(Value::as_text)?;
+    restatement_key(iss, sub, &row_type, &family, &payload)
 }
 
 /// The payload members a restatement replaces because they ARE the

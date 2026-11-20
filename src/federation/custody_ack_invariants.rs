@@ -473,6 +473,50 @@ pub(crate) mod bodies {
         Box::pin(e2::put_statement(d, &st)).await
     }
 
+    /// v62.0.0 (E6-fix8) — the statement door's raw answer for `device`'s
+    /// own `self` report (no outcome insisted on), and the held reason when
+    /// it waits. A report outside the device's cohort WAITS (CC 3.1.3.3, a
+    /// wait under CC 2.7.3), so a witness of "outside" reads it here.
+    pub(crate) async fn self_report_outcome(
+        d: &dyn FederationDirectory,
+        device: &str,
+        sha: &[u8; 32],
+        state: CustodyState,
+        at: DateTime<Utc>,
+    ) -> (
+        crate::federation::edition2::ingest::StatementOutcome,
+        Option<String>,
+    ) {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::ingest::StatementOutcome;
+        use crate::federation::edition2::typed;
+        let size = (state == CustodyState::Here).then_some(4096);
+        let k = e2::kid_or_keep(device);
+        let at_ms = u64::try_from(at.timestamp_millis()).expect("after the epoch");
+        let payload = typed::custody_payload(&k, sha, state, size, cs::SELF, None, at_ms)
+            .expect("a well-formed self report");
+        let st = e2::typed_statement(
+            &e2::seed_of(device),
+            None,
+            &k,
+            typed::CUSTODY_PREFIX,
+            &payload,
+        );
+        let out = Box::pin(e2::put_statement(d, &st))
+            .await
+            .unwrap_or_else(|e| panic!("the statement door answers a self report: {e}"));
+        let why = match &out {
+            StatementOutcome::Pending { row_id, .. } => {
+                crate::federation::edition2::fold::why_held(d, row_id)
+                    .await
+                    .unwrap()
+                    .map(|h| h.reason)
+            }
+            _ => None,
+        };
+        (out, why)
+    }
+
     /// **I406** — outside the cohort WAITS; inside is admitted.
     ///
     /// v62.0.0 (E6-fix4, T2's ruling) — the cohort is OTHER rows (the
@@ -1501,139 +1545,14 @@ mod engine_bodies {
         }
     }
 
-    /// **I605** (v54.0.0, Codex round 2 on PR #1050) — **durability reaches
-    /// every room shared plaintext was written into.** Plaintext is written
-    /// only into the commons or an authorized infrastructure room, and both
-    /// reach everyone; but a room's infrastructure standing is a property of
-    /// its record, and a supersession can drop it. Its plaintext rows stay,
-    /// and from then on the room reaches its members' nodes. Here room A's
-    /// only member occurs through node A and room B's through node B; the
-    /// same bytes are written into both while both are infrastructure, then
-    /// both records are superseded without the label. The row's provenance
-    /// names room A, and the audience was resolved from it alone, so node B
-    /// (only in room B) was never a target and never missing while room B
-    /// held no copy. Now the audience is the union over the associations.
-    pub(crate) async fn i605_durability_reaches_every_plaintext_room<B>(
-        dsn_a: &str,
-        dsn_b: &str,
-        run: &str,
-        pick: Pick<B>,
-    ) where
-        B: BlobStorage
-            + FederationDirectory
-            + crate::federation::attestation_query::AttestationQueryExec
-            + crate::federation::canonical_community_invariants::bodies::SetNodeKey
-            + Sync
-            + 'static,
-    {
-        use crate::federation::durability::{content_audience, ContentAudience, DeficitAudience};
-        use crate::federation::tier_ingest::test_support as ts;
-        let l = ladder(dsn_a, dsn_b, run, pick).await;
-        let e = &l.engine_a;
-        let ba = l.ba.as_ref();
-        let bob = format!("em-bob-{run}");
-        let room_a = infra_room_of(&l, run, "i605a", &l.alice).await;
-        let room_b = infra_room_of(&l, run, "i605b", &bob).await;
-        let bytes = format!("i605 shared plaintext {run}").into_bytes();
-        let pa = e
-            .put_blob_scoped(COMMUNITY, Some(&room_a), &bytes, None, None)
-            .await
-            .unwrap();
-        let pb = e
-            .put_blob_scoped(COMMUNITY, Some(&room_b), &bytes, None, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            pa.at_rest_sha256, pb.at_rest_sha256,
-            "I605 one content address"
-        );
-        let sha = pa.at_rest_sha256;
-        assert_eq!(
-            ba.blob_provenance(&sha)
-                .await
-                .unwrap()
-                .unwrap()
-                .group_key_id
-                .as_deref(),
-            Some(room_a.as_str()),
-            "I605 precondition: the row's columns name room A only"
-        );
-        // Both rooms lose their infrastructure standing ON NODE A.
-        // v62.0.0 (CC rc20 3.2 / 4.4.3.34, #1274): an infrastructure room is a
-        // trust-root record that cannot drop its grade, and its carve-out
-        // holds only while it roots in THIS node's trust set. Until v62 each
-        // founder superseded its record without the label; now node A
-        // re-roots: its own trust edge names another root, so neither
-        // accord-rooted room is authorized here any more.
-        {
-            use crate::federation::envelope::EnvelopeCore;
-            use crate::federation::EmitAttestationInput;
-            let other_root = format!("em-other-root-{run}");
-            ts::register_hybrid_key_as(
-                ba,
-                &other_root,
-                &other_root,
-                crate::federation::types::identity_type::USER,
-            )
-            .await;
-            let core = EnvelopeCore::from_value(serde_json::json!({
-                "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
-            }))
-            .unwrap();
-            let mut input = EmitAttestationInput::with_envelope(
-                crate::federation::types::attestation_type::DELEGATES_TO,
-                core,
-                crate::federation::types::cohort_scope::FEDERATION,
-            );
-            input.attested_key_id = Some(crate::federation::edition2::fixture_switch::kid(
-                &other_root,
-            ));
-            e.emit_attestation_self(input)
-                .await
-                .expect("I605: node A's trust edge to another root");
-            for room in [&room_a, &room_b] {
-                let held = ba.lookup_community(room).await.unwrap().expect("held");
-                assert!(
-                    !crate::federation::admission::is_authorized_infrastructure_community(
-                        ba as &dyn FederationDirectory,
-                        &held
-                    )
-                    .await
-                    .unwrap(),
-                    "I605: re-rooted, node A no longer authorizes {room}"
-                );
-            }
-        }
-        // The premise: the two rooms now reach DIFFERENT nodes.
-        for (room, has, lacks) in [
-            (&room_a, &l.node_a, &l.node_b),
-            (&room_b, &l.node_b, &l.node_a),
-        ] {
-            match content_audience(ba as &dyn FederationDirectory, COMMUNITY, None, Some(room))
-                .await
-                .unwrap()
-            {
-                ContentAudience::Nodes(n) => assert!(
-                    n.contains(has) && !n.contains(lacks),
-                    "I605 premise: room {room} reaches {has} and not {lacks}: {n:?}"
-                ),
-                other => panic!("I605 premise: room {room} resolves to nodes: {other:?}"),
-            }
-        }
-        let d = e.durability_deficit(&sha, &l.node_a, None).await.unwrap();
-        let DeficitAudience::Nodes(nodes) = &d.audience else {
-            panic!("I605 the audience resolves to nodes: {d:?}");
-        };
-        assert!(
-            nodes.contains(&l.node_a) && nodes.contains(&l.node_b),
-            "I605 the audience is both rooms' nodes: {nodes:?}"
-        );
-        assert!(
-            d.missing.contains(&l.node_b),
-            "I605 node B (room B only) holds no copy and is missing: {d:?}"
-        );
-    }
-
+    // v62.0.0 (E6-fix8) — I605 is DELETED: its premise is an infrastructure
+    // room that LOSES its standing on node A when node A's own trust edge
+    // names another root (the earlier `trusted_roots_of` reading). A v62
+    // infrastructure room roots through its trust-root chain
+    // (`trust_root::infrastructure_reached_here` → `stored_standing_at`), not
+    // through this node's acceptance edges, and its grade cannot drop (CC
+    // rc20 3.2 / 4.4.3.34), so the premise cannot be set up. The union over
+    // associations it relied on is witnessed by I607.
     /// **I607** (v54.0.0, Codex round 3 on PR #1050) — **each association is
     /// resolved with its own principal.** A `self` association records the
     /// owner its write named (V177: the group of a `self` write is the owner
@@ -1660,7 +1579,8 @@ mod engine_bodies {
         };
         let l = ladder(dsn_a, dsn_b, run, pick).await;
         let ba = l.ba.as_ref() as &dyn FederationDirectory;
-        let bob = format!("em-bob-{run}");
+        // v62.0.0 (E6-fix8) — the ladder names bob by his kid (`ladder`: `kid("em-bob-{run}")`); his bare seed resolves no self room.
+        let bob = crate::federation::edition2::fixture_switch::kid(&format!("em-bob-{run}"));
         // The premise: each owner's own `self` room reaches its own node.
         for (owner, has, lacks) in [
             (&l.alice, &l.node_a, &l.node_b),
@@ -1922,7 +1842,6 @@ mod runners {
     #[cfg(feature = "sqlite")]
     sqlite_engine_case!(i579_sqlite, i579_shared_plaintext_keeps_every_room);
     #[cfg(feature = "sqlite")]
-    sqlite_engine_case!(i605_sqlite, i605_durability_reaches_every_plaintext_room);
     #[cfg(feature = "sqlite")]
     sqlite_engine_case!(
         i607_sqlite,
@@ -1998,7 +1917,6 @@ mod runners {
     #[cfg(feature = "postgres")]
     postgres_engine_case!(i579_postgres, i579_shared_plaintext_keeps_every_room);
     #[cfg(feature = "postgres")]
-    postgres_engine_case!(i605_postgres, i605_durability_reaches_every_plaintext_room);
     #[cfg(feature = "postgres")]
     postgres_engine_case!(
         i607_postgres,

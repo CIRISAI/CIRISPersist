@@ -553,10 +553,19 @@ mod run {
         // The node is a member of the owner's family: both voice the founding
         // roster (T1; a node/agent-signed row is now-relative).
         let fam = e2::put_key(&*dir, &format!("fam-{s}"), &[USER]).await;
-        let joined = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
-            (chrono::Utc::now() - chrono::Duration::days(1)).timestamp_millis(),
-        )
-        .expect("ms");
+        // E5-fix2 (round 6) — dated from the node key's own window: the
+        // engine states its `key:record` at registration, so a roster voice
+        // a day earlier waited `AttesterKeyUnknown` (the key was not live at
+        // the voice's instant). The founding is at the record's `valid_from`.
+        let joined = dir
+            .lookup_public_key(&node)
+            .await
+            .expect("lookup the engine's key")
+            .expect("the engine's key is held")
+            .valid_from;
+        let joined =
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(joined.timestamp_millis())
+                .expect("ms");
         let signed_family = ts::sign_family(
             &owner,
             Family {

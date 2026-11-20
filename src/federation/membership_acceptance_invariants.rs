@@ -784,7 +784,10 @@ pub(crate) mod bodies {
         widen_family(d, &fid, &founder, &m, None, now)
             .await
             .expect("I212: a member (not a founder) joins the family");
-        let e = put(
+        // E5-fix2 (round 6) — the proposer's standing is read from the roster
+        // (other rows, CC 2.7.3): the proposal is HELD, and `put_e2` answers a
+        // hold as its refusal-shaped error (its detail is the gate's text).
+        let e = put_e2(
             d,
             &proposal(&m, FAMILY, &fid, &j, None, now, Some(Duration::days(7))),
         )
@@ -1003,7 +1006,9 @@ pub(crate) mod bodies {
             &founder,
             &serde_json::json!({
                 "id": uuid::Uuid::new_v4().to_string(),
-                "references_attestation_id": pm.attestation_id,
+                // E5-fix2 (round 6) — the target by its node-computed row id
+                // (`refs.target`), never the JSON row's chosen id.
+                "references_attestation_id": crate::federation::edition2::fixture_switch::rid(&pm),
                 "withdrawal_reason": "rescinded",
             }),
         );

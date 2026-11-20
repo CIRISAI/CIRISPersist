@@ -169,10 +169,62 @@ pub mod two_node {
         // statement door, then the bound key's voice by `key_seed`; it asserts
         // the binding lands, and the builder dates it inside the bound key's
         // window). In the earlier form it is `put_attestation`, as before.
-        let row = ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), owner, key);
+        let mut row = ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), owner, key);
+        // v62.0.0 (E11-fix4) — dated from the bound key's record AS THIS
+        // DIRECTORY HOLDS IT ([`owner_binding_instant`]), then re-sealed. The
+        // builder dates from the process-wide default window of `key`'s seed,
+        // which is not this directory's record when the key is an ENGINE's
+        // own (`register_self_federation_key` starts the record at its
+        // registration instant): the binding fell before the record began and
+        // the key's voice waited `AttesterKeyUnknown` (86 reds, pass 4d).
+        if e2::emit_edition2() {
+            let at = owner_binding_instant(d, key_seed).await;
+            row.asserted_at = at;
+            row.scrub_timestamp = at;
+            if let Some(m) = row.attestation_envelope.as_object_mut() {
+                if m.contains_key("asserted_at") {
+                    m.insert(
+                        "asserted_at".to_owned(),
+                        serde_json::Value::String(
+                            crate::federation::admission::render_signed_instant(at),
+                        ),
+                    );
+                }
+            }
+            ts::reseal(&mut row);
+        }
         ts::put_sealed_owner_binding(d, &row, key_seed)
             .await
             .unwrap_or_else(|e| panic!("{owner} owns {key}: {e}"));
+    }
+
+    /// v62.0.0 (E11-fix4) — the offset past the bound key's record start at
+    /// which [`own_key`] dates the owner binding.
+    pub const OWNER_BINDING_RECORD_OFFSET_MS: i64 = 1;
+
+    /// v62.0.0 (E11-fix4) — **the instant an owner binding of `key_seed`'s
+    /// key is dated at on `d`**: the key's record as `d` holds it
+    /// (`lookup_public_key`, its `valid_from`, at whole ms) plus
+    /// [`OWNER_BINDING_RECORD_OFFSET_MS`]. Inside the record by construction,
+    /// whenever and however the record was put (a default node window, an
+    /// engine's registration instant). Call after [`key_live`].
+    ///
+    /// # Panics
+    /// `d` holds no record for the key.
+    pub async fn owner_binding_instant(
+        d: &dyn crate::federation::FederationDirectory,
+        key_seed: &str,
+    ) -> chrono::DateTime<chrono::Utc> {
+        let k = e2::kid(&e2::seed_of(key_seed));
+        let rec = d
+            .lookup_public_key(&k)
+            .await
+            .unwrap_or_else(|e| panic!("{k}'s record: {e}"))
+            .unwrap_or_else(|| panic!("{k} is held before it is owned"));
+        let ms = rec.valid_from.timestamp_millis() + OWNER_BINDING_RECORD_OFFSET_MS;
+        chrono::TimeZone::timestamp_millis_opt(&chrono::Utc, ms)
+            .single()
+            .expect("an instant inside the key's record")
     }
 
     /// v62.0.0 (P1-fix10) — **make the bound key live before anything it
@@ -3072,6 +3124,10 @@ pub mod two_node {
     /// observable: early → the plane's own refusal (the fold passed); late →
     /// `signer_not_active_member` (the fold refused first).
     /// Ruled on PR #850's review.
+    ///
+    /// v62.0.0 (E11-fix4) — the minter node is its owner's device by owner
+    /// binding (CC rc21 3.3.6), so its standing ends when its OWNER leaves the
+    /// room; the removal stands in for the earlier occurrence revocation.
     pub async fn exercise_i60b_delayed_set_survives_a_later_occurrence_revocation<B>(
         a: &Node<'_, B>,
         b: &Node<'_, B>,
@@ -3092,22 +3148,32 @@ pub mod two_node {
             .unwrap()
             .expect("A holds wraps");
         let early_row = emitted_row_for(a, &early, &b.key).await;
-        // B learns that A's occurrence was revoked AFTER the early set was
-        // asserted (and before now).
-        b.backend
-            .put_identity_occurrence_revocation_local(
-                crate::federation::types::IdentityOccurrenceRevocation {
-                    identity_key_id: alice.clone(),
-                    occurrence_key_id: a.key.clone(),
-                    revoked_at: chrono::Utc::now(),
-                    effective_at: early_row.asserted_at + chrono::Duration::milliseconds(1),
-                    reason: None,
-                    witness_set: vec![],
-                    persist_row_hash: String::new(),
-                },
-            )
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I60b: B records the revocation: {e}"));
+        // B learns that A's principal stopped standing AFTER the early set was
+        // asserted (and before now). v62.0.0 (E11-fix4; CC rc21 3.3.6): A is
+        // alice's device by her OWNER BINDING (`place_device`), never an
+        // occurrence of hers, so the earlier "A's occurrence revoked" has no
+        // row to revoke; what ends A's standing is alice leaving the room.
+        // Her removal is effective NOW, after the early row's `asserted_at`
+        // (its own signed instant, never re-dated): v49.0.0 (#908), her own
+        // voice, and bob's to meet the majority.
+        let removed_at = chrono::Utc::now();
+        assert!(
+            removed_at > early_row.asserted_at,
+            "{tag} I60b: the removal follows the early row"
+        );
+        let rev = community_removal_voices(
+            b.backend,
+            &comm,
+            &alice,
+            removed_at,
+            removed_at,
+            &[&alice, &bob],
+        )
+        .await;
+        match e2::put_voices(b.backend, &rev).await {
+            Ok(StatementOutcome::Row { .. }) => {}
+            other => panic!("{tag} I60b: B holds alice's removal: {other:?}"),
+        }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         // v62.0.0 (E11, round 3) — the two gates are asked apart. The
         // key-grant rule folds membership at the row's `asserted_at`, so it
@@ -4552,8 +4618,15 @@ mod tests {
                 crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), "sqlite::memory:")
                     .await
                     .unwrap();
+            // v62.0.0 (E11-fix4; CC rc21 3.3.6) — the engine is a MACHINE: a
+            // member's device node (`place_device`: an owner binding onto a NODE
+            // key), so it registers (and is introduced) as a NODE.
             engine
-                .register_self_federation_key(USER, None, None)
+                .register_self_federation_key(
+                    crate::federation::types::identity_type::NODE,
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
             let sq = engine.sqlite_backend().unwrap().clone();
@@ -4715,7 +4788,7 @@ mod tests {
             use crate::federation::key_grant::{KeyGrantAxis, SignedKeyGrantRow};
             use crate::federation::tier_ingest::test_support as ts;
             use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
-            use crate::federation::types::identity_type::USER;
+            use crate::federation::types::identity_type::NODE;
             use crate::federation::{
                 AdoptDisposition, BlobBody, BlobProvenance, BlobStorage, EncryptionPubkeys,
             };
@@ -4733,10 +4806,17 @@ mod tests {
             )
             .await
             .unwrap();
+            // v62.0.0 (E11-fix4; CC rc21 3.3.6) — the engine is a MACHINE: a
+            // member's device node (`place_device`: an owner binding onto a NODE
+            // key), so it registers (and is introduced) as a NODE.
             for e in [&engine_a, &engine_b] {
-                e.register_self_federation_key(USER, None, None)
-                    .await
-                    .expect("register the engine's own key");
+                e.register_self_federation_key(
+                    crate::federation::types::identity_type::NODE,
+                    None,
+                    None,
+                )
+                .await
+                .expect("register the engine's own key");
             }
             let (sa, sb) = (
                 engine_a.sqlite_backend().unwrap().clone(),
@@ -4759,7 +4839,7 @@ mod tests {
                 key: engine_b.local_derived_key_id().await.unwrap(),
                 kem: kem(sb.load_or_init_content_kem_identity().await.unwrap()),
             };
-            introduce(&[&a, &b], &[&alias_a, &alias_b]).await;
+            introduce_as(&[&a, &b], &[&alias_a, &alias_b], NODE).await;
             let comm = e2::kid(&format!("eng-comm-{run}"));
             let (alice, bob) = (
                 e2::kid(&format!("eng-alice-{run}")),

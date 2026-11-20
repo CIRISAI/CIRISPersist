@@ -557,11 +557,12 @@ pub(crate) async fn fork_roster_body(d: &dyn FederationDirectory) {
         "I3001 the roster is the members common to both tips"
     );
 
-    // I3002 — a fork with disjoint members: an empty roster. The door's
-    // add rule (#955 Q2, judged against THIS node's head) never admits a tip
-    // listing a member the head does not, so the tip is held through the
-    // supersede executor K1's verdict writes (`supersede_group_row`): the
-    // read rule is what this witnesses.
+    // I3002 — two forks with disjoint members: an empty roster. Through the
+    // door only (the earlier `supersede_group_row` snapshot plant is shut,
+    // CP2): the head w2 keeps all four members, so each fork lists a subset
+    // of the head (#955 Q2, judged against THIS node's head) and is held as
+    // a tip. The members common to the head {a,b,c,e}, the tip {a,b} and the
+    // tip {c,e} are none.
     let gid2 = iref(&g2);
     let abce = [(&a, None), (&b, None), (&c, None), (&e, None)];
     let w1 = family(&g2, "w1", "majority", &abce);
@@ -570,47 +571,50 @@ pub(crate) async fn fork_roster_body(d: &dyn FederationDirectory) {
         w1_id = landed(&put(d, &roster(&w1, 1, None, 2_000, k)).await.unwrap());
     }
     let w1_id = w1_id.expect("I3002 founded");
-    let w1_hash = d
-        .lookup_family(&gid2)
-        .await
-        .unwrap()
-        .unwrap()
-        .persist_row_hash;
+    // The head: a rename, the same four members (majority: three of four).
+    let w2 = family(&g2, "w2", "majority", &abce);
+    for k in [&a, &b, &c] {
+        put(d, &roster(&w2, 2, Some(&w1_id), 3_000, k))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        d.lookup_family(&gid2).await.unwrap().unwrap().family_name,
+        "w2",
+        "I3002 the head"
+    );
+    // Tip one: {a,b}, naming w1, counted over the head's four (three voices).
     let ab = family(&g2, "ab", "majority", &[(&a, None), (&b, None)]);
     for k in [&a, &b, &c] {
-        put(d, &roster(&ab, 2, Some(&w1_id), 3_000, k))
+        put(d, &roster(&ab, 2, Some(&w1_id), 4_000, k))
             .await
             .unwrap();
     }
     assert_eq!(
         active(gid2.clone()).await,
         sorted(vec![iref(&a), iref(&b)]),
-        "I3002 the head's roster"
+        "I3002 one tip: the members common to the head and it"
     );
-    let GroupRecord::Family(mut ce) = family(&g2, "ce", "majority", &[(&c, None), (&e, None)])
-    else {
-        unreachable!()
-    };
-    ce.prev_head_digest = w1_hash;
-    let snapshot = serde_json::to_value(crate::federation::types::SignedFamily {
-        family: ce,
-        authority_key_id: iref(&c),
-        scrub_signature_classical: String::new(),
-        scrub_signature_pqc: None,
-        supersede_proof: None,
-        cosignatures: Vec::new(),
-    })
-    .unwrap();
-    d.supersede_group_row(Cohort::Family, snapshot, None)
-        .await
-        .unwrap();
+    // Tip two: {c,e}, naming w1, counted over the roster now common to the
+    // tips, {a,b} (a majority of two is both).
+    let ce = family(&g2, "ce", "majority", &[(&c, None), (&e, None)]);
+    for k in [&a, &b] {
+        put(d, &roster(&ce, 2, Some(&w1_id), 5_000, k))
+            .await
+            .unwrap();
+    }
     assert_eq!(
         d.list_group_tips(Cohort::Family, &gid2)
             .await
             .unwrap()
             .len(),
-        1,
-        "I3002 held as a tip"
+        2,
+        "I3002 both forks held as tips"
+    );
+    assert_eq!(
+        d.lookup_family(&gid2).await.unwrap().unwrap().family_name,
+        "w2",
+        "I3002 the head stays"
     );
     assert!(
         active(gid2.clone()).await.is_empty(),

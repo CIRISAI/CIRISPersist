@@ -226,7 +226,10 @@ pub mod bodies {
             &format!("i149-minter-{s}"),
         )
         .await
-        .derived_key_id();
+        // v62 (E4-fix6; cut B): the minter is named by the signer's
+        // federation id (its composite identity-ref).
+        .federation_id()
+        .await;
         let sealed = crate::federation::community_dek::orchestrate::encrypt_and_cascade_community(
             b,
             &comm,
@@ -238,7 +241,12 @@ pub mod bodies {
         .unwrap_or_else(|e| panic!("I149: seal at the community tier: {e}"))
         .at_rest_sha256;
         assert_eq!(
-            kind_of(&engine.read_blob_as(&sealed, &alice_occ, None).await),
+            // v62 (E4-fix6): the viewer is named by its identity-ref.
+            kind_of(
+                &engine
+                    .read_blob_as(&sealed, &e2::kid(&alice_occ), None)
+                    .await
+            ),
             "ok",
             "I149: the member occurrence reads the sealed blob before"
         );
@@ -254,7 +262,9 @@ pub mod bodies {
         withdraw(b, &format!("i149-sealed-w-{s}"), &subject, &sealed_row)
             .await
             .expect("I149: the subject withdraws the sealed row");
-        let r = engine.read_blob_as(&sealed, &alice_occ, None).await;
+        let r = engine
+            .read_blob_as(&sealed, &e2::kid(&alice_occ), None)
+            .await;
         assert!(
             matches!(&r, Err(BlobError::Withdrawn { .. })),
             "I149: the member sees Withdrawn on the sealed, withdrawn blob: {r:?}"
@@ -554,43 +564,14 @@ pub mod bodies {
             !b.list_local_holders(&sha).await.unwrap().contains(&node),
             "I153: this node no longer lists itself as a holder"
         );
-        // A REFUSED retraction ABORTS (I18's contract for one sha): announce a
-        // second blob, then evict it with a `now` far outside the admission
-        // skew, so the withdraws cannot be admitted. The bytes and the claim
-        // must survive, and the error must surface — a door that deleted
-        // first would report a retraction that never happened.
-        let body2 = format!("held by this node, second {s}").into_bytes();
-        let sha2 = *blake_free_sha(&body2);
-        b.put_blob_signing_at(
-            crate::federation::types::cohort_scope::FEDERATION,
-            crate::federation::StorageFloor::resolved(
-                crate::federation::types::cohort_scope::CryptoTier::Plaintext,
-            ),
-            &sha2,
-            crate::federation::BlobBody::Inline(body2),
-            None,
-            &node,
-            &signer,
-            chrono::Utc::now(),
-            uuid::Uuid::new_v4(),
-            None,
-        )
-        .await
-        .expect("I153: announce the second blob");
-        let far_future = chrono::Utc::now() + chrono::Duration::days(3650);
-        let res = engine.evict_blob(&sha2, far_future).await;
-        assert!(
-            res.is_err(),
-            "I153: a retraction that cannot be admitted must ABORT the eviction, got {res:?}"
-        );
-        assert!(
-            b.has_blob(&sha2).await.unwrap(),
-            "I153: the bytes were DELETED although the retraction failed"
-        );
-        assert!(
-            b.list_local_holders(&sha2).await.unwrap().contains(&node),
-            "I153: the claim survives a failed eviction"
-        );
+        // v62 (E4-fix6; ruling 4): the far-future-`now` abort leg is DELETED.
+        // It made the retraction inadmissible by passing an instant outside
+        // the admission skew; in v62 the node states its `withdraws` at its
+        // own clock (CC 2.4.1.1: a stamped instant is the signer's; the
+        // emission helper ignores the caller's `now`), so that row cannot be
+        // built. The abort contract itself is unchanged in
+        // `holding_claim::retract_own_claims` (an emission error aborts
+        // before any byte is deleted).
 
         // Retry after success: no second retraction, nothing held.
         let again = engine.evict_blob(&sha, chrono::Utc::now()).await.unwrap();

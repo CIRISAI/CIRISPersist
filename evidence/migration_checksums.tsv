@@ -17,5 +17,6 @@
 # again, so its two rows are re-pinned to the bytes on disk (refinery's
 # SipHasher13 over name, version and text). Still unshipped: no node ran it.
 # dialect	version	name	checksum
-sqlite	300	edition2_baseline	3392621981409750751
-postgres	300	edition2_baseline	5070577711594960456
+# v62.0.0 (P8-fix14): re-pinned over V300's appended restatement_key column (plain TEXT, written beside the row) and its index (both dialects; V300 is unshipped).
+sqlite	300	edition2_baseline	15633899536491953851
+postgres	300	edition2_baseline	15801953822701352571

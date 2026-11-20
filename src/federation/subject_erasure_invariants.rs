@@ -59,7 +59,14 @@ pub(crate) mod bodies {
     where
         B: FederationDirectory + ?Sized,
     {
-        let alias = format!("node-key-{tag}-0123456789abcdef")
+        // v62.0.0 (E2-fix7) — a test key seeds from the first 32 bytes of its
+        // name, and two tags may differ only in their last character
+        // (`{tag}a` / `{tag}b`): a short digest of the tag leads the alias.
+        let lead = {
+            use sha2::Digest as _;
+            hex::encode(&sha2::Sha256::digest(tag.as_bytes())[..4])
+        };
+        let alias = format!("{lead}-node-key-{tag}-0123456789abcdef")
             .replace('_', "-")
             .to_lowercase();
         // v62.0.0 (JSON cut, E7) — the node's key is an edition-2 record; its
@@ -80,7 +87,10 @@ pub(crate) mod bodies {
             severity: crate::derived::DetectionSeverity::Warning,
             cohort_cell: serde_json::json!({"agent_role": "x"}),
             conformity_variant: crate::derived::ConformityVariant::Numeric,
-            conformity_payload: serde_json::json!({"score": 0.25}),
+            // v62.0.0 (P8-fix12) — an integral score: a non-integral body real is a
+            // tag-4 decimal, which Verify 23.3.1's `ceg-value` refuses (admitted
+            // from 23.3.2, pass 4e). P8's I3535 keeps the tag-4 witness.
+            conformity_payload: serde_json::json!({"score": 1}),
             lens_core_version: "1.0.0".into(),
             ratchet_calibration_version: 3,
             canonical_bytes: format!("{{\"trace\":\"{trace}\"}}").into_bytes(),
@@ -617,9 +627,9 @@ pub(crate) mod bodies {
     where
         B: FederationDirectory + ?Sized,
     {
-        let alias = format!("{role}-key-{tag}-0123456789abcdef")
-            .replace('_', "-")
-            .to_lowercase();
+        // v62.0.0 (round 6, E7) — as [`signing_node`]: distinct in the first
+        // 32 bytes (`role` is a short identity type, at most 5 bytes).
+        let alias = role_seed(role, tag).replace('_', "-").to_lowercase();
         let id = e2::put_key(b, &alias, &[role]).await;
         Node { id, alias }
     }
@@ -830,6 +840,21 @@ pub(crate) mod bodies {
         )
     }
 
+    /// v62.0.0 (round 6, E7; CC 2.7.3) — the row concludes nothing: HELD
+    /// (`Pending`) or refused outright by an earlier gate, and not live under
+    /// its row id. For an arm more than one door can stop (a filing naming a
+    /// community that is not the target's, which also names a room the filer
+    /// is no member of): the property is that it does not land.
+    async fn put_not_landed(dir: &dyn FederationDirectory, row: Attestation) -> bool {
+        let id = e2::rid(&row);
+        let out = e2::put_signed(dir, &row).await;
+        let stopped = matches!(
+            out,
+            Ok(crate::federation::edition2::ingest::StatementOutcome::Pending { .. }) | Err(_)
+        );
+        stopped && dir.get_attestation(&id).await.unwrap().is_none()
+    }
+
     fn reconsideration(
         id: &str,
         filer: &str,
@@ -938,7 +963,7 @@ pub(crate) mod bodies {
         .expect("I972: the review-holder rules");
         // (5) the action's community is the target's.
         assert!(
-            put_held(
+            put_not_landed(
                 dir,
                 reconsideration(
                     &format!("i972-r5-{tag}"),
@@ -949,7 +974,7 @@ pub(crate) mod bodies {
                 ),
             )
             .await,
-            "I972: a filing naming another community: held (CC 2.7, GC1), concluding nothing"
+            "I972: a filing naming another community concludes nothing (held or refused)"
         );
         // (6) a target not held here: the subject arm is empty.
         assert!(

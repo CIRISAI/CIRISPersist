@@ -366,16 +366,12 @@ pub(crate) mod bodies {
 
     /// A structural composer of `kind` by `author`, attested to `attested`,
     /// naming `target` in `references_attestation_id`.
-    fn composer(author: &str, attested: &str, kind: &str, target: &Attestation) -> Attestation {
-        let id = uuid::Uuid::new_v4().to_string();
-        let env = serde_json::json!({
-            "id": id,
-            "references_attestation_id": target.attestation_id,
-        });
-        let mut r = ts::bare_attestation(&id, author, attested, &env);
-        r.attestation_type = kind.to_owned();
-        ts::seal_row_in_place(author, &mut r);
-        r
+    /// v62.0.0 (round 6, E7) — E0's `composer_of`: `refs.target` names the
+    /// target's row id and the row carries the target's family (CC 2.4.1.1).
+    /// The earlier literal (an `id` member, a bare `references_attestation_id`)
+    /// is no composer payload. `_attested` is the target's subject.
+    fn composer(author: &str, _attested: &str, kind: &str, target: &Attestation) -> Attestation {
+        e2::composer_of(kind, target, author)
     }
 
     /// `consent:state:<stance>:v1` by `subject` about `target` naming
@@ -462,17 +458,24 @@ pub(crate) mod bodies {
         // that stands.
         let g21 = grant(o2, Some(n1), Some(&[("community", "r1")]), None);
         put(d, g21.clone()).await.unwrap();
-        let mut sup = grant(
-            o2,
-            Some(n1),
-            Some(&[("community", "r1"), ("family", "f2")]),
-            None,
-        );
-        sup.attestation_type = attestation_type::SUPERSEDES.to_owned();
-        sup.attestation_envelope["references_attestation_id"] =
-            serde_json::Value::String(g21.attestation_id.clone());
-        ts::reseal(&mut sup);
-        put(d, sup).await.expect("o2 supersedes its own grant");
+        // v62.0.0 (round 6, E7) — an edition-2 `supersedes` is a COMPOSER
+        // (common members + `refs.target`, the target's family; CC 2.4.1.1):
+        // it carries no replacement body. The replacement list is its own
+        // grant row, and o2's `supersedes` retires g21.
+        put(
+            d,
+            grant(
+                o2,
+                Some(n1),
+                Some(&[("community", "r1"), ("family", "f2")]),
+                None,
+            ),
+        )
+        .await
+        .expect("o2's replacement list");
+        put(d, composer(o2, o2, attestation_type::SUPERSEDES, &g21))
+            .await
+            .expect("o2 supersedes its own grant");
         put(d, grant(o2, Some(n2), Some(&[("family", "f2")]), None))
             .await
             .unwrap();
@@ -631,6 +634,16 @@ pub(crate) mod bodies {
         )
     }
 
+    /// v62.0.0 (round 6, E7; CC 3.4.5, CC 2.6.1.9) — a charter toward a
+    /// GROUP root is a group act (`trust:{job}:{version}`: `act=group =>
+    /// counted`): a counted statement (no `author`) that `a` signs first and
+    /// any member voices. [`charter`] signs it as `a`'s OWN (authored) row,
+    /// over which `b`'s voice is refused `iss_not_in_role`.
+    fn group_charter(id: &str, root: &str, a: &str, b: &str) -> Attestation {
+        let c = charter(id, root, a, b);
+        e2::row_of_statement(&e2::counted_statement_of(&c, a), &c.tier)
+    }
+
     /// Point `fid`'s head at `digest`: v62.0.0 (JSON cut, E7; T1 §6) a
     /// roster version v+1 naming the held head, voiced by the family's
     /// members (`a` authors).
@@ -664,7 +677,7 @@ pub(crate) mod bodies {
         // fam1: a charter the head names — public.
         let fam1 = e2::kid(&format!("i534-fam1-{s}"));
         rab::family(d, &fam1, &[&a, &b]).await;
-        let c1 = charter(&format!("i534-c1-{s}"), &fam1, &a, &b);
+        let c1 = group_charter(&format!("i534-c1-{s}"), &fam1, &a, &b);
         put_cosigned(d, c1.clone(), &[&b])
             .await
             .expect("fam1 charter");
@@ -680,15 +693,19 @@ pub(crate) mod bodies {
         // fam2: a charter the head does NOT name — private.
         let fam2 = e2::kid(&format!("i534-fam2-{s}"));
         rab::family(d, &fam2, &[&a, &b]).await;
-        put_cosigned(d, charter(&format!("i534-c2-{s}"), &fam2, &a, &b), &[&b])
-            .await
-            .expect("fam2 charter");
+        put_cosigned(
+            d,
+            group_charter(&format!("i534-c2-{s}"), &fam2, &a, &b),
+            &[&b],
+        )
+        .await
+        .expect("fam2 charter");
         out.push((fam2, Some(false)));
 
         // fam3: a named charter, recanted by its attester — private again.
         let fam3 = e2::kid(&format!("i534-fam3-{s}"));
         rab::family(d, &fam3, &[&a, &b]).await;
-        let c3 = charter(&format!("i534-c3-{s}"), &fam3, &a, &b);
+        let c3 = group_charter(&format!("i534-c3-{s}"), &fam3, &a, &b);
         put_cosigned(d, c3.clone(), &[&b])
             .await
             .expect("fam3 charter");
@@ -717,13 +734,13 @@ pub(crate) mod bodies {
             e2::kid(&format!("i534-k3-{s}")),
         );
         rab::users(d, &[&k1, &k2, &k3]).await;
-        put_cosigned(d, charter(&format!("i534-ck1-{s}"), &k1, &a, &b), &[&b])
+        // v62.0.0 (round 6, E7) — a charter toward a KEY root is `a`'s own
+        // authored row: no second voice joins it (`iss_not_in_role`).
+        put_cosigned(d, charter(&format!("i534-ck1-{s}"), &k1, &a, &b), &[])
             .await
             .expect("k1 charter");
         let ck2 = charter(&format!("i534-ck2-{s}"), &k2, &a, &b);
-        put_cosigned(d, ck2.clone(), &[&b])
-            .await
-            .expect("k2 charter");
+        put_cosigned(d, ck2.clone(), &[]).await.expect("k2 charter");
         put(d, composer(&a, &k2, attestation_type::RECANTS, &ck2))
             .await
             .expect("k2 charter recanted");
@@ -1282,7 +1299,9 @@ pub(crate) mod bodies {
         put_cosigned(
             d,
             charter(&format!("i537-charter-{s}"), &root, &a, &b),
-            &[&b],
+            // v62.0.0 (round 6, E7) — a key root's charter is authored: no
+            // second voice joins it.
+            &[],
         )
         .await
         .expect("I537 charter");

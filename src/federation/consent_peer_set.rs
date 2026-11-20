@@ -279,8 +279,9 @@ pub(crate) mod test_support {
         // is bound into the signed envelope, so the door takes the re-stamped
         // + re-signed bundle beside the new placement.
         // (v39.0.0 — the in-place re-scope primitive is gone; a scope change is a
-        // `supersedes` written through `widen_audience`, witnessed in
-        // `bootstrap_admission::test_support::exercise_actor_signature_survives_the_crossing`.)
+        // `supersedes` written through `widen_audience`; v62.0.0, a
+        // restatement at the wider audience, witnessed by
+        // `edition2::crossing_producer_invariants`.)
 
         // ── list_live_consent_grants_by: grant → live, withdraw → gone ──
         let g = grant("-", &node_seed, &peer);

@@ -513,15 +513,12 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("read_key_registration_history", ConnClass::Read),
     ("read_renditions", ConnClass::Read),
     ("read_attestations", ConnClass::Read),
-    // v61 (CIRISPersist#934, S4a) — the accord and evidence executors:
-    // the cursor maxima and the held-proof read are reads; every store is a
-    // write (one `self.write`, its transaction inside).
-    ("last_accord_proposal_created_at", ConnClass::Read),
-    ("last_accord_participation_arrival", ConnClass::Read),
+    // v61 (CIRISPersist#934, S4a) — the evidence executors: the held-proof
+    // read is a read; every store is a write (one `self.write`, its
+    // transaction inside). v62.0.0 (E1-fix2): the accord executors' rows
+    // (`last_accord_*`, `store_planned_accord_*`) are deleted with their fns
+    // (F0's CP2 cut, pass 4d: the earlier-form accord doors).
     ("held_location_proof", ConnClass::Read),
-    ("store_planned_accord_proposal", ConnClass::Write),
-    ("store_planned_accord_participation", ConnClass::Write),
-    ("store_planned_accord_decision", ConnClass::Write),
     ("store_planned_location_proof", ConnClass::Write),
     ("store_planned_location_proof_withdrawal", ConnClass::Write),
     ("store_planned_touch_claim", ConnClass::Write),
@@ -973,6 +970,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // connection. v62.0.0 (P8-fix11) — the detection door's executor
     // (`store_planned_detection`) is deleted with the earlier-form door.
     ("store_planned_hard_case", ConnClass::Write),
+    // v62.0.0 (P8-fix14) — the restatement key, beside the row (a helper
+    // write inside the caller's transaction).
+    ("sqlite_stamp_restatement_key", ConnClass::HelperWrite),
     ("trace_agent_id_hash", ConnClass::Read),
     ("detection_row_ids_for_agent", ConnClass::Read),
     ("projection_rebuild", ConnClass::Write),

@@ -3915,6 +3915,17 @@ mod holdings_authority_tests {
         let canonical = fixture_genesis::bundle_v2()
             .serve_node_identity_ref(0)
             .to_owned();
+        // v62.0.0 (E6-fix8; CC rc20 5.4.6) — a seat serves only with an
+        // ANNOUNCED owner (`admission::serves_under_seat`): the seat's owner
+        // binds it at `cohort_scope: federation` and the seat voices it, the
+        // shape `serve_seat_owner_invariants::bodies::announce_seat` puts
+        // (its doc names this fixture). An unannounced seat is no trust root.
+        crate::federation::serve_seat_owner_invariants::bodies::announce_seat(
+            &backend,
+            0,
+            "holdings-744-seat-owner",
+        )
+        .await;
         (backend, canonical)
     }
 

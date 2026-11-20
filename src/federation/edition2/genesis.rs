@@ -514,6 +514,15 @@ impl GenesisInForce {
         self.seat(identity_ref).is_some()
     }
 
+    /// v62.0.0 (F0-cp8) — is `identity_ref` an accord holder of the bundle in
+    /// force (every tip seats it alike, [`Self::holders`])?
+    #[must_use]
+    pub fn is_holder(&self, identity_ref: &str) -> bool {
+        self.holders()
+            .iter()
+            .any(|h| h.identity_ref == identity_ref)
+    }
+
     /// The keys the bundle in force seats, by identity-ref: each holder and
     /// each seat at its placed key. No bundle held:
     /// [`BundleSeats::not_held`].

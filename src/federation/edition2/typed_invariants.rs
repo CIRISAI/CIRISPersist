@@ -701,14 +701,17 @@ async fn evicted_voice_body<D: FederationDirectory + ?Sized>(d: &D) {
 
     // The same revocation naming the superseded H2 is VOID (CC 2.7.8): even
     // bob + tablet do not land it; it is kept and settled void_superseded.
+    // T2-fix13 — signed just BEFORE tablet's eviction takes effect (t0):
+    // after it, tablet's seat is gone and the door's key-of-issuer check
+    // refuses its voice (`kid_not_of_iss`) before the VOID rule is reached.
     let stale = occurrence_revocation_payload(
-        &rev(tb.as_str(), t0 + 1),
+        &rev(tb.as_str(), t0 - 1),
         None,
         None,
         &h2,
         &[],
         &evict_cites,
-        t0 + 1,
+        t0 - 1,
     )
     .unwrap();
     let mut row = None;
@@ -1192,7 +1195,11 @@ where
     let signer = ls::seed_community_with_node(d, &comm, &[(&alice, &alice_occ)], &node).await;
     let comm = ls::id_of(&comm);
     d.set_node_key(signer.federation_id().await);
-    let minter = signer.derived_key_id();
+    // T2-fix13 — the minter is the key the sweep reads the epochs under
+    // (`sweep_rotated_epochs`: `signer.federation_id()`). The derived id named
+    // another (community, minter) pointer, so the sweep found no past epoch,
+    // evicted nothing and never reached the window (`Elapsed`).
+    let minter = signer.federation_id().await;
     let sealed =
         encrypt_and_cascade_community(d, &comm, b"t2 eviction window", None, Some(&minter))
             .await

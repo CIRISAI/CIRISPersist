@@ -2,9 +2,7 @@
 //! and for routes at agent keys. One body, run on sqlite and postgres.
 
 pub(crate) mod bodies {
-    use crate::federation::self_at_login::{
-        BindingProvenance, SignedTransportDestination, TransportDestination,
-    };
+    use crate::federation::self_at_login::{BindingProvenance, TransportDestination};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::transport_routes::TRANSPORT_DESTINATION_AGENT_KEY;
     use crate::federation::types::identity_type::{AGENT, NODE, USER};
@@ -22,28 +20,6 @@ pub(crate) mod bodies {
             binding_provenance: BindingProvenance::Rooted,
             epoch,
             retired_at: None,
-        }
-    }
-
-    /// The route signed by its own key, with its instant in the CC 2.6.2 form.
-    async fn signed(r: &TransportDestination) -> SignedTransportDestination {
-        let mut env = serde_json::to_value(r).unwrap();
-        env["asserted_at"] = serde_json::json!(
-            crate::federation::admission::render_signed_instant(r.asserted_at)
-        );
-        let signer = ts::hybrid_identity(&r.occurrence_key_id);
-        let (signed_envelope, signature) =
-            ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
-                signer.as_ref(),
-                env,
-            )
-            .await
-            .unwrap();
-        SignedTransportDestination {
-            transport_destination: r.clone(),
-            attesting_key_id: r.occurrence_key_id.clone(),
-            signed_envelope,
-            signature,
         }
     }
 
@@ -161,6 +137,9 @@ pub(crate) mod bodies {
             let node = format!("{tag}-tied-{i}");
             ts::register_identity_key(d, &node, NODE).await;
             ts::put_owner_binding(d, &owner, &node).await;
+            // v62 (O1 fix 11): an edition-2 key, and its owner binding, are
+            // named by its kid; the route names the same id.
+            let node = crate::federation::edition2::fixture_switch::kid(&node);
             let r = route(&node, &tied_dest, 1 + i as u64, "2026-10-22T00:00:00.000Z");
             d.put_transport_destination(&r).await.unwrap();
             tied.push(r);
@@ -171,7 +150,10 @@ pub(crate) mod bodies {
                 .unwrap();
         assert_eq!(
             keys(&kept),
-            vec![format!("{tag}-tied-{}", CLAIMANTS - 1)],
+            vec![crate::federation::edition2::fixture_switch::kid(&format!(
+                "{tag}-tied-{}",
+                CLAIMANTS - 1
+            ))],
             "I1543: the newest tied key alone stays live"
         );
         assert!(
@@ -184,7 +166,7 @@ pub(crate) mod bodies {
     /// live owner (a split home) on one destination: the newer route displaces
     /// the older on every read, and the older key lists no route. A third key
     /// with no owner tie (a spoofer) on the same destination still coexists.
-    /// The signed replication read still serves the displaced row.
+    /// The stored rows keep the displaced one (the fold is read-time).
     pub(crate) async fn i1122_b_a_tied_newer_route_displaces(
         d: &dyn FederationDirectory,
         tag: &str,
@@ -199,12 +181,19 @@ pub(crate) mod bodies {
         }
         ts::put_owner_binding(d, &owner, &old_node).await;
         ts::put_owner_binding(d, &owner, &new_node).await;
+        // v62 (O1 fix 11): edition-2 keys (and their owner bindings) are named
+        // by their kids; the routes name the same ids.
+        let kid = crate::federation::edition2::fixture_switch::kid;
+        let (old_node, new_node, stranger) = (kid(&old_node), kid(&new_node), kid(&stranger));
         let dest = format!("{tag}split");
         let older = route(&old_node, &dest, 1, "2026-10-22T00:00:00.000Z");
         let newer = route(&new_node, &dest, 1, "2026-10-23T00:00:00.000Z");
         let spoof = route(&stranger, &dest, 1, "2026-10-24T00:00:00.000Z");
+        // v62 (O1 fix 11; CP2): the signed transport apply is an earlier-form
+        // door, shut. The fold under test is read-time over the stored rows,
+        // so the routes are stored through the live local door.
         for r in [&older, &newer, &spoof] {
-            d.put_signed_transport_destination(&signed(r).await)
+            d.put_transport_destination(r)
                 .await
                 .expect("I1122-B: each route is admitted");
         }
@@ -279,12 +268,16 @@ pub(crate) mod bodies {
         }
         ts::put_owner_binding(d, &owner, &old_node).await;
         ts::put_owner_binding(d, &owner, &new_node).await;
+        // v62 (O1 fix 11): the keys by their kids, as I1122-B.
+        let kid = crate::federation::edition2::fixture_switch::kid;
+        let (old_node, new_node) = (kid(&old_node), kid(&new_node));
         let dest = format!("{tag}kinds");
         let older = route(&old_node, &dest, 1, "2026-10-22T00:00:00.000Z");
         let mut newer = route(&new_node, &dest, 2, "2026-10-23T00:00:00.000Z");
         newer.transport_kind = "websocket".into();
+        // v62 (O1 fix 11; CP2): stored through the live local door, as I1122-B.
         for r in [&older, &newer] {
-            d.put_signed_transport_destination(&signed(r).await)
+            d.put_transport_destination(r)
                 .await
                 .expect("I1626: each route is admitted");
         }

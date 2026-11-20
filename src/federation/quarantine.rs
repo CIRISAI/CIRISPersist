@@ -751,14 +751,12 @@ pub async fn record_quarantine_marker(
 
     // The author's own signature, re-verified against pubkeys resolved from
     // this node's directory (#377 — never pubkeys carried on the row).
-    if super::verify_envelope_hybrid_signature(
-        directory,
+    if crate::federation::edition2::group::vouched_envelope(
         &marker.attesting_key_id,
         &marker.attestation_envelope,
         &marker.scrub_signature_classical,
-        marker.scrub_signature_pqc.as_deref(),
+        "quarantine_marker",
     )
-    .await
     .is_err()
     {
         return refused(QuarantineRefusalReason::UnverifiableSignature);

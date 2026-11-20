@@ -365,6 +365,18 @@ pub mod bodies {
             }
             None => row,
         };
+        // v62.0.0 (E2-fix7; K2-fix4, CC 2.7.3 / CC 2.7.5) — an authored
+        // delegation waits for the voices its family's model names (the
+        // delegate's, and a machine delegate's owner's): the roles the door
+        // will ask for are voiced here (`second_signer_voices`, the resolved
+        // model's parties), beside any noted cosigner. A counted row names
+        // none.
+        let (needed, _unvoiced) = e2::second_signer_voices(dir, &row).await?;
+        for seed in needed {
+            if !cosigners.contains(&seed) {
+                cosigners.push(seed);
+            }
+        }
         let mut out = e2::put_signed(dir, &row).await?;
         let seeds: Vec<&str> = cosigners.iter().map(String::as_str).collect();
         for voice in e2::voices_of(&row, &seeds) {
@@ -1656,7 +1668,14 @@ pub mod bodies {
             1,
             // v62 (E4 round 3): `founder_only` above the family only as a
             // declared affiliation (CC 4.5.13, 4.4.3.2.8).
-            Some(crate::federation::affiliation_invariants::bodies::affiliation_blob(None)),
+            // v62.0.0 (E2-fix7; CC 2.4.1.2.1) — a licence has no public
+            // default: the charter declares the licence class public, and the
+            // federation-scope control row carries that class.
+            Some(
+                crate::federation::affiliation_invariants::bodies::affiliation_blob(Some(
+                    serde_json::json!({ "licence_audiences": { (crate::federation::affiliation_licence_invariants::bodies::PUBLIC_CLASS): "federation" } }),
+                )),
+            ),
             None,
         )
         .await;
@@ -1705,14 +1724,14 @@ pub mod bodies {
         );
         let testimony = must_put(
             dir,
-            &licence(
+            &crate::federation::affiliation_licence_invariants::bodies::classed(licence(
                 &room,
                 &holder,
                 &room,
                 "revoked",
                 None,
                 now - Duration::minutes(20),
-            ),
+            )),
             &format!("[{tag}] I610 control: the same key's row claiming no delegation"),
         )
         .await;

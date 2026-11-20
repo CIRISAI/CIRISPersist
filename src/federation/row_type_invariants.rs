@@ -970,7 +970,15 @@ pub(crate) mod bodies {
                 async fn i377() {
                     let Some(b) = $fresh.await else { return };
                     let s = suffix();
-                    let node = format!("i377-node-{s}");
+                    // v62 (E3, round 6): this node's key is an edition-2 `node`
+                    // record, declared by its identity-ref (the trust walk
+                    // starts at `node_key_id()`).
+                    let node = crate::federation::edition2::fixture_switch::put_key(
+                        &b,
+                        &format!("i377-node-{s}"),
+                        &[crate::federation::types::identity_type::NODE],
+                    )
+                    .await;
                     b.set_node_key_id(node.clone());
                     let w = bodies::witness(&b, &node, &s).await;
                     bodies::i377_assurance_reads_both_shapes(&b, &w, &s).await

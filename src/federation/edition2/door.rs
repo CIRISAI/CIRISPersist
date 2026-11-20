@@ -459,6 +459,36 @@ pub fn admit_row(
         // `author`), so Verify's verdict is `Valid { role: None }` and the
         // persist-side `author_column` override is gone. The counted rule
         // (`admission::check_officer_appointment_counted`) still counts it.
+        // v62.0.0 (K2-fix12; CC 2.6.1.9, authorship_text.tsv:44, CC
+        // 4.4.3.19) — the `delegate_owner` role of an own-act delegation onto
+        // a MACHINE sub is `owner_of_sub`: the owner the sub's live owner
+        // binding names. Verify 23.3.1 drops that member as unresolvable from
+        // the row (`family::UNRESOLVED_MEMBERS`), and a `FamilyModel` cannot
+        // state it (`RoleParty` is `Sub` or a payload member), so the owner's
+        // voice reads `iss_not_in_role`. Who the owner is reads another row
+        // (CC 2.7.3: a fold, never a door refusal), so the door admits a
+        // Valid voice on a statement whose own roles name `owner_of_sub`, in
+        // that role; the gate (`admission::check_second_signers_voiced`)
+        // counts it only when its issuer IS the resolved owner
+        // ([`resolved_second_signer_roles`]). Any other issuer's voice is
+        // kept and fills no role. Drop when Verify resolves `owner_of_sub`.
+        FamilyVerdict::FamilyInvalid(FamilyFault::IssNotInRole)
+            if owner_of_sub_role(bytes).is_some() =>
+        {
+            let Some(owner_role) = owner_of_sub_role(bytes) else {
+                return Err(refuse(
+                    token::FAMILY_INVALID,
+                    fault_label(&FamilyFault::IssNotInRole),
+                ));
+            };
+            match verify_row_statement(bytes, keys) {
+                Verdict::Valid(row) => (row, Some(owner_role)),
+                Verdict::Invalid(i) => {
+                    return Err(refuse(token::STATEMENT_INVALID, invalid_label(&i)));
+                }
+                Verdict::Waiting { missing } => return Err(waiting(&missing)),
+            }
+        }
         FamilyVerdict::FamilyInvalid(f) => {
             return Err(refuse(token::FAMILY_INVALID, fault_label(&f)));
         }
@@ -699,6 +729,23 @@ pub fn second_signer_roles(bytes: &[u8]) -> Vec<SecondSignerRole> {
             Some(SecondSignerRole { role, parties })
         })
         .collect()
+}
+
+/// v62.0.0 (K2-fix12; CC 2.6.1.9, authorship_text.tsv:44) — the name of
+/// the role of `bytes` filled by the owner of its machine sub
+/// ([`SecondSignerParty::OwnerOf`]; `delegate_owner` on `self:delegates_to`),
+/// read from the statement alone ([`second_signer_roles`]). `None` when the
+/// row's roles name no `owner_of_sub`.
+#[must_use]
+pub fn owner_of_sub_role(bytes: &[u8]) -> Option<String> {
+    second_signer_roles(bytes)
+        .into_iter()
+        .find(|r| {
+            r.parties
+                .iter()
+                .any(|p| matches!(p, SecondSignerParty::OwnerOf(_)))
+        })
+        .map(|r| r.role)
 }
 
 /// v62.0.0 (K2-fix6; CC 2.6.1.9, authorship_text.tsv:43–44, CC 4.4.3.19)

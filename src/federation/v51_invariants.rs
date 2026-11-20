@@ -65,8 +65,18 @@ mod postgres {
         ts::reseal(&mut row);
         let id = row.attestation_id.clone();
 
+        // v62.0.0 (round 6, E7) — the delegation is COUNTED (CC 2.6.1.9: the
+        // delegate's own voice), so it concludes, and projects, only when its
+        // last voice lands: each attempt lands it with every voice its family
+        // names (E0's `second_signer_voices` + `land_with_voices`).
+        let (voices, missing) = e2::second_signer_voices(d, &row).await.unwrap();
+        assert!(
+            missing.is_empty(),
+            "I125: every voice is in hand: {missing:?}"
+        );
+        let voices: Vec<&str> = voices.iter().map(String::as_str).collect();
         b.test_hooks().fail_next("pg_project_consent_peer_set", 1);
-        let got = e2::put_signed(d, &row).await;
+        let got = e2::land_with_voices(d, &row, &voices).await;
         assert!(
             matches!(&got, Err(Error::Backend(m)) if m.contains("injected transient")),
             "the projection's failure is the door's failure: {got:?}"
@@ -77,7 +87,7 @@ mod postgres {
         );
 
         b.test_hooks().fail_next("pg_project_consent_peer_set", 0);
-        let again = e2::put_signed(d, &row).await.unwrap();
+        let again = e2::land_with_voices(d, &row, &voices).await.unwrap();
         assert!(
             matches!(again, StatementOutcome::Row { new: true, .. }),
             "the retry INSERTS (never already-held over an unprojected row): {again:?}"
@@ -305,13 +315,12 @@ pub(crate) mod live_fold {
     //! owner's (or subject's, or delegate's) withdrawal was stored as withdrawn
     //! and still listed as Live. Edge's `lifecycle_of` mirrored it
     //! (CIRISEdge#712).
-    use crate::federation::admission::steward_liveness_test_support::withdraws_of;
     use crate::federation::consent_peer_set::test_support::grant;
     use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::edition2::ingest::StatementOutcome;
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::identity_type as it;
-    use crate::federation::{Error, FederationDirectory};
+    use crate::federation::types::{attestation_type, identity_type as it};
+    use crate::federation::FederationDirectory;
     use crate::read::{AttestationFilter, LifecycleView};
 
     fn suffix() -> String {
@@ -381,12 +390,14 @@ pub(crate) mod live_fold {
         .expect("the node's voice on its owner binding");
         // two node-authored rows naming the peer as subject
         let mut ids = Vec::new();
+        let mut rows = Vec::new();
         for id in [
             uuid::Uuid::new_v4().to_string(),
             uuid::Uuid::new_v4().to_string(),
         ] {
             let g = grant(&id, &node, &peer);
             ids.push(g.attestation_id.clone());
+            rows.push(g.clone());
             assert!(
                 matches!(
                     put(g).await.expect("stored"),
@@ -401,16 +412,26 @@ pub(crate) mod live_fold {
             live.contains(&a) && live.contains(&b),
             "precondition: {live:?}"
         );
-        // control: a stranger's withdrawal is refused at the door
+        // v62.0.0 (round 6, E7) — every withdraws is an edition-2 composer
+        // (`e2::composer_of`: `refs.target` = the target's row id, the
+        // target's family). The shared `withdraws_of` returns the earlier
+        // sealed literal for a composer, which retracts nothing on edition 2.
+        let wd = |who: &str, target: &crate::federation::Attestation| {
+            e2::composer_of(attestation_type::WITHDRAWS, target, who)
+        };
+        // control: a stranger's withdrawal concludes nothing (refused, or
+        // held under CC 2.7.3), and the row stays live
+        let r = put(wd(&stranger, &rows[0])).await;
         assert!(
-            matches!(
-                put(withdraws_of(&stranger, &node, &a)).await,
-                Err(Error::WithdrawsNotAdmitted { .. })
-            ),
-            "a stranger's withdrawal is refused"
+            matches!(r, Err(_) | Ok(StatementOutcome::Pending { .. })),
+            "a stranger's withdrawal is refused: {r:?}"
+        );
+        assert!(
+            listed(d, &node, LifecycleView::Live).await.contains(&a),
+            "a stranger's withdrawal hides nothing"
         );
         // the node's OWNER withdraws A (#941, rule 1 lifted to the principal)
-        let wa = withdraws_of(&owner, &node, &a);
+        let wa = wd(&owner, &rows[0]);
         let wa_id = wa.attestation_id.clone();
         put(wa).await.expect("the owner's withdrawal is admitted");
         assert_eq!(
@@ -423,7 +444,7 @@ pub(crate) mod live_fold {
             "the door recorded the admitting rule"
         );
         // the SUBJECT withdraws B (rule 2)
-        let wb = withdraws_of(&peer, &node, &b);
+        let wb = wd(&peer, &rows[1]);
         let wb_id = wb.attestation_id.clone();
         put(wb).await.expect("the subject's revocation is admitted");
         assert_eq!(
@@ -538,7 +559,7 @@ pub(crate) mod live_fold {
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod owner_withdraw {
-    use crate::federation::admission::steward_liveness_test_support::{signed_row, withdraws_of};
+    use crate::federation::admission::steward_liveness_test_support::signed_row;
     use crate::federation::admission::{owner_of, resolve_withdraws_admission_rule};
     use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::tier_ingest::test_support as ts;
@@ -669,9 +690,13 @@ pub(crate) mod owner_withdraw {
             "the owner at the row's instant withdraws it"
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        e2::put_signed(d, &withdraws_of(&other, &node2, &ob2.attestation_id))
-            .await
-            .expect("B withdraws its binding");
+        // v62.0.0 (round 6, E7) — an edition-2 composer of the held binding.
+        e2::put_signed(
+            d,
+            &e2::composer_of(attestation_type::WITHDRAWS, &ob2, &other),
+        )
+        .await
+        .expect("B withdraws its binding");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         bind(d, &owner, &node2, Utc::now(), None).await;
         assert_eq!(
@@ -692,9 +717,12 @@ pub(crate) mod owner_withdraw {
         let node3 = e2::put_key(d, &format!("ow-node3-{s}"), &[it::NODE]).await;
         let prior = e2::put_key(d, &format!("ow-prior-{s}"), &[it::USER]).await;
         let obc = bind(d, &prior, &node3, Utc::now() - Duration::minutes(10), None).await;
-        e2::put_signed(d, &withdraws_of(&prior, &node3, &obc.attestation_id))
-            .await
-            .expect("C withdraws its binding");
+        e2::put_signed(
+            d,
+            &e2::composer_of(attestation_type::WITHDRAWS, &obc, &prior),
+        )
+        .await
+        .expect("C withdraws its binding");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         bind(d, &owner, &node3, Utc::now(), None).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;

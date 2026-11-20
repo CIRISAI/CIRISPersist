@@ -258,27 +258,6 @@ async fn i1853_witness_counting_over_the_audit_head() {
     i1853_counting_rules(&served, "audit");
 }
 
-/// I1853 over a TRUST-GRANT receipt's head: the receipt crosses as JSON, in
-/// either form, and its head counts the same after the round trip.
-#[test]
-fn i1853_witness_counting_over_a_trust_grant_receipt_head() {
-    let operator = composite(0x02);
-    let receipt = super::trust_grant::TrustGrantReceipt {
-        grant_id: uuid::Uuid::nil(),
-        chain_event_id: 7,
-        chain_event_hash: vec![9; 32],
-        tenant_id: "t".into(),
-        tree_size_at_emit: 5,
-        sth: head("tenant:t", 5, [0x5A; 32], &operator),
-    };
-    let wire = serde_json::to_string(&receipt).unwrap();
-    let back: super::trust_grant::TrustGrantReceipt = serde_json::from_str(&wire).unwrap();
-    assert_eq!(back.sth.signature, receipt.sth.signature);
-    sth_form::verify_sth_signature(&back.sth, &back.sth.signature, &pinned_of(&operator))
-        .expect("I1853: the receipt head verifies after the round trip");
-    i1853_counting_rules(&back.sth, "trust-grant");
-}
-
 /// I1853 over a STREAM log's head (producer-signed, over chunk shas).
 #[test]
 fn i1853_witness_counting_over_a_stream_head() {

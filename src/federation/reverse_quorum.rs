@@ -77,7 +77,7 @@
 //! [`FederationDirectory::active_members`](super::FederationDirectory::active_members)
 //! (revocation-folded), the threshold from the cohort's OWN stored
 //! `consensus_protocol`, and every counted signature is re-verified through
-//! [`verify_envelope_hybrid_signature`](super::tier_ingest::verify_envelope_hybrid_signature)
+//! `verify_envelope_hybrid_signature` (deleted v62.0.0, F0-cp8)
 //! against pubkeys resolved from this node's directory.
 //!
 //! # The vocabulary is closed in THREE places
@@ -1815,10 +1815,12 @@ where
 /// The row's FULL scrub set ([`Attestation::scrubs`] — the base
 /// `scrub_key_id`/`scrub_signature_*` plus every `additional_scrubs` entry,
 /// all over the SAME canonical envelope) intersected with `roster`, each
-/// survivor hybrid-verified through
-/// [`verify_envelope_hybrid_signature`](super::tier_ingest::verify_envelope_hybrid_signature)
-/// against pubkeys resolved from THIS node's directory. Never the roster a
-/// caller passed on the row, never pubkeys carried on the row.
+/// survivor admitted only as a voice the edition-2 door vouches for
+/// ([`vouched_envelope`](crate::federation::edition2::group::vouched_envelope);
+/// v62.0.0, F0-cp8: the earlier envelope verify against the directory's
+/// registered component halves is deleted, so `_directory` reads nothing).
+/// Never the roster a caller passed on the row, never pubkeys carried on the
+/// row.
 ///
 /// A scrub that is not a roster member, or that does not verify, simply does
 /// not COUNT — it is not an error. That is the m-of-n discipline the key plane
@@ -1830,7 +1832,7 @@ where
 /// charter plane; it was lifted here rather than copied so the two planes
 /// cannot drift on what "a distinct verified co-signature" means.
 pub(crate) async fn count_distinct_roster_scrubs<F>(
-    directory: &F,
+    _directory: &F,
     envelope: &serde_json::Value,
     scrubs: &[super::types::ScrubSig],
     roster: &[String],
@@ -1844,14 +1846,12 @@ where
         {
             continue;
         }
-        if super::verify_envelope_hybrid_signature(
-            directory,
+        if crate::federation::edition2::group::vouched_envelope(
             &scrub.scrub_key_id,
             envelope,
             &scrub.scrub_signature_classical,
-            scrub.scrub_signature_pqc.as_deref(),
+            "roster_scrub",
         )
-        .await
         .is_ok()
         {
             counted.insert(scrub.scrub_key_id.clone());
@@ -2065,14 +2065,12 @@ where
 
     // The objector's own signature, re-verified against pubkeys resolved from
     // this node's directory.
-    if super::verify_envelope_hybrid_signature(
-        directory,
+    if crate::federation::edition2::group::vouched_envelope(
         &objection.attesting_key_id,
         &objection.attestation_envelope,
         &objection.scrub_signature_classical,
-        objection.scrub_signature_pqc.as_deref(),
+        "objection",
     )
-    .await
     .is_err()
     {
         return refused(ObjectionRefusalReason::UnverifiableSignature);
@@ -2362,14 +2360,12 @@ where
         }
     }
 
-    if super::verify_envelope_hybrid_signature(
-        directory,
+    if crate::federation::edition2::group::vouched_envelope(
         &ballot.attesting_key_id,
         &ballot.attestation_envelope,
         &ballot.scrub_signature_classical,
-        ballot.scrub_signature_pqc.as_deref(),
+        "ballot",
     )
-    .await
     .is_err()
     {
         return refused(ObjectionRefusalReason::UnverifiableSignature);

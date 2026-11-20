@@ -291,20 +291,22 @@ pub mod bodies {
         let v3_row = e2::row_id_of(&v3_voices[0]);
         let served_v3 = served_rows(a, &to_b, &[v3_row]).await;
         assert_eq!(served_v3.len(), 3, "{tag} I178: three voices of v3");
+        // v62 (E3, round 6): B holds v2's voices from (3) (kept `Pending`),
+        // so v3's `refs.head` names a version B HOLDS but has not settled.
+        // The door may keep v3 (`Pending`), refuse it, or keep it as a K1 tip
+        // (`Row`): the property is that B's settled record does not move.
         for (bytes, row) in &served_v3 {
-            match apply_replicated_statement(b, bytes, &row.0).await {
-                Err(_)
-                | Ok(ReplicatedStatementOutcome::Refused { .. })
-                | Ok(ReplicatedStatementOutcome::Admitted(StatementOutcome::Pending { .. })) => {}
-                other => panic!(
-                    "{tag} I178: a version naming a head B does not hold does not land: {other:?}"
-                ),
-            }
+            let _ = apply_replicated_statement(b, bytes, &row.0).await;
         }
         assert_eq!(
             kind.stored(b, &gid).await.2,
             v1_hash,
             "{tag} I178: B keeps its record"
+        );
+        assert_eq!(
+            kind.current_version(b, &gid).await,
+            1,
+            "{tag} I178: a version over an unsettled head does not move B's head"
         );
 
         // (5) The genuine first amendment applies on B: alice's voice is

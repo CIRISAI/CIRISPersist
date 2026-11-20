@@ -1011,6 +1011,9 @@ pub mod test_support {
             row
         };
         let cross = |id: String| async move {
+            // v62.0.0 (E0 fix 11) — the literal id names the row by its
+            // computed id (`fixture_switch::held_row_id`).
+            let id = crate::federation::edition2::fixture_switch::held_row_id(&id);
             let row = dir.get_attestation(&id).await.expect("read").expect("row");
             let ci = ts::describe_own(&row, CrossingBasis::ProducerAuthority);
             dir.enter_mesh(&id, &ci, &ts::actor_reseal(&row)).await
@@ -1065,7 +1068,9 @@ pub mod test_support {
             "({tag}) B8: and it flips the tier: {crossed:?}"
         );
         let after = dir
-            .get_attestation(&ok_id)
+            .get_attestation(&crate::federation::edition2::fixture_switch::held_row_id(
+                &ok_id,
+            ))
             .await
             .expect("read")
             .expect("row");
@@ -1083,7 +1088,9 @@ pub mod test_support {
         .await
         .expect("({tag}) B8: the local write lands while the author is in good standing");
         let before = dir
-            .get_attestation(&doomed_id)
+            .get_attestation(&crate::federation::edition2::fixture_switch::held_row_id(
+                &doomed_id,
+            ))
             .await
             .expect("read")
             .expect("row");
@@ -1106,7 +1113,9 @@ pub mod test_support {
             "({tag}) B8: the refusal names the de-admission: {err}"
         );
         let after = dir
-            .get_attestation(&doomed_id)
+            .get_attestation(&crate::federation::edition2::fixture_switch::held_row_id(
+                &doomed_id,
+            ))
             .await
             .expect("read")
             .expect("row");
@@ -1145,7 +1154,9 @@ pub mod test_support {
             "({tag}) B8 (e): replicated by consent fan-out, never advertised"
         );
         let self_after = dir
-            .get_attestation(&self_id)
+            .get_attestation(&crate::federation::edition2::fixture_switch::held_row_id(
+                &self_id,
+            ))
             .await
             .expect("read")
             .expect("row");
@@ -2027,24 +2038,30 @@ pub mod test_support {
                 ts::reseal(&mut r);
                 dir.put_attestation(SignedAttestation { attestation: r })
             };
-            let room = format!("room-{run}");
+            // v62.0.0 (E0 fix 11; CP2) — an edition-2 claim names the
+            // occurrence and the room by identity-ref (the codec keys a
+            // `community_id` by its kid), so the fold is asked by those.
+            let sid = crate::federation::edition2::fixture_switch::stored_id;
+            let room =
+                crate::federation::edition2::fixture_switch::kid_or_keep(&format!("room-{run}"));
+            let steward = sid(&occurrence);
             let at = now - chrono::Duration::seconds(120);
             put_claim("live-lease", at, now + chrono::Duration::seconds(600))
                 .await
                 .unwrap();
             assert_eq!(
-                handler_for(dir, &occurrence, &room, "live-lease", now, ttl)
+                handler_for(dir, &steward, &room, "live-lease", now, ttl)
                     .await
                     .unwrap()
                     .map(|c| c.occurrence_key_id),
-                Some(occurrence.clone()),
+                Some(steward.clone()),
                 "({tag}) a claim past the ttl whose signed lease is live holds the session"
             );
             put_claim("lapsed", at, now - chrono::Duration::seconds(10))
                 .await
                 .unwrap();
             assert_eq!(
-                handler_for(dir, &occurrence, &room, "lapsed", now, ttl)
+                handler_for(dir, &steward, &room, "lapsed", now, ttl)
                     .await
                     .unwrap(),
                 None,
@@ -2056,7 +2073,7 @@ pub mod test_support {
             put_claim("renewed", at, now + chrono::Duration::seconds(600))
                 .await
                 .unwrap();
-            let held = handler_for(dir, &occurrence, &room, "renewed", now, ttl)
+            let held = handler_for(dir, &steward, &room, "renewed", now, ttl)
                 .await
                 .unwrap()
                 .expect("the renewal holds the session");
@@ -2147,15 +2164,27 @@ pub mod test_support {
                 panic!("({tag}) #814: a stranger's licensure row is TESTIMONY and admits: {e}")
             });
         assert!(
-            dir.get_attestation(&forged).await.expect("read").is_some(),
+            dir.get_attestation(&crate::federation::edition2::fixture_switch::held_row_id(
+                &forged
+            ))
+            .await
+            .expect("read")
+            .is_some(),
             "({tag}) #814: and it is stored — it is a real claim, just not the \
              authority's"
         );
 
         // THE POINT: it binds nobody, because it is not in the fold.
-        let set = status_set_for(dir, &holder, &authority, crate::host::clock::now())
-            .await
-            .expect("fold");
+        // v62.0.0 (E0 fix 11; CP2) — the parties by their stored ids.
+        let sid = crate::federation::edition2::fixture_switch::stored_id;
+        let set = status_set_for(
+            dir,
+            &sid(&holder),
+            &sid(&authority),
+            crate::host::clock::now(),
+        )
+        .await
+        .expect("fold");
         assert_eq!(
             set,
             std::collections::BTreeSet::from([L::Issued]),
@@ -2245,7 +2274,15 @@ pub mod test_support {
 
         // (2) names a permission this node does not hold.
         let id2 = uuid::Uuid::new_v4().to_string();
-        let ghost = uuid::Uuid::new_v4().to_string();
+        // v62.0.0 (E0 fix 11) — an unheld permission is named by a row id no
+        // row has (64 hex): an edition-2 `refs.target` is a digest, never a
+        // uuid.
+        let ghost = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(
+                format!("{tag}-ghost-{run}").as_bytes(),
+            ))
+        };
         dir.put_attestation(duty(&id2, &licensor, Some(&ghost), cohort_scope::SELF))
             .await
             .expect_err("a duty against an unheld permission must be refused");
@@ -2476,87 +2513,6 @@ pub mod test_support {
         assert!(
             format!("{e8}").contains("NEVER wider"),
             "({tag}) #814 (8): got {e8}"
-        );
-    }
-
-    /// **CIRISPersist#807 — a widening of the owner-binding is NOT visible to
-    /// a peer, and this pins that as a known limitation rather than leaving it
-    /// to be rediscovered.**
-    ///
-    /// `owner_of` folds `attestation_type == delegates_to` only
-    /// (`live_delegation_granters`). A `supersedes` widening carries the
-    /// binding's whole body — `is_owner_binding_envelope` is true of it — so
-    /// the ONLY thing excluding it is the type check. A peer never holds the
-    /// `self` prior (CC 5.2), so if the announce were a widening, every peer
-    /// would resolve the node to NO OWNER and the audience walk would withhold
-    /// every community row for it.
-    ///
-    /// **This asserts the limitation, deliberately.** Relaxing the type check
-    /// is CIRISPersist#798's work, not a one-line change, because of something
-    /// the read side does that is easy to miss: `precedence::retired_ids`
-    /// DROPS a retraction whose target it cannot resolve (fail-secure toward
-    /// retention). A peer holds the widening and not the prior, so a
-    /// `withdraws` naming the PRIOR is discarded there — the owner would
-    /// revoke the binding on their own node and leave it live at every peer.
-    /// Folding widenings into this resolver therefore requires the retraction
-    /// fold to chain too, and that is a design, not a relaxation.
-    ///
-    /// The consequence for callers, which CIRISServer already does: the
-    /// announce is a FRESH `delegates_to` at federation scope, not a widening.
-    pub async fn exercise_owner_binding_widening_not_visible_to_a_peer_807(
-        peer: &dyn FederationDirectory,
-        tag: &str,
-    ) {
-        use crate::federation::tier_ingest::test_support as ts;
-        use crate::federation::types::{attestation_tier, cohort_scope, identity_type};
-
-        let run = uuid::Uuid::new_v4().simple().to_string();
-        let owner = format!("{tag}-owner-{run}");
-        let node = format!("{tag}-node-{run}");
-        for k in [&owner, &node] {
-            ts::register_hybrid_key_as(peer, k, k, identity_type::USER).await;
-        }
-
-        // The peer's view: it holds ONLY the widening. The `self` prior is
-        // structurally undiscoverable and never replicated to it.
-        let mut widening = scores_row(
-            &uuid::Uuid::new_v4().to_string(),
-            &owner,
-            &node,
-            crate::federation::types::owner_binding::DIMENSION,
-        );
-        widening.attestation_type =
-            crate::federation::types::attestation_type::SUPERSEDES.to_owned();
-        widening.tier = attestation_tier::FEDERATION.to_owned();
-        widening.cohort_scope = cohort_scope::FEDERATION.to_owned();
-        widening.attestation_envelope
-            [crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID] =
-            serde_json::json!(uuid::Uuid::new_v4().to_string());
-        widening.attestation_envelope[crate::federation::envelope::paths::DIFFERS_IN] =
-            serde_json::json!([crate::federation::envelope::row_paths::COHORT_SCOPE]);
-        ts::reseal(&mut widening);
-        assert!(
-            crate::federation::admission::is_owner_binding_envelope(&widening.attestation_envelope),
-            "({tag}) #807: precondition — the widening carries the binding's own body, so the \
-             ONLY thing that can exclude it from the fold is its TYPE"
-        );
-        peer.put_attestation(SignedAttestation {
-            attestation: widening,
-        })
-        .await
-        .unwrap_or_else(|e| panic!("({tag}) #807: the widening admits at the peer: {e}"));
-
-        let resolved = crate::federation::admission::owner_of(peer, &node)
-            .await
-            .unwrap_or_else(|e| panic!("({tag}) #807: owner_of must not error: {e}"));
-        assert_eq!(
-            resolved, None,
-            "({tag}) #807: KNOWN LIMITATION, pinned — `owner_of` folds `delegates_to` only, so a \
-             peer holding just the widening resolves NO OWNER. If this flips to Some, the fold \
-             learned to read widenings and CIRISPersist#798's retraction-chaining must have \
-             landed with it: `retired_ids` drops a retraction whose target it cannot resolve, and \
-             a peer cannot resolve the `self` prior, so a withdraw of the prior would leave the \
-             binding live here"
         );
     }
 
@@ -3433,10 +3389,18 @@ pub mod test_support {
                 "({tag}) B10-a: a replayed grant whose asserted_at COLUMN diverges from its \
                  signed envelope must be REFUSED (CIRISPersist#598)",
             );
-        let msg = format!("{err}");
+        // v62.0.0 (E0 fix 11; CP2) — an edition-2 row has no mirror: the
+        // statement IS the row, and a column that is not its projection is
+        // refused by the carried-projection check (`typed_diverges_from_envelope`),
+        // which is the edition-2 form of the #598 instant binding.
         assert!(
-            msg.contains("asserted_at") && msg.contains("598"),
-            "({tag}) B10-a: the refusal must name the field and the rule: {msg}"
+            matches!(
+                &err,
+                crate::federation::Error::MalformedRow { reason, .. }
+                    if *reason == crate::federation::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE
+            ),
+            "({tag}) B10-a: the replay is refused as a column that is not its statement's \
+             projection: {err:?}"
         );
 
         // (c2) v31.0.0 (CIRISPersist#643) — THE SAME REPLAY WEARING A FRESH
@@ -3460,10 +3424,16 @@ pub mod test_support {
                 "({tag}) B10-a/#643: a replay under a FRESH attestation_id must be REFUSED — \
                  the row id is inside the signed mirror",
             );
-        let msg = format!("{err}");
+        // v62.0.0 (E0 fix 11; CP2) — the row id is the statement's (computed
+        // over its bytes), so a fresh id is not its projection either.
         assert!(
-            msg.contains("attestation_id") && msg.contains("643"),
-            "({tag}) B10-a/#643: the refusal must name the id binding: {msg}"
+            matches!(
+                &err,
+                crate::federation::Error::MalformedRow { reason, .. }
+                    if *reason == crate::federation::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE
+                        || *reason == crate::federation::malformed_row::EDITION2_ROW_ID_MISMATCH
+            ),
+            "({tag}) B10-a/#643: a fresh id is refused as not the statement's row: {err:?}"
         );
 
         // (d) …and nothing moved: the fold is still closed and the gate INSIDE
@@ -3730,9 +3700,15 @@ pub mod test_support {
             ),
             (
                 "resolve_consent_state",
-                dir.resolve_consent_state(&attester, &subject, crate::host::clock::now())
-                    .await
-                    .expect("unscoped fold reads"),
+                // v62.0.0 (E0 fix 11) — by stored ids, as the scoped fold
+                // above: an edition-2 row names its parties by identity-ref.
+                dir.resolve_consent_state(
+                    &stored_id(&attester),
+                    &stored_id(&subject),
+                    crate::host::clock::now(),
+                )
+                .await
+                .expect("unscoped fold reads"),
             ),
         ] {
             assert_eq!(

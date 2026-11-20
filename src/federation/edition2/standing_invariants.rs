@@ -177,117 +177,103 @@ pub(crate) async fn self_declared_detector_body(d: &dyn FederationDirectory) {
     assert!(!stored(d, &row).await, "I3080: nothing concluded");
 }
 
-/// I3081: the conferred detector (E0's builders). The caller has set this
-/// node's identity to `e2::kid("p4-node")`.
+/// I3081: the conferred detector. The caller has set this node's identity
+/// to `e2::kid("p4-node")`.
+///
+/// P4-fix2 (round 6) — the root is a ROOTED edition-2 trust root (W1b's
+/// `fixture_trust_root`: the bundle in force, an infrastructure community
+/// founded by its holders, the root's charter and THIS node's acceptance).
+/// A bare key's self-charter is not a root an edition-2 reader trusts, so the
+/// walk found no conferral and the detection row was held (it was never
+/// stored, while `try_put_row` returned `Ok` for the held row).
 pub(crate) async fn conferred_detector_body(d: &dyn FederationDirectory) {
     use super::fixture_switch as e2;
-    use crate::federation::trust_root::{
-        TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION, TRUST_CONFERS_DIMENSION,
-    };
     use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
-    let lit = |from: &str, to: &str, at: &str, envelope: serde_json::Value| {
-        let now = crate::host::clock::now();
-        crate::federation::Attestation {
-            attestation_id: String::new(),
-            attesting_key_id: e2::kid(from),
-            attested_key_id: e2::kid(to),
-            attestation_type: at.to_owned(),
-            weight: Some(1.0),
-            asserted_at: now,
-            expires_at: None,
-            attestation_envelope: envelope,
-            original_content_hash: String::new(),
-            scrub_signature_classical: String::new(),
-            scrub_signature_pqc: None,
-            scrub_key_id: e2::kid(from),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            subject_key_ids: Vec::new(),
-            withdraws_admission_rule: None,
-            cohort_scope: cohort_scope::FEDERATION.to_owned(),
-            tier: attestation_tier::FEDERATION.to_owned(),
-            promoted_at: None,
-            additional_scrubs: Vec::new(),
-        }
-    };
-    let (node, root, det) = ("p4-node", "p4-root", "p4-detector");
+    let (node, det) = ("p4-node", "p4-detector");
     e2::put_key(d, node, &["node"]).await;
-    e2::put_key(d, root, &["node"]).await;
     // The detector states only `agent`: the duty is the delegation's.
     e2::put_key(d, det, &["agent"]).await;
-    // The root charters itself (a key root carries infra:serve AND
-    // infra:attest, and a pre-rotation commitment); this node accepts it; it
-    // confers infra:detect on the detector.
-    let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&[
-        "p4-root-successor".to_owned(),
-    ])
-    .expect("commitment");
-    for (from, to, envelope) in [
-        (
-            root,
-            root,
-            serde_json::json!({
-                "dimension": TRUST_CHARTER_DIMENSION,
-                "scope": ["infra:serve", "infra:attest"],
-                "pre_rotation_commitment": commitment,
-            }),
-        ),
-        (
-            node,
-            root,
-            serde_json::json!({"dimension": TRUST_ACCEPTS_DIMENSION, "scope": ["infra:serve"]}),
-        ),
-        (
-            root,
-            det,
-            serde_json::json!({
-                "dimension": TRUST_CONFERS_DIMENSION,
-                "scope": [crate::federation::types::delegation_scope::INFRA_DETECT],
-            }),
-        ),
-    ] {
-        let confers = envelope
-            .get("dimension")
-            .and_then(serde_json::Value::as_str)
-            == Some(TRUST_CONFERS_DIMENSION);
-        let edge = e2::try_put_row(
-            d,
-            &lit(from, to, attestation_type::DELEGATES_TO, envelope),
-            from,
-        )
+    let r = e2::rooted_trust_root(d, &super::fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
+    // The grant is stated after the root's own rows, at an instant derived
+    // from the bundle in force (as `fixture_trust_root::put_conferral` does;
+    // never the wall clock). The detector's `agent` window covers it.
+    let tip = super::genesis::genesis_in_force(d)
         .await
-        .unwrap_or_else(|e| panic!("I3081: the trust edge {from} -> {to} is admitted: {e:?}"));
-        // G0-fix3 — Verify's `confers` rule asks the delegate for a second
-        // voice (`delegate: sub`, CC 2.6.1.9; W1b's `put_conferral`). Without
-        // it the conferral is held, so the detector's detection:* row was
-        // held `reserved_prefix_emitter_mismatch` too (I3081 red).
-        if confers {
-            let st = e2::carried_statement(&edge).expect("I3081: the conferral's statement");
-            e2::put_statement(d, &e2::voice_of(&st, to))
-                .await
-                .expect("I3081: the detector's own voice on its conferral");
-        }
-    }
-    let detection = lit(
-        det,
-        det,
-        attestation_type::SCORES,
-        serde_json::json!({
+        .expect("I3081: the genesis in force")
+        .tips()
+        .iter()
+        .map(|t| t.asserted_at)
+        .max()
+        .expect("I3081: a bundle in force");
+    let at = tip + 90_000;
+    let grant = super::fixture_trust_root::confers_statement(
+        &r,
+        &e2::kid(det),
+        &[crate::federation::types::delegation_scope::INFRA_DETECT],
+        at,
+    );
+    e2::put_statement(d, &grant)
+        .await
+        .expect("I3081: the root's grant");
+    // Verify's `confers` rule asks the delegate for a second voice
+    // (`delegate: sub`, CC 2.6.1.9).
+    e2::put_statement(d, &e2::voice_of(&grant, det))
+        .await
+        .expect("I3081: the detector's own voice on its conferral");
+    let grant_id = RowId::of_statement(&grant).expect("I3081: the grant's row id");
+    assert!(
+        d.get_attestation(&grant_id.hex()).await.unwrap().is_some(),
+        "I3081: the conferral concludes; held {:?}",
+        super::fold::why_held(d, &grant_id)
+            .await
+            .unwrap()
+            .map(|h| (h.reason, h.detail))
+    );
+    let instant = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+        i64::try_from(at + 60_000).expect("I3081: an instant"),
+    )
+    .expect("I3081: an instant");
+    let detection = crate::federation::Attestation {
+        attestation_id: String::new(),
+        attesting_key_id: e2::kid(det),
+        attested_key_id: e2::kid(det),
+        attestation_type: attestation_type::SCORES.to_owned(),
+        weight: Some(1.0),
+        asserted_at: instant,
+        expires_at: None,
+        attestation_envelope: serde_json::json!({
             "dimension": "detection:hash_chain_integrity:v1",
             "score": 0.75,
             "confidence": 0.9,
         }),
-    );
+        original_content_hash: String::new(),
+        scrub_signature_classical: String::new(),
+        scrub_signature_pqc: None,
+        scrub_key_id: e2::kid(det),
+        scrub_timestamp: instant,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: Vec::new(),
+        withdraws_admission_rule: None,
+        cohort_scope: cohort_scope::FEDERATION.to_owned(),
+        tier: attestation_tier::FEDERATION.to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    };
     let stored_row = e2::try_put_row(d, &detection, det)
         .await
         .unwrap_or_else(|e| panic!("I3081: a conferred detector emits detection:*: {e:?}"));
+    let id = e2::rid_digest(&stored_row);
     assert!(
         d.get_attestation(&e2::rid(&stored_row))
             .await
             .unwrap()
             .is_some(),
-        "I3081: stored under its row id"
+        "I3081: stored under its row id; held {:?}",
+        super::fold::why_held(d, &RowId(id))
+            .await
+            .unwrap()
+            .map(|h| (h.reason, h.detail))
     );
 }
 

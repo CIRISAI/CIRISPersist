@@ -1,0 +1,296 @@
+//! v62.0.0 (F0-cp8; CC 2.6.1.7, CC 6.1.3) — **the closed registry of signing
+//! domains**, and the one framing a host artefact's composite signature is
+//! over.
+//!
+//! RULINGS: composite signatures only, and no standalone component signer.
+//! A host artefact that is not a `COSE_Sign1` statement (an audit entry, the
+//! accord manifest, an Agent task / deferral / DSAR / external-SQL proof) is
+//! signed with ONE composite over [`domain_preimage`]:
+//!
+//! ```text
+//! b"ciris.signing_domain/v1\0"           24 bytes, the framing tag
+//! u32le(len(tag)) || tag (UTF-8)          the domain (SigningDomain::tag)
+//! message                                 the artefact's own bytes
+//! ```
+//!
+//! The tag is length-framed and the registry is CLOSED ([`SigningDomain`]):
+//! a signature made for one domain does not verify as another's, and an
+//! unregistered tag is refused by name ([`SIGNING_DOMAIN_UNKNOWN`]) before
+//! anything is signed or read. The framing tag keeps these preimages apart
+//! from every other byte string a key signs: a COSE `Sig_structure` opens
+//! with a CBOR array header, a signed tree head with its own fields.
+//!
+//! The registry is APPENDED and pinned by position (I2899): a tag is never
+//! renamed or reused; a new artefact appends a variant.
+//!
+//! Hardware: the composite's Ed25519 half signs the composite's fixed-size
+//! message representative (127 bytes, `ciris_crypto::composite::REPRESENTATIVE_LEN`),
+//! never the message itself, so a single-part PKCS#11 EdDSA token signs a
+//! composite over any message length.
+
+use sha2::{Digest as _, Sha256};
+
+use super::composite_verify::{verify_composite_via_directory, CompositeVerifyError, LiveSigner};
+use crate::federation::{Error, FederationDirectory};
+
+/// The framing tag every domain preimage opens with.
+pub const DOMAIN_PREIMAGE_PREFIX: &[u8] = b"ciris.signing_domain/v1\0";
+
+/// Refusal token: a tag the closed registry does not hold.
+pub const SIGNING_DOMAIN_UNKNOWN: &str = "signing_domain_unknown";
+
+/// Refusal token: an accord manifest signed by a key that is not a holder of
+/// the genesis bundle in force.
+pub const ACCORD_MANIFEST_SIGNER_NOT_HOLDER: &str = "accord_manifest_signer_not_holder";
+
+/// **The closed set of signing domains.** Appended only; each tag is pinned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SigningDomain {
+    /// An audit-chain entry (`audit::verify::entry_signing_preimage`).
+    AuditEntry,
+    /// The accord manifest, signed by an accord holder
+    /// ([`accord_manifest_v2_message`]).
+    AccordManifest,
+    /// An Agent system-task signature.
+    AgentSystemTask,
+    /// An Agent deferral resolution.
+    AgentDeferralResolution,
+    /// An Agent DSAR proof.
+    AgentDsarProof,
+    /// An Agent external-data SQL proof.
+    AgentExternalDataSql,
+    /// The Agent's verification-route response.
+    AgentVerificationRoute,
+}
+
+impl SigningDomain {
+    /// Every domain, in registry order (pinned by position).
+    pub const ALL: [Self; 7] = [
+        Self::AuditEntry,
+        Self::AccordManifest,
+        Self::AgentSystemTask,
+        Self::AgentDeferralResolution,
+        Self::AgentDsarProof,
+        Self::AgentExternalDataSql,
+        Self::AgentVerificationRoute,
+    ];
+
+    /// The domain's tag, the bytes framed into its preimage.
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::AuditEntry => "ciris.audit_entry.v1",
+            Self::AccordManifest => "ciris.accord_manifest.v2",
+            Self::AgentSystemTask => "ciris.agent.system_task.v1",
+            Self::AgentDeferralResolution => "ciris.agent.deferral_resolution.v1",
+            Self::AgentDsarProof => "ciris.agent.dsar_proof.v1",
+            Self::AgentExternalDataSql => "ciris.agent.external_data_sql.v1",
+            Self::AgentVerificationRoute => "ciris.agent.verification_route.v1",
+        }
+    }
+
+    /// The domain a tag names, exactly (one spelling).
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] leading with [`SIGNING_DOMAIN_UNKNOWN`].
+    pub fn from_tag(tag: &str) -> Result<Self, Error> {
+        Self::ALL
+            .into_iter()
+            .find(|d| d.tag() == tag)
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "{SIGNING_DOMAIN_UNKNOWN}: {tag:?} is not a registered signing domain"
+                ))
+            })
+    }
+}
+
+/// **The bytes a domain's ONE composite is over** (see the module doc).
+#[must_use]
+pub fn domain_preimage(domain: SigningDomain, message: &[u8]) -> Vec<u8> {
+    let tag = domain.tag().as_bytes();
+    let mut buf = Vec::with_capacity(DOMAIN_PREIMAGE_PREFIX.len() + 4 + tag.len() + message.len());
+    buf.extend_from_slice(DOMAIN_PREIMAGE_PREFIX);
+    // A registered tag is a short literal: its length fits a u32.
+    buf.extend_from_slice(&(tag.len() as u32).to_le_bytes());
+    buf.extend_from_slice(tag);
+    buf.extend_from_slice(message);
+    buf
+}
+
+/// **Verify a domain's composite under the live edition-2 key of
+/// `identity_ref`** at `at_ms`: [`verify_composite_via_directory`] over
+/// [`domain_preimage`]. It asks about the signer's key only; a role the
+/// artefact needs (a holder, a seat) is the caller's, or a domain verify
+/// that names it ([`verify_accord_manifest_v2`]).
+///
+/// # Errors
+/// [`CompositeVerifyError`], each by its token.
+#[allow(clippy::result_large_err)] // the error type is composite_verify's
+pub async fn verify_domain_composite_via_directory<F>(
+    dir: &F,
+    domain: SigningDomain,
+    message: &[u8],
+    identity_ref: &str,
+    composite_sig: &[u8],
+    at_ms: u64,
+) -> Result<LiveSigner, CompositeVerifyError>
+where
+    F: FederationDirectory + ?Sized,
+{
+    verify_composite_via_directory(
+        dir,
+        &domain_preimage(domain, message),
+        identity_ref,
+        composite_sig,
+        at_ms,
+    )
+    .await
+}
+
+/// **The accord manifest's signed message (v2)**: the 32-byte SHA-256 of the
+/// RFC 8785 (JCS) image of
+/// `{"domain": "ciris.accord_manifest.v2", "manifest_sha256": <hex>,
+/// "manifest_size": <bytes>, "signer_identity": <the holder's identity-ref>}`.
+/// The holder signs [`domain_preimage`]`(AccordManifest, this)`: 24 + 4 + 24 +
+/// 32 = 84 bytes.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] for a `manifest_sha256` that is not 64 lowercase
+/// hex characters, or an empty `signer_identity`.
+pub fn accord_manifest_v2_message(
+    manifest_sha256_hex: &str,
+    manifest_size: u64,
+    signer_identity: &str,
+) -> Result<[u8; 32], Error> {
+    let hex_ok = manifest_sha256_hex.len() == 64
+        && manifest_sha256_hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !hex_ok {
+        return Err(Error::InvalidArgument(
+            "accord manifest: manifest_sha256 must be 64 lowercase hex characters".into(),
+        ));
+    }
+    if signer_identity.is_empty() {
+        return Err(Error::InvalidArgument(
+            "accord manifest: signer_identity is empty".into(),
+        ));
+    }
+    let statement = serde_json::json!({
+        "domain": SigningDomain::AccordManifest.tag(),
+        "manifest_sha256": manifest_sha256_hex,
+        "manifest_size": manifest_size,
+        "signer_identity": signer_identity,
+    });
+    let jcs = crate::verify::canonical::ceg_produce_canonicalize(&statement)
+        .map_err(|e| Error::InvalidArgument(format!("accord manifest canonicalize: {e}")))?;
+    Ok(Sha256::digest(&jcs).into())
+}
+
+/// **Verify an accord manifest signature (v2)**: `signer_identity` must be a
+/// holder of the genesis bundle in force
+/// ([`GenesisInForce::is_holder`](super::genesis::GenesisInForce::is_holder)),
+/// and `composite_sig` ONE composite over
+/// [`domain_preimage`]`(AccordManifest, `[`accord_manifest_v2_message`]`)`
+/// under that holder's live edition-2 key at `at_ms`. The holder check is
+/// here, in the verify: the manifest's authority is the role.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] for a malformed statement;
+/// [`Error::MalformedRow`] leading with [`ACCORD_MANIFEST_SIGNER_NOT_HOLDER`]
+/// for a signer that is not a holder; a composite refusal as
+/// [`Error::SignatureInvalid`] leading with its token; a directory failure as
+/// itself.
+pub async fn verify_accord_manifest_v2<F>(
+    dir: &F,
+    manifest_sha256_hex: &str,
+    manifest_size: u64,
+    signer_identity: &str,
+    composite_sig: &[u8],
+    at_ms: u64,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let message = accord_manifest_v2_message(manifest_sha256_hex, manifest_size, signer_identity)?;
+    let in_force = super::genesis::genesis_in_force(dir).await?;
+    if !in_force.is_holder(signer_identity) {
+        return Err(Error::malformed_row(
+            "accord_manifest",
+            ACCORD_MANIFEST_SIGNER_NOT_HOLDER,
+            format!(
+                "{signer_identity} is not an accord holder of the genesis bundle in force; \
+                 the accord manifest is signed by a holder"
+            ),
+        ));
+    }
+    match verify_domain_composite_via_directory(
+        dir,
+        SigningDomain::AccordManifest,
+        &message,
+        signer_identity,
+        composite_sig,
+        at_ms,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(CompositeVerifyError::Directory(e)) => Err(e),
+        Err(e) => Err(Error::SignatureInvalid(e.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **I2899 (the registry leg) — the closed set, pinned by position, one
+    /// spelling per tag; the framing is exact.**
+    #[test]
+    fn i2899_the_signing_domain_registry_is_closed_and_pinned() {
+        let tags: Vec<&str> = SigningDomain::ALL.iter().map(|d| d.tag()).collect();
+        assert_eq!(
+            tags,
+            [
+                "ciris.audit_entry.v1",
+                "ciris.accord_manifest.v2",
+                "ciris.agent.system_task.v1",
+                "ciris.agent.deferral_resolution.v1",
+                "ciris.agent.dsar_proof.v1",
+                "ciris.agent.external_data_sql.v1",
+                "ciris.agent.verification_route.v1",
+            ],
+            "I2899: appended only, pinned by position"
+        );
+        for d in SigningDomain::ALL {
+            assert_eq!(SigningDomain::from_tag(d.tag()).unwrap(), d, "I2899");
+        }
+        for bad in ["", "ciris.audit_entry.V1", "ciris.audit_entry.v1 ", "x"] {
+            match SigningDomain::from_tag(bad) {
+                Err(Error::InvalidArgument(m)) => {
+                    assert!(m.starts_with(SIGNING_DOMAIN_UNKNOWN), "I2899 {bad:?}: {m}");
+                }
+                other => panic!("I2899 {bad:?}: refused by name, got {other:?}"),
+            }
+        }
+        let pre = domain_preimage(SigningDomain::AuditEntry, b"m");
+        let mut want = b"ciris.signing_domain/v1\0".to_vec();
+        want.extend_from_slice(&20u32.to_le_bytes());
+        want.extend_from_slice(b"ciris.audit_entry.v1");
+        want.extend_from_slice(b"m");
+        assert_eq!(pre, want, "I2899: the framing");
+        assert_ne!(
+            domain_preimage(SigningDomain::AgentSystemTask, b"m"),
+            domain_preimage(SigningDomain::AgentDsarProof, b"m"),
+            "I2899: two domains, two preimages"
+        );
+        let msg = accord_manifest_v2_message(&"ab".repeat(32), 10, "urn:x").unwrap();
+        assert_eq!(
+            domain_preimage(SigningDomain::AccordManifest, &msg).len(),
+            84,
+            "I2899: the accord manifest preimage stays small"
+        );
+        assert!(accord_manifest_v2_message("AB", 10, "urn:x").is_err());
+    }
+}

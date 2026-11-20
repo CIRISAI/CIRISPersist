@@ -3592,3 +3592,12 @@ CREATE TABLE cirislens.ceg_roster_proposals (
 CREATE INDEX ceg_roster_proposals_open
     ON cirislens.ceg_roster_proposals (identity_key_id, received_at)
     WHERE settled_at IS NULL;
+
+-- v62.0.0 (P8-fix14; CC 4.4.3.3.1 / 8.1.5, lead ruling (a)): an edition-2
+-- row's restatement key (crossing::restatement_key_of_row), derived from its
+-- statement on every node and written by the row writer beside the row,
+-- never in the envelope (no content hash sees it). The Live read hides a row
+-- that a live, same-attester row with this key and a strictly containing
+-- audience restates (store::edition_baseline::ATTESTATIONS_EDITION_TWO_POSTGRES).
+ALTER TABLE cirislens.federation_attestations ADD COLUMN restatement_key text;
+CREATE INDEX federation_attestations_restatement ON cirislens.federation_attestations USING btree (attesting_key_id, restatement_key) WHERE (restatement_key IS NOT NULL);

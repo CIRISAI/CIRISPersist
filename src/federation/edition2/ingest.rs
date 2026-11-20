@@ -1387,8 +1387,36 @@ pub async fn apply_replicated_statement<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    apply_replicated_statement_with_origin(
+        dir,
+        bytes,
+        offered_id,
+        crate::federation::replication::admission::WriteOrigin::Wire,
+    )
+    .await
+}
+
+/// v62.0.0 (E6-fix9; CIRISPersist#804) — [`apply_replicated_statement`]
+/// under the CALL's write origin. The privileged sync door
+/// (`put_attestation_synced`, `WriteOrigin::Sync { peer_key_id }`) reaches
+/// the statement door through `attestation_apply::apply_as_statement`, and
+/// the origin is what decides WHICH budget a fresh row is metered against
+/// (the cohort question stays inside the write door). Dropping it to `Wire`
+/// metered a cohort mate's sync as a wire stranger and opened a peer bucket.
+///
+/// # Errors
+/// As [`apply_replicated_statement`].
+pub async fn apply_replicated_statement_with_origin<F>(
+    dir: &F,
+    bytes: &[u8],
+    offered_id: &Digest32,
+    origin: crate::federation::replication::admission::WriteOrigin,
+) -> Result<ReplicatedStatementOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     use crate::federation::attestation_apply::AttestationRefusalReason;
-    match put_statement(dir, bytes, Some(offered_id), INGEST_TIER).await {
+    match put_statement_with_origin(dir, bytes, Some(offered_id), INGEST_TIER, origin).await {
         Ok(out) => {
             let new = match &out {
                 StatementOutcome::KeyPlane { new, .. }

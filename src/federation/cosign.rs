@@ -562,14 +562,12 @@ where
                 .event
                 .plane_signing_envelope()
                 .ok_or_else(|| malformed(row, "a record carries no cosignature"))?;
-            super::tier_ingest::verify_envelope_hybrid_signature(
-                dir,
+            crate::federation::edition2::group::vouched_envelope(
                 &c.authority_key_id,
                 &envelope,
                 &c.scrub_signature_classical,
-                c.scrub_signature_pqc.as_deref(),
-            )
-            .await?;
+                "cosign",
+            )?;
         }
     }
     Ok(true)

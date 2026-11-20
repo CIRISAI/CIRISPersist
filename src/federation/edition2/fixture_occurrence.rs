@@ -96,15 +96,16 @@ pub fn occurrence_bind_voices(
     if let Some(h) = &opts.head {
         let mut refs = vec![("head", ciris_verify_core::edition2::row_ref(&h.0))];
         if !opts.further_heads.is_empty() {
-            refs.push((
-                "further_heads",
-                Value::Array(
-                    opts.further_heads
-                        .iter()
-                        .map(|f| ciris_verify_core::edition2::row_ref(&f.0))
-                        .collect(),
-                ),
-            ));
+            // v62.0.0 (E2-fix10) — a `row-ref-set`: sorted by encoding, no
+            // duplicate (CC 2.6.1.2; `payloads::check_refs`).
+            let mut set: Vec<Value> = opts
+                .further_heads
+                .iter()
+                .map(|f| ciris_verify_core::edition2::row_ref(&f.0))
+                .collect();
+            set.sort_by_key(ciris_verify_core::cde::encode);
+            set.dedup();
+            refs.push(("further_heads", Value::Array(set)));
         }
         m.push(("refs", det_map(refs)));
     }

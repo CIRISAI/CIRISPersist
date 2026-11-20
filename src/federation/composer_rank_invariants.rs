@@ -136,9 +136,14 @@ pub(crate) mod bodies {
         let id = id
             .map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // v62.0.0 (round 6, E7) — the room is named `community_id`, the
+        // edition-2 common member (`payloads::COMMON`); the earlier alias
+        // `community_key_id` is no payload member, so the composer named no
+        // room and the write scope found no membership. The target by its
+        // row id (`e2::rid`).
         let mut env = serde_json::json!({
-            "references_attestation_id": head.attestation_id,
-            "community_key_id": e2::kid(room),
+            "references_attestation_id": e2::rid(head),
+            "community_id": e2::kid(room),
         });
         if kind == attestation_type::SUPERSEDES {
             env["dimension"] = serde_json::json!("trust:demo:v1");
@@ -204,9 +209,16 @@ pub(crate) mod bodies {
             live.contains(&pa.attestation_id) && live.contains(&pb.attestation_id),
             "I1506: both placements live ({live:?})"
         );
+        // v62.0.0 (round 6, E7; lead) — what a READER sees: once widened, the
+        // read returns the restatements as current and no longer serves the
+        // prior as current (its bytes stay untouched; the fold supersedes
+        // it), on sqlite and pg. Read-checked: no fold or read path links a
+        // restatement to its prior (`widen_by_restatement` writes no
+        // composer), so this is RED until production does: a production
+        // finding, reported to P8 and the lead.
         assert!(
             !live.contains(&prior.attestation_id),
-            "I1506: the prior is hidden"
+            "I1506: the prior is no longer served as current ({live:?})"
         );
     }
 

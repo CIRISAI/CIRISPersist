@@ -131,6 +131,18 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // refusal: it refuses the caller's object by its form, before any parse.
     ("refuse_earlier_form", Class::Gate),
     ("refuse_earlier_form_row", Class::Gate),
+    // v62.0.0 (E8-fix4) — the lineage-head cosign store's one gate (the
+    // earlier-form refusal), decided once for both backends (#934).
+    ("plan_store_lineage_head_cosign", Class::Plan),
+    // v62.0.0 (E8-fix4) — P8's crossing: an edition-2 row's statements
+    // move to the next serve position inside the crossing's transaction.
+    // It refuses nothing about the caller; it fails only on the substrate's
+    // own terms (an UPDATE of `ceg_statements.admitted_us`).
+    ("restamp_row", Class::Plumbing),
+    // v62.0.0 (E8-fix4) — P7-fix6's trace signer rule, run by the shared
+    // attestation plan: a `trace:*` / `trace_summary:*` row from a signer
+    // that is not an agent's key is refused `trace_signer_not_agent`.
+    ("check_trace_signer_kind", Class::Gate),
     // v62.0.0 (slice E2a) — the edition-2 attestation path: the carried
     // statement's re-verify and signer identity set refuses a row that is
     // not its statement's projection (Gate); `put_row` writes an admitted
@@ -237,7 +249,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("store_planned_chunk_batch", Class::Plumbing),
     ("read_stream_chunk_hashes", Class::Plumbing),
     ("store_stream_sth", Class::Plumbing),
-    ("store_delivery_receipt", Class::Plumbing),
     // v61 (CIRISPersist#934, S4a) — the operator peer add, the known-hash sighting, the purge record write and the trust revocation.
     ("add_peer_record_planned", Class::Plan),
     ("insert_known_wire_hash_planned", Class::Plan),
@@ -459,11 +470,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // in-transaction emitters call `plan_hard_case_row` inside their own
     // transaction). The put plan's two new refusals are Gates.
     ("plan_hard_case_row", Class::Plan),
-    // The detection plan's V008 shape refusal (a Gate); the two envelope
-    // builders are serialization (Plumbing).
-    ("detection_shape_refusal", Class::Gate),
+    // The hard_case envelope builder is serialization (Plumbing). v62.0.0
+    // (P8-fix12) — the detection plan's rows (`detection_shape_refusal`,
+    // `detection_envelope`) left with the deleted earlier-form door (fix11).
     ("hard_case_envelope", Class::Plumbing),
-    ("detection_envelope", Class::Plumbing),
     ("check_detection_body", Class::Gate),
     // The same-file emit helpers: each plans a row (the shared plan) and
     // stores it, so it carries the plan's sequence.
@@ -484,7 +494,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("pg_project_hard_case", Class::Plumbing),
     ("sqlite_project_detection", Class::Plumbing),
     ("pg_project_detection", Class::Plumbing),
-    ("pg_row_to_hard_case_event", Class::Plumbing),
     ("sqlite_render_table", Class::Plumbing),
     ("pg_render_table", Class::Plumbing),
     ("execute_batch", Class::Plumbing),
@@ -492,7 +501,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // The two projections (rows → table): a derivation that answers `None`
     // for a row that is not its family's, never a refusal.
     ("project_hard_case_row", Class::Plumbing),
-    ("project_detection_row", Class::Plumbing),
     ("project_detection_row_under", Class::Plumbing),
     // v60.0.0 (CIRISPersist#988 item 1) — the ledger projection (this node's
     // `credits:` / `expertise:` rows → the ledgers): a derivation and its
@@ -533,7 +541,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("sqlite_store_erasure_withdraws", Class::Plumbing),
     ("pg_store_erasure_withdraws", Class::Plumbing),
     // The canonical subject of an agent / a detection's trace: derivations.
-    ("detection_subject", Class::Plumbing),
     ("sqlite_erase_cited_rows", Class::Plumbing),
     ("pg_erase_cited_rows", Class::Plumbing),
     ("sqlite_put_erasure_execution", Class::Plumbing),
@@ -760,7 +767,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_rebind_admission", Class::Gate),
     // After an admitted re-bind: applies the carried row through the
     // transport door (which runs its own gates).
-    ("after_admission", Class::Delegates),
     // v52.0.0 (#953) — Plumbing: a pure shape test that names the inline blob
     // a stream id spells, inside the chunk-hash loader; it refuses nothing.
     ("inline_blob_of_stream_id", Class::Plumbing),
@@ -958,6 +964,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // read). It replaced the accord proposal's own `transaction_with_behavior`
     // (v54.1.0, Codex round 4 on PR #1057) and every deferred `transaction`.
     ("write_tx", Class::Plumbing),
+    // v62.0.0 (P8-fix14) — Plumbing: an edition-2 row's restatement key,
+    // stored beside the row in the writer's transaction (refuses nothing).
+    ("sqlite_stamp_restatement_key", Class::Plumbing),
+    ("pg_stamp_restatement_key", Class::Plumbing),
     // v54.1.0 (Codex round 4 sweep) — Plumbing: the orphaned thought-signature
     // cleanup both trace-removal doors run in their transaction.
     ("sqlite_drop_orphaned_thought_signatures", Class::Plumbing),
@@ -1638,7 +1648,7 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 69] = [
+    const SHARED_PLANS: [(&str, &str); 70] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance.
         (
             "src/federation/transport_admit.rs",
@@ -1687,6 +1697,11 @@ mod tests {
         ("src/federation/blob_admit.rs", "store_blob_local_planned"),
         // v62.0.0 (E8-fix2) — the sealed-floor announce (I27 / I28).
         ("src/federation/blob_admit.rs", "announce_held_blob_planned"),
+        // v62.0.0 (E8-fix4) — the lineage-head cosign store's gate.
+        (
+            "src/federation/lineage_witness.rs",
+            "plan_store_lineage_head_cosign",
+        ),
         ("src/federation/blob_admit.rs", "adopt_sealed_blob_planned"),
         ("src/federation/blob_admit.rs", "put_blob_chunks_planned"),
         (
@@ -1895,7 +1910,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 75] = [
+    const SHARED_DOORS: [(&str, &str, &str); 76] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance,
         // decoded by the row mapper both doors read through.
         (
@@ -1965,6 +1980,12 @@ mod tests {
             "BlobStorage",
             "announce_held_blob",
             "announce_held_blob_planned",
+        ),
+        // v62.0.0 (E8-fix4) — the lineage-head cosign store (#934).
+        (
+            "FederationDirectory",
+            "store_lineage_head_cosign",
+            "plan_store_lineage_head_cosign",
         ),
         (
             "BlobStorage",

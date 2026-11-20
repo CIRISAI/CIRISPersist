@@ -636,6 +636,34 @@ pub(crate) mod bodies {
             .map(|(_, d)| d.clone())
             .expect("I3545: the agent's delegation draft");
         let agent_engine = node(dsn, &alias("agent")).await;
+        // v62.0.0 (P8-fix12) — the agent's OTHER drafts first: its voice on
+        // its owner binding (the owner stated its half; without the agent's
+        // voice the agent has no owner and the delegation's `delegate_owner`
+        // role cannot fill) and on its occurrence bind.
+        for (_, other) in out.bind_drafts.iter().filter(|(k, d)| {
+            *k == agent_id
+                && crate::federation::edition2::names::RowId::of_statement(&d.assemble(Vec::new()))
+                    != Some(rid)
+        }) {
+            let st = agent_engine
+                .sign_draft(other)
+                .await
+                .expect("I3545: the agent signs its other drafts");
+            a.put_edition2_statement(&st, None)
+                .await
+                .expect("I3545: the agent's other voices are admitted");
+        }
+        assert!(
+            crate::federation::admission::agent_owner_of(
+                &*dir,
+                &agent_id,
+                u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0),
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "I3545: the agent's owner binding landed on its voice"
+        );
         let st = agent_engine
             .sign_draft(&draft)
             .await

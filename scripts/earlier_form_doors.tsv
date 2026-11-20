@@ -31,7 +31,7 @@ trait	put_wholeness_witness	composite	federation/evidence_admit.rs::put_wholenes
 trait	revoke_member	refuses	trait:*	-
 trait	revoke_trust	refuses	federation/consent_admit.rs::revoke_trust_planned	-
 trait	store_invalid_replaced_key_record	refuses	federation/key_plane.rs::key_record_write_planned	-
-trait	store_lineage_head_cosign	refuses	-	the store leaf is a trait door too, so it refuses itself (F0)
+trait	store_lineage_head_cosign	refuses	federation/lineage_witness.rs::plan_store_lineage_head_cosign	the store leaf is a trait door too; both backends refuse on the shared plan first (E8-fix4)
 trait	store_rebound_key_record	refuses	federation/key_plane.rs::key_record_write_planned	-
 trait	supersede_affiliations	refuses	federation/group_amendment.rs::supersede_community_signed	-
 trait	supersede_affiliations_with_quorum	refuses	federation/group_amendment.rs::supersede_community_signed	-
@@ -59,7 +59,7 @@ pyo3	attestation_insert_local	exempt	-	a producer: the node signs its own row fr
 pyo3	attestation_insert_local_many	exempt	-	a producer: the node signs its own row from unsigned input (slice B re-targets it to sign_row)
 pyo3	attestation_upsert_local	exempt	-	a producer: the node signs its own row from unsigned input (slice B re-targets it to sign_row)
 pyo3	attestation_upsert_local_many	exempt	-	a producer: the node signs its own row from unsigned input (slice B re-targets it to sign_row)
-pyo3	audit_record_entry	substrate	audit/sqlite.rs::record_entry > audit/verify.rs::verify_entry_signature | audit/postgres.rs::record_entry > audit/verify.rs::verify_entry_signature	CC 1.13.4: no other node verifies an entry's inner signature (served: composite head, hashes, proofs); the substrate predicate keeps its form
+pyo3	audit_record_entry	composite	audit/sqlite.rs::record_entry > audit/verify.rs::verify_entry_signature | audit/postgres.rs::record_entry > audit/verify.rs::verify_entry_signature	F0-cp8: ONE composite over the entry's binary preimage under the signer's identity-ref (CC 6.1.3); a lone Ed25519 is refused verify_component_signature
 pyo3	ceremony_record	exempt	-	agent-local store of an unsigned record; no signed object is admitted
 pyo3	cirisgraph_upsert_edge	exempt	-	agent-local store of an unsigned record; no signed object is admitted
 pyo3	cirisgraph_upsert_node	exempt	-	agent-local store of an unsigned record; no signed object is admitted

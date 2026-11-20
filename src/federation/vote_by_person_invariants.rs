@@ -431,10 +431,14 @@ pub(crate) mod bodies {
         next.family_name = format!("{} (renamed)", held.family_name);
         let record =
             crate::federation::edition2::group::GroupRecord::Family(e2::family_with_kids(&next));
+        // v62.0.0 (E6-fix8) — ONE instant for every voice of the version: the
+        // instant is in the signed payload, so voices stamped at two clocks are
+        // two different versions, and the second put counted q alone.
+        let at = now_ms();
         let voices = |signers: &[&str]| {
             let keys: Vec<_> = signers.iter().map(|s| e2::signing_key(s)).collect();
             let refs: Vec<&_> = keys.iter().collect();
-            e2::roster_voices(&record, version + 1, Some(&h), now_ms(), &refs)
+            e2::roster_voices(&record, version + 1, Some(&h), at, &refs)
         };
         let w = e2::put_voices(d, &voices(&[&p, &pd])).await;
         assert!(short(&w), "I1530: one person of two: {w:?}");

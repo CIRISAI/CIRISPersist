@@ -59,9 +59,6 @@ pub(crate) mod bodies {
     use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::edition2::group::{GroupRecord, MembershipRecord};
     use crate::federation::edition2::ingest::StatementOutcome;
-    use crate::federation::lineage_witness::{
-        LineageCosignOutcome, LineageCosignRefusal, LineageHeadCosign,
-    };
     use crate::federation::membership_acceptance::test_support::{acceptance_row, proposal_row};
     use crate::federation::roster_head::{
         fold_disagreement, roster_lag, LineageRecord, LINEAGE_HEAD_LAGS_ROSTER,
@@ -312,9 +309,38 @@ pub(crate) mod bodies {
         out
     }
 
-    fn disagrees(e: &Error, key: &str) -> bool {
-        matches!(e, Error::LineageVersionDisagreesWithFold { keys, .. } if keys == &[key.to_owned()])
-            && e.kind() == crate::federation::roster_head::LINEAGE_VERSION_DISAGREES_WITH_FOLD
+    /// v62.0.0 (E13 fix2; CC 2.7.3, GC5) — **a version the fold disagrees
+    /// with is HELD**, concluding nothing: `Pending`, held for
+    /// `lineage_version_disagrees_with_fold`, and the head did not move.
+    /// (Outside a fold attempt it was the `LineageVersionDisagreesWithFold`
+    /// refusal; the edition-2 door folds.)
+    pub(crate) async fn held_for_the_fold(
+        d: &dyn FederationDirectory,
+        out: Result<StatementOutcome, Error>,
+        what: &str,
+    ) {
+        let row = match out {
+            Ok(StatementOutcome::Pending { row_id, .. }) => row_id,
+            other => panic!("{what}: expected the version HELD (Pending), got {other:?}"),
+        };
+        let why = crate::federation::edition2::fold::why_held(d, &row)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{what}: the version is held with a reason"));
+        assert_eq!(
+            why.reason,
+            crate::federation::edition2::fold::reason::LINEAGE_VERSION_DISAGREES_WITH_FOLD,
+            "{what}: the reason"
+        );
+    }
+
+    /// v62.0.0 (E13 fix2) — the voices of a version that drops ONE member:
+    /// a family amendment whose only change removes one member is the
+    /// member's own leave (`family_dissolution::self_leave_member`), which
+    /// `admit_amendment` authorizes by the LEAVER's signature, not the quorum.
+    /// So the leaver voices it too, beside the two holders.
+    fn with_leaver(keys: &[String]) -> [&str; 3] {
+        [keys[0].as_str(), keys[1].as_str(), keys[2].as_str()]
     }
 
     /// The two holders who voice every version (the head's `quorum:2/3`).
@@ -328,13 +354,15 @@ pub(crate) mod bodies {
         let fam = conferring(d, tag, &keys).await;
         leave(d, &fam, &keys[2], chrono::Utc::now() - hours(1)).await;
         let held = head(d, &fam).await;
-        let e = version(d, &fam, held.members.clone(), &two(&keys))
-            .await
-            .expect_err("a version still listing the leaver is refused");
-        assert!(disagrees(&e, &keys[2]), "{tag} I450: {e:?}");
+        held_for_the_fold(
+            d,
+            version(d, &fam, held.members.clone(), &two(&keys)).await,
+            &format!("{tag} I450: a version still listing the leaver"),
+        )
+        .await;
         assert_eq!(head(d, &fam).await, held, "{tag} I450: nothing written");
         landed(
-            version(d, &fam, without(&held, &keys[2]), &two(&keys)).await,
+            version(d, &fam, without(&held, &keys[2]), &with_leaver(&keys)).await,
             &format!("{tag} I450: the version dropping the seat"),
         );
     }
@@ -354,14 +382,19 @@ pub(crate) mod bodies {
         )
         .await;
         let held = head(d, &fam).await;
-        let e = version(d, &fam, held.members.clone(), &two(&keys))
-            .await
-            .expect_err("a version without the widened seat is refused");
-        assert!(disagrees(&e, &joiner), "{tag} I451 seat: {e:?}");
-        let e = version(d, &fam, with(&held, &joiner, Some("founder")), &two(&keys))
-            .await
-            .expect_err("the seat with another role is refused");
-        assert!(disagrees(&e, &joiner), "{tag} I451 role: {e:?}");
+        held_for_the_fold(
+            d,
+            version(d, &fam, held.members.clone(), &two(&keys)).await,
+            &format!("{tag} I451 seat: a version without the widened seat"),
+        )
+        .await;
+        held_for_the_fold(
+            d,
+            version(d, &fam, with(&held, &joiner, Some("founder")), &two(&keys)).await,
+            &format!("{tag} I451 role: the seat with another role"),
+        )
+        .await;
+        assert_eq!(head(d, &fam).await, held, "{tag} I451: nothing written");
         landed(
             version(d, &fam, with(&held, &joiner, Some("member")), &two(&keys)).await,
             &format!("{tag} I451: the covering version"),
@@ -611,7 +644,7 @@ pub(crate) mod bodies {
         );
         let held = head(d, &fam).await;
         landed(
-            version(d, &fam, without(&held, &keys[2]), &two(&keys)).await,
+            version(d, &fam, without(&held, &keys[2]), &with_leaver(&keys)).await,
             &format!("{tag} I454: the covering version"),
         );
         assert!(
@@ -620,38 +653,17 @@ pub(crate) mod bodies {
         );
     }
 
-    /// A witness's cosign of `fam`'s head: `witness` is its identity-ref, and
-    /// the signature is the witness SEED's hybrid pair (the material E0's
-    /// composite key for that seed carries).
-    fn cosign(
-        fam: &Family,
-        witness: &str,
-        witness_seed: &str,
-        signed_at: chrono::DateTime<chrono::Utc>,
-    ) -> LineageHeadCosign {
-        let mut c = LineageHeadCosign {
-            lineage_key_id: fam.family_key_id.clone(),
-            head_digest_sha256_hex: fam.persist_row_hash.clone(),
-            head_asserted_at: fam.founded_at.to_rfc3339(),
-            prior_head_digest_sha256_hex: None,
-            signed_at: signed_at.to_rfc3339(),
-            witness_key_id: witness.to_owned(),
-            signature_classical: String::new(),
-            signature_pqc: None,
-        };
-        let bytes = crate::verify::canonical::ceg_produce_canonicalize(&c.signing_envelope())
-            .expect("cosign envelope canonicalizes");
-        let sig = ts::threshold_sign(witness_seed, &bytes);
-        c.signature_classical = sig.ed25519_signature_base64;
-        c.signature_pqc = sig.mldsa65_signature_base64;
-        c
-    }
-
-    /// **I455** — (ii) witnesses do not cosign a lagging head; with witnessed
-    /// mode off the lag is only reported.
+    /// **I455** — (ii) a lagging head, in either witnessed mode: the lag is
+    /// reported (and served on the witness view), and the covering version
+    /// clears it.
+    ///
+    /// v62.0.0 (E13 fix2; CP2, ruling 4) — the witness-COSIGN arms are
+    /// DELETED: `put_lineage_head_cosign` takes a `LineageHeadCosign`, a JSON
+    /// object signed over its JCS image, an earlier-form object the shut
+    /// doors refuse (`earlier_form_object`), and edition 2 has no lineage
+    /// cosign door yet. What stays is the lag, which every node computes from
+    /// its own held rows.
     pub async fn i455_a_lagging_head_is_not_cosigned(d: &dyn FederationDirectory, tag: &str) {
-        let witness_seed = format!("rw-{tag}");
-        let witness = e2::put_key(d, &witness_seed, &[identity_type::WITNESS]).await;
         for (mode, extra) in [
             ("on", serde_json::json!({ "witness_quorum": 2 })),
             ("off", serde_json::json!({})),
@@ -664,68 +676,27 @@ pub(crate) mod bodies {
             let held = head(d, &fam).await;
             let lag = roster_lag(d, &fam, chrono::Utc::now()).await.unwrap();
             assert!(lag.is_some(), "{tag} I455: lags in either mode");
-            let out = d
-                .put_lineage_head_cosign(cosign(&held, &witness, &witness_seed, chrono::Utc::now()))
+            assert_eq!(
+                lag.as_ref().map(|l| l.token.as_str()),
+                Some(LINEAGE_HEAD_LAGS_ROSTER),
+                "{tag} I455: the token CC names"
+            );
+            let view = root_witness_view(d, &fam, chrono::Utc::now())
                 .await
+                .unwrap()
                 .unwrap();
-            match mode {
-                "on" => {
-                    // v62.0.0 (wave GC3; CC 2.7, rc21 item 15) — kept, and
-                    // not counted toward the head's quorum.
-                    assert_eq!(
-                        out,
-                        LineageCosignOutcome::KeptNotCounted {
-                            reason: LineageCosignRefusal::HeadLagsRoster
-                        },
-                        "{tag} I455: a cosign on a lagging head is kept, not counted"
-                    );
-                    let view = root_witness_view(d, &fam, chrono::Utc::now())
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    assert_eq!(
-                        view.latest_cosign_at, None,
-                        "{tag} I455: the kept cosign counts for nothing"
-                    );
-                    assert_eq!(
-                        LineageCosignRefusal::HeadLagsRoster.as_str(),
-                        LINEAGE_HEAD_LAGS_ROSTER,
-                        "{tag} I455: the token CC names"
-                    );
-                    // The covering version is cosignable.
-                    landed(
-                        version(d, &fam, without(&held, &keys[2]), &two(&keys)).await,
-                        &format!("{tag} I455: the covering version"),
-                    );
-                    let covered = head(d, &fam).await;
-                    let out = d
-                        .put_lineage_head_cosign(cosign(
-                            &covered,
-                            &witness,
-                            &witness_seed,
-                            chrono::Utc::now(),
-                        ))
-                        .await
-                        .unwrap();
-                    assert_eq!(
-                        out,
-                        LineageCosignOutcome::Inserted,
-                        "{tag} I455: the covering head"
-                    );
-                }
-                _ => {
-                    assert_eq!(
-                        out,
-                        LineageCosignOutcome::Inserted,
-                        "{tag} I455: witnessed mode off changes nothing but the report"
-                    );
-                    let view = root_witness_view(d, &fam, chrono::Utc::now())
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    assert!(view.roster_lag.is_some(), "{tag} I455: reported");
-                }
-            }
+            assert!(view.roster_lag.is_some(), "{tag} I455: reported");
+            landed(
+                version(d, &fam, without(&held, &keys[2]), &with_leaver(&keys)).await,
+                &format!("{tag} I455: the covering version"),
+            );
+            assert!(
+                roster_lag(d, &fam, chrono::Utc::now())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{tag} I455: the covering version clears the lag"
+            );
         }
     }
 
@@ -888,13 +859,16 @@ pub(crate) mod backdated {
         let (room, node, _) = backdated_revocation(b).await;
         let d: &dyn FederationDirectory = b;
         let held = d.lookup_community(&room).await.unwrap().unwrap();
-        let e = room_version(d, with_member(&held, &node, "member"))
-            .await
-            .expect_err("a v3 still listing the revoked node is refused");
-        assert!(
-            matches!(&e, Error::LineageVersionDisagreesWithFold { keys, .. }
-                if keys == std::slice::from_ref(&node)),
-            "I450c: {e:?}"
+        super::bodies::held_for_the_fold(
+            d,
+            room_version(d, with_member(&held, &node, "member")).await,
+            "I450c: a v3 still listing the revoked node",
+        )
+        .await;
+        assert_eq!(
+            d.lookup_community(&room).await.unwrap().unwrap(),
+            held,
+            "I450c: nothing written"
         );
         landed(
             room_version(d, without(&held, &node)).await,

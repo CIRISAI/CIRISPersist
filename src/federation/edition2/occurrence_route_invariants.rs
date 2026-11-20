@@ -308,6 +308,10 @@ async fn displacement_body(d: &dyn FederationDirectory) {
     }
     ts::put_owner_binding(d, &owner, &old_node).await;
     ts::put_owner_binding(d, &owner, &new_node).await;
+    // v62 (O1 fix 11): an edition-2 key, its owner binding, its occurrence
+    // and its route are all named by its kid (E0's `put_key`), not its seed.
+    let kid = super::fixture_switch::kid;
+    let (old_node, new_node) = (kid(&old_node), kid(&new_node));
     // The tie that lets a newer route displace (the control: without it the
     // witness could not tell).
     let (a, b) = (

@@ -123,7 +123,8 @@ pub fn with_earlier_form<R>(f: impl FnOnce() -> R) -> R {
 /// `KeyRecord`, `SignedKeyRecord`, `SignedFamily`, `SignedCommunity`).
 /// I1912 re-derives the list from disk, so a new builder that is not listed
 /// is red. v62.0.0 (E0): the two zero-caller `*_widening_by_consensus`
-/// builders are deleted (37 → 35).
+/// builders are deleted (37 → 35). v62.0.0 (pass 4d): `reverse_quorum.rs`
+/// deleted its `signed_row` builder (35 → 34).
 pub const FLIP: &[&str] = &[
     "src/federation/bootstrap_admission.rs::consent_scope_row",
     "src/federation/bootstrap_admission.rs::consent_scope_row_superseding",
@@ -141,7 +142,6 @@ pub const FLIP: &[&str] = &[
     "src/federation/operational.rs::steward_key_record",
     "src/federation/register.rs::authority_signed_record",
     "src/federation/register.rs::self_scrubbed_record_signed_at",
-    "src/federation/reverse_quorum.rs::signed_row",
     "src/federation/tier_ingest.rs::bare_attestation",
     "src/federation/tier_ingest.rs::community_naming_held",
     "src/federation/tier_ingest.rs::expired_key_record",
@@ -212,18 +212,39 @@ fn row_aliases() -> &'static Mutex<HashMap<String, String>> {
 
 /// Record a minted statement: its row id's family and, when the literal row
 /// carried an id of its own choosing, that id as an alias of the row id.
-fn remember_row(statement: &[u8], literal_id: &str, family: &str) {
+///
+/// v62.0.0 (E0 fix 11) — a RE-SEAL follows the alias. A mapped row's
+/// `attestation_id` is its computed row id, so the suite's "build (sealed),
+/// change the scope, `reseal`" signs a NEW row id while the literal id the
+/// fixture chose still named the FIRST seal's: a later `supersedes` naming
+/// that literal id named a row never put (`config:load:v1 is a supersedes
+/// naming no resolvable target held here`). A re-seal of a row (`literal_id`
+/// is an earlier seal's row id) re-points every alias of that row to the new
+/// one, as the earlier form's id stayed the row's across re-signs. A
+/// composer is never a re-seal of its target (`composer_of` clones the
+/// target), so a composer's seal moves no alias.
+fn remember_row(statement: &[u8], literal_id: &str, family: &str, row_type: &str) {
     if let Some(id) = RowId::of_statement(statement) {
         let hex = id.hex();
         row_families()
             .lock()
             .expect("family map")
             .insert(hex.clone(), family.to_owned());
-        if !literal_id.is_empty() && !is_hex64(literal_id) {
-            row_aliases()
-                .lock()
-                .expect("alias map")
-                .insert(literal_id.to_owned(), hex);
+        if literal_id.is_empty() {
+            return;
+        }
+        let mut aliases = row_aliases().lock().expect("alias map");
+        if !is_hex64(literal_id) {
+            aliases.insert(literal_id.to_owned(), hex);
+        } else if !COMPOSER_ROW_TYPES.contains(&row_type) {
+            let earlier = literal_id.to_ascii_lowercase();
+            if earlier != hex {
+                for v in aliases.values_mut() {
+                    if *v == earlier {
+                        v.clone_from(&hex);
+                    }
+                }
+            }
         }
     }
 }
@@ -237,6 +258,16 @@ pub fn resolve_target(name: &str) -> Option<String> {
         return Some(name.to_ascii_lowercase());
     }
     row_aliases().lock().expect("alias map").get(name).cloned()
+}
+
+/// v62.0.0 (E0 fix 11) — **the id a row is held under**, for a fixture
+/// that kept the literal id it chose: that row's computed row id (its latest
+/// seal, [`resolve_target`]), or `id` as given (a row id already, or a name
+/// no sealed row carries). Under the earlier form the literal id is the
+/// stored one.
+#[must_use]
+pub fn held_row_id(id: &str) -> String {
+    resolve_target(id).unwrap_or_else(|| id.to_owned())
 }
 
 fn key_of_seed_text(seed: &str) -> CompositeSigningKey {
@@ -811,12 +842,22 @@ fn payload_of(row: &Attestation, family: &str, signer_iref: &str) -> Value {
     o.remove("asserted_at");
     o.remove("expires_at");
     let has_refs = o.contains_key("refs");
+    let composer = COMPOSER_ROW_TYPES.contains(&row.attestation_type.as_str());
     let target = o.remove(REFERENCES_MEMBER).filter(|t| {
         // v62.0.0 (E0 fix 8) — an earlier-form SELF-reference (a trust
         // charter's, a delegation's: `references_attestation_id` = the row's
         // own id) names no other row. An edition-2 row cannot name itself (its
         // id is computed over its payload), so the echo is not stated.
-        t.as_str() != Some(row.attestation_id.as_str())
+        //
+        // v62.0.0 (E0 fix 11) — except on a COMPOSER: its
+        // `references_attestation_id` is always its target (`refs.target`).
+        // A composer built from a clone of its target (`composer_of`, and the
+        // suite's `let mut w = target.clone(); w.attestation_type =
+        // "withdraws"`) still carries the target's `attestation_id`, which
+        // is the target's row id, so the "self-echo" is the target itself.
+        // Dropping it left the composer with no `refs.target`, which
+        // `payloads::check_composer` refuses (TRIAGE5: 71 reds).
+        composer || t.as_str() != Some(row.attestation_id.as_str())
     });
     // v62.0.0 (E0 fix 8) — a JSON `null` member is an absent one (CBOR
     // `null` is no ceg-value, CC 2.6.1.3; `emit::payload_from_envelope` skips
@@ -1123,7 +1164,7 @@ pub fn counted_statement_of_family(a: &Attestation, seed: &str, family: &str) ->
         vec![],
     )
     .expect("fixture_switch: sign a counted row");
-    remember_row(&st, &a.attestation_id, &family);
+    remember_row(&st, &a.attestation_id, &family, &a.attestation_type);
     st
 }
 
@@ -1152,12 +1193,17 @@ pub fn is_untargeted_composer(row: &Attestation) -> bool {
     if env.get("refs").is_some_and(|r| !r.is_null()) {
         return false;
     }
+    // v62.0.0 (E0 fix 11) — a composer's `references_attestation_id` names
+    // its target even when it equals the row's own (cloned-from-target) id.
+    // It is untargeted only while the name resolves to no row this codec
+    // knows (`resolve_target`), so a premature seal stays a no-op and never
+    // panics on a name the fixture has not set yet.
     match env
         .get(REFERENCES_MEMBER)
         .and_then(serde_json::Value::as_str)
     {
         None => true,
-        Some(t) => t.is_empty() || t == row.attestation_id,
+        Some(t) => t.is_empty() || resolve_target(t).is_none(),
     }
 }
 
@@ -1190,7 +1236,7 @@ pub fn statement_of_family(a: &Attestation, seed: &str, family: &str) -> Vec<u8>
         vec![],
     )
     .expect("fixture_switch: sign");
-    remember_row(&st, &a.attestation_id, family);
+    remember_row(&st, &a.attestation_id, family, &a.attestation_type);
     st
 }
 
@@ -1892,7 +1938,7 @@ pub fn statement_of_with_key(a: &Attestation, key: &CompositeSigningKey, family:
         vec![],
     )
     .expect("fixture_switch: sign");
-    remember_row(&st, &a.attestation_id, family);
+    remember_row(&st, &a.attestation_id, family, &a.attestation_type);
     st
 }
 
@@ -2705,7 +2751,7 @@ mod tests {
         let mut listed: Vec<String> = FLIP.iter().map(|s| (*s).to_owned()).collect();
         listed.sort();
         assert_eq!(builders_on_disk(), listed, "I1912: FLIP is stale");
-        assert_eq!(FLIP.len(), 35, "I1912: the count");
+        assert_eq!(FLIP.len(), 34, "I1912: the count");
     }
 
     /// **I2541 (E0)**: every builder of [`FLIP`] not in [`NOT_FLIPPED`]

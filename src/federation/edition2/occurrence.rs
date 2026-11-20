@@ -1230,7 +1230,9 @@ fn lowest_voice_as<'a>(voices: &'a [Vec<u8>], iss: &str) -> Option<&'a Vec<u8>> 
 /// statement id. A voice by a key off that roster is kept and concludes
 /// nothing: it is never the proposer (statement ids are random, so the
 /// unfiltered lowest could be a stray voice that refuses the proposal for
-/// good). `None` when no voice is by a roster key.
+/// good). Among the eligible voices a key in `avoid` (one with an open
+/// proposal of its own ahead) is chosen only when no other is. `None` when no
+/// voice is by a roster key.
 ///
 /// # Errors
 /// Directory read failures.
@@ -1240,6 +1242,7 @@ pub async fn proposer_on_roster<F>(
     iss: &str,
     roster: &BTreeSet<String>,
     exclude: Option<&str>,
+    avoid: &BTreeSet<String>,
 ) -> Result<Option<String>, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -1257,7 +1260,10 @@ where
             }
             statement_id_of(v).map(|id| (id, key))
         })
-        .min_by_key(|(id, _)| *id)
+        // O1 fix 12 (E3's I1134): prefer a key with no open proposal of its
+        // own ahead (`avoid`), so `one_open_per_proposer` never blocks a row
+        // a free roster voice can propose; then the lowest statement id.
+        .min_by_key(|(id, k)| (avoid.contains(k), *id))
         .map(|(_, k)| k))
 }
 
@@ -2007,19 +2013,7 @@ where
     let (_, agent_iss) = super::produce::signer_identity(agent)
         .await
         .map_err(unavailable)?;
-    let mut m = vec![
-        (
-            Value::Text("asserted_at".into()),
-            Value::Uint(asserted_at_ms),
-        ),
-        (Value::Text("author".into()), Value::Text(owner_iss)),
-        (
-            Value::Text("dimension".into()),
-            Value::Text("ownership:responsible_party:agent:v1".into()),
-        ),
-    ];
-    m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
-    let payload = Value::Map(m);
+    let payload = agent_owner_binding_payload(&owner_iss, asserted_at_ms);
     let family = ownership_family();
     for signer in [owner, agent] {
         let st = super::produce::sign_row(signer, &agent_iss, "delegates_to", &family, &payload)
@@ -2028,6 +2022,65 @@ where
         super::ingest::put_statement(dir, &st, None, super::ingest::INGEST_TIER).await?;
     }
     Ok(())
+}
+
+/// The payload of an agent's owner binding authored by `owner_iss` at
+/// `asserted_at_ms` (one spelling for both producers).
+fn agent_owner_binding_payload(owner_iss: &str, asserted_at_ms: u64) -> Value {
+    let mut m = vec![
+        (
+            Value::Text("asserted_at".into()),
+            Value::Uint(asserted_at_ms),
+        ),
+        (
+            Value::Text("author".into()),
+            Value::Text(owner_iss.to_owned()),
+        ),
+        (
+            Value::Text("dimension".into()),
+            Value::Text("ownership:responsible_party:agent:v1".into()),
+        ),
+    ];
+    m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
+    Value::Map(m)
+}
+
+/// v62.0.0 (v62 P8-fix12; CC 3.3.6, CC 2.6.1.9) — **an agent's owner binding
+/// when only the OWNER's pen is in hand** (the agent's key is hardware or
+/// remote): the owner's statement, signed and put (the row is HELD for the
+/// bound agent's voice, K2's `bound_node`), and the agent's voice DRAFTED over
+/// the same payload (`second_signer_voice::voice_draft`) for the agent to sign
+/// and submit. Until the agent voices it the agent has no owner, so a
+/// delegation waiting for its `delegate_owner` waits too.
+///
+/// # Errors
+/// `composite_signing_unavailable`; `agent_iss` not an identity-ref; the
+/// door's refusals.
+pub async fn state_agent_owner_binding_by_owner<F>(
+    dir: &F,
+    owner: &crate::signing::LocalSigner,
+    agent_iss: &str,
+    asserted_at_ms: u64,
+) -> Result<super::emit::Draft, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let producer = "agent_owner_binding";
+    let (_, owner_iss) = super::produce::signer_identity(owner)
+        .await
+        .map_err(|e| super::emit::composite_signing_unavailable(producer, &e.to_string()))?;
+    let payload = agent_owner_binding_payload(&owner_iss, asserted_at_ms);
+    let st = super::produce::sign_row(
+        owner,
+        agent_iss,
+        "delegates_to",
+        &ownership_family(),
+        &payload,
+    )
+    .await
+    .map_err(|e| super::emit::produce_error(producer, e))?;
+    super::ingest::put_statement(dir, &st, None, super::ingest::INGEST_TIER).await?;
+    super::second_signer_voice::voice_draft(&st, agent_iss)
 }
 
 /// v62.0.0 (v62 P8) — the author of a bind under `identity_key_id` at

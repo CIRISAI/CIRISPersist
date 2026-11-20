@@ -81,7 +81,10 @@ pub mod bodies {
         let mut payload =
             serde_json::json!({"grants": "replication", "attestation_prefixes": prefixes});
         if let Some(f) = for_key {
-            payload[cbh::FOR_KEY_ID] = serde_json::Value::String(f.to_owned());
+            // v62 (E3, round 6): a nested payload member the codec carries as
+            // text, so the machine is named here by its identity-ref (the
+            // V147 projection and the principals reader key on it).
+            payload[cbh::FOR_KEY_ID] = serde_json::Value::String(e2::kid_or_keep(f));
         }
         row(
             id,
@@ -123,6 +126,27 @@ pub mod bodies {
         // K2.api: the shared landing (owner's statement, then the node's
         // voice, C557; asserts Row).
         let b = ts::owner_binding_attestation("", owner, node);
+        ts::put_sealed_owner_binding(d, &b, node)
+            .await
+            .unwrap_or_else(|e| panic!("the owner binding {owner} → {node}: {e}"));
+    }
+
+    /// [`put_owner_binding`] dated just inside `node`'s held key record (its
+    /// `valid_from` + 1 ms). v62 (E3, round 6; E11-fix3's finding): an
+    /// Engine's `register_self_federation_key` starts the node's record at
+    /// the registration instant, and the builder dates a binding an hour
+    /// back, before the record began, so the node's voice had no key yet.
+    async fn put_owner_binding_inside_record(d: &dyn FederationDirectory, owner: &str, node: &str) {
+        let held = d
+            .lookup_public_key(&e2::kid(node))
+            .await
+            .expect("lookup_public_key")
+            .unwrap_or_else(|| panic!("the node key {node} is held"));
+        let mut b = ts::owner_binding_attestation("", owner, node);
+        b.asserted_at = crate::federation::admission::truncate_to_substrate_resolution(
+            held.valid_from + chrono::Duration::milliseconds(1),
+        );
+        ts::reseal(&mut b);
         ts::put_sealed_owner_binding(d, &b, node)
             .await
             .unwrap_or_else(|e| panic!("the owner binding {owner} → {node}: {e}"));
@@ -347,7 +371,7 @@ pub mod bodies {
         ts::register_identity_key(&*dir, &peer, NODE).await;
         // The human is bound to the machine (her statement and its voice);
         // the machine is claimed.
-        put_owner_binding(&*dir, &alice, &node).await;
+        put_owner_binding_inside_record(&*dir, &alice, &node).await;
         // A sealed local row authored by the machine: its own statement at
         // the local tier.
         let signer = engine

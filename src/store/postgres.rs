@@ -11697,10 +11697,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         cosign: &crate::federation::lineage_witness::LineageHeadCosign,
     ) -> Result<bool, crate::federation::Error> {
-        // v62.0.0 (JSON-cut slice F) — a cosign of the earlier form is a
-        // JSON object; this leaf is a trait door too, so it refuses by name
-        // itself and not only behind `admit_lineage_head_cosign`.
-        crate::federation::edition2::door::refuse_earlier_form("lineage_head_cosign")?;
+        // v62.0.0 (JSON-cut slice F; E8-fix4, #934) — the earlier-form
+        // refusal, on the shared plan.
+        crate::federation::lineage_witness::plan_store_lineage_head_cosign(cosign)?;
         // v51.0.0 (#938) — V159; insert-or-hold, never delete (evidence).
         let admitted_at = crate::host::clock::now();
         let client = self
@@ -21589,6 +21588,8 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
             )
             .await
             .map_err(map_attestation_pg_err("insert attestation", row))?;
+        // v62.0.0 (P8-fix14) — the restatement key, beside the row.
+        pg_stamp_restatement_key(&tx, row).await?;
         if inserted_rows > 0 {
             if let Some(depth) = planned.withdraws_depth {
                 tx.execute(
@@ -23033,6 +23034,26 @@ async fn pg_put_erasure_execution(
     Ok(())
 }
 
+/// v62.0.0 (v62 P8-fix14; lead ruling (a)) — the postgres twin of
+/// `sqlite_stamp_restatement_key`: an edition-2 row's restatement key in the
+/// plain `restatement_key` column, beside the row, in the writer's
+/// transaction; never an envelope member.
+async fn pg_stamp_restatement_key(
+    tx: &tokio_postgres::Transaction<'_>,
+    row: &crate::federation::Attestation,
+) -> Result<(), crate::federation::Error> {
+    if let Some(key) = crate::federation::crossing::restatement_key_of_row(row) {
+        tx.execute(
+            "UPDATE cirislens.federation_attestations SET restatement_key = $1 \
+             WHERE attestation_id = $2 AND restatement_key IS NULL",
+            &[&key, &row.attestation_id],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("restatement key: {e}")))?;
+    }
+    Ok(())
+}
+
 /// v58.0.0 (CIRISPersist#991) — insert a key-plane row (federation tier,
 /// minted by `federation::key_plane` from the signed object it carries)
 /// inside `tx`, with its serve position. One signed object, one id: a
@@ -23051,8 +23072,9 @@ async fn pg_insert_plane_row(
     let additional_scrubs = serde_json::to_string(&row.additional_scrubs)
         .map_err(|e| Error::Backend(format!("additional_scrubs encode: {e}")))?;
     let admitted_at = pg_next_plane_position(tx, "federation_attestations").await?;
-    tx.execute(
-        "INSERT INTO cirislens.federation_attestations (\
+    let n = tx
+        .execute(
+            "INSERT INTO cirislens.federation_attestations (\
             attestation_id, attesting_key_id, attested_key_id, attestation_type, \
             weight, asserted_at, expires_at, attestation_envelope, \
             original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
@@ -23062,28 +23084,30 @@ async fn pg_insert_plane_row(
          ) VALUES ($1, $2, $3, $4, NULL, $5, NULL, $6, $7, $8, $9, $10, $11, $12, $13, \
                    '[]'::jsonb, NULL, $14, $15, NULL, $17, $16) \
          ON CONFLICT (attestation_id) DO NOTHING",
-        &[
-            &row.attestation_id,
-            &row.attesting_key_id,
-            &row.attested_key_id,
-            &row.attestation_type,
-            &row.asserted_at,
-            &attestation_envelope_text,
-            &original_content_hash,
-            &row.scrub_signature_classical,
-            &row.scrub_signature_pqc,
-            &row.scrub_key_id,
-            &row.scrub_timestamp,
-            &row.pqc_completed_at,
-            &row.persist_row_hash,
-            &row.cohort_scope,
-            &row.tier,
-            &admitted_at,
-            &additional_scrubs,
-        ],
-    )
-    .await
-    .map_err(map_attestation_pg_err("insert key-plane row", row))
+            &[
+                &row.attestation_id,
+                &row.attesting_key_id,
+                &row.attested_key_id,
+                &row.attestation_type,
+                &row.asserted_at,
+                &attestation_envelope_text,
+                &original_content_hash,
+                &row.scrub_signature_classical,
+                &row.scrub_signature_pqc,
+                &row.scrub_key_id,
+                &row.scrub_timestamp,
+                &row.pqc_completed_at,
+                &row.persist_row_hash,
+                &row.cohort_scope,
+                &row.tier,
+                &admitted_at,
+                &additional_scrubs,
+            ],
+        )
+        .await
+        .map_err(map_attestation_pg_err("insert key-plane row", row))?;
+    pg_stamp_restatement_key(tx, row).await?;
+    Ok(n)
 }
 
 /// v59.0.0 (CIRISPersist#1099) — one V199 row as the receipt it is.
@@ -23673,6 +23697,7 @@ async fn pg_insert_local_attestation_row(
         )
         .await
         .map_err(map_attestation_pg_err("insert local attestation", row))?;
+    pg_stamp_restatement_key(tx, row).await?;
     // v17.4.0 (V106) — subject projection at `local` tier. On the
     // upsert-replace path the prior projection rows were dropped by the
     // DELETE above (FK ON DELETE CASCADE), so no stale rows survive.
@@ -29150,6 +29175,89 @@ mod tests {
         }
     }
 
+    /// v62.0.0 (E1-fix2; CC 2.7.3, CC 2.7.5, CC 4.4.3.19) — **a sealed
+    /// `delegates_to` row put as it lands** (the sqlite twin is
+    /// `land_delegation_any`): the author's statement, then each
+    /// second-signer voice its resolved model names
+    /// ([`e2::land_delegation`]: the delegate, and a machine delegate's bound
+    /// owner); an owner-binding-purpose row (a custody claim) through
+    /// [`e2::land_owner_binding`] (the bound key's voice). Returns the sealed
+    /// row and the last outcome: `Pending` while a role is unvoiced, `Row`
+    /// once it seats. Edition 2 only.
+    async fn pg_land_delegation(
+        backend: &PostgresBackend,
+        row: crate::federation::Attestation,
+    ) -> Result<
+        (
+            crate::federation::Attestation,
+            crate::federation::edition2::ingest::StatementOutcome,
+        ),
+        crate::federation::Error,
+    > {
+        let owner_binding = row
+            .attestation_envelope
+            .get("delegation_purpose")
+            .and_then(serde_json::Value::as_str)
+            == Some(crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE);
+        let sealed = if e2::carried_statement(&row).is_some() {
+            row
+        } else {
+            let seed = e2::seed_of(&row.attesting_key_id);
+            e2::try_row_of(&row, &seed)?
+        };
+        let out = if owner_binding {
+            let node = e2::seed_of(&sealed.attested_key_id);
+            e2::land_owner_binding(backend, &sealed, &node).await?
+        } else {
+            e2::land_delegation(backend, &sealed).await?.0
+        };
+        Ok((sealed, out))
+    }
+
+    /// [`pg_land_delegation`] that must SEAT (`Row`); the earlier form (a
+    /// HELD test) puts the row through `put_attestation`. Returns the stored
+    /// row. A delegation to a machine key seats only once its owner is bound
+    /// ([`pg_bind_machine_owner`]). The sqlite twin is `put_delegation`.
+    async fn pg_put_delegation(
+        backend: &PostgresBackend,
+        row: crate::federation::Attestation,
+    ) -> crate::federation::Attestation {
+        if !e2::emit_edition2() {
+            crate::federation::FederationDirectory::put_attestation(
+                backend,
+                crate::federation::SignedAttestation {
+                    attestation: row.clone(),
+                },
+            )
+            .await
+            .expect("the delegation is admitted (held test)");
+            return row;
+        }
+        let (sealed, out) = pg_land_delegation(backend, row)
+            .await
+            .unwrap_or_else(|e| panic!("the delegation lands: {e:?}"));
+        assert!(
+            matches!(
+                out,
+                crate::federation::edition2::ingest::StatementOutcome::Row { .. }
+            ),
+            "the delegation {} seats, got {out:?}",
+            sealed.attestation_id
+        );
+        sealed
+    }
+
+    /// v62.0.0 (E1-fix2; CC 4.4.3.19, E4-fix4) — `owner` binds the machine
+    /// key `machine` (the owner binding, the machine's voice included), so a
+    /// delegation to `machine` can seat and `machine` is steward-bound. The
+    /// sqlite twin is `bind_machine_owner`.
+    async fn pg_bind_machine_owner(backend: &PostgresBackend, owner: &str, machine: &str) {
+        crate::federation::admission::steward_liveness_test_support::bind_machine_owner(
+            backend, owner, machine,
+        )
+        .await;
+    }
+
     /// v62.0.0 (wave T1) — put a typed-plane builder's record through the
     /// edition-2 group door: its voices (`e2::community_voices`), naming the
     /// held roster version as its head when there is one.
@@ -29729,7 +29837,7 @@ mod tests {
         Box::pin(
             crate::federation::operational::test_support::exercise_family_trust_root(
                 &backend,
-                &format!("pg557-{}", uuid::Uuid::new_v4().simple()),
+                &format!("pg557-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
             ),
         )
         .await
@@ -29838,7 +29946,7 @@ mod tests {
         );
         crate::federation::operational::test_support::exercise_ceremony_plane_capability_walk(
             &backend,
-            &format!("pg548-{}", uuid::Uuid::new_v4().simple()),
+            &format!("pg548-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
         )
         .await
         .expect("548 exercise");
@@ -29927,7 +30035,9 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         // Unique per run: this database persists across tests and the exercise
         // registers fresh keys derived from the tag.
-        let tag = format!("pg598{}", uuid_like());
+        // v62.0.0 (E2-fix7): a short tag, so `{tag}-<role>` names differ within
+        // their first 32 bytes (a test key seeds from them).
+        let tag = format!("pg598{}", &uuid::Uuid::new_v4().simple().to_string()[..5]);
         crate::federation::bootstrap_admission::test_support::exercise_consent_replay_refusal(
             &backend,
             &format!("{tag}a"),
@@ -29948,7 +30058,9 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         // Unique per run: this database persists across tests and the exercise
         // registers fresh keys derived from the tag.
-        let tag = format!("pg598{}", uuid_like());
+        // v62.0.0 (E2-fix7): a short tag, so `{tag}-<role>` names differ within
+        // their first 32 bytes (a test key seeds from them).
+        let tag = format!("pg598{}", &uuid::Uuid::new_v4().simple().to_string()[..5]);
         crate::federation::bootstrap_admission::test_support::exercise_consent_divergent_order(
             &backend,
             &format!("{tag}b"),
@@ -29969,7 +30081,9 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         // Unique per run: this database persists across tests and the exercise
         // registers fresh keys derived from the tag.
-        let tag = format!("pg598{}", uuid_like());
+        // v62.0.0 (E2-fix7): a short tag, so `{tag}-<role>` names differ within
+        // their first 32 bytes (a test key seeds from them).
+        let tag = format!("pg598{}", &uuid::Uuid::new_v4().simple().to_string()[..5]);
         crate::federation::bootstrap_admission::test_support::exercise_consent_tie_restriction_wins(
             &backend, &format!("{tag}c")
         )
@@ -31001,24 +31115,6 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(postgres)]
-    #[cfg(feature = "sqlite")]
-    async fn promoted_row_crosses_to_a_peer_postgres_649() {
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let origin = PostgresBackend::connect(&dsn).await.expect("connect");
-        origin.run_migrations().await.expect("migrations run");
-        let peer = crate::store::test_backend::test_backend();
-        let tag = format!("pg649{}", uuid_like());
-        crate::federation::bootstrap_admission::test_support::exercise_promoted_row_crosses_to_a_peer(
-            &origin, &peer, &tag,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn privileged_sync_door_postgres_804() {
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -31034,20 +31130,6 @@ mod tests {
         ));
         crate::federation::bootstrap_admission::test_support::exercise_privileged_sync_door_804(
             &dir, &us, &tag,
-        )
-        .await;
-    }
-    #[tokio::test]
-    async fn actor_signature_survives_the_crossing_postgres_v39() {
-        let Some(dsn) = crate::test_pg::dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let dir = PostgresBackend::connect(&dsn).await.expect("connect");
-        dir.run_migrations().await.expect("migrations run");
-        let tag = format!("pg39{}", uuid_like());
-        crate::federation::bootstrap_admission::test_support::exercise_actor_signature_survives_the_crossing(
-            &dir, &tag,
         )
         .await;
     }
@@ -31783,7 +31865,7 @@ mod tests {
             detection_id: uuid::Uuid::new_v4(),
             trace_id: format!("trace-derived-{}", uuid_like()),
             body_sha256: vec![0xAB; 32],
-            detector: "manifold_conformity_outlier".into(),
+            detector: "hash_chain_integrity".into(),
             severity: DetectionSeverity::Warning,
             cohort_cell: serde_json::json!({
                 "agent_role": "ally",
@@ -31794,7 +31876,7 @@ mod tests {
                 "deployment_trust_mode": "federated_peer"
             }),
             conformity_variant: ConformityVariant::Numeric,
-            conformity_payload: serde_json::json!({"score": 3.7}),
+            conformity_payload: serde_json::json!({"score": 4}),
             lens_core_version: "0.1.0".into(),
             ratchet_calibration_version: 1,
             canonical_bytes: b"{\"detection_id\":\"x\"}".to_vec(),
@@ -37483,18 +37565,61 @@ mod tests {
         key: &str,
         classes: &[&str],
     ) -> Vec<u8> {
-        let edge = e2::trust_accepts_statement(
+        // v62.0.0 (E1-fix2; T2-fix6, CC 3.2 T4a) — an edge to a held registry
+        // root names the lineage head it attaches on (`TrustRootHeadUnnamed`
+        // otherwise); an edge to a key is unchanged. The sqlite twin is
+        // `put_trust_edge`.
+        let edge = e2::trust_accepts_edge(
+            backend,
             granter,
             key,
             classes,
             None,
             crate::federation::types::cohort_scope::FEDERATION,
             e2::ms(chrono::Utc::now()),
-        );
+        )
+        .await;
         e2::put_statement(backend, &edge)
             .await
             .expect("the trust:accepts edge is admitted");
         edge
+    }
+
+    /// v62.0.0 (E1-fix2; CC 3.2, `trust_root::check_trust_charter_admission`)
+    /// — **`seed`'s self `trust:accepts` edge as a valid ROOT CHARTER**: a
+    /// self-loop `delegates_to` with an `infra:*` scope IS the root charter, and
+    /// a root charter carries its `pre_rotation_commitment` (the pre-committed
+    /// successor key, as W1's `fixture_trust_root::charter_statement` commits
+    /// it). The successor seed leads with its distinguishing part (seeds are
+    /// cut at 32 bytes). The sqlite (`self_trust_charter_edge`) twin is the same.
+    fn pg_self_trust_charter_edge(seed: &str) -> Vec<u8> {
+        use ciris_verify_core::cde::Value;
+        let Value::Map(mut m) = crate::federation::edition2::typed::trust_accepts_payload(
+            &e2::kid_or_keep(seed),
+            &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
+            &[],
+            None,
+            crate::federation::types::cohort_scope::FEDERATION,
+            e2::ms(chrono::Utc::now()),
+        ) else {
+            unreachable!("trust_accepts_payload is a map")
+        };
+        let successor = e2::signing_key(&format!("succ-{seed}"));
+        let commitment = ciris_verify_core::edition2::recovery::recovery_commitment(&[successor
+            .public_key()
+            .clone()]);
+        m.push((
+            Value::Text(crate::federation::trust_root::CHARTER_PRE_ROTATION_FIELD.to_owned()),
+            Value::Bytes(commitment.to_vec()),
+        ));
+        m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
+        e2::typed_statement_as(
+            seed,
+            "delegates_to",
+            seed,
+            crate::federation::edition2::typed::TRUST_PREFIX,
+            &Value::Map(m),
+        )
     }
 
     /// The granter's `withdraws` of `edge` (the projected row expires).
@@ -37592,7 +37717,12 @@ mod tests {
             crate::federation::types::identity_type::USER,
         )
         .await;
-        pg_put_trust_edge(&backend, &self_seed, &self_seed, &[]).await;
+        // v62.0.0 (E1-fix2; CC 3.2) — a self `trust:accepts` edge IS the root
+        // charter, so it carries the charter's pre-rotation commitment
+        // (`pg_self_trust_charter_edge`); it is admitted as an edge but projects no trust row.
+        e2::put_statement(&backend, &pg_self_trust_charter_edge(&self_seed))
+            .await
+            .expect("the self trust:accepts edge (a root charter) is admitted");
         assert!(
             backend
                 .lookup_trust(&e2::kid(&self_seed))
@@ -37765,6 +37895,13 @@ mod tests {
         // v62.0.0 NOT flipped (E2.md): the derived id is the earlier-form
         // `derive_key_id(alias, ed pubkey)`; once slice B makes a signer's id
         // `kid(alias)` this second registration is the first one and goes.
+        //
+        // v62.0.0 (E1-fix2): under edition 2 the signer's id IS `kid(alias)`,
+        // the record `fix_section_i_key` just put (the sqlite twin is
+        // `fed_key_derived`), so only a HELD test registers the second row.
+        if e2::emit_edition2() {
+            return;
+        }
         let derived = pg_derived_id_for(host_key_id);
         let (ed_pk, mldsa_pk) =
             crate::federation::tier_ingest::test_support::hybrid_pubkeys(host_key_id);
@@ -37804,7 +37941,12 @@ mod tests {
 
     /// v9.3.0 (#247) — the DERIVED federation key_id for `alias`'s
     /// deterministic test keypair (`derive_key_id(alias, <ed pubkey>)`).
+    /// v62.0.0 (E1-fix2): under edition 2 a signer's id is its identity-ref
+    /// `kid(alias)` (cut B, `LocalSigner::federation_id`).
     fn pg_derived_id_for(alias: &str) -> String {
+        if e2::emit_edition2() {
+            return e2::kid(alias);
+        }
         let (ed_pk_b64, _) = crate::federation::tier_ingest::test_support::hybrid_pubkeys(alias);
         let ed_pk = {
             use base64::engine::general_purpose::STANDARD as B64;
@@ -38644,18 +38786,22 @@ mod tests {
         };
 
         // (a) infra-only → ADMITTED.
-        let (id_a, att_a) = put(
+        let (_, att_a) = put(
             &owner,
             &node,
             serde_json::json!([ds::INFRA_NETWORK_PRESENCE, ds::INFRA_SERVE]),
         );
-        backend
-            .put_attestation(crate::federation::SignedAttestation { attestation: att_a })
-            .await
-            .unwrap();
+        // v62.0.0 (E1-fix2; CC 4.4.3.19) — a delegation to a machine key waits
+        // for its owner's voice, so the owner binds `node` and `agent` first:
+        // each key then holds its binding beside the delegations below (the
+        // sqlite twins are `node_delegation_infra_only_admitted_sqlite` and
+        // `agent_delegation_agency_admitted_not_over_rejected_sqlite`).
+        pg_bind_machine_owner(&backend, &owner, &node).await;
+        pg_bind_machine_owner(&backend, &owner, &agent).await;
+        let id_a = pg_put_delegation(&backend, att_a).await.attestation_id;
         let stored = backend.all_attestations_for(&pg_id(&node)).await.unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].attestation_id, id_a);
+        assert_eq!(stored.len(), 2, "the owner binding and (a)");
+        assert!(stored.iter().any(|r| r.attestation_id == id_a));
 
         // (b) agency:* → REJECTED + not stored. THE CC 3.4.7.3 guard.
         let (id_b, att_b) = put(
@@ -38681,9 +38827,10 @@ mod tests {
             other => panic!("expected NodeAgencyForbidden, got {other:?}"),
         }
         assert_eq!(err.kind(), "federation_node_agency_forbidden");
-        // Run-scoped: still exactly the one (a) row for this node; id_b absent.
+        // Run-scoped: still exactly the binding and the (a) row for this node;
+        // id_b absent.
         let after_b = backend.all_attestations_for(&pg_id(&node)).await.unwrap();
-        assert_eq!(after_b.len(), 1);
+        assert_eq!(after_b.len(), 2);
         assert!(after_b.iter().all(|r| r.attestation_id != id_b));
 
         // (b') legacy unprefixed agency kind → REJECTED.
@@ -38715,18 +38862,15 @@ mod tests {
         ));
 
         // (d) NON-node recipient (agent) w/ agency:* → ADMITTED (no over-reject).
-        let (id_d, att_d) = put(
+        let (_, att_d) = put(
             &owner,
             &agent,
             serde_json::json!([ds::AGENCY_ACT_ON_BEHALF, ds::AGENCY_DECIDE]),
         );
-        backend
-            .put_attestation(crate::federation::SignedAttestation { attestation: att_d })
-            .await
-            .unwrap();
+        let id_d = pg_put_delegation(&backend, att_d).await.attestation_id;
         let on_agent = backend.all_attestations_for(&pg_id(&agent)).await.unwrap();
-        assert_eq!(on_agent.len(), 1);
-        assert_eq!(on_agent[0].attestation_id, id_d);
+        assert_eq!(on_agent.len(), 2, "the owner binding and (d)");
+        assert!(on_agent.iter().any(|r| r.attestation_id == id_d));
     }
 
     /// SecReview F1 (PG parity): a DUPLICATE / whitespace node token
@@ -38843,16 +38987,12 @@ mod tests {
         // v42.0.0 (CIRISPersist#811) — a second agent, stewarded by a PLAIN
         // conferral only, for the blast-radius arm.
         let agent_plain = format!("ob-agentp-{suffix}");
-        let node_wd = format!("ob-node-wd-{suffix}");
-        let node_exp = format!("ob-node-exp-{suffix}");
         let node_unstewarded = format!("ob-node-unstewarded-{suffix}");
         for (kid, ity) in [
             (&owner, crate::federation::types::identity_type::USER),
             (&node, crate::federation::types::identity_type::NODE),
             (&agent, crate::federation::types::identity_type::AGENT),
             (&agent_plain, crate::federation::types::identity_type::AGENT),
-            (&node_wd, crate::federation::types::identity_type::NODE),
-            (&node_exp, crate::federation::types::identity_type::NODE),
             (
                 &node_unstewarded,
                 crate::federation::types::identity_type::NODE,
@@ -38911,9 +39051,6 @@ mod tests {
         let comm_infra = format!("ob-cinfra-{suffix}");
         let comm_fakeinfra = format!("ob-cfakeinfra-{suffix}");
         let comm_user = format!("ob-cuser-{suffix}");
-        let comm_wd_live = format!("ob-cwdlive-{suffix}");
-        let comm_wd_dead = format!("ob-cwddead-{suffix}");
-        let comm_exp = format!("ob-cexp-{suffix}");
         for cid in [
             &comm_unstewarded_node,
             &comm_unstewarded_agent,
@@ -38923,9 +39060,6 @@ mod tests {
             &comm_infra,
             &comm_fakeinfra,
             &comm_user,
-            &comm_wd_live,
-            &comm_wd_dead,
-            &comm_exp,
         ] {
             // SecReview F2: the infra carve-out is honored only when the
             // community's own key is the `substrate_persist` governance
@@ -38970,17 +39104,20 @@ mod tests {
             .is_none());
 
         // STEWARD-BOUND node (live delegates_to(user → node, infra:*)) → ADMITTED.
-        backend
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: pg_delegates_to(
-                    &owner,
-                    &node,
-                    serde_json::json!([ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE]),
-                    false,
-                ),
-            })
-            .await
-            .unwrap();
+        // v62.0.0 (E1-fix2; CC 4.4.3.19) — a delegation to a machine key waits
+        // for its owner's voice: the owner binds the node, then the delegation
+        // seats.
+        pg_bind_machine_owner(&backend, &owner, &node).await;
+        pg_put_delegation(
+            &backend,
+            pg_delegates_to(
+                &owner,
+                &node,
+                serde_json::json!([ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE]),
+                false,
+            ),
+        )
+        .await;
         pg_put_community(&backend, put_comm(&comm_node_ok, vec![&node], None))
             .await
             .expect("steward-bound node admitted");
@@ -38998,17 +39135,13 @@ mod tests {
         // a job — and under CC 3.2 rc4 it never steward-bound an agent; the
         // predicate merely said it did. It now passes a custody-marked edge,
         // and the conferral-only case is asserted as a REFUSAL below.
-        backend
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: pg_delegates_to_custody(
-                    &owner,
-                    &agent,
-                    serde_json::json!(["share"]),
-                    false,
-                ),
-            })
-            .await
-            .unwrap();
+        // v62.0.0 (E1-fix2) — the custody edge is the agent's owner binding,
+        // landed with the agent's voice.
+        pg_put_delegation(
+            &backend,
+            pg_delegates_to_custody(&owner, &agent, serde_json::json!(["share"]), false),
+        )
+        .await;
         pg_put_community(&backend, put_comm(&comm_agent_ok, vec![&agent], None))
             .await
             .expect("steward-bound agent admitted");
@@ -39021,17 +39154,18 @@ mod tests {
         // v42.0.0 (CIRISPersist#811) — THE BLAST RADIUS, on the Postgres leg
         // too. A SECOND agent whose only incoming edge is a PLAIN conferral is
         // NOT steward-bound, so its community is refused and not stored.
-        backend
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: pg_delegates_to(
-                    &owner,
-                    &agent_plain,
-                    serde_json::json!(["share"]),
-                    false,
-                ),
-            })
-            .await
-            .unwrap();
+        // v62.0.0 (E1-fix2; CC 4.4.3.19) — the conferral to an agent with no
+        // bound owner WAITS for that owner's voice: held, never seated.
+        let (_, held) = pg_land_delegation(
+            &backend,
+            pg_delegates_to(&owner, &agent_plain, serde_json::json!(["share"]), false),
+        )
+        .await
+        .expect("the conferral is held, not refused");
+        assert!(
+            matches!(held, StatementOutcome::Pending { .. }),
+            "a conferral to an unbound agent waits for its owner, got {held:?}"
+        );
         waits(
             pg_put_community(
                 &backend,
@@ -39084,76 +39218,13 @@ mod tests {
             .unwrap()
             .is_none());
 
-        // SecReview F3: a WITHDRAWN delegation no longer confers
-        // steward-binding. owner delegates infra:* → node_wd (admitted while
-        // live); owner then withdraws the edge → a fresh community with
-        // node_wd is REJECTED.
-        let d_wd = pg_delegates_to(
-            &owner,
-            &node_wd,
-            serde_json::json!([ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE]),
-            false,
-        );
-        let d_wd_id = d_wd.attestation_id.clone();
-        backend
-            .put_attestation(crate::federation::SignedAttestation { attestation: d_wd })
-            .await
-            .unwrap();
-        pg_put_community(&backend, put_comm(&comm_wd_live, vec![&node_wd], None))
-            .await
-            .expect("steward-bound (live) node admitted");
-        // owner withdraws the edge (issuer-against-recipient: attested = node_wd).
-        // v62.0.0: the withdrawal names the edge by `refs.target`.
-        let w = e2::composer_of(
-            crate::federation::types::attestation_type::WITHDRAWS,
-            &backend
-                .get_attestation(&d_wd_id)
-                .await
-                .unwrap()
-                .expect("the edge is held"),
-            &owner,
-        );
-        backend
-            .put_attestation(crate::federation::SignedAttestation { attestation: w })
-            .await
-            .expect("owner withdraws own delegation edge");
-        waits(
-            pg_put_community(&backend, put_comm(&comm_wd_dead, vec![&node_wd], None)).await,
-            "a withdrawn delegation",
-        );
-        assert!(backend
-            .lookup_community(&pg_id(&comm_wd_dead))
-            .await
-            .unwrap()
-            .is_none());
-
-        // SecReview F3: an EXPIRED delegation does NOT confer steward-binding.
-        let mut d_exp = pg_delegates_to(
-            &owner,
-            &node_exp,
-            serde_json::json!([ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE]),
-            false,
-        );
-        d_exp.expires_at = Some("2020-01-01T00:00:00Z".parse().unwrap());
-        // v31.0.0 (CIRISPersist#598) — `expires_at` is bound in BOTH directions
-        // now (envelope absent ⇔ column None), so setting the column is a
-        // re-sign trigger. That is this leg's own premise from the other side:
-        // the expiry is what kills the delegation's liveness, and an expiry a
-        // writer could set ALONE would be an unsigned mute button.
-        crate::federation::tier_ingest::test_support::reseal(&mut d_exp);
-        backend
-            .put_attestation(crate::federation::SignedAttestation { attestation: d_exp })
-            .await
-            .unwrap();
-        waits(
-            pg_put_community(&backend, put_comm(&comm_exp, vec![&node_exp], None)).await,
-            "an expired delegation",
-        );
-        assert!(backend
-            .lookup_community(&pg_id(&comm_exp))
-            .await
-            .unwrap()
-            .is_none());
+        // v62.0.0 (E1-fix2; ruling 4) — the SecReview F3 legs (a WITHDRAWN
+        // and an EXPIRED plain delegation to a node) are deleted: they assert
+        // that a plain delegation steward-binds an unbound node while live,
+        // the earlier form. Under CC 4.4.3.19 such a delegation waits for the
+        // node's owner and never seats; once the owner is bound, the binding
+        // is itself the anchor. Granter liveness is witnessed by
+        // `exercise_steward_binding_liveness` (E4-fix4).
 
         // Pure-user member → not over-rejected.
         pg_put_community(&backend, put_comm(&comm_user, vec![&owner], None))
@@ -39189,12 +39260,20 @@ mod tests {
         let rando = format!("rando-{suffix}");
         let founder = format!("founder-{suffix}");
         let comm = format!("comm-{suffix}");
-        // subject + founder are user-role (steward-bound); the rest agents.
+        // subject + founder are user-role (steward-bound); the rest primitive.
+        // v62.0.0 (E1-fix2; CC 4.4.3.19) — not agents: a delegation to a
+        // machine key waits for its owner's voice, and this matrix is about
+        // review authority (the backend_suite twin registers them primitive).
         for kid in [&subject, &founder, &comm] {
             let _ = pg_put_key(&backend, kid, crate::federation::types::identity_type::USER).await;
         }
         for kid in [&delegate, &rando] {
-            pg_put_key_rec(&backend, &fix_section_i_key(kid, "a", now, true)).await;
+            let _ = pg_put_key(
+                &backend,
+                kid,
+                crate::federation::types::identity_type::PRIMITIVE,
+            )
+            .await;
         }
         pg_put_community(
             &backend,
@@ -39250,17 +39329,11 @@ mod tests {
         // (b1) subject-delegated chain → REJECT. The subject never held review
         // authority, so it cannot delegate it (the delegation row admits; the
         // delegate's reconsideration does not) (#517).
-        backend
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: pg_delegates_to(
-                    &subject,
-                    &delegate,
-                    serde_json::json!(["review"]),
-                    false,
-                ),
-            })
-            .await
-            .unwrap();
+        pg_put_delegation(
+            &backend,
+            pg_delegates_to(&subject, &delegate, serde_json::json!(["review"]), false),
+        )
+        .await;
         let err = backend
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: report(&delegate, &[&subject], None),
@@ -39275,18 +39348,17 @@ mod tests {
         // delegation — #517 cut only the subject-self seed, not genuine
         // moderator delegation.
         let fdelegate = format!("fdelegate-{suffix}");
-        pg_put_key_rec(&backend, &fix_section_i_key(&fdelegate, "a", now, true)).await;
-        backend
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: pg_delegates_to(
-                    &founder,
-                    &fdelegate,
-                    serde_json::json!(["review"]),
-                    false,
-                ),
-            })
-            .await
-            .unwrap();
+        let _ = pg_put_key(
+            &backend,
+            &fdelegate,
+            crate::federation::types::identity_type::PRIMITIVE,
+        )
+        .await;
+        pg_put_delegation(
+            &backend,
+            pg_delegates_to(&founder, &fdelegate, serde_json::json!(["review"]), false),
+        )
+        .await;
         backend
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: report(&fdelegate, &[], Some(&comm)),
@@ -39325,17 +39397,16 @@ mod tests {
         );
 
         // (d) scope isolation — consent_revocation-only chain ⇏ review.
-        backend
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: pg_delegates_to(
-                    &subject,
-                    &rando,
-                    serde_json::json!(["consent_revocation"]),
-                    false,
-                ),
-            })
-            .await
-            .unwrap();
+        pg_put_delegation(
+            &backend,
+            pg_delegates_to(
+                &subject,
+                &rando,
+                serde_json::json!(["consent_revocation"]),
+                false,
+            ),
+        )
+        .await;
         let err = backend
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: report(&rando, &[&subject], None),
@@ -40845,7 +40916,6 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        use crate::federation::FederationDirectory;
         let steward = format!("pg-ren-stw-§102-{}", uuid_like());
         let agent_k = format!("pg-ren-agt-§102-{}", uuid_like());
         pg_put_key_rec(
@@ -40862,7 +40932,10 @@ mod tests {
             &pg_admission_key(
                 &agent_k,
                 "primitive-ren",
-                crate::federation::types::identity_type::AGENT,
+                // v62.0.0 (E1-fix2; CC 4.4.3.19) — primitive, as its identity
+                // and the sqlite twin's `k-a` say: a delegation to an agent
+                // would wait for the agent's owner.
+                crate::federation::types::identity_type::PRIMITIVE,
             ),
         )
         .await;
@@ -40893,19 +40966,18 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        backend
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: pg_delegates_to(
-                    &steward,
-                    &agent_k,
-                    serde_json::json!([
-                        crate::federation::types::delegation_scope::AGENCY_ACT_ON_BEHALF
-                    ]),
-                    false,
-                ),
-            })
-            .await
-            .unwrap();
+        pg_put_delegation(
+            &backend,
+            pg_delegates_to(
+                &steward,
+                &agent_k,
+                serde_json::json!([
+                    crate::federation::types::delegation_scope::AGENCY_ACT_ON_BEHALF
+                ]),
+                false,
+            ),
+        )
+        .await;
         let rows = backend
             .all_attestations_for(&pg_id(&agent_k))
             .await
@@ -41886,20 +41958,20 @@ mod tests {
         // seed's hybrid key, which the edition-2 key plane does not hold. A
         // revocation of ANOTHER key needs a slash conferral; the row-hash
         // witness needs only a held revocation, so the target revokes itself.
-        let now = chrono::Utc::now();
-        let st = e2::revocation_statement(
-            &target,
-            &target,
-            "agent",
-            "compromise",
-            now,
-            now,
-            None,
-            e2::ms(now),
-        );
-        e2::put_statement(&backend, &st)
+        //
+        // v62.0.0 (E1-fix2) — as the sqlite twin
+        // (`federation_persist_row_hash_surfaces_on_reads`): a `key:revocation`
+        // statement, which lands on the KEY plane. The
+        // `revocation:{entity_type}:{reason}` statement is itself an
+        // attestation ABOUT the target, so the one-attestation assertion
+        // below counted it as a second row.
+        match e2::put_statement(&backend, &e2::key_revocation(&target, &target, None))
             .await
-            .expect("the self-revocation lands on the revocation plane");
+            .expect("the key:revocation is admitted")
+        {
+            crate::federation::edition2::ingest::StatementOutcome::KeyPlane { .. } => {}
+            other => panic!("a key:revocation lands on the key plane, got {other:?}"),
+        }
 
         // Keys.
         let k1 = FederationDirectory::lookup_public_key(&backend, &pg_id(&target))
@@ -42092,7 +42164,6 @@ mod tests {
     #[serial_test::serial(postgres)]
     async fn delegates_to_graph_one_level_pg() {
         use crate::federation::types::attestation_type;
-        use crate::federation::FederationDirectory;
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -42102,32 +42173,34 @@ mod tests {
         let suffix = uuid_like();
         let root = format!("del-pg-root-{suffix}");
         let child = format!("del-pg-child-{suffix}");
-        for (k, ident) in [(&root, "agent-a"), (&child, "agent-b")] {
-            pg_put_key_rec(
+        // v62.0.0 (E1-fix2; CC 4.4.3.19) — primitive keys, as the sqlite twin
+        // registers them: a delegation to an agent waits for its owner's voice.
+        for k in [&root, &child] {
+            let _ = pg_put_key(
                 &backend,
-                &fix_section_i_key(k, ident, chrono::Utc::now(), false),
+                k,
+                crate::federation::types::identity_type::PRIMITIVE,
             )
             .await;
         }
         let when = chrono::Utc::now();
-        backend
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: pg_topo_attestation(
-                    &root,
-                    &child,
-                    attestation_type::DELEGATES_TO,
-                    None,
-                    Some("manifest:bundle-pg"),
-                    // v62.0.0 (E0 fix 9) — an edition-2 `evidence_refs` entry is a
-                    // SHA-256 digest (`[-16, bstr32]`), read back as 64 hex.
-                    &[EVIDENCE_DIGEST_HEX],
-                    None,
-                    when,
-                ),
-            })
-            .await
-            .unwrap();
-        let graph = crate::federation::build_delegation_graph(&backend, &root, Some(4))
+        pg_put_delegation(
+            &backend,
+            pg_topo_attestation(
+                &root,
+                &child,
+                attestation_type::DELEGATES_TO,
+                None,
+                Some("manifest:bundle-pg"),
+                // v62.0.0 (E0 fix 9) — an edition-2 `evidence_refs` entry is a
+                // SHA-256 digest (`[-16, bstr32]`), read back as 64 hex.
+                &[EVIDENCE_DIGEST_HEX],
+                None,
+                when,
+            ),
+        )
+        .await;
+        let graph = crate::federation::build_delegation_graph(&backend, &pg_id(&root), Some(4))
             .await
             .unwrap();
         assert_eq!(graph.edges.len(), 1);
@@ -46874,7 +46947,7 @@ mod tests {
     #[serial_test::serial(postgres)]
     async fn pg_cut_b_graph_dx_enumerators_and_add_member() {
         use crate::federation::admission::{DELEGATION_SCOPE_MODERATE, MEMBER_ROLE_FOUNDER};
-        use crate::federation::types::{delegation_scope as ds, identity_type};
+        use crate::federation::types::identity_type;
         use crate::federation::FederationDirectory;
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -47090,17 +47163,17 @@ mod tests {
         )
         .await
         .unwrap();
-        backend
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: pg_delegates_to(
-                    &founder,
-                    &deputy,
-                    serde_json::json!([DELEGATION_SCOPE_MODERATE]),
-                    false,
-                ),
-            })
-            .await
-            .unwrap();
+        // v62.0.0 (E1-fix2; CC 2.7.3) — the edge seats with the deputy's voice.
+        pg_put_delegation(
+            &backend,
+            pg_delegates_to(
+                &founder,
+                &deputy,
+                serde_json::json!([DELEGATION_SCOPE_MODERATE]),
+                false,
+            ),
+        )
+        .await;
         let mods = crate::federation::admission::moderators_of(
             &backend,
             &pg_id(&mod_comm),
@@ -47120,17 +47193,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        backend
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: pg_delegates_to(
-                    &founder,
-                    &node,
-                    serde_json::json!([ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE]),
-                    false,
-                ),
-            })
-            .await
-            .unwrap();
+        // v62.0.0 (E1-fix2; CC 3.2, CC 4.4.3.19) — a machine key's steward
+        // binding is its OWNER BINDING (a `delegates_to(founder → node)` scoped
+        // infra:*, the node's voice included); a plain delegation to an
+        // unbound node waits for that owner's voice and seats nothing. The
+        // sqlite twin is `steward_bindings_of_returns_user_anchors_sqlite`.
+        pg_bind_machine_owner(&backend, &founder, &node).await;
         assert_eq!(
             crate::federation::admission::steward_bindings_of(&backend, &pg_id(&node))
                 .await
@@ -47193,13 +47261,13 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        // v62.0.0 (E1-fix2; CC 2.7.3) — each edge seats with dt_k's voice.
         for g in [&dt_g1, &dt_g2] {
-            backend
-                .put_attestation(crate::federation::SignedAttestation {
-                    attestation: pg_delegates_to(g, &dt_k, serde_json::json!(["share"]), false),
-                })
-                .await
-                .unwrap();
+            pg_put_delegation(
+                &backend,
+                pg_delegates_to(g, &dt_k, serde_json::json!(["share"]), false),
+            )
+            .await;
         }
         backend
             .put_attestation(crate::federation::SignedAttestation {

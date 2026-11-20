@@ -1262,7 +1262,10 @@ pub(crate) mod bodies {
         assert_eq!(rep.tombstoned.get("attestation"), Some(&2));
         // A delegates_to between two keys neither of which is purged is a
         // third party's standing grant: inadmissible.
-        let grant = ts::put_delegates_to(dir, SCORER, BYSTANDER, None)
+        // v62.0.0 (E10-fix3; CC 4.4.3.19) — a delegation to a MACHINE waits
+        // for its owner's voice; this third party's grant goes to a person.
+        e2::put_key(dir, "i653-grantee-person", &["user"]).await;
+        let grant = ts::put_delegates_to(dir, SCORER, "i653-grantee-person", None)
             .await
             .unwrap();
         let gid = format!("attestation:{grant}");
@@ -1906,12 +1909,15 @@ pub(crate) mod bodies {
         let by = put_score(d, HARNESS, BYSTANDER, &[]).await.attestation_id;
         let kept = put_score(d, HARNESS, SCORER, &[]).await;
         let about = put_score(d, BYSTANDER, HARNESS, &[]).await.attestation_id;
-        let grant = ts::put_delegates_to(dir, HARNESS, BYSTANDER, None)
+        // v62.0.0 (E10-fix3; CC 4.4.3.19) — a delegation to a MACHINE waits
+        // for the delegate's owner's voice (`delegate_owner`): the actor's
+        // grant goes to a person, and the row another key signed about the
+        // actor is a score (a delegation TO the machine actor would wait).
+        e2::put_key(dir, "i665-grantee-person", &["user"]).await;
+        let grant = ts::put_delegates_to(dir, HARNESS, "i665-grantee-person", None)
             .await
             .unwrap();
-        let incoming = ts::put_delegates_to(dir, SCORER, HARNESS, None)
-            .await
-            .unwrap();
+        let incoming = put_score(d, SCORER, HARNESS, &[]).await.attestation_id;
         let tid = "trace-harness-i665";
         let tatt = seed_trace(d, tid, HARNESS, "gpt-real").await;
         let later = t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1);
@@ -4348,11 +4354,11 @@ pub(crate) mod bodies {
             detection_id: uuid::Uuid::new_v4(),
             trace_id: trace_id.to_owned(),
             body_sha256: vec![7u8; 32],
-            detector: "manifold_conformity_outlier".to_owned(),
+            detector: "hash_chain_integrity".to_owned(),
             severity: crate::derived::DetectionSeverity::Warning,
             cohort_cell: serde_json::json!({"deployment_domain": "legal"}),
             conformity_variant: crate::derived::ConformityVariant::Numeric,
-            conformity_payload: serde_json::json!({"score": 3.1}),
+            conformity_payload: serde_json::json!({"score": 3}),
             lens_core_version: "lc-1.0.0".to_owned(),
             ratchet_calibration_version: 4,
             canonical_bytes: canonical.to_vec(),
@@ -4713,12 +4719,15 @@ pub(crate) mod bodies {
             );
             assert!(dir.get_attestation(id).await.unwrap().is_none());
         }
-        // v62.0.0 (E10-fix2; CC 3.1.5) — a trace is an AGENT's: the trace leg
-        // is CAROL's (an agent), never a person's.
+        // v62.0.0 (E10-fix2/fix3; CC 3.1.5) — a trace is an AGENT's: the
+        // trace leg is CAROL's, never a person's. A trace's signer can never
+        // be a person, so its tombstone stands whether or not the signer's
+        // key is held yet: nothing waits on the key (the retryable arm above
+        // is the attestation rows' only).
         let e = ingest(d, &batch(&trace_json(trace_id, CAROL, "gpt-real", None)))
             .await
-            .expect_err("I832: a trace whose signer is not held yet is not admitted");
-        assert_eq!(e.kind(), "verify_unknown_key", "I832 trace: {e}");
+            .expect_err("I832: a trace at a tombstoned id is not admitted");
+        assert_eq!(e.kind(), token::TOMBSTONED, "I832 trace: {e}");
         // The keys land.
         e2::put_key(dir, BOB, &["user"]).await;
         e2::put_key(dir, CAROL, &["agent"]).await;

@@ -37,6 +37,10 @@
 //!   PyO3 wraps, integration tests covering the chain-break / replay
 //!   / cross-tenant rejection paths.
 
+/// v62.0.0 (F0-cp8) — I2895–I2898: an entry carries ONE composite under its
+/// signer's identity-ref; a lone Ed25519 is refused by name.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod composite_entry_invariants;
 /// v62.0.0 (slice A) — I1794–I1795: the Merkle stores on one thread, with
 /// no `block_on`, stamped by the installed clock.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -57,6 +61,9 @@ pub mod service;
 pub use crate::federation::sth_form;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+/// v62.0.0 (F0-cp8) — composite-sealed test entries.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod test_support;
 pub mod types;
 pub mod verify;
 
@@ -128,17 +135,6 @@ pub enum Error {
     /// any missing Merkle projection rows.
     #[error("merkle: {0}")]
     Merkle(String),
-
-    /// TrustGrant projection-layer error (v1.5.0 Phase D). Surfaces
-    /// a failure from the `subject_kind="trust_grant"` materialization
-    /// hook that UPSERTs into `federation_trust_grants`. Same atomicity
-    /// stance as `Merkle`: chain commit lands FIRST, projection runs
-    /// AFTER. A failure here means the audit row + Merkle leaf are
-    /// already on-chain (source of truth) but the projection row is
-    /// missing or stale; Phase I's V021 backfill recomputes it from
-    /// the chain. Callers should NOT re-issue the audit entry.
-    #[error("trust_grant: {0}")]
-    TrustGrant(String),
 }
 
 impl Error {
@@ -155,7 +151,6 @@ impl Error {
             Error::NotImplemented(_) => "audit_not_implemented",
             Error::Internal(_) => "audit_internal",
             Error::Merkle(_) => "audit_merkle",
-            Error::TrustGrant(_) => "audit_trust_grant",
         }
     }
 }
@@ -186,7 +181,6 @@ mod tests {
         assert_eq!(Error::NotImplemented("x").kind(), "audit_not_implemented");
         assert_eq!(Error::Internal("x".into()).kind(), "audit_internal");
         assert_eq!(Error::Merkle("x".into()).kind(), "audit_merkle");
-        assert_eq!(Error::TrustGrant("x".into()).kind(), "audit_trust_grant");
     }
 
     #[test]

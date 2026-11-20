@@ -1838,7 +1838,9 @@ mod tests {
         // (deleted, ruling 4: a V300 store holds no v60 typed row); and -1 to
         // match the registry as it stood: 401 src/ rows at f46eaab7 against a
         // pin of 402 (counted from the file by the predicate below).
-        const EXPECTED: usize = 400;
+        // v62.0.0 (X2 pass 4d.2): set ONCE from the registry on the merged tree
+        // (402 src/ rows), not from any single patch's value.
+        const EXPECTED: usize = 402;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

@@ -81,12 +81,10 @@ pub(crate) mod bodies {
                 .edge_exists,
             "CONTROL: the edge to r1 stands before the rotation"
         );
-        let head = d
-            .lookup_community(&r2.root)
-            .await
-            .unwrap()
-            .expect("r2 is held")
-            .persist_row_hash;
+        // v62.0.0 (E9-fix2) — a composer states only the common members and
+        // `refs.target` (`payloads::check_composer`, CC 2.4.1.1): no `scope`,
+        // no `attached_head_digest`. The head-naming rule gates `delegates_to`
+        // only (`check_attach_freshness`), never its composers.
         let succ = ciris_verify_core::edition2::sign_row_statement(
             &e2::signing_key(&node),
             &node,
@@ -99,14 +97,6 @@ pub(crate) mod bodies {
                 ("author", Value::Text(node.clone())),
                 ("asserted_at", Value::Uint(ops::e2_now_ms())),
                 ("dimension", Value::Text(TRUST_ACCEPTS_DIMENSION.to_owned())),
-                (
-                    "scope",
-                    Value::Array(vec![Value::Text(INFRA_SERVE_SCOPE.to_owned())]),
-                ),
-                (
-                    crate::federation::envelope::paths::ATTACHED_HEAD_DIGEST,
-                    Value::Bytes(hex::decode(&head).expect("a held head is hex")),
-                ),
                 (
                     "refs",
                     det_map(vec![(

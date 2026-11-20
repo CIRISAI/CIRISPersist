@@ -521,7 +521,13 @@ mod tests {
         // v39.0.0 — the crossing is two operations: enter the mesh over the
         // same bytes, then widen by a `supersedes` the attester signs.
         let ci = ts::describe_own(&row, CrossingBasis::ProducerAuthority);
-        dir.enter_mesh(id, &ci, &ts::actor_reseal(&row)).await?;
+        // E5-fix2 (round 6; v62 P8) — an edition-2 row crosses on its OWN
+        // statement (`TierPromotionCustody::Statement`); the JCS actor reseal
+        // is refused for it at `crossing::plan_enter_mesh`.
+        let custody =
+            crate::federation::TierPromotionCustody::of_statement(&row, crate::host::clock::now())
+                .expect("the local row carries its statement");
+        dir.enter_mesh(id, &ci, &custody).await?;
         let stored = dir
             .get_attestation(id)
             .await?
@@ -730,44 +736,57 @@ mod tests {
         use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::{attestation_tier, cohort_scope};
 
-        let local_row = |dimension: &str| crate::federation::types::LocalAttestationInput {
-            // UUID: postgres types `attestation_id` as `uuid`.
-            attestation_id: Some(uuid::Uuid::new_v4().to_string()),
-            attesting_key_id: derived.to_owned(),
-            attested_key_id: None,
-            attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
-            weight: None,
-            expires_at: None,
-            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                serde_json::json!({
+        // E5-fix3 (round 6; CP2) — the setup rows are edition-2 LOCAL
+        // statements signed by this node's composite (`e2::row_of` under its
+        // alias seed), dated inside its key's window, so a crossing is on the
+        // row's own statement (`TierPromotionCustody::of_statement`). The
+        // earlier fixture wrote unsigned rows through `attestation_insert_local`,
+        // which the shut doors never cross. The two rows differ by their
+        // instant (an edition-2 row id is a function of the bytes).
+        use crate::federation::edition2::fixture_switch as e2;
+        let seed = e2::seed_of(derived);
+        let local_row = |dimension: &str, offset_ms: u64| {
+            let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                i64::try_from(e2::key_window_start_ms(&seed) + 150 * 86_400_000 + offset_ms)
+                    .expect("ms"),
+            )
+            .expect("an instant");
+            let literal = crate::federation::Attestation {
+                attestation_id: uuid::Uuid::new_v4().to_string(),
+                attesting_key_id: derived.to_owned(),
+                attested_key_id: derived.to_owned(),
+                attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
+                weight: None,
+                asserted_at: at,
+                expires_at: None,
+                attestation_envelope: serde_json::json!({
                     "dimension": dimension,
                     "campaign_id": "torque-17",
                 }),
-            )
-            .expect("envelope"),
-            subject_key_ids: vec![derived.to_owned()],
-            cohort_scope: cohort_scope::SELF.to_owned(),
-            scrub_signature_classical: None,
-            scrub_signature_pqc: None,
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: derived.to_owned(),
+                scrub_timestamp: at,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: vec![derived.to_owned()],
+                withdraws_admission_rule: None,
+                cohort_scope: cohort_scope::SELF.to_owned(),
+                tier: attestation_tier::LOCAL.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            };
+            e2::row_of(&literal, &seed)
         };
-
-        let first = dir
-            .attestation_insert_local(local_row("regime:manifest:v1"))
-            .await
-            .expect("insert local regime row");
-        let second = dir
-            .attestation_insert_local(local_row("regime:manifest:v1"))
-            .await
-            .expect("insert local regime row");
-        // A private-use row alongside them, to prove the consent edge cannot
-        // buy what CC forbids (CC 3.1.7 R2, "under any authority").
-        let private = dir
-            .attestation_insert_local(local_row(&format!(
-                "{}regime:manifest:v1",
-                crate::federation::admission::PRIVATE_USE_FAMILY_STEM
-            )))
-            .await
-            .expect("insert local private-use row");
+        let put_local = |row: crate::federation::Attestation| async move {
+            e2::put_signed(dir, &row)
+                .await
+                .unwrap_or_else(|e| panic!("insert local regime row: {e}"));
+            e2::rid(&row)
+        };
+        let first = put_local(local_row("regime:manifest:v1", 0)).await;
+        let second = put_local(local_row("regime:manifest:v1", 1_000)).await;
 
         // NEGATIVE CONTROL — a grant covering only `capacity:` (#571's quoted
         // deployment posture) leaves the regime rows exactly where they are.
@@ -821,32 +840,11 @@ mod tests {
         let sibling = dir.get_attestation(&second).await.unwrap().expect("row");
         assert_eq!(sibling.tier, attestation_tier::FEDERATION);
 
-        // ── CC 3.1.7 R2 Private Use vs the consent edge. A grant naming
-        //    `x_private:` is a mistake an operator can absolutely make, and the
-        //    grant is this node's OWN signed authority — the strongest one the
-        //    sweep ever sees. "Under any authority" means it still does not
-        //    move the row. The sweep skips it (a refused promotion is logged
-        //    and counted, never fatal), so the rest of the backlog is
-        //    unaffected — a poisoned row must not wedge the walk.
-        emit_replication_grant(
-            engine,
-            &format!("peer-571-private-{tag}"),
-            &[crate::federation::admission::PRIVATE_USE_FAMILY_STEM],
-        )
-        .await;
-        engine.promote_consented_backlog().await.expect("sweep");
-        let stayed = dir.get_attestation(&private).await.unwrap().expect("row");
-        assert_eq!(
-            stayed.tier,
-            attestation_tier::LOCAL,
-            "a consent grant cannot federate an x_private:* row — CC 3.1.7 R2 forbids it under \
-             ANY authority, and this node's own signed grant is an authority"
-        );
-        assert_eq!(
-            stayed.cohort_scope,
-            cohort_scope::SELF,
-            "the refused promotion left the row byte-identical (verify-before-mutation)"
-        );
+        // E5-fix3 (round 6) — the CC 3.1.7 R2 Private Use leg is DELETED
+        // (ruling 4): its setup was an unsigned `x_private:*` local row, and an
+        // unregistered dimension cannot be stated as an edition-2 row at all
+        // (the statement door refuses it), so the leg could only witness the
+        // earlier form. R2 at the door is the namespace witnesses'.
     }
 
     #[cfg(feature = "sqlite")]

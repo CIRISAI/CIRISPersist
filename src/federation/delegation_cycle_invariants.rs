@@ -81,8 +81,37 @@ pub mod bodies {
     use crate::federation::{Error, FederationDirectory};
 
     /// v62.0.0 — the key of seed `k`, an edition-2 `key:record`.
+    ///
+    /// v62.0.0 (E2-fix8; CC 2.7.5, K2-fix4) — an agent is a MACHINE delegate:
+    /// a delegation onto it waits for its owner's voice (`delegate_owner`).
+    /// So `k` is owned by a person (`owner-{k}`, role first: a test key seeds
+    /// from the first 32 bytes of its name), through the edition-2 agent
+    /// owner binding, before any edge names it.
     pub(crate) async fn agent(d: &dyn FederationDirectory, k: &str) {
         let _ = e2::put_key(d, k, &[identity_type::AGENT]).await;
+        let owner = format!("owner-{k}");
+        let _ = e2::put_key(d, &owner, &[identity_type::USER]).await;
+        e2::put_agent_owner_binding(d, &owner, k, e2::ms(chrono::Utc::now())).await;
+    }
+
+    /// v62.0.0 (E2-fix8) — land an authored delegation with the voices its
+    /// family's model names (`e2::land_delegation`: the delegate's, and a
+    /// machine delegate's owner's). A delegation left HELD is reported as a
+    /// refusal naming the unvoiced roles.
+    async fn land(
+        d: &dyn FederationDirectory,
+        row: &crate::federation::Attestation,
+    ) -> Result<(), Error> {
+        use crate::federation::edition2::ingest::StatementOutcome;
+        let (out, missing) = e2::land_delegation(d, row).await?;
+        match out {
+            StatementOutcome::Row { .. } | StatementOutcome::Voice { .. } => Ok(()),
+            other => Err(Error::InvalidArgument(format!(
+                "delegation {} is HELD ({other:?}); unvoiced roles: {:?}",
+                row.attestation_id,
+                missing.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+            ))),
+        }
     }
 
     /// A row's envelope instant follows its column (a fixture that moves
@@ -171,8 +200,8 @@ pub mod bodies {
         restamp(&mut row);
         let row = e2::row_of(&row, granter);
         let stored = row.attestation_id.clone();
-        d.put_attestation(crate::federation::SignedAttestation { attestation: row })
-            .await?;
+        // v62.0.0 (E2-fix8): the delegation lands with its second signers.
+        land(d, &row).await?;
         Ok(stored)
     }
 
@@ -186,31 +215,37 @@ pub mod bodies {
         crate::federation::ContextualIntegrity,
         crate::federation::TierPromotionCustody,
     ) {
-        let staged_id = d
-            .attestation_insert_local(crate::federation::types::LocalAttestationInput {
-                attestation_id: None,
-                attesting_key_id: e2::kid_or_keep(from),
-                attested_key_id: Some(e2::kid_or_keep(to)),
-                attestation_type: attestation_type::DELEGATES_TO.to_owned(),
-                weight: Some(1.0),
-                expires_at: None,
-                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                    serde_json::json!({
-                        "dimension": crate::federation::self_at_login::DIMENSION_DELEGATES_TO,
-                        "scope": ["act_on_behalf"],
-                    }),
-                )
-                .unwrap(),
-                subject_key_ids: Vec::new(),
-                cohort_scope: cohort_scope::SELF.to_owned(),
-                scrub_signature_classical: None,
-                scrub_signature_pqc: None,
-            })
+        // v62.0.0 (E2-fix8; CP2, P8-fix13) — the JCS custody arms are shut
+        // (`enter_mesh: earlier_form_object`): the edge is an EDITION-2 local
+        // row (`from`'s statement, put at the local tier with its second
+        // signers' voices) and it crosses on its own statement
+        // (`TierPromotionCustody::Statement`).
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut shape = ts::bare_attestation(
+            &id,
+            from,
+            to,
+            &serde_json::json!({ "id": id, "scope": ["act_on_behalf"] }),
+        );
+        shape.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+        shape.cohort_scope = cohort_scope::SELF.to_owned();
+        shape.tier = attestation_tier::LOCAL.to_owned();
+        restamp(&mut shape);
+        let row = e2::row_of(&shape, from);
+        land(d, &row)
             .await
-            .expect("the local door stages producer-authority rows");
+            .expect("the edition-2 local edge is staged with its voices");
+        let staged_id = row.attestation_id.clone();
         let staged = d.get_attestation(&staged_id).await.unwrap().unwrap();
+        assert_eq!(
+            staged.tier,
+            attestation_tier::LOCAL,
+            "the staged edge is local"
+        );
         let ci = ts::describe_own(&staged, crate::federation::CrossingBasis::ProducerAuthority);
-        let custody = ts::actor_reseal(&staged);
+        let custody =
+            crate::federation::TierPromotionCustody::of_statement(&staged, chrono::Utc::now())
+                .expect("an edition-2 row crosses on its own statement");
         (staged_id, ci, custody)
     }
 
@@ -256,7 +291,9 @@ pub mod bodies {
 
     /// I608 — see the module doc.
     pub async fn i608_a_future_retraction_hides_no_edge(d: &dyn FederationDirectory, tag: &str) {
-        let k = |n: &str| format!("{tag}-{n}");
+        // v62.0.0 (E2-fix7): the role FIRST, the tag after it — a test key seeds
+        // from the first 32 bytes of its name.
+        let k = |n: &str| format!("{n}-{tag}");
         for n in ["e", "f"] {
             agent(d, &k(n)).await;
         }
@@ -287,7 +324,9 @@ pub mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let k = |n: &str| format!("{tag}-{n}");
+        // v62.0.0 (E2-fix7): the role FIRST, the tag after it — a test key seeds
+        // from the first 32 bytes of its name.
+        let k = |n: &str| format!("{n}-{tag}");
         for n in ["o", "p", "o2", "p2"] {
             agent(d, &k(n)).await;
         }
@@ -350,7 +389,9 @@ pub mod bodies {
 
     /// I590 — see the module doc.
     pub async fn i590_the_cycle_closing_edge_is_refused(d: &dyn FederationDirectory, tag: &str) {
-        let k = |n: &str| format!("{tag}-{n}");
+        // v62.0.0 (E2-fix7): the role FIRST, the tag after it — a test key seeds
+        // from the first 32 bytes of its name.
+        let k = |n: &str| format!("{n}-{tag}");
         for n in [
             "a", "b", "c", "d", "e", "f", "g", "h", "x", "y", "m", "n", "o", "p", "q", "r", "r1",
             "n1", "r2", "n2", "r3", "x3", "y3", "h4", "f4", "h5", "f5",
@@ -631,33 +672,10 @@ pub mod bodies {
         ts::put_delegates_to(d, &x, &y, None)
             .await
             .expect("(7) x → y");
-        let staged_id = d
-            .attestation_insert_local(crate::federation::types::LocalAttestationInput {
-                attestation_id: None,
-                attesting_key_id: e2::kid(&y),
-                attested_key_id: Some(e2::kid(&x)),
-                attestation_type: attestation_type::DELEGATES_TO.to_owned(),
-                weight: Some(1.0),
-                expires_at: None,
-                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                    serde_json::json!({
-                        "dimension": crate::federation::self_at_login::DIMENSION_DELEGATES_TO,
-                        "scope": ["act_on_behalf"],
-                    }),
-                )
-                .unwrap(),
-                subject_key_ids: Vec::new(),
-                cohort_scope: cohort_scope::SELF.to_owned(),
-                scrub_signature_classical: None,
-                scrub_signature_pqc: None,
-            })
-            .await
-            .expect("(7) the local door stages producer-authority rows");
-        let staged = d.get_attestation(&staged_id).await.unwrap().unwrap();
-        let ci = ts::describe_own(&staged, crate::federation::CrossingBasis::ProducerAuthority);
-        // v62.0.0 (slice C) — the crossing of a cycle-closing local edge lands:
-        // the kernel's walk visits the cycle once and refuses no edge for it.
-        d.enter_mesh(&staged_id, &ci, &ts::actor_reseal(&staged))
+        // v62.0.0 (E2-fix8): the edition-2 local edge, crossing on its own
+        // statement ([`stage_local_edge`]).
+        let (staged_id, ci, custody) = stage_local_edge(d, &y, &x).await;
+        d.enter_mesh(&staged_id, &ci, &custody)
             .await
             .expect("(7) the cycle-closing crossing is admitted (v62)");
         assert_eq!(

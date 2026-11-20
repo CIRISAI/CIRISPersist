@@ -106,7 +106,26 @@ pub(crate) mod bodies {
             .map(|_| ())
     }
 
+    /// An amendment's envelope naming `target`. v62.0.0 (E5-fix3) — a
+    /// `supersedes` is a composer, so the goal family's members ride its
+    /// common `body` member (`goal::goal_members`), as `Engine::amend_goal`
+    /// states them; `dimension` / `score` / `confidence` stay at the top.
     fn naming(target: &str, ty: &str, mut env: serde_json::Value) -> serde_json::Value {
+        let mut inner = serde_json::Map::new();
+        if let Some(o) = env.as_object_mut() {
+            for member in [
+                goal::GOAL_TEXT_MEMBER,
+                goal::META_ALIGNMENT_MEMBER,
+                goal::COHORT_ID_MEMBER,
+            ] {
+                if let Some(v) = o.remove(member) {
+                    inner.insert(member.to_owned(), v);
+                }
+            }
+        }
+        if !inner.is_empty() {
+            env["body"] = serde_json::Value::Object(inner);
+        }
         env["references_attestation_id"] = serde_json::json!(target);
         env["references_attestation_type"] = serde_json::json!(ty);
         env
@@ -163,7 +182,10 @@ pub(crate) mod bodies {
             .expect("projected");
         assert_eq!(g.goal_id, d.attestation_id);
         assert_eq!(g.attestation_id, d.attestation_id);
-        assert_eq!(g.declared_by_key_id, alice.id);
+        // E5-fix2 (round 6) — the declarer is the signer's identity-ref
+        // (`federation_id`: the `iss` its statement carries), never the
+        // earlier `derived_key_id` the shared `Signer` keeps as `id`.
+        assert_eq!(g.declared_by_key_id, alice.signer.federation_id().await);
         assert_eq!(g.declared_at, d.asserted_at);
         assert_eq!(g.goal_text, "v0");
         assert_eq!(g.score, -0.25, "a negative stance is projected as signed");
@@ -262,7 +284,8 @@ pub(crate) mod bodies {
             declared_by_key_id: Some(k.to_owned()),
             ..GoalsFilter::default()
         };
-        assert_eq!(all(b, by(&alice.id)).await, vec![d.attestation_id.clone()]);
+        let alice_id = alice.signer.federation_id().await;
+        assert_eq!(all(b, by(&alice_id)).await, vec![d.attestation_id.clone()]);
         let scale = |s: &str| GoalsFilter {
             scale: Some(s.to_owned()),
             ..GoalsFilter::default()

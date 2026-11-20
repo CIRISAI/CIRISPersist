@@ -272,14 +272,17 @@ pub mod bodies {
         }
 
         // (1) the record door: the key's own set holds `node`.
-        let room = format!("root-{tag}");
-        authorized_room_key(d, &room).await;
+        // v62.0.0 (round 6, E7) — its OWN room: a held founding is a version
+        // 1 the store keeps (CC 2.7.3), so the conformant founding in (2)
+        // under the same id would be a rival version 1, not a founding.
+        let room_a = format!("root-a-{tag}");
+        authorized_room_key(d, &room_a).await;
         let r = found_outcome(
             d,
             ts::sign_community(
                 &human,
                 infra_room(
-                    &room,
+                    &room_a,
                     "quorum:2/2",
                     vec![seat(&human, "founder"), seat(&install, "founder")],
                 ),
@@ -290,7 +293,13 @@ pub mod bodies {
             held(&r),
             "#925: a node key is never an infrastructure founder (held): {r:?}"
         );
-        assert!(d.lookup_community(&e2::kid(&room)).await.unwrap().is_none());
+        assert!(d
+            .lookup_community(&e2::kid(&room_a))
+            .await
+            .unwrap()
+            .is_none());
+        let room = format!("root-{tag}");
+        authorized_room_key(d, &room).await;
 
         // (1b) through the bind: the key's own record is `primitive`, the
         // identity it is bound under is `node`.
@@ -638,9 +647,22 @@ pub mod bodies {
             keys.push(e2::put_key(d, k, &[it::PRIMITIVE]).await);
         }
         for i in 0..hops {
-            e2::put_signed(d, &edge(&seeds[i], &keys[i + 1], scope))
+            // v62.0.0 (round 6, E7) — each edge lands with the voices its
+            // family names (E0's `land_delegation`: the delegate's own voice,
+            // CC 2.6.1.9); short of one it is held and the walk stops there.
+            let (out, missing) = e2::land_delegation(d, &edge(&seeds[i], &keys[i + 1], scope))
                 .await
                 .unwrap_or_else(|e| panic!("{tag}: edge {} → {}: {e}", seeds[i], seeds[i + 1]));
+            assert!(
+                missing.is_empty()
+                    && !matches!(
+                        out,
+                        crate::federation::edition2::ingest::StatementOutcome::Pending { .. }
+                    ),
+                "{tag}: edge {} → {} lands: {out:?}, unvoiced {missing:?}",
+                seeds[i],
+                seeds[i + 1]
+            );
         }
         keys
     }

@@ -271,14 +271,12 @@ where
     let mut offered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     offered.insert(framed.attesting_key_id.clone());
     for (i, scrub) in row.additional_scrubs.iter().enumerate() {
-        super::tier_ingest::verify_envelope_hybrid_signature(
-            dir,
+        crate::federation::edition2::group::vouched_envelope(
             &scrub.scrub_key_id,
             &row.attestation_envelope,
             &scrub.scrub_signature_classical,
-            scrub.scrub_signature_pqc.as_deref(),
+            "occurrence_revocation_carrier",
         )
-        .await
         .map_err(|e| {
             Error::SignatureInvalid(format!(
                 "occurrence revocation carrier {}: cosignature [{i}] by {} does not verify: {e}",

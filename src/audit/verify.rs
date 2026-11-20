@@ -23,10 +23,16 @@
 //! future flip is a per-row version-gate migration, not a canonicalizer
 //! edit.
 //!
-//! Note: `entry_hash` IS part of the signed body. That binds the
-//! signature to the chain position — a chain-rewrite that flipped
-//! `prev_hash` of subsequent entries would invalidate this entry's
-//! signature too, even though `signature` itself was stripped.
+//! # The signature (v62.0.0, F0-cp8)
+//!
+//! The canonical JSON above is the HASH plane: `entry_hash` and the Merkle
+//! leaves are over it. The signature is ONE composite (ML-DSA-65-Ed25519)
+//! over a binary, domain-separated preimage ([`entry_signing_preimage`],
+//! CC 6.1.3's framing) that carries `entry_hash`, so it binds the chain
+//! position: a rewrite that flipped a later entry's `prev_hash` invalidates
+//! that entry's signature too. `actor_id` is the signer's identity-ref, and
+//! the signature verifies under the signer's edition-2 `key:record`
+//! ([`verify_entry_signature`]).
 //!
 //! # Why local (not cirisnode::verify::verify_envelope_signed)
 //!
@@ -100,99 +106,187 @@ pub fn truncate_to_micros(dt: chrono::DateTime<chrono::Utc>) -> chrono::DateTime
     dt.with_nanosecond(micros * 1000).unwrap_or(dt)
 }
 
-/// Verify an audit entry's Ed25519 signature against the embedded
-/// `actor_id` (which IS the pubkey, per the v0.7.1 self-signed
-/// identity model).
+/// v62.0.0 (F0-cp8; CC 6.1.3, CC 2.6.1.7) — **the bytes an audit entry's ONE
+/// composite signature is over**: the entry's body framed under the
+/// [`SigningDomain::AuditEntry`](crate::federation::edition2::signing_domain::SigningDomain::AuditEntry)
+/// domain ([`domain_preimage`](crate::federation::edition2::signing_domain::domain_preimage)).
+/// The body is binary and length-prefixed (the framing
+/// `SignedTreeHead::signing_bytes` and the delivery receipt use: a `u32`
+/// little-endian length before each variable field, little-endian integers):
 ///
-/// # Policy: `Ed25519Fallback`, PINNED — and why that is not a gap
+/// ```text
+/// b"ciris.signing_domain/v1\0"                24 bytes, the framing tag
+/// u32le(20) || b"ciris.audit_entry.v1"        the domain
+/// u32le(len(tenant_id))  || tenant_id (UTF-8)
+/// u32le(len(actor_id))   || actor_id  (UTF-8)  the signer's identity-ref
+/// i64le(sequence_number)                       8 bytes
+/// prev_hash                                    32 bytes
+/// entry_hash                                   32 bytes
+/// ```
 ///
-/// **The audit plane's hybrid gate is the signed tree head, not the entry**
-/// (CC 5.3.1; CC's reading on CIRISPersist#1233). The audit chain is this
-/// holder's own per-tenant log. What carries its accountability across a
-/// node boundary is the head the holder signs over it, and
-/// `audit::merkle_store` signs every head with a `HybridSignature`, refuses
-/// to store a new one without its ML-DSA-65 half
-/// (`merkle_store::require_hybrid_sth`), and verifies one only hybrid-Strict
-/// (`merkle_store::verify_audit_sth`). A head stored by an earlier build is
-/// served as itself (CC 2.6.1.8) and refused by that verify. An
-/// [`AuditEntry`] is a leaf, authenticated by inclusion under a hybrid-signed
-/// head at a tree size; its Ed25519 signature is an **inner** signature that
-/// binds the row to its actor and chain position. It is not the federation
-/// gate, and the hybrid-required mandate (CC 5.3.2.4.3.1) is met at the head.
+/// `entry_hash` is SHA-256 of the entry's canonical JSON with `entry_hash`
+/// and `signature` stripped ([`compute_entry_hash`]), so it binds every
+/// other field (`entry_id`, `action_type`, `subject_*`, `payload`,
+/// `recorded_at`); the tenant, signer, chain position and predecessor are
+/// framed beside it so the preimage names them without a JSON parse. The
+/// signature itself is never in it, and the Merkle leaf keeps stripping it
+/// (`audit::merkle_leaf`): the leaf hashes the same canonical JSON as before.
 ///
-/// So this check stays classical. [`AuditEntry`] has exactly one `signature`
-/// field and no PQC half, and `actor_id` IS the Ed25519 pubkey (the v0.7.1
-/// self-signed identity model), so both PQC arguments below are a hardcoded
-/// `None` and `Strict` would refuse every entry: `verify_chain` re-checks
-/// stored rows and the RFC 6962 leaves hash the same bytes, so the stored
-/// chain and Merkle corpus would go dark (measured in v37.0.0: 19 reds across
-/// `audit::sqlite` and `audit::verify`). v37's flip to Strict per entry was
-/// the wrong place for the gate.
-///
-/// The one case that WOULD need the PQC half: an audit entry that leaves the
-/// node as a bare row, outside a head plus inclusion proof, is a
-/// federation-tier row and must carry it like any other (CIRISPersist#1233).
-///
-/// [`AuditEntry`]: crate::audit::types::AuditEntry
-pub fn verify_entry_signature(entry: &AuditEntry) -> Result<(), Error> {
-    // v62.0.0 (F0-cp6b; CC 6.1.3, CC 1.13.4) — the one substrate predicate.
-    // An entry's inner Ed25519 signature is verified by no other node (what
-    // is served is the composite-signed head, row hashes and inclusion
-    // proofs), so the plane keeps its own form. Flipped, an entry has no key
-    // a composite would verify under (`actor_id` is the Ed25519 pubkey), so
-    // it is refused by name until the entry carries an identity-ref.
-    use crate::federation::edition2::substrate::{
-        refuse_own_form, substrate_form, SubstrateForm, SubstratePlane,
-    };
-    let form = substrate_form(SubstratePlane::AuditEntry);
-    if form == SubstrateForm::Composite {
-        refuse_own_form(SubstratePlane::AuditEntry).map_err(|e| Error::Signature(e.to_string()))?;
+/// # Errors
+/// [`Error::InvalidArgument`] for a `prev_hash` / `entry_hash` that is not
+/// 32 bytes, or a field longer than `u32::MAX` bytes.
+pub fn entry_signing_preimage(entry: &AuditEntry) -> Result<Vec<u8>, Error> {
+    fn framed(buf: &mut Vec<u8>, name: &str, field: &[u8]) -> Result<(), Error> {
+        let len = u32::try_from(field.len())
+            .map_err(|_| Error::InvalidArgument(format!("{name} is longer than u32::MAX bytes")))?;
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(field);
+        Ok(())
     }
+    let prev: &[u8; 32] = entry.prev_hash.as_slice().try_into().map_err(|_| {
+        Error::InvalidArgument(format!(
+            "prev_hash must be 32 bytes, got {}",
+            entry.prev_hash.len()
+        ))
+    })?;
+    let hash: &[u8; 32] = entry.entry_hash.as_slice().try_into().map_err(|_| {
+        Error::InvalidArgument(format!(
+            "entry_hash must be 32 bytes, got {}",
+            entry.entry_hash.len()
+        ))
+    })?;
+    let mut buf =
+        Vec::with_capacity(4 + entry.tenant_id.len() + 4 + entry.actor_id.len() + 8 + 32 + 32);
+    framed(&mut buf, "tenant_id", entry.tenant_id.as_bytes())?;
+    framed(&mut buf, "actor_id", entry.actor_id.as_bytes())?;
+    buf.extend_from_slice(&entry.sequence_number.to_le_bytes());
+    buf.extend_from_slice(prev);
+    buf.extend_from_slice(hash);
+    use crate::federation::edition2::signing_domain::{domain_preimage, SigningDomain};
+    Ok(domain_preimage(SigningDomain::AuditEntry, &buf))
+}
+
+/// v62.0.0 (F0-cp8) — the instant (POSIX ms) a stored entry's signature is
+/// re-checked at by a chain walk: its own `recorded_at`. The entry was
+/// admitted at the instant it was recorded (`record_entry` /
+/// `try_claim_event` check at the node's now); the walk asks whether the
+/// signer's key covered the entry when it was written, so a key that has
+/// since rotated out does not take the chain dark.
+#[must_use]
+pub fn stored_entry_instant_ms(entry: &AuditEntry) -> u64 {
+    u64::try_from(entry.recorded_at.timestamp_millis()).unwrap_or(0)
+}
+
+/// **Verify an audit entry's ONE composite signature** (v62.0.0, F0-cp8; CC
+/// 6.1.3, CC 2.6.1.7: composite signatures only): `signature` is the base64
+/// ML-DSA-65-Ed25519 composite (3373 bytes) over
+/// [`entry_signing_preimage`], verified under the live edition-2 `key:record`
+/// of the signer `actor_id` names (an identity-ref) at `at_ms`, through the
+/// one directory-backed verifier
+/// ([`verify_composite_via_directory`](crate::federation::edition2::composite_verify::verify_composite_via_directory)).
+///
+/// In order, each refused by name:
+/// - an empty `signature` (`signature missing`) or `actor_id`;
+/// - an `entry_hash` that is not the entry's own ([`compute_entry_hash`]);
+/// - a signature that is not standard base64;
+/// - a lone Ed25519 (64 bytes) or ML-DSA-65 half: `verify_component_signature`
+///   (the earlier entry form, a lone Ed25519 under an `actor_id` that was the
+///   pubkey, is this refusal), any other length `verify_composite_invalid`;
+/// - an `actor_id` that is not an identity-ref: `verify_not_identity_ref`;
+/// - the signer's key plane at `at_ms`: `verify_unknown_key`,
+///   `verify_signer_revoked`, `verify_signer_not_covered`,
+///   `verify_signer_waiting`;
+/// - a composite that does not verify: `verify_composite_invalid`.
+///
+/// Each is [`Error::Signature`] whose message leads with the token, except a
+/// failed directory read, which is [`Error::Backend`] (`verify_directory`).
+///
+/// Before v62 an entry carried an inner Ed25519 signature under an `actor_id`
+/// that was the pubkey, kept classical because no other node verified it (CC
+/// 1.13.4). F0-cp8: the entry is signed under the signer's identity-ref, like
+/// every other object a key signs, and the one deliberate classical verify
+/// is gone.
+///
+/// # Errors
+/// As above.
+pub async fn verify_entry_signature<F>(dir: &F, entry: &AuditEntry, at_ms: u64) -> Result<(), Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    use crate::federation::edition2::composite_verify::{
+        verify_composite_via_directory, CompositeVerifyError,
+    };
     if entry.signature.is_empty() {
         return Err(Error::Signature("signature missing".into()));
     }
     if entry.actor_id.is_empty() {
         return Err(Error::InvalidArgument("actor_id missing".into()));
     }
-    let canonical = canonical_bytes_for_entry(entry)?;
-    // v62.0.0 (F0-cp7) — the bound-hybrid verify family is deleted, and an
-    // audit entry never carried a hybrid: its signature is the INNER Ed25519
-    // signature of a local actor whose `actor_id` IS the Ed25519 pubkey, over
-    // a preimage no other node verifies (CC 1.13.4; what is served is the
-    // composite-signed tree head, the row hashes and the inclusion proofs).
-    // It is checked here directly, strict, the one deliberate classical
-    // verify left in persist (`scripts/earlier_form_doors.py`'s
-    // `LONE_VERIFY_ALLOWED`). It is not a composite's half: the actor key is
-    // not an edition-2 key.
-    verify_actor_ed25519(&canonical, &entry.signature, &entry.actor_id)
+    let derived = compute_entry_hash(entry)?;
+    if derived.as_slice() != entry.entry_hash.as_slice() {
+        return Err(Error::ChainIntegrity(
+            "entry_hash mismatch: the signed preimage binds the entry's own hash".into(),
+        ));
+    }
+    use base64::Engine as _;
+    let sig = base64::engine::general_purpose::STANDARD
+        .decode(&entry.signature)
+        .map_err(|e| Error::Signature(format!("signature base64: {e}")))?;
+    let preimage = entry_signing_preimage(entry)?;
+    match verify_composite_via_directory(dir, &preimage, &entry.actor_id, &sig, at_ms).await {
+        Ok(_) => Ok(()),
+        Err(e @ CompositeVerifyError::Directory(_)) => Err(Error::Backend(e.to_string())),
+        Err(e) => Err(Error::Signature(e.to_string())),
+    }
 }
 
-/// The strict Ed25519 check of an entry's inner signature (see
-/// [`verify_entry_signature`]): 64-byte signature, 32-byte key, both
-/// standard base64; `verify_strict` (no small-order `A`/`R`).
-fn verify_actor_ed25519(message: &[u8], sig_b64: &str, pubkey_b64: &str) -> Result<(), Error> {
+/// v62.0.0 (F0-cp8) — **seal an audit entry with `signer`'s composite key**:
+/// the persist-side producer of the form [`verify_entry_signature`] admits.
+///
+/// - `actor_id` becomes the signer's identity-ref
+///   ([`LocalSigner::federation_id`](crate::signing::LocalSigner::federation_id));
+///   an entry that already names another signer is refused;
+/// - `recorded_at` is truncated to microseconds ([`truncate_to_micros`]);
+/// - `entry_hash` is computed ([`compute_entry_hash`]);
+/// - `signature` is the base64 composite over [`entry_signing_preimage`].
+///
+/// The caller fills the chain position (`sequence_number`, `prev_hash`, from
+/// `AuditService::next_chain_position`) and the content fields first.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] for an entry naming another signer or a
+/// malformed `prev_hash`; [`Error::Signature`] when the signer cannot sign a
+/// composite (no ML-DSA-65 half: `PqcNotConfigured`).
+pub async fn seal_entry(
+    signer: &crate::signing::LocalSigner,
+    mut entry: AuditEntry,
+) -> Result<AuditEntry, Error> {
     use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let sig = b64
-        .decode(sig_b64)
-        .map_err(|e| Error::Signature(format!("signature base64: {e}")))?;
-    let key = b64
-        .decode(pubkey_b64)
-        .map_err(|e| Error::Signature(format!("actor_id base64: {e}")))?;
-    let sig: [u8; 64] = sig
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::Signature(format!("signature must be 64 bytes (got {})", sig.len())))?;
-    let key: [u8; 32] = key.as_slice().try_into().map_err(|_| {
-        Error::Signature(format!(
-            "actor_id must be a 32-byte Ed25519 key (got {})",
-            key.len()
-        ))
-    })?;
-    let key = ed25519_dalek::VerifyingKey::from_bytes(&key)
-        .map_err(|e| Error::Signature(format!("actor_id key: {e}")))?;
-    key.verify_strict(message, &ed25519_dalek::Signature::from_bytes(&sig))
-        .map_err(|_| Error::Signature("ed25519 signature mismatch".to_owned()))
+    if signer.pqc_signer().is_none() {
+        return Err(Error::Signature(
+            "audit entry: the signer has no ML-DSA-65 half; an entry is signed with ONE \
+             composite (CC 2.6.1.7)"
+                .into(),
+        ));
+    }
+    let identity_ref = signer.federation_id().await;
+    if !entry.actor_id.is_empty() && entry.actor_id != identity_ref {
+        return Err(Error::InvalidArgument(format!(
+            "actor_id {} is not this signer ({identity_ref}); an entry is sealed by its actor",
+            entry.actor_id
+        )));
+    }
+    entry.actor_id = identity_ref;
+    entry.recorded_at = truncate_to_micros(entry.recorded_at);
+    entry.signature = String::new();
+    entry.entry_hash = compute_entry_hash(&entry)?.to_vec();
+    let preimage = entry_signing_preimage(&entry)?;
+    let sig = signer
+        .sign_composite(&preimage)
+        .await
+        .map_err(|e| Error::Signature(format!("audit entry composite sign: {e}")))?;
+    entry.signature = base64::engine::general_purpose::STANDARD.encode(sig);
+    Ok(entry)
 }
 
 #[cfg(test)]
@@ -200,24 +294,14 @@ mod tests {
     use super::*;
     use crate::audit::types::AuditEntry;
     use crate::audit::GENESIS_PREV_HASH;
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine as _;
     use chrono::Utc;
-    use ed25519_dalek::{Signer as _, SigningKey};
-    use uuid::Uuid;
 
-    fn pubkey_b64(key: &SigningKey) -> String {
-        B64.encode(key.verifying_key().to_bytes())
-    }
-
-    /// Build + sign a genesis-of-chain audit entry under one tenant.
-    fn sign_genesis_entry(key: &SigningKey, tenant_id: &str) -> AuditEntry {
-        let actor = pubkey_b64(key);
+    fn unsigned_entry(tenant_id: &str) -> AuditEntry {
         let mut entry = AuditEntry {
-            entry_id: Uuid::new_v4().to_string(),
-            sequence_number: 1,
+            entry_id: "00000000-0000-4000-8000-000000000001".into(),
+            sequence_number: 7,
             tenant_id: tenant_id.to_owned(),
-            actor_id: actor,
+            actor_id: "urn:ietf:params:oauth:ckt:sha-256:f0-cp8".into(),
             action_type: "test_action".into(),
             subject_kind: "task".into(),
             subject_id: "test-task-1".into(),
@@ -227,63 +311,53 @@ mod tests {
             recorded_at: truncate_to_micros(Utc::now()),
             signature: String::new(),
         };
-        // entry_hash is derived from canonical(entry minus signature).
-        // Since signature is empty going in, this also captures the
-        // post-INSERT state when persist normalizes signature.
-        let hash = compute_entry_hash(&entry).unwrap();
-        entry.entry_hash = hash.to_vec();
-        let canonical = canonical_bytes_for_entry(&entry).unwrap();
-        let sig = key.sign(&canonical);
-        entry.signature = B64.encode(sig.to_bytes());
+        entry.entry_hash = compute_entry_hash(&entry).unwrap().to_vec();
         entry
     }
 
     #[test]
     fn entry_hash_round_trip() {
-        let key = SigningKey::from_bytes(&[0x33; 32]);
-        let entry = sign_genesis_entry(&key, "tenant-test-1");
-        // Re-deriving from the signed entry must match — note that
-        // signature is stripped by the canonicalizer, so the hash
-        // is stable even after signing.
+        let mut entry = unsigned_entry("tenant-test-1");
+        // `signature` is stripped from the hashed bytes, so the hash is
+        // stable once the entry is signed.
+        entry.signature = "c2ln".into();
         let derived = compute_entry_hash(&entry).unwrap();
         assert_eq!(derived.to_vec(), entry.entry_hash);
     }
 
+    /// **I2894 — the audit entry's signing preimage, byte for byte** (the
+    /// layout F0-cp8.md hands the Agent): the domain framing, the u32-LE framed
+    /// tenant and signer, the i64-LE sequence number, then the two hashes.
+    /// The signature is not in it.
     #[test]
-    fn verify_genesis_entry_signature() {
-        let key = SigningKey::from_bytes(&[0x44; 32]);
-        let entry = sign_genesis_entry(&key, "tenant-test-2");
-        verify_entry_signature(&entry).expect("genesis entry must verify");
-    }
-
-    #[test]
-    fn verify_rejects_tampered_payload() {
-        let key = SigningKey::from_bytes(&[0x55; 32]);
-        let mut entry = sign_genesis_entry(&key, "tenant-test-3");
-        entry.payload = serde_json::json!({"k": "TAMPERED"});
-        let err = verify_entry_signature(&entry).unwrap_err();
-        assert!(matches!(err, Error::Signature(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn verify_rejects_wrong_actor_id() {
-        let signer = SigningKey::from_bytes(&[0x66; 32]);
-        let imposter = SigningKey::from_bytes(&[0x77; 32]);
-        let mut entry = sign_genesis_entry(&signer, "tenant-test-4");
-        entry.actor_id = pubkey_b64(&imposter);
-        let err = verify_entry_signature(&entry).unwrap_err();
-        assert!(matches!(err, Error::Signature(_)));
-    }
-
-    #[test]
-    fn verify_rejects_empty_signature() {
-        let key = SigningKey::from_bytes(&[0x88; 32]);
-        let mut entry = sign_genesis_entry(&key, "tenant-test-5");
-        entry.signature = String::new();
-        let err = verify_entry_signature(&entry).unwrap_err();
-        match err {
-            Error::Signature(msg) => assert!(msg.contains("missing")),
-            other => panic!("expected Signature, got {other:?}"),
-        }
+    fn i2894_the_entry_signing_preimage_layout() {
+        let mut entry = unsigned_entry("t1");
+        let pre = entry_signing_preimage(&entry).unwrap();
+        let mut want = b"ciris.signing_domain/v1\0".to_vec();
+        want.extend_from_slice(&20u32.to_le_bytes());
+        want.extend_from_slice(b"ciris.audit_entry.v1");
+        want.extend_from_slice(&2u32.to_le_bytes());
+        want.extend_from_slice(b"t1");
+        let actor = entry.actor_id.as_bytes().to_vec();
+        want.extend_from_slice(&u32::try_from(actor.len()).unwrap().to_le_bytes());
+        want.extend_from_slice(&actor);
+        want.extend_from_slice(&7i64.to_le_bytes());
+        want.extend_from_slice(&GENESIS_PREV_HASH);
+        want.extend_from_slice(&entry.entry_hash);
+        assert_eq!(pre, want, "I2894: the preimage layout");
+        entry.signature = "anything".into();
+        assert_eq!(
+            entry_signing_preimage(&entry).unwrap(),
+            want,
+            "I2894: the signature is not in its own preimage"
+        );
+        entry.entry_hash = vec![0; 31];
+        assert!(
+            matches!(
+                entry_signing_preimage(&entry),
+                Err(Error::InvalidArgument(_))
+            ),
+            "I2894: a hash that is not 32 bytes has no preimage"
+        );
     }
 }

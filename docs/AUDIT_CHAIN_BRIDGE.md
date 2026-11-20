@@ -38,15 +38,15 @@ bridge (a cutover from a prior chain).
 
 Every audit entry's `entry_hash` covers the canonical JSON of the entry
 **minus the `signature` and `entry_hash` fields**. The `signature` then covers
-the canonical bytes **including** the resolved `entry_hash`. This is the same
-shape as the `cirisnode` envelopes (`src/cirisnode/verify.rs`); the reference
-implementation is `compute_entry_hash` in `src/audit/verify.rs`.
+a binary preimage that **includes** the resolved `entry_hash` (v62.0.0: ONE
+composite, `entry_signing_preimage` in `src/audit/verify.rs`); the hash's
+reference implementation is `compute_entry_hash` in the same file.
 
 ```
 canonical_bytes_for_hash = canonical_json(entry minus signature minus entry_hash)
 entry_hash = sha256(canonical_bytes_for_hash)
-canonical_bytes_for_sign = canonical_json(entry minus signature, WITH entry_hash filled in)
-signature = Ed25519(signing_key, canonical_bytes_for_sign)
+preimage = "ciris.signing_domain/v1\0" || u32le(20) || "ciris.audit_entry.v1" || framed(tenant_id) || framed(actor_id) || i64le(seq) || prev_hash || entry_hash
+signature = composite_ML-DSA-65-Ed25519(signer's edition-2 key, preimage)
 ```
 
 **Canonicalizer:** `PythonJsonDumpsCanonicalizer` — sorted keys, no
@@ -63,41 +63,51 @@ without reimplementing the canonical-bytes rule:
 # Step 0: read the chain head — the (next_sequence_number, prev_hash) to stamp
 head = json.loads(engine.audit_next_chain_position(tenant_id))
 
-# Step 1: build the entry with entry_hash="" and signature=""
+# Step 1: build the entry at that position, actor_id/entry_hash/signature empty
 entry = {
     "entry_id": str(uuid.uuid4()),
-    "sequence_number": 1,
+    "sequence_number": head["next_sequence_number"],
     "tenant_id": "...",
-    "actor_id": "<base64 Ed25519 pubkey>",
+    "actor_id": "",            # sealed: the engine's identity-ref
     "action_type": "system_event",
     "subject_kind": "audit_chain",
     "subject_id": "...",
     "payload": {...},
-    "prev_hash": "<base64 32 bytes>",
+    "prev_hash": head["prev_hash"],
     "entry_hash": "",
     "recorded_at": "...",
     "signature": "",
 }
 
-# Step 2: canonical bytes for the hash phase; compute entry_hash
-ch = engine.audit_canonicalize_for_hash(json.dumps(entry))
-entry["entry_hash"] = base64.b64encode(hashlib.sha256(ch).digest()).decode()
-
-# Step 3: canonical bytes for the signing phase; sign externally
-cs = engine.audit_canonicalize_for_signing(json.dumps(entry))
-sig_bytes = your_signer.sign_ed25519(cs)   # CIRISVerify TPM signer, etc.
-entry["signature"] = base64.b64encode(sig_bytes).decode()
-
-# Step 4: submit — persist re-derives entry_hash and verifies the signature
-engine.audit_record_entry(json.dumps(entry))
+# Step 2: seal with the engine's composite key, then submit — persist
+# re-derives entry_hash and verifies the ONE composite under the signer's
+# edition-2 key:record
+engine.audit_record_entry(engine.audit_seal_entry(json.dumps(entry)))
 ```
 
-Stripping rule:
-- `audit_canonicalize_for_hash` strips **both** `entry_hash` and `signature`
-  from the top-level JSON object, then canonicalizes.
-- `audit_canonicalize_for_signing` strips **only** `signature` — `entry_hash`
-  is part of the signed body, which binds the signature to the chain
-  position.
+v62.0.0 (F0-cp8; CC 6.1.3): the signature is ONE ML-DSA-65-Ed25519 composite
+(3373 bytes, base64) over a binary, domain-separated preimage, and `actor_id`
+is the signer's identity-ref (`urn:ietf:params:oauth:ckt:sha-256:…`). A lone
+Ed25519 entry (the earlier form, `actor_id` the Ed25519 pubkey) is refused
+`audit_signature: verify_component_signature: …`. The preimage, for a caller
+that signs with its composite key outside the engine
+(`engine.audit_signing_preimage(json.dumps(entry))` returns it):
+
+```text
+b"ciris.signing_domain/v1\0"
+u32le(20) || b"ciris.audit_entry.v1"
+u32le(len(tenant_id))  || tenant_id (UTF-8)
+u32le(len(actor_id))   || actor_id  (UTF-8, the identity-ref)
+i64le(sequence_number)
+prev_hash              (32 bytes)
+entry_hash             (32 bytes)
+```
+
+Hashing rule: `audit_canonicalize_for_hash` strips **both** `entry_hash` and
+`signature` from the top-level JSON object, then canonicalizes;
+`entry_hash = sha256` of those bytes. The preimage carries `entry_hash`, which
+binds the signature to every other field and to the chain position. The
+Merkle leaf hashes the same canonical JSON, signature stripped.
 
 Persist owns the rule; callers stay in their language.
 
@@ -108,7 +118,7 @@ Persist owns the rule; callers stay in their language.
   "entry_id": "<uuid-v4>",
   "sequence_number": 1,
   "tenant_id": "<see §2.1>",
-  "actor_id": "<base64 Ed25519 pubkey of the signer>",
+  "actor_id": "<the signer's identity-ref (v62.0.0)>",
   "action_type": "system_event",
   "subject_kind": "audit_chain",
   "subject_id": "<legacy chain identifier — caller's choice; commonly the legacy DB filename or chain UUID>",
@@ -123,7 +133,7 @@ Persist owns the rule; callers stay in their language.
   "prev_hash": "<base64 of sha256(canonical legacy root marker), see below>",
   "entry_hash": "<base64 of sha256(canonical entry minus signature minus entry_hash)>",
   "recorded_at": "<RFC 3339, cutover wall-clock>",
-  "signature": "<base64 Ed25519 over canonical_bytes_for_sign>"
+  "signature": "<base64 composite over the entry's signing preimage>"
 }
 ```
 
@@ -153,12 +163,15 @@ both.
 
 ### Who computes the hash and signature
 
-**The caller computes `entry_hash` and `signature`**, because persist has no
-access to the caller's TPM-backed signing key. `audit_record_entry` then:
+**The engine seals the entry** (`audit_seal_entry`: `actor_id`, `entry_hash`
+and the composite `signature`) with its own composite key; a caller that signs
+outside the engine signs `audit_signing_preimage`. `audit_record_entry` then:
 
 1. re-derives `entry_hash` from the canonical bytes and rejects a mismatch
    (AV-49);
-2. verifies the Ed25519 signature against `actor_id` (which is the pubkey);
+2. verifies the ONE composite under the live edition-2 `key:record` of the
+   identity-ref `actor_id` names (a lone Ed25519 is refused
+   `verify_component_signature`);
 3. checks `sequence_number` is the prior entry's plus one (or 1 for a new
    tenant), and `prev_hash` matches the prior entry's `entry_hash`;
 4. inserts the row with `signature_verified = TRUE`.

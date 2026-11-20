@@ -2185,7 +2185,7 @@ pub fn fold_key_statement_standing(
 /// short is worth writing down rather than papering over:
 ///
 /// - **Signature verification cannot honour it.** `verify_hybrid` and
-///   [`verify_envelope_hybrid_signature`](super::verify_envelope_hybrid_signature)
+///   `verify_envelope_hybrid_signature` (deleted v62.0.0, F0-cp8)
 ///   answer a mathematical question — do these bytes carry this key's
 ///   signature. A compromised key's signature still verifies; that is what
 ///   makes compromise dangerous. Wiring a revocation lookup into the verifier

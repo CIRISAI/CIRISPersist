@@ -1255,20 +1255,35 @@ pub const REF_MEMBERS: &[(&str, &str, &str, RefShape)] = &[
         "references_attestation_id",
         RefShape::One,
     ),
+    // v62.0.0 (E2-fix9; CC rc21 994b4f5 ruling (c); CC 3.2 "the recovery
+    // gate", CC 8.10's `ownership:*` withdraw guard) — `wa_adjudication_ref`
+    // is a LOGICAL name (signed_object_v2.tsv): on the gated `withdraws` of
+    // an owner binding (a composer carrying the binding's family) the WA
+    // quorum finding stands in `refs.also.cites`, EXACTLY ONE row, the
+    // withdrawn binding in `refs.target`. No refs member or also role is
+    // added; a `cites` of any other count projects nothing (the gate then
+    // reads no finding: the withdraws concludes nothing).
+    (
+        "ownership:{relation}:{target_kind}:{version}",
+        "also:cites",
+        "wa_adjudication_ref",
+        RefShape::One,
+    ),
 ];
 
 /// v62.0.0 (wave P1e) — the [`REF_MEMBERS`] entries of the family a
 /// statement's header names (its family id).
+///
+/// v62.0.0 (E2-fix9) — matched by the entry's own family id, so a family
+/// with no member list here (`ownership:*`, whose composers carry its family)
+/// keeps its named rows too.
 #[must_use]
 pub fn ref_members(family_id: &str) -> Vec<(&'static str, &'static str, RefShape)> {
-    match family_by_id(family_id) {
-        Some(f) => REF_MEMBERS
-            .iter()
-            .filter(|(fam, ..)| *fam == f.family)
-            .map(|(_, role, member, shape)| (*role, *member, *shape))
-            .collect(),
-        None => Vec::new(),
-    }
+    REF_MEMBERS
+        .iter()
+        .filter(|(fam, ..)| ciris_verify_core::namespace_match::family_id(fam) == family_id)
+        .map(|(_, role, member, shape)| (*role, *member, *shape))
+        .collect()
 }
 
 /// v62.0.0 (wave P1e; CC rc21, CC 3.2) — the `cohort_subkind` of a

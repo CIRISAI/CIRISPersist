@@ -14,11 +14,11 @@
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use crate::federation::key_grant_invariants::two_node::{
-        introduce, seed_community_everywhere, Node,
+        introduce_as, seed_community_everywhere, Node,
     };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
-    use crate::federation::types::identity_type::USER;
+    use crate::federation::types::identity_type::NODE;
     use crate::federation::{
         BlobStorage, EncryptionPubkeys, FederationDirectory, SignedAttestation,
     };
@@ -40,8 +40,11 @@ mod tests {
             crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias_b), "sqlite::memory:")
                 .await
                 .unwrap();
+        // v62.0.0 (E11-fix4; CC rc21 3.3.6) — the engines are MACHINES: each is
+        // a member's device node (`place_device`, an owner binding onto a NODE
+        // key), so each registers, and is introduced, as a NODE.
         for (e, _alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
-            e.register_self_federation_key(USER, None, None)
+            e.register_self_federation_key(NODE, None, None)
                 .await
                 .expect("register the engine's own key");
         }
@@ -66,7 +69,7 @@ mod tests {
             key: engine_b.local_derived_key_id().await.unwrap(),
             kem: kem(sb.load_or_init_content_kem_identity().await.unwrap()),
         };
-        introduce(&[&a, &b], &[&alias_a, &alias_b]).await;
+        introduce_as(&[&a, &b], &[&alias_a, &alias_b], NODE).await;
         let comm = format!("i79-comm-{run}");
         let (alice, bob) = (format!("i79-alice-{run}"), format!("i79-bob-{run}"));
         seed_community_everywhere(&[&a, &b], &comm, &[(&alice, Some(&a)), (&bob, Some(&b))]).await;
@@ -678,10 +681,18 @@ mod tests {
     /// keyed on the earlier envelope's `references_attestation_type` (an
     /// edition-2 composer states the target's family in its header, never as a
     /// payload member).
-    async fn i85_body(d: &dyn crate::federation::FederationDirectory, minter: &str, run: &str) {
+    ///
+    /// v62.0.0 (E6-fix8) — the runner builds the target ONCE and hands the
+    /// same row to the seed and to the body. `held_key_grant_row` stamps the
+    /// statement at the clock, so a second call minted a different statement
+    /// (another row id) and the precondition read the wrong id.
+    async fn i85_body(
+        d: &dyn crate::federation::FederationDirectory,
+        minter: &str,
+        target: crate::federation::Attestation,
+    ) {
         use crate::federation::edition2::fixture_switch as e2;
         use crate::federation::key_grant::is_key_grant_row;
-        let target = held_key_grant_row(minter, run);
         assert!(
             is_key_grant_row(&target),
             "I85 precondition: the mapped row is a key-grant row: {:?}",
@@ -769,7 +780,8 @@ mod tests {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let minter = format!("i85-minter-{run}");
         e2::put_key(&backend, &minter, &[USER]).await;
-        let (id, iss, sub, ty, env, scope) = i85_seed_params(&held_key_grant_row(&minter, &run));
+        let target = held_key_grant_row(&minter, &run);
+        let (id, iss, sub, ty, env, scope) = i85_seed_params(&target);
         {
             let conn = backend.conn_handle();
             let conn = conn.lock();
@@ -787,7 +799,7 @@ mod tests {
             )
             .expect("I85: the held key-grant row is seeded");
         }
-        i85_body(&backend, &minter, &run).await;
+        i85_body(&backend, &minter, target).await;
     }
 
     #[cfg(feature = "postgres")]
@@ -806,7 +818,8 @@ mod tests {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let minter = format!("i85-minter-{run}");
         e2::put_key(&backend, &minter, &[USER]).await;
-        let (id, iss, sub, ty, env, scope) = i85_seed_params(&held_key_grant_row(&minter, &run));
+        let target = held_key_grant_row(&minter, &run);
+        let (id, iss, sub, ty, env, scope) = i85_seed_params(&target);
         backend
             .get_client()
             .await
@@ -825,7 +838,7 @@ mod tests {
             )
             .await
             .expect("I85: the held key-grant row is seeded");
-        i85_body(&backend, &minter, &run).await;
+        i85_body(&backend, &minter, target).await;
     }
 
     /// **I86 (PR #852 review) — the row records the AUTHOR, the claim the
@@ -928,77 +941,12 @@ mod tests {
         );
     }
 
-    /// **I87 (PR #852 review) — a LocalOnly adopt needs no announcing signer.**
-    /// A hardware/classical engine may hold received bytes; only `Announce`
-    /// requires the PQC LocalSigner.
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn i87_local_only_adoption_works_without_a_local_signer_sqlite() {
-        use crate::federation::at_rest_cascade::{fresh_dek, seal};
-        use crate::federation::tier_ingest::test_support as ts;
-        use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
-        use crate::federation::{AdoptDisposition, BlobProvenance, BlobStorage};
-        use crate::store::Backend as _;
-        use std::sync::Arc;
-        let backend = Arc::new(
-            crate::store::sqlite::SqliteBackend::open_in_memory()
-                .await
-                .unwrap(),
-        );
-        backend.run_migrations().await.unwrap();
-        let run = uuid::Uuid::new_v4().simple().to_string();
-        // The node, its community and the peer author — seeded by the same
-        // two-node helpers every §20 witness uses, so the node is a member
-        // (the operator rule: a node holds only what it is party to, #846).
-        use crate::federation::key_grant_invariants::two_node::{
-            node_as, seed_community_everywhere,
-        };
-        let n = node_as(
-            backend.as_ref(),
-            &format!("i87-node-{run}"),
-            crate::federation::types::identity_type::NODE,
-        )
-        .await;
-        let node = n.key.clone();
-        let author = format!("i87-author-{run}");
-        let comm = format!("i87-comm-{run}");
-        seed_community_everywhere(&[&n], &comm, &[(&author, Some(&n))]).await;
-        let local = ts::local_signer(&format!("i87-node-{run}"));
-        assert_eq!(local.federation_id().await, node);
-        let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
-            crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
-        );
-        // No LocalSigner at all — the documented hardware/classical shape.
-        let engine = crate::Engine::from_shared(
-            crate::engine::BackendDispatch::Sqlite(backend.clone()),
-            signer,
-        );
-        let envelope = seal(&fresh_dek().unwrap(), b"i87 received bytes", None)
-            .unwrap()
-            .to_bytes();
-        let sha = engine
-            .adopt_sealed_blob(
-                &envelope,
-                BlobProvenance {
-                    author_key_id: author.clone(),
-                    cohort_scope: COMMUNITY.into(),
-                    community_key_id: Some(comm.clone()),
-                    epoch: Some(0),
-                    tier: CryptoTier::CommunityDek,
-                    minter_key_id: None,
-                },
-                None,
-                AdoptDisposition::LocalOnly,
-            )
-            .await
-            .expect("I87: LocalOnly adoption emits no claim and needs no LocalSigner");
-        assert!(backend.get_blob(&sha.sha256).await.unwrap().is_some());
-        assert!(
-            backend.list_holders(&sha.sha256).await.unwrap().is_empty(),
-            "I87: LocalOnly announces nothing"
-        );
-    }
-
+    // v62.0.0 (E6-fix8) — I87 ("a LocalOnly adopt needs no LocalSigner") is
+    // DELETED: its premise is a classical-only engine (`Engine::from_shared`,
+    // no LocalSigner) party to a room. Such an engine names itself by the
+    // earlier derived id (`local_derived_key_id`, read-checked), not an
+    // edition-2 identity-ref (CC 2.6.1.1), so no roster names it and it is
+    // party to nothing (`NotPartyTo`). A v62 node holds a composite signer.
     /// **I84 (b) — the subject gate is ONE gate.** v60.0.0 (#854, I1172):
     /// ingest and emit ask the same validator, so a raw base64 pubkey subject
     /// (uppercase), the shape cirisnode's retired Contributions carried, is

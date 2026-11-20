@@ -13,7 +13,8 @@
 //!   rule stamped then) when the target concludes; target first, it
 //!   concludes at once.
 //! - **I3672** (other-key existence, refusal on presence) — an agency
-//!   delegation to a key with no record is held; when the recipient's record
+//!   delegation to a key with no record is held (`count_short`: it waits for
+//!   the recipient's voice, GC1-fix1); when the recipient's record
 //!   lands as a NODE it stays held, now `node_agency_forbidden`; with the
 //!   node's record first it is held `node_agency_forbidden` at once. Same
 //!   (held, reason) in either order — the earlier door admitted it in one
@@ -161,9 +162,13 @@ pub(crate) async fn node_agency_either_order_body(d: &dyn FederationDirectory) {
         .await
         .expect("I3672: a delegation to an unheld key is KEPT");
     assert!(pending(&o), "I3672: held: {o:?}");
+    // GC1-fix1 — a `self:delegates_to` also waits for its delegate's own
+    // voice (K2-fix6, `check_second_signers_voiced`, CC 2.6.1.9). That gate
+    // runs before the subject gate, so the first mark is `count_short`: the
+    // row waits for the recipient's voice (and record).
     assert_eq!(
         held_reason(d, &del).await.as_deref(),
-        Some(reason::LINK_UNHELD),
+        Some(reason::COUNT_SHORT),
         "I3672: it waits for the recipient"
     );
     e2::put_key(d, r, &[identity_type::NODE]).await;

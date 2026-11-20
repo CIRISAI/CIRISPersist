@@ -2906,6 +2906,29 @@ pub trait BlobStorage: Send + Sync {
                 )));
             }
             if floor.tier() == crate::federation::types::cohort_scope::CryptoTier::Plaintext {
+                // v62.0.0 (v62 P8-fix15; the operator rule "never store what
+                // we are not party to", P7-fix8's shape) — the bytes are
+                // stored only when the claim that announces them can be
+                // admitted: a holder whose key record this node does not hold
+                // yet would leave bytes on disk behind a claim the statement
+                // door refuses (`federation_attester_key_unknown`, retryable).
+                // Refused here first, with the door's own error, and nothing
+                // is written.
+                let holder = local.federation_id().await;
+                if self
+                    .lookup_public_key(&holder)
+                    .await
+                    .map_err(|e| BlobError::Backend(format!("holding claim signer lookup: {e}")))?
+                    .is_none()
+                {
+                    return Err(BlobError::InvalidArgument(
+                        crate::federation::Error::AttesterKeyUnknown {
+                            attesting_key_id: holder,
+                            plane: "holding_claim",
+                        }
+                        .to_string(),
+                    ));
+                }
                 self.store_blob_local(
                     sha256,
                     body,

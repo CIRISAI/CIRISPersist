@@ -299,6 +299,15 @@ pub(crate) mod bodies {
 
         let voices = trust_root_room("i3112-room-a", Some(&agent));
         let mut last = None;
+        // v62 P5-fix2 — the listed member signs the founding too (the
+        // founding rule, `check_community_founding_signers`: a listed member's
+        // voice is its consent; an edition-2 node key record carries no
+        // accord scrub, so no node is seated without it). Its voice first,
+        // then the holders', so the last voice completes the row and the only
+        // thing missing is the agent's steward binding.
+        e2::put_statement(d, &e2::voice_of(&voices[0], "i3112-agent"))
+            .await
+            .expect("I3112: the agent's own voice over the founding is kept");
         for v in &voices {
             last = Some(
                 e2::put_statement(d, v)
@@ -338,9 +347,14 @@ pub(crate) mod bodies {
             "I3112: verify-before-mutation: nothing stored"
         );
 
-        // The control: the same room with its unstewarded NODE member lands.
+        // The control: the same room with its unstewarded NODE member lands
+        // (the node's own voice over the founding first, as above).
+        let room_b = trust_root_room("i3112-room-b", Some(&node));
+        e2::put_statement(d, &e2::voice_of(&room_b[0], "i3112-node"))
+            .await
+            .expect("I3112 control: the node's own voice over the founding is kept");
         let mut last = None;
-        for v in &trust_root_room("i3112-room-b", Some(&node)) {
+        for v in &room_b {
             last = Some(
                 e2::put_statement(d, v)
                     .await

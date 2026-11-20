@@ -223,9 +223,11 @@ pub(crate) mod bodies {
 
     /// The `group:roster:v1` row of `cid`.
     async fn record_row(d: &dyn FederationDirectory, cid: &str, scope: &str) -> Attestation {
+        // v62 (E3, round 6): an edition-2 group is keyed by the identity-ref
+        // its founding names (`found_room` states it through T1's voices).
         d.list_targeted_by_dimension_prefix(
             &[scope],
-            cid,
+            &e2::kid_or_keep(cid),
             crate::federation::group_plane::GROUP_ROSTER_DIMENSION,
         )
         .await
@@ -286,7 +288,7 @@ pub(crate) mod bodies {
         };
         let env = serde_json::json!({
             "references_attestation_id": target.attestation_id,
-            member: cid,
+            member: e2::kid_or_keep(cid),
         });
         composer_voices(attestation_type::WITHDRAWS, target, &env, scope, signers)
     }

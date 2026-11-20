@@ -105,7 +105,7 @@ pub(crate) mod bodies {
     use crate::federation::key_grant::{
         is_key_grant_row, key_grant_dimension_of, KEY_GRANT_STREAM_DIMENSION,
     };
-    use crate::federation::key_grant_invariants::two_node::key_grant_rows_for;
+    use crate::federation::key_grant_invariants::two_node::{admit_replicated, key_grant_rows_for};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
     use crate::federation::{
@@ -140,6 +140,11 @@ pub(crate) mod bodies {
             .collect()
     }
 
+    // v62 (E3, round 6; CP2): the JSON door (`Engine::apply_replicated_key_grant`)
+    // is shut; B admits A's served grant at the edition-2 door through E11's
+    // shared `two_node::admit_replicated` (its carried statement through
+    // `apply_replicated_statement`).
+
     /// Write `n` room chunks to `stream` on A at producer epoch `epoch`.
     async fn write_room<B>(l: &Ladder<B>, stream: &str, n: usize, epoch: u64) -> Vec<u8>
     where
@@ -173,8 +178,7 @@ pub(crate) mod bodies {
     {
         l.engine_a.emit_pending_key_grants().await.unwrap();
         for row in key_grant_rows_for(l.ba.as_ref(), &l.node_a, &l.node_b).await {
-            l.engine_b
-                .apply_replicated_key_grant(row)
+            admit_replicated(l.bb.as_ref(), row)
                 .await
                 .unwrap_or_else(|e| panic!("B admits A's row: {e}"));
         }
@@ -993,7 +997,7 @@ pub(crate) mod bodies {
             .expect("A seals the room stream");
         l.engine_a.emit_pending_key_grants().await.unwrap();
         for row in key_grant_rows_for(l.ba.as_ref(), &l.node_a, &l.node_b).await {
-            l.engine_b.apply_replicated_key_grant(row).await.unwrap();
+            admit_replicated(l.bb.as_ref(), row).await.unwrap();
         }
         let owner = claimant(0x18);
         let producer = format!("i1406-producer-{run}");
@@ -1287,8 +1291,7 @@ pub(crate) mod bodies {
             .expect("a room manifest names its community epoch");
         l.engine_a.emit_pending_key_grants().await.unwrap();
         for row in key_grant_rows_for(l.ba.as_ref(), &l.node_a, &l.node_b).await {
-            l.engine_b
-                .apply_replicated_key_grant(row)
+            admit_replicated(l.bb.as_ref(), row)
                 .await
                 .unwrap_or_else(|e| panic!("I758: B admits A's row: {e}"));
         }
@@ -1548,7 +1551,7 @@ pub(crate) mod bodies {
             "I759: A wrapped the stream epoch to B"
         );
         for row in epoch_rows {
-            l.engine_b.apply_replicated_key_grant(row).await.unwrap();
+            admit_replicated(l.bb.as_ref(), row).await.unwrap();
         }
         let manifest_prov = room_row_provenance(&l, &format!("i759-{run}"), &root, room_epoch);
         l.engine_b
@@ -1611,7 +1614,7 @@ pub(crate) mod bodies {
         // evicted and re-adopted with the chunk provenance; the DAG promotes
         // and both reads open.
         for row in stream_rows {
-            l.engine_b.apply_replicated_key_grant(row).await.unwrap();
+            admit_replicated(l.bb.as_ref(), row).await.unwrap();
         }
         for c in &chunks {
             l.engine_b
@@ -1677,7 +1680,7 @@ pub(crate) mod bodies {
         );
         l.engine_a.emit_pending_key_grants().await.unwrap();
         for row in key_grant_rows_for(l.ba.as_ref(), &l.node_a, &l.node_b).await {
-            l.engine_b.apply_replicated_key_grant(row).await.unwrap();
+            admit_replicated(l.bb.as_ref(), row).await.unwrap();
         }
         // The room row's provenance, epoch and all, is right for every legacy
         // chunk: each was sealed under that community epoch.

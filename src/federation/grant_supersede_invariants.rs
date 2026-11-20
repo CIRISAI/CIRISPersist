@@ -31,8 +31,9 @@
 pub(crate) mod bodies {
     use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::operational::test_support::{
-        establish_e2_trust_root, signed_trust_attestation,
+        accept_e2_root, confer_e2, signed_trust_attestation, stand_up_e2_root,
     };
+    use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::trust_root::{
         capability_roots_to_trusted_root, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE,
         TRUST_CONFERS_DIMENSION,
@@ -60,15 +61,11 @@ pub(crate) mod bodies {
             .expect("the runner sets the node key (set_node_key_id(e2::put_key(..)))");
         let subject_seed = format!("gs-subject-{tag}");
         let subject = e2::put_key(d, &subject_seed, &[it::NODE]).await;
-        let root = establish_e2_trust_root(
-            d,
-            &format!("gs-root-{tag}"),
-            &subject_seed,
-            INFRA_SERVE_SCOPE,
-        )
-        .await
-        .expect("the edition-2 fixture stands up the root and the grant")
-        .root;
+        // v62 (E4-fix6; CC 4.4.3.19): the subject is a MACHINE key, so the
+        // root's conferral needs its owner's voice too
+        // ([`root_conferring_on_a_node`]).
+        let root =
+            root_conferring_on_a_node(d, &user, &format!("gs-root-{tag}"), &subject_seed).await;
         let grant = d
             .all_attestations_for(&subject)
             .await
@@ -90,6 +87,57 @@ pub(crate) mod bodies {
             subject,
             grant,
         }
+    }
+
+    /// v62 (E4-fix6; CC 4.4.3.19) — **a root, accepted by `user`, conferring
+    /// `infra:serve` on the NODE key `subject_seed`.** A machine key's owner is
+    /// a required voice on a delegation to it, so the subject's owner is bound
+    /// first (K2's `put_sealed_owner_binding`, the node's voice included);
+    /// then the root is stood up (E9's `stand_up_e2_root`) and accepted, and
+    /// its conferral is voiced by the subject (`confer_e2`) and by the
+    /// subject's owner. (`establish_e2_trust_root` voices the subject only, so
+    /// a node subject's grant waited and its postcondition read `None`.) The
+    /// root's identity-ref.
+    pub(crate) async fn root_conferring_on_a_node(
+        d: &dyn FederationDirectory,
+        user: &str,
+        root_seed: &str,
+        subject_seed: &str,
+    ) -> String {
+        let owner_seed = format!("gs-owner-of-{subject_seed}");
+        e2::put_key(d, &owner_seed, &[it::USER]).await;
+        ts::put_sealed_owner_binding(
+            d,
+            &ts::owner_binding_attestation(
+                &uuid::Uuid::new_v4().to_string(),
+                &owner_seed,
+                subject_seed,
+            ),
+            subject_seed,
+        )
+        .await
+        .expect("the subject's owner binding lands");
+        let root = stand_up_e2_root(d, root_seed)
+            .await
+            .expect("the edition-2 fixture stands up the root")
+            .root;
+        accept_e2_root(d, user, &root)
+            .await
+            .expect("the node accepts the root");
+        let grant_row = confer_e2(d, root_seed, subject_seed, &[INFRA_SERVE_SCOPE])
+            .await
+            .expect("the root confers on the subject");
+        let grant_st = d
+            .edition2_voices(&grant_row)
+            .await
+            .expect("the conferral's voices")
+            .into_iter()
+            .next()
+            .expect("the conferral is held as a statement");
+        e2::put_statement(d, &e2::voice_of(&grant_st, &owner_seed))
+            .await
+            .expect("the subject's owner voices the conferral");
+        root
     }
 
     /// `by` writes a `supersedes` on `target` carrying a conferral body.
@@ -276,15 +324,9 @@ pub(crate) mod bodies {
         // rotates its own grants), so it confers nothing either.
         let other_subject = format!("gs-osubj-{tag}");
         e2::put_key(d, &other_subject, &[it::NODE]).await;
-        let root2 = establish_e2_trust_root(
-            d,
-            &format!("gs-root2-{tag}"),
-            &other_subject,
-            INFRA_SERVE_SCOPE,
-        )
-        .await
-        .expect("I386 a second trusted root")
-        .root;
+        let root2 =
+            root_conferring_on_a_node(d, &fx.user, &format!("gs-root2-{tag}"), &other_subject)
+                .await;
         let _ = supersede(
             d,
             &format!("gs-r2succ-{tag}"),

@@ -76,6 +76,10 @@ pub fn produce_error(producer: &str, e: ProduceError) -> Error {
             Error::InvalidArgument(format!("edition2_payload_invalid: {producer}: {why}"))
         }
         ProduceError::Signer(s) => composite_signing_unavailable(producer, &s.to_string()),
+        // v62.0.0 (E2-fix10) — the door's own payload refusal, as raised.
+        ProduceError::Rejected(why) => {
+            Error::InvalidArgument(format!("edition2_payload_invalid: {producer}: {why}"))
+        }
     }
 }
 
@@ -639,8 +643,22 @@ pub fn draft_from_envelope(
     )
     .map_err(|e| produce_error("draft", e))?;
     if let Some((t, _)) = target {
-        payload =
-            with_member(payload, "refs", refs_target(t)).map_err(|e| produce_error("draft", e))?;
+        // v62.0.0 (E2-fix9) — the target joins the roles the envelope already
+        // states under `refs` (`payloads::REF_MEMBERS`: a reclaim withdraws's
+        // `wa_adjudication_ref`); it never replaces them.
+        let refs = match payload.get_text("refs").and_then(Value::as_map) {
+            Some(roles) => {
+                let mut m: Vec<(Value, Value)> = roles
+                    .iter()
+                    .filter(|(k, _)| k.as_text() != Some("target"))
+                    .cloned()
+                    .collect();
+                m.push((text("target"), row_ref(t)));
+                sorted_map(m)
+            }
+            None => refs_target(t),
+        };
+        payload = with_member(payload, "refs", refs).map_err(|e| produce_error("draft", e))?;
     }
     draft_row(kid, iss, sub, row_type, &family, &payload).map_err(|e| produce_error("draft", e))
 }

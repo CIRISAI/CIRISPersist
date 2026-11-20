@@ -388,6 +388,14 @@ struct RowPlacement {
     strip: Vec<String>,
 }
 
+/// v62.0.0 (v62 P8-fix15) — is a held crossing's `reason` an absent or
+/// unresolved roster (CIRISPersist#797's `awaiting_roster`)? Any other fold
+/// condition is counted `awaiting_voices`.
+fn held_for_a_roster(reason: &str) -> bool {
+    use crate::federation::edition2::fold::reason as r;
+    [r::SCOPE_MEMBERSHIP_UNRESOLVED, r::ROSTER_UNHELD].contains(&reason)
+}
+
 /// v50.0.0 (CIRISPersist#924 review, MEDIUM-3) — a row the grants' PREFIXES
 /// cover but whose dimension the one matcher refuses: counted and sampled on
 /// the report, never promoted or widened.
@@ -2897,6 +2905,26 @@ impl Engine {
         Ok(local.sign_composite(message).await?)
     }
 
+    /// v62.0.0 (F0-cp8; CC 2.6.1.7) — **this engine's composite signature
+    /// over a host artefact in a registered signing domain**: ONE composite
+    /// over [`domain_preimage`](crate::federation::edition2::signing_domain::domain_preimage)`(domain, message)`,
+    /// the form
+    /// [`verify_domain_composite_via_directory`](crate::federation::edition2::signing_domain::verify_domain_composite_via_directory)
+    /// admits under this engine's identity-ref.
+    ///
+    /// # Errors
+    /// As [`Self::sign_composite`].
+    pub async fn sign_domain(
+        &self,
+        domain: crate::federation::edition2::signing_domain::SigningDomain,
+        message: &[u8],
+    ) -> Result<Vec<u8>, SignError> {
+        self.sign_composite(
+            &crate::federation::edition2::signing_domain::domain_preimage(domain, message),
+        )
+        .await
+    }
+
     /// v62.0.0 (v62 P8) — **sign a drafted statement** with this engine's
     /// composite key: the `COSE_Sign1` statement over the draft's
     /// `sig_structure` ([`crate::federation::edition2::emit::Draft`]), ready
@@ -4330,9 +4358,15 @@ impl Engine {
                 report.awaiting_actor += 1;
                 false
             }
-            // v62.0.0 (v62 P8-fix5) — held for its second signers: not yet.
-            Ok(MeshCrossingOutcome::Held { .. }) => {
-                report.awaiting_voices += 1;
+            // v62.0.0 (v62 P8-fix5, fix15) — held: not yet. An absent roster
+            // is `awaiting_roster` (#797), any other fold condition
+            // `awaiting_voices`.
+            Ok(MeshCrossingOutcome::Held { reason, .. }) => {
+                if held_for_a_roster(&reason) {
+                    report.awaiting_roster += 1;
+                } else {
+                    report.awaiting_voices += 1;
+                }
                 false
             }
             Err(e) => {
@@ -4402,8 +4436,16 @@ impl Engine {
             Ok(MeshCrossingOutcome::AlreadyWidened { .. })
             | Ok(MeshCrossingOutcome::AlreadyInMesh { .. }) => {}
             Ok(MeshCrossingOutcome::AwaitingActor { .. }) => report.awaiting_actor += 1,
-            // v62.0.0 (v62 P8-fix5) — held for its second signers: not yet.
-            Ok(MeshCrossingOutcome::Held { .. }) => report.awaiting_voices += 1,
+            // v62.0.0 (v62 P8-fix5, fix15) — held: an absent roster is
+            // `awaiting_roster` (#797), any other fold condition
+            // `awaiting_voices`.
+            Ok(MeshCrossingOutcome::Held { reason, .. }) => {
+                if held_for_a_roster(&reason) {
+                    report.awaiting_roster += 1;
+                } else {
+                    report.awaiting_voices += 1;
+                }
+            }
             // v47.0.0 (CIRISPersist#797) — the room's roster has not arrived:
             // wait for it, and do not log "not a member" for a room this node
             // simply has not received yet.
@@ -8917,24 +8959,43 @@ impl Engine {
             .identity_key_id
             .clone()
             .unwrap_or_else(|| input.agent.occurrence_key_id.clone());
-        if let (Some(owner), Some(agent_signer)) =
-            (&input.identity_signer, &input.agent.occurrence_signer)
-        {
+        let mut bind_drafts = Vec::new();
+        if let Some(owner) = &input.identity_signer {
             if agent_identity == input.agent.occurrence_key_id
                 && crate::federation::admission::agent_owner_of(&*directory, &agent_identity, at_ms)
                     .await?
                     .is_none()
             {
-                crate::federation::edition2::occurrence::state_agent_owner_binding(
-                    &*directory,
-                    owner,
-                    agent_signer,
-                    at_ms,
-                )
-                .await?;
+                match &input.agent.occurrence_signer {
+                    Some(agent_signer) => {
+                        crate::federation::edition2::occurrence::state_agent_owner_binding(
+                            &*directory,
+                            owner,
+                            agent_signer,
+                            at_ms,
+                        )
+                        .await?;
+                    }
+                    // v62.0.0 (v62 P8-fix12) — the agent's pen is not in hand
+                    // (hardware / remote): the owner states its half (held for
+                    // the agent's voice) and the agent's voice is DRAFTED.
+                    // Before this the binding was never stated, so the agent
+                    // had no owner and the delegation's `delegate_owner` role
+                    // could never fill (I3545).
+                    None => {
+                        let draft =
+                            crate::federation::edition2::occurrence::state_agent_owner_binding_by_owner(
+                                &*directory,
+                                owner,
+                                &agent_identity,
+                                at_ms,
+                            )
+                            .await?;
+                        bind_drafts.push((agent_identity.clone(), draft));
+                    }
+                }
             }
         }
-        let mut bind_drafts = Vec::new();
         let app_identity = input
             .app
             .identity_key_id
@@ -12612,6 +12673,42 @@ mod tests {
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use ed25519_dalek::SigningKey;
 
+    /// v62 (E3, round 6; CC 2.6.1.9, E0.api v1.15/1.17) — **land a row an
+    /// Engine producer stated and the door holds `Pending`**: an own-act
+    /// `self:delegates_to` (and the other counted shapes) waits for its
+    /// second signers' voices (the delegate; a machine delegate's owner).
+    /// The Engine's door is right to wait; the witness supplies the parties
+    /// it owns: each resolved role's voice over the held statement
+    /// (`second_signer_voices`). Returns the roles no fixture key can voice
+    /// (empty when every party was voiced).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn land_held_row(
+        dir: &dyn crate::federation::FederationDirectory,
+        row_hex: &str,
+    ) -> Vec<crate::federation::edition2::fixture_switch::UnvoicedRole> {
+        use crate::federation::edition2::fixture_switch as e2;
+        let id: [u8; 32] = hex::decode(row_hex)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            .unwrap_or_else(|| panic!("land_held_row: {row_hex} is a row id"));
+        let rid = crate::federation::edition2::names::RowId(id);
+        let held = dir.edition2_voices(&rid).await.expect("edition2_voices");
+        let st = held
+            .first()
+            .unwrap_or_else(|| panic!("land_held_row: no statement held for {row_hex}"))
+            .clone();
+        let row = e2::row_of_statement(&st, crate::federation::types::attestation_tier::FEDERATION);
+        let (seeds, unvoiced) = e2::second_signer_voices(dir, &row)
+            .await
+            .unwrap_or_else(|e| panic!("land_held_row: the roles of {row_hex}: {e}"));
+        for seed in seeds {
+            e2::put_statement(dir, &e2::voice_of(&st, &seed))
+                .await
+                .unwrap_or_else(|e| panic!("land_held_row: {seed}'s voice on {row_hex}: {e}"));
+        }
+        unvoiced
+    }
+
     fn test_signer() -> Arc<LocalSigner> {
         // v9.0.0 (CC 5.3.2.4.3.1) — a PQC-configured LocalSigner keyed on
         // "test-engine-steward" (deterministic; its Ed25519 + ML-DSA-65
@@ -12998,27 +13095,63 @@ mod tests {
         assert!(engine.genesis_posture().await.entrenched());
     }
 
-    /// v13.4.0 (CIRISPersist#390) — the operator's success criterion: a FRESH
-    /// install (no ceremony, no manual adopt) boots with `ciris-canonical-1`
-    /// already in the conferred canonical set, so the client Trust Root shows it
-    /// as canonical and peers can address it by key_id.
+    /// v62.0.0 (ruling: v62.0 carries NO compiled-in genesis bundle; v62.1
+    /// bakes the ceremony's) — **a fresh v62.0 engine is pre-genesis**, on
+    /// sqlite and postgres: it holds no bundle, so no serve node is seated,
+    /// no identity-ref is canonical (ruling C), the canonical listing is
+    /// empty, and the posture reads `pre_genesis`. The fresh node is
+    /// [`Engine::with_signer_pre_genesis`], which in a production build is
+    /// exactly [`Engine::with_signer`] (in lib tests the other constructors
+    /// install the test ceremony at boot). Replaces v13.4.0's
+    /// `fresh_engine_auto_loads_2of3_canonical_server` (CIRISPersist#390),
+    /// which asserted the earlier baked-v4 auto-load; v62.1 re-adds that
+    /// witness against the baked ceremony bundle.
+    async fn assert_fresh_engine_is_pre_genesis(dsn: &str, tag: &str) {
+        let engine = Engine::with_signer_pre_genesis(test_signer(), dsn)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] a fresh v62.0 node must boot: {e:?}"));
+        let held = engine.genesis_in_force().await.expect("genesis read");
+        assert!(!held.is_held(), "[{tag}] no genesis bundle is held");
+        assert!(held.seats().is_empty(), "[{tag}] no seat");
+        // The test ceremony's seats exist as identities, and are canonical
+        // nowhere on a node that holds no bundle.
+        for node in
+            crate::federation::edition2::fixture_genesis::bundle_v2().serve_node_identity_refs()
+        {
+            assert!(
+                !engine.is_canonical(&node).await.expect("is_canonical"),
+                "[{tag}] {node} is not canonical on a pre-genesis node"
+            );
+        }
+        assert!(
+            engine
+                .list_canonical_servers()
+                .await
+                .expect("list")
+                .is_empty(),
+            "[{tag}] the canonical listing is empty"
+        );
+        assert_eq!(
+            engine.genesis_posture().await.as_str(),
+            "pre_genesis",
+            "[{tag}] the posture says so"
+        );
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn fresh_engine_auto_loads_2of3_canonical_server() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("construct engine");
-        // v62 (E3): canonical standing is an identity-ref in `serve_nodes` of
-        // the bundle in force (ruling C); the test engine holds bundle_v2().
-        let node = crate::federation::edition2::fixture_genesis::bundle_v2()
-            .serve_node_identity_ref(0)
-            .to_owned();
-        assert!(
-            engine.is_canonical(&node).await.expect("is_canonical"),
-            "a fresh install must trust {node} out of the box"
-        );
-        let listed = engine.list_canonical_servers().await.expect("list");
-        assert!(listed.iter().any(|r| r.key_id == node));
+    async fn fresh_v62_0_engine_is_pre_genesis_sqlite() {
+        assert_fresh_engine_is_pre_genesis("sqlite::memory:", "sqlite").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn fresh_v62_0_engine_is_pre_genesis_postgres() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        assert_fresh_engine_is_pre_genesis(&dsn, "postgres").await;
     }
 
     #[cfg(feature = "sqlite")]
@@ -13471,11 +13604,8 @@ mod tests {
     #[cfg(all(feature = "cirisaudit", feature = "sqlite"))]
     #[tokio::test]
     async fn audit_service_sqlite_round_trip() {
-        use crate::audit::verify::{compute_entry_hash, truncate_to_micros};
+        use crate::audit::verify::truncate_to_micros;
         use crate::audit::{AuditEntry, AuditFilter, AuditService, GENESIS_PREV_HASH};
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine as _;
-        use ed25519_dalek::{Signer as _, SigningKey};
         use uuid::Uuid;
 
         let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
@@ -13490,14 +13620,20 @@ mod tests {
             AuditDispatch::Postgres(_) => panic!("expected sqlite audit variant"),
         };
 
-        // Build + sign a genesis audit entry (actor_id IS the pubkey).
-        let key = SigningKey::from_bytes(&[0xA1; 32]);
+        // Build + seal a genesis audit entry (v62.0.0, F0-cp8: ONE composite
+        // under the actor's identity-ref, its `key:record` held).
+        let key = "engine-audit-a1";
+        crate::audit::test_support::put_actor(
+            &**engine.sqlite_backend().expect("sqlite backend"),
+            key,
+        )
+        .await;
         let tenant = format!("engine93-{}", Uuid::new_v4().simple());
-        let mut entry = AuditEntry {
+        let entry = AuditEntry {
             entry_id: Uuid::new_v4().to_string(),
             sequence_number: 1,
             tenant_id: tenant.clone(),
-            actor_id: B64.encode(key.verifying_key().to_bytes()),
+            actor_id: String::new(),
             action_type: "handler_action_task_complete".into(),
             subject_kind: "task".into(),
             subject_id: "subj-1".into(),
@@ -13507,9 +13643,7 @@ mod tests {
             recorded_at: truncate_to_micros(chrono::Utc::now()),
             signature: String::new(),
         };
-        entry.entry_hash = compute_entry_hash(&entry).unwrap().to_vec();
-        let canonical = crate::audit::verify::canonical_bytes_for_entry(&entry).unwrap();
-        entry.signature = B64.encode(key.sign(&canonical).to_bytes());
+        let entry = crate::audit::test_support::seal(key, entry);
 
         backend
             .record_entry(entry.clone())
@@ -13556,11 +13690,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn audit_service_postgres_round_trip() {
-        use crate::audit::verify::{compute_entry_hash, truncate_to_micros};
+        use crate::audit::verify::truncate_to_micros;
         use crate::audit::{AuditEntry, AuditFilter, AuditService, GENESIS_PREV_HASH};
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine as _;
-        use ed25519_dalek::{Signer as _, SigningKey};
         use uuid::Uuid;
 
         let Some(dsn) = crate::test_pg::dsn() else {
@@ -13580,13 +13711,14 @@ mod tests {
             AuditDispatch::Sqlite(_) => panic!("expected postgres audit variant"),
         };
 
-        let key = SigningKey::from_bytes(&[0xB2; 32]);
+        let key = "engine-audit-pg-b2";
+        crate::audit::test_support::put_actor(&*backend, key).await;
         let tenant = format!("engine93-pg-{}", Uuid::new_v4().simple());
-        let mut entry = AuditEntry {
+        let entry = AuditEntry {
             entry_id: Uuid::new_v4().to_string(),
             sequence_number: 1,
             tenant_id: tenant.clone(),
-            actor_id: B64.encode(key.verifying_key().to_bytes()),
+            actor_id: String::new(),
             action_type: "handler_action_task_complete".into(),
             subject_kind: "task".into(),
             subject_id: "subj-1".into(),
@@ -13596,9 +13728,7 @@ mod tests {
             recorded_at: truncate_to_micros(chrono::Utc::now()),
             signature: String::new(),
         };
-        entry.entry_hash = compute_entry_hash(&entry).unwrap().to_vec();
-        let canonical = crate::audit::verify::canonical_bytes_for_entry(&entry).unwrap();
-        entry.signature = B64.encode(key.sign(&canonical).to_bytes());
+        let entry = crate::audit::test_support::seal(key, entry);
 
         backend
             .record_entry(entry.clone())
@@ -14268,11 +14398,11 @@ mod tests {
             detection_id: uuid::Uuid::new_v4(),
             trace_id: trace_id.to_owned(),
             body_sha256: vec![0xABu8; 32],
-            detector: "manifold_conformity_outlier".to_owned(),
+            detector: "hash_chain_integrity".to_owned(),
             severity: crate::derived::DetectionSeverity::Warning,
             cohort_cell: serde_json::json!({"deployment_domain": "legal"}),
             conformity_variant: crate::derived::ConformityVariant::Numeric,
-            conformity_payload: serde_json::json!({"score": 2.7}),
+            conformity_payload: serde_json::json!({"score": 3}),
             lens_core_version: "lc-test".to_owned(),
             ratchet_calibration_version: 1,
             canonical_bytes: canonical.to_vec(),
@@ -15499,6 +15629,8 @@ mod tests {
             )
             .await
             .expect("I1233: a termed grant admits");
+        // v62 (E3, round 6): an own-act delegation waits for the delegate's voice.
+        land_held_row(&*sq, &id).await;
         let row = sq.get_attestation(&id).await.unwrap().expect("row");
         assert_eq!(
             row.attestation_envelope[DELEGATION_VALID_UNTIL_FIELD],
@@ -16916,9 +17048,10 @@ mod tests {
 
     // ── v39.0.0 — the two crossing verbs (FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE) ──
     //
-    // The primitive-level witnesses W1–W14 run on every backend in
-    // `bootstrap_admission::test_support::exercise_actor_signature_survives_the_crossing`;
-    // the tests here drive the ENGINE's one policy — who signs — and the
+    // The primitive-level JCS-custody witnesses W1–W14 are deleted in v62.0.0
+    // (E0 fix 11; an edition-2 row crosses on its own statement, and
+    // `edition2::crossing_producer_invariants` witnesses that crossing); the
+    // tests here drive the ENGINE's one policy — who signs — and the
     // consent sweep over both verbs.
 
     /// v62.0.0 (P7-fix6; CC 3.1.5, key_roles R4) — [`engine_with_registered_node`]
@@ -16959,27 +17092,6 @@ mod tests {
             .expect("register self");
         let sq = engine.sqlite_backend().expect("sqlite").clone();
         (engine, sq, node)
-    }
-
-    /// A `scores` local row (`trust:demo:v1`) by `attester`, unsigned.
-    #[cfg(feature = "sqlite")]
-    fn local_scores_input(attester: &str) -> crate::federation::types::LocalAttestationInput {
-        crate::federation::types::LocalAttestationInput {
-            attestation_id: None,
-            attesting_key_id: attester.to_owned(),
-            attested_key_id: None,
-            attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
-            weight: Some(1.0),
-            expires_at: None,
-            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                serde_json::json!({ "dimension": "trust:demo:v1", "score": 1.0, "confidence": 0.9 }),
-            )
-            .unwrap(),
-            subject_key_ids: vec![],
-            cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
-            scrub_signature_classical: None,
-            scrub_signature_pqc: None,
-        }
     }
 
     /// v62 (E3b, P8) — the edition-2 twin of [`local_scores_input`]: a
@@ -17269,11 +17381,14 @@ mod tests {
     #[tokio::test]
     async fn a_widening_never_strips_the_delegation_purpose_marker() {
         use crate::federation::FederationDirectory;
-        let (engine, sq, node) = engine_with_registered_node("node-929").await;
-        let id = sq
-            .attestation_upsert_local(local_scores_input(&node))
-            .await
-            .unwrap();
+        // v62 (E3, round 6; CP2): the prior is an EDITION-2 local row (the
+        // earlier unsigned JSON local row meets the shut `widen_audience`
+        // door, which is not what this witness is about).
+        let (engine, sq, _node) = engine_with_registered_node("node-929").await;
+        let signer = engine
+            .composite_signer("929 widening witness")
+            .expect("a composite signer");
+        let id = local_e2_row(&*sq, signer, e2_scores_input()).await;
         let local = sq.get_attestation(&id).await.unwrap().expect("row");
         engine
             .enter_mesh(
@@ -17425,12 +17540,16 @@ mod tests {
     #[tokio::test]
     async fn contextual_integrity_mismatch_names_the_axis() {
         use crate::federation::{ContentRef, DataSubject, Error, FederationDirectory};
+        // v62 (E3, round 6; CP2): an EDITION-2 local row crosses on its own
+        // statement, which is where the contextual-integrity axes are judged
+        // (an unsigned JSON local row takes the earlier crossing arm).
         let (engine, sq, node) = engine_with_registered_node("node-39e").await;
-        let id = sq
-            .attestation_upsert_local(local_scores_input(&node))
-            .await
-            .unwrap();
+        let signer = engine
+            .composite_signer("39e crossing witness")
+            .expect("a composite signer");
+        let id = local_e2_row(&*sq, signer, e2_scores_input()).await;
         let row = sq.get_attestation(&id).await.unwrap().expect("row");
+        let _ = &node;
         let axis_of = |e: &Error| match e {
             Error::ContextualIntegrityMismatch { axis, .. } => *axis,
             other => panic!("expected a CI mismatch, got {other}"),
@@ -17500,6 +17619,21 @@ mod tests {
         // reference to a room with no steward-bound authority, and a USER key
         // is steward-bound.
         let human = e2::put_key(&*sq, "human-39f", &[identity_type::USER]).await;
+        // v62.0.0 (P8-fix15; GC1, CC 3.2) — an AGENT member must be
+        // steward-bound, or the founding is HELD
+        // `unstewarded_community_member`: its human is its OWNER
+        // (`admission::is_steward_bound` (2b)). The owner binding carries the
+        // owner's voice and the agent's own, dated inside the agent's record
+        // (which starts at its registration above).
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        crate::federation::edition2::occurrence::state_agent_owner_binding(
+            &*sq,
+            &ts::local_signer("human-39f"),
+            &ts::local_signer("node-39f"),
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+        )
+        .await
+        .expect("the agent's owner binding");
         // v47.0.0 (#897) / v54.0.0 (#1034) — the room is a declared
         // affiliation, founded (v62, T1) by both members' roster voices. Its
         // instant is after the node key's record starts (registered above).
@@ -17533,6 +17667,14 @@ mod tests {
         )
         .await
         .expect("the affiliation is founded");
+        if let StatementOutcome::Pending { row_id, .. } = &founded {
+            panic!(
+                "the affiliation founding is held: {:?}",
+                crate::federation::edition2::fold::why_held(&*sq, row_id)
+                    .await
+                    .unwrap()
+            );
+        }
         assert!(
             matches!(founded, StatementOutcome::Row { .. }),
             "{founded:?}"
@@ -17710,12 +17852,14 @@ mod tests {
         let (engine, sq, node) = engine_with_registered_agent("node-39h").await;
         // A trace envelope's REQUIRED members (`agent_id_hash`, `trace_id`,
         // `trace`) are what the trace-dimension gate asks for and cannot be
-        // stripped; a restriction strips an OPTIONAL member.
+        // stripped; a restriction strips an OPTIONAL member. v62 (E3, round
+        // 6): the trace family's list is closed (P1d), so the optional member
+        // is a COMMON one, `body` (the earlier operator note member is none).
         let mut input = e2_trace_input(&node, "trace-39h");
         input
             .attestation_envelope
             .extra
-            .insert("operator_note".into(), serde_json::json!("strip me"));
+            .insert("body".into(), serde_json::json!("strip me"));
         let signer = engine
             .composite_signer("e3b sweep witness")
             .expect("a composite signer");
@@ -17727,14 +17871,14 @@ mod tests {
                 "grants": "transfer",
                 "attestation_prefixes": ["trace:"],
                 "audience": "species",
-                "restrictions": [{"op": "strip_field", "path": "operator_note"}],
+                "restrictions": [{"op": "strip_field", "path": "body"}],
             }),
         )
         .await;
         let prior = sq.get_attestation(&id).await.unwrap().expect("row");
         assert_eq!(prior.cohort_scope, cohort_scope::SELF);
         assert!(
-            prior.attestation_envelope.get("operator_note").is_some(),
+            prior.attestation_envelope.get("body").is_some(),
             "the prior keeps it"
         );
         // The (c) hook already widened during the grant's emit; asking again
@@ -17745,7 +17889,7 @@ mod tests {
                 &id,
                 &producer_ci(&prior, crate::federation::Audience::Species),
                 None,
-                &["operator_note".to_owned()],
+                &["body".to_owned()],
             )
             .await
             .unwrap();
@@ -17764,10 +17908,7 @@ mod tests {
             .filter(|a| a.cohort_scope == cohort_scope::SPECIES)
             .collect();
         assert_eq!(w.len(), 1);
-        assert!(
-            w[0].attestation_envelope.get("operator_note").is_none(),
-            "stripped"
-        );
+        assert!(w[0].attestation_envelope.get("body").is_none(), "stripped");
         assert_eq!(
             w[0].attestation_envelope["trace_id"],
             serde_json::json!("trace-39h"),
@@ -17920,8 +18061,9 @@ mod tests {
     #[cfg(feature = "sqlite")]
     async fn emit_509_withdraws(engine: &Engine, target_id: &str) -> String {
         let envelope = crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
+            // v62 (E3, round 6): a composer's payload is the common members
+            // and `refs.target` (P1d); the earlier `withdrawal_reason` is none.
             "references_attestation_id": target_id,
-            "withdrawal_reason": "509 test",
         }))
         .unwrap();
         let input = crate::federation::EmitAttestationInput::with_envelope(
@@ -19153,6 +19295,8 @@ mod tests {
             )
             .await
             .expect("grant_delegation");
+        // v62 (E3, round 6): an own-act delegation waits for the delegate's voice.
+        land_held_row(&*sq, &att_id).await;
 
         let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
         assert_eq!(
@@ -19205,6 +19349,8 @@ mod tests {
             )
             .await
             .expect("steward_bind infra:* admitted on node key");
+        // v62 (E3, round 6): the binding waits for its second signers' voices.
+        land_held_row(&*sq, &att_id).await;
         let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
         // Edge carries infra:* only (passed the node-agency gate).
         let scope = row.attestation_envelope["scope"].as_array().unwrap();
@@ -19370,7 +19516,7 @@ mod tests {
         let valid_until = crate::federation::admission::render_signed_instant(
             chrono::Utc::now() + chrono::Duration::days(30),
         );
-        engine
+        let binding_id = engine
             .steward_bind_incapacity(
                 &s_signer,
                 &ward_a,
@@ -19382,6 +19528,8 @@ mod tests {
             )
             .await
             .expect("(2) a conforming adult-incapacity guardianship must ADMIT");
+        // v62 (E3, round 6): the binding waits for its second signers' voices.
+        land_held_row(&*sq, &binding_id).await;
         assert!(
             steward_bindings_of(&*sq, &ward_a)
                 .await
@@ -19536,6 +19684,8 @@ mod tests {
             .emit_attestation(&w_signer, cross)
             .await
             .expect("witness-targets-subject age_assurance admitted");
+        // v62 (E3, round 6): a counted row waits for its resolved parties.
+        land_held_row(&*sq, &att_id).await;
         let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
         assert_eq!(row.attesting_key_id, w, "attester = the witness");
         assert_eq!(row.attested_key_id, t, "subject rides attested_key_id");
@@ -19665,10 +19815,12 @@ mod tests {
             crate::federation::types::cohort_scope::FEDERATION,
         );
         cross.attested_key_id = Some(t.clone());
-        engine
+        let cross_id = engine
             .emit_attestation(&w_signer, cross)
             .await
             .expect("witness-targets-subject admitted on postgres");
+        // v62 (E3, round 6): a counted row waits for its resolved parties.
+        land_held_row(pg.as_ref(), &cross_id).await;
         assert_eq!(engine.age_band(&t).await.unwrap(), AgeBand::Adult);
 
         // Self-graduation via the witness prefix rejected on PG too.
@@ -19758,10 +19910,12 @@ mod tests {
             crate::federation::types::cohort_scope::FEDERATION,
         );
         minor.attested_key_id = Some(mg_ward.clone());
-        engine
+        let minor_id = engine
             .emit_attestation(&w_signer, minor)
             .await
             .expect("witness attests the ward minor");
+        // v62 (E3, round 6): a counted row waits for its resolved parties.
+        land_held_row(&*sq, &minor_id).await;
         assert_eq!(engine.age_band(&mg_ward).await.unwrap(), AgeBand::Minor);
         // A PROVEN minor with no steward fails secure.
         assert!(
@@ -19802,10 +19956,12 @@ mod tests {
             crate::federation::types::cohort_scope::FEDERATION,
         );
         adult.attested_key_id = Some(s.clone());
-        engine
+        let adult_id = engine
             .emit_attestation(&w_signer, adult)
             .await
             .expect("witness attests the steward adult");
+        // v62 (E3, round 6): a counted row waits for its resolved parties.
+        land_held_row(&*sq, &adult_id).await;
         assert_eq!(engine.age_band(&s).await.unwrap(), AgeBand::Adult);
 
         // The CC 3.2 positive case: adult user S → proven-minor T ADMITTED
@@ -19943,10 +20099,12 @@ mod tests {
             crate::federation::types::cohort_scope::FEDERATION,
         );
         minor.attested_key_id = Some(ward.clone());
-        engine
+        let minor_id = engine
             .emit_attestation(&w_signer, minor)
             .await
             .expect("witness attests ward minor");
+        // v62 (E3, round 6): a counted row waits for its resolved parties.
+        land_held_row(pg.as_ref(), &minor_id).await;
         let mut adult = crate::federation::EmitAttestationInput::with_envelope(
             "age_assurance:government:adult:v1",
             crate::federation::envelope::EnvelopeCore::from_value(
@@ -19956,10 +20114,12 @@ mod tests {
             crate::federation::types::cohort_scope::FEDERATION,
         );
         adult.attested_key_id = Some(s.clone());
-        engine
+        let adult_id = engine
             .emit_attestation(&w_signer, adult)
             .await
             .expect("witness attests steward adult");
+        // v62 (E3, round 6): a counted row waits for its resolved parties.
+        land_held_row(pg.as_ref(), &adult_id).await;
         assert_eq!(engine.age_band(&ward).await.unwrap(), AgeBand::Minor);
         assert_eq!(engine.age_band(&s).await.unwrap(), AgeBand::Adult);
         assert!(
@@ -20348,6 +20508,8 @@ mod tests {
             )
             .await
             .expect("add_moderator");
+        // v62 (E3, round 6): the appointment waits for the moderator's voice.
+        land_held_row(&*sq, &appt).await;
         assert!(
             is_named_moderator(&*sq, &moderator, &comm_1, SCOPE_MODERATE)
                 .await
@@ -20933,14 +21095,19 @@ mod tests {
         ghost_rec.family_key_id = ghost.clone();
         let ghost_v1 = crate::federation::tier_ingest::test_support::sign_family(&ghost, ghost_rec);
         let unheld = e2::row_id_of(&e2::family_voices(&ghost_v1, 1, None, at_ms)[0]);
+        // CC 2.7 (round 6): the missing head is a WAIT (held, concluding
+        // nothing), not a refusal; either way the version does not land.
+        let over_unheld = e2::put_voices(
+            d,
+            &e2::family_voices(&ghost_v1, 2, Some(&unheld), at_ms + 3),
+        )
+        .await;
         assert!(
-            e2::put_voices(
-                d,
-                &e2::family_voices(&ghost_v1, 2, Some(&unheld), at_ms + 3)
-            )
-            .await
-            .is_err(),
-            "a version over an unheld head is not admitted"
+            !matches!(
+                over_unheld,
+                Ok(crate::federation::edition2::ingest::StatementOutcome::Row { .. })
+            ),
+            "a version over an unheld head is not admitted: {over_unheld:?}"
         );
         assert!(d.lookup_family(&e2::kid(&ghost)).await.unwrap().is_none());
     }
@@ -22077,6 +22244,8 @@ mod tests {
             )
             .await
             .expect("add_moderator");
+        // v62 (E3, round 6): the appointment waits for the moderator's voice.
+        land_held_row(&*pg, &appt).await;
         assert!(
             is_named_moderator(&*pg, &moderator, &community, SCOPE_MODERATE)
                 .await

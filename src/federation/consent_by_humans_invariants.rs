@@ -258,9 +258,20 @@ pub(crate) mod bodies {
         );
 
         // A conferral (the login delegation's shape) is a job, not stewardship.
-        put(d, conferral(&format!("i94-conf-{s}"), &alice_s, &agent))
-            .await
-            .expect("I94: a conferral admits");
+        // v62.0.0 (round 6, E7) — with the delegate's own voice (CC 2.6.1.9,
+        // E0's `land_delegation`); short of it the conferral is held.
+        let (out, missing) =
+            e2::land_delegation(d, &conferral(&format!("i94-conf-{s}"), &alice_s, &agent))
+                .await
+                .expect("I94: a conferral admits");
+        assert!(
+            missing.is_empty()
+                && !matches!(
+                    out,
+                    crate::federation::edition2::ingest::StatementOutcome::Pending { .. }
+                ),
+            "I94: a conferral admits: {out:?}, unvoiced {missing:?}"
+        );
         assert!(
             admission::steward_bindings_of(d, &agent)
                 .await
@@ -810,22 +821,29 @@ mod run {
             vec![alice.clone()],
             "I97: on A the human stewards the agent"
         );
-        let mut crossed = 0;
-        for served in crate::federation::key_plane::test_support::served_identity_occurrences(
-            sa.as_dyn_directory(),
-            1_000,
-        )
-        .await
-        .unwrap()
-        {
-            if served.occurrence.identity_occurrence.occurrence_key_id == agent {
-                sb.put_identity_occurrence(served.occurrence)
-                    .await
-                    .expect("I97: B admits the agent's occurrence through the gated door");
-                crossed += 1;
-            }
+        // v62.0.0 (round 6, E7) — the agent's occurrence is an edition-2
+        // `identity:occurrence` bind (its own identity, P8's ceremony); its
+        // statements reach B through B's statement door, as the mesh delivers
+        // them. (The earlier served-occurrence plane and its gated JSON door
+        // carry no edition-2 bind.)
+        let occurrence = ciris_verify_core::namespace_match::family_id(
+            crate::federation::edition2::occurrence::OCCURRENCE_FAMILY,
+        );
+        let binds = sa
+            .edition2_statements_about(&occurrence, &agent)
+            .await
+            .unwrap();
+        assert!(!binds.is_empty(), "I97: the anchor was on the plane");
+        for st in &binds {
+            crate::federation::edition2::ingest::put_statement(
+                sb.as_ref(),
+                st,
+                None,
+                crate::federation::edition2::ingest::INGEST_TIER,
+            )
+            .await
+            .expect("I97: B admits the agent's occurrence bind");
         }
-        assert_eq!(crossed, 1, "I97: the anchor was on the plane");
         // v62.0.0 (round 3) — the agent's human is its OWNER binding: its
         // statements (the owner's and the agent's voice) reach B through B's
         // statement door, as the mesh delivers them.

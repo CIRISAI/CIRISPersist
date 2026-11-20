@@ -1326,7 +1326,7 @@ pub(crate) fn family_charter_threshold(family: &super::types::Family, roster_siz
 /// `scrub_key_id`/`scrub_signature_*` plus every `additional_scrubs` entry, all
 /// over the SAME canonical envelope) is intersected with the family's OWN active
 /// roster, and each survivor is hybrid-verified through
-/// [`verify_envelope_hybrid_signature`](super::verify_envelope_hybrid_signature)
+/// `verify_envelope_hybrid_signature` (deleted v62.0.0, F0-cp8)
 /// — the same primitive federation-tier ingest runs, against pubkeys resolved
 /// from THIS node's directory. Never the roster a caller passed, never pubkeys
 /// carried on the row: authority is re-derived from the node's own verified

@@ -65,7 +65,7 @@ pub struct LineageHeadCosign {
 
 impl LineageHeadCosign {
     /// The signed envelope: every member but the signatures, plus the domain
-    /// label. The verifier is [`crate::federation::tier_ingest::verify_envelope_hybrid_signature`]
+    /// label. The verifier is `verify_envelope_hybrid_signature` (deleted v62.0.0, F0-cp8)
     /// over this value, exactly as every other signed persist object.
     pub fn signing_envelope(&self) -> serde_json::Value {
         let mut v = serde_json::json!({
@@ -212,6 +212,23 @@ where
     })
 }
 
+/// v62.0.0 (E8-fix4; CIRISPersist#934) — **the raw cosign store's gate,
+/// decided once**: every backend's `store_lineage_head_cosign` runs this
+/// before its insert. A cosign of the earlier form is a JSON object, and this
+/// leaf is a trait door too, so it refuses by name itself (JSON-cut slice
+/// F), not only behind [`admit_lineage_head_cosign`].
+///
+/// # Errors
+/// `earlier_form_object` once the earlier-form doors are shut.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn plan_store_lineage_head_cosign(
+    cosign: &LineageHeadCosign,
+) -> Result<(), crate::federation::Error> {
+    let _ = cosign;
+    crate::federation::edition2::door::refuse_earlier_form("lineage_head_cosign")?;
+    Ok(())
+}
+
 /// **The cosign door** (FSD `TRUST_ROOT_RC6.md` §2.1) — every refusal in door
 /// order, then the store. `now` is the door's one clock read (round-9
 /// discipline). A cosign for a head this node does not hold is STORED and
@@ -308,14 +325,12 @@ where
         .await;
     }
     // 4. the signature, hybrid-Strict over the domain-labelled envelope
-    if crate::federation::tier_ingest::verify_envelope_hybrid_signature(
-        directory,
+    if crate::federation::edition2::group::vouched_envelope(
         &cosign.witness_key_id,
         &cosign.signing_envelope(),
         &cosign.signature_classical,
-        cosign.signature_pqc.as_deref(),
+        "lineage_head_cosign",
     )
-    .await
     .is_err()
     {
         return refused(LineageCosignRefusal::SignatureInvalid);

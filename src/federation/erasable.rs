@@ -1255,7 +1255,7 @@ mod ingest_gate_proof {
     /// see the `original_content_hash mismatch` message — ambiguous between
     /// redaction and tampering. In fact the hybrid signature is verified
     /// **before** the hash cross-check
-    /// ([`verify_envelope_hybrid_signature`](super::tier_ingest::verify_envelope_hybrid_signature)
+    /// (`verify_envelope_hybrid_signature` (deleted v62.0.0, F0-cp8)
     /// runs `verify_hybrid` first and only then compares the declared hash), so
     /// a lawfully-redacted sealed row never reaches the ambiguous message at
     /// all. It is refused as **"Classical signature verification failed:

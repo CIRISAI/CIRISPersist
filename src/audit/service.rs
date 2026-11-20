@@ -24,14 +24,14 @@ use super::types::{
 };
 use super::Error;
 use crate::ClaimResult;
-use ciris_verify_core::transparency::{ConsistencyProof, MerkleProof, SignedTreeHead};
+use ciris_verify_core::transparency::SignedTreeHead;
 
 /// Per-tenant chain head — the `(sequence_number, entry_hash)` of the
 /// tail row, suitable for composing the next [`AuditEntry`].
 ///
 /// Returned by [`AuditService::next_chain_position`] so emit-side
-/// callers (v1.5.0 Phase E `federation::emit::grant_trust`) can build
-/// and sign the next entry without re-implementing the tenant-tail
+/// callers (the Agent's `audit_seal_entry` flow) can build and sign
+/// the next entry without re-implementing the tenant-tail
 /// probe each backend already performs in `record_entry` under
 /// `SELECT … FOR UPDATE` / `BEGIN IMMEDIATE`. This helper is best-
 /// effort: by the time the caller commits its newly-signed entry the
@@ -56,8 +56,9 @@ pub trait AuditService: Send + Sync {
     /// Verify-and-insert an audit entry. Persist:
     /// 1. Re-derives `entry_hash` from canonical bytes; rejects on
     ///    mismatch with caller-claimed value (AV-49).
-    /// 2. Verifies Ed25519 signature against `actor_id` (which IS
-    ///    the pubkey).
+    /// 2. Verifies the ONE composite signature under the live
+    ///    edition-2 `key:record` of the identity-ref `actor_id` names
+    ///    (v62.0.0, F0-cp8; a lone Ed25519 is refused by name).
     /// 3. Asserts `sequence_number = (prior entry's seq) + 1` for
     ///    the tenant; sequence_number=1 must have
     ///    `prev_hash = GENESIS_PREV_HASH`.
@@ -108,7 +109,7 @@ pub trait AuditService: Send + Sync {
     ///
     /// `accessor` is a free-form observability tag surfaced into
     /// tracing only; the cryptographic actor identity remains
-    /// `entry.actor_id` (self-signed: actor_id IS the pubkey).
+    /// `entry.actor_id` (v62.0.0: the signer's identity-ref).
     ///
     /// # Determinism guarantee
     ///
@@ -197,10 +198,7 @@ pub trait AuditService: Send + Sync {
     ///
     /// Backends implement by constructing a per-tenant
     /// `TransparencyStore<AuditLeaf>` (PgMerkleStore / SqliteMerkleStore)
-    /// and calling its `latest_sth()`. Phase E's `grant_trust` uses
-    /// this to surface the post-emit STH on the receipt without
-    /// changing the [`AuditService::record_entry`] return type.
-    /// Phase G's "current STH" read API will hit this same surface.
+    /// and calling its `latest_sth()`.
     ///
     /// # Default impl
     ///
@@ -211,207 +209,5 @@ pub trait AuditService: Send + Sync {
     ) -> impl Future<Output = Result<Option<SignedTreeHead>, Error>> + Send {
         let _ = tenant_id;
         async { Err(Error::NotImplemented("current_sth")) }
-    }
-
-    /// Look up the canonical `grant_id` (federation_trust_grants PK)
-    /// for the projection row materialized by a specific chain event.
-    /// Used by Phase E's `grant_trust` to surface the canonical
-    /// projection PK on the receipt (rather than a fresh UUID that
-    /// wouldn't match a subsequent read-path lookup, especially on
-    /// re-issuance where the UPSERT keeps the original `grant_id`
-    /// stable).
-    ///
-    /// Lookups are tenant-scoped: `audit_log.sequence_number` is
-    /// `UNIQUE(tenant_id, sequence_number)` (per-tenant, not global),
-    /// so a `chain_event_id` alone may match multiple
-    /// `federation_trust_grants` rows across tenants. Phase E's
-    /// `grant_trust` always knows the tenant it just emitted into; the
-    /// migration `V045__federation_trust_grants_unique_tenant_chain`
-    /// adds `UNIQUE(tenant_id, chain_event_id)` to make the schema
-    /// enforce the invariant the API now relies on.
-    ///
-    /// Returns `Ok(None)` if no projection row exists for the chain
-    /// event in the given tenant (caller wasn't a `trust_grant`
-    /// subject_kind, or the projection failed and Phase I backfill
-    /// hasn't caught up).
-    ///
-    /// # Default impl
-    ///
-    /// Returns [`Error::NotImplemented`].
-    fn lookup_grant_id_by_chain_event(
-        &self,
-        tenant_id: &str,
-        chain_event_id: i64,
-    ) -> impl Future<Output = Result<Option<uuid::Uuid>, Error>> + Send {
-        let _ = (tenant_id, chain_event_id);
-        async { Err(Error::NotImplemented("lookup_grant_id_by_chain_event")) }
-    }
-
-    // ── v1.5.0 Phase F+G — trust-grant read API + proof retrieval ───
-    //
-    // FSD §4.3 (read API) + §4.1 (inclusion / consistency proof
-    // signatures). Phase F is the projection-side queries; Phase G is
-    // the Merkle-side proof generation against the per-tenant store
-    // already shipped at Phase B.
-
-    /// v1.5.0 Phase F — point-lookup a trust grant by its canonical
-    /// PK (`federation_trust_grants.grant_id`). Returns `None` if no
-    /// such row exists. Used by Phase G's inclusion-proof API to
-    /// resolve a grant_id back to its `(tenant_id, chain_event_id)`
-    /// coordinates before generating the Merkle proof.
-    ///
-    /// # Default impl
-    ///
-    /// Returns [`Error::NotImplemented`].
-    fn get_trust_grant(
-        &self,
-        grant_id: uuid::Uuid,
-    ) -> impl Future<Output = Result<Option<crate::federation::trust_grant::TrustGrantRow>, Error>> + Send
-    {
-        let _ = grant_id;
-        async { Err(Error::NotImplemented("get_trust_grant")) }
-    }
-
-    /// v1.5.0 Phase F — live-grants lookup for `(grantee, purpose, scope)`.
-    /// Returns rows from **all** granters that match — caller filters by
-    /// granter (NodeCore's `resolve_trust` composes this) and decides
-    /// whether a wildcard scope satisfies the query. Per FSD §3.3
-    /// wildcards (`scope = '*'`) are also surfaced unconditionally:
-    /// the caller is the policy layer.
-    ///
-    /// `include_revoked` flips whether rows with `revoked_at IS NOT NULL`
-    /// are returned. `include_expired` flips whether rows with
-    /// `expires_at <= NOW()` are returned (which are NOT necessarily
-    /// `revoked_at`-populated until a re-issuance projects them).
-    ///
-    /// # Default impl
-    ///
-    /// Returns [`Error::NotImplemented`].
-    fn lookup_trust_grant(
-        &self,
-        grantee_key: &str,
-        purpose: crate::federation::trust_grant::TrustPurpose,
-        scope: &str,
-        include_revoked: bool,
-        include_expired: bool,
-    ) -> impl Future<Output = Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error>> + Send
-    {
-        let _ = (
-            grantee_key,
-            purpose,
-            scope,
-            include_revoked,
-            include_expired,
-        );
-        async { Err(Error::NotImplemented("lookup_trust_grant")) }
-    }
-
-    /// v1.5.0 Phase F — filter query over `federation_trust_grants`.
-    /// All non-`None` fields on the filter are AND-intersected.
-    /// `scope_prefix` matches via SQL `LIKE '<prefix>%'`. Revoked /
-    /// expired rows are excluded unless the matching `include_*` flag
-    /// on the filter is set.
-    ///
-    /// # Default impl
-    ///
-    /// Returns [`Error::NotImplemented`].
-    fn list_trust_grants(
-        &self,
-        filter: crate::federation::trust_grant::TrustGrantFilter,
-    ) -> impl Future<Output = Result<Vec<crate::federation::trust_grant::TrustGrantRow>, Error>> + Send
-    {
-        let _ = filter;
-        async { Err(Error::NotImplemented("list_trust_grants")) }
-    }
-
-    /// v1.5.0 Phase G — fetch the `canonical_bytes` column for the
-    /// merkle_leaves row keyed by `(tenant_id, chain_event_id)`. These
-    /// are the RFC 6962 §2.1 hashing-form bytes a verifier needs to
-    /// recompute `leaf_hash = sha256(0x00 || canonical_bytes)` and
-    /// walk the inclusion proof up to the STH's root_hash without
-    /// trusting the directory's projection.
-    ///
-    /// Returns `Ok(None)` if no merkle leaf was appended for the
-    /// chain event (Merkle hook disabled at emit time, or Phase I
-    /// backfill not yet run).
-    ///
-    /// # Default impl
-    ///
-    /// Returns [`Error::NotImplemented`].
-    fn leaf_canonical_bytes_for_chain_event(
-        &self,
-        tenant_id: &str,
-        chain_event_id: i64,
-    ) -> impl Future<Output = Result<Option<Vec<u8>>, Error>> + Send {
-        let _ = (tenant_id, chain_event_id);
-        async {
-            Err(Error::NotImplemented(
-                "leaf_canonical_bytes_for_chain_event",
-            ))
-        }
-    }
-
-    /// v1.5.0 Phase G — RFC 6962 inclusion proof for a chain event
-    /// against the **current** STH for its tenant. Wraps a per-tenant
-    /// `TransparencyStore<AuditLeaf>` in a `TransparencyLog` and
-    /// delegates to `inclusion_proof(leaf_index)`. Maps
-    /// `chain_event_id → leaf_index` via the merkle_leaves table.
-    ///
-    /// Returns [`Error::NotFound`] if no merkle leaf exists for the
-    /// chain event.
-    ///
-    /// # Default impl
-    ///
-    /// Returns [`Error::NotImplemented`].
-    fn inclusion_proof_for_chain_event(
-        &self,
-        tenant_id: &str,
-        chain_event_id: i64,
-    ) -> impl Future<Output = Result<MerkleProof, Error>> + Send {
-        let _ = (tenant_id, chain_event_id);
-        async { Err(Error::NotImplemented("inclusion_proof_for_chain_event")) }
-    }
-
-    /// v1.5.0 Phase G — RFC 6962 consistency proof between two tree
-    /// sizes for a tenant. Verifier confirms STH(old_size) →
-    /// STH(new_size) is a legal append (no retroactive rewrite).
-    ///
-    /// # Default impl
-    ///
-    /// Returns [`Error::NotImplemented`].
-    fn consistency_proof(
-        &self,
-        tenant_id: &str,
-        old_size: u64,
-        new_size: u64,
-    ) -> impl Future<Output = Result<ConsistencyProof, Error>> + Send {
-        let _ = (tenant_id, old_size, new_size);
-        async { Err(Error::NotImplemented("consistency_proof")) }
-    }
-
-    /// v1.5.0 Phase I (FSD §6.2) — enumerate V020 trust rows where
-    /// `trusted_by` matches `local_pubkey`. Used by
-    /// [`crate::federation::backfill::backfill_v020_trust_rows`] to
-    /// drive the one-shot migration from the V020 trust columns on
-    /// `federation_keys` to V021's signed-event substrate.
-    ///
-    /// Returned rows satisfy `trust_relationship IS NOT NULL` (i.e.,
-    /// they have an explicit V020 grant — rows with NULL trust
-    /// columns are pre-V020 and not backfillable). Rows where
-    /// `trusted_by` is some *other* agent's `key_id` are excluded
-    /// per the FSD §6.2 scope constraint: only the granter can
-    /// re-emit on the chain (FSD §3.1, signer == author_id).
-    ///
-    /// # Default impl
-    ///
-    /// Returns [`Error::NotImplemented`]. PG + SQLite both ship
-    /// concrete overrides at v1.5.0 Phase I.
-    fn read_v020_trust_rows_for_local(
-        &self,
-        local_pubkey: &str,
-    ) -> impl Future<Output = Result<Vec<crate::federation::trust_grant::V020TrustRow>, Error>> + Send
-    {
-        let _ = local_pubkey;
-        async { Err(Error::NotImplemented("read_v020_trust_rows_for_local")) }
     }
 }

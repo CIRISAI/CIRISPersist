@@ -309,6 +309,11 @@ pub fn parse_goal_body(
     envelope: &serde_json::Value,
 ) -> Result<GoalBody, (&'static str, String)> {
     use super::malformed_row::{GOAL_BODY, GOAL_META_ALIGNMENT};
+    // v62.0.0 (E5-fix3) — the goal family's own members (`goal_text`,
+    // `cohort_id`, `meta_goal_alignment`) are read from the row's `body` when
+    // it states one (an amendment: [`plan_goal_amendment_row`]); `score` is a
+    // common member and stays where every row states it.
+    let members = goal_members(envelope);
     let m = super::namespace::matcher::match_family(dimension);
     let scale = match (m.family, m.refusal, m.binds.get("scale")) {
         (Some(GOAL_FAMILY), None, Some(s)) => s.clone(),
@@ -319,13 +324,13 @@ pub fn parse_goal_body(
             ))
         }
     };
-    let cohort_id = match envelope.get(COHORT_ID_MEMBER) {
+    let cohort_id = match members.get(COHORT_ID_MEMBER) {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(c)) => Some(c.as_str()),
         Some(_) => return Err((GOAL_BODY, "cohort_id is not a string".into())),
     };
     let scope = GoalScope::new(&scale, cohort_id).map_err(|e| (GOAL_BODY, e))?;
-    let goal_text = envelope
+    let goal_text = members
         .get(GOAL_TEXT_MEMBER)
         .and_then(serde_json::Value::as_str)
         .filter(|t| !t.trim().is_empty())
@@ -336,7 +341,7 @@ pub fn parse_goal_body(
         .and_then(serde_json::Value::as_f64)
         .filter(|s| (-1.0..=1.0).contains(s))
         .ok_or((GOAL_BODY, "score is missing or outside [-1, 1]".to_owned()))?;
-    let alignment = envelope.get(META_ALIGNMENT_MEMBER).ok_or((
+    let alignment = members.get(META_ALIGNMENT_MEMBER).ok_or((
         GOAL_META_ALIGNMENT,
         "meta_goal_alignment is missing: every goal names the M-1 dimension it serves and why"
             .to_owned(),
@@ -363,6 +368,29 @@ pub fn parse_goal_body(
         meta_goal_alignment,
         score,
     })
+}
+
+/// v62.0.0 (E5-fix3; CC 2.6.1.3, CC 3.1.9.7) — **where a goal row states its
+/// family's members**: in its `body` when it carries one that holds them, else
+/// at the top of the envelope (a declaration, whose family has no payload
+/// list, states them there). An amendment is a `supersedes`, a composer, and a
+/// composer's payload is the common members and `refs.target` only
+/// (`edition2::payloads::check_composer`): `body` is a common member ("the
+/// family's body", CC 2.6.1.3), so the amendment carries the whole new goal
+/// there. One reader for both shapes, so the gate, the planners and the
+/// projection agree.
+#[must_use]
+pub fn goal_members(envelope: &serde_json::Value) -> &serde_json::Value {
+    match envelope.get("body") {
+        Some(b)
+            if b.is_object()
+                && (b.get(GOAL_TEXT_MEMBER).is_some()
+                    || b.get(META_ALIGNMENT_MEMBER).is_some()) =>
+        {
+            b
+        }
+        _ => envelope,
+    }
 }
 
 /// Does `dimension` name the goal family (by stem)?
@@ -527,7 +555,9 @@ pub fn plan_goal_row(input: &GoalInput) -> Result<EmitAttestationInput, Error> {
 }
 
 /// **An amendment**: `supersedes` naming `head_id` (the goal's current head:
-/// the declaration, or its latest amendment) and carrying the whole new body.
+/// the declaration, or its latest amendment) and carrying the whole new body
+/// in its `body` member (v62.0.0, E5-fix3: a composer states the common
+/// members only).
 ///
 /// # Errors
 ///
@@ -538,6 +568,28 @@ pub fn plan_goal_amendment_row(
     input: &GoalInput,
 ) -> Result<EmitAttestationInput, Error> {
     let mut env = goal_envelope(input)?;
+    // v62.0.0 (E5-fix3) — a `supersedes` is a composer: its payload is the
+    // common members and `refs.target` (`edition2::payloads::check_composer`),
+    // never the goal family's members at the top. The whole new goal rides
+    // the common `body` member ([`goal_members`]); `dimension`, `score` and
+    // `confidence` are common and stay. Checked by the gate's own parser.
+    let dimension = format!("{GOAL_DIMENSION_PREFIX}{}:v1", input.scale);
+    let mut body = serde_json::Map::new();
+    if let Some(o) = env.as_object_mut() {
+        for member in [GOAL_TEXT_MEMBER, META_ALIGNMENT_MEMBER, COHORT_ID_MEMBER] {
+            if let Some(v) = o.remove(member) {
+                body.insert(member.to_owned(), v);
+            }
+        }
+    }
+    env["body"] = serde_json::Value::Object(body);
+    parse_goal_body(&dimension, &env).map_err(|(reason, detail)| {
+        Error::malformed_row(
+            PLANE,
+            reason,
+            format!("federation_malformed_row: {PLANE}: {reason}: {detail}"),
+        )
+    })?;
     env["references_attestation_id"] = serde_json::json!(head_id);
     env["references_attestation_type"] = serde_json::json!(head_type);
     row_input(attestation_type::SUPERSEDES, env)
@@ -908,6 +960,19 @@ mod tests {
         assert_eq!(v["references_attestation_id"], "head-1");
         assert_eq!(v["references_attestation_type"], "scores");
         assert_eq!(v["dimension"], "goal:cohort:v1");
+        // E5-fix3 — a composer states the common members only: the goal's own
+        // members ride `body`, none at the top, and the shared reader parses it.
+        for member in [GOAL_TEXT_MEMBER, META_ALIGNMENT_MEMBER, COHORT_ID_MEMBER] {
+            assert!(v.get(member).is_none(), "{member} at the top of a composer");
+            assert!(v["body"].get(member).is_some(), "{member} in the body");
+        }
+        assert_eq!(
+            parse_goal_body("goal:cohort:v1", &v)
+                .unwrap()
+                .scope
+                .cohort_id(),
+            Some("stewards")
+        );
         for verb in ["withdraws", "recants"] {
             let r = plan_goal_retraction_row(verb, "g-1").unwrap();
             assert_eq!(r.attestation_type, verb);

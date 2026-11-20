@@ -396,13 +396,23 @@ pub(crate) mod bodies {
         let t0 = cust::base();
         cust::report(d, &here, &sha, CustodyState::Here, t0).await;
         cust::report(d, &gone, &sha, CustodyState::None, t0).await;
-        // a server-class node is not in its owner's self cohort, so it cannot
-        // even place a self report: the audience and the report door agree
-        let r = cust::try_report(d, &server, &sha, CustodyState::Here, t0).await;
+        // a server-class node is not in its owner's self cohort, so its self
+        // report counts for nothing: the audience and the report door agree.
+        // v62.0.0 (E6-fix8; T2's ruling, CC 3.1.3.3 / CC 2.7.3) — outside the
+        // cohort the report WAITS (held `custody_ack_outside_cohort`); it is
+        // not a refusal.
+        let (r, why) = cust::self_report_outcome(d, &server, &sha, CustodyState::Here, t0).await;
         assert!(
-            r.as_ref()
-                .is_err_and(|e| e.to_string().contains("custody_ack_outside_cohort")),
-            "I415 a server-class node's self report is refused: {r:?}"
+            matches!(
+                r,
+                crate::federation::edition2::ingest::StatementOutcome::Pending { .. }
+            ),
+            "I415 a server-class node's self report waits: {r:?}"
+        );
+        assert_eq!(
+            why.as_deref(),
+            Some(crate::federation::edition2::fold::reason::CUSTODY_ACK_OUTSIDE_COHORT),
+            "I415 held outside its cohort"
         );
         let now = t0 + Duration::hours(1);
         let v = deficit(d, &owner, &sha, &Default::default(), now).await;

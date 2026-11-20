@@ -746,14 +746,12 @@ mod tests {
     #[cfg(all(feature = "cirisaudit", feature = "sqlite"))]
     #[tokio::test]
     async fn archive_audit_range_preserves_chain_sqlite() {
-        use crate::audit::verify::{compute_entry_hash, truncate_to_micros};
+        use crate::audit::verify::truncate_to_micros;
         use crate::audit::{AuditEntry, AuditService, GENESIS_PREV_HASH};
         use crate::engine::Engine;
         use crate::signing::LocalSigner;
         use crate::store::sqlite::SqliteBackend;
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine as _;
-        use ed25519_dalek::{Signer as _, SigningKey};
+        use ed25519_dalek::SigningKey;
         use std::sync::Arc;
         use uuid::Uuid;
 
@@ -767,8 +765,11 @@ mod tests {
         // Build + sign 10 chained entries under one tenant. recorded_at
         // is set deterministically so the archive range can target the
         // middle slice.
-        let key = SigningKey::from_bytes(&[0xA7; 32]);
-        let actor = B64.encode(key.verifying_key().to_bytes());
+        // v62.0.0 (F0-cp8) — the entries' actor: a composite key whose
+        // `key:record` the store holds.
+        let key = "retention-sqlite-a7";
+        crate::audit::test_support::put_actor(&*backend_arc, key).await;
+        let actor = crate::audit::test_support::actor(key);
         let tenant = format!("retention-{}", Uuid::new_v4().simple());
         let base_ts = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
@@ -778,7 +779,7 @@ mod tests {
         let mut prev_hash = GENESIS_PREV_HASH.to_vec();
         for seq in 1..=10i64 {
             let ts = base_ts + chrono::Duration::seconds(seq * 10);
-            let mut entry = AuditEntry {
+            let entry = AuditEntry {
                 entry_id: Uuid::new_v4().to_string(),
                 sequence_number: seq,
                 tenant_id: tenant.clone(),
@@ -792,10 +793,7 @@ mod tests {
                 recorded_at: truncate_to_micros(ts),
                 signature: String::new(),
             };
-            let hash = compute_entry_hash(&entry).unwrap();
-            entry.entry_hash = hash.to_vec();
-            let canonical = crate::audit::verify::canonical_bytes_for_entry(&entry).unwrap();
-            entry.signature = B64.encode(key.sign(&canonical).to_bytes());
+            let entry = crate::audit::test_support::seal(key, entry);
             audit.record_entry(entry.clone()).await.unwrap();
             prev_hash = entry.entry_hash.clone();
             entries.push(entry);
@@ -911,13 +909,11 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn archive_audit_range_preserves_chain_postgres() {
-        use crate::audit::verify::{compute_entry_hash, truncate_to_micros};
+        use crate::audit::verify::truncate_to_micros;
         use crate::audit::{AuditEntry, AuditService, GENESIS_PREV_HASH};
         use crate::engine::Engine;
         use crate::signing::LocalSigner;
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine as _;
-        use ed25519_dalek::{Signer as _, SigningKey};
+        use ed25519_dalek::SigningKey;
         use std::sync::Arc;
         use uuid::Uuid;
 
@@ -939,8 +935,17 @@ mod tests {
 
         // Each test run uses a unique tenant so concurrent runs / re-
         // runs don't tread on each other's rows.
-        let key = SigningKey::from_bytes(&[0xB7; 32]);
-        let actor = B64.encode(key.verifying_key().to_bytes());
+        // v62.0.0 (F0-cp8) — the entries' actor: a composite key whose
+        // `key:record` the store holds.
+        let key = "retention-pg-b7";
+        match &audit {
+            crate::engine::AuditDispatch::Postgres(b) => {
+                crate::audit::test_support::put_actor(&**b, key).await;
+            }
+            #[cfg(feature = "sqlite")]
+            crate::engine::AuditDispatch::Sqlite(_) => panic!("expected postgres dispatch"),
+        }
+        let actor = crate::audit::test_support::actor(key);
         let tenant = format!("retention-pg-{}", Uuid::new_v4().simple());
         let base_ts = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
@@ -951,7 +956,7 @@ mod tests {
         let mut prev_hash = GENESIS_PREV_HASH.to_vec();
         for seq in 1..=10i64 {
             let ts = base_ts + chrono::Duration::seconds(seq * 10);
-            let mut entry = AuditEntry {
+            let entry = AuditEntry {
                 entry_id: Uuid::new_v4().to_string(),
                 sequence_number: seq,
                 tenant_id: tenant.clone(),
@@ -965,10 +970,7 @@ mod tests {
                 recorded_at: truncate_to_micros(ts),
                 signature: String::new(),
             };
-            let hash = compute_entry_hash(&entry).unwrap();
-            entry.entry_hash = hash.to_vec();
-            let canonical = crate::audit::verify::canonical_bytes_for_entry(&entry).unwrap();
-            entry.signature = B64.encode(key.sign(&canonical).to_bytes());
+            let entry = crate::audit::test_support::seal(key, entry);
             match &audit {
                 crate::engine::AuditDispatch::Postgres(b) => {
                     b.record_entry(entry.clone()).await.unwrap();
@@ -1633,13 +1635,11 @@ mod tests {
     #[cfg(all(feature = "cirisaudit", feature = "sqlite"))]
     #[tokio::test]
     async fn archive_audit_range_rejects_multi_tenant_sqlite() {
-        use crate::audit::verify::{compute_entry_hash, truncate_to_micros};
+        use crate::audit::verify::truncate_to_micros;
         use crate::audit::{AuditEntry, AuditService, GENESIS_PREV_HASH};
         use crate::engine::Engine;
         use crate::signing::LocalSigner;
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine as _;
-        use ed25519_dalek::{Signer as _, SigningKey};
+        use ed25519_dalek::SigningKey;
         use std::sync::Arc;
         use uuid::Uuid;
 
@@ -1655,13 +1655,16 @@ mod tests {
         let sq = engine.sqlite_backend().expect("sqlite backend");
         let audit = crate::audit::sqlite::SqliteAuditBackend::new(sq.conn_handle());
 
-        let key = SigningKey::from_bytes(&[0xC9; 32]);
-        let actor = B64.encode(key.verifying_key().to_bytes());
+        // v62.0.0 (F0-cp8) — the entries' actor: a composite key whose
+        // `key:record` the store holds.
+        let key = "retention-mt-c9";
+        crate::audit::test_support::put_actor(&**sq, key).await;
+        let actor = crate::audit::test_support::actor(key);
         let base_ts = chrono::DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
         for tenant in &["tnt-a", "tnt-b"] {
-            let mut entry = AuditEntry {
+            let entry = AuditEntry {
                 entry_id: Uuid::new_v4().to_string(),
                 sequence_number: 1,
                 tenant_id: (*tenant).to_owned(),
@@ -1675,9 +1678,7 @@ mod tests {
                 recorded_at: truncate_to_micros(base_ts),
                 signature: String::new(),
             };
-            entry.entry_hash = compute_entry_hash(&entry).unwrap().to_vec();
-            let canonical = crate::audit::verify::canonical_bytes_for_entry(&entry).unwrap();
-            entry.signature = B64.encode(key.sign(&canonical).to_bytes());
+            let entry = crate::audit::test_support::seal(key, entry);
             audit.record_entry(entry).await.unwrap();
         }
 

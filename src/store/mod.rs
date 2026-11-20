@@ -103,6 +103,10 @@ pub mod sqlite;
 /// `FSD/SQLITE_CONNECTION_MODEL.md`.
 #[cfg(feature = "sqlite")]
 pub mod sqlite_conn_model;
+// v62.0.0 (v62 P8-fix16) — I3523b: every production writer of
+// `federation_attestations` stores the row's restatement key.
+#[cfg(test)]
+mod restatement_key_gate;
 /// v60.0.0 (CIRISPersist#1002) — a migrated in-memory clone of one template
 /// per process: the test constructor (the genesis scratch is deleted, v62.0.0).
 #[cfg(feature = "sqlite")]

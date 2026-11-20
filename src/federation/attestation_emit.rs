@@ -2,9 +2,6 @@
 //! ATTESTATION-emit recipe, lifted out of [`crate::Engine`] so it has exactly
 //! ONE implementation.
 //!
-//! (Not to be confused with [`super::emit`], which is the trust-grant /
-//! audit-entry emit API.)
-//!
 //! `canonicalize → hash → hybrid-sign → assemble the 20-field
 //! [`Attestation`] → put_attestation` was previously reachable only through an
 //! [`Engine`](crate::Engine), which exists solely over the `sqlite` /

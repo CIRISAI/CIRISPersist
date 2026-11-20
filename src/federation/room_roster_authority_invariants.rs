@@ -259,6 +259,17 @@ pub mod bodies {
         }
     }
 
+    /// v62 (E4-fix6; CC 2.7.3) — a change that must NOT land, judged by a
+    /// condition that reads the held roster (a fold condition): HELD
+    /// (`Pending`, it concludes nothing) or refused by `want`. Never a row.
+    pub(crate) fn held_or_refused(r: Result<StatementOutcome, Error>, want: &str, what: &str) {
+        match r {
+            Ok(StatementOutcome::Pending { .. }) => {}
+            Ok(other) => panic!("{what}: landed ({other:?}); expected {want} or held"),
+            Err(e) => assert_eq!(rule_of(&e), want, "{what}: {e}"),
+        }
+    }
+
     async fn active(d: &dyn FederationDirectory, room: &str) -> Vec<String> {
         let mut v: Vec<String> = d
             .active_community_members(room)
@@ -309,8 +320,11 @@ pub mod bodies {
     /// founder's single signature is the protocol (CC 4.4.3.4.2).
     pub async fn i170_admission_is_the_roster(d: &dyn FederationDirectory, tag: &str) {
         let (room, alice, _bob) = make_room(d, tag, "quorum:1/1").await;
-        let carol = sd("carol", tag);
-        user(d, &carol).await;
+        // v62 (E4-fix6): registered from its seed, named by its identity-ref
+        // (the id every admission reader returns).
+        let carol_seed = sd("carol", tag);
+        user(d, &carol_seed).await;
+        let carol = crate::federation::edition2::fixture_switch::kid(&carol_seed);
         assert!(!admitted(d, &carol, &room).await, "{tag} I170: control");
         widen(
             d,
@@ -368,48 +382,13 @@ pub mod bodies {
         }
         let eve = newcomer("eve");
 
-        // v61 S2 (CIRISPersist#1123) — a legacy room stored under
-        // founder_only admits no widening and no removal, a founder's
-        // included: its one event is the escape (I1518). (The evaluator's
-        // founder_only arm stays witnessed on families and in
-        // `consensus::tests`.)
-        let (r, k) = make_group(
-            d,
-            &sd("fo", tag),
-            consensus_protocol::FOUNDER_ONLY,
-            &["a", "b"],
-            1,
-            None,
-            None,
-        )
-        .await;
-        let founder_only = |res: Result<StatementOutcome, Error>, what: &str| match res {
-            Err(Error::CommunityConsensusProtocolViolation { rule, .. }) => assert_eq!(
-                rule,
-                crate::federation::admission::FOUNDER_ONLY_ABOVE_FAMILY,
-                "{tag} I171 {what}"
-            ),
-            other => panic!("{tag} I171 {what}: {other:?}"),
-        };
-        founder_only(
-            widen_by(d, &[&k[1]], widening(&r, &newcomer("x1"), t(1), None)).await,
-            "founder_only: a plain member",
-        );
-        founder_only(
-            widen_by(d, &[&k[0]], widening(&r, &newcomer("x1"), t(2), None)).await,
-            "founder_only: a founder",
-        );
-        founder_only(
-            revoke_by(d, &[&k[0]], revocation(&r, &k[1], t(3))).await,
-            "founder_only: a founder removes a member",
-        );
-        assert!(
-            d.list_community_membership_revocations_for(&r)
-                .await
-                .unwrap()
-                .is_empty(),
-            "{tag} I171: a refused removal stores no row (and rotates nothing)"
-        );
+        // v62 (E4-fix6; CP2, ruling 4): the legacy `founder_only` arm is
+        // DELETED. It drove a room stored under `founder_only` before v61; an
+        // edition-2 room above the family is never founded under it (CC
+        // 4.5.13, `founder_only_above_family`), so that room cannot be built.
+        // The refusal of such a founding is the door's own witness; the
+        // evaluator's `founder_only` arm stays witnessed on families and in
+        // `consensus::tests`.
 
         // majority of three: one refused, two admitted.
         let (r, k) = make_group(
@@ -603,29 +582,27 @@ pub mod bodies {
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I180: bob leaves a unanimous room alone: {e}"));
-        let e = revoke_by(
-            d,
-            &[alice],
-            revocation(&room, alice, at("2026-03-02T00:00:00Z")),
-        )
-        .await
-        .expect_err("the last founder may not leave while carol remains");
-        assert_eq!(
-            rule_of(&e),
+        // v62 (E4-fix6; CC 2.7.3): the last-founder rule reads the held
+        // roster, a fold condition: the change is held or refused by name.
+        held_or_refused(
+            revoke_by(
+                d,
+                &[alice],
+                revocation(&room, alice, at("2026-03-02T00:00:00Z")),
+            )
+            .await,
             crate::federation::ROSTER_LAST_FOUNDER,
-            "{tag} I180: {e}"
+            &format!("{tag} I180: the last founder may not leave while carol remains"),
         );
-        let e = widen_by(
-            d,
-            &[alice, carol],
-            widening(&room, alice, at("2026-03-02T00:00:00Z"), None),
-        )
-        .await
-        .expect_err("nor be demoted");
-        assert_eq!(
-            rule_of(&e),
+        held_or_refused(
+            widen_by(
+                d,
+                &[alice, carol],
+                widening(&room, alice, at("2026-03-02T00:00:00Z"), None),
+            )
+            .await,
             crate::federation::ROSTER_LAST_FOUNDER,
-            "{tag} I180 demote: {e}"
+            &format!("{tag} I180 demote: nor be demoted"),
         );
         widen_by(
             d,
@@ -705,32 +682,29 @@ pub mod bodies {
             None,
         )
         .await;
-        let e = widen_by(
-            d,
-            &[&k[1], &k[2]],
-            widening(&r, &y, at("2026-03-01T00:00:00Z"), None),
-        )
-        .await
-        .expect_err("no founder");
         // v62.0.0 (slice C) — CC 4.4.3.6's protocol table has six arms and no
         // `custom:`: a `custom:` group admits no change, with or without its
-        // founder (was: insufficient without, admitted with).
-        assert_eq!(
-            rule_of(&e),
+        // founder (was: insufficient without, admitted with). v62 (E4-fix6;
+        // CC 2.7.3): judged against the held roster, it is held or refused.
+        held_or_refused(
+            widen_by(
+                d,
+                &[&k[1], &k[2]],
+                widening(&r, &y, at("2026-03-01T00:00:00Z"), None),
+            )
+            .await,
             crate::federation::ROSTER_CONSENSUS_UNEVALUABLE,
-            "{tag} I182 custom: {e}"
+            &format!("{tag} I182 custom: no founder"),
         );
-        let e = widen_by(
-            d,
-            &[&k[0], &k[1]],
-            widening(&r, &y, at("2026-03-02T00:00:00Z"), None),
-        )
-        .await
-        .expect_err("CC 4.4.3.6: custom: is no consensus_protocol");
-        assert_eq!(
-            rule_of(&e),
+        held_or_refused(
+            widen_by(
+                d,
+                &[&k[0], &k[1]],
+                widening(&r, &y, at("2026-03-02T00:00:00Z"), None),
+            )
+            .await,
             crate::federation::ROSTER_CONSENSUS_UNEVALUABLE,
-            "{tag} I182 custom, founder + 2: {e}"
+            &format!("{tag} I182 custom, founder + 2: custom: is no consensus_protocol"),
         );
     }
 
@@ -906,14 +880,18 @@ pub mod bodies {
             // is the node's.
             let row = review(plain, &sd("plain", &tag));
             let id = e2::rid(&e2::row_of(&row, plain));
-            let err = e2::try_put_row(d, &row, plain)
-                .await
-                .expect_err("I1522: a plain member holds no review duty");
-            assert_eq!(
-                err.kind(),
-                "federation_delegated_scope_unauthorized",
-                "I1522 {protocol}: {err}"
-            );
+            // v62 (E4-fix6; CC 2.7.3): the duty is read from the room's
+            // roster and delegations (other rows), a fold condition: the
+            // review is HELD or refused by name, and never stored as a row.
+            match e2::put_statement(d, &e2::statement_of(&row, plain)).await {
+                Ok(StatementOutcome::Pending { .. }) => {}
+                Ok(other) => panic!("I1522 {protocol}: a plain member's review landed: {other:?}"),
+                Err(err) => assert_eq!(
+                    err.kind(),
+                    "federation_delegated_scope_unauthorized",
+                    "I1522 {protocol}: {err}"
+                ),
+            }
             assert!(d.get_attestation(&id).await.unwrap().is_none());
             e2::try_put_row(d, &review(founder, &sd("founder", &tag)), founder)
                 .await
