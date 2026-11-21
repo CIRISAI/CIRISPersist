@@ -27,6 +27,10 @@
 //! - **I4124** — seat first: a deputy on a live slash-scoped chain
 //!   (founder → d1 with `sub_delegation` → d2) signs: the verdict lands.
 //! - **I4125** — a holder of ANOTHER duty (`moderate` only) signs: held.
+//!
+//! Every seat edge NAMES the room (`community_id`): since CW-fix1 a room's
+//! duty walk follows only edges naming that room (an unscoped duty edge
+//! confers no room duty), so I4122–I4125's seats are room appointments.
 //! - **I4126** — a verdict naming no `community_id` is refused
 //!   `slashing_community_required` and nothing is kept: it never falls through
 //!   to the accord resolver (the quarantine arm's alone) or to "any registered
@@ -70,19 +74,25 @@ pub(crate) mod bodies {
     }
 
     /// `granter`'s `delegates_to(granter → grantee)` bearing `scope` (and
-    /// `sub_delegation` when `sub`), asserted at `at` with a test term from
-    /// it, landed with the grantee's voice (a seat is two consents).
+    /// `sub_delegation` when `sub`), NAMING `room`, asserted at `at` with a
+    /// test term from it, landed with the grantee's voice (a seat is two
+    /// consents).
     async fn seat(
         d: &dyn FederationDirectory,
+        room: &str,
         granter: &str,
         grantee: &str,
         scope: &[&str],
         sub: bool,
         at: DateTime<Utc>,
     ) {
+        // v62.0.0 (CW-fix1, SL-fix4) — a duty edge confers in a room only
+        // when it NAMES the room (`community_id`): an unscoped edge confers
+        // no room duty (CW-fix1's ruling, the cross-room leak closed).
         let mut envelope = serde_json::json!({
             "id": uuid::Uuid::new_v4().to_string(),
             "scope": scope,
+            "community_id": room,
         });
         if sub {
             envelope["sub_delegation"] = serde_json::json!(true);
@@ -208,6 +218,7 @@ pub(crate) mod bodies {
         held_unseated(d, &by_early, "I4122 (before the seat)").await;
         seat(
             d,
+            &room,
             founder,
             early,
             &[DELEGATION_SCOPE_SLASH],
@@ -229,6 +240,7 @@ pub(crate) mod bodies {
         );
         seat(
             d,
+            &room,
             founder,
             late,
             &[DELEGATION_SCOPE_SLASH],
@@ -246,6 +258,7 @@ pub(crate) mod bodies {
         // ── I4124: seat first; a deputy on a live slash-scoped chain.
         seat(
             d,
+            &room,
             founder,
             d1,
             &[DELEGATION_SCOPE_SLASH],
@@ -253,7 +266,16 @@ pub(crate) mod bodies {
             now - hours(4),
         )
         .await;
-        seat(d, d1, d2, &[DELEGATION_SCOPE_SLASH], false, now - hours(4)).await;
+        seat(
+            d,
+            &room,
+            d1,
+            d2,
+            &[DELEGATION_SCOPE_SLASH],
+            false,
+            now - hours(4),
+        )
+        .await;
         let by_deputy = verdict(d2, now - hours(1));
         let out = put(by_deputy.clone()).await;
         assert!(
@@ -265,6 +287,7 @@ pub(crate) mod bodies {
         // ── I4125: a holder of another duty (`moderate` only).
         seat(
             d,
+            &room,
             founder,
             modr,
             &[DELEGATION_SCOPE_MODERATE],

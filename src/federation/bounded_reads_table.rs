@@ -128,6 +128,10 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         "list_derived_hex",
         Bound::Schema("the V149 renditions of ONE original blob"),
     ),
+    (
+        "list_dial_hints",
+        Bound::Open("every node this node holds signed dial hints for: grows with the peers it has met"),
+    ),
     ("list_expired_attestation_ids", Bound::Paged),
     (
         "list_families_for_member",
@@ -430,6 +434,12 @@ pub(super) mod gates {
                             if let Some(&e) = b.get(i + 1) {
                                 out.push(e);
                             }
+                        } else if b.get(i + 1) == Some(&'\n') {
+                            // GT-fix1 — a `\`-continued string line keeps its
+                            // newline: dropping it shifted every later line
+                            // number, and I2190 reads a call's site key from
+                            // the SOURCE at the blanked text's line.
+                            out.push('\n');
                         }
                         i += 1;
                     } else if b[i] == '\n' {
@@ -776,6 +786,26 @@ pub(super) mod gates {
             }
         }
         out
+    }
+
+    /// GT-fix1 — blanking keeps the line structure: a string continued with
+    /// a trailing `\\` keeps its newline, so a line number read off the
+    /// blanked text names the same line of the source (I2190's site keys, and
+    /// every gate message that prints a line).
+    #[test]
+    fn i4177_blanking_keeps_every_newline() {
+        let src = "fn f() {\n    let s = \"a \\\n         b\";\n    g(\"k\");\n}\n";
+        let blanked = blank_comments_and_strings(src);
+        assert_eq!(
+            blanked.matches('\n').count(),
+            src.matches('\n').count(),
+            "a continued string line keeps its newline: {blanked:?}"
+        );
+        assert_eq!(
+            blanked.lines().position(|l| l.contains("g(")),
+            src.lines().position(|l| l.contains("g(")),
+            "the call is on the same line of both"
+        );
     }
 
     /// The scanner's own witness (I2190): the swallow shapes it must see, and

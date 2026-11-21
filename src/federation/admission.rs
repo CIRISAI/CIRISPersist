@@ -5756,6 +5756,36 @@ pub async fn root_grant_consenter<F: super::FederationDirectory + ?Sized>(
     }
 }
 
+/// v62.0.0 (KR-fix5; CC 4.4.3.19) — **does `signer_key` sign for the grantee
+/// of a root grant at `at`?** True when the key's OWN identity
+/// (`active_identity_for_occurrence`: a person's occurrence key answers by
+/// its person) is the grantee's consenter ([`root_grant_consenter`]).
+///
+/// The key is NOT lifted to its owner here.
+/// [`admission_identity_for_writer`] lifts a node to its owner (#765: a
+/// node writes on its owner's behalf), which is right for a write gate and
+/// wrong for a consent: a bound worker node's own signature read as its
+/// owner's, so the machine accepted its own grant. A machine's consent is
+/// its owner's own key's.
+///
+/// The ONE comparison behind the reply gate
+/// (`membership_acceptance::check_root_grant_reply`) and the read
+/// (`membership_acceptance::root_grant_accepted_at`).
+///
+/// # Errors
+/// Directory reads.
+pub async fn signs_for_root_grantee<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    signer_key: &str,
+    grantee: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error> {
+    let Some(consenter) = root_grant_consenter(directory, grantee, at).await? else {
+        return Ok(false);
+    };
+    Ok(directory.active_identity_for_occurrence(signer_key).await? == consenter)
+}
+
 /// v62.0.0 (KR-fix2; CC 2.4.1.1 rule 0, CC 4.5.5 "a seat stands on its own")
 /// — **the `withdraws` of a counted root grant**, decided on its own rule.
 /// `Ok(None)`: `target` is no root grant (the caller's rules apply).
@@ -14970,6 +15000,20 @@ where
     {
         return Ok(());
     }
+    // v62.0.0 (RL-fix10; CC 3.2 at rc22 `87abd2d`) — the BUNDLE root: the
+    // `family_key_id` of the genesis bundle in force is a subject this node
+    // knows (the root a node accepts, KB-fix1). No key record, family or
+    // community row stands behind it, so without this arm every acceptance
+    // edge to the bundle root was held `link_unheld` and never concluded
+    // (the 4q run: I2400–I2409, KR-fix3a's I4221–I4224). A subject that is
+    // the accord's id while no bundle is in force waits on the import door
+    // (the bundle-in-force read is declared below, on the hold).
+    if super::trust_root::bundle_root_holders(directory, attested_key_id)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
     match directory.lookup_family(attested_key_id).await {
         Ok(Some(_)) => return Ok(()),
         Ok(None) => {}
@@ -14994,6 +15038,9 @@ where
         Ok(_) => {}
         Err(e) => return Err(e),
     }
+    // v62.0.0 (RL-fix10) — the bundle that would make this subject the root
+    // in force is another row too: a placement re-folds the hold.
+    super::edition2::genesis::reads_bundle_in_force();
     Err(fold_hold(
         fold::reason::LINK_UNHELD,
         Error::InvalidArgument(format!(
@@ -17817,7 +17864,12 @@ where
         .and_then(|b| b.get("cohort_subkind"))
         .and_then(|v| v.as_str())
         == Some(COHORT_SUBKIND_INFRASTRUCTURE);
-    if !labeled_infra || !is_quorum_protocol(&community.consensus_protocol) {
+    // IQ-fix1 — the DOOR's own protocol rule, whole
+    // (`check_infrastructure_consensus_protocol`: `quorum:M/N` with `M >= 2`,
+    // `N` the founder count, `M` its strict majority), never a second
+    // parser: this reader read `quorum:1/N` and `quorum:2/5` as conformant
+    // while the door refused them.
+    if !labeled_infra || check_infrastructure_consensus_protocol(community).is_err() {
         return Ok(false);
     }
     let founders: Vec<&str> = community
@@ -17848,18 +17900,6 @@ where
         }
     }
     Ok(true)
-}
-
-/// `quorum:M/N` with `0 < M <= N` (the one protocol kind an infrastructure
-/// community may declare; CC 3.2 conformance, #927).
-fn is_quorum_protocol(protocol: &str) -> bool {
-    let Some(rest) = protocol.strip_prefix("quorum:") else {
-        return false;
-    };
-    let Some((m, n)) = rest.split_once('/') else {
-        return false;
-    };
-    matches!((m.parse::<u32>(), n.parse::<u32>()), (Ok(m), Ok(n)) if m > 0 && m <= n)
 }
 
 /// v62.0.0 (CC rc20 4.4.3.34 / 3.2, CIRISPersist#1274) — (ii) of
@@ -27457,7 +27497,7 @@ pub(crate) mod r2_test_support {
     /// owner binding (`agent_owner_of` reads it), a node through
     /// `steward_liveness_test_support::bind_machine_owner` (the node's voice
     /// included). A person's key, or a machine already owned, is left alone.
-    async fn bind_owner_if_machine(
+    pub(crate) async fn bind_owner_if_machine(
         dir: &dyn FederationDirectory,
         subject: &str,
         at: chrono::DateTime<chrono::Utc>,
@@ -27503,7 +27543,7 @@ pub(crate) mod r2_test_support {
     /// The bound owner of a MACHINE `key` at `at` (K2's `owner_of_sub`
     /// reading: an agent's edition-2 agent owner binding, else the owner
     /// binding); `None` for a person's key or an unowned machine.
-    async fn machine_owner_of(
+    pub(crate) async fn machine_owner_of(
         dir: &dyn FederationDirectory,
         key: &str,
         at: chrono::DateTime<chrono::Utc>,
@@ -28644,24 +28684,28 @@ pub(crate) mod moderation_walk_liveness_test_support {
     /// Distinct from the steward witness's helper only in carrying an explicit
     /// `sub_delegation` flag — the §13.3 deputization gate the moderation walk
     /// enforces and the steward walk does not.
+    ///
+    /// v62.0.0 (CW-fix1 fixture fix, 4u) — `community: Some(C)` NAMES the
+    /// room (a room's duty walk follows only edges naming it); `None` for an
+    /// edge on an unscoped plane (consent revocation).
     fn moderation_edge(
         granter: &str,
         recipient: &str,
         scope: &[&str],
         subjects: &[&str],
         sub_delegation: bool,
+        community: Option<&str>,
     ) -> Attestation {
         let id = uuid::Uuid::new_v4().to_string();
-        let mut row = signed_row(
-            granter,
-            recipient,
-            attestation_type::DELEGATES_TO,
-            serde_json::json!({
-                "id": id,
-                "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
-                "sub_delegation": sub_delegation,
-            }),
-        );
+        let mut envelope = serde_json::json!({
+            "id": id,
+            "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            "sub_delegation": sub_delegation,
+        });
+        if let Some(c) = community {
+            envelope["community_id"] = serde_json::json!(c);
+        }
+        let mut row = signed_row(granter, recipient, attestation_type::DELEGATES_TO, envelope);
         row.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
         crate::federation::tier_ingest::test_support::reseal(&mut row);
         row
@@ -28812,8 +28856,15 @@ pub(crate) mod moderation_walk_liveness_test_support {
 
         // ── the live moderation chain ────────────────────────────────────
         // founder →(moderate, sub_delegation) deputy →(moderate) leaf.
-        let e_fd = moderation_edge(&founder, &deputy, &[duty], &[&deputy], true);
-        let e_dl = moderation_edge(&deputy, &leaf, &[duty], &[&leaf], false);
+        let e_fd = moderation_edge(
+            &founder,
+            &deputy,
+            &[duty],
+            &[&deputy],
+            true,
+            Some(&community),
+        );
+        let e_dl = moderation_edge(&deputy, &leaf, &[duty], &[&leaf], false, Some(&community));
         let e_fd = store_row(dir, &e_fd)
             .await
             .expect("founder -> deputy admitted");
@@ -28934,7 +28985,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
         }
         register(dir, &d2, &[identity_type::PRIMITIVE]).await;
         commons(dir, &c2, &f2, suffix).await;
-        let edge_f2 = moderation_edge(&f2, &d2, &[duty], &[], true);
+        let edge_f2 = moderation_edge(&f2, &d2, &[duty], &[], true, Some(&c2));
         store(dir, &edge_f2).await.expect("second chain admitted");
         assert_moderator_agreement(dir, &c2, duty, &[&f2, &d2], "second live chain").await;
         assert_eq!(
@@ -28966,9 +29017,12 @@ pub(crate) mod moderation_walk_liveness_test_support {
         }
         register(dir, &d3, &[identity_type::PRIMITIVE]).await;
         commons(dir, &c3, &f3, suffix).await;
-        store(dir, &moderation_edge(&f3, &d3, &[duty], &[&d3], true))
-            .await
-            .expect("third chain admitted");
+        store(
+            dir,
+            &moderation_edge(&f3, &d3, &[duty], &[&d3], true, Some(&c3)),
+        )
+        .await
+        .expect("third chain admitted");
         // v62 (E4, wave 4): a composer naming an unheld target waits (not
         // kept); the edge must stand either way.
         let _ = store(dir, &withdraws_of(&d3, &d3, &"ab".repeat(32))).await;
@@ -29022,6 +29076,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             &[DELEGATION_SCOPE_CONSENT_REVOCATION],
             &[&cr_to],
             true,
+            None,
         );
         store(dir, &cr_edge).await.expect("cr edge admitted");
         let cr_targets = cr_targets_of(&cr_to);
@@ -29069,6 +29124,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             &[DELEGATION_SCOPE_CONSENT_REVOCATION],
             &[&cr2_to],
             true,
+            None,
         );
         store(dir, &cr2_edge).await.expect("cr2 edge admitted");
         let cr2_targets = cr_targets_of(&cr2_to);
@@ -29130,6 +29186,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
                     &[DELEGATION_SCOPE_CONSENT_REVOCATION],
                     &[peer],
                     true,
+                    None,
                 ),
             )
             .await
@@ -29178,6 +29235,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             &[DELEGATION_SCOPE_CONSENT_REVOCATION],
             &[&broad_p],
             true,
+            None,
         );
         let other_edge = moderation_edge(
             &broad_g,
@@ -29185,6 +29243,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             &[DELEGATION_SCOPE_REVIEW],
             &[&broad_p],
             true,
+            None,
         );
         store(dir, &keep_edge).await.expect("cr edge admitted");
         store(dir, &other_edge).await.expect("review edge admitted");
@@ -29268,7 +29327,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             register(backend, k, &[identity_type::PRIMITIVE]).await;
         }
         for (g, r) in [(&founder, &deputy), (&deputy, &leaf), (&leaf, &tail)] {
-            store(backend, &moderation_edge(g, r, &[duty], &[r], true))
+            store(backend, &moderation_edge(g, r, &[duty], &[r], true, None))
                 .await
                 .expect("chain edge admitted");
         }
@@ -29370,9 +29429,12 @@ pub(crate) mod moderation_walk_liveness_test_support {
         register(backend, &f4, &[identity_type::USER]).await;
         register(backend, &d4, &[identity_type::PRIMITIVE]).await;
         for _ in 0..5 {
-            store(backend, &moderation_edge(&f4, &d4, &[duty], &[&d4], true))
-                .await
-                .expect("parallel edge admitted");
+            store(
+                backend,
+                &moderation_edge(&f4, &d4, &[duty], &[&d4], true, None),
+            )
+            .await
+            .expect("parallel edge admitted");
         }
         let _ = crate::federation::read_probe::take();
         assert!(
@@ -29428,7 +29490,14 @@ pub(crate) mod moderation_walk_liveness_test_support {
         for (g, r) in [(&cr_iss, &cr_mid), (&cr_mid, &cr_sub)] {
             store(
                 backend,
-                &moderation_edge(g, r, &[DELEGATION_SCOPE_CONSENT_REVOCATION], &[r], true),
+                &moderation_edge(
+                    g,
+                    r,
+                    &[DELEGATION_SCOPE_CONSENT_REVOCATION],
+                    &[r],
+                    true,
+                    None,
+                ),
             )
             .await
             .expect("proxy chain edge admitted");
@@ -29536,13 +29605,16 @@ pub(crate) mod moderation_walk_liveness_test_support {
         .expect("founder -> deputy admitted");
         store(
             dir,
-            &moderation_edge(&deputy, &leaf, &[duty], &[&leaf], true),
+            &moderation_edge(&deputy, &leaf, &[duty], &[&leaf], true, None),
         )
         .await
         .expect("deputy -> leaf admitted");
-        store(dir, &moderation_edge(&leaf, &tail, &[duty], &[&tail], true))
-            .await
-            .expect("leaf -> tail admitted");
+        store(
+            dir,
+            &moderation_edge(&leaf, &tail, &[duty], &[&tail], true, None),
+        )
+        .await
+        .expect("leaf -> tail admitted");
 
         let reach = async |t: &str| -> bool {
             reachable_under_scope(dir, &founder, t, duty, MAX_MODERATION_DELEGATION_DEPTH)
@@ -29604,10 +29676,10 @@ pub(crate) mod moderation_walk_liveness_test_support {
         )
         .await
         .expect("d2 -> l2 admitted (the WRITE is not gated; the WALK is)");
-        store(dir, &moderation_edge(&l2, &t2, &[duty], &[&t2], true))
+        store(dir, &moderation_edge(&l2, &t2, &[duty], &[&t2], true, None))
             .await
             .expect("l2 -> t2 admitted");
-        store(dir, &moderation_edge(&t2, &x2, &[duty], &[&x2], true))
+        store(dir, &moderation_edge(&t2, &x2, &[duty], &[&x2], true, None))
             .await
             .expect("t2 -> x2 admitted");
 
@@ -29677,7 +29749,14 @@ pub(crate) mod moderation_walk_liveness_test_support {
         register(dir, &root, &[identity_type::USER]).await;
 
         // ── (1) the CONFERRAL is admitted ────────────────────────────────
-        let conferral = moderation_edge(&root, &human, &[DELEGATION_SCOPE_SLASH], &[&human], true);
+        let conferral = moderation_edge(
+            &root,
+            &human,
+            &[DELEGATION_SCOPE_SLASH],
+            &[&human],
+            true,
+            None,
+        );
         store(dir, &conferral).await.unwrap_or_else(|e| {
             panic!(
                 "a capability conferral on an age-unverified human must be ADMITTED — this is \

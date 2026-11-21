@@ -38332,6 +38332,21 @@ mod tests {
         a
     }
 
+    /// v62.0.0 (CW-fix1 fixture fix, 4u) — [`pg_delegates_to`] for a ROOM
+    /// duty: the edge NAMES its room (`community_id`, `pg_id` as the reports
+    /// key it), the only edge a room's duty walk follows (CC 4.5.4).
+    fn pg_delegates_to_in(
+        granter: &str,
+        grantee: &str,
+        scope: serde_json::Value,
+        community: &str,
+    ) -> crate::federation::Attestation {
+        let mut a = pg_delegates_to(granter, grantee, scope, false);
+        a.attestation_envelope["community_id"] = serde_json::Value::String(pg_id(community));
+        pg_resign(&mut a);
+        a
+    }
+
     /// #369 (CC 4.5.4 / §11.11) — no-moderator federation-APPLY gate,
     /// broadened keying, END-TO-END through `put_attestation` (PG backend;
     /// 3-backend parity with memory's decision table + the sqlite twin). A
@@ -39102,7 +39117,7 @@ mod tests {
         .await;
         pg_put_delegation(
             &backend,
-            pg_delegates_to(&founder, &fdelegate, serde_json::json!(["review"]), false),
+            pg_delegates_to_in(&founder, &fdelegate, serde_json::json!(["review"]), &comm),
         )
         .await;
         backend
@@ -46890,11 +46905,11 @@ mod tests {
         // v62.0.0 (E1-fix2; CC 2.7.3) — the edge seats with the deputy's voice.
         pg_put_delegation(
             &backend,
-            pg_delegates_to(
+            pg_delegates_to_in(
                 &founder,
                 &deputy,
                 serde_json::json!([DELEGATION_SCOPE_MODERATE]),
-                false,
+                &mod_comm,
             ),
         )
         .await;

@@ -1436,6 +1436,27 @@ mod tests {
         d
     }
 
+    /// v62.0.0 (CW-fix1 fixture fix, 4u) — [`fix_delegates_to`] for a ROOM
+    /// duty: the edge NAMES its room (`community_id`, keyed as
+    /// `fix_scores_report` keys it), the only edge a room's duty walk follows.
+    fn fix_delegates_to_in(
+        id: &str,
+        granter: &str,
+        grantee: &str,
+        scope: serde_json::Value,
+        community: &str,
+    ) -> Attestation {
+        let mut d = fix_delegates_to(id, granter, grantee, scope);
+        d.attestation_envelope["community_id"] =
+            serde_json::Value::String(if e2::emit_edition2() {
+                e2::kid_or_keep(community)
+            } else {
+                community.to_owned()
+            });
+        resign_fix(&mut d);
+        d
+    }
+
     /// #973 — a node's acceptance edge toward a root, naming its job
     /// (`trust:accepts:v1`). An unlabelled `delegates_to` gives no acceptance.
     fn fix_accepts(id: &str, node: &str, root: &str, scope: serde_json::Value) -> Attestation {
@@ -2152,11 +2173,13 @@ mod tests {
         .await;
         put_voiced(
             &backend,
-            &fix_delegates_to(
+            // CW-fix1 fixture fix (4u) — the room duty edge NAMES comm-1.
+            &fix_delegates_to_in(
                 "d-frev",
                 "founder",
                 "fdelegate",
                 serde_json::json!(["message_io", "review"]),
+                "comm-1",
             ),
         )
         .await

@@ -1409,11 +1409,16 @@ pub(crate) mod test_support {
         grantee: &str,
         scopes: &[&str],
         at: DateTime<Utc>,
+        community: &str,
     ) -> Attestation {
         // K2-fix13: no `dimension` (`delegation:duty:v1` is no registered
         // dimension of `self:delegates_to`: `dimension_unregistered`).
+        // v62.0.0 (CW-fix1, SL-fix4) — the edge NAMES the room it confers in
+        // (`community_id`): a room's duty walk follows only edges naming
+        // that room, so an unscoped duty edge seats no room deputy.
         let mut envelope = serde_json::json!({
             "scope": scopes,
+            "community_id": community,
         });
         // v60.0.0 (#1048) — a duty edge carries a term (CC 2.4).
         crate::federation::admission::with_test_term(&mut envelope, at);
@@ -3528,6 +3533,7 @@ pub(crate) mod test_support {
             &e2::kid(&deputy),
             &[DELEGATION_SCOPE_SLASH],
             late + chrono::Duration::hours(2),
+            &community_k,
         );
         let seated = e2::land_with_voices(dir, &edge, &[deputy.as_str()])
             .await
@@ -4107,7 +4113,7 @@ pub(crate) mod test_support {
             (&deputy_slash, DELEGATION_SCOPE_SLASH),
         ] {
             e2::put_agent_owner_binding(dir, &founder, deputy, e2::ms(tick())).await;
-            let edge = delegation_row(&founder, &e2::kid(deputy), &[scope], tick());
+            let edge = delegation_row(&founder, &e2::kid(deputy), &[scope], tick(), &community_k);
             let (out, unvoiced) = e2::land_delegation(dir, &edge)
                 .await
                 .expect("the delegation is admitted");

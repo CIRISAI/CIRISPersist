@@ -248,6 +248,7 @@ async fn edge(d: &dyn FederationDirectory, granter: &str, subject: &str, class: 
         "self",
         now_ms() - 1_000,
     );
+    let p = names_held_head(d, subject, p).await;
     let st = ciris_verify_core::edition2::sign_row_statement(
         &e2::signing_key(granter),
         &e2::kid(granter),
@@ -259,6 +260,32 @@ async fn edge(d: &dyn FederationDirectory, granter: &str, subject: &str, class: 
     )
     .expect("AU: sign a trust:accepts edge");
     put(d, &st).await;
+}
+
+/// v62.0.0 (AU-fix4; CC 3.2 T4a, as `typed_fixtures::trust_accepts_edge`,
+/// T2-fix6) — an acceptance edge to a community this node holds names the
+/// lineage head it attaches on (`attached_head_digest`, the held head's row
+/// hash as bytes); without it a new labelled edge is `TrustRootHeadUnnamed`.
+/// An edge to a key (no held community) is `p` unchanged.
+async fn names_held_head(d: &dyn FederationDirectory, subject: &str, p: Value) -> Value {
+    let Some(c) = d
+        .lookup_community(subject)
+        .await
+        .expect("AU: read the root the edge names")
+    else {
+        return p;
+    };
+    let Value::Map(mut m) = p else {
+        unreachable!("trust_accepts_payload is a map")
+    };
+    m.push((
+        Value::Text(crate::federation::envelope::paths::ATTACHED_HEAD_DIGEST.to_owned()),
+        Value::Bytes(
+            hex::decode(&c.persist_row_hash).expect("AU: the held head's row hash is hex"),
+        ),
+    ));
+    m.sort_by_key(|(k, _)| cde::encode(k));
+    Value::Map(m)
 }
 
 /// `voice` again, carrying `TS`'s receipt over it (merged into the held
@@ -385,7 +412,10 @@ pub(crate) async fn counted_row_body(d: &dyn FederationDirectory) {
 pub(crate) async fn two_person_floor_body(d: &dyn FederationDirectory) {
     let solo = "au-f-solo";
     setup(d, &[solo]).await;
-    let (_, head) = group(d, "au-f-g", &[solo], "majority").await;
+    let (gid, head) = group(d, "au-f-g", &[solo], "majority").await;
+    // AU-fix4 — the owner reaches the group, so the count is the leg that
+    // answers (the model's order puts reach before the count, I2164).
+    edge(d, OWNER, &gid, au::ADMISSION_CLASS).await;
     let st = counted(
         solo,
         0x52,
@@ -398,11 +428,19 @@ pub(crate) async fn two_person_floor_body(d: &dyn FederationDirectory) {
         pending(&o),
         "I2153 a one-person group's voice is short of two persons: {o:?}"
     );
-    assert!(says(
-        &answer(d, &st).await,
-        au::ADMISSION_COUNT_UNMET,
-        Some("two")
-    ));
+    // AU-fix4 — the count's own words name the floor (`admission.rs`,
+    // `admission_unit_count_at_head`); "two" was never in them.
+    let floor = format!(
+        "fewer than {} persons",
+        crate::federation::admission::ADMISSION_UNIT_MIN_PERSONS
+    );
+    let a = answer(d, &st).await;
+    assert!(
+        says(&a, au::ADMISSION_COUNT_UNMET, Some(floor.as_str())),
+        "I2153 a one-person group is short of the two-person floor: {:?} {:?}",
+        a.token(),
+        a.detail()
+    );
 }
 
 /// I2154 + I2155: one person's row, and the host's standing.

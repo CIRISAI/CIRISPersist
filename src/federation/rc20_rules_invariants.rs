@@ -406,6 +406,29 @@ pub(crate) mod bodies {
             c.consensus_protocol = p.to_owned();
             assert!(!conformant(c).await, "I1884: {p} is not conformant");
         }
+        // IQ-fix1 — the reader judges by the door's whole rule: `N` is the
+        // founder count and `M` its strict majority. Over the control's three
+        // founders `quorum:3/3` is not conformant; over five, `quorum:2/5`
+        // is not and `quorum:3/5` is.
+        let mut c = base.clone();
+        c.consensus_protocol = "quorum:3/3".to_owned();
+        assert!(!conformant(c).await, "I1884: 3/3 over three founders");
+        let mut five = base.clone();
+        for n in 0..2 {
+            let k = e2::put_key(d, &format!("i1884-fifth-{n}-{tag}"), &[it::USER]).await;
+            let mut m = five.members[0].clone();
+            m.key_id = k;
+            five.members.push(m);
+        }
+        for (p, want) in [
+            ("quorum:2/5", false),
+            ("quorum:3/5", true),
+            ("quorum:2/3", false),
+        ] {
+            let mut c = five.clone();
+            c.consensus_protocol = p.to_owned();
+            assert_eq!(conformant(c).await, want, "I1884: {p} over five founders");
+        }
         for (n, t) in [it::NODE, it::AGENT].into_iter().enumerate() {
             let k = e2::put_key(d, &format!("i1884-founder-{n}-{tag}"), &[t]).await;
             let mut c = base.clone();

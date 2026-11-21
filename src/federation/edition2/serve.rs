@@ -396,8 +396,10 @@ where
     if allegiance || is_bootstrap_kind(statement) {
         return Ok(true);
     }
-    if requester.is_some_and(|p| !p.is_empty() && parties.contains(&p)) {
-        return Ok(true);
+    if let Some(peer) = requester.filter(|p| !p.is_empty()) {
+        if Box::pin(is_party_to_row(dir, statement, peer, parties)).await? {
+            return Ok(true);
+        }
     }
     let ctx = SERVE_CTX.try_with(std::sync::Arc::clone).ok();
     let rooted = match ctx.as_ref().and_then(|c| c.rooted.get().copied()) {
@@ -421,6 +423,90 @@ where
         );
     }
     Ok(rooted)
+}
+
+/// v62.0.0 (RL-fix11; lead ruling 2026-11-21, CC 5.3.4) — **is `peer` a
+/// PARTY to the row `statement` is a voice of?** The ONE answer the rootless
+/// serve wait asks, on the pending path (a statement with no typed row yet,
+/// `group_serve::scope_servable`) and the concluded one
+/// ([`servable_by_own_rule`]) alike. The parties are:
+///
+/// - the row's subject and its attester (`parties`, as the caller names them:
+///   the attester of an authored row is the one-voice case);
+/// - EVERY key that signed a verifying voice of the row: the voices this node
+///   holds for its row id (each verified at the door), and the signer of the
+///   statement asked about. A signer always may see the row it signed and
+///   its outcome;
+/// - whoever the row's own family designates: the holders of the bundle a
+///   counted root row names, when the statement is a holder's own voice
+///   (KR-fix2 rev 7's arm, folded in here from
+///   `group_serve::servable_without_row`); and (v62.0.0, PT-fix1; CC
+///   4.4.3.12 as ruled 11-21) the designated officials of the one-seat
+///   affiliation a counted act against a member is taken in
+///   ([`super::group_serve::served_to_floor_official`], the ONE
+///   implementation). The same function is also asked directly by
+///   [`servable_by_own_rule`] and by `group_serve::servable_without_row`,
+///   so the official's reach holds at every placement and on rooted and
+///   rootless nodes alike; this arm makes the rootless wait's own answer
+///   complete.
+///
+/// # Errors
+/// Directory reads.
+pub(crate) async fn is_party_to_row<F>(
+    dir: &F,
+    statement: &[u8],
+    peer: &str,
+    parties: &[&str],
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if parties.contains(&peer) {
+        return Ok(true);
+    }
+    let Some((protected, _)) = statement_parts(statement) else {
+        return Ok(false);
+    };
+    let iss = protected
+        .get_int(15)
+        .and_then(|c| c.get_int(1))
+        .and_then(Value::as_text)
+        .unwrap_or("");
+    if iss == peer {
+        return Ok(true);
+    }
+    if let Some(rid) = super::names::RowId::of_statement(statement) {
+        if super::voices::voices_of_row(dir, &rid)
+            .await?
+            .iter()
+            .any(|v| v.iss == peer)
+        {
+            return Ok(true);
+        }
+    }
+    // v62.0.0 (PT-fix1) — the floor-act officials, by the one function.
+    if Box::pin(super::group_serve::served_to_floor_official(
+        dir, statement, peer,
+    ))
+    .await?
+    {
+        return Ok(true);
+    }
+    if let Some(holders) =
+        crate::federation::admission::root_grant_voice_parties(dir.as_dyn_directory(), statement)
+            .await?
+    {
+        if holders.iter().any(|h| h == iss) {
+            if holders.iter().any(|h| h == peer) {
+                return Ok(true);
+            }
+            let principals = crate::federation::self_collective::principals_of(dir, peer).await?;
+            if principals.iter().any(|p| holders.contains(p)) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Is `attestation_type` served under the row-type rule in force?
@@ -501,15 +587,8 @@ where
     };
     let rid = rid.hex();
     let Some(row) = dir.get_attestation(&rid).await? else {
-        // v62.0.0 (K2-fix6; CC 2.6.1.9, CC 2.7.3) — an authored row whose
-        // family names second signers and that has no typed row is HELD for
-        // a second signer's voice: kept, not served. The second signer gets
-        // the payload from the producer's draft, never from the serve feed;
-        // once the row lands its voices follow the row.
-        if !super::door::second_signer_roles(statement).is_empty() {
-            return Ok(false);
-        }
         // v62.0.0 (wave T1) — no attestation row: judged from the statement.
+        // A purged row is never served.
         if dir
             .purge_tombstoned("attestation", &rid)
             .await
@@ -517,6 +596,31 @@ where
             .is_some()
         {
             return Ok(false);
+        }
+        // v62.0.0 (K2-fix6; CC 2.6.1.9, CC 2.7.3) — an authored row whose
+        // family names second signers and that has no typed row is HELD for
+        // a second signer's voice: kept, not served. The second signer gets
+        // the payload from the producer's draft, never from the serve feed;
+        // once the row lands its voices follow the row.
+        //
+        // v62.0.0 (RL-fix12; CC 5.3.4, CC 3.3.6.2) — a BOOTSTRAP kind with
+        // second signers (an `identity:occurrence` bind: the device's voice
+        // and its identity's) never gets an attestation row: its typed row
+        // is the occurrence row. So "no attestation row" is not "not yet a
+        // fact" for it; the fold is. A bind whose second voice is still
+        // missing is HELD (`fold_held`): not a fact, withheld from every
+        // reader, as before. A CONCLUDED one is the fact the pre-seal route
+        // fetch needs, served before Rooted (the 4q run's I2245: 2 of 4).
+        // A concluded bind then takes the same scope rule as any statement
+        // with no typed row (`servable_without_row`).
+        if !super::door::second_signer_roles(statement).is_empty() {
+            let concluded_bootstrap = match super::names::RowId::of_statement(statement) {
+                Some(id) if is_bootstrap_kind(statement) => dir.fold_held(&id).await?.is_none(),
+                _ => false,
+            };
+            if !concluded_bootstrap {
+                return Ok(false);
+            }
         }
         return Box::pin(super::group_serve::servable_without_row(
             dir, statement, requester,
@@ -546,6 +650,19 @@ where
     // rule below serves it.
     if let Some(peer) = requester {
         if super::group_serve::delivered_to_requester(dir, &row, peer).await? {
+            return Ok(true);
+        }
+        // v62.0.0 (SL-fix4; CC 4.4.3.12 as ruled 11-21) — a CONCLUDED
+        // countersigned act reaches the designated officials of its room as
+        // a party, as it did while it gathered voices (`group_serve`): the
+        // commons wait's parties (its attester and subject) left them out,
+        // so a rootless node that concluded the act withheld it from the
+        // official (I4164).
+        if Box::pin(super::group_serve::served_to_floor_official(
+            dir, statement, peer,
+        ))
+        .await?
+        {
             return Ok(true);
         }
     }

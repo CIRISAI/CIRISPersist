@@ -911,10 +911,12 @@ pub mod bodies {
                     granter,
                     grantee,
                     attestation_type::DELEGATES_TO,
+                    // CW-fix1 fixture fix (4u) — the appointment NAMES the room.
                     serde_json::json!({
                         "id": id,
                         "scope": [DELEGATION_SCOPE_MODERATE],
                         "sub_delegation": false,
+                        "community_id": room,
                     }),
                 )
             };

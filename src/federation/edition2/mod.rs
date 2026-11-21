@@ -78,6 +78,10 @@ mod fold_gc8_invariants;
 // v62.0.0 (RL-fix1; CC 5.3.4) — a rootless node runs the P2P mesh (I2240–I2243).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod rootless_mesh_invariants;
+// v62.0.0 (RL-fix11) — the parties to a row under the rootless serve rule:
+// every voice's signer (I2412–I2414).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod rootless_parties_invariants;
 // v62.0.0 (KB-fix1; CC 3.2 at rc22 `87abd2d`) — the root is the bundle's
 // lineage: acceptance by `family_key_id`, validity, rooting and the mesh-config
 // author read the bundle in force (I2400–I2404).

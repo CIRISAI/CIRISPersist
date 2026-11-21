@@ -427,6 +427,15 @@ pub(crate) enum ConnClass {
 /// and are `Write`.
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
+    // v62.0.0 (GC-fix1) — the accord rescan marks and the signed dial hints:
+    // each body is one `self.read(..)` or one `self.write(..)`.
+    ("note_accord_skip", ConnClass::Write),
+    ("accord_skips", ConnClass::Read),
+    ("clear_accord_skip", ConnClass::Write),
+    ("put_dial_hints", ConnClass::Write),
+    ("dial_hints_for", ConnClass::Read),
+    ("list_dial_hints", ConnClass::Read),
+    ("remove_dial_hints", ConnClass::Write),
     // v62.0.0 (slice E2a) — the edition-2 statement store.
     ("edition2_statements_about", ConnClass::Read),
     ("edition2_objects", ConnClass::Read),

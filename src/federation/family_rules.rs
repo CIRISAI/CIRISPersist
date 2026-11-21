@@ -24,7 +24,7 @@
 //! `minted_by_persist` entries — scoped to the three families persist is the
 //! PRODUCER of, because CC 3.1.7 R2(a) is a producer obligation. R2(a) is not
 //! the whole exposure. Measured on the vendored rc5 @ 4b624513 cut, the minted
-//! set is **4 of 21** (three from #590, plus `mesh_config:` — CIRISPersist#570
+//! set is **4 of 22** (three from #590, plus `mesh_config:` — CIRISPersist#570
 //! ask 1; v60.0.0 added `goal:`, CIRISPersist#988 item 4; v60.1.0 added
 //! `identity_amendment:`, CIRISPersist#1120). v50.0.0 (CIRISPersist#924): CC's `_meta.case_rule.reserved_stems`
 //! now states the `capacity:` and `detection:` rules at the FAMILY (the
@@ -1225,9 +1225,9 @@ mod tests {
         // stop, so it is checked here rather than trusted.
         assert_eq!(
             RULES_NOT_ON_THE_ROW.len(),
-            21,
+            22,
             "the inventory now has {} entries; this module's doc says the minted set is \"4 of \
-             21\". Update BOTH numbers so the claim a reader acts on is the claim the build \
+             22\". Update BOTH numbers so the claim a reader acts on is the claim the build \
              checked.",
             RULES_NOT_ON_THE_ROW.len()
         );

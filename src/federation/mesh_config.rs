@@ -4232,7 +4232,26 @@ mod tests {
         };
         let st =
             e2::statement_of_with_key(&a, &fg::test_key(fg::HOLDER_SEEDS[0]), &e2::family_of(&a));
-        let row = e2::row_of_statement(&st, crate::federation::edition2::ingest::INGEST_TIER);
+        // RL-fix10 — the holder's key is placed by the bundle, not by a
+        // fixture seed, so the row is admitted over THIS node's held keys
+        // (`ingest::held_keys_for`), never the fixture's seed map.
+        let row = {
+            let keys = crate::federation::edition2::ingest::held_keys_for(dir, &st)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] the holder's key reads: {e}"));
+            let admitted = crate::federation::edition2::door::admit_row(
+                &st,
+                &keys,
+                None,
+                ciris_verify_core::edition2::family::SelectContext::default(),
+            )
+            .unwrap_or_else(|e| panic!("[{tag}] the holder's row admits: {e}"));
+            crate::federation::edition2::ingest::attestation_of(
+                &admitted,
+                crate::federation::edition2::ingest::INGEST_TIER,
+            )
+            .unwrap_or_else(|e| panic!("[{tag}] the row maps: {e}"))
+        };
         let door = |row: &Attestation| {
             let row = row.clone();
             let node = node.clone();

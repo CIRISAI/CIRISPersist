@@ -720,6 +720,18 @@ pub fn is_digest_member(family_id: &str, member: &str) -> bool {
         })
 }
 
+/// v62.0.0 (KR-fix7) — is `member` a byte-string member (`bstr`) of
+/// `family_id`'s payload list? The draft builder states such a member from
+/// its hex text (`emit::payload_from_envelope`).
+#[must_use]
+pub fn is_bstr_member(family_id: &str, member: &str) -> bool {
+    family_by_id(family_id).is_some_and(|f| {
+        f.members
+            .iter()
+            .any(|m| m.name == member && matches!(m.ty, Ty::Bstr))
+    })
+}
+
 /// A hash digest `[-16, bstr .size 32]` as lowercase hex.
 #[must_use]
 pub fn digest_hex(v: &Value) -> Option<String> {
@@ -1331,6 +1343,10 @@ pub const REF_MEMBERS: &[(&str, &str, &str, RefShape)] = &[
     // surfaces: a holder drafts it with `statement_draft`, and the mapping
     // projects it back.
     ("trust:{job}:{version}", "head", "head", RefShape::One),
+    // v62.0.0 (KR-fix7; CC 3.4.7) — a seat re-bind names the genesis bundle
+    // it is counted over: the envelope member `head` (64-hex object id) is
+    // stated as `refs.head`, as a grant from the root's is.
+    ("transport:canonical_rebind", "head", "head", RefShape::One),
 ];
 
 /// v62.0.0 (wave P1e) — the [`REF_MEMBERS`] entries of the family a

@@ -1342,6 +1342,15 @@ pub fn route_of(admitted: &AdmittedRow) -> Route {
     if super::typed::is_trust_family(&admitted.family) {
         return Route::Trust;
     }
+    // v62.0.0 (SL-fix4) — a counted takedown notice stays a takedown row
+    // (its envelope projection keys on `typed::typed_plane_of_row`) and is
+    // stored by the counted attestation tail (CC 2.6.1.9). SL-fix3a hid it
+    // from `typed_plane_of_row` instead, which also dropped the projection:
+    // the door then read no `claimant_key_id` and held it `count_short`
+    // forever.
+    if super::typed::is_counted_takedown(admitted) {
+        return Route::Attestation;
+    }
     if let Some(plane) = super::typed::typed_plane_of_row(admitted) {
         return Route::Typed(plane);
     }

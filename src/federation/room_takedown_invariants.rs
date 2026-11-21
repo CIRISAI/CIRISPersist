@@ -43,7 +43,7 @@
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
     use crate::federation::doors_takedown_invariants::bodies::{
-        delegate, key_as, notice, Claimant,
+        delegate_in, key_as, notice, Claimant,
     };
     use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::edition2::ingest::StatementOutcome;
@@ -276,7 +276,8 @@ pub(crate) mod bodies {
         // rule), and the takedown reads none (every notice is signed by the
         // identity itself).
         // The founder appoints its deputy on B; the appointment reaches A.
-        let appointment = delegate(b, founder, deputy, &["takedown", "review"]).await;
+        // CW-fix1 fixture fix (4u) — the appointment NAMES the room.
+        let appointment = delegate_in(b, founder, deputy, &["takedown", "review"], &room).await;
 
         // E12-fix2 — an own-act delegation lands with its delegate's voice
         // (CC 2.6.1.9): on A as on B, through E0's `land_delegation`.

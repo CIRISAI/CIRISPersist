@@ -154,18 +154,6 @@ pub fn typed_plane_of(row_type: &str, family: &str) -> Option<TypedPlane> {
 #[must_use]
 pub fn typed_plane_of_row(row: &AdmittedRow) -> Option<TypedPlane> {
     let plane = typed_plane_of(&row.row_type, &row.family)?;
-    // v62.0.0 (SL-fix3a; CC 4.4.3.12, CC 2.6.1.9) — a COUNTED takedown
-    // notice that is no steward purge (no `author`: a one-seat affiliation's
-    // act against a member's content) is counted by its voices, so it takes
-    // the attestation tail that keeps each voice and re-runs the gates over
-    // all of them (`voices::put_counted_row`), not the typed single-statement
-    // put. The gates are the same `put_attestation` gates either way.
-    if plane == TypedPlane::Takedown
-        && !is_steward_purge(row)
-        && row.payload.get_text("author").is_none()
-    {
-        return None;
-    }
     if plane == TypedPlane::Revocation
         && row
             .payload
@@ -949,6 +937,21 @@ where
     }
 }
 
+/// v62.0.0 (SL-fix3a, SL-fix4) — **a COUNTED takedown notice that is no
+/// steward purge** (no `author`: a one-seat affiliation's act against a
+/// member's content, CC 4.4.3.12). It is still the takedown plane's row: its
+/// envelope is projected to the names the takedown door reads
+/// ([`project_envelope`]: `claimant` → `claimant_key_id`, ...). Only its
+/// STORE TAIL differs: it is counted by its voices, so `ingest::route_of`
+/// sends it to the attestation tail that keeps each voice and re-runs the
+/// gates over all of them (`voices::put_counted_row`).
+#[must_use]
+pub fn is_counted_takedown(row: &AdmittedRow) -> bool {
+    typed_plane_of(&row.row_type, &row.family) == Some(TypedPlane::Takedown)
+        && !is_steward_purge(row)
+        && row.payload.get_text("author").is_none()
+}
+
 /// `takedown_notice:steward_purge`: the `{basis}` leaf.
 pub(crate) fn is_steward_purge(row: &AdmittedRow) -> bool {
     dimension_segment(&row.payload, 1)
@@ -1408,6 +1411,33 @@ pub async fn put_trust_statement<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (RL-fix9; CC 2.6.1.11, CC 3.4.7 as corrected at `13829f5`) —
+    // the accord's charter is the genesis bundle's `charter` member and no
+    // row. A `trust:charter:v1` naming the accord is refused HERE, by its
+    // bytes, before the counted-row attempt opens: a gate inside that attempt
+    // that marks a fold condition first would turn the charter gate's later
+    // refusal into a hold (the 4q run's `Pending`, I2350/I2353). The charter
+    // gate (`trust_root::check_family_charter_admission`) keeps the same
+    // refusal for the attestation-plane callers.
+    if row.row_type == crate::federation::types::attestation_type::DELEGATES_TO
+        && row.sub == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
+        && row.payload.get_text("dimension").and_then(Value::as_text)
+            == Some(crate::federation::trust_root::TRUST_CHARTER_DIMENSION)
+    {
+        return Err(Error::malformed_row(
+            super::door::PLANE,
+            crate::federation::malformed_row::ACCORD_CHARTER_IS_THE_BUNDLE,
+            format!(
+                "{}: a `{}` row naming {} (by {}); the accord's charter is the genesis \
+                 bundle's `charter` member, changed by a later bundle at the import door \
+                 (CC 2.6.1.11)",
+                crate::federation::malformed_row::ACCORD_CHARTER_IS_THE_BUNDLE,
+                crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
+                row.sub,
+                row.iss
+            ),
+        ));
+    }
     // W1-fix2 (CC 2.6.1.9; W1.api.md v1.6) — a trust edge is a counted row
     // like any attestation: its store goes through the ONE shared voice path
     // (`voices::put_counted_row`). The row is projected from its author's

@@ -121,68 +121,75 @@ where
     // designated officials whatever scope it is placed at: the countersign is
     // theirs to give, and a voice they never receive can never conclude.
     if let Some(peer) = requester {
-        if super::typed::is_floor_family(family) && payload.get_text("author").is_none() {
-            if let Some(input) = super::typed::floor_act_of_payload(family, &payload) {
-                let at = payload
-                    .get_text("asserted_at")
-                    .and_then(Value::as_u64)
-                    .and_then(|ms| i64::try_from(ms).ok())
-                    .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-                    .unwrap_or_else(crate::host::clock::now);
-                let probe = payload
-                    .get_text("claimant")
-                    .and_then(Value::as_text)
-                    .unwrap_or(iss);
-                if let Some(room) = crate::federation::affiliation_config::floor_affiliation(
-                    dir,
-                    input.as_act(),
-                    probe,
-                    at,
-                )
-                .await?
-                {
-                    if crate::federation::affiliation_config::designated_official_keys(&room)
-                        .unwrap_or_default()
-                        .contains(peer)
-                    {
-                        return Ok(true);
-                    }
-                }
-            }
+        if Box::pin(served_to_floor_official(dir, statement, peer)).await? {
+            return Ok(true);
         }
     }
-    // v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21) — a COUNTED row of the
-    // root still gathering its voices (a grant, or the root's counted
-    // withdrawal of one) reaches the holders of the bundle it names, whether
-    // or not this node is rooted: the count is theirs to give, and a voice
-    // they never receive can never conclude. The requester is a holder, or a
-    // key whose principal is one.
-    //
-    // ONLY A HOLDER'S OWN VOICE crosses this way (rev 7): the statement's
-    // signer must itself be a holder of the bundle it names. A counted
-    // trust-family statement anyone else signs over a held bundle is kept
-    // short by the door and never reaches the holders through this arm, so a
-    // stranger cannot push statements at them through an unrooted node.
-    if let Some(peer) = requester {
-        if let Some(holders) = crate::federation::admission::root_grant_voice_parties(
-            dir.as_dyn_directory(),
-            statement,
-        )
-        .await?
-        {
-            if holders.iter().any(|h| h == iss) {
-                if holders.iter().any(|h| h == peer) {
-                    return Ok(true);
-                }
-                let principals =
-                    crate::federation::self_collective::principals_of(dir, peer).await?;
-                if principals.iter().any(|p| holders.contains(p)) {
-                    return Ok(true);
-                }
-            }
-        }
-    }
+    // v62.0.0 (KR-fix2 rev 7; folded by RL-fix11) — a counted root row
+    // still gathering its voices reaches the holders of the bundle it names
+    // (a holder's own voice only): a family arm of the ONE party answer,
+    // `serve::is_party_to_row`, which `scope_servable` asks through
+    // `serve::commons_servable`.
     scope_servable(dir, iss, sub, statement, &payload, requester).await
+}
+
+/// v62.0.0 (SL-fix3c, SL-fix4; CC 4.4.3.12 as ruled 11-21: "designation
+/// makes it a party to that decision, not a member") — **is `peer` a
+/// designated official of the one-seat affiliation a COUNTED act against a
+/// member (`statement`, or any voice of it) is taken in?** Such an official
+/// is a party to that act: it is served the act's statements whether the act
+/// is still gathering voices (this module) or has concluded (the row path,
+/// `serve::servable_to`), whatever scope the act is placed at and whether or
+/// not this node is rooted. Never the room's content (I4165).
+///
+/// # Errors
+/// Directory reads.
+pub(crate) async fn served_to_floor_official<F>(
+    dir: &F,
+    statement: &[u8],
+    peer: &str,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some((protected, payload)) = statement_parts(statement) else {
+        return Ok(false);
+    };
+    let Some(family) = protected.get_int(-70002).and_then(Value::as_text) else {
+        return Ok(false);
+    };
+    if !super::typed::is_floor_family(family) || payload.get_text("author").is_some() {
+        return Ok(false);
+    }
+    let Some(input) = super::typed::floor_act_of_payload(family, &payload) else {
+        return Ok(false);
+    };
+    let iss = protected
+        .get_int(15)
+        .and_then(|c| c.get_int(1))
+        .and_then(Value::as_text)
+        .unwrap_or("");
+    let at = payload
+        .get_text("asserted_at")
+        .and_then(Value::as_u64)
+        .and_then(|ms| i64::try_from(ms).ok())
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .unwrap_or_else(crate::host::clock::now);
+    let probe = payload
+        .get_text("claimant")
+        .and_then(Value::as_text)
+        .unwrap_or(iss);
+    let Some(room) =
+        crate::federation::affiliation_config::floor_affiliation(dir, input.as_act(), probe, at)
+            .await?
+    else {
+        return Ok(false);
+    };
+    Ok(
+        crate::federation::affiliation_config::designated_official_keys(&room)
+            .unwrap_or_default()
+            .contains(peer),
+    )
 }
 
 /// How many `cosign` statements a cosign's `refs.target` chain follows to

@@ -20614,9 +20614,15 @@ mod tests {
         };
         for (pair, b_first) in [("1", false), ("2", true)] {
             let m = format!("cw-mod-{tag}-{pair}");
-            dir.put_live(sweeper_test_key(&m))
-                .await
-                .expect("seed moderator");
+            // 4u — a PERSON: a quarantine marker is signed by a person or an
+            // agent, never a primitive key (`quarantine::check_signer_kind`;
+            // that refusal, not the duty's, answered the B leg before).
+            dir.put_live(typed_test_key(
+                &m,
+                crate::federation::types::identity_type::USER,
+            ))
+            .await
+            .expect("seed moderator");
             let mk = crate::federation::edition2::fixture_switch::kid(&m);
             let a =
                 seed_community_with_founder(engine, &format!("cw-a-{tag}-{pair}"), &derived, label)

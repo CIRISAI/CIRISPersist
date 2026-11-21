@@ -992,6 +992,15 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("envelope_dimension", Class::Plumbing),
     ("execute", Class::Plumbing),
     ("filter_withheld_rows", Class::Gate),
+    // v62.0.0 (GC-fix1; RL-fix2) — the serve wait on the relay read: a node
+    // that is not rooted withholds federation-tier rows. It decides what the
+    // caller is served, as `filter_withheld_rows` does: a Gate.
+    ("withhold_waiting_rows", Class::Gate),
+    // v62.0.0 (GC-fix1; AU-fix1) — is the row an `admission` acceptance edge
+    // to a held group? Its answer selects which subject rule the door runs,
+    // so it decides something about the caller's row: a Gate (Plumbing would
+    // be the fail-open filing).
+    ("is_admission_edge_to_held_group", Class::Gate),
     // v62.0.0 (RL-fix2b; CC 5.3.4) — the serve wait: the point read's row
     // test is a policy decision (a Gate); this node's standing, asked once
     // per serve call and passed into the SQL serve rule, is a derivation.
@@ -1505,6 +1514,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // that read this node's holding of the blob. It refuses nothing about the
     // caller; it fails only on the substrate's own terms (a fold read/write).
     ("refold_on_blob", Class::Plumbing),
+    // v62.0.0 (DR-fix3) — the stream's touch after a head is stored
+    // (`put_stream_sth`): re-folds the rows that read the stream (a delivery
+    // receipt waiting on its head). It refuses nothing about the caller; it
+    // fails only on the substrate's own terms (a fold read/write).
+    ("refold_on_stream", Class::Plumbing),
     // v55.0.0 (CIRISPersist#989) — sqlite: the holding claim's INSERT inside
     // the caller's transaction. Storage, as `insert_holding_claim_tx`.
     // v62.0.0 (red round 3, X1) — the v62 waves' propagated calls.

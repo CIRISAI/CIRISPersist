@@ -273,6 +273,10 @@ pub(crate) mod family_dissolution_invariants;
 /// v49.0.0 (CIRISPersist#910) — I177 / I179: the family roster plane.
 #[cfg(test)]
 pub mod family_roster_invariants;
+/// v62.0.0 (PT-fix1; CC 4.4.3.12, CC 5.3.4) — I4155: the rootless wait's
+/// party answer names a one-seat affiliation's designated officials.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod floor_party_invariants;
 /// v53.0.0 (CC 3.2 T2) — I383–I386, a superseded grant hands standing to its
 /// successor; a withdrawn one has none.
 #[cfg(test)]

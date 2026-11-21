@@ -146,7 +146,7 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         s: &str,
     ) {
-        use crate::federation::doors_takedown_invariants::bodies::{delegate, notice, Claimant};
+        use crate::federation::doors_takedown_invariants::bodies::{delegate_in, notice, Claimant};
         use crate::federation::room_roster_authority_invariants::bodies::make_group;
         use crate::federation::takedown_reversal_invariants::bodies::{ruling, sha_bytes, sha_hex};
         use crate::federation::takedown_tombstone::{self as td, token};
@@ -172,7 +172,7 @@ pub(crate) mod bodies {
                 .contains(plain),
             "I1745: the plain member may still sign for the room"
         );
-        delegate(d, founder, deputy, &["takedown", "review"]).await;
+        delegate_in(d, founder, deputy, &["takedown", "review"], &room).await;
 
         // The moderation-act door, in CC's shape (I1512), on the author's
         // placed row.

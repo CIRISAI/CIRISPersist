@@ -191,7 +191,6 @@ RATCHET: dict[tuple[str, str, str], tuple[int, str]] = {
     ('present', 'src/federation/mod.rs', 'check_write_cohort_scope_for'): (2, 'decision reads the roster at the host clock; -> standing::roster(G, act instant) (CLEAN S4)'),
     ('present', 'src/federation/public_room.rs', 'check_community_listing_admission'): (1, 'decision reads the roster at the host clock; -> standing::roster(G, act instant) (CLEAN S4)'),
     ('protocol', 'src/federation/admission.rs', 'infrastructure_quorum'): (1, 'parses quorum:M/N; -> standing::parse_protocol (CLEAN S2)'),
-    ('protocol', 'src/federation/admission.rs', 'is_quorum_protocol'): (1, 'parses quorum:M/N; -> standing::parse_protocol (CLEAN S2)'),
     ('protocol', 'src/federation/canonical_community.rs', 'check_trust_root_shape'): (1, 'parses quorum:M/N; -> standing::parse_protocol (CLEAN S2)'),
     ('protocol', 'src/federation/canonical_community.rs', 'parse_quorum'): (1, 'parses quorum:M/N; -> standing::parse_protocol (CLEAN S2)'),
     ('protocol', 'src/federation/consensus.rs', 'evaluate_counted'): (1, 'parses quorum:M/N; -> standing::parse_protocol (CLEAN S2)'),

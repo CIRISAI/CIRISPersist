@@ -298,6 +298,27 @@ pub fn payload_from_envelope(
         if k == STATEMENT_MEMBER || k == "row" || drop.contains(&k.as_str()) || v.is_null() {
             continue;
         }
+        // v62.0.0 (KR-fix7; CC 3.4.7) — a seat re-bind
+        // (`transport:canonical_rebind`) has no leaf: the `dimension` a host
+        // names it by picks the family and is not a payload member, and its
+        // key members are byte strings, stated from their hex text. So a
+        // holder whose key is on hardware can draft the FIRST voice
+        // (`Engine::statement_draft`) with the exact payload the door counts.
+        if family == super::transport_rebind::REBIND_FAMILY {
+            if k == "dimension" {
+                continue;
+            }
+            if super::payloads::is_bstr_member(family, k) {
+                let bytes =
+                    v.as_str()
+                        .and_then(|h| hex::decode(h).ok())
+                        .ok_or(ProduceError::Payload(
+                            "a re-bind's key member is not hex text",
+                        ))?;
+                m.push((text(k), Value::Bytes(bytes)));
+                continue;
+            }
+        }
         let c = if INSTANT_MEMBERS.contains(&k.as_str()) {
             Value::Uint(ms_of(v)?)
         } else if is_digest_member(family, k) {
@@ -824,6 +845,117 @@ where
     ))
 }
 
+/// v62.0.0 (KR-fix6; CC 2.6.1.3 "a member that names a row stands in `refs`")
+/// — **the row a membership REPLY answers**: for an envelope whose
+/// `dimension` is `membership:acceptance:v1` or `membership:decline:v1`, its
+/// `references_attestation_id` as a row id. The reply gates read it back from
+/// `refs.target` (`ingest::attestation_of`). `None` for any other row, or a
+/// reply that names none.
+///
+/// # Errors
+/// `edition2_payload_invalid`: the member is not 64 hex.
+pub fn reply_target_of(envelope: &serde_json::Value) -> Result<Option<Digest32>, Error> {
+    use crate::federation::membership_acceptance::{ACCEPTANCE_DIMENSION, DECLINE_DIMENSION};
+    let dimension = envelope
+        .get("dimension")
+        .and_then(serde_json::Value::as_str);
+    if dimension != Some(ACCEPTANCE_DIMENSION) && dimension != Some(DECLINE_DIMENSION) {
+        return Ok(None);
+    }
+    let Some(id) = envelope
+        .get("references_attestation_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    hex::decode(id)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .map(Some)
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "edition2_payload_invalid: a membership reply names the row it answers by row \
+                 id, and {id:?} is not an edition-2 row id (64 lowercase hex)"
+            ))
+        })
+}
+
+/// v62.0.0 (KR-fix6) — **THE payload of a produced row**, from its JSON
+/// envelope. The ONE builder behind the software producer
+/// (`attestation_emit::produce_row`: `emit_statement`, the Engine's emit
+/// verbs) and the draft a signer elsewhere signs ([`draft_from_envelope`]:
+/// `Engine::statement_draft`), so the two cannot state a row differently:
+///
+/// - the envelope's members ([`payload_from_envelope`]), without the earlier
+///   bookkeeping a row type restates as `refs` (a composer's
+///   [`COMPOSER_EARLIER_MEMBERS`]; `references_attestation_id` otherwise);
+/// - `author` when the caller says the row is authored;
+/// - an `admission:unit` row's `capabilities` as a sorted, unique set;
+/// - `refs.target`: the composer's `target`, or the row a membership reply
+///   answers ([`reply_target_of`]), JOINING the roles the envelope already
+///   states under `refs` (`payloads::REF_MEMBERS`), never replacing them.
+///
+/// Before KR-fix6 each producer had its own copy: the draft sorted
+/// `capabilities` and joined `refs` and the software producer did neither;
+/// neither stated a reply's target, and KR-fix5 taught only one of them.
+///
+/// # Errors
+/// [`payload_from_envelope`]'s, as `edition2_payload_invalid`;
+/// [`reply_target_of`]'s.
+pub fn row_payload(
+    producer: &'static str,
+    row_type: &str,
+    family: &str,
+    envelope: &serde_json::Value,
+    asserted_at_ms: u64,
+    author: Option<&str>,
+    target: Option<&Digest32>,
+) -> Result<Value, Error> {
+    let composer = super::payloads::COMPOSER_ROW_TYPES.contains(&row_type);
+    let drop: &[&str] = if composer {
+        COMPOSER_EARLIER_MEMBERS
+    } else {
+        &["references_attestation_id"]
+    };
+    let mut payload = payload_from_envelope(envelope, family, asserted_at_ms, author, drop)
+        .map_err(|e| produce_error(producer, e))?;
+    // v62.0.0 (AU-fix2; CC 2.7.11) — `capabilities` is a deterministic set
+    // (sorted by encoding, unique): stated so whatever order the host gave.
+    if family == super::payloads::ADMISSION_UNIT_FAMILY {
+        if let Some(Value::Array(caps)) = payload.get_text("capabilities") {
+            let mut caps = caps.clone();
+            caps.sort_by_key(cde::encode);
+            caps.dedup();
+            payload = with_member(payload, "capabilities", Value::Array(caps))
+                .map_err(|e| produce_error(producer, e))?;
+        }
+    }
+    let reply = if composer || target.is_some() {
+        None
+    } else {
+        reply_target_of(envelope)?
+    };
+    if let Some(t) = target.or(reply.as_ref()) {
+        // v62.0.0 (E2-fix9) — the target joins the roles the envelope already
+        // states under `refs` (`payloads::REF_MEMBERS`: a reclaim withdraws's
+        // `wa_adjudication_ref`); it never replaces them.
+        let refs = match payload.get_text("refs").and_then(Value::as_map) {
+            Some(roles) => {
+                let mut m: Vec<(Value, Value)> = roles
+                    .iter()
+                    .filter(|(k, _)| k.as_text() != Some("target"))
+                    .cloned()
+                    .collect();
+                m.push((text("target"), row_ref(t)));
+                sorted_map(m)
+            }
+            None => refs_target(t),
+        };
+        payload = with_member(payload, "refs", refs).map_err(|e| produce_error(producer, e))?;
+    }
+    Ok(payload)
+}
+
 /// [`draft_from_envelope`] with the authorship decided by the caller when
 /// `authored` is given (the directory's answer, [`draft_from_envelope_in`]).
 #[allow(clippy::too_many_arguments)]
@@ -864,48 +996,15 @@ fn draft_from_envelope_as(
                     .and_then(serde_json::Value::as_str),
             )
         });
-    let drop: &[&str] = if super::payloads::COMPOSER_ROW_TYPES.contains(&row_type) {
-        COMPOSER_EARLIER_MEMBERS
-    } else {
-        &["references_attestation_id"]
-    };
-    let mut payload = payload_from_envelope(
-        envelope,
+    let payload = row_payload(
+        "draft",
+        row_type,
         &family,
+        envelope,
         asserted_at_ms,
         authored.then_some(iss),
-        drop,
-    )
-    .map_err(|e| produce_error("draft", e))?;
-    // v62.0.0 (AU-fix2; CC 2.7.11) — `capabilities` is a deterministic set
-    // (sorted by encoding, unique): stated so whatever order the host gave.
-    if family == super::payloads::ADMISSION_UNIT_FAMILY {
-        if let Some(Value::Array(caps)) = payload.get_text("capabilities") {
-            let mut caps = caps.clone();
-            caps.sort_by_key(cde::encode);
-            caps.dedup();
-            payload = with_member(payload, "capabilities", Value::Array(caps))
-                .map_err(|e| produce_error("draft", e))?;
-        }
-    }
-    if let Some((t, _)) = target {
-        // v62.0.0 (E2-fix9) — the target joins the roles the envelope already
-        // states under `refs` (`payloads::REF_MEMBERS`: a reclaim withdraws's
-        // `wa_adjudication_ref`); it never replaces them.
-        let refs = match payload.get_text("refs").and_then(Value::as_map) {
-            Some(roles) => {
-                let mut m: Vec<(Value, Value)> = roles
-                    .iter()
-                    .filter(|(k, _)| k.as_text() != Some("target"))
-                    .cloned()
-                    .collect();
-                m.push((text("target"), row_ref(t)));
-                sorted_map(m)
-            }
-            None => refs_target(t),
-        };
-        payload = with_member(payload, "refs", refs).map_err(|e| produce_error("draft", e))?;
-    }
+        target.map(|(t, _)| t),
+    )?;
     draft_row(kid, iss, sub, row_type, &family, &payload).map_err(|e| produce_error("draft", e))
 }
 

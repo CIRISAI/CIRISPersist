@@ -206,6 +206,16 @@ pub(crate) async fn conferred_detector_body(d: &dyn FederationDirectory) {
         .max()
         .expect("I3081: a bundle in force");
     let at = tip + 90_000;
+    // FX-fix1 (CC 4.4.3.19) — the detector is a MACHINE key: a conferral on
+    // it also waits for its owner's voice (`delegate_owner`), so it is given
+    // an owner first, bound at the grant's instant, as the shared conferral
+    // helper does (`r2_test_support::confer_scope_from_trusted_root_at`).
+    // Without one the grant was held `count_short` for good.
+    let at_instant = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+        i64::try_from(at).expect("I3081: an instant"),
+    )
+    .expect("I3081: an instant");
+    crate::federation::admission::r2_test_support::bind_owner_if_machine(d, det, at_instant).await;
     let grant = super::fixture_trust_root::confers_statement(
         &r,
         &e2::kid(det),
@@ -220,6 +230,17 @@ pub(crate) async fn conferred_detector_body(d: &dyn FederationDirectory) {
     e2::put_statement(d, &e2::voice_of(&grant, det))
         .await
         .expect("I3081: the detector's own voice on its conferral");
+    // ... and the machine delegate's owner for a third.
+    let owner = crate::federation::admission::r2_test_support::machine_owner_of(
+        d,
+        &e2::kid(det),
+        at_instant,
+    )
+    .await
+    .expect("I3081: the detector's owner is bound");
+    e2::put_statement(d, &e2::voice_of(&grant, &owner))
+        .await
+        .expect("I3081: the owner's voice on the detector's conferral");
     let grant_id = RowId::of_statement(&grant).expect("I3081: the grant's row id");
     assert!(
         d.get_attestation(&grant_id.hex()).await.unwrap().is_some(),

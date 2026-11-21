@@ -48046,7 +48046,18 @@ mod tests {
         .unwrap();
         put_delegation(
             &backend,
-            node_delegates_to_sqlite("mod-founder", "mod-deputy", &[DELEGATION_SCOPE_MODERATE]),
+            // CW-fix1 fixture fix (4u) — the room duty edge NAMES mod-comm.
+            {
+                let mut e = node_delegates_to_sqlite(
+                    "mod-founder",
+                    "mod-deputy",
+                    &[DELEGATION_SCOPE_MODERATE],
+                );
+                e.attestation_envelope["community_id"] =
+                    serde_json::Value::String(kid_any("mod-comm"));
+                resign_fed(&mut e);
+                e
+            },
         )
         .await;
         let mods = crate::federation::admission::moderators_of(

@@ -216,10 +216,27 @@ pub(crate) async fn land_grant(
             .await
             .unwrap_or_else(|e| panic!("{what}: holder {i}'s voice: {e}"));
     }
-    d.get_attestation(&id.hex())
-        .await
-        .expect("get_attestation")
-        .unwrap_or_else(|| panic!("{what}: two of three holders land the grant"))
+    landed(
+        d,
+        &id,
+        &format!("{what}: two of three holders land the grant"),
+    )
+    .await
+}
+
+/// v62.0.0 (PX-fix4) — **the row LANDED**: a put that answers `Ok` may have
+/// kept the row HELD (`Pending`, or a voice short of its count), and a
+/// fixture that reads held as done hides the gate that holds it. Returns the
+/// held row; otherwise panics naming the fold's hold reason and its detail.
+async fn landed(d: &dyn FederationDirectory, id: &RowId, what: &str) -> Attestation {
+    if let Some(row) = d.get_attestation(&id.hex()).await.expect("get_attestation") {
+        return row;
+    }
+    let held = super::fold::why_held(d, id).await.expect("why_held");
+    panic!(
+        "{what}: did not land; held {:?}",
+        held.map(|h| (h.reason, h.detail))
+    )
 }
 
 /// The owner accepts `grant`.
@@ -229,9 +246,17 @@ pub(crate) async fn owner_accepts(
     grant: &Attestation,
     what: &str,
 ) {
-    e2::put_signed(d, &acceptance(owner, grant))
+    let acc = acceptance(owner, grant);
+    e2::put_signed(d, &acc)
         .await
         .unwrap_or_else(|e| panic!("{what}: the owner's acceptance: {e}"));
+    // PX-fix4 — `Ok(Pending)` is not an acceptance: it must land.
+    landed(
+        d,
+        &RowId(e2::rid_digest(&acc)),
+        &format!("{what}: the owner's acceptance"),
+    )
+    .await;
 }
 
 /// A node `seed` that accepts the bundle root (its `trust:accepts:v1` edge to
@@ -257,7 +282,14 @@ pub(crate) async fn accepting_node(d: &dyn FederationDirectory, seed: &str) -> S
     .expect("the acceptance edge signs");
     e2::put_statement(d, &edge)
         .await
-        .expect("the acceptance edge lands");
+        .expect("the acceptance edge is admitted");
+    // PX-fix4 — a held edge accepts nothing: it must land.
+    landed(
+        d,
+        &row_of(&edge),
+        &format!("{seed}: the acceptance edge of the bundle root"),
+    )
+    .await;
     node
 }
 
@@ -571,11 +603,7 @@ pub(crate) async fn i4226_an_unaccepted_root_grant_never_confers_by_its_first_vo
         .await
         .unwrap_or_else(|e| panic!("I4226: holder {i}'s voice: {e}"));
     }
-    let grant = d
-        .get_attestation(&id.hex())
-        .await
-        .expect("I4226 reads")
-        .expect("I4226: two holders land the grant");
+    let grant = landed(d, &id, "I4226: two holders land the grant").await;
     if kept {
         // CONSTRUCTIBLE: the bypass shape. Dropping the delegation-loop
         // exclusion would confer it as a grant BY the keyed root.

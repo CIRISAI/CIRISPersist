@@ -579,6 +579,65 @@ pub(crate) async fn i2268_a_short_founding_stays_held(
     );
 }
 
+/// How many voices of `bind` an anonymous reader is served.
+async fn served_count(d: &dyn FederationDirectory, bind: &RowId) -> usize {
+    statements_served_to(d, None, 256, None)
+        .await
+        .expect("the anonymous serve")
+        .statements
+        .iter()
+        .filter(|s| RowId::of_statement(&s.bytes).as_ref() == Some(bind))
+        .count()
+}
+
+/// **I2415** (RL-fix12) — a bootstrap bind whose identity has NOT voiced it
+/// yet is not a fact: a rootless node withholds the device's lone voice from
+/// an anonymous reader (the second-signer withhold stands for it), and serves
+/// both voices once the identity's lands and the bind concludes.
+pub(crate) async fn i2415_a_pending_bind_stays_withheld(d: &dyn FederationDirectory, tag: &str) {
+    let (owner, device) = (key(244), key(245));
+    for k in [&owner, &device] {
+        Box::pin(put_statement(
+            d,
+            &key_record(k, &["user"], 0, None),
+            None,
+            INGEST_TIER,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] a key record lands: {e}"));
+    }
+    let (u, k) = (iref(&owner), iref(&device));
+    let extra = || {
+        vec![
+            ("transport_destination", transport(11, 12)),
+            ("transit_xwing_pubkey", Value::Bytes(vec![0x53u8; 1216])),
+        ]
+    };
+    let own = bind_voice(d, &device, &u, &k, 22_000, extra()).await;
+    let bind = RowId::of_statement(&own).expect("a row id");
+    let out = Box::pin(put_statement(d, &own, None, INGEST_TIER))
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the device's bind voice: {e}"));
+    assert!(
+        matches!(out, StatementOutcome::Pending { .. }),
+        "[{tag}] I2415: the device's lone voice waits for its identity: {out:?}"
+    );
+    assert_eq!(
+        served_count(d, &bind).await,
+        0,
+        "[{tag}] I2415: a pending bind is no fact: withheld from an anonymous reader"
+    );
+    let author = bind_voice(d, &owner, &u, &k, 22_000, extra()).await;
+    Box::pin(put_statement(d, &author, None, INGEST_TIER))
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the owner's bind voice: {e}"));
+    assert_eq!(
+        served_count(d, &bind).await,
+        2,
+        "[{tag}] I2415: once concluded, both voices of the bind are served"
+    );
+}
+
 /// **I2244** on one backend.
 pub(crate) async fn i2244_agent_and_federation_wait(d: &dyn FederationDirectory, tag: &str) {
     assert_rootless(d, tag).await;
@@ -717,6 +776,13 @@ mod sqlite {
         assert_rootless(&bb, "sqlite B after").await;
     }
 
+    /// I2415 — a pending bind stays withheld; a concluded one is served.
+    #[tokio::test]
+    async fn i2415_a_pending_bind_stays_withheld_sqlite() {
+        let d = fresh().await;
+        Box::pin(i2415_a_pending_bind_stays_withheld(&d, "sqlite")).await;
+    }
+
     /// I2244 — agent and federation operations wait on a rootless node.
     #[tokio::test]
     async fn i2244_agent_and_federation_wait_on_a_rootless_node_sqlite() {
@@ -814,6 +880,15 @@ mod postgres {
         Box::pin(exercise_i61_end_to_end(&a, &b, "i2242-postgres")).await;
         assert_rootless(&ba, "postgres A after").await;
         assert_rootless(&bb, "postgres B after").await;
+    }
+
+    #[tokio::test]
+    async fn i2415_a_pending_bind_stays_withheld_postgres() {
+        let Some(d) = fresh().await else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        Box::pin(i2415_a_pending_bind_stays_withheld(&d, "postgres")).await;
     }
 
     #[tokio::test]

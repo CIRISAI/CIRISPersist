@@ -251,29 +251,20 @@ pub(crate) async fn deadmission_on_the_revocation_plane_body(
     d: &dyn FederationDirectory,
     node: &str,
 ) {
-    use crate::federation::admission::{check_peer_deadmission, DELEGATION_SCOPE_SLASH};
-    let (root, peer) = ("gc1-dr-root", "gc1-dr-peer");
+    use crate::federation::admission::check_peer_deadmission;
+    let peer = "gc1-dr-peer";
     e2::put_key(d, node, &[identity_type::NODE]).await;
     e2::put_key(d, peer, &[identity_type::NODE]).await;
-    // The node's `slash` conferral from a root it trusts (I3081's shape):
-    // revoking another's key needs it (`check_revocation_authority`).
-    //
-    // RT-fix1 — the root is a ROOTED edition-2 trust root (the shared
-    // conferral fixture: the bundle in force, an `infrastructure` community
-    // founded by its holders, the charter, this node's acceptance), and the
-    // grant carries the node's own voice (G0-fix4; CC 2.6.1.9) and its bound
-    // owner's (a node key is a machine key, CC 4.4.3.19). The earlier body
-    // chartered a bare `node` KEY root by hand, whose grant rooted nowhere.
-    // The fixture returns only once the grant reaches the root through this
-    // node.
-    crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
-        d,
-        node,
-        root,
-        node,
-        DELEGATION_SCOPE_SLASH,
-    )
-    .await;
+    // v62.0.0 (SL-fix4) — no `slash` conferral. The earlier body conferred
+    // `slash` on the NODE so it could revoke another's key through
+    // `check_revocation_authority` (the key plane's door). A peer
+    // de-admission is the node's own act (CC 3.3.1: "de-admission decisions
+    // by other nodes ... remain per-node acts"), a `revocation:peer_admission`
+    // scores row on the attestation plane (`typed::typed_plane_of_row` keeps
+    // it off the key plane), which no duty gate reads; and a node key holds no
+    // duty at all (CC 3.4.7.3 Clause B: the conferral is refused
+    // `node_agency_forbidden`). The leg this witnesses is the de-admission
+    // GATE reading the concluded row.
     // A peer write is admitted before the de-admission.
     let from_peer = crate::federation::tier_ingest::test_support::bare_attestation(
         "gc1-dr-from-peer",

@@ -1761,6 +1761,205 @@ pub(crate) async fn i4211_the_engine_verbs(e: &crate::Engine) {
     );
 }
 
+/// **I4218** (KR-fix7). A seat re-bind produced end to end by the host
+/// verbs, no software key in the Engine: holder 1 DRAFTS the first voice
+/// (`Engine::statement_draft`), signs the draft outside the Engine, submits
+/// (short); holder 2 finds it (`Engine::held_rows_for`, role `root_holder`),
+/// drafts its voice (`Engine::voice_draft`), signs outside, submits: seated,
+/// and it is the seat's live re-bind. The drafted first voice is the same
+/// row a statement signed directly over the documented payload names.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn i4218_a_rebind_drafted_and_voiced_by_hardware_holders(e: &crate::Engine) {
+    use super::second_signer_voice::VoiceOutcome;
+    use super::transport_rebind::{REBIND_FAMILY, REBIND_ROW_TYPE, TRANSIT_MEMBER};
+    use crate::federation::admission::ROOT_HOLDER_ROLE;
+    let c = bundle_v2();
+    let (h1, h2) = (
+        c.holder_identity_ref(0).to_owned(),
+        c.holder_identity_ref(1).to_owned(),
+    );
+    let seat = &c.seats[0];
+    let mut rebound = seat.transit_xwing_pubkey.to_vec();
+    rebound[0] ^= 0x31;
+    rebound[1200] ^= 0x31;
+    // Dated from the bundle, never the wall clock.
+    let at = c.asserted_at_ms + 1_000;
+    let envelope = serde_json::json!({
+        "dimension": REBIND_FAMILY,
+        "head": hex::encode(c.object_id),
+        TRANSIT_MEMBER: hex::encode(&rebound),
+    });
+    let draft = e
+        .statement_draft(
+            REBIND_ROW_TYPE,
+            &envelope,
+            &h1,
+            &hex::encode(super::fixture_genesis::kid_of(
+                super::fixture_genesis::HOLDER_SEEDS[0],
+            )),
+            &seat.identity_ref,
+            at,
+            None,
+        )
+        .await
+        .expect("I4218: Engine::statement_draft drafts a re-bind");
+    let first = draft.assemble(
+        c.holder_key(0)
+            .sign(&draft.sig_structure)
+            .expect("I4218: holder 1 signs outside the Engine"),
+    );
+    let id = row_of(&first);
+    let direct = sign_row_statement(
+        &c.holder_key(0),
+        &h1,
+        &seat.identity_ref,
+        REBIND_ROW_TYPE,
+        REBIND_FAMILY,
+        &map(vec![
+            ("asserted_at", Value::Uint(at)),
+            ("refs", map(vec![("head", row_ref(&c.object_id))])),
+            (TRANSIT_MEMBER, Value::Bytes(rebound.clone())),
+        ]),
+        vec![],
+    )
+    .expect("I4218: the documented payload signs");
+    assert_eq!(
+        id,
+        row_of(&direct),
+        "I4218: the draft states exactly asserted_at, refs.head and the key (no author, no \
+         dimension)"
+    );
+    let o = e
+        .submit_voice(&first)
+        .await
+        .expect("I4218: holder 1's drafted voice is kept");
+    assert!(
+        matches!(&o, VoiceOutcome::Waiting { reason, .. }
+            if reason == super::fold::reason::COUNT_SHORT),
+        "I4218: one holder of three is short: {o:?}"
+    );
+    let rows = e
+        .held_rows_for(Some(h2.as_str()), Some(ROOT_HOLDER_ROLE), None, 10)
+        .await
+        .expect("I4218: Engine::held_rows_for");
+    assert_eq!(rows.len(), 1, "I4218: holder 2 finds the re-bind: {rows:?}");
+    assert_eq!(rows[0].row_id, id.hex(), "I4218: the row");
+    let d2 = e
+        .voice_draft(&rows[0].row_id, &h2)
+        .await
+        .expect("I4218: Engine::voice_draft");
+    let second = d2.assemble(
+        c.holder_key(1)
+            .sign(&d2.sig_structure)
+            .expect("I4218: holder 2 signs outside the Engine"),
+    );
+    let o = e
+        .submit_voice(&second)
+        .await
+        .expect("I4218: holder 2's voice");
+    assert!(o.is_seated(), "I4218: two of three seat it: {o:?}");
+    let live = e
+        .rebind_held_for(&seat.identity_ref)
+        .await
+        .expect("I4218: Engine::rebind_held_for")
+        .expect("I4218: a live re-bind");
+    assert_eq!(live.row_id, id, "I4218: the live re-bind");
+    assert_eq!(
+        live.transit_xwing_pubkey.to_vec(),
+        rebound,
+        "I4218: its key"
+    );
+}
+
+/// **I4217** (KR-fix6). The acceptance of a HARDWARE-held owner: drafted by
+/// the Engine, signed outside it, submitted. The owner's key is one the
+/// Engine does not hold (a fixture composite key): the test signs the
+/// returned `sig_structure`, as a YubiKey would. The reply is admitted and
+/// the grant confers. Before the acceptance nothing confers, and the WORKER's
+/// own drafted acceptance (signed with the worker's key) confers nothing.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn i4217_a_hardware_held_owner_accepts_by_draft(e: &crate::Engine) {
+    use crate::federation::membership_acceptance::reply_envelope;
+    let c = bundle_v2();
+    let dir = e.federation_directory();
+    let d: &dyn FederationDirectory = dir.as_dyn_directory();
+    let head = c.object_id;
+    let (worker, owner_seed) = worker_with_owner(d, "i4217").await;
+    let worker_seed = "w-i4217";
+    let grant = land_grant(
+        d,
+        c,
+        &worker,
+        ATTEST_BUILD,
+        &head,
+        grant_instant(d).await,
+        "I4217",
+    )
+    .await;
+    let now = || Some(ms_now() + chrono::Duration::seconds(1));
+    let read = || async {
+        e.root_grants_for(&worker, now())
+            .await
+            .expect("I4217: Engine::root_grants_for")
+    };
+    assert!(
+        read().await.len() == 1 && !read().await[0].confers,
+        "I4217: counted, not accepted"
+    );
+    let envelope = reply_envelope(&grant, true);
+    let at_ms = u64::try_from(ms_now().timestamp_millis()).expect("ms");
+    let drafted = |seed: &'static str| {
+        let envelope = envelope.clone();
+        let worker = worker.clone();
+        async move {
+            let draft = e
+                .statement_draft(
+                    attestation_type::SCORES,
+                    &envelope,
+                    &e2::kid(seed),
+                    &hex::encode(e2::kid_digest(seed)),
+                    &worker,
+                    at_ms,
+                    None,
+                )
+                .await
+                .expect("I4217: Engine::statement_draft drafts the reply");
+            draft.assemble(
+                e2::signing_key(seed)
+                    .sign(&draft.sig_structure)
+                    .expect("I4217: signed outside the Engine"),
+            )
+        }
+    };
+    // The worker's own key: kept or refused, it confers nothing.
+    let _ = e.submit_voice(&drafted(worker_seed).await).await;
+    assert!(
+        !read().await[0].confers,
+        "I4217: a worker cannot accept its own grant by a draft either"
+    );
+    // The owner's key, held outside the Engine.
+    let owner_seed: &'static str = Box::leak(owner_seed.into_boxed_str());
+    let reply = drafted(owner_seed).await;
+    let (_, payload) = super::liveness::statement_parts(&reply).expect("I4217: the reply reads");
+    assert_eq!(
+        super::names::names_of(&payload)
+            .ok()
+            .and_then(|n| super::names::single(&n, "target")),
+        Some(row_of_id(&grant)),
+        "I4217: the drafted reply names the grant in refs.target"
+    );
+    let o = e
+        .submit_voice(&reply)
+        .await
+        .expect("I4217: the owner's drafted acceptance is admitted");
+    assert!(o.is_seated(), "I4217: admitted: {o:?}");
+    let after = read().await;
+    assert!(
+        after.len() == 1 && after[0].accepted && after[0].confers,
+        "I4217: accepted by the hardware-held owner, conferring: {after:?}"
+    );
+}
+
 #[cfg(feature = "sqlite")]
 mod sqlite {
     use crate::store::Backend as _;
@@ -1812,6 +2011,28 @@ mod sqlite {
         i4210_an_unrooted_node_serves_a_held_grant_to_the_named_holders_sqlite,
         i4210_an_unrooted_node_serves_a_held_grant_to_the_named_holders
     );
+
+    #[tokio::test]
+    async fn i4218_a_rebind_drafted_and_voiced_by_hardware_holders_sqlite() {
+        let e = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer("i4218-engine"),
+            "sqlite::memory:",
+        )
+        .await
+        .expect("I4218: a sqlite Engine");
+        Box::pin(super::i4218_a_rebind_drafted_and_voiced_by_hardware_holders(&e)).await;
+    }
+
+    #[tokio::test]
+    async fn i4217_a_hardware_held_owner_accepts_by_draft_sqlite() {
+        let e = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer("i4217-engine"),
+            "sqlite::memory:",
+        )
+        .await
+        .expect("I4217: a sqlite Engine");
+        Box::pin(super::i4217_a_hardware_held_owner_accepts_by_draft(&e)).await;
+    }
 
     #[tokio::test]
     async fn i4211_the_engine_verbs_sqlite() {
@@ -1950,6 +2171,34 @@ mod postgres {
         i4210_an_unrooted_node_serves_a_held_grant_to_the_named_holders_postgres,
         i4210_an_unrooted_node_serves_a_held_grant_to_the_named_holders
     );
+
+    #[tokio::test]
+    async fn i4218_a_rebind_drafted_and_voiced_by_hardware_holders_postgres() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            return;
+        };
+        let e = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer("i4218-engine"),
+            &dsn,
+        )
+        .await
+        .expect("I4218: a postgres Engine");
+        Box::pin(super::i4218_a_rebind_drafted_and_voiced_by_hardware_holders(&e)).await;
+    }
+
+    #[tokio::test]
+    async fn i4217_a_hardware_held_owner_accepts_by_draft_postgres() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            return;
+        };
+        let e = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer("i4217-engine"),
+            &dsn,
+        )
+        .await
+        .expect("I4217: a postgres Engine");
+        Box::pin(super::i4217_a_hardware_held_owner_accepts_by_draft(&e)).await;
+    }
 
     #[tokio::test]
     async fn i4211_the_engine_verbs_postgres() {

@@ -645,14 +645,34 @@ pub(crate) async fn put_stream_sth_planned<D: BlobFloorStore>(
             // stream (`held_on`); it re-folds now, as a row waiting on bytes
             // re-folds when they land (`holding_claim::refold_on_blob`).
             // Without it the receipt stayed held until `refold_all`.
-            let mut touched = std::collections::BTreeSet::new();
-            touched.insert(super::edition2::fold::Dep::key(&stream_id).read_key());
-            Box::pin(super::edition2::fold::refold_touched(dir, touched))
+            refold_on_stream(dir, &stream_id)
                 .await
                 .map_err(|e| BlobError::Backend(format!("put_stream_sth re-fold: {e}")))?;
             Ok(())
         }
     }
+}
+
+/// v62.0.0 (DR-fix2/DR-fix3; CC 2.7.3) — **the stream's touch**: re-fold
+/// every row whose fold read `stream_id` (`held_on` declares `key:<stream>`
+/// for a receipt waiting on its head). The head's door calls it once the
+/// head is stored, as a blob door calls
+/// [`refold_on_blob`](super::holding_claim::refold_on_blob).
+///
+/// # Errors
+/// Storage failures.
+pub(crate) async fn refold_on_stream<D>(
+    dir: &D,
+    stream_id: &str,
+) -> Result<(), crate::federation::Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let mut touched = std::collections::BTreeSet::new();
+    touched.insert(super::edition2::fold::Dep::key(stream_id).read_key());
+    super::edition2::fold::refold_touched(dir, touched)
+        .await
+        .map(|_| ())
 }
 
 /// The door: every backend's `put_delivery_receipt`.

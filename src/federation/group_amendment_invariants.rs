@@ -159,7 +159,10 @@ pub mod bodies {
         tag: &str,
     ) {
         for kind in [Kind::Family, Kind::Community] {
-            one_kind(a, b, kind, &format!("{tag}-{kind:?}").to_lowercase()).await;
+            // FX-fix1 — the kind goes FIRST: a test key seeds from the first 32
+            // bytes of its seed name, and `alice-i178-<32 hex>-family` /
+            // `-community` were one key (`guard_seed_collision`).
+            one_kind(a, b, kind, &format!("{kind:?}-{tag}").to_lowercase()).await;
         }
     }
 

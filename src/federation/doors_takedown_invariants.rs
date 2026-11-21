@@ -649,7 +649,7 @@ pub(crate) mod bodies {
         // E12-fix2: a person deputy (a machine delegate's edge would wait on
         // its owner's voice; the duty walk is what this witnesses).
         key_as(dir, &deputy.id, USER).await;
-        delegate(dir, &founder.id, &deputy.id, &["takedown"]).await;
+        delegate_in(dir, &founder.id, &deputy.id, &["takedown"], &e2::kid(room)).await;
 
         let shas: Vec<String> = ["founder", "delegate"].map(sha_of).to_vec();
         for sha in &shas {
@@ -1197,6 +1197,30 @@ pub(crate) mod bodies {
             "scope": scope,
         });
         // v60.0.0 (#1048) — a duty edge carries a term (CC 2.4).
+        crate::federation::admission::with_test_term(&mut envelope, chrono::Utc::now());
+        let mut row = ts::bare_attestation("", granter, grantee, &envelope);
+        row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+        ts::seal_row_in_place(granter, &mut row);
+        land(dir, &row).await;
+        e2::rid(&row)
+    }
+
+    /// v62.0.0 (CW-fix1 fixture fix, 4u) — [`delegate`] for a ROOM duty: the
+    /// edge NAMES its room (`community_id`), the only edge a room's duty walk
+    /// follows (CC 4.5.4). [`delegate`] stays unscoped for a content
+    /// subject's own chain, which walks only unscoped edges.
+    pub(crate) async fn delegate_in(
+        dir: &dyn FederationDirectory,
+        granter: &str,
+        grantee: &str,
+        scope: &[&str],
+        community: &str,
+    ) -> String {
+        let mut envelope = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "scope": scope,
+            "community_id": community,
+        });
         crate::federation::admission::with_test_term(&mut envelope, chrono::Utc::now());
         let mut row = ts::bare_attestation("", granter, grantee, &envelope);
         row.attestation_type = attestation_type::DELEGATES_TO.to_owned();

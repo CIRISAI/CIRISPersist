@@ -656,12 +656,15 @@ where
     if !super::admission::is_counted_root_grant_row(&grant) {
         return Err(refuse(ROOT_GRANT_GROUP, member, RULE_ACCEPTANCE_MISMATCH));
     }
-    let signer =
-        super::admission::admission_identity_for_writer(dir, &row.attesting_key_id).await?;
-    let consenter =
-        super::admission::root_grant_consenter(dir, &grant.attested_key_id, row.asserted_at)
-            .await?;
-    if consenter.as_deref() != Some(signer.as_str())
+    // KR-fix5 — the signing key's OWN identity, never lifted to its owner: a
+    // bound worker node's signature is not its owner's consent.
+    if !super::admission::signs_for_root_grantee(
+        dir,
+        &row.attesting_key_id,
+        &grant.attested_key_id,
+        row.asserted_at,
+    )
+    .await?
         || member != grant.attested_key_id
         || env_str(row, "proposal_hash") != Some(grant.original_content_hash.as_str())
     {
@@ -725,12 +728,13 @@ where
         .iter()
         .filter(|r| membership_row(r) == Some(MembershipRow::Acceptance))
     {
-        let signer =
-            super::admission::admission_identity_for_writer(dir, &r.attesting_key_id).await?;
-        if super::admission::root_grant_consenter(dir, grantee, r.asserted_at)
-            .await?
-            .as_deref()
-            == Some(signer.as_str())
+        if super::admission::signs_for_root_grantee(
+            dir,
+            &r.attesting_key_id,
+            grantee,
+            r.asserted_at,
+        )
+        .await?
         {
             return Ok(true);
         }
@@ -1533,6 +1537,35 @@ pub fn standing_proposal_input(
     );
     input.subject_key_ids = Vec::new();
     input
+}
+
+/// v62.0.0 (KR-fix6) — **a reply's envelope, for a signer whose pen is
+/// elsewhere** (a hardware-held owner): exactly the members
+/// [`reply_input`] gives the software producer (`dimension`,
+/// `references_attestation_id`, `proposal_hash`, the group's members for a
+/// group reply) plus the `cohort_scope` the producer states. Hand it to
+/// `Engine::statement_draft("scores", &envelope, signer_iss, signer_kid_hex,
+/// sub, asserted_at_ms, None)`, with `sub` = the proposal's
+/// `attested_key_id` for a root grant; sign the draft; `submit_voice`. Both
+/// paths then state the reply through `emit::row_payload`.
+#[must_use]
+pub fn reply_envelope(proposal: &Attestation, accept: bool) -> serde_json::Value {
+    let input = reply_input(proposal, accept);
+    let mut envelope = input.attestation_envelope.to_value();
+    if let Some(o) = envelope.as_object_mut() {
+        if !input.subject_key_ids.is_empty() {
+            o.insert(
+                "subject_key_ids".into(),
+                serde_json::json!(input.subject_key_ids),
+            );
+        }
+        o.insert(
+            "cohort_scope".into(),
+            serde_json::Value::String(input.cohort_scope.clone()),
+        );
+        o.retain(|_, v| !v.is_null());
+    }
+    envelope
 }
 
 /// The emit input for K's reply (acceptance or decline) to `proposal`.

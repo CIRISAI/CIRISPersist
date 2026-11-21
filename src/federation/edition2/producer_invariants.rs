@@ -35,6 +35,12 @@ pub(crate) mod bodies {
 
     /// An engine over `dsn` with a composite signer from `alias`.
     pub(crate) async fn node(dsn: &str, alias: &str) -> Engine {
+        // v62.0.0 (RL-fix8) — the engine's key is the fixture key of `alias`
+        // (`signer(alias, alias)` seeds both halves as `seed_for(alias)`
+        // does): register that derivation, as `ts::local_signer` does, so a
+        // fixture handed the engine's identity-ref (the root fixture signing
+        // this node's acceptance, `deliver`) re-signs as it.
+        let _ = crate::federation::edition2::fixture_switch::kid(alias);
         Engine::with_signer_pre_genesis(signer(alias, alias), dsn)
             .await
             .expect("engine")

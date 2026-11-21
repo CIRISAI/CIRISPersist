@@ -75,6 +75,9 @@ pub(crate) mod bodies {
         requester: &str,
         reverse: bool,
     ) {
+        // ONE pull, as the witness was written: a row a pull delivers whose
+        // predecessor arrived in the same pull must be woken by the write
+        // that landed the predecessor, never by a second pull.
         let mut feed = served(from, requester).await;
         if reverse {
             feed.reverse();
@@ -287,10 +290,14 @@ pub(crate) mod bodies {
         deliver(a, b, &official, false).await;
         countersign(b, &official, &rid2, "I4164").await;
         deliver(b, c, &official, true).await;
+        let held_on_c = crate::federation::edition2::fold::why_held(c, &rid2)
+            .await
+            .unwrap();
         assert_eq!(
             attester(c, &rid2).await.as_deref(),
             Some(f.as_str()),
-            "I4164: on C the official's voice arrived first, and the row names the seat"
+            "I4164: on C the official's voice arrived first, and the row names the seat \
+             (held on C: {held_on_c:?})"
         );
     }
 }

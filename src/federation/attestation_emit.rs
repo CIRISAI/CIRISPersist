@@ -411,9 +411,7 @@ pub async fn produce_row<D>(
 where
     D: FederationDirectory + Sync + ?Sized,
 {
-    use super::edition2::emit::{
-        family_for, payload_from_envelope, produce_error, refs_target, with_member,
-    };
+    use super::edition2::emit::{family_for, produce_error};
     use super::types::attestation_type as t;
 
     let producer = "emit_attestation";
@@ -526,28 +524,19 @@ where
             ),
         };
     let author = authored.then_some(iss.as_str());
-    // v62.0.0 (E12, round 3) — a composer's payload is the common members
-    // and `refs` only (`payloads::check_composer`). The earlier envelope's
-    // composer bookkeeping (`withdraws_attestation_envelope`: `kind`,
-    // `references_attestation_type`) restated what the header already says
-    // (the row type, and the target's family it carries); stated as members,
-    // the door refused every edition-2 withdraws this producer signed.
-    let drop_members: &[&str] = if composer {
-        &[
-            "references_attestation_id",
-            "references_attestation_type",
-            "kind",
-        ]
-    } else {
-        &["references_attestation_id"]
-    };
-    let mut payload =
-        payload_from_envelope(&envelope, &family, asserted_at_ms, author, drop_members)
-            .map_err(|e| produce_error(producer, e))?;
-    if let Some((digest, _)) = &target {
-        payload = with_member(payload, "refs", refs_target(digest))
-            .map_err(|e| produce_error(producer, e))?;
-    }
+    // v62.0.0 (KR-fix6) — the payload is built by the ONE builder the draft
+    // path uses too (`emit::row_payload`): the composer bookkeeping dropped
+    // (E12), a membership reply's `references_attestation_id` stated as
+    // `refs.target` (KR-fix5), `refs` joined, never replaced.
+    let payload = super::edition2::emit::row_payload(
+        producer,
+        &input.attestation_type,
+        &family,
+        &envelope,
+        asserted_at_ms,
+        author,
+        target.as_ref().map(|(d, _)| d),
+    )?;
     let sub = input.attested_key_id.clone().unwrap_or_else(|| iss.clone());
     let statement = super::edition2::produce::sign_row(
         signer,
