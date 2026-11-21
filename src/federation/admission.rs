@@ -10001,6 +10001,42 @@ async fn scoped_delegation_reach(
     policy: DelegationWalkPolicy,
     band_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<ScopedReach, Error> {
+    scoped_delegation_reach_in(
+        directory,
+        issuer,
+        targets,
+        scope_token,
+        max_depth,
+        policy,
+        band_at,
+        CommunityWalk::Any,
+    )
+    .await
+}
+
+/// v62.0.0 (CW-fix1; CC 4.5.4) — [`scoped_delegation_reach`] filtered by
+/// the community each edge names ([`CommunityWalk`]): `In(C)` follows only
+/// edges naming C (so an appointment made in one room confers nothing in
+/// another room its appointer also holds a seat in, and an unscoped edge
+/// confers nothing in any room); `Unscoped` follows only edges naming no
+/// room (so a room appointment confers no federation-scope or
+/// content-subject duty); `Any` is the generic walk.
+#[allow(clippy::too_many_arguments)]
+async fn scoped_delegation_reach_in(
+    directory: &dyn super::FederationDirectory,
+    issuer: &str,
+    targets: &std::collections::HashSet<String>,
+    scope_token: &str,
+    max_depth: usize,
+    policy: DelegationWalkPolicy,
+    band_at: Option<chrono::DateTime<chrono::Utc>>,
+    walk: CommunityWalk<'_>,
+) -> Result<ScopedReach, Error> {
+    let (community_id, community_rule) = match walk {
+        CommunityWalk::Any => (None, CommunityRule::Compat),
+        CommunityWalk::In(c) => (Some(c), CommunityRule::Strict),
+        CommunityWalk::Unscoped => (None, CommunityRule::UnscopedOnly),
+    };
     // v54.0.0 (CIRISPersist#1032, CC 2.1 / CC 4.5.5) — the ISSUANCE scopes
     // never walk the timeless default lens. A `license` / `grant` chain is
     // live only if every link is live at the instant asked about, and a walk
@@ -10012,11 +10048,15 @@ async fn scoped_delegation_reach(
         DelegationWalkLens {
             as_of: Some(crate::host::clock::now()),
             band_at,
+            community_id,
+            community_rule,
             ..DelegationWalkLens::default()
         }
     } else {
         DelegationWalkLens {
             band_at,
+            community_id,
+            community_rule,
             ..DelegationWalkLens::default()
         }
     };
@@ -10127,6 +10167,10 @@ struct DelegationWalkLens<'a> {
     /// (read only with `as_of`, beside the term). `None`: only the
     /// constitutional one-year ceiling binds.
     role_term_seconds: Option<i64>,
+    /// v62.0.0 (CW-fix1) — how `community_id` filters the chain's edges
+    /// ([`CommunityRule`]). The default is the pre-CW-fix1 compatibility
+    /// reading; every COMMUNITY reader passes [`CommunityRule::Strict`].
+    community_rule: CommunityRule,
     /// v62.0.0 (K2-fix16; the T8 pattern, CC 2.7.9) — `Some(t)`: the instant
     /// the SEAT is judged at, i.e. the asserted_at of the act being judged.
     /// A duty edge onto a person whose age band reads `minor` AT `t` from an
@@ -10134,6 +10178,39 @@ struct DelegationWalkLens<'a> {
     /// to `as_of`; with neither, the walk judges no act and only the VOID
     /// rule applies (it reads no instant but the edge's own).
     band_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// v62.0.0 (CW-fix1; CC 4.5.4 "a moderator appointment is
+/// `delegates_to(authority → K, scope ⊇ {moderate}, community_id: C)`") —
+/// **how a walk reads the community an edge names.**
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum CommunityRule {
+    /// With `community_id: Some(C)`: an edge naming C or naming none
+    /// (the pre-CW-fix1 reading, kept only for the callers that are not a
+    /// community duty question). With `None`: every edge.
+    #[default]
+    Compat,
+    /// With `community_id: Some(C)`: ONLY an edge naming C. An unscoped
+    /// edge, or one naming another room, confers nothing in C.
+    Strict,
+    /// Only an edge naming NO community (a federation-scope duty, a content
+    /// subject's own duty, a licence authority's own reviewers): an
+    /// appointment made in a room confers nothing outside it.
+    UnscopedOnly,
+}
+
+/// v62.0.0 (CW-fix1) — which edges a duty walk may follow, by the community
+/// they name ([`scoped_delegation_reach_in`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommunityWalk<'a> {
+    /// Every edge (the generic reachability questions: consent revocation,
+    /// `reachable_under_scope`).
+    Any,
+    /// Only edges naming this community (a community duty).
+    In(&'a str),
+    /// Only edges naming no community (a federation-scope or content
+    /// subject's own duty).
+    Unscoped,
 }
 
 /// v54.0.0 (CIRISPersist#1032, CC 4.4.3.2.8 C) — the `delegates_to`
@@ -10612,9 +10689,13 @@ impl DelegationWalkLens<'_> {
                 return false;
             }
         }
+        // v62.0.0 (CW-fix1) — the community rule.
+        if self.community_rule == CommunityRule::UnscopedOnly {
+            return matches!(envelope_cohort_target(&edge.attestation_envelope), Ok(None));
+        }
         if let Some(c) = self.community_id {
             match envelope_cohort_target(&edge.attestation_envelope) {
-                Ok(None) => {}
+                Ok(None) if self.community_rule == CommunityRule::Compat => {}
                 Ok(Some(named)) if named == c => {}
                 _ => return false,
             }
@@ -11251,6 +11332,11 @@ pub async fn reachable_under_scope_with_reasons(
 /// [`scoped_delegation_reach`] with an **empty** `targets` set. No edge can be
 /// in the empty set, so the shared short-circuit never fires and the walk runs
 /// to exhaustion — full enumeration out of the very body the predicate uses.
+///
+/// v62.0.0 (CW-fix1) — its production caller, `moderators_of`, now walks
+/// within a community ([`scoped_delegation_reach_in`]); this unfiltered form
+/// is left to the backend-gated witnesses that call it.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 async fn enumerate_scoped_delegation_reach(
     directory: &dyn super::FederationDirectory,
     issuer: &str,
@@ -18621,7 +18707,8 @@ pub async fn is_named_moderator(
             return Ok(true);
         }
         // Walk-down from the authority root to k under the §11.10 policy.
-        if issuer_reaches_target_via_scoped_delegation(
+        // v62.0.0 (CW-fix1) — within THIS community: only edges naming it.
+        if scoped_delegation_reach_in(
             directory,
             &root,
             &target,
@@ -18629,8 +18716,10 @@ pub async fn is_named_moderator(
             MAX_MODERATION_DELEGATION_DEPTH,
             DelegationWalkPolicy::MODERATION_DUTY,
             Some(at),
+            CommunityWalk::In(community_id),
         )
         .await?
+        .hit_target
         {
             return Ok(true);
         }
@@ -18672,15 +18761,19 @@ pub async fn moderators_of(
     for root in moderation_duty_roots(directory, community_id).await? {
         // Zero-hop: a steward-bound founder IS a named moderator.
         // Then every delegate it reaches under the duty-scoped walk.
-        let reach = enumerate_scoped_delegation_reach(
+        // v62.0.0 (CW-fix1) — within THIS community: only edges naming it.
+        let reach = scoped_delegation_reach_in(
             directory,
             &root,
+            &std::collections::HashSet::new(),
             duty,
             MAX_MODERATION_DELEGATION_DEPTH,
             DelegationWalkPolicy::MODERATION_DUTY,
             Some(at),
+            CommunityWalk::In(community_id),
         )
-        .await?;
+        .await?
+        .reached;
         out.insert(root);
         out.extend(reach);
     }
@@ -18713,6 +18806,8 @@ pub(crate) async fn moderation_reach_of_at_within(
         DelegationWalkLens {
             as_of: Some(as_of),
             community_id: Some(community_id),
+            // v62.0.0 (CW-fix1) — a community duty: only edges naming it.
+            community_rule: CommunityRule::Strict,
             root_authority: Some(root_authority),
             role_term_seconds: affiliation_role_term_at(directory, community_id, as_of).await?,
             band_at: None,
@@ -18767,6 +18862,8 @@ pub(crate) async fn moderation_reach_of_at(
         DelegationWalkLens {
             as_of: Some(as_of),
             community_id: Some(community_id),
+            // v62.0.0 (CW-fix1) — a community duty: only edges naming it.
+            community_rule: CommunityRule::Strict,
             root_authority: None,
             role_term_seconds: affiliation_role_term_at(directory, community_id, as_of).await?,
             band_at: None,
@@ -18919,10 +19016,16 @@ pub const MEMBER_ROLE_FOUNDER: &str = "founder";
 /// resolves to itself.
 ///
 /// [`MODERATION_DUTY`]: DelegationWalkPolicy::MODERATION_DUTY
+///
+/// v62.0.0 (CW-fix1) — `duty_holders` says, per root, which edges its chain
+/// may follow ([`DutyHolders`]): a community's roots walk only edges naming
+/// that community; a content subject, a licence authority and the
+/// federation-scope holders walk only edges naming none. An appointment in
+/// one room confers nothing in another, and nothing outside rooms.
 pub async fn check_moderation_admission(
     directory: &dyn super::FederationDirectory,
     signer: &str,
-    duty_holders: &std::collections::HashSet<String>,
+    duty_holders: &DutyHolders,
     duty: &str,
     target_descriptor: &str,
     at: chrono::DateTime<chrono::Utc>,
@@ -18938,7 +19041,7 @@ pub async fn check_moderation_admission(
     fold_reads_key(&signer_identity);
     // (a) as-self: the signer, or the identity it acts for, holds the duty
     //     over the target.
-    if duty_holders.contains(signer) || duty_holders.contains(&signer_identity) {
+    if duty_holders.holds(signer) || duty_holders.holds(&signer_identity) {
         return Ok(());
     }
     // (b) delegated: an steward-bound duty-holder root reaches the signer
@@ -18946,12 +19049,12 @@ pub async fn check_moderation_admission(
     //     + sub_delegation).
     let target: std::collections::HashSet<String> =
         [signer.to_owned(), signer_identity].into_iter().collect();
-    for root in duty_holders {
+    for (root, walk) in duty_holders.roots() {
         fold_reads_key(root);
         if !is_steward_bound(directory, root).await? {
             continue;
         }
-        if issuer_reaches_target_via_scoped_delegation(
+        if scoped_delegation_reach_in(
             directory,
             root,
             &target,
@@ -18960,8 +19063,10 @@ pub async fn check_moderation_admission(
             DelegationWalkPolicy::MODERATION_DUTY,
             // K2-fix16 (T8): the seat is judged at the act's own instant.
             Some(at),
+            walk,
         )
         .await?
+        .hit_target
         {
             return Ok(());
         }
@@ -18971,6 +19076,60 @@ pub async fn check_moderation_admission(
         on_behalf_of: target_descriptor.to_string(),
         scope: duty.to_string(),
     })
+}
+
+/// v62.0.0 (CW-fix1) — **the duty holders of an act, with the edges each
+/// one's chain may follow** ([`check_moderation_admission`]).
+#[derive(Debug, Clone, Default)]
+pub struct DutyHolders {
+    /// A community's roots: their chains follow only edges NAMING it.
+    pub in_community: Vec<(String, std::collections::HashSet<String>)>,
+    /// Roots whose chains follow only edges naming NO community: a content
+    /// subject, a licence authority, the federation-scope holders.
+    pub unscoped: std::collections::HashSet<String>,
+}
+
+impl DutyHolders {
+    /// The roots of community `community_id`.
+    #[must_use]
+    pub fn of_community(community_id: &str, roots: std::collections::HashSet<String>) -> Self {
+        Self {
+            in_community: vec![(community_id.to_owned(), roots)],
+            unscoped: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Roots whose chains follow only unscoped edges.
+    #[must_use]
+    pub fn unscoped(roots: std::collections::HashSet<String>) -> Self {
+        Self {
+            in_community: Vec::new(),
+            unscoped: roots,
+        }
+    }
+
+    /// Does `k` hold the duty itself (as-self)?
+    #[must_use]
+    pub fn holds(&self, k: &str) -> bool {
+        self.unscoped.contains(k) || self.in_community.iter().any(|(_, r)| r.contains(k))
+    }
+
+    /// Every root, with the walk its chain takes.
+    fn roots(&self) -> Vec<(&str, CommunityWalk<'_>)> {
+        let mut out: Vec<(&str, CommunityWalk<'_>)> = self
+            .unscoped
+            .iter()
+            .map(|k| (k.as_str(), CommunityWalk::Unscoped))
+            .collect();
+        for (c, roots) in &self.in_community {
+            out.extend(
+                roots
+                    .iter()
+                    .map(|k| (k.as_str(), CommunityWalk::In(c.as_str()))),
+            );
+        }
+        out
+    }
 }
 
 /// v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10; CIRISRegistry#96)
@@ -19496,14 +19655,20 @@ pub async fn check_delegated_duty_scores_admission(
     // resolver for a scope that had none; it does not give anyone a second try
     // at a scope that refused them.
     fold_reads_key(community_id);
+    // v62.0.0 (CW-fix1) — a federation-scope act walks only unscoped edges
+    // (a room appointment confers no federation duty); a community act only
+    // edges naming its community.
     let duty_holders =
         if community_id.is_empty() && dimension.starts_with(QUARANTINE_DIMENSION_PREFIX) {
-            fold_held(
+            DutyHolders::unscoped(fold_held(
                 fold::reason::gc1::DELEGATED_SCOPE_UNAUTHORIZED,
                 duty_holders_for_federation(directory, duty).await,
-            )?
+            )?)
         } else {
-            duty_holders_for_community(directory, community_id, duty).await?
+            DutyHolders::of_community(
+                community_id,
+                duty_holders_for_community(directory, community_id, duty).await?,
+            )
         };
     // v62.0.0 (wave GC1; CC 2.7.3) — the duty-holders (the community's
     // roster and named moderators, the accord roster) and the chains from
@@ -19633,8 +19798,12 @@ pub async fn check_reconsideration_admission(
         None => declared_community_id.to_owned(),
     };
     fold_reads_key(&community_id);
-    let mut holders =
-        duty_holders_for_community(directory, &community_id, DELEGATION_SCOPE_REVIEW).await?;
+    // v62.0.0 (CW-fix1) — the community's roots walk only edges naming it;
+    // a licence authority and the target's subjects walk only unscoped ones.
+    let mut holders = DutyHolders::of_community(
+        &community_id,
+        duty_holders_for_community(directory, &community_id, DELEGATION_SCOPE_REVIEW).await?,
+    );
     // v60.0.0 (CIRISPersist#1036 item 5, CIRISConstitution#164; CC 2.4.1.1,
     // CLM-licence-contest) — the duty-holders for a reconsideration against
     // `licensure:{A}` are A's authority set, plus any `review`-scoped chain
@@ -19644,7 +19813,9 @@ pub async fn check_reconsideration_admission(
             .and_then(crate::federation::licensure::authority_of)
         {
             fold_reads_key(&authority_id);
-            holders.extend(licence_authority_set(directory, &authority_id).await?);
+            holders
+                .unscoped
+                .extend(licence_authority_set(directory, &authority_id).await?);
         }
     }
     let is_ruling = row
@@ -19653,7 +19824,7 @@ pub async fn check_reconsideration_admission(
         .is_some();
     if !is_ruling {
         if let Some(t) = &target {
-            holders.extend(fold_held(
+            holders.unscoped.extend(fold_held(
                 fold::reason::gc1::DELEGATED_SCOPE_UNAUTHORIZED,
                 reconsideration_target_subjects(directory, &row.attesting_key_id, t).await,
             )?);
@@ -19724,7 +19895,8 @@ async fn check_takedown_reconsideration_admission(
         .get(RECONSIDERATION_OUTCOME_MEMBER)
         .is_some();
     if !is_ruling {
-        holders.extend(binding.subjects.iter().cloned());
+        // v62.0.0 (CW-fix1) — a content subject walks only unscoped edges.
+        holders.unscoped.extend(binding.subjects.iter().cloned());
     }
     fold_held(
         fold::reason::gc1::DELEGATED_SCOPE_UNAUTHORIZED,
@@ -19964,6 +20136,8 @@ pub async fn holds_grant_delegation(
         DelegationWalkLens {
             as_of: Some(now),
             community_id: None,
+            // v62.0.0 (CW-fix1) — the grant plane is not a community duty.
+            community_rule: CommunityRule::Compat,
             root_authority: None,
             role_term_seconds: None,
             band_at: None,
@@ -27824,7 +27998,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             check_moderation_admission(
                 dir,
                 k,
-                &std::iter::once(founder.clone()).collect(),
+                &DutyHolders::unscoped(std::iter::once(founder.clone()).collect()),
                 duty,
                 "content:deadbeef",
                 crate::host::clock::now(),
@@ -27884,7 +28058,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
             let err = check_moderation_admission(
                 dir,
                 k,
-                &std::iter::once(founder.clone()).collect(),
+                &DutyHolders::unscoped(std::iter::once(founder.clone()).collect()),
                 duty,
                 "content:deadbeef",
                 crate::host::clock::now(),

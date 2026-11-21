@@ -34,10 +34,6 @@
 
 pub mod accord_carriage;
 pub mod accord_quorum;
-/// v53.0.0 (CC 4.2.6) — an accord holder's recovery under a pre-committed key.
-pub mod accord_recovery;
-/// v53.0.0 (CC 4.2.6) — the accord's roster change, the door's third shape.
-pub mod accord_roster;
 pub mod admission;
 pub mod adopt_cascade;
 /// v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the declared affiliation
@@ -918,6 +914,9 @@ mod purge_digest_v2_invariants;
 mod room_takedown_invariants;
 #[cfg(test)]
 mod steward_purge_invariants;
+// v62.0.0 (CW-fix1) — I2167: an appointment in one room confers nothing in another.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod cross_room_invariants;
 pub mod takedown_tombstone;
 // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — erasure is the subject's
 // withdraws; the replicated fact is the tombstone.
@@ -14554,6 +14553,19 @@ pub mod malformed_row {
     pub const FEDCODE_TRANSPORT_IS_FEDERATION_KEY: &str = "fedcode_transport_is_federation_key";
     /// v62.0.0 (RL-fix3) — a dial hint record over its bounds.
     pub const DIAL_HINT_OUT_OF_BOUNDS: &str = "dial_hint_out_of_bounds";
+    /// v62.0.0 (RL-fix7; CC 2.6.1.11, CC 3.4.7 as corrected at `13829f5`)
+    /// — a `trust:charter:v1` row naming the accord. The accord's charter is
+    /// the genesis bundle's `charter` member and no row: offer a bundle at
+    /// the import door (`put_genesis_bundle`). Refused by its bytes, the
+    /// same on a rooted and a rootless node; nothing is kept.
+    pub const ACCORD_CHARTER_IS_THE_BUNDLE: &str = "accord_charter_is_the_bundle";
+    /// v62.0.0 (RL-fix7; CC 2.6.1.11, CC 4.2.6) — a family or `group:*`
+    /// version of the accord (a roster, a roster change, a holder's
+    /// recovery, a membership change). The accord's roster, seats and
+    /// recovery are the genesis bundle in force and no row: a change is a
+    /// later bundle at the import door. Refused by its bytes, rooted or
+    /// rootless; nothing is kept.
+    pub const ACCORD_VERSION_IS_A_BUNDLE: &str = "accord_version_is_a_bundle";
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
         NO_SIGNER,
@@ -14564,6 +14576,8 @@ pub mod malformed_row {
         CODE_OWNER_BINDING_NOT_FOR_NODE,
         FEDCODE_TRANSPORT_IS_FEDERATION_KEY,
         DIAL_HINT_OUT_OF_BOUNDS,
+        ACCORD_CHARTER_IS_THE_BUNDLE,
+        ACCORD_VERSION_IS_A_BUNDLE,
         ENVELOPE_MEMBER_MISSING,
         ENVELOPE_MEMBER_INVALID,
         TYPED_DIVERGES_FROM_ENVELOPE,

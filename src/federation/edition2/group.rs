@@ -1200,6 +1200,25 @@ where
     if let Some(table) = payload_family_of(&row.family) {
         super::payloads::check(table, &row.payload)?;
     }
+    // v62.0.0 (RL-fix7; CC 2.6.1.11, CC 4.2.6) — the accord's roster, seats
+    // and recovery are the genesis bundle in force and no row. A group
+    // statement about the accord (a roster version at its id, or a
+    // membership change of it) is refused by its bytes, before any read, a
+    // count or a kept voice, the same on a rooted and a rootless node: a
+    // change is a later bundle at the import door.
+    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    if row.sub == accord || row.payload.get_text("group").and_then(Value::as_text) == Some(accord) {
+        return Err(Error::malformed_row(
+            PLANE,
+            malformed_row::ACCORD_VERSION_IS_A_BUNDLE,
+            format!(
+                "{}: a `{}` statement about {accord}; the accord's roster is the genesis \
+                 bundle in force, changed by a later bundle at the import door (CC 2.6.1.11)",
+                malformed_row::ACCORD_VERSION_IS_A_BUNDLE,
+                row.family
+            ),
+        ));
+    }
     // v62.0.0 (T1-fix2; G0.api "every door is already inside an attempt")
     // — the group door runs inside `ingest::put_admitted_row`'s ONE fold
     // attempt (no inner attempt: it would swallow the marks and reads the

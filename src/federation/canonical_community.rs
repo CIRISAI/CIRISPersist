@@ -242,11 +242,14 @@ enum FounderArm {
     Neither,
 }
 
-/// Is `key_id` a seat of the conferring accord family at `at`? Asked of this
-/// node's stored family and its roster planes
-/// ([`authorized_family_roster_at`](super::authorized_family_roster_at), the
-/// fold the accord quorum itself is counted over) — never of the key's own
+/// Is `key_id` a seat of the accord? Asked of the genesis bundle in force
+/// (`edition2::trust_root_group::is_bundle_holder`) — never of the key's own
 /// `identity_type`, which is the key's word.
+///
+/// v62.0.0 (RL-fix7) — the fallback to the accord's family row and its
+/// roster planes at `at` is deleted: no v62 door writes that row, and the
+/// bundle in force is the only source of the accord's roster. `at` is kept
+/// for the caller's signature.
 async fn accord_holder_seated_at<F>(
     directory: &F,
     key_id: &str,
@@ -255,20 +258,8 @@ async fn accord_holder_seated_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    // v62.0.0 (wave W1) — the accord is the genesis bundle in force: a
-    // holder of it is a seat of the accord (`edition2::trust_root_group`).
-    if super::edition2::trust_root_group::is_bundle_holder(directory, key_id).await? {
-        return Ok(true);
-    }
-    let Some(family) =
-        super::trust_root::resolve_family_root(directory, accord_family_key_id()).await?
-    else {
-        return Ok(false);
-    };
-    match super::authorized_family_roster_at(directory, &family, at).await {
-        Ok(seats) => Ok(seats.iter().any(|m| m.key_id == key_id)),
-        Err(e) => Err(e),
-    }
+    let _ = at;
+    super::edition2::trust_root_group::is_bundle_holder(directory, key_id).await
 }
 
 /// [`FounderArm`] of `record` at `at`, plus the earliest occurrence-interval

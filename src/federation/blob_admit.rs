@@ -638,7 +638,20 @@ pub(crate) async fn put_stream_sth_planned<D: BlobFloorStore>(
                 sth.tree_size
             )),
         )),
-        _ => Ok(()),
+        _ => {
+            // v62.0.0 (DR-fix2; CC 2.7.3) — the head landed: the stream's
+            // touch. A delivery receipt that arrived before this head is
+            // held `receipt_root_unpublished` and declared a read of the
+            // stream (`held_on`); it re-folds now, as a row waiting on bytes
+            // re-folds when they land (`holding_claim::refold_on_blob`).
+            // Without it the receipt stayed held until `refold_all`.
+            let mut touched = std::collections::BTreeSet::new();
+            touched.insert(super::edition2::fold::Dep::key(&stream_id).read_key());
+            Box::pin(super::edition2::fold::refold_touched(dir, touched))
+                .await
+                .map_err(|e| BlobError::Backend(format!("put_stream_sth re-fold: {e}")))?;
+            Ok(())
+        }
     }
 }
 

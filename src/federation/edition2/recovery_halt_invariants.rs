@@ -142,7 +142,9 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
         supersede_proof: Some(GroupSupersedeProof {
             prior_persist_row_hash: String::new(),
             change_envelope: serde_json::json!({
-                "kind": crate::federation::accord_recovery::RECOVERY_STATEMENT_KIND,
+                // v62.0.0 (RL-fix7) — the earlier-form recovery kind, spelled out:
+                // its module (`accord_recovery`) is deleted.
+                "kind": "ciris.accord_recovery.v1",
                 "family_key_id": FAMILY_KEY_ID,
                 "old_holder_key_id": holder,
             }),

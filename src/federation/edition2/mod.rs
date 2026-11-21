@@ -78,6 +78,10 @@ mod fold_gc8_invariants;
 // v62.0.0 (RL-fix1; CC 5.3.4) — a rootless node runs the P2P mesh (I2240–I2243).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod rootless_mesh_invariants;
+// v62.0.0 (RL-fix7; CC 2.6.1.11) — the accord's facts are the bundle in force:
+// its charter row and roster versions are refused by name (I2350–I2353).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod accord_bundle_only_invariants;
 // v62.0.0 (RL-fix1, ruling (B)) — I2246: accord rows skipped rootless, rescanned once rooted.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod accord_rescan_invariants;

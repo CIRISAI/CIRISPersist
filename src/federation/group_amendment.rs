@@ -180,10 +180,6 @@ struct Offer<'a> {
     /// from the held family record: that member and the held record. Its
     /// signature alone authorizes it.
     self_leave: Option<(&'a str, &'a super::types::Family)>,
-    /// v53.0.0 (CC 4.2.6) — the amendment is an accord holder's recovery,
-    /// verified on its own proof ([`verify_accord_recovery`](super::accord_recovery::verify_accord_recovery)):
-    /// the recovery key's signature over the statement, no quorum, one seat.
-    recovery: bool,
 }
 
 /// What this node holds under the offered id.
@@ -234,15 +230,10 @@ where
         entrenched: Some(f.consensus_protocol_entrenched),
         proof: family.supersede_proof.as_ref(),
         prev_head_digest: &f.prev_head_digest,
+        // v62.0.0 (RL-fix7) — the accord's recovery and roster change are
+        // genesis bundles: `verify_family_admission` refuses every version of
+        // the accord before this route, so no amendment here is either.
         self_leave: super::family_dissolution::self_leave_member(&held, f).map(|l| (l, &held)),
-        recovery: super::accord_recovery::verify_accord_recovery(dir, family)
-            .await?
-            .is_some()
-            // v53.0.0 (CC 4.2.6) — a roster change is verified whole on its
-            // own proof too: decisions, standing majority, consent.
-            || super::accord_roster::verify_accord_roster_change(dir, family)
-                .await?
-                .is_some(),
     };
     let stored = Stored {
         persist_row_hash: held.persist_row_hash.clone(),
@@ -359,7 +350,6 @@ where
         proof: community.supersede_proof.as_ref(),
         prev_head_digest: &c.prev_head_digest,
         self_leave: None,
-        recovery: false,
     };
     let stored = Stored {
         persist_row_hash: stored.persist_row_hash,
@@ -553,13 +543,6 @@ where
         offer.prev_head_digest,
         &stored.persist_row_hash,
     )?;
-    // v53.0.0 (CC 4.2.6) — a recovery's proof is not a membership change
-    // envelope and carries no quorum: it was verified whole (statement bound
-    // to this prior and this version, one seat, the recovery key's stored
-    // material and signature, not spent) before this offer was built.
-    if offer.recovery {
-        return Ok(true);
-    }
     if let Some(offered_entrenched) = offer.entrenched {
         check_family_entrenchment(
             stored.entrenched,
@@ -851,23 +834,16 @@ where
     // v52.0.0 (#956) — a dissolved family admits no change, on either door.
     super::family_dissolution::refuse_if_held_family_dissolved(dir, &new.family.family_key_id)
         .await?;
-    // v52.0.0 (#955, Q2) — an amendment never adds a member. v53.0.0 (CC
-    // 4.2.6): the one exception is an accord holder's recovery, whose new key
-    // takes the holder's own seat and signed the version that seats it.
-    let mut allowed = super::membership_acceptance::supersede_allowed_members(
+    // v52.0.0 (#955, Q2) — an amendment never adds a member. v62.0.0
+    // (RL-fix7): the accord's recovery and roster change, the exceptions
+    // v53.0.0 made, are genesis bundles; `verify_family_admission` above
+    // refuses every version of the accord.
+    let allowed = super::membership_acceptance::supersede_allowed_members(
         dir,
         Cohort::Family,
         &new.family.family_key_id,
     )
     .await?;
-    if let Some(recovered) = super::accord_recovery::verify_accord_recovery(dir, &new).await? {
-        allowed.insert(recovered);
-    }
-    // v53.0.0 (CC 4.2.6) — an accord roster change seats the holders the
-    // decisions added, each of whom signed the version (consent, #955 Q1).
-    if let Some(added) = super::accord_roster::verify_accord_roster_change(dir, &new).await? {
-        allowed.extend(added);
-    }
     super::membership_acceptance::check_supersede_adds_no_member(
         &new.family.family_key_id,
         &new.family

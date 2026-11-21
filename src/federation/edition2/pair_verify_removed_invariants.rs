@@ -4,12 +4,10 @@
 //! edition-2 door's vouched voices only: each voice is ONE composite
 //! statement, verified when it arrived.
 //!
-//! - **I2120** (sqlite AND postgres) — the accord's standing-majority count
-//!   (`tier_ingest::standing_majority_signed_by`, read by the accord head
-//!   version and the accord roster change): genuine separate pairs from every
-//!   standing holder over the change envelope's signing bytes count for
-//!   nothing; vouched voices of a strict majority count; a minority, voices
-//!   off the standing roster, or a vouch over another envelope do not.
+//! - **I2120** deleted in v62.0.0 (RL-fix7): the accord's standing-majority
+//!   count it witnessed (`tier_ingest::standing_majority_signed_by`, read by
+//!   the accord head version and roster change) is deleted with those doors;
+//!   the accord is the genesis bundle in force.
 //! - **I2121** (a pure rule) — the self-leave (`family_dissolution::
 //!   verify_self_leave_signature`, CIRISPersist#956): the leaver's vouched
 //!   voice is the authority; another member's voice, no vouch, or a vouch
@@ -23,8 +21,7 @@
 
 use crate::federation::edition2::group::with_quorum_vouch;
 use crate::federation::family_dissolution::verify_self_leave_signature;
-use crate::federation::tier_ingest::standing_majority_signed_by;
-use crate::federation::types::{Family, FamilyMember, GroupSupersedeProof};
+use crate::federation::types::{Family, FamilyMember};
 use crate::federation::{malformed_row, Error, FederationDirectory};
 
 /// Standing holders; their names differ within their first 32 bytes (a test
@@ -32,127 +29,6 @@ use crate::federation::{malformed_row, Error, FederationDirectory};
 const A: &str = "bh1-a-standing-holder";
 const B: &str = "bh1-b-standing-holder";
 const C: &str = "bh1-c-standing-holder";
-/// Never on the standing roster.
-const OUTSIDER: &str = "bh1-o-not-a-holder";
-
-fn envelope(tag: &str) -> serde_json::Value {
-    serde_json::json!({
-        "kind": "ciris.accord_roster_change.v1",
-        "tag": tag,
-        "members": [A, B, C],
-    })
-}
-
-/// A proof over `env` carrying GENUINE separate pairs from `signers`, each
-/// over the change envelope's signing bytes (the bound form: ML-DSA-65 over
-/// `bytes ‖ ed25519_sig`), from the signer's own deterministic component
-/// keys.
-fn proof_with_pairs(env: &serde_json::Value, signers: &[&str]) -> GroupSupersedeProof {
-    // v62.0.0 (VA-steward-purge) — the change envelope's signing bytes are
-    // its JCS (CIRISVerify 23.3.2's `accord_family_signing_bytes` was
-    // `jcs::canonicalize`, removed in 23.3.3): the same bytes, as setup.
-    let bytes =
-        ciris_verify_core::jcs::canonicalize(env).expect("the change envelope canonicalizes");
-    GroupSupersedeProof {
-        prior_persist_row_hash: String::new(),
-        change_envelope: env.clone(),
-        quorum_signatures: signers
-            .iter()
-            .map(|s| crate::federation::tier_ingest::test_support::threshold_sign(s, &bytes))
-            .collect(),
-    }
-}
-
-async fn standing(d: &dyn FederationDirectory) {
-    let standing: Vec<String> = [A, B, C].iter().map(|s| (*s).to_owned()).collect();
-    let env = envelope("I2120");
-    let proof = proof_with_pairs(&env, &[A, B, C]);
-    assert_eq!(
-        proof.quorum_signatures.len(),
-        3,
-        "I2120: the proof carries a separate pair from every holder"
-    );
-
-    // (a) every holder's genuine separate pair, no vouch: nobody signed.
-    assert!(
-        !standing_majority_signed_by(d, &standing, &proof)
-            .await
-            .unwrap(),
-        "I2120 (a): separate pairs are not counted"
-    );
-    // (b) the vouched voices of a strict majority count.
-    assert!(
-        with_quorum_vouch(
-            env.clone(),
-            &[A, B],
-            standing_majority_signed_by(d, &standing, &proof)
-        )
-        .await
-        .unwrap(),
-        "I2120 (b): two of three vouched voices are a strict majority"
-    );
-    // (c) a minority does not, whatever pairs the proof carries.
-    assert!(
-        !with_quorum_vouch(
-            env.clone(),
-            &[A],
-            standing_majority_signed_by(d, &standing, &proof)
-        )
-        .await
-        .unwrap(),
-        "I2120 (c): one vouched voice of three is short"
-    );
-    // (d) voices off the standing roster count for nothing.
-    assert!(
-        !with_quorum_vouch(
-            env.clone(),
-            &[A, OUTSIDER],
-            standing_majority_signed_by(d, &standing, &proof)
-        )
-        .await
-        .unwrap(),
-        "I2120 (d): an outsider's voice is not a holder's"
-    );
-    // (e) a vouch over another change envelope vouches nothing here.
-    assert!(
-        !with_quorum_vouch(
-            envelope("another"),
-            &[A, B, C],
-            standing_majority_signed_by(d, &standing, &proof)
-        )
-        .await
-        .unwrap(),
-        "I2120 (e): the vouch names another envelope"
-    );
-}
-
-/// I2120 on sqlite.
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn i2120_standing_majority_counts_voices_sqlite() {
-    use crate::store::Backend as _;
-    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
-        .await
-        .unwrap();
-    b.run_migrations().await.unwrap();
-    Box::pin(standing(&b)).await;
-}
-
-/// I2120 on postgres.
-#[cfg(feature = "postgres")]
-#[tokio::test]
-async fn i2120_standing_majority_counts_voices_postgres() {
-    use crate::store::Backend as _;
-    let Some(dsn) = crate::test_pg::empty_dsn() else {
-        return;
-    };
-    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
-        .await
-        .unwrap();
-    b.run_migrations().await.unwrap();
-    Box::pin(standing(&b)).await;
-}
-
 fn household() -> Family {
     let founded_at: chrono::DateTime<chrono::Utc> =
         "2020-01-01T00:00:00Z".parse().expect("a pinned instant");

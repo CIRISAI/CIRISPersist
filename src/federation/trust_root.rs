@@ -537,20 +537,6 @@ pub fn test_accord_recovery_commitments<S: AsRef<str>>(holders: &[S]) -> serde_j
     serde_json::json!(map)
 }
 
-/// Test-only: [`test_accord_recovery_commitments`] for the accord roster `d`
-/// holds now (the revocation-folded seat set the charter door reads).
-#[cfg(any(test, feature = "test-anchor"))]
-pub async fn test_accord_recovery_commitments_held(
-    d: &(dyn FederationDirectory + '_),
-) -> serde_json::Value {
-    let roster: Vec<String> = d
-        .active_family_members(ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID)
-        .await
-        .map(|m| m.into_iter().map(|m| m.key_id).collect())
-        .unwrap_or_default();
-    test_accord_recovery_commitments(&roster)
-}
-
 /// Test-only: [`pre_rotation_commitment`] over the test pairs of `key_ids`.
 #[cfg(any(test, feature = "test-anchor"))]
 pub fn test_pre_rotation_commitment(key_ids: &[String]) -> Result<String, Error> {
@@ -4224,31 +4210,38 @@ where
     F: FederationDirectory + ?Sized,
 {
     if row.attestation_type != attestation_type::DELEGATES_TO
-        || row.attesting_key_id == row.attested_key_id
         || super::admission::envelope_dimension(&row.attestation_envelope)
             != Some(TRUST_CHARTER_DIMENSION)
     {
         return Ok(());
     }
+    // v62.0.0 (RL-fix7; CC 2.6.1.11, CC 3.4.7 as corrected at `13829f5`) —
+    // the accord's charter is the genesis bundle's `charter` member and no
+    // row. A `trust:charter:v1` naming the accord (by a holder, by anyone, or
+    // a self-edge at the accord's id) is refused by its bytes, ahead of every
+    // read, the same on a rooted and a rootless node: nothing is kept, and
+    // nothing waits for a family row no v62 door writes. A keyed root's own
+    // self-charter (`delegates_to(root → root)`) is not this row and passes
+    // below unchanged.
+    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    if row.attested_key_id == accord {
+        return Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::ACCORD_CHARTER_IS_THE_BUNDLE,
+            format!(
+                "{}: a `{TRUST_CHARTER_DIMENSION}` row naming {accord} (by {}); the accord's \
+                 charter is the genesis bundle's `charter` member, changed by a later bundle \
+                 at the import door (CC 2.6.1.11)",
+                super::malformed_row::ACCORD_CHARTER_IS_THE_BUNDLE,
+                row.attesting_key_id
+            ),
+        ));
+    }
+    if row.attesting_key_id == row.attested_key_id {
+        return Ok(());
+    }
     let refuse = |detail: String| Err(Error::CharterInvalid { detail });
     check_charter_witness_quorum(&row.attestation_envelope)?;
-
-    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
-    // v62.0.0 (wave GC6; CC 2.7, G2 finding 7) — the DOOR part ahead of the
-    // fold. A charter whose subject IS the accord family is a family charter
-    // by its own bytes, so its own-bytes rules (the pre-rotation commitment,
-    // the recovery commitments' shape) refuse before the family is read: a
-    // malformed accord charter about an unheld accord is refused, not held.
-    if row.attested_key_id == accord {
-        if !charter_commitment_well_formed(&row.attestation_envelope) {
-            return refuse(format!(
-                "family charter for {accord} must carry a well-formed \
-                 \"{CHARTER_PRE_ROTATION_FIELD}\" (64 lowercase hex — sha256 of the \
-                 pre-committed successor key set)"
-            ));
-        }
-        accord_recovery_commitments_of(&row.attestation_envelope)?;
-    }
 
     // v62.0.0 (wave GC6; CC 2.7.3) — everything below reads the family this
     // charter names (its record, roster, protocol): declared on every path,
@@ -4259,52 +4252,9 @@ where
     // Not a family ⇒ a MISLABELED key-plane row. Stored and inert, per #551
     // item 2 — see the type-level doc.
     let Some(family) = resolve_family_root(directory, &row.attested_key_id).await? else {
-        // v31.0.0 (CIRISPersist#648) — EXCEPT when the subject is the
-        // constitutional accord family itself.
-        //
-        // This early return is the #632 inversion in miniature: the quorum
-        // check is skipped because the family row cannot be found, so on a
-        // PRE-GENESIS node — the state 31.0.0 ships in — a
-        // `delegates_to(anyone → "humanity-accord")` labelled
-        // `trust:charter:v1` was admitted with no quorum and no pre-rotation
-        // commitment at all. The row is inert at read time (the family arm of
-        // `trust_root_valid` re-derives the quorum), but "the write gate is
-        // off" is not a thing to leave true because a later read happens to
-        // catch it. Absence of the family is not absence of the rule ABOUT the
-        // family.
-        //
-        // The degrade-to-no-op contract is otherwise unchanged: for any OTHER
-        // subject an unanswerable family question still writes the row and
-        // leaves the walk to refuse it.
-        //
-        // The refusal is raised HERE rather than delegated to
-        // `require_constitutional_root`, because the missing leg is the FAMILY
-        // and that chokepoint deliberately gates on the roster alone (a
-        // ceremony seats the roster, then confers; demanding the family row
-        // would refuse the ceremony). This gate's authority genuinely IS the
-        // family row, so its absence is its own refusal.
-        //
-        // v62.0.0 (wave GC6; CC 2.7.3) — the family the charter names is not
-        // held YET: the charter WAITS for it (held, re-folded when the
-        // family lands), never refused.
-        if row.attested_key_id == accord {
-            return Err(fold::hold(
-                reason::NO_CONSTITUTIONAL_ROOT_YET,
-                Error::NoConstitutionalRootYet {
-                    operation: super::genesis::posture::FAMILY_CHARTER_ADMISSION,
-                    // v62.0.0 — the constitutional family's charter is the
-                    // genesis bundle in force; its absence is the root's
-                    // (bundle/1's separate `family` leg is gone).
-                    leg: super::genesis::GenesisLeg::Anchor,
-                    fault_kind: "absent",
-                    detail: format!(
-                        "a `{TRUST_CHARTER_DIMENSION}` naming {} cannot be judged: this node \
-                         holds no such family, so the quorum it must carry cannot be re-derived",
-                        row.attested_key_id
-                    ),
-                },
-            ));
-        }
+        // v62.0.0 (RL-fix7) — the accord's own case is refused by its bytes
+        // above; any other subject no family answers writes the row and
+        // leaves the walk to refuse it (#551 item 2).
         return Ok(());
     };
     fold::reads(Dep::key(&family.family_key_id));
@@ -4343,145 +4293,7 @@ where
             family.consensus_protocol
         ));
     }
-    if family.family_key_id == accord {
-        check_accord_recovery_commitments(directory, &row.attestation_envelope, &family).await?;
-    }
     Ok(())
-}
-
-/// v53.0.0 (CC 4.2.6, rc7 `5e89627`, CIRISConstitution#139) — **the accord's
-/// charter commits a recovery key for every holder.**
-///
-/// > Every holder carries a **recovery key**, committed in the accord's charter
-/// > at seating […], held offline and apart from the signing key. A holder who
-/// > has lost signing-key material, and only that holder, rotates by a
-/// > `supersedes` signed under the recovery key; […] it needs no quorum.
-///
-/// `recovery_commitments` is `{holder_key_id: commitment}`, each value
-/// [`recovery_commitment`] of that holder's recovery key. Refused, each with
-/// its own detail:
-///
-/// - the member is absent or not an object of 64-lowercase-hex strings;
-/// - (v53.0.0, R2c ruling (a)) whether the commitments cover EXACTLY a
-///   roster (no missing holder `accord_recovery_commitment_missing`, no stray
-///   key `accord_recovery_commitment_stray`) is judged at the accord version
-///   door against the version that puts this charter in force
-///   (`accord_roster::check_charter_covers_roster`), where the roster is
-///   known. A charter row no version names is not in force (CC 3.2 T6), so
-///   admitting it early grants nothing, and a roster change's re-scrub names
-///   a holder before the version seats them;
-/// - an entry commits to a key that is the SIGNING key of a holder the
-///   charter names
-///   (recomputed from the stored record), or two holders commit to the same
-///   key — `accord_recovery_key_not_apart`. A recovery key held with the
-///   signing key, or shared with another holder, is not "apart": losing one
-///   loses both, or one holder could rotate another's seat.
-///
-/// What this does NOT do: admit the recovery `supersedes` itself (the door that
-/// checks a rotation against these commitments). That rides the record
-/// versioning of CC 3.2 T6 and is a separate slice.
-async fn check_accord_recovery_commitments<F>(
-    directory: &F,
-    envelope: &serde_json::Value,
-    _family: &super::types::Family,
-) -> Result<(), Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let commitments = accord_recovery_commitments_of(envelope)?;
-    // Apart from every signing key the charter names (its own holders): judged
-    // on the charter alone, so it holds whatever roster a version later puts
-    // it in force for.
-    //
-    // v62.0.0 (wave GC6; CC 2.7.2/2.7.3) — this reads OTHER rows (each named
-    // holder's key record), so it is a fold: each holder's record is a
-    // declared read, and a collision HOLDS the charter. A holder whose record
-    // is not held yet decides nothing NOW, and its arrival re-folds the
-    // charter: before, an unheld record was skipped and a charter admitted
-    // early stayed admitted when the colliding record landed (admit early,
-    // refuse late: an order-dependent verdict).
-    for holder in commitments.keys() {
-        fold::reads(Dep::key(holder));
-        let Some(record) = directory.lookup_public_key(holder).await? else {
-            continue;
-        };
-        // A record that cannot form an element cannot be the key a commitment
-        // names, so it cannot collide either.
-        let Ok(signing) = CommittedKey::from_record(&record) else {
-            continue;
-        };
-        let signing = recovery_commitment(&signing)?;
-        if let Some((owner, _)) = commitments.iter().find(|(_, c)| **c == signing) {
-            return Err(fold::hold(
-                reason::ACCORD_RECOVERY_KEY_NOT_APART,
-                Error::CharterInvalid {
-                    detail: format!(
-                        "accord_recovery_key_not_apart: the recovery commitment for {owner} is \
-                         the signing key of standing holder {holder}; a recovery key is held \
-                         apart from every signing key"
-                    ),
-                },
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// v62.0.0 (wave GC6) — **the accord charter's recovery commitments, by its
-/// own bytes** (the DOOR part of [`check_accord_recovery_commitments`]): the
-/// member is present, an object of 64-lowercase-hex values, no two holders
-/// committing to the same key. Reads nothing.
-///
-/// # Errors
-///
-/// [`Error::CharterInvalid`] `accord_recovery_commitment_missing` /
-/// `accord_recovery_key_not_apart`.
-fn accord_recovery_commitments_of(
-    envelope: &serde_json::Value,
-) -> Result<std::collections::BTreeMap<String, String>, Error> {
-    use super::envelope::paths::RECOVERY_COMMITMENTS;
-    let refuse = |token: &str, detail: String| {
-        Err(Error::CharterInvalid {
-            detail: format!("{token}: {detail}"),
-        })
-    };
-    let well_formed = |h: &str| {
-        h.len() == 64
-            && h.bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    };
-    let commitments: std::collections::BTreeMap<String, String> = match envelope
-        .get(RECOVERY_COMMITMENTS)
-        .map(|v| serde_json::from_value(v.clone()))
-    {
-        Some(Ok(m)) => m,
-        Some(Err(_)) | None => {
-            return refuse(
-                "accord_recovery_commitment_missing",
-                format!(
-                    "the accord's charter must carry \"{RECOVERY_COMMITMENTS}\": an object \
-                     naming each holder's pre-committed recovery key (CC 4.2.6)"
-                ),
-            )
-        }
-    };
-    if let Some((holder, _)) = commitments.iter().find(|(_, c)| !well_formed(c)) {
-        return refuse(
-            "accord_recovery_commitment_missing",
-            format!(
-                "the recovery commitment for {holder} is not 64 lowercase hex (a sha256 \
-                 over the recovery key, CC 3.2 T3)"
-            ),
-        );
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    if let Some(dup) = commitments.values().find(|c| !seen.insert(c.as_str())) {
-        return refuse(
-            "accord_recovery_key_not_apart",
-            format!("two holders commit to the same recovery key (commitment {dup})"),
-        );
-    }
-    Ok(commitments)
 }
 
 /// v19.0.0 (CIRISPersist#488 delta 1, CRITICAL — the KERI lesson) — the

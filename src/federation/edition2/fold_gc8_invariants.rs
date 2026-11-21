@@ -43,10 +43,10 @@
 //! - **I3957** (CC 2.7 rc21 ruling 11) `not_in_audience` is the one LOCAL
 //!   decline among the replicated plane's reasons: never a verdict, always
 //!   retryable.
-//! - **I3958** (rc21 X6) a version of the reserved accord id that is not the
-//!   held accord's head move, recovery or roster change is HELD
-//!   (`federation_constitutional_family_reserved`, reading `key:<accord>`),
-//!   and outside an attempt the plain refusal.
+//! - **I3958** (rc21 X6; v62.0.0 RL-fix7) a family version of the reserved
+//!   accord id is REFUSED by name (`accord_version_is_a_bundle`), inside a
+//!   fold attempt and outside alike, never held: the accord is the genesis
+//!   bundle in force.
 //! - **I3960** (rc21 ruling 10) is `tier_ingest::test_support::exercise_location_proof_authority`
 //!   (sqlite and pg runners `location_proof_authority_is_the_subject_*_734`):
 //!   a proof whose attester is not its subject is refused at the door, a live
@@ -522,12 +522,21 @@ pub(crate) async fn reserved_accord_body(d: &dyn FederationDirectory) {
     }))
     .expect("I3958: a family record");
     let signed = crate::federation::tier_ingest::test_support::sign_family("gc8-rival", family);
-    assert!(
-        matches!(
-            crate::federation::verify_family_admission(d, &signed).await,
-            Err(Error::ConstitutionalFamilyReserved { .. })
+    // v62.0.0 (RL-fix7) — the accord is the genesis bundle in force: a family
+    // version at its id is REFUSED by name, outside an attempt and inside one
+    // alike (never held: no v62 door writes the family row a hold would wait
+    // for).
+    let named = |out: Result<(), Error>, what: &str| match out {
+        Err(Error::MalformedRow { reason, .. }) => assert_eq!(
+            reason,
+            crate::federation::malformed_row::ACCORD_VERSION_IS_A_BUNDLE,
+            "I3958: {what}"
         ),
-        "I3958: outside an attempt, the refusal it was"
+        other => panic!("I3958: {what}: refused by name, got {other:?}"),
+    };
+    named(
+        crate::federation::verify_family_admission(d, &signed).await,
+        "outside an attempt",
     );
     let (out, att) = fold::attempt(
         rid(0x5a),
@@ -535,17 +544,8 @@ pub(crate) async fn reserved_accord_body(d: &dyn FederationDirectory) {
         crate::federation::verify_family_admission(d, &signed),
     )
     .await;
-    assert!(out.is_err());
-    assert_eq!(
-        att.held.as_ref().map(|(r, _)| r.as_str()),
-        Some(reason::gc8::CONSTITUTIONAL_FAMILY_RESERVED),
-        "I3958: an amendment the held accord does not admit concludes nothing"
-    );
-    assert!(
-        att.reads.contains(&Dep::key(accord).read_key()),
-        "I3958: the accord is declared read: {:?}",
-        att.reads
-    );
+    named(out, "inside an attempt");
+    assert_eq!(att.held, None, "I3958: refused, never held");
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -749,13 +749,19 @@ pub async fn takedown_authority(
         ));
     };
     let duty = super::admission::DELEGATION_SCOPE_TAKEDOWN;
-    let mut holders: std::collections::HashSet<String> = binding.subjects.iter().cloned().collect();
+    // v62.0.0 (CW-fix1) — the content's subjects walk only unscoped edges;
+    // each bound community's roots only edges naming THAT community.
+    let mut holders =
+        super::admission::DutyHolders::unscoped(binding.subjects.iter().cloned().collect());
     for h in &binding.subjects {
         super::edition2::fold::reads(super::edition2::fold::Dep::key(h));
     }
     for community in &binding.communities {
         super::edition2::fold::reads(super::edition2::fold::Dep::key(community));
-        holders.extend(super::admission::community_duty_roots(directory, community, duty).await?);
+        holders.in_community.push((
+            community.clone(),
+            super::admission::community_duty_roots(directory, community, duty).await?,
+        ));
     }
     match super::admission::check_moderation_admission(
         directory,
@@ -830,20 +836,22 @@ pub fn is_reversal_of(row: &super::Attestation, notice_row_id: &str) -> bool {
 pub(crate) async fn review_holders_of_content(
     directory: &dyn FederationDirectory,
     content_sha256: &str,
-) -> Result<Option<(ContentBinding, std::collections::HashSet<String>)>, Error> {
+) -> Result<Option<(ContentBinding, super::admission::DutyHolders)>, Error> {
     let Some(binding) = content_binding(directory, content_sha256).await? else {
         return Ok(None);
     };
-    let mut holders = std::collections::HashSet::new();
+    // v62.0.0 (CW-fix1) — each community's roots walk only edges naming it.
+    let mut holders = super::admission::DutyHolders::default();
     for community in &binding.communities {
-        holders.extend(
+        holders.in_community.push((
+            community.clone(),
             super::admission::community_duty_roots(
                 directory,
                 community,
                 super::admission::DELEGATION_SCOPE_REVIEW,
             )
             .await?,
-        );
+        ));
     }
     Ok(Some((binding, holders)))
 }

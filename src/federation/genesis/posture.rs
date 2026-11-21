@@ -516,13 +516,16 @@ where
 /// | `infra_attest_role_admission` | `check_infra_attest_role_admission[_over_roster]` | `infra:attest`, the build-manifest signing authority |
 /// | `accord_role_admission` | `check_accord_role_admission_over_roster` | the role-generic conferral behind co-steward roles and the accord-co-scrubbed privileged identity types |
 /// | `canonical_withdraw_authority` | `verify_canonical_withdraw_authority` / `..._supersede_authority` | the destructive canonical ops |
-/// | `family_charter_admission` | `check_family_charter_admission` | a `trust:charter:v1` naming a constitutional family as its subject |
+///
+/// v62.0.0 (RL-fix7) — `family_charter_admission` is no longer listed: a
+/// `trust:charter:v1` naming the accord is refused by its bytes
+/// (`malformed_row::ACCORD_CHARTER_IS_THE_BUNDLE`), the same with or without
+/// a root, so it resolves nothing to the constitutional root.
 pub const ROOT_REQUIRING_GATES: &[&str] = &[
     CANONICAL_ROLE_ADMISSION,
     INFRA_ATTEST_ROLE_ADMISSION,
     ACCORD_ROLE_ADMISSION,
     CANONICAL_WITHDRAW_AUTHORITY,
-    FAMILY_CHARTER_ADMISSION,
 ];
 
 /// `operation` token — see [`ROOT_REQUIRING_GATES`].
@@ -533,8 +536,6 @@ pub const INFRA_ATTEST_ROLE_ADMISSION: &str = "infra_attest_role_admission";
 pub const ACCORD_ROLE_ADMISSION: &str = "accord_role_admission";
 /// `operation` token — see [`ROOT_REQUIRING_GATES`].
 pub const CANONICAL_WITHDRAW_AUTHORITY: &str = "canonical_withdraw_authority";
-/// `operation` token — see [`ROOT_REQUIRING_GATES`].
-pub const FAMILY_CHARTER_ADMISSION: &str = "family_charter_admission";
 
 /// v31.0.0 (CIRISPersist#648) — **the anti-fail-open chokepoint.**
 ///
@@ -812,10 +813,11 @@ pub(crate) async fn exercise_seedless_gate_refusals(dir: &dyn FederationDirector
         "verify_withdrawal_authority_over_roster",
     );
 
-    // 5. family_charter_admission — the #632 inversion in miniature. With no
-    //    family row the quorum check used to be SKIPPED entirely, so an
-    //    unauthorized charter for the constitutional family was admitted with
-    //    no quorum and no pre-rotation commitment at all.
+    // 5. v62.0.0 (RL-fix7) — a charter for the accord is no root-requiring
+    //    gate: it is refused by its bytes, `accord_charter_is_the_bundle`,
+    //    rooted or rootless (the #632 inversion is closed by refusing the
+    //    row, not by waiting for a root). Witnessed here on the rootless
+    //    directory; it is not counted among the listed gates.
     let ts: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
     let charter = crate::federation::Attestation {
         attestation_id: format!("rogue-charter-{tag}"),
@@ -852,12 +854,14 @@ pub(crate) async fn exercise_seedless_gate_refusals(dir: &dyn FederationDirector
         promoted_at: None,
         additional_scrubs: Vec::new(),
     };
-    record(
-        crate::federation::trust_root::check_family_charter_admission(dir, &charter)
-            .await
-            .expect_err("an unquorumed constitutional charter must REFUSE, not be skipped"),
-        "check_family_charter_admission",
-    );
+    match crate::federation::trust_root::check_family_charter_admission(dir, &charter).await {
+        Err(Error::MalformedRow { reason, .. }) => assert_eq!(
+            reason,
+            crate::federation::malformed_row::ACCORD_CHARTER_IS_THE_BUNDLE,
+            "[{tag}] a charter naming the accord is refused by name"
+        ),
+        other => panic!("[{tag}] a charter naming the accord must refuse by name, got {other:?}"),
+    }
 
     // The enumeration IS the contract.
     let listed: BTreeSet<&str> = ROOT_REQUIRING_GATES.iter().copied().collect();

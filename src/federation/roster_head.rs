@@ -433,7 +433,8 @@ pub struct RosterLag {
     pub uncovered_keys: Vec<String>,
     /// The accord `roster_change` proposals (digests) whose authorized
     /// decision names this head as its `prior_family_digest`, with a window
-    /// closed before the cutoff. Empty for every lineage but the accord.
+    /// closed before the cutoff. v62.0.0 (RL-fix7): always empty — the
+    /// accord is the genesis bundle in force, not a lineage this reads.
     pub uncovered_decisions: Vec<String>,
     /// The earliest instant THIS node admitted an uncovered row (a decision
     /// counts at its window's close).
@@ -521,13 +522,12 @@ where
             earliest(*admitted);
         }
     }
-    let mut uncovered_decisions = Vec::new();
-    if root == super::canonical_community::accord_family_key_id() {
-        for (digest, closes) in uncovered_accord_decisions(directory, &head_digest, cutoff).await? {
-            uncovered_decisions.push(digest);
-            earliest(closes);
-        }
-    }
+    // v62.0.0 (RL-fix7) — the accord's roster-change decisions are no longer
+    // a lineage this reads: the accord is the genesis bundle in force (no
+    // family row is written for it, so `roster_lag` of the accord answered
+    // `None` above, before this point). A roster head covers its own roster
+    // rows; the earlier-form decision arm is deleted.
+    let uncovered_decisions: Vec<String> = Vec::new();
     if uncovered_keys.is_empty() && uncovered_decisions.is_empty() {
         return Ok(None);
     }
@@ -539,45 +539,4 @@ where
         since: first.unwrap_or(cutoff),
         cadence_secs,
     }))
-}
-
-/// The accord `roster_change` proposals anchored on `head_digest` (CC 3.2 T6:
-/// "the `prior_family_digest` an `accord_proposal` names is the digest of its
-/// current head") whose stored decision is authorized and whose window closed
-/// at or before `cutoff`, with the window's close. A roster change is carried
-/// as a family supersede (verify-core `AccordAction::RosterChange`), so a head
-/// that still IS the proposal's anchor has not been covered by it.
-async fn uncovered_accord_decisions<F>(
-    directory: &F,
-    head_digest: &str,
-    cutoff: chrono::DateTime<chrono::Utc>,
-) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let action = super::accord_quorum::AccordAction::RosterChange.as_str();
-    let proposals = directory
-        .list_accord_proposals_by_anchor(action, head_digest)
-        .await?;
-    let mut out = Vec::new();
-    for p in proposals {
-        let Ok(closes) = chrono::DateTime::parse_from_rfc3339(&p.proposal.window_until)
-            .map(|t| t.with_timezone(&chrono::Utc))
-        else {
-            continue;
-        };
-        if closes > cutoff {
-            continue;
-        }
-        let digest = p.proposal.digest();
-        let authorized = match directory.get_accord_decision(&digest).await {
-            Ok(d) => d.is_some_and(|d| d.decision.authorized),
-            Err(e) => return Err(e),
-        };
-        if authorized {
-            out.push((digest, closes));
-        }
-    }
-    out.sort();
-    Ok(out)
 }

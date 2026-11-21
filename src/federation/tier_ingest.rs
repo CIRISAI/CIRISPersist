@@ -237,119 +237,6 @@ where
     .map(|_| ())
 }
 
-/// v53.0.0 (CC 3.2 T6, operator ruling B-1 on CIRISConstitution#136) — **the
-/// one record the reserved `humanity-accord` id admits through a door: a new
-/// version of the HELD accord that moves only its head.**
-///
-/// The accord's head is its family record at a version and names the charter
-/// in force; a charter re-scrub takes effect only through a new version. The
-/// id stays reserved against every founding and every roster, protocol or
-/// entrenchment change (a squat, or a roster change by another rule). What
-/// passes is exactly: this node holds the accord; the offered record equals
-/// it in everything but `prev_head_digest` / `charter_digest`; it carries a
-/// supersede proof naming the held version, whose change envelope binds the
-/// offered record's content hash (`next_persist_row_hash` — the quorum signs
-/// WHICH charter, not only "the same roster"); and that envelope verifies to
-/// the held roster's own protocol. The prev-head check then runs in the
-/// supersede transaction.
-async fn is_accord_head_version<F>(
-    directory: &F,
-    signed: &super::SignedFamily,
-) -> Result<bool, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let offered = &signed.family;
-    let Some(proof) = signed.supersede_proof.as_ref() else {
-        return Ok(false);
-    };
-    let Some(held) = directory.lookup_family(&offered.family_key_id).await? else {
-        return Ok(false);
-    };
-    let head_only = offered.family_name == held.family_name
-        && offered.members == held.members
-        && offered.founded_at == held.founded_at
-        && offered.consensus_protocol == held.consensus_protocol
-        && offered.consensus_protocol_entrenched == held.consensus_protocol_entrenched
-        && offered.dissolved_at == held.dissolved_at;
-    if !head_only || proof.prior_persist_row_hash != held.persist_row_hash {
-        return Ok(false);
-    }
-    let bound = proof
-        .change_envelope
-        .get(super::canonical_community::NEXT_PERSIST_ROW_HASH)
-        .and_then(|v| v.as_str());
-    if bound != Some(super::types::compute_persist_row_hash(offered)?.as_str()) {
-        return Ok(false);
-    }
-    match directory
-        .verify_membership_quorum(
-            super::cohort::Cohort::Family,
-            &offered.family_key_id,
-            &proof.change_envelope,
-        )
-        .await
-    {
-        Ok(()) => {}
-        Err(Error::Backend(m)) => return Err(Error::Backend(m)),
-        Err(_) => return Ok(false),
-    }
-    // v53.0.0 (CC 3.2 T6 / CC 4.2.6, rc7 `36432c6`) — the accord's version
-    // needs yes-votes from a strict majority of its STANDING roster, whatever
-    // its `consensus_protocol` reads (`quorum:2/3` is that majority only while
-    // the roster is three).
-    accord_standing_majority_signed(directory, &offered.family_key_id, proof).await
-}
-
-/// v53.0.0 (CC 3.2 T6 / CC 4.2.6) — do distinct members of `family`'s standing
-/// roster (the one fold, [`FederationDirectory::active_family_members`]) that
-/// make a strict majority of it sign `proof.change_envelope`? Each signature
-/// is verified against the member's REGISTERED pinned hybrid key, one member
-/// at a time, so a key counts once however many signatures name it.
-pub(crate) async fn accord_standing_majority_signed<F>(
-    directory: &F,
-    family_key_id: &str,
-    proof: &super::types::GroupSupersedeProof,
-) -> Result<bool, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let standing: Vec<String> = directory
-        .active_family_members(family_key_id)
-        .await?
-        .into_iter()
-        .map(|m| m.key_id)
-        .collect();
-    standing_majority_signed_by(directory, &standing, proof).await
-}
-
-/// Do distinct members of `standing` that make a strict majority of it sign
-/// `proof.change_envelope`?
-///
-/// v62.0.0 (BH-fix1; RULINGS "composite signatures only") — a member signs
-/// with ONE composite statement, verified at the edition-2 door, which
-/// vouches for exactly this change envelope
-/// (`edition2::group::vouched_quorum_signers`); a key counts once however
-/// many voices name it. The earlier `proof.quorum_signatures` (separate
-/// Ed25519 + ML-DSA-65 pairs verified against each member's component
-/// halves) are not read: their verify is deleted, so outside a vouch nobody
-/// has signed.
-pub(crate) async fn standing_majority_signed_by<F>(
-    directory: &F,
-    standing: &[String],
-    proof: &super::types::GroupSupersedeProof,
-) -> Result<bool, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let _ = directory;
-    let vouched =
-        super::edition2::group::vouched_quorum_signers(&proof.change_envelope).unwrap_or_default();
-    let signed: std::collections::BTreeSet<&String> =
-        standing.iter().filter(|k| vouched.contains(*k)).collect();
-    Ok(signed.len() >= crate::federation::admission::strict_majority(standing.len()))
-}
-
 /// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
 /// [`SignedFamily`](super::SignedFamily): hybrid-Strict verify the scrub
 /// signature against the **claimed authority**'s REGISTERED pubkeys, over
@@ -382,6 +269,10 @@ where
 /// through nothing else. That single-door property is also what keeps a SECOND
 /// ceremony from replacing a first: the seeder's own already-entrenched check
 /// is a no-op, never an overwrite.
+///
+/// v62.0.0 (RL-fix7) — the accord is the genesis bundle in force: every
+/// family version at the reserved id is refused here by name
+/// ([`super::malformed_row::ACCORD_VERSION_IS_A_BUNDLE`]); none is held.
 pub async fn verify_family_admission<F>(
     directory: &F,
     signed: &super::SignedFamily,
@@ -389,59 +280,30 @@ pub async fn verify_family_admission<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    // v62.0.0 (wave GC8; CC 2.7.3) — whether a version of the reserved
-    // accord id is admitted reads the HELD accord (its head, its standing
-    // roster, its members' key records, the recovery and roster-change
-    // decisions): a fold condition, held with
-    // `federation_constitutional_family_reserved` and re-folded when the
-    // accord's rows change. The id is the row's own bytes; nothing else here
-    // is the signer's key plane.
-    let reserved = signed.family.family_key_id
-        == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
-    if reserved {
-        super::edition2::fold::reads(super::edition2::fold::Dep::key(
-            ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID,
-        ));
-    }
-    if reserved
-        && !is_accord_head_version(directory, signed).await?
-        // v53.0.0 (CC 4.2.6) — the door's second admitted shape: a holder's
-        // own seat rotated under their pre-committed recovery key. A version
-        // shaped as a recovery that fails a check is refused by that check's
-        // name (`accord_recovery_*`), here and on every peer.
-        && super::accord_recovery::verify_accord_recovery(directory, signed)
-            .await?
-            .is_none()
-        // v53.0.0 (CC 4.2.6) — the third: a roster change covering authorized
-        // decisions, under a strict majority of the standing roster.
-        && super::accord_roster::verify_accord_roster_change(directory, signed)
-            .await?
-            .is_none()
-    {
-        return Err(super::edition2::fold::hold(
-            super::edition2::fold::reason::gc8::CONSTITUTIONAL_FAMILY_RESERVED,
-            Error::ConstitutionalFamilyReserved {
-                family_key_id: signed.family.family_key_id.clone(),
-                attesting_key_id: signed.authority_key_id.clone(),
-            },
-        ));
-    }
-    // v53.0.0 (CC 4.2.6, R2c ruling (a)) — every accord version, whichever
-    // shape, names a charter whose recovery commitments cover exactly its
-    // roster (a recovery's next commitment stands in for its seat's entry).
+    // v62.0.0 (RL-fix7; CC 2.6.1.11, CC 4.2.6, CC 3.4.7 as corrected at
+    // `13829f5`) — the accord's roster, its parameters, its seats and a
+    // holder's recovery are the genesis bundle in force and no row. A family
+    // version at the reserved id (a founding, a head move, a roster change, a
+    // recovery) is refused by its bytes, the same on a rooted and a rootless
+    // node, before anything is kept: a change is a later bundle at the
+    // import door (`edition2::genesis::put_genesis_bundle`). The family-table
+    // verifiers it ran (the head version, `accord_roster`, `accord_recovery`)
+    // are deleted: no v62 door writes the accord's family row they read.
     if signed.family.family_key_id
         == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
     {
-        let recovery = signed
-            .supersede_proof
-            .as_ref()
-            .map(|p| &p.change_envelope)
-            .filter(|e| {
-                e.get("kind").and_then(|k| k.as_str())
-                    == Some(super::accord_recovery::RECOVERY_STATEMENT_KIND)
-            });
-        super::accord_roster::check_charter_covers_roster(directory, &signed.family, recovery)
-            .await?;
+        return Err(Error::malformed_row(
+            "family",
+            super::malformed_row::ACCORD_VERSION_IS_A_BUNDLE,
+            format!(
+                "{}: a version of {} by {} is a row; the accord's roster, seats and recovery \
+                 are the genesis bundle in force, changed by a later bundle at the import \
+                 door (CC 2.6.1.11, CC 4.2.6)",
+                super::malformed_row::ACCORD_VERSION_IS_A_BUNDLE,
+                signed.family.family_key_id,
+                signed.authority_key_id
+            ),
+        ));
     }
     let envelope = signed.family.signing_envelope();
     crate::federation::edition2::group::vouched_envelope(

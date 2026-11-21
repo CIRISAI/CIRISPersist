@@ -934,8 +934,7 @@ mod pure {
     }
 
     /// **I458** — from disk, comments stripped: every version door runs
-    /// consequence (i) before its write, the cosign door runs (ii), and the
-    /// accord head door counts the standing majority.
+    /// consequence (i) before its write and the cosign door runs (ii).
     #[test]
     fn i458_every_door_runs_its_consequence() {
         let ga = code_of("src/federation/group_amendment.rs");
@@ -971,19 +970,9 @@ mod pure {
             h.contains("roster_head::roster_lag("),
             "I458: the shared predicate reads the roster lag"
         );
-        // The door RETURNS the count's verdict (its tail expression), so a
-        // call whose result is dropped does not pass. While the accord is three
-        // holders `quorum:2/3` IS the standing majority, so no behaviour can tell
-        // the leg apart; I457 witnesses the count itself.
-        let ti = code_of("src/federation/tier_ingest.rs");
-        let b = body(&ti, "async fn is_accord_head_version");
-        let flat: String = b.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            flat.contains(
-                "accord_standing_majority_signed(directory, &offered.family_key_id, proof).await }"
-            ),
-            "I458: the accord head door returns the standing-majority count"
-        );
+        // v62.0.0 (RL-fix7) — the accord head door (`is_accord_head_version`)
+        // is deleted: every version of the accord is refused by name at
+        // `verify_family_admission` (I3958).
     }
 }
 

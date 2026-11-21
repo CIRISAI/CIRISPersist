@@ -4513,6 +4513,34 @@ impl Engine {
         delegation_purpose: Option<&str>,
         term: crate::federation::admission::DelegationTermBounds,
     ) -> Result<String, crate::federation::Error> {
+        self.grant_delegation_in(
+            signer,
+            delegate_key_id,
+            scopes,
+            sub_delegation,
+            delegation_purpose,
+            term,
+            None,
+        )
+        .await
+    }
+
+    /// v62.0.0 (CW-fix1) — [`Self::grant_delegation`] naming the community
+    /// the edge is in (`community_id` on the edge): the one body. A duty
+    /// edge counts in a room only if it names that room
+    /// ([`crate::federation::admission::is_named_moderator`]).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[allow(clippy::too_many_arguments)]
+    async fn grant_delegation_in(
+        &self,
+        signer: &crate::signing::LocalSigner,
+        delegate_key_id: &str,
+        scopes: Vec<String>,
+        sub_delegation: bool,
+        delegation_purpose: Option<&str>,
+        term: crate::federation::admission::DelegationTermBounds,
+        community_id: Option<&str>,
+    ) -> Result<String, crate::federation::Error> {
         let owner_binding = delegation_purpose
             .is_some_and(|p| p == crate::federation::types::owner_binding::PURPOSE);
         let mut envelope = match delegation_purpose {
@@ -4526,6 +4554,10 @@ impl Engine {
         };
         // v60.0.0 (CIRISPersist#1048) — the term is signed onto the edge.
         term.stamp(&mut envelope);
+        // v62.0.0 (CW-fix1) — the room the edge is in.
+        if let Some(c) = community_id {
+            envelope["community_id"] = serde_json::Value::String(c.to_owned());
+        }
         let mut input = crate::federation::EmitAttestationInput::with_envelope(
             crate::federation::types::attestation_type::DELEGATES_TO,
             crate::federation::envelope::EnvelopeCore::from_value(envelope)
@@ -5011,11 +5043,10 @@ impl Engine {
     /// steward-bound — the appointment edge `signer → moderator` is the
     /// root-out-edge the §11.10 duty walk traverses.
     ///
-    /// `community_id` rides the appointment **implicitly**: the §11.10 walk
-    /// resolves the community → its authority roots, then walks `root →*
-    /// moderator` over `duty`-scoped `delegates_to` edges — so the binding
-    /// is "this steward-bound community authority delegated `duty` to the
-    /// moderator", NOT a `community_id` field on the edge. The caller is
+    /// v62.0.0 (CW-fix1): `community_id` rides the appointment EXPLICITLY, as
+    /// the edge's `community_id`; the §11.10 walk for a community follows only
+    /// edges naming it (before CW-fix1 it rode implicitly, and the appointment
+    /// counted in every room its appointer held a seat in). The caller is
     /// therefore responsible for `signer` BEING a community authority (this
     /// helper emits the edge; admissibility is the authority-set membership,
     /// checked by the reader). `sub_delegation` is `true` so the appointee
@@ -5035,18 +5066,19 @@ impl Engine {
         duty: &str,
         term: crate::federation::admission::DelegationTermBounds,
     ) -> Result<String, crate::federation::Error> {
-        // `community_id` is intentionally not stamped on the edge: the
-        // §11.10 walk binds a moderator to a community by reaching it from
-        // the community's authority roots, not by a field match. Bind it in
-        // the debug log so the appointment is traceable.
-        let _ = community_id;
-        self.grant_delegation(
+        // v62.0.0 (CW-fix1; CC 4.5.4) — the appointment NAMES its room
+        // (`community_id`): a community's duty walk follows only edges naming
+        // it, so an appointment confers nothing in any other room its
+        // appointer holds (before CW-fix1 the edge named none and counted in
+        // every room the appointer held a seat in).
+        self.grant_delegation_in(
             signer,
             moderator_key_id,
             vec![duty.to_owned()],
             true,
             None,
             term,
+            Some(community_id),
         )
         .await
     }
@@ -20506,6 +20538,231 @@ mod tests {
             .unwrap(),
             "is_named_moderator FALSE after remove_moderator (withdraws revokes the edge)"
         );
+    }
+
+    /// v62.0.0 (CW-fix1; CC 4.5.4) — **I2168: through the real verb, an
+    /// appointment in room A confers nothing in room B.** The founder F of A
+    /// and B appoints M in A with `add_moderator` (the edge now names A):
+    /// M moderates A and NOT B (`is_named_moderator`, `moderators_of`, and the
+    /// write chokepoint every quarantine / takedown / review act goes through,
+    /// `check_moderation_admission`, refused in B and admitted in A); then
+    /// `add_moderator` in B makes M a moderator of B. Both orders: the B
+    /// appointment before or after the A one (a second pair of rooms).
+    async fn cross_room_verb_body(engine: &Engine, label: &str, tag: &str) {
+        use crate::federation::admission::{
+            check_moderation_admission, is_named_moderator, moderators_of, DutyHolders,
+        };
+        use crate::federation::types::delegation_scope::SCOPE_MODERATE;
+        let signer = crate::federation::tier_ingest::test_support::local_signer(label);
+        let derived = signer.federation_id().await;
+        let dir = engine.federation_directory();
+        dir.put_live(user_test_key_derived_for(&derived, label))
+            .await
+            .expect("seed founder");
+        let term = || {
+            crate::federation::admission::DelegationTermBounds::until(
+                chrono::Utc::now() + chrono::Duration::days(90),
+            )
+        };
+        for (pair, b_first) in [("1", false), ("2", true)] {
+            let m = format!("cw-mod-{tag}-{pair}");
+            dir.put_live(sweeper_test_key(&m))
+                .await
+                .expect("seed moderator");
+            let mk = crate::federation::edition2::fixture_switch::kid(&m);
+            let a =
+                seed_community_with_founder(engine, &format!("cw-a-{tag}-{pair}"), &derived, label)
+                    .await;
+            let b =
+                seed_community_with_founder(engine, &format!("cw-b-{tag}-{pair}"), &derived, label)
+                    .await;
+            let appoint = |room: String| {
+                let (signer, mk) = (signer.clone(), mk.clone());
+                async move {
+                    let id = engine
+                        .add_moderator(&signer, &room, &mk, SCOPE_MODERATE, term())
+                        .await
+                        .expect("add_moderator");
+                    land_held_row(&*engine.federation_directory(), &id).await;
+                }
+            };
+            let named = |room: String| {
+                let mk = mk.clone();
+                async move {
+                    is_named_moderator(
+                        &*engine.federation_directory(),
+                        &mk,
+                        &room,
+                        SCOPE_MODERATE,
+                        crate::host::clock::now(),
+                    )
+                    .await
+                    .unwrap()
+                }
+            };
+            if b_first {
+                appoint(b.clone()).await;
+                assert!(named(b.clone()).await, "I2168 {pair}: M moderates B");
+                assert!(!named(a.clone()).await, "I2168 {pair}: and not A, yet");
+                appoint(a.clone()).await;
+                assert!(named(a.clone()).await, "I2168 {pair}: then A too");
+                continue;
+            }
+            appoint(a.clone()).await;
+            assert!(named(a.clone()).await, "I2168 {pair}: M moderates A");
+            assert!(
+                !named(b.clone()).await,
+                "I2168 {pair}: M does NOT moderate B"
+            );
+            let in_b = moderators_of(&*dir, &b, SCOPE_MODERATE, crate::host::clock::now())
+                .await
+                .unwrap();
+            assert!(
+                !in_b.contains(&mk),
+                "I2168 {pair}: B's moderators exclude M: {in_b:?}"
+            );
+            let roots: std::collections::HashSet<String> =
+                std::iter::once(derived.clone()).collect();
+            assert!(
+                matches!(
+                    check_moderation_admission(
+                        &*dir,
+                        &mk,
+                        &DutyHolders::of_community(&b, roots.clone()),
+                        SCOPE_MODERATE,
+                        "content:i2168",
+                        crate::host::clock::now(),
+                    )
+                    .await,
+                    Err(crate::federation::Error::DelegatedScopeUnauthorized { .. })
+                ),
+                "I2168 {pair}: M's act in B is refused at the chokepoint"
+            );
+            check_moderation_admission(
+                &*dir,
+                &mk,
+                &DutyHolders::of_community(&a, roots),
+                SCOPE_MODERATE,
+                "content:i2168",
+                crate::host::clock::now(),
+            )
+            .await
+            .expect("I2168: and admitted in A");
+            // A QUARANTINE by M in B (a real `quarantine:withheld` row through
+            // the scores admission door's duty check): with M appointed to
+            // `slash` in A only, refused in B by name.
+            let slash = engine
+                .add_moderator(
+                    &signer,
+                    &a,
+                    &mk,
+                    crate::federation::admission::DELEGATION_SCOPE_SLASH,
+                    term(),
+                )
+                .await
+                .expect("add_moderator slash");
+            land_held_row(&*dir, &slash).await;
+            let quarantine = |room: &str| {
+                let id = uuid::Uuid::new_v4().to_string();
+                let mut env = crate::federation::quarantine::withhold_envelope(
+                    &crate::federation::edition2::fixture_switch::kid(&format!("cw-target-{tag}")),
+                    room,
+                    &slash,
+                    "spam",
+                );
+                env["id"] = serde_json::json!(id);
+                let mut row = crate::federation::tier_ingest::test_support::bare_attestation(
+                    &id, &m, &m, &env,
+                );
+                row.attestation_type =
+                    crate::federation::types::attestation_type::SCORES.to_owned();
+                crate::federation::tier_ingest::test_support::seal_row_in_place(&m, &mut row);
+                row
+            };
+            assert!(
+                matches!(
+                    crate::federation::admission::check_delegated_duty_scores_admission(
+                        &*dir,
+                        &quarantine(&b)
+                    )
+                    .await,
+                    Err(crate::federation::Error::DelegatedScopeUnauthorized { .. })
+                ),
+                "I2168 {pair}: M's quarantine in B is refused: no slash duty there"
+            );
+            assert!(
+                !matches!(
+                    crate::federation::admission::check_delegated_duty_scores_admission(
+                        &*dir,
+                        &quarantine(&a)
+                    )
+                    .await,
+                    Err(crate::federation::Error::DelegatedScopeUnauthorized { .. })
+                ),
+                "I2168 {pair}: M's quarantine in A passes the duty check"
+            );
+            appoint(b.clone()).await;
+            assert!(
+                named(b.clone()).await,
+                "I2168 {pair}: an appointment in B works for B"
+            );
+        }
+        // An UNSCOPED duty edge minted by the generic verb confers nothing in
+        // any room (fails under a lensed walk that still follows unscoped
+        // edges, the second mutation).
+        let g = format!("cw-generic-{tag}");
+        dir.put_live(sweeper_test_key(&g))
+            .await
+            .expect("seed generic");
+        let gk = crate::federation::edition2::fixture_switch::kid(&g);
+        let rooms: Vec<String> = vec![
+            seed_community_with_founder(engine, &format!("cw-g1-{tag}"), &derived, label).await,
+            seed_community_with_founder(engine, &format!("cw-g2-{tag}"), &derived, label).await,
+        ];
+        let id = engine
+            .grant_delegation(
+                &signer,
+                &gk,
+                vec![SCOPE_MODERATE.to_owned()],
+                true,
+                None,
+                term(),
+            )
+            .await
+            .expect("grant_delegation");
+        land_held_row(&*dir, &id).await;
+        for room in rooms {
+            assert!(
+                !is_named_moderator(&*dir, &gk, &room, SCOPE_MODERATE, crate::host::clock::now())
+                    .await
+                    .unwrap(),
+                "I2168: an unscoped duty edge confers nothing in a room"
+            );
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i2168_cross_room_through_add_moderator_sqlite() {
+        let signer = crate::federation::tier_ingest::test_support::local_signer("cw-founder");
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        cross_room_verb_body(&engine, "cw-founder", "sq").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn i2168_cross_room_through_add_moderator_postgres() {
+        let Some(dsn) = crate::test_pg::dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let label = format!("cw-founder-{}", uuid::Uuid::new_v4().simple());
+        let signer = crate::federation::tier_ingest::test_support::local_signer(&label);
+        let engine = Engine::with_signer(signer, &dsn).await.expect("pg engine");
+        cross_room_verb_body(&engine, &label, &uuid::Uuid::new_v4().simple().to_string()).await;
     }
 
     /// #249 Cut G1 — the uniform cohort surface round-trips across all three
