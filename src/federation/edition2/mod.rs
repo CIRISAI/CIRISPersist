@@ -180,6 +180,10 @@ mod group_serve_invariants;
 mod halt_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod halt_lifecycle_invariants;
+// v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21) — a counted grant from the
+// root, over the holders of the bundle it names (I4200–I4204).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod root_grant_invariants;
 // v62.0.0 (BH-fix3) — I2125: an identity template is signed by an accord
 // holder, in its own domain.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]

@@ -748,6 +748,42 @@ impl Engine {
         crate::federation::edition2::genesis::genesis_in_force(dir.as_ref()).await
     }
 
+    /// v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21, CC 4.4.3.19) — **the
+    /// counted grants from the root that `grantee` holds** at `at` (now when
+    /// `None`): each `trust:confers:v1` row counted over the holders of the
+    /// genesis bundle it names, with its `scope`, the accord, the bundle,
+    /// whether the grantee's consent is held (a `node` or `agent` grantee's
+    /// is its owner's acceptance), whether it is withdrawn, and `confers`
+    /// (`accepted && !withdrawn`). See
+    /// [`root_grants_for`](crate::federation::admission::root_grants_for).
+    ///
+    /// The verbs around it are the draft-and-voice surface's own: a holder
+    /// drafts the first voice with [`Self::statement_draft`] (row type
+    /// `delegates_to`, envelope `{dimension: "trust:confers:v1", scope:
+    /// [..], head: <the bundle's object id, hex>}`, `sub` = the grantee); the
+    /// other holders find it with [`Self::held_rows_for`] (role
+    /// `root_holder`) and voice it ([`Self::voice_draft`] /
+    /// [`Self::voice_held_row`], [`Self::submit_voice`]); the grantee's
+    /// consenter accepts with [`Self::reply_to_membership_proposal`] naming
+    /// the grant's row id.
+    ///
+    /// # Errors
+    /// Directory read failures.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn root_grants_for(
+        &self,
+        grantee: &str,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<crate::federation::admission::RootGrantView>, crate::federation::Error> {
+        let dir = self.federation_directory();
+        crate::federation::admission::root_grants_for(
+            dir.as_dyn_directory(),
+            grantee,
+            at.unwrap_or_else(crate::host::clock::now),
+        )
+        .await
+    }
+
     /// v62.0.0 (ceremony gap 2; CC 3.3.6.2, CC 3.4.7) — **the counted
     /// re-bind live for a seat**, the edition-2 answer to a pre-roll gate:
     /// the re-bind whose `transit_xwing_pubkey` is the seat's live key, or
@@ -11224,7 +11260,9 @@ impl Engine {
         row_id: [u8; 32],
     ) -> Result<Option<crate::federation::edition2::fold::HeldReason>, crate::federation::Error>
     {
-        crate::federation::edition2::fold::why_held(
+        // KR-fix2 rev 5 — a seat re-bind's answer is recomputed, never the
+        // stored (arrival-order) state (`fold::why_held_listed`).
+        crate::federation::edition2::fold::why_held_listed(
             self.federation_directory().as_ref(),
             &crate::federation::edition2::names::RowId(row_id),
         )
@@ -11233,6 +11271,9 @@ impl Engine {
 
     /// v62.0.0 (wave G0) — the held edition-2 rows that conclude nothing, in
     /// row-id order after `after`, at most `limit` (clamped to 1000).
+    /// KR-fix2 rev 5 — seat re-binds are not listed here
+    /// (`fold::held_rows_listed`): read one with
+    /// [`Self::edition2_held_reason`] or [`Self::voice_status`].
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn edition2_held_rows(
         &self,
@@ -11240,7 +11281,7 @@ impl Engine {
         limit: u32,
     ) -> Result<Vec<crate::federation::edition2::fold::HeldReason>, crate::federation::Error> {
         let after = after.map(crate::federation::edition2::names::RowId);
-        crate::federation::edition2::fold::held_rows(
+        crate::federation::edition2::fold::held_rows_listed(
             self.federation_directory().as_ref(),
             after.as_ref(),
             limit,

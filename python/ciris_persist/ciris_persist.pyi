@@ -856,6 +856,22 @@ class Engine:
         bundle it is counted over.
         """
 
+    def root_grants_for(self, grantee_key_id: str) -> str:
+        """v62.0.0 (KR-fix2; CC 3.2, CC 4.4.3.19) — the counted grants from
+        the root that a key holds.
+
+        Returns a JSON array, one object per held counted
+        ``trust:confers:v1`` grant to ``grantee_key_id``: ``{"row_id": hex,
+        "grantee": str, "scope": [str], "family_key_id": str, "bundle": hex,
+        "bundle_in_force": bool, "accepted": bool, "withdrawn": bool,
+        "confers": bool}``. A grant is counted over the holders of the
+        genesis bundle it names (a strict majority, by voices dated before
+        that bundle's successor). ``confers`` is ``accepted and not
+        withdrawn``: for a node or agent grantee only its owner's acceptance
+        counts. A grant still short of its holders' count is not listed; a
+        holder finds it with ``held_rows_for(role="root_holder")``.
+        """
+
     def peer_rooting_json(
         self,
         peer_identity_ref: str,

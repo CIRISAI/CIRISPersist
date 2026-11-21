@@ -937,6 +937,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // appointment; at the edition-2 door it waits (`Pending`).
     ("check_officer_appointment_counted", Class::Gate),
     ("check_admission_unit_counted", Class::Gate),
+    // v62.0.0 (KR-fix2, CC 3.2) — Gate: a counted grant from the root waits
+    // for the holders of the bundle it names; refuses a superseded bundle and
+    // a missing head. A statement about the caller's row and held bundles.
+    ("check_root_grant_counted", Class::Gate),
     // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — refuses a community record
     // whose declared cohort or affiliation config is malformed or invalid.
     ("check_community_record", Class::Gate),

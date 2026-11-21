@@ -5383,6 +5383,555 @@ pub async fn check_officer_appointment_counted(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+//  The root's counted grant (KR-fix2; CC 3.2 as ruled 2026-11-21, CC 4.4.3.19)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// v62.0.0 (KR-fix2) — the prefix of [`check_root_grant_counted`]'s
+/// shortfall: `root_grant_short: …`, an [`Error::InvalidArgument`]. At the
+/// edition-2 door it is never seen: the grant waits (`Pending`, held
+/// `count_short`).
+pub const ROOT_GRANT_SHORT: &str = "root_grant_short";
+/// v62.0.0 (KR-fix2) — the prefix of a root grant's terminal refusal
+/// (`root_grant_refused: …`): it names no `refs.head`.
+pub const ROOT_GRANT_REFUSED: &str = "root_grant_refused";
+/// v62.0.0 (KR-fix2; CC 4.4.3.19, Constitution's name) — the prefix of the
+/// REFUSAL of a root grant whose `scope` the charter of the bundle it names
+/// does not cover (`conferral_outside_charter_scope: …`). A refusal, never a
+/// hold: the grant names its bundle, and a bundle's charter is its own bytes,
+/// so the scope can never become covered and there is nothing to wait for.
+pub const CONFERRAL_OUTSIDE_CHARTER_SCOPE: &str = "conferral_outside_charter_scope";
+
+/// v62.0.0 (KR-fix2; CC 3.2: "A grant from the root is a row counted over the
+/// holders of the bundle in force, and it names the bundle it is counted
+/// over") — is `row` **a counted grant from the root**: a statement-carrying
+/// `delegates_to` at `trust:confers:v1` with no `author` (act = group) that
+/// names no community? Its group is the accord of the bundle `refs.head`
+/// names; the row carries no second name for it. (A counted `delegates_to`
+/// that names a community is an affiliation's appointment,
+/// [`is_counted_officer_appointment_row`].)
+#[must_use]
+pub fn is_counted_root_grant_row(row: &super::Attestation) -> bool {
+    row.attestation_type == attestation_type::DELEGATES_TO
+        && super::edition2::voices::carried_row_id(row).is_some()
+        && row.attestation_envelope.get("author").is_none()
+        && envelope_dimension(&row.attestation_envelope)
+            == Some(super::trust_root::TRUST_CONFERS_DIMENSION)
+        && envelope_cohort_target(&row.attestation_envelope)
+            .ok()
+            .flatten()
+            .is_none()
+}
+
+/// The `scope` tokens a delegation envelope carries (a string, or an array
+/// of strings).
+fn envelope_scope_tokens(envelope: &serde_json::Value) -> Vec<&str> {
+    match envelope.get(super::envelope::paths::SCOPE) {
+        Some(serde_json::Value::String(s)) => vec![s.as_str()],
+        Some(serde_json::Value::Array(items)) => {
+            items.iter().filter_map(serde_json::Value::as_str).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// v62.0.0 (KR-fix2) — **a counted root row read against the bundle it
+/// names** ([`root_grant_reading`]): the bundle, its accord, whether it is in
+/// force now, and the count of its holders among the row's voices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootGrantReading {
+    /// The bundle `refs.head` names (its object id).
+    pub bundle: [u8; 32],
+    /// The accord of that bundle (`family_key_id`): the root.
+    pub family_key_id: String,
+    /// Is the named bundle a tip in force NOW (`false`: a later held bundle
+    /// superseded it)?
+    pub in_force: bool,
+    /// The `asserted_at` of the next bundle of the lineage this node holds
+    /// after the named one, if any: only voices dated BEFORE it count.
+    pub successor_at_ms: Option<u64>,
+    /// The distinct holders of the NAMED bundle among the row's voices that
+    /// still count (`trust_root_group::voices_before_successor`), against the
+    /// strict majority of its holders.
+    pub count: super::trust_root::SignerCount,
+    /// The first `scope` token the named bundle's `charter.scope` does not
+    /// cover ([`scope_covers`]), if any; a row with no scope names itself.
+    pub outside_charter: Option<String>,
+}
+
+/// v62.0.0 (KR-fix2) — read the counted root row `row` (a grant, or the
+/// counted withdrawal of one) against the bundle its `refs.head` names.
+/// `Ok(None)`: no head named, or the named bundle is not in this node's held
+/// VALID lineage (the row waits on it). The count is over the holders of the
+/// NAMED bundle (`trust_root_group::holders_count_at`), whether it is the
+/// newest bundle or one a later bundle superseded, and it counts ONLY the
+/// voices whose own `asserted_at` is before the `asserted_at` of the next
+/// bundle of the lineage this node holds
+/// (`trust_root_group::voices_before_successor`; Constitution's ruling, CC
+/// rc22 7b4a55e). Held rows and signed instants only: the verdict never
+/// depends on which arrived first, the grant or a later bundle. `in_force`
+/// is reported, not judged. Declares the bundle as a fold read (RL-fix6's
+/// key), so the row re-folds at every placement: one held short over no
+/// bundle lands, and one that concluded on voices dated at or after a
+/// successor that then lands stops being counted.
+///
+/// # Errors
+/// Directory reads.
+pub async fn root_grant_reading(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<Option<RootGrantReading>, Error> {
+    let Some(head) = edition2_named_head(row) else {
+        return Ok(None);
+    };
+    super::edition2::genesis::reads_bundle_in_force();
+    let state = super::edition2::genesis::genesis_in_force(directory).await?;
+    let in_force = matches!(
+        state.head_standing(&head.0),
+        super::edition2::genesis::HeadStanding::InForce(_)
+    );
+    let Some(placement) = state.valid.iter().find(|p| p.object_id == head.0) else {
+        return Ok(None);
+    };
+    // Each holder of the named bundle is a party whose voice this row may
+    // wait for: declared as a read, so a held row is indexed under every
+    // holder's key and `held_rows_for(holder, "root_holder")` finds it
+    // (`second_signer_voice`), and a holder's key moving re-folds it.
+    let Some(holders) = super::edition2::trust_root_group::bundle_holders(&state, &head.0) else {
+        return Ok(None);
+    };
+    for h in &holders {
+        fold_reads_key(h);
+    }
+    // Only the voices dated before the next held bundle of the lineage count.
+    let voices: std::collections::BTreeSet<String> =
+        super::edition2::trust_root_group::voices_before_successor(
+            &state,
+            &head.0,
+            super::edition2::voices::row_voices(directory, row).await?,
+            |v| Some(v.asserted_at_ms),
+        )
+        .into_iter()
+        .map(|v| v.iss)
+        .collect();
+    let outside_charter = {
+        let tokens = envelope_scope_tokens(&row.attestation_envelope);
+        if tokens.is_empty() && row.attestation_type == attestation_type::DELEGATES_TO {
+            Some(String::new())
+        } else {
+            tokens
+                .into_iter()
+                .find(|wanted| {
+                    !placement
+                        .charter
+                        .scope
+                        .iter()
+                        .any(|held| scope_covers(held, wanted))
+                })
+                .map(str::to_owned)
+        }
+    };
+    let Some(count) = super::edition2::trust_root_group::holders_count_at(&state, &head.0, &voices)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(RootGrantReading {
+        bundle: head.0,
+        family_key_id: placement.family_key_id.clone(),
+        in_force,
+        successor_at_ms: state.successor_instant(&head.0),
+        count,
+        outside_charter,
+    }))
+}
+
+/// v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21, CC 4.4.3.19) — **a grant
+/// from the root is a counted row.** A counted `trust:confers:v1`
+/// ([`is_counted_root_grant_row`]) lands only when the voices of a strict
+/// majority of the holders of the bundle it names are held
+/// ([`root_grant_reading`]; the one holders count, the accord's threshold).
+///
+/// - no `refs.head`: refused ([`ROOT_GRANT_REFUSED`]);
+/// - the named bundle not in the held Valid lineage: it WAITS (held
+///   `count_short`, re-folded when a bundle is placed);
+/// - the named bundle held, the newest or not: counted over THAT bundle's
+///   holders, and only by voices dated BEFORE the next bundle of the lineage
+///   this node holds (Constitution's ruling, CC rc22 7b4a55e). A grant dated
+///   before its bundle's successor lands whichever arrives first. One dated
+///   at or after it is short (`count_short`): it never lands on a node that
+///   holds the successor, and where it had already concluded it is
+///   UN-CONCLUDED when the successor lands (this gate's shortfall is a fold
+///   condition and the bundle is a declared read), so every node ends with
+///   one verdict;
+/// - a `scope` token the named bundle's `charter.scope` does not cover
+///   ([`scope_covers`], the attenuation rule): REFUSED
+///   [`CONFERRAL_OUTSIDE_CHARTER_SCOPE`], nothing kept (rev 2: a bundle's
+///   charter never changes, so a hold could never lift);
+/// - short of the count: the gate notes a shortfall, so the door keeps the
+///   voice and answers `Pending`; the next holder's voice lands it, in either
+///   order.
+///
+/// The grantee's consent is NOT a voice here (a group act has no second
+/// signer): it is the separate acceptance row
+/// ([`membership_acceptance::root_grant_accepted_at`](super::membership_acceptance::root_grant_accepted_at)),
+/// read where the conferral is read ([`root_grant_of`]).
+///
+/// # Errors
+/// [`Error::InvalidArgument`] prefixed as above; directory reads.
+pub async fn check_root_grant_counted(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    if !is_counted_root_grant_row(row) {
+        return Ok(());
+    }
+    let Some(head) = edition2_named_head(row) else {
+        return Err(Error::InvalidArgument(format!(
+            "{ROOT_GRANT_REFUSED}: grant {} to {} names no `refs.head`: a grant from the root \
+             names the bundle it is counted over (CC 3.2)",
+            row.attestation_id, row.attested_key_id
+        )));
+    };
+    let Some(reading) = root_grant_reading(directory, row).await? else {
+        super::edition2::voices::note_short();
+        return Err(Error::InvalidArgument(format!(
+            "{ROOT_GRANT_SHORT}: grant {} to {} waits for the genesis bundle {} it names (not \
+             held yet)",
+            row.attestation_id,
+            row.attested_key_id,
+            head.hex()
+        )));
+    };
+    // A refusal that marks no fold condition: nothing of the grant is kept.
+    if let Some(token) = &reading.outside_charter {
+        return Err(Error::InvalidArgument(format!(
+            "{CONFERRAL_OUTSIDE_CHARTER_SCOPE}: grant {} to {} carries scope {token:?}, which the \
+             charter scope of the bundle {} it names does not cover: it confers nothing (CC \
+             4.4.3.19)",
+            row.attestation_id,
+            row.attested_key_id,
+            head.hex()
+        )));
+    }
+    if reading.count.met() {
+        return Ok(());
+    }
+    super::edition2::voices::note_short();
+    Err(Error::InvalidArgument(format!(
+        "{ROOT_GRANT_SHORT}: grant {} to {} waits for {} of the {} holders of bundle {} ({} \
+         voiced) (CC 3.2)",
+        row.attestation_id,
+        row.attested_key_id,
+        reading.count.required,
+        reading.count.roster_size,
+        head.hex(),
+        reading.count.distinct_holders
+    )))
+}
+
+/// v62.0.0 (KR-fix2) — **who consents for the grantee of a root grant**: a
+/// person's key consents by its person; a MACHINE grantee (a `node` or
+/// `agent` key, CC 4.4.3.19) by its OWNER, read at `at` (an agent's edition-2
+/// agent owner binding, [`agent_owner_of`]; a node's counted owner binding,
+/// [`owner_of`]). `None`: a machine with no owner bound (nobody can consent
+/// for it yet).
+///
+/// # Errors
+/// Directory reads.
+pub async fn root_grant_consenter<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    grantee: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<String>, Error> {
+    use super::types::identity_type as it;
+    fold_reads_key(grantee);
+    let Some(rec) = directory.lookup_public_key(grantee).await? else {
+        // No held record: an occurrence key answers by its identity.
+        return Ok(Some(
+            admission_identity_for_writer(directory, grantee).await?,
+        ));
+    };
+    let owner = if it::set_contains(&rec.identity_type, it::AGENT) {
+        let at_ms = u64::try_from(at.timestamp_millis()).unwrap_or(0);
+        match agent_owner_of(directory, grantee, at_ms).await? {
+            Some(o) => Some(o),
+            None => owner_of(directory, grantee).await?,
+        }
+    } else if it::set_contains(&rec.identity_type, it::NODE) {
+        owner_of(directory, grantee).await?
+    } else {
+        return Ok(Some(
+            admission_identity_for_writer(directory, grantee).await?,
+        ));
+    };
+    match owner {
+        Some(o) => Ok(Some(admission_identity_for_writer(directory, &o).await?)),
+        None => Ok(None),
+    }
+}
+
+/// v62.0.0 (KR-fix2; CC 2.4.1.1 rule 0, CC 4.5.5 "a seat stands on its own")
+/// — **the `withdraws` of a counted root grant**, decided on its own rule.
+/// `Ok(None)`: `target` is no root grant (the caller's rules apply).
+///
+/// - the GRANTEE's own withdrawal: an authored `withdraws` signed for the
+///   grantee ([`root_grant_consenter`] at the withdrawal's instant: the
+///   grantee's person, or a machine grantee's owner): rule 3;
+/// - the ROOT's withdrawal: a counted `withdraws` (no `author`) whose
+///   `refs.head` names a held Valid bundle of the same accord, at a strict
+///   majority of THAT bundle's holders ([`root_grant_reading`] over the
+///   withdrawal's own voices; judged against the bundle it names and by the
+///   voices dated before its successor, as the grant is). Short, or its
+///   bundle not held, it waits (`count_short`).
+///   Rule 1 when its first voice signed the grant's, else 4;
+/// - any other `withdraws` (one holder's authored one included) is refused
+///   [`Error::WithdrawsNotAdmitted`]: the root's act is never undone by one
+///   key.
+///
+/// # Errors
+/// As above; directory reads.
+async fn check_root_grant_withdrawal(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    target: &super::Attestation,
+) -> Result<Option<u8>, Error> {
+    if !is_counted_root_grant_row(target) {
+        return Ok(None);
+    }
+    let not_admitted = || Error::WithdrawsNotAdmitted {
+        issuer: row.attesting_key_id.clone(),
+        target_attestation_id: target.attestation_id.clone(),
+        beyond_delegation_depth_cap: false,
+    };
+    let counted = super::edition2::voices::carried_row_id(row).is_some()
+        && row.attestation_envelope.get("author").is_none();
+    if !counted {
+        let signer = admission_identity_for_writer(directory, &row.attesting_key_id).await?;
+        return match root_grant_consenter(directory, &target.attested_key_id, row.asserted_at)
+            .await?
+        {
+            Some(consenter) if consenter == signer => Ok(Some(3)),
+            _ => Err(not_admitted()),
+        };
+    }
+    let Some(head) = edition2_named_head(row) else {
+        return Err(not_admitted());
+    };
+    let Some(reading) = root_grant_reading(directory, row).await? else {
+        super::edition2::voices::note_short();
+        return Err(Error::InvalidArgument(format!(
+            "{ROOT_GRANT_SHORT}: withdrawal {} of grant {} waits for the genesis bundle {} it \
+             names (not held yet)",
+            row.attestation_id,
+            target.attestation_id,
+            head.hex()
+        )));
+    };
+    // The same root: the grant's bundle and the withdrawal's are one accord's.
+    if root_grant_reading(directory, target)
+        .await?
+        .is_some_and(|g| g.family_key_id != reading.family_key_id)
+    {
+        return Err(not_admitted());
+    }
+    if reading.count.met() {
+        return Ok(Some(if row.attesting_key_id == target.attesting_key_id {
+            1
+        } else {
+            4
+        }));
+    }
+    super::edition2::voices::note_short();
+    Err(Error::InvalidArgument(format!(
+        "{ROOT_GRANT_SHORT}: withdrawal {} of grant {} waits for {} of the {} holders of bundle \
+         {} ({} voiced) (CC 3.2, CC 2.4.1.1 rule 0)",
+        row.attestation_id,
+        target.attestation_id,
+        reading.count.required,
+        reading.count.roster_size,
+        head.hex(),
+        reading.count.distinct_holders
+    )))
+}
+
+/// v62.0.0 (KR-fix2) — the role a holder of the bundle voices a counted root
+/// row in, on the draft-and-voice surface
+/// (`second_signer_voice::held_rows_for(key, Some("root_holder"), ..)`).
+pub const ROOT_HOLDER_ROLE: &str = "root_holder";
+
+/// v62.0.0 (KR-fix2) — **who may voice the counted root row `statement` is a
+/// voice of**: the holders of the genesis bundle its `refs.head` names, when
+/// this node holds that bundle. `None` for any statement that is not a
+/// counted row of the trust family naming a bundle (an authored trust edge,
+/// another family, a head this node does not hold as a bundle). A grant
+/// (`trust:confers:v1`) and the root's counted withdrawal of one both answer.
+///
+/// # Errors
+/// Directory reads.
+pub(crate) async fn root_grant_voice_parties(
+    directory: &dyn super::FederationDirectory,
+    statement: &[u8],
+) -> Result<Option<Vec<String>>, Error> {
+    use ciris_verify_core::cde::Value;
+    let Some((protected, payload)) = super::edition2::liveness::statement_parts(statement) else {
+        return Ok(None);
+    };
+    if !protected
+        .get_int(-70002)
+        .and_then(Value::as_text)
+        .is_some_and(super::edition2::typed::is_trust_family)
+        || payload.get_text("author").is_some()
+    {
+        return Ok(None);
+    }
+    let Some(head) = super::edition2::names::names_of(&payload)
+        .ok()
+        .and_then(|n| super::edition2::names::single(&n, "head"))
+    else {
+        return Ok(None);
+    };
+    let state = super::edition2::genesis::genesis_in_force(directory).await?;
+    Ok(super::edition2::trust_root_group::bundle_holders(
+        &state, &head.0,
+    ))
+}
+
+/// v62.0.0 (KR-fix2) — one counted grant from the root to a key, as a host
+/// reads it ([`root_grants_for`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootGrantView {
+    /// The grant's row id (hex).
+    pub row_id: String,
+    /// The grantee (the row's `sub`).
+    pub grantee: String,
+    /// The `scope` tokens the grant carries.
+    pub scope: Vec<String>,
+    /// The root: the accord (`family_key_id`) of the bundle it names.
+    pub family_key_id: String,
+    /// The bundle it is counted over (object id, hex).
+    pub bundle: String,
+    /// Is that bundle the one in force now?
+    pub bundle_in_force: bool,
+    /// The grantee's consent is held (its acceptance, or a machine grantee's
+    /// owner's).
+    pub accepted: bool,
+    /// A withdrawal of the grant is held (the grantee's own, or the root's
+    /// counted one).
+    pub withdrawn: bool,
+    /// `accepted && !withdrawn`: the grant confers its `scope` on the
+    /// grantee, as far as the grant itself goes. Whether THIS node honours
+    /// the root is the capability walk's leg.
+    pub confers: bool,
+}
+
+/// v62.0.0 (KR-fix2) — **the counted grants from the root that `grantee`
+/// holds at `t`**: every held `trust:confers:v1` row to it that
+/// [`root_grant_of`] reads as a counted root grant (its count met by voices
+/// dated before its bundle's successor, its scope inside its bundle's
+/// charter), each with whether it is accepted and whether it is withdrawn.
+/// A grant still short of its count is not a held row and is not listed
+/// (`held_rows_for` lists it for the holders).
+///
+/// # Errors
+/// Directory reads.
+pub async fn root_grants_for(
+    directory: &dyn super::FederationDirectory,
+    grantee: &str,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<RootGrantView>, Error> {
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::to(grantee, FOLD_PAGE)
+        .types(&[attestation_type::DELEGATES_TO])
+        .dimension(super::trust_root::TRUST_CONFERS_DIMENSION)
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page.into_iter().filter(is_counted_root_grant_row));
+    }
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<String> = rows.iter().map(|r| r.attestation_id.clone()).collect();
+    let composers = directory
+        .list_composers_referencing_any(&ids, None, None)
+        .await?;
+    let refs: Vec<&super::Attestation> = rows.iter().chain(composers.iter()).collect();
+    let retired = super::precedence::retired_ids(&refs);
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let Some(g) = root_grant_of(directory, row, t).await? else {
+            continue;
+        };
+        let withdrawn = retired.contains(&row.attestation_id);
+        out.push(RootGrantView {
+            row_id: row.attestation_id.clone(),
+            grantee: row.attested_key_id.clone(),
+            scope: envelope_scope_tokens(&row.attestation_envelope)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            family_key_id: g.family_key_id,
+            bundle: hex::encode(g.bundle),
+            bundle_in_force: g.bundle_in_force,
+            accepted: g.accepted,
+            withdrawn,
+            confers: g.accepted && !withdrawn,
+        });
+    }
+    Ok(out)
+}
+
+/// v62.0.0 (KR-fix2) — **what the conferral reader gets from a counted root
+/// grant** (part 3's hook: `capability_root_of(grant)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootGrant {
+    /// The root: the accord (`family_key_id`) of the bundle the grant names.
+    pub family_key_id: String,
+    /// The bundle the grant is counted over (its object id).
+    pub bundle: [u8; 32],
+    /// Is that bundle the one in force now? `false`: a later held bundle
+    /// superseded it. Reported, never judged here: whether a grant naming an
+    /// earlier bundle still confers is the walk's (and Constitution's) to say.
+    pub bundle_in_force: bool,
+    /// Has the grantee's consent been given by `t` (the acceptance row;
+    /// `membership_acceptance::root_grant_accepted_at`)? A grant CONFERS only
+    /// when this is `true`.
+    pub accepted: bool,
+}
+
+/// v62.0.0 (KR-fix2) — **the root a held counted grant confers under**, for
+/// the capability walk. `Ok(None)` for any row that is no counted root grant,
+/// for one whose named bundle is not held, whose holders' voices do not meet
+/// the count, or whose `scope` its bundle's charter does not cover (each
+/// confers nothing). A counted row's `attesting_key_id` is its FIRST VOICE (a
+/// holder), never the root: the reader takes the root from here.
+///
+/// The walk still applies its own legs: the grant live (no counted or grantee
+/// withdrawal), `scope`, and this node's acceptance of the root.
+///
+/// # Errors
+/// Directory reads.
+pub async fn root_grant_of(
+    directory: &dyn super::FederationDirectory,
+    grant: &super::Attestation,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<RootGrant>, Error> {
+    if !is_counted_root_grant_row(grant) {
+        return Ok(None);
+    }
+    let Some(reading) = root_grant_reading(directory, grant).await? else {
+        return Ok(None);
+    };
+    if !reading.count.met() || reading.outside_charter.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(RootGrant {
+        family_key_id: reading.family_key_id,
+        bundle: reading.bundle,
+        bundle_in_force: reading.in_force,
+        accepted: super::membership_acceptance::root_grant_accepted_at(directory, grant, t).await?,
+    }))
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 //  admission:unit — the count (AU-fix1; CC 2.7.11, CC 2.6.1.9)
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -12103,6 +12652,12 @@ pub(crate) async fn check_withdraws_admission_against(
         return Ok(decided);
     }
     if let Some(rule) = check_admission_unit_withdrawal(directory, row, target).await? {
+        return Ok(Some(rule));
+    }
+    // v62.0.0 (KR-fix2; CC 3.2) — a counted grant from the root is withdrawn
+    // by its grantee (or a machine grantee's owner) or by the root's counted
+    // withdrawal over the bundle in force; no other rule reaches it.
+    if let Some(rule) = check_root_grant_withdrawal(directory, row, target).await? {
         return Ok(Some(rule));
     }
     if let Some((group, by_dimension)) = counted_group_of(target) {

@@ -383,8 +383,8 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 3.1.5	CLM-occurrence-revocation-carrier	CIRISPersist	src/federation/occurrence_revocation_carrier.rs#check_carrier_admission	ciris-persist@61.4.2	37f1f729b89700251d2a210465efd1893b3f28cd8f208cf8b6716adddd765aab
 5.3.4	CLM-bundle-seeds-transit-pairs	CIRISPersist	src/federation/edition2/transport_rebind.rs#seat_transit_key	ciris-persist@61.4.2	9532999f487eadb3e24ce21507b62d39ed69b7fc01d04830d3040e7da470fe9f
 5.3.4	CLM-bundle-seeds-transit-pairs	CIRISPersist	src/federation/self_at_login.rs#transit_xwing_pubkey_for	ciris-persist@61.4.2	746d4701f7e8e4416d7f3f7d56e602dd2bbc54d4fb1c0fcdf5389bc134a9c01a
-5.3.4	CLM-bundle-seeds-transit-pairs	CIRISPersist	src/federation/edition2/transport_rebind.rs#put_rebind_voice	ciris-persist@61.4.2	b65288d288eeb4a1dbc4cd3b445c6c9f4bbbb524959ee936eb56235c16a4da10
-3.1.5	CLM-canonical-rebind	CIRISPersist	src/federation/edition2/transport_rebind.rs#put_rebind_voice	ciris-persist@61.4.2	b65288d288eeb4a1dbc4cd3b445c6c9f4bbbb524959ee936eb56235c16a4da10
+5.3.4	CLM-bundle-seeds-transit-pairs	CIRISPersist	src/federation/edition2/transport_rebind.rs#put_rebind_voice	ciris-persist@61.4.2	1198355aefbefacb303f258722d36caa439f0ca2d5b431b61e76d2aeb40fdb35
+3.1.5	CLM-canonical-rebind	CIRISPersist	src/federation/edition2/transport_rebind.rs#put_rebind_voice	ciris-persist@61.4.2	1198355aefbefacb303f258722d36caa439f0ca2d5b431b61e76d2aeb40fdb35
 3.1.5	CLM-canonical-rebind	CIRISPersist	src/federation/edition2/transport_rebind.rs#seat_transit_key	ciris-persist@61.4.2	9532999f487eadb3e24ce21507b62d39ed69b7fc01d04830d3040e7da470fe9f
 3.1.1	CLM-takedown-notice-row	CIRISPersist	src/federation/takedown_tombstone.rs#check_takedown_notice_row_admission	ciris-persist@61.4.2	22995dea4ec35c2a4704c196c33a6c38256dbf34a1f06c77f8d101a95ac80d8a
 3.1.1	CLM-takedown-notice-row	CIRISPersist	src/federation/takedown_tombstone.rs#takedown_terms	ciris-persist@61.4.2	72445dfb40f4d94f9e86c58d0cfd6b796f13eff023e8bce7d8dbd18dd7d24215

@@ -845,7 +845,17 @@ fn draft_from_envelope_as(
     // statement to read `act` from).
     let counted_admission =
         family == super::payloads::ADMISSION_UNIT_FAMILY && envelope.get("head").is_some();
+    // v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21) — a row of the trust
+    // family that names the bundle it is counted over (`head`) is the ROOT's
+    // act, COUNTED over that bundle's holders: a grant from the root
+    // (`trust:confers:v1`), or the root's counted withdrawal of one. No
+    // `author` is stated for it (the vendored cell is `act=group => counted ;
+    // authored`, and a draft has no statement to read `act` from). A trust
+    // row with no `head` stays authored (an acceptance edge, a keyed root's
+    // own grant, a grantee's own withdrawal).
+    let counted_root = super::typed::is_trust_family(&family) && envelope.get("head").is_some();
     let authored = !counted_admission
+        && !counted_root
         && authored_override.unwrap_or_else(|| {
             family_is_authored(
                 &family,

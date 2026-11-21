@@ -1336,6 +1336,11 @@ where
     // v62.0.0 (wave V1b, CC 4.4.3.12) — an affiliation's counted officer
     // appointment waits (`Pending`) for the quorum at the head it names.
     crate::federation::admission::check_officer_appointment_counted(dir, &row).await?;
+    // v62.0.0 (KR-fix2, CC 3.2 as ruled 2026-11-21) — a counted grant from
+    // the root waits (`count_short`) for a strict majority of the holders of
+    // the bundle it names; a superseded bundle is refused by name; a scope
+    // outside the bundle's charter is held (CC 4.4.3.19).
+    crate::federation::admission::check_root_grant_counted(dir, &row).await?;
     // v62.0.0 (AU-fix1, CC 2.7.11 P2:1682) — a counted `admission:unit` row
     // waits (`count_short`) for its group's count at the head it names,
     // never on fewer than two persons.

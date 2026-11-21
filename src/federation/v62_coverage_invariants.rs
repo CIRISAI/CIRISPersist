@@ -700,9 +700,10 @@ fn is_payload_invalid(e: &Error) -> bool {
     )
 }
 
-/// **I3240** — a re-bind is counted over the bundle in force, named by
-/// `refs.head`: none is refused, an unheld bundle waits, a bundle no longer
-/// in force is refused.
+/// **I3240** — a re-bind names the bundle it is counted over (`refs.head`):
+/// none is refused, an unheld bundle waits, and over an EARLIER bundle of the
+/// lineage only the voices dated before its successor count (KR-fix2 rev 3;
+/// CC rc22 7b4a55e).
 pub(crate) async fn i3240_a_rebind_names_the_bundle_in_force(d: &dyn FederationDirectory) {
     fixture_genesis::install_v2(d)
         .await
@@ -738,21 +739,75 @@ pub(crate) async fn i3240_a_rebind_names_the_bundle_in_force(d: &dyn FederationD
     fixture_genesis::install_ceremony_v2(d, &later)
         .await
         .expect("I3240: the later bundle installs");
-    // CC 2.7.3 ("a check that reads another row concludes nothing"): which
-    // bundle is in force is other rows, so a re-bind over a superseded one is
-    // HELD with its reason, never refused (G0's conversion of this door).
+    // v62.0.0 (KR-fix2 rev 3; Constitution's ruling, CC rc22 7b4a55e) — a
+    // re-bind is judged against the bundle it NAMES, and counts only voices
+    // whose own `asserted_at` is before the next held bundle's. (Before: a
+    // re-bind over a superseded bundle was held `rebind_head_not_in_force`,
+    // whatever its instant, which made the outcome depend on arrival order.)
+    //
+    // Dated NOW, after the later bundle's instant: kept, and it counts
+    // nothing, from one holder or from two.
     let stale = voice(Some(&c.object_id));
-    match e2::put_statement(d, &stale).await {
-        Ok(StatementOutcome::Pending { .. }) => {}
-        other => panic!("I3240: a re-bind over a bundle no longer in force, got {other:?}"),
+    for (i, v) in [
+        stale.clone(),
+        rebind_voice(
+            &c.holder_key(1),
+            c.holder_identity_ref(1),
+            &seat.identity_ref,
+            &rebound,
+            {
+                let (_, p) = crate::federation::edition2::liveness::statement_parts(&stale)
+                    .expect("I3240: the stale voice reads");
+                p.get_text("asserted_at")
+                    .and_then(ciris_verify_core::cde::Value::as_u64)
+                    .expect("I3240: its instant")
+            },
+            Some(&c.object_id),
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        match e2::put_statement(d, v).await {
+            Ok(StatementOutcome::Pending { .. }) => {}
+            other => panic!(
+                "I3240: voice {i} of a re-bind over the earlier bundle, dated after its \
+                 successor, counts nothing: {other:?}"
+            ),
+        }
     }
     assert_eq!(
-        crate::federation::edition2::fold::why_held(d, &row_id_of(&stale))
+        live_transit_key(d, &seat.identity_ref).await,
+        Some(seat.transit_xwing_pubkey.to_vec()),
+        "I3240: two holders' voices dated after the successor move nothing"
+    );
+    // Dated BEFORE the later bundle's instant, over the same earlier bundle:
+    // two holders' voices count, whichever arrived first, the re-bind or the
+    // later bundle.
+    let before = later.spec.t0_ms + fixture_genesis::DAY_MS / 2 + 1_000;
+    let early = other_key(&seat.transit_xwing_pubkey, 0x22);
+    let mut last = None;
+    for i in 0..2 {
+        last = Some(
+            e2::put_statement(
+                d,
+                &rebind_voice(
+                    &c.holder_key(i),
+                    c.holder_identity_ref(i),
+                    &seat.identity_ref,
+                    &early,
+                    before,
+                    Some(&c.object_id),
+                ),
+            )
             .await
-            .unwrap()
-            .map(|h| h.reason),
-        Some(crate::federation::edition2::fold::reason::REBIND_HEAD_NOT_IN_FORCE.to_owned()),
-        "I3240: held, by name"
+            .expect("I3240: a voice dated before the successor is kept"),
+        );
+    }
+    assert!(
+        matches!(last, Some(StatementOutcome::Row { .. })),
+        "I3240: two holders' voices dated before the successor count over the bundle they \
+         name: {last:?}"
     );
     let o = e2::put_statement(d, &voice(Some(&later.object_id)))
         .await
@@ -761,6 +816,153 @@ pub(crate) async fn i3240_a_rebind_names_the_bundle_in_force(d: &dyn FederationD
         matches!(o, StatementOutcome::Pending { new: true, .. }),
         "I3240: {o:?}"
     );
+}
+
+/// **I4209** (KR-fix2 rev 5; CC rc22 7b4a55e) — **two nodes that hold the
+/// same re-bind and the same bundles LIST it alike, whichever arrived
+/// first.** Two holders voice a re-bind over the first bundle, dated AFTER
+/// the later bundle's `asserted_at`. Node A receives the voices and then the
+/// later bundle (its door answered `Row`: no successor was held, and the
+/// re-bind plane is final, so A's stored fold state says concluded). Node B
+/// receives the later bundle and then the voices (`Pending`: stored held).
+/// The verdict readers already agreed (the seat's live key is the binding's
+/// on both). The host listings now agree too: `voice_status` is `Waiting` /
+/// `count_short` on both, `why_held_listed` gives the same reason on both,
+/// and the held-rows page lists the re-bind on neither.
+pub(crate) async fn i4209_a_rebind_lists_alike_in_either_order(
+    a: &dyn FederationDirectory,
+    b: &dyn FederationDirectory,
+) {
+    use crate::federation::edition2::fold;
+    use crate::federation::edition2::names::RowId;
+    use crate::federation::edition2::second_signer_voice::{row_status, VoiceOutcome};
+    use crate::federation::edition2::transport_rebind::{rebind_counted, rebind_held_for};
+    let c = fixture_genesis::bundle_v2();
+    let later = fixture_genesis::later_v2(
+        c,
+        &fixture_genesis::HOLDER_SEEDS,
+        &fixture_genesis::SERVE_NODE_SEEDS,
+        &fixture_genesis::HOLDER_SEEDS[..2],
+    );
+    let seat = &c.seats[0];
+    let rebound = other_key(&seat.transit_xwing_pubkey, 0x29);
+    // Dated from the later bundle's own instant, never the wall clock.
+    let late = later.asserted_at_ms + 1_000;
+    let voices: Vec<Vec<u8>> = (0..2)
+        .map(|i| {
+            rebind_voice(
+                &c.holder_key(i),
+                c.holder_identity_ref(i),
+                &seat.identity_ref,
+                &rebound,
+                late,
+                Some(&c.object_id),
+            )
+        })
+        .collect();
+    let rid = RowId::of_statement(&voices[0]).expect("I4209: a row id");
+
+    // A: the first bundle, the voices, then the later bundle.
+    fixture_genesis::install_v2(a)
+        .await
+        .expect("I4209: A installs the first bundle");
+    let mut last = None;
+    for v in &voices {
+        last = Some(
+            e2::put_statement(a, v)
+                .await
+                .expect("I4209: A keeps the voice"),
+        );
+    }
+    assert!(
+        matches!(last, Some(StatementOutcome::Row { .. })),
+        "I4209: with no successor held, A's door counts both voices: {last:?}"
+    );
+    assert_eq!(
+        rebind_counted(a, &rid).await.expect("I4209: A reads"),
+        Some(true),
+        "I4209: before the later bundle, the re-bind counts on A"
+    );
+    fixture_genesis::install_ceremony_v2(a, &later)
+        .await
+        .expect("I4209: A installs the later bundle");
+
+    // B: both bundles, then the voices.
+    fixture_genesis::install_v2(b)
+        .await
+        .expect("I4209: B installs the first bundle");
+    fixture_genesis::install_ceremony_v2(b, &later)
+        .await
+        .expect("I4209: B installs the later bundle");
+    for v in &voices {
+        match e2::put_statement(b, v).await {
+            Ok(StatementOutcome::Pending { .. }) => {}
+            other => panic!("I4209: dated after the successor B holds, got {other:?}"),
+        }
+    }
+
+    // The stored fold state differs (this is what the listings must not
+    // show): concluded on A, held on B.
+    assert!(
+        fold::why_held(a, &rid)
+            .await
+            .expect("I4209: A's stored state")
+            .is_none(),
+        "I4209: A stores the re-bind as concluded (the final plane never un-concludes it)"
+    );
+    assert_eq!(
+        fold::why_held(b, &rid)
+            .await
+            .expect("I4209: B's stored state")
+            .map(|h| h.reason),
+        Some(fold::reason::COUNT_SHORT.to_owned()),
+        "I4209: B stores it as held"
+    );
+
+    // Every reader a host has gives one answer on both nodes.
+    for (name, d) in [("A", a), ("B", b)] {
+        assert_eq!(
+            rebind_counted(d, &rid).await.expect("I4209: reads"),
+            Some(false),
+            "I4209: {name}: the re-bind does not count"
+        );
+        assert_eq!(
+            rebind_held_for(d, &seat.identity_ref)
+                .await
+                .expect("I4209: reads"),
+            None,
+            "I4209: {name}: no re-bind is live for the seat"
+        );
+        assert_eq!(
+            live_transit_key(d, &seat.identity_ref).await,
+            Some(seat.transit_xwing_pubkey.to_vec()),
+            "I4209: {name}: the seat's key is its binding's"
+        );
+        match row_status(d, &rid).await.expect("I4209: voice_status") {
+            VoiceOutcome::Waiting { reason, .. } => assert_eq!(
+                reason,
+                fold::reason::COUNT_SHORT,
+                "I4209: {name}: voice_status"
+            ),
+            other => panic!("I4209: {name}: voice_status says {other:?}"),
+        }
+        let listed = fold::why_held_listed(d, &rid)
+            .await
+            .expect("I4209: why_held_listed")
+            .unwrap_or_else(|| panic!("I4209: {name}: the listing says concluded"));
+        assert_eq!(
+            (listed.reason.as_str(), listed.plane.as_str()),
+            (fold::reason::COUNT_SHORT, fold::plane::REBIND),
+            "I4209: {name}: why_held_listed"
+        );
+        let page = fold::held_rows_listed(d, None, fold::MAX_HELD_PAGE)
+            .await
+            .expect("I4209: held_rows_listed");
+        assert!(
+            page.iter().all(|h| h.plane != fold::plane::REBIND),
+            "I4209: {name}: the held-rows page lists no re-bind"
+        );
+    }
 }
 
 /// **I3241** — a later bundle that re-seats the seat on new X-Wing keys makes
@@ -1988,6 +2190,25 @@ async fn i3240_postgres() {
         return;
     };
     Box::pin(i3240_a_rebind_names_the_bundle_in_force(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i4209_sqlite() {
+    Box::pin(i4209_a_rebind_lists_alike_in_either_order(
+        &sqlite().await,
+        &sqlite().await,
+    ))
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i4209_postgres() {
+    let (Some(a), Some(b)) = (postgres().await, postgres().await) else {
+        return;
+    };
+    Box::pin(i4209_a_rebind_lists_alike_in_either_order(&a, &b)).await;
 }
 
 #[cfg(feature = "sqlite")]

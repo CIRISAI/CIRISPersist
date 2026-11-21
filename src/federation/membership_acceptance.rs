@@ -263,6 +263,19 @@ pub fn check_membership_row_shape(row: &Attestation) -> Result<(), Error> {
             "membership rows are federation-tier (a local row defers its signature)".into(),
         ));
     }
+    // v62.0.0 (KR-fix2) — a reply to a counted grant from the root is placed
+    // at the federation scope and names no group: the root is the accord of
+    // the bundle the grant names (`check_root_grant_reply`).
+    if is_root_grant_reply(row) {
+        for key in ["references_attestation_id", "proposal_hash"] {
+            if env_str(row, key).is_none_or(str::is_empty) {
+                return Err(Error::InvalidArgument(format!(
+                    "root grant reply: envelope `{key}` is required"
+                )));
+            }
+        }
+        return Ok(());
+    }
     group_of(row)?;
     env_role(row)?;
     match kind {
@@ -445,6 +458,11 @@ where
             .await;
     };
     check_membership_row_shape(row)?;
+    // v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21) — the grantee's consent
+    // to a counted grant from the root: no group's roster is read.
+    if is_root_grant_reply(row) {
+        return check_root_grant_reply(dir, row, kind).await;
+    }
     let group = group_of(row)?;
     // v61 S2 (CIRISPersist#1123) — a room stored under founder_only admits
     // no proposal and no acceptance (its one event is the escape).
@@ -577,6 +595,147 @@ where
             Ok(())
         }
     }
+}
+
+/// v62.0.0 (KR-fix2) — is `row` **a reply to a counted grant from the root**
+/// by its form: a `membership:acceptance` / `membership:decline` placed at
+/// `cohort_scope: federation`? Every other membership row is placed at its
+/// group (`family` / `community`, [`group_of`]); a federation-scope reply was
+/// refused for naming no group before this arm, so the form is the root
+/// grant's alone. The root is not named by the reply: it is the accord of the
+/// bundle the grant it answers names.
+#[must_use]
+pub fn is_root_grant_reply(row: &Attestation) -> bool {
+    matches!(
+        membership_row(row),
+        Some(MembershipRow::Acceptance | MembershipRow::Decline)
+    ) && row.cohort_scope == cohort_scope::FEDERATION
+}
+
+/// The group id a root grant's reply is reported under in a refusal: the
+/// trust root (no room, no family record).
+const ROOT_GRANT_GROUP: &str = "trust-root";
+
+/// v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21, CC 4.4.3.19) — **a reply to
+/// a counted grant from the root** (the grant's second consent, the same
+/// acceptance family as an officer's): it names a HELD counted root grant
+/// (`references_attestation_id`; not held yet, it waits), is attested to the
+/// grant's grantee, binds the grant's content hash, and is signed FOR the
+/// grantee: by the grantee's person, or for a MACHINE grantee (a `node` or an
+/// `agent`) by its OWNER at the reply's own instant
+/// ([`admission::root_grant_consenter`](super::admission::root_grant_consenter)).
+/// A machine with no owner bound yet waits (held, re-folded when the binding
+/// lands). Never both an acceptance and a decline of one grant.
+async fn check_root_grant_reply<F>(
+    dir: &F,
+    row: &Attestation,
+    kind: MembershipRow,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let member = row.attested_key_id.as_str();
+    let grant_id = env_str(row, "references_attestation_id").unwrap_or_default();
+    fold::reads(Dep::key(member));
+    fold::reads(Dep::key(&row.attesting_key_id));
+    if let Some(d) = row_dep(grant_id) {
+        fold::reads(d);
+    }
+    let Some(grant) = dir
+        .get_attestation(grant_id)
+        .await?
+        .filter(|g| g.tier == attestation_tier::FEDERATION)
+    else {
+        // The grant is not held (or still short of its count): the reply
+        // WAITS for it.
+        return Err(fold::hold(
+            reason::MEMBERSHIP_PROPOSAL_UNRESOLVED,
+            refuse(ROOT_GRANT_GROUP, member, RULE_PROPOSAL_UNRESOLVED),
+        ));
+    };
+    if !super::admission::is_counted_root_grant_row(&grant) {
+        return Err(refuse(ROOT_GRANT_GROUP, member, RULE_ACCEPTANCE_MISMATCH));
+    }
+    let signer =
+        super::admission::admission_identity_for_writer(dir, &row.attesting_key_id).await?;
+    let consenter =
+        super::admission::root_grant_consenter(dir, &grant.attested_key_id, row.asserted_at)
+            .await?;
+    if consenter.as_deref() != Some(signer.as_str())
+        || member != grant.attested_key_id
+        || env_str(row, "proposal_hash") != Some(grant.original_content_hash.as_str())
+    {
+        return Err(fold::hold(
+            reason::MEMBERSHIP_ACCEPTANCE_MISMATCH,
+            refuse(ROOT_GRANT_GROUP, member, RULE_ACCEPTANCE_MISMATCH),
+        ));
+    }
+    let held = replies_of(dir, member).await?;
+    let opposite = match kind {
+        MembershipRow::Acceptance => MembershipRow::Decline,
+        _ => MembershipRow::Acceptance,
+    };
+    if opposite_reply_stands(
+        dir,
+        row,
+        &replies_to(&held, &grant.attestation_id),
+        opposite,
+    )
+    .await?
+    {
+        return Err(fold::hold(
+            reason::MEMBERSHIP_REPLY_CONFLICT,
+            refuse(ROOT_GRANT_GROUP, member, RULE_REPLY_CONFLICT),
+        ));
+    }
+    Ok(())
+}
+
+/// v62.0.0 (KR-fix2) — **has the grantee of the counted root grant `grant`
+/// consented by `t`?** A held federation-tier `membership:acceptance:v1` at
+/// the federation scope ([`is_root_grant_reply`]), attested to the grantee,
+/// naming the grant, signed for the grantee (its person, or a machine
+/// grantee's owner at the acceptance's own instant), asserted by `t`, and no
+/// decline of it by `t`. The grant's count is the other consent
+/// (`admission::check_root_grant_counted`); it confers only when both hold.
+///
+/// # Errors
+/// Directory reads.
+pub async fn root_grant_accepted_at<F>(
+    dir: &F,
+    grant: &Attestation,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let grantee = grant.attested_key_id.as_str();
+    let held = replies_of(dir, grantee).await?;
+    let replies: Vec<&Attestation> = replies_to(&held, &grant.attestation_id)
+        .into_iter()
+        .filter(|r| r.asserted_at <= t && is_root_grant_reply(r))
+        .collect();
+    if replies
+        .iter()
+        .any(|r| membership_row(r) == Some(MembershipRow::Decline))
+    {
+        return Ok(false);
+    }
+    for r in replies
+        .iter()
+        .filter(|r| membership_row(r) == Some(MembershipRow::Acceptance))
+    {
+        let signer =
+            super::admission::admission_identity_for_writer(dir, &r.attesting_key_id).await?;
+        if super::admission::root_grant_consenter(dir, grantee, r.asserted_at)
+            .await?
+            .as_deref()
+            == Some(signer.as_str())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// v62.0.0 (wave V1b; CC 4.4.3.12) — **a reply to a counted officer
@@ -1379,6 +1538,39 @@ pub fn standing_proposal_input(
 /// The emit input for K's reply (acceptance or decline) to `proposal`.
 #[must_use]
 pub fn reply_input(proposal: &Attestation, accept: bool) -> super::types::EmitAttestationInput {
+    // v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21) — a reply to a counted
+    // grant from the root: placed at the federation scope, naming no group
+    // (the root is the accord of the bundle the grant names), attested to the
+    // grantee, binding the grant's id and content hash
+    // ([`check_root_grant_reply`]). The signer must be the grantee's
+    // consenter: for a `node` or `agent` grantee, its owner.
+    if super::admission::is_counted_root_grant_row(proposal) {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "proposal_hash".into(),
+            proposal.original_content_hash.clone().into(),
+        );
+        let envelope = super::envelope::EnvelopeCore {
+            dimension: Some(
+                if accept {
+                    ACCEPTANCE_DIMENSION
+                } else {
+                    DECLINE_DIMENSION
+                }
+                .to_owned(),
+            ),
+            references_attestation_id: Some(proposal.attestation_id.clone()),
+            extra,
+            ..super::envelope::EnvelopeCore::default()
+        };
+        let mut input = super::types::EmitAttestationInput::with_envelope(
+            attestation_type::SCORES,
+            envelope,
+            cohort_scope::FEDERATION.to_owned(),
+        );
+        input.attested_key_id = Some(proposal.attested_key_id.clone());
+        return input;
+    }
     let mut extra = serde_json::Map::new();
     for key in [
         "group_kind",

@@ -1692,6 +1692,95 @@ where
     dir.fold_held_page(after, limit.min(MAX_HELD_PAGE)).await
 }
 
+/// v62.0.0 (KR-fix2 rev 5; CC rc22 7b4a55e) — **[`why_held`] as a host
+/// reads it.** The same answer for every row but a seat re-bind
+/// (`transport:canonical_rebind`), whose answer is RECOMPUTED from the held
+/// lineage and the voices' signed instants
+/// ([`transport_rebind::rebind_counted`](super::transport_rebind::rebind_counted),
+/// the count the verdict readers use): `None` when it reaches its count now,
+/// a [`reason::COUNT_SHORT`] reason when it does not.
+///
+/// The re-bind plane is FINAL, so its stored state is the door's answer at
+/// the last arrival and differs between two nodes that received the voices
+/// and a later bundle in opposite orders. No verdict reads that stored state;
+/// this keeps the host listings from reading it either. The fold's own
+/// callers keep [`why_held`] (the stored state is what a re-fold acts on).
+///
+/// # Errors
+/// Storage failures.
+pub async fn why_held_listed<F>(dir: &F, row_id: &RowId) -> Result<Option<HeldReason>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let stored = dir.fold_held(row_id).await?;
+    if stored.as_ref().is_some_and(|h| h.plane != plane::REBIND) {
+        return Ok(stored);
+    }
+    match super::transport_rebind::rebind_counted(dir, row_id).await? {
+        None => Ok(stored),
+        Some(true) => Ok(None),
+        Some(false) => {
+            if stored.is_some() {
+                return Ok(stored);
+            }
+            // Stored as concluded (its voices arrived before the bundle that
+            // now dates them out); the same reason a node that held the
+            // bundle first stores.
+            Ok(dir.fold_state(row_id).await?.map(|st| HeldReason {
+                row_id: st.row_id,
+                family: st.family,
+                tier: st.tier,
+                replicated: st.replicated,
+                plane: st.plane,
+                reason: reason::COUNT_SHORT.to_owned(),
+                detail: "the row's voices are short of its count".to_owned(),
+                since_us: 0,
+            }))
+        }
+    }
+}
+
+/// v62.0.0 (KR-fix2 rev 5) — **[`held_rows`] as a host reads it**: the same
+/// page without the seat re-binds. A re-bind's stored state is arrival-order
+/// dependent (see [`why_held_listed`]), and a page of STORED held rows cannot
+/// list the re-binds a node stores as concluded and no longer counts, so the
+/// page lists none of them on any node. A re-bind's state is read per row
+/// ([`why_held_listed`], `voice_status`) or per seat
+/// (`transport_rebind::rebind_held_for`). The page is refilled past the rows
+/// it leaves out, so a short page still means the listing is done.
+///
+/// # Errors
+/// Storage failures.
+pub async fn held_rows_listed<F>(
+    dir: &F,
+    after: Option<&RowId>,
+    limit: u32,
+) -> Result<Vec<HeldReason>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let limit = limit.min(MAX_HELD_PAGE);
+    let mut out: Vec<HeldReason> = Vec::new();
+    let mut after = after.copied();
+    loop {
+        let page = dir.fold_held_page(after.as_ref(), limit).await?;
+        let full = page.len() >= limit as usize;
+        let Some(last) = page.last().map(|h| h.row_id) else {
+            break;
+        };
+        for h in page {
+            if h.plane != plane::REBIND && out.len() < limit as usize {
+                out.push(h);
+            }
+        }
+        if !full || out.len() >= limit as usize {
+            break;
+        }
+        after = Some(last);
+    }
+    Ok(out)
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 //  What a statement touches
 // ─────────────────────────────────────────────────────────────────────────

@@ -32,7 +32,7 @@
 //! bundle/2). Covered by C2's I2339 (a recovery counts on its one statement),
 //! I2340 (a spent commitment never returns), I2341 (a recovery key is refused
 //! as a signing key) and I2333 (a later bundle at the holders' majority).
-//! I437–I439 (trust-root edges, a keyless family's conferral) survive.
+//! I437–I439 (trust-root edges, a KEYED root's own conferral) survive.
 //!
 //! v62.0.0 (E9) — **I437–I439 re-pointed at edition 2** (W1b's rooted trust
 //! root; DEPENDS ON W1's `trust_root_valid` edition-2 arm, W1b update 5):
@@ -40,7 +40,13 @@
 //!   W1b root, `trust:accepts:v1`) is rotated by its own `supersedes`
 //!   composer (`refs.target` = the edge, same `trust:{job}:{version}` family)
 //!   naming r2, a second root founded by the bundle's holders.
-//! - I439: the keyless family is gone (a root is an identity-ref community
+//! - I439 (renamed by KR-fix2: it never tested a keyless conferral): the
+//!   grant that confers is signed by the root's OWN KEY
+//!   (`fixture_trust_root::confers_statement`, author = the root), so this
+//!   witnesses a KEYED root. The root of the federation is the genesis bundle
+//!   (CC 3.2 as ruled 2026-11-21); its counted grant, over the bundle's
+//!   holders, is `edition2::root_grant_invariants` (I4200–I4204).
+//!   The keyless family is gone (a root is an identity-ref community
 //!   founded by the bundle's holders, CC 3.2). "Confers only as it charters"
 //!   keeps its intent: a grant ONE founder signs confers nothing; the
 //!   root's own `trust:confers:v1` grant (with the delegate's second voice)
@@ -185,7 +191,7 @@ pub(crate) mod bodies {
 
     /// **I439** — CC 3.4.7: a threshold root confers only as itself; one
     /// founder's grant is no grant by the root.
-    pub(crate) async fn i439_a_keyless_family_confers_at_its_quorum(
+    pub(crate) async fn i439_a_keyed_root_confers_by_its_own_key_not_by_one_founder(
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
@@ -289,7 +295,7 @@ mod runners {
                 }
                 tagged!(i437_trust_root_valid_reads_a_superseded_edge);
                 tagged!(i438_trusted_roots_of_reads_a_superseded_edge);
-                tagged!(i439_a_keyless_family_confers_at_its_quorum);
+                tagged!(i439_a_keyed_root_confers_by_its_own_key_not_by_one_founder);
             }
         };
     }

@@ -2671,6 +2671,9 @@ pub mod test_support {
         );
 
         // ── (d) GREEN — the threshold root, founded, chartered, accepted ───
+        // (KR-fix2: its grant below is signed by the root's OWN KEY, a KEYED
+        // root's conferral. The federation root's counted grant, over the
+        // bundle's holders, is `edition2::root_grant_invariants`.)
         let r = e2::rooted_trust_root(directory, &HOLDER_SEEDS, "quorum:2/3").await;
         match chain_standing_at(directory, &r.root, now()).await? {
             StoredStanding::Rooted(held) => {

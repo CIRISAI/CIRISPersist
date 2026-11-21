@@ -219,6 +219,9 @@ Engine	amendment_standings_json	deontic
 # v62.0.0 (ceremony gap 2) — the pre-roll gate's re-bind read is DEONTIC like
 # bundles_in_force_json: a wrong answer makes a key live a seat's holders never counted.
 Engine	rebind_held_for_json	deontic	
+# v62.0.0 (KR-fix2) — the read of a key's counted grants from the root is DEONTIC:
+# a wrong `confers` names a CI worker as holding infra:attest the bundle's holders never counted.
+Engine	root_grants_for	deontic	
 # v62.0.0 (PR-fix1) — the peer verdict is DEONTIC: a wrong Rooted serves the
 # federation tier to a peer whose standing never reached this node's root (CC 3.2 T8).
 Engine	peer_rooting_json	deontic	

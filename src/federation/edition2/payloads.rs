@@ -1324,6 +1324,13 @@ pub const REF_MEMBERS: &[(&str, &str, &str, RefShape)] = &[
     // the JSON surfaces: a host drafts it (`emit::draft_from_envelope`) and
     // the mapping projects it back.
     ("admission:unit", "head", "head", RefShape::One),
+    // v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21) — a counted grant from
+    // the root (`trust:confers:v1`, no `author`) and the root's counted
+    // withdrawal of one name the genesis bundle they are counted over as the
+    // logical member `head` (the bundle's object id, 64 hex) on the JSON
+    // surfaces: a holder drafts it with `statement_draft`, and the mapping
+    // projects it back.
+    ("trust:{job}:{version}", "head", "head", RefShape::One),
 ];
 
 /// v62.0.0 (wave P1e) — the [`REF_MEMBERS`] entries of the family a

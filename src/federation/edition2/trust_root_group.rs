@@ -158,13 +158,130 @@ where
     // does not declare it: it is also the standing cache's key input.
     super::genesis::reads_bundle_in_force();
     let holders = bundle_holder_refs(dir).await?;
-    let distinct_holders = holders.iter().filter(|h| signers.contains(*h)).count();
-    Ok(SignerCount {
-        distinct_holders,
+    Ok(holders_count(&holders, signers))
+}
+
+/// v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21) — **the ONE count over a
+/// bundle's holders**: the distinct `holders` (identity-refs) among `signers`,
+/// against [`accord_threshold`](crate::federation::admission::accord_threshold)
+/// of their number (the strict majority, through the one seam). Shared by the
+/// birth's count ([`bundle_quorum_over`]: the holders in force) and a counted
+/// grant from the root ([`holders_count_at`]: the holders of the bundle the
+/// grant NAMES). No holder, never met.
+#[must_use]
+pub fn holders_count(holders: &[String], signers: &BTreeSet<String>) -> SignerCount {
+    SignerCount {
+        distinct_holders: holders.iter().filter(|h| signers.contains(*h)).count(),
         // TR-fix1 — the ONE spelling of the holders' strict majority.
         required: crate::federation::admission::accord_threshold(holders.len()),
         roster_size: holders.len(),
-    })
+    }
+}
+
+/// v62.0.0 (KR-fix2 rev 3; Constitution's ruling, CC rc22 7b4a55e: "A
+/// verdict reads only held rows and signer-stamped instants") — **the voices
+/// of a row counted over the bundle `named` that still count**: those whose
+/// OWN `asserted_at` is BEFORE the `asserted_at` of the next bundle of the
+/// lineage this node holds after `named`
+/// ([`GenesisInForce::successor_instant`](super::genesis::GenesisInForce::successor_instant)).
+/// With no successor held, every voice counts. A voice with no readable
+/// instant never counts once a successor is held.
+///
+/// The ONE function behind a counted grant from the root
+/// (`admission::root_grant_reading`) and a seat re-bind
+/// (`transport_rebind`), at the door and at every read. It reads the held
+/// lineage and the voices' signed instants only, never which arrived first:
+/// a row that concluded on voices dated at or after a successor this node did
+/// not yet hold stops counting when that successor lands, so two nodes that
+/// receive the row and the successor in opposite orders hold one verdict.
+/// NOT applied to halts (`edition2::halt` is unchanged).
+#[must_use]
+pub fn voices_before_successor<V>(
+    state: &super::genesis::GenesisInForce,
+    named: &ciris_verify_core::edition2::Digest32,
+    voices: Vec<V>,
+    asserted_at_ms: impl Fn(&V) -> Option<u64>,
+) -> Vec<V> {
+    match state.successor_instant(named) {
+        None => voices,
+        Some(next) => voices
+            .into_iter()
+            .filter(|v| asserted_at_ms(v).is_some_and(|at| at < next))
+            .collect(),
+    }
+}
+
+/// v62.0.0 (KR-fix2 rev 5; CC 3.2 as ruled 2026-11-21: "the root is the
+/// bundle") — **THE holder reader: the holders of one bundle of the held
+/// lineage**, as identity-refs in the bundle's own order. `bundle` is a
+/// bundle object id (what a counted row's `refs.head` names). `None`: `bundle`
+/// is not a Valid placement of the lineage this node holds (not held, or
+/// held and not Valid).
+///
+/// Every reader of "who holds the root" goes through this function: a row
+/// counted over the bundle it NAMES ([`holders_count_at`],
+/// `admission::root_grant_voice_parties`) reads it directly; "the holders in
+/// force" ([`holders_in_force`]) reads it once per tip.
+#[must_use]
+pub fn bundle_holders(
+    state: &super::genesis::GenesisInForce,
+    bundle: &ciris_verify_core::edition2::Digest32,
+) -> Option<Vec<String>> {
+    state
+        .valid
+        .iter()
+        .find(|p| p.object_id == *bundle)
+        .map(|p| p.holders.iter().map(|h| h.identity_ref.clone()).collect())
+}
+
+/// v62.0.0 (KR-fix2 rev 5) — **the holders in force**: [`bundle_holders`] of
+/// each tip of the held lineage, keeping the holders COMMON to every tip.
+/// With one head that is the head's holders; with no bundle held, empty.
+///
+/// On a fork of successors this is the reading the halt path already uses
+/// (`GenesisInForce::holders`, `GenesisInForce::halt_roster`): a holder
+/// counts while EVERY tip seats it, under the same key. A holder two tips
+/// seat under different keys is not common (the retain below), so this is
+/// never wider than the halt path's roster.
+///
+/// It sits beside the fork rule of a row that NAMES a bundle (ruled,
+/// Constitution, CC rc22 7b4a55e: the EARLIEST successor's instant is the
+/// cutoff, [`voices_before_successor`]) without meeting it: a row that names
+/// a bundle is counted over [`bundle_holders`] of THAT bundle, whatever the
+/// tips are, and the fork only decides which of its voices are in time; a
+/// reader with no named bundle (a halt, the birth's count, standing) has only
+/// "in force" to read, and on a fork that is what every tip agrees on.
+#[must_use]
+pub fn holders_in_force(state: &super::genesis::GenesisInForce) -> Vec<String> {
+    let mut tips = state.tips().into_iter();
+    let Some(first) = tips.next() else {
+        return Vec::new();
+    };
+    let mut common = bundle_holders(state, &first.object_id).unwrap_or_default();
+    for tip in tips {
+        let theirs = bundle_holders(state, &tip.object_id).unwrap_or_default();
+        common.retain(|h| theirs.contains(h));
+    }
+    // "Under the same key" (the halt path's `TipsInCommon.holders`).
+    let same_key: BTreeSet<&str> = state
+        .holders()
+        .iter()
+        .map(|h| h.identity_ref.as_str())
+        .collect();
+    common.retain(|h| same_key.contains(h.as_str()));
+    common
+}
+
+/// v62.0.0 (KR-fix2) — [`holders_count`] over the holders of the bundle a
+/// row names in `refs.head` ([`bundle_holders`]), never the holders in force
+/// now. `None`: the named bundle is not a held Valid placement.
+#[must_use]
+pub fn holders_count_at(
+    state: &super::genesis::GenesisInForce,
+    bundle: &ciris_verify_core::edition2::Digest32,
+    signers: &BTreeSet<String>,
+) -> Option<SignerCount> {
+    bundle_holders(state, bundle).map(|holders| holders_count(&holders, signers))
 }
 
 /// A held statement's `iss`.

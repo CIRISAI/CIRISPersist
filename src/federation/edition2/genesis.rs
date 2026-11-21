@@ -500,6 +500,21 @@ impl GenesisInForce {
         }
     }
 
+    /// v62.0.0 (KR-fix2 rev 3; CC rc22 7b4a55e) — **the `asserted_at` of the
+    /// NEXT bundle of the lineage this node holds after `head`**: the held
+    /// Valid bundle whose `refs.prev` is `head` (the earliest of them on a
+    /// fork of successors). `None`: the node holds no successor of `head`.
+    /// The instant a row counted over `head`'s holders is read against
+    /// (`trust_root_group::voices_before_successor`).
+    #[must_use]
+    pub fn successor_instant(&self, head: &Digest32) -> Option<u64> {
+        self.valid
+            .iter()
+            .filter(|p| p.prev == Some(*head))
+            .map(|p| p.asserted_at)
+            .min()
+    }
+
     /// The tips: the head, or each tip of a fork of successors.
     #[must_use]
     pub fn tips(&self) -> Vec<&GenesisPlacement> {

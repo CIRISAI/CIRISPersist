@@ -215,6 +215,30 @@ where
     Ok(out)
 }
 
+/// v62.0.0 (KR-fix2 rev 3) — every voice of a statement-carrying `row` with
+/// its signed instant: its held voices and its own carried voice (the one at
+/// the door now), no roster filter. Empty for an earlier-form row. The
+/// reader of a count that judges each voice by its own `asserted_at`
+/// (`trust_root_group::voices_before_successor`).
+///
+/// # Errors
+/// Directory read failures.
+pub async fn row_voices<F>(dir: &F, row: &Attestation) -> Result<Vec<Voice>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(row_id) = carried_row_id(row) else {
+        return Ok(Vec::new());
+    };
+    let mut out = voices_of_row(dir, &row_id).await?;
+    if let Some(v) = carried_voice(row) {
+        if !out.iter().any(|h| h.iss == v.iss && h.kid == v.kid) {
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 //  The counted-row hold (wave V1b)
 // ─────────────────────────────────────────────────────────────────────────

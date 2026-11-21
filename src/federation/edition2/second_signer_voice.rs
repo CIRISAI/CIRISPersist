@@ -148,8 +148,12 @@ impl VoiceOutcome {
 }
 
 /// **The state of row `row_id`**: `Seated` when the attestation plane holds
-/// it, else `Waiting` with its held reason (`fold::why_held`), else `Waiting`
-/// with an empty reason (nothing under the id has arrived).
+/// it, else `Waiting` with its held reason (`fold::why_held_listed`), else
+/// `Waiting` with an empty reason (nothing under the id has arrived). A seat
+/// re-bind (never an attestation row) is `Seated` when it reaches its count
+/// now and `Waiting` otherwise, recomputed from the held lineage and its
+/// voices' signed instants: two nodes that hold the same rows answer alike,
+/// whichever arrived first (KR-fix2 rev 5).
 ///
 /// # Errors
 /// Directory reads.
@@ -161,7 +165,13 @@ where
     if dir.get_attestation(&hex).await?.is_some() {
         return Ok(VoiceOutcome::Seated { row_id: hex });
     }
-    Ok(match super::fold::why_held(dir, row_id).await? {
+    // KR-fix2 rev 5 — a seat re-bind never has an attestation row: it is
+    // `Seated` when it reaches its count NOW, recomputed
+    // (`transport_rebind::rebind_counted`), never by the fold's stored state.
+    if super::transport_rebind::rebind_counted(dir, row_id).await? == Some(true) {
+        return Ok(VoiceOutcome::Seated { row_id: hex });
+    }
+    Ok(match super::fold::why_held_listed(dir, row_id).await? {
         Some(h) => VoiceOutcome::Waiting {
             row_id: hex,
             reason: h.reason,
@@ -320,7 +330,58 @@ where
         if after.is_some_and(|a| row_id <= *a) {
             continue;
         }
-        let Some(held) = dir.fold_state(&row_id).await?.and_then(|s| s.held) else {
+        let Some(state) = dir.fold_state(&row_id).await? else {
+            continue;
+        };
+        // v62.0.0 (KR-fix2 rev 8; CC 3.4.7) — a seat RE-BIND still short of
+        // its count waits for the holders of the bundle it names, in the
+        // role `root_holder`. Decided by the recomputed count
+        // (`transport_rebind::rebind_voice_parties`), never the fold's stored
+        // state: the re-bind plane is final, so that state depends on which
+        // arrived first.
+        if state.plane == super::fold::plane::REBIND {
+            let r = crate::federation::admission::ROOT_HOLDER_ROLE;
+            if role.is_some_and(|want| want != r) {
+                continue;
+            }
+            let Some(parties) = super::transport_rebind::rebind_voice_parties(dir, &row_id).await?
+            else {
+                continue;
+            };
+            if !parties.iter().any(|p| p == key) {
+                continue;
+            }
+            let voices = dir.edition2_voices(&row_id).await?;
+            if voices
+                .iter()
+                .any(|v| statement_iss(v).as_deref() == Some(key))
+            {
+                continue;
+            }
+            let Some(st) = voices.first() else {
+                continue;
+            };
+            let Ok((family, row_type, sub, _)) = row_parts(st) else {
+                continue;
+            };
+            out.push(HeldRow {
+                row_id: row_id.hex(),
+                family,
+                row_type,
+                author: statement_iss(st).unwrap_or_default(),
+                sub,
+                role: r.to_owned(),
+                parties,
+                reason: super::fold::reason::COUNT_SHORT.to_owned(),
+                detail: "the re-bind's voices are short of its count".to_owned(),
+                statement: st.clone(),
+            });
+            if out.len() >= limit {
+                return Ok(out);
+            }
+            continue;
+        }
+        let Some(held) = state.held else {
             continue;
         };
         let voices = dir.edition2_voices(&row_id).await?;
@@ -354,6 +415,36 @@ where
                     author: statement_iss(st).unwrap_or_default(),
                     sub: sub.clone(),
                     role: member.to_owned(),
+                    parties,
+                    reason: held.reason.clone(),
+                    detail: held.detail.clone(),
+                    statement: st.clone(),
+                });
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+            continue;
+        }
+        // v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21) — a COUNTED row of
+        // the root (a grant, `trust:confers:v1`, or the root's counted
+        // withdrawal of one) has no second-signer role (a group act); every
+        // holder of the genesis bundle its `refs.head` names may voice it, in
+        // the role `root_holder`, and its count decides it
+        // (`admission::check_root_grant_counted`).
+        if let Some(parties) =
+            crate::federation::admission::root_grant_voice_parties(dir.as_dyn_directory(), st)
+                .await?
+        {
+            let r = crate::federation::admission::ROOT_HOLDER_ROLE;
+            if role.is_none_or(|want| want == r) && parties.iter().any(|p| p == key) {
+                out.push(HeldRow {
+                    row_id: row_id.hex(),
+                    family: family.clone(),
+                    row_type: row_type.clone(),
+                    author: statement_iss(st).unwrap_or_default(),
+                    sub: sub.clone(),
+                    role: r.to_owned(),
                     parties,
                     reason: held.reason.clone(),
                     detail: held.detail.clone(),

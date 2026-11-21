@@ -151,6 +151,37 @@ where
             }
         }
     }
+    // v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21) — a COUNTED row of the
+    // root still gathering its voices (a grant, or the root's counted
+    // withdrawal of one) reaches the holders of the bundle it names, whether
+    // or not this node is rooted: the count is theirs to give, and a voice
+    // they never receive can never conclude. The requester is a holder, or a
+    // key whose principal is one.
+    //
+    // ONLY A HOLDER'S OWN VOICE crosses this way (rev 7): the statement's
+    // signer must itself be a holder of the bundle it names. A counted
+    // trust-family statement anyone else signs over a held bundle is kept
+    // short by the door and never reaches the holders through this arm, so a
+    // stranger cannot push statements at them through an unrooted node.
+    if let Some(peer) = requester {
+        if let Some(holders) = crate::federation::admission::root_grant_voice_parties(
+            dir.as_dyn_directory(),
+            statement,
+        )
+        .await?
+        {
+            if holders.iter().any(|h| h == iss) {
+                if holders.iter().any(|h| h == peer) {
+                    return Ok(true);
+                }
+                let principals =
+                    crate::federation::self_collective::principals_of(dir, peer).await?;
+                if principals.iter().any(|p| holders.contains(p)) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
     scope_servable(dir, iss, sub, statement, &payload, requester).await
 }
 

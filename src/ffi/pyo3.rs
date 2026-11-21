@@ -6973,6 +6973,43 @@ impl PyEngine {
         })
     }
 
+    /// v62.0.0 (KR-fix2; CC 3.2, CC 4.4.3.19) — **the counted grants from
+    /// the root that a key holds**: FFI mirror of
+    /// [`root_grants_for`](crate::federation::admission::root_grants_for).
+    ///
+    /// Returns a JSON array, one object per held counted `trust:confers:v1`
+    /// grant to `grantee_key_id`: `{row_id, grantee, scope: [str],
+    /// family_key_id, bundle (hex), bundle_in_force, accepted, withdrawn,
+    /// confers}`. `confers` is `accepted and not withdrawn`. A grant still
+    /// short of its holders' count is not listed (`held_rows_for` with role
+    /// `root_holder` lists it for a holder). A holder drafts a grant with
+    /// `statement_draft` (row type `delegates_to`, envelope `{"dimension":
+    /// "trust:confers:v1", "scope": [...], "head": <bundle object id hex>}`,
+    /// `sub` = the grantee); the grantee's consenter (for a node or agent,
+    /// its owner) accepts with `reply_to_membership_proposal(row_id, True)`.
+    fn root_grants_for(&self, py: Python<'_>, grantee_key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let grantee = grantee_key_id.to_owned();
+            let rows = py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::admission::root_grants_for(
+                        dir.as_dyn_directory(),
+                        &grantee,
+                        crate::host::clock::now(),
+                    )
+                    .await
+                    .map_err(federation_err_to_py)
+                })
+            })?;
+            Ok(serde_json::to_value(&rows)
+                .unwrap_or(serde_json::Value::Null)
+                .to_string())
+        })
+    }
+
     /// v62.0.0 (PR-fix1; CC 3.2 T8, CC 5.3.4) — **is the peer Rooted for
     /// this reader node at `at_ms`?** FFI mirror of
     /// [`peer_rooting`](crate::federation::edition2::peer_rooting::peer_rooting).

@@ -33,10 +33,15 @@
 //!   hold: the voice WAITS (the retryable unknown-signer error naming
 //!   `ceg-genesis-bundle/2:<hex>`), as the genesis door waits.
 //! - `refs.head` names a held bundle that is not in force (a predecessor of
-//!   the head, a superseded tip): refused `edition2_payload_invalid`.
-//! - `sub` is not a seat of the bundle in force, or the signer is not a holder
-//!   of it at its placed key: refused `reserved_family_unseated` (CC 3.4.7).
-//!   A seat signing its own re-bind is refused by this rule.
+//!   the head): judged against THAT bundle (v62.0.0, KR-fix2 rev 3;
+//!   Constitution's ruling, CC rc22 7b4a55e). Its voices count only when
+//!   their own `asserted_at` is before the `asserted_at` of the next bundle
+//!   of the lineage this node holds; a voice dated at or after it is kept and
+//!   counts nothing. (Before: held `rebind_head_not_in_force`, which made the
+//!   outcome depend on which arrived first.)
+//! - `sub` is not a seat of the bundle the re-bind names, or the signer is not
+//!   a holder of it at its placed key: refused `reserved_family_unseated`
+//!   (CC 3.4.7). A seat signing its own re-bind is refused by this rule.
 //! - A transit key that is not 1216 bytes: `xwing_pubkey_wrong_length`.
 //! - Otherwise the voice is kept. The row is `Row` once its distinct holder
 //!   voices reach the count ([`accord_threshold`](crate::federation::admission::accord_threshold), the one spelling), `Pending` before.
@@ -118,6 +123,124 @@ fn counted_holders(holders: &[PlacedHolder], voices: &[Vec<u8>]) -> BTreeSet<Str
         .collect()
 }
 
+/// v62.0.0 (KR-fix2 rev 3; CC rc22 7b4a55e) — the voices of a re-bind over
+/// the bundle `named` that still count: those dated before the next bundle
+/// of the lineage this node holds
+/// ([`trust_root_group::voices_before_successor`](super::trust_root_group::voices_before_successor),
+/// the one function a counted grant from the root uses too). The door and
+/// the read ([`latest_counted_rebind`]) both count through it.
+fn counting_voices(
+    in_force: &GenesisInForce,
+    named: &Digest32,
+    voices: Vec<Vec<u8>>,
+) -> Vec<Vec<u8>> {
+    super::trust_root_group::voices_before_successor(in_force, named, voices, |v| {
+        statement_parts(v.as_slice())
+            .and_then(|(_, p)| p.get_text("asserted_at").and_then(Value::as_u64))
+    })
+}
+
+/// v62.0.0 (KR-fix2 rev 5) — **does a re-bind over the bundle `named` reach
+/// its count on `voices`?** The distinct holders of `named`, at the key each
+/// signed with, among the voices that still count ([`counting_voices`]),
+/// against the one threshold. THE count of a re-bind: the door
+/// ([`put_rebind_voice`]), the verdict readers ([`latest_counted_rebind`],
+/// behind [`seat_transit_key`] and [`rebind_held_for`]) and the host listings
+/// ([`rebind_counted`]) all ask it, so none of them can disagree with
+/// another.
+fn counts(in_force: &GenesisInForce, named: &GenesisPlacement, voices: Vec<Vec<u8>>) -> bool {
+    let voices = counting_voices(in_force, &named.object_id, voices);
+    counted_holders(&named.holders, &voices).len()
+        >= crate::federation::admission::accord_threshold(named.holders.len())
+}
+
+/// v62.0.0 (KR-fix2 rev 5) — **is the held row `row_id` a re-bind, and does
+/// it reach its count NOW?** `None`: no re-bind voice is held under the id.
+/// `Some(true)`: counted ([`counts`]). `Some(false)`: held and short (its
+/// bundle is not held, or too few of its holders' voices are in time).
+///
+/// The host listings read this in place of the fold's stored state
+/// (`fold::why_held_listed`, `second_signer_voice::row_status`). The re-bind
+/// plane is FINAL, so the stored state is whatever the door answered when
+/// the last voice arrived: a node that held the voices before a later bundle
+/// stores "concluded", a node that held the bundle first stores "held", for
+/// one and the same row. This reading has no arrival order in it.
+///
+/// # Errors
+/// Directory read failures.
+pub async fn rebind_counted<F>(dir: &F, row_id: &RowId) -> Result<Option<bool>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let voices = dir.edition2_voices(row_id).await?;
+    let Some(first) = voices.first() else {
+        return Ok(None);
+    };
+    if super::emit::family_of_statement(first).is_none_or(|(family, _)| family != REBIND_FAMILY) {
+        return Ok(None);
+    }
+    let Some(head) = statement_parts(first.as_slice()).and_then(|(_, p)| head_of(&p)) else {
+        return Ok(Some(false));
+    };
+    let in_force = genesis_in_force(dir).await?;
+    let Some(named) = in_force.valid.iter().find(|p| p.object_id == head.0) else {
+        return Ok(Some(false));
+    };
+    Ok(Some(counts(&in_force, named, voices)))
+}
+
+/// v62.0.0 (KR-fix2 rev 8) — **who may still voice the held re-bind
+/// `row_id`**: the holders of the bundle it names
+/// ([`trust_root_group::bundle_holders`](super::trust_root_group::bundle_holders)),
+/// when the row is a re-bind that does NOT count now ([`counts`]) and a
+/// further voice could still make it count (its `asserted_at`, which every
+/// voice shares, is before the next held bundle of the lineage). `None`: not
+/// a re-bind held here, its bundle not held, already counted, or dated out.
+///
+/// What `second_signer_voice::held_rows_for` lists a re-bind by, in the role
+/// `root_holder`. Recomputed from the held lineage and the voices' signed
+/// instants, never the fold's stored state, so two nodes that hold the same
+/// rows list the same re-binds.
+///
+/// # Errors
+/// Directory read failures.
+pub async fn rebind_voice_parties<F>(dir: &F, row_id: &RowId) -> Result<Option<Vec<String>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let voices = dir.edition2_voices(row_id).await?;
+    let Some(first) = voices.first() else {
+        return Ok(None);
+    };
+    if super::emit::family_of_statement(first).is_none_or(|(family, _)| family != REBIND_FAMILY) {
+        return Ok(None);
+    }
+    let Some((_, payload)) = statement_parts(first.as_slice()) else {
+        return Ok(None);
+    };
+    let Some(head) = head_of(&payload) else {
+        return Ok(None);
+    };
+    let in_force = genesis_in_force(dir).await?;
+    let Some(named) = in_force.valid.iter().find(|p| p.object_id == head.0) else {
+        return Ok(None);
+    };
+    let at = payload.get_text("asserted_at").and_then(Value::as_u64);
+    if in_force
+        .successor_instant(&named.object_id)
+        .is_some_and(|next| at.is_none_or(|a| a >= next))
+    {
+        return Ok(None);
+    }
+    if counts(&in_force, named, voices) {
+        return Ok(None);
+    }
+    Ok(super::trust_root_group::bundle_holders(
+        &in_force,
+        &named.object_id,
+    ))
+}
+
 /// The transit key a re-bind payload carries, when it is exactly 1216 bytes.
 fn transit_of(payload: &Value) -> Option<[u8; XWING_PUBKEY_LEN]> {
     payload
@@ -158,38 +281,38 @@ where
     // re-bind plane is FINAL: it reads the row's NAMED past only).
     super::fold::reads(super::fold::Dep::Row(head));
     let in_force = genesis_in_force(dir).await?;
-    // v62.0.0 (HL-fix1) — the one head reading (`head_standing`), shared
-    // with the halt lifecycle door.
-    let standing = in_force.head_standing(&head.0);
-    if !matches!(standing, super::genesis::HeadStanding::InForce(_)) {
-        if matches!(standing, super::genesis::HeadStanding::Superseded) {
-            // v62.0.0 (wave GC5; CC 2.7.3) — whether a LATER bundle
-            // superseded the named one is another statement's word: the
-            // voice is HELD (`rebind_head_not_in_force`), concluding
-            // nothing, never refused.
-            return Err(super::fold::hold(
-                super::fold::reason::REBIND_HEAD_NOT_IN_FORCE,
-                invalid(format!(
-                    "{REBIND_FAMILY}: `refs.head` names bundle {}, which is not in force: a \
-                     re-bind is counted over the bundle in force",
-                    head.hex()
-                )),
-            ));
-        }
+    // v62.0.0 (KR-fix2 rev 3; Constitution's ruling, CC rc22 7b4a55e) — a
+    // re-bind is judged against the bundle it NAMES, in force or not: the
+    // named bundle must be in this node's held Valid lineage (else the voice
+    // waits on it). A later bundle no longer HOLDS the voice
+    // (`rebind_head_not_in_force` is retired from this door): what a later
+    // bundle changes is which voices COUNT, by their own signed instant
+    // (`voices_before_successor` below), so the verdict does not depend on
+    // which arrived first.
+    let Some(named) = in_force.valid.iter().find(|p| p.object_id == head.0) else {
         return Err(waiting_on_bundle(&head));
-    }
-    if in_force.seat(&row.sub).is_none() {
+    };
+    if !named.seats.iter().any(|s| s.identity_ref == row.sub) {
         return Err(unseated(format!(
-            "{REBIND_FAMILY}: {} is not a seat of the genesis bundle in force",
+            "{REBIND_FAMILY}: {} is not a seat of the genesis bundle the re-bind names",
             row.sub
         )));
     }
-    if holder_of(in_force.holders(), &row.iss, &row.kid).is_none() {
+    if holder_of(&named.holders, &row.iss, &row.kid).is_none() {
         return Err(unseated(format!(
-            "{REBIND_FAMILY}: {} is not a holder of the genesis bundle in force at the key it \
-             signed with; only the accord's holders re-bind a seat (CC 3.4.7)",
+            "{REBIND_FAMILY}: {} is not a holder of the genesis bundle the re-bind names, at the \
+             key it signed with; only the accord's holders re-bind a seat (CC 3.4.7)",
             row.iss
         )));
+    }
+    // v62.0.0 (KR-fix2 rev 8) — each holder of the named bundle is a party
+    // whose voice this row may wait for: declared as a read (as a counted
+    // grant from the root declares them), so the row is indexed under every
+    // holder's key and `held_rows_for(holder, "root_holder")` finds it
+    // ([`rebind_voice_parties`]). A monotone trigger on this FINAL plane
+    // (`fold::enforce_final_plane`): it only re-runs a held row.
+    for h in &named.holders {
+        super::fold::reads(super::fold::Dep::key(&h.identity_ref));
     }
     if transit_of(&row.payload).is_none() {
         return Err(Error::malformed_row(
@@ -199,11 +322,8 @@ where
         ));
     }
     let new = dir.put_edition2_statement(row).await?;
-    let voices = dir.edition2_voices(&row.row_id).await?;
-    let counted = counted_holders(in_force.holders(), &voices);
     Ok(
-        if counted.len() >= crate::federation::admission::accord_threshold(in_force.holders().len())
-        {
+        if counts(&in_force, named, dir.edition2_voices(&row.row_id).await?) {
             StatementOutcome::Row {
                 row_id: row.row_id,
                 new,
@@ -275,9 +395,9 @@ where
         let Some(over) = run.iter().find(|p| p.object_id == head.0) else {
             continue;
         };
-        if counted_holders(&over.holders, &voices).len()
-            < crate::federation::admission::accord_threshold(over.holders.len())
-        {
+        // Only voices dated before the next held bundle of the lineage
+        // count (KR-fix2 rev 3; the door's own filter).
+        if !counts(in_force, over, voices) {
             continue;
         }
         let Some(at) = payload.get_text("asserted_at").and_then(Value::as_u64) else {
