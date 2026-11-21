@@ -79,6 +79,8 @@ mod fold_gc8_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod rootless_mesh_invariants;
 // v62.0.0 (KB-fix4) — the host's acceptance of the bundle root (I2416–I2418).
+#[cfg(test)]
+mod baked_genesis_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod bundle_root_acceptance_invariants;
 // v62.0.0 (RL-fix11) — the parties to a row under the rootless serve rule:

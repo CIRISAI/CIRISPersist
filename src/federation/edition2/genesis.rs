@@ -1708,13 +1708,244 @@ pub fn check_seats_dialable(p: &GenesisPlacement) -> Result<(), Error> {
     Ok(())
 }
 
-/// v62.0.0 (CE-fix3) — **every genesis bundle this build BAKES**: `(name,
-/// bytes)`, the bytes a CDE array of the bundle's statements (its voices and
-/// every row it names, as bstr). **v62.0 bakes no edition-2 bundle** (a
-/// fresh v62.0 node is pre-genesis, C1-fix3), so this is empty and the bake
-/// gate runs only on fixtures until v62.1 adds the ceremony's bundle here.
-/// A bake anywhere else is refused by the from-disk witness (I2297).
-pub const BAKED_BUNDLES: &[(&str, &[u8])] = &[];
+/// v62.0.0 (CE-fix3; GB-fix1) — **every genesis bundle this build BAKES**:
+/// `(name, bytes)`, the bytes a CDE array of the bundle's statements (its
+/// voices and every row it names, as bstr), each statement BYTE-FOR-BYTE as
+/// the ceremony signed it (only the array framing is this build's). v62.0
+/// bakes the real HUMANITY_ACCORD genesis (minted 2026-11-21; package
+/// `ciris-genesis-2026-11-21-public`): bundle `cb9ada31…deb5`, version 1,
+/// holders A1/B1/C1, one serve seat `canonical-1`. Its eight statements, in
+/// put order, are [`BAKED_GENESIS_STATEMENTS`]. A fresh node imports it at
+/// open through the import door ([`import_baked_genesis`]). A bake anywhere
+/// else is refused by the from-disk witness (I2293).
+pub const BAKED_BUNDLES: &[(&str, &[u8])] = &[(
+    "humanity-accord-v1",
+    include_bytes!("baked/humanity-accord-genesis-v1.cbor"),
+)];
+
+/// v62.0.0 (GB-fix1) — the object id of the baked bundle (`terms.json`'s
+/// `bundle_object_id`): the anchor a fresh node imports it under.
+pub const BAKED_GENESIS_OBJECT_ID: &str =
+    "cb9ada31fbce34103a8b01acecc67bbb8cb0e96c1210bb83e40c5f34d8e6deb5";
+
+/// v62.0.0 (GB-fix1) — the baked bundle's statements in put order, by their
+/// file in the ceremony package and its SHA-256 (the package's `SHA256SUMS`):
+/// the three holders' key records, the seat's key record and its occurrence
+/// binding (the five rows the voices cite), then the three holders' voices.
+pub const BAKED_GENESIS_STATEMENTS: [(&str, &str); 8] = [
+    (
+        "holder-record-0.cose",
+        "77448a059b81a91256bc297e717d515b0b0e7b74089fbcae28d74dc059d6a284",
+    ),
+    (
+        "holder-record-1.cose",
+        "fa2515f80597460c912bdb6d2839d475c04c06c136dfbdecce416b2122754694",
+    ),
+    (
+        "holder-record-2.cose",
+        "7205dec0015cee38278d43b17e27ddf3a3048c68d5203116431396333ddae0c3",
+    ),
+    (
+        "seat-record-0.cose",
+        "19059c7ac7099a2b5e7095b68f0b5c56dafe718ae0a6d8bbe5fdadce5f6ea6b1",
+    ),
+    (
+        "seat-binding-0.cose",
+        "b98406f054d0264bba5a8f46bc49658a100be87027356109d4a87baed11804a8",
+    ),
+    (
+        "voice-0.cose",
+        "32d13cddfddb6723558732f48592ead1a23c9bd2d5f0a496f1debcdc2d73b616",
+    ),
+    (
+        "voice-1.cose",
+        "edf8cb41d7dc7898756e58361d3bf6e426ccf6bbbdf76c07aab928ef5839a169",
+    ),
+    (
+        "voice-2.cose",
+        "b116e0b2c7715211cc33f77a5f626ba527e61fd2645abb908996e8157c457815",
+    ),
+];
+
+/// v62.0.0 (GB-fix1) — the SHA-256 of the baked array itself
+/// (`baked/humanity-accord-genesis-v1.cbor`).
+pub const BAKED_GENESIS_ARRAY_SHA256: &str =
+    "4bd259f1d1df8513de210bca4bc1544f8fdcb548f4f964b33355412b8df50e95";
+
+/// v62.0.0 (GB-fix1) — a baked bundle's statements: the CDE array's bstr
+/// elements, as they are (no element is re-encoded). `None`: not an array of
+/// bstr.
+#[must_use]
+pub fn baked_statements(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let v = cde::decode(bytes).ok()?;
+    let a = v.as_array()?;
+    a.iter().map(|s| s.as_bytes().map(<[u8]>::to_vec)).collect()
+}
+
+/// v62.0.0 (GB-fix1) — **the anchor a production node imports the baked
+/// genesis under**: [`Anchor::ObjectId`] of [`BAKED_GENESIS_OBJECT_ID`], a
+/// CONSTANT of this source computed once from the ceremony package, never
+/// derived from the baked bytes at run time (a changed baked byte changes
+/// the bundle's object id, and the bundle is then void for this reader:
+/// Verify's `NotAnchored`). No environment variable or configuration
+/// reaches it.
+///
+/// # Panics
+/// Never: the constant is 64 hex (I2468 pins it).
+#[must_use]
+pub fn baked_genesis_anchor() -> Anchor {
+    let mut oid = [0u8; 32];
+    hex::decode_to_slice(BAKED_GENESIS_OBJECT_ID, &mut oid)
+        .expect("BAKED_GENESIS_OBJECT_ID is 64 hex");
+    Anchor::ObjectId(oid)
+}
+
+/// v62.0.0 (GB-fix1) — what an import of baked bundles did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BakedImport {
+    /// The node held no genesis bundle; the baked bundles were offered at the
+    /// import door and these object ids (hex) were placed.
+    Imported(Vec<String>),
+    /// The node already holds a genesis bundle (the baked one, a later one of
+    /// its lineage, or any other): nothing was offered and nothing changed.
+    AlreadyHeld,
+    /// This build bakes no bundle.
+    NoneBaked,
+}
+
+/// v62.0.0 (GB-fix1; CC 2.6.1.11, CC 5.3.4) — **a fresh node imports the
+/// baked genesis**: [`import_genesis_bundles`] of [`BAKED_BUNDLES`] under
+/// [`baked_genesis_anchor`]. Importing is not ACCEPTING: the node stays
+/// rootless until its own (or its owner's) acceptance edge names the root
+/// (`Engine::accept_root`; CC 3.2 T3).
+///
+/// # Errors
+/// As [`import_genesis_bundles`].
+pub async fn import_baked_genesis<F>(dir: &F) -> Result<BakedImport, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    import_genesis_bundles(dir, BAKED_BUNDLES, &baked_genesis_anchor()).await
+}
+
+/// v62.0.0 (GB-fix1) — **offer `bundles` (each a CDE array of statements) at
+/// THE import door** ([`put_genesis_bundle`]) under `anchor`, when `dir`
+/// holds no genesis bundle. Idempotent: a node holding any bundle (the same
+/// one on a reopen, a later bundle of its lineage, which holds the first as
+/// its `prev`, or another) offers nothing and changes nothing. The order of
+/// statements within a bundle is not significant to the door: voices and
+/// rows are told apart by their own bytes, rows are found by row id, and key
+/// records are admitted first.
+///
+/// # Errors
+/// `genesis_bundle_malformed` for bytes that are not an array of statements;
+/// the import door's refusal, unchanged (`genesis_bundle_not_anchored`, a
+/// named row's own token, `genesis_holder_custody`, ...), including a bundle
+/// the door kept without placing it; directory reads.
+pub async fn import_genesis_bundles<F>(
+    dir: &F,
+    bundles: &[(&str, &[u8])],
+    anchor: &Anchor,
+) -> Result<BakedImport, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if bundles.is_empty() {
+        return Ok(BakedImport::NoneBaked);
+    }
+    if genesis_in_force(dir).await?.held > 0 {
+        return Ok(BakedImport::AlreadyHeld);
+    }
+    let mut placed = Vec::new();
+    for (name, bytes) in bundles {
+        let statements = baked_statements(bytes).ok_or_else(|| {
+            refuse(
+                token::MALFORMED,
+                format!("baked bundle {name}: not a CDE array of statements"),
+            )
+        })?;
+        let admission = put_genesis_bundle(dir, &statements, Some(anchor)).await?;
+        if let Some(n) = admission.not_placed.first() {
+            return Err(error_of(n));
+        }
+        placed.extend(admission.placed.iter().map(|p| hex::encode(p.object_id)));
+    }
+    Ok(BakedImport::Imported(placed))
+}
+
+/// v62.0.0 (GB-fix1) — what the open leg did ([`import_baked_genesis_at_boot`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootImport {
+    /// As [`import_genesis_bundles`] answered.
+    Done(BakedImport),
+    /// Skipped: Verify's test-anchor mode is active (a test rig roots its
+    /// own ceremony).
+    TestAnchor,
+    /// The import door refused the baked bundle: its token. The node opens
+    /// ROOTLESS (a supported state: the mesh runs) and says so loudly.
+    Refused(String),
+}
+
+/// The refusal token of an import error: a malformed row's reason, else the
+/// error's kind.
+fn token_of(e: &Error) -> String {
+    match e {
+        Error::MalformedRow { reason, .. } => (*reason).to_string(),
+        other => other.kind().to_owned(),
+    }
+}
+
+/// v62.0.0 (GB-fix1) — **the open leg**: [`import_baked_genesis`] at a
+/// node's open, run by the Engine's production constructors and by the
+/// Python wheel's open alike (one function), after the migrations and
+/// before anything reads standing. Never boot-fatal and never silent: a
+/// refusal is logged at ERROR with its token and the node opens rootless.
+pub async fn import_baked_genesis_at_boot<F>(dir: &F) -> BootImport
+where
+    F: FederationDirectory + ?Sized,
+{
+    import_bundles_at_boot(dir, BAKED_BUNDLES, &baked_genesis_anchor()).await
+}
+
+/// [`import_baked_genesis_at_boot`] over given bundles (the witnesses' seam:
+/// a corrupted COPY is offered here; the baked bytes are never changed).
+pub(crate) async fn import_bundles_at_boot<F>(
+    dir: &F,
+    bundles: &[(&str, &[u8])],
+    anchor: &Anchor,
+) -> BootImport
+where
+    F: FederationDirectory + ?Sized,
+{
+    // (Never in lib unit tests: their witnesses run this leg itself.)
+    #[cfg(all(feature = "test-anchor", not(test)))]
+    if ciris_verify_core::test_anchor::test_anchor_active() {
+        return BootImport::TestAnchor;
+    }
+    match import_genesis_bundles(dir, bundles, anchor).await {
+        Ok(done) => {
+            if let BakedImport::Imported(ids) = &done {
+                tracing::info!(
+                    bundles = ?ids,
+                    "the baked genesis was imported at the import door (not accepted: the \
+                     node roots nothing until it accepts the root)"
+                );
+            }
+            BootImport::Done(done)
+        }
+        Err(e) => {
+            let token = token_of(&e);
+            tracing::error!(
+                posture = "pre_genesis",
+                token = %token,
+                error = %e,
+                "THE BAKED GENESIS WAS REFUSED at the import door ({token}); this node opens \
+                 holding no root (rootless: the mesh runs, nothing is rooted)"
+            );
+            BootImport::Refused(token)
+        }
+    }
+}
 
 /// v62.0.0 (CE-fix3) — **the bake gate**: a baked bundle (`bytes`, a CDE
 /// array of statements) reads Valid under its OWN object id
@@ -1731,21 +1962,12 @@ pub fn check_baked_bundle(
     bytes: &[u8],
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<GenesisPlacement>, Error> {
-    let statements: Vec<Vec<u8>> = cde::decode(bytes)
-        .ok()
-        .and_then(|v| {
-            v.as_array().map(|a| {
-                a.iter()
-                    .filter_map(|s| s.as_bytes().map(<[u8]>::to_vec))
-                    .collect()
-            })
-        })
-        .ok_or_else(|| {
-            refuse(
-                token::MALFORMED,
-                "baked bundle: not a CDE array of statements",
-            )
-        })?;
+    let statements: Vec<Vec<u8>> = baked_statements(bytes).ok_or_else(|| {
+        refuse(
+            token::MALFORMED,
+            "baked bundle: not a CDE array of statements",
+        )
+    })?;
     let oid = statements
         .iter()
         .find_map(|s| cose_parts(s).as_ref().and_then(voice_of).map(|(o, _)| o))

@@ -2,7 +2,15 @@
 //! is left of the earlier genesis module: the posture, and nothing that gives
 //! standing.**
 //!
-//! A v62.0 node carries no production genesis. The baked `ceg-genesis-bundle/1`
+//! v62.0.0 (GB-fix1): a v62.0 build BAKES the real `ceg-genesis-bundle/2`
+//! (HUMANITY_ACCORD v1, bundle `cb9ada31…deb5`, minted 2026-11-21) in
+//! [`edition2::genesis::BAKED_BUNDLES`](super::edition2::genesis::BAKED_BUNDLES),
+//! and a store holding no bundle imports it at open THROUGH THE IMPORT DOOR
+//! ([`edition2::genesis::import_baked_genesis`](super::edition2::genesis::import_baked_genesis)),
+//! like any other bundle; importing is not accepting (a node roots nothing
+//! until it, or its owner, accepts the root). Nothing below is a second path.
+//!
+//! The earlier production genesis is gone: the baked `ceg-genesis-bundle/1`
 //! (`canonical_seed.json`, the v4 amend), the baked A1/B1/C1 accord-holder
 //! records (`accord_holder_seed.json`), the boot seeds that installed them, the
 //! pinned-row exemptions and the id-squat reserve over the baked ids, the

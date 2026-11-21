@@ -613,8 +613,13 @@ impl Engine {
         // v61 — the open legs every open runs, the Python `Engine(...)`
         // included ([`Self::settle_at_open`]). Never boot-fatal.
         engine.settle_at_open().await;
+        // v62.0.0 (GB-fix1) — a fresh node imports the BAKED genesis through
+        // the import door (`Self::import_baked_genesis_at_boot`; never in lib
+        // unit tests, which root the test ceremony's bundle below).
+        #[cfg(not(test))]
+        let _ = engine.import_baked_genesis_at_boot().await;
         // v62.0.0 (JSON-cut slice C) — the genesis posture, read from the
-        // bundles held (never seeded). Never boot-fatal.
+        // bundles held. Never boot-fatal.
         engine.report_genesis_at_boot().await;
         // v62.0.0 (JSON-cut slice C) — lib unit tests only: root the test
         // ceremony's bundle/2 (`Self::install_test_genesis_at_boot`).
@@ -625,12 +630,11 @@ impl Engine {
 
     /// v31.0.0 (CIRISPersist#648) — **the pre-genesis constructor**.
     ///
-    /// v62.0.0 (JSON-cut slice C): every production constructor now boots
-    /// pre-genesis. There is no baked genesis to seed: a node roots nothing
-    /// until a `ceg-genesis-bundle/2` arrives at the import door (CC
-    /// 2.6.1.11, CC 5.3.4), and then roots it only under its anchor. In a
-    /// production build this constructor is exactly
-    /// [`with_signer`](Self::with_signer).
+    /// v62.0.0 (GB-fix1): every OTHER production constructor imports the
+    /// baked genesis at open ([`Self::import_baked_genesis`]: the real
+    /// HUMANITY_ACCORD bundle through the import door, on a store that holds
+    /// none). This one never does: it is "a fresh node" that holds no bundle
+    /// until one arrives at the import door (CC 2.6.1.11, CC 5.3.4).
     ///
     /// It stays, under its name, as the one constructor that NEVER installs a
     /// genesis, in any build: in lib unit tests the other constructors root
@@ -725,6 +729,47 @@ impl Engine {
             .unwrap_or_else(|e| panic!("test_ceremony_v2 install: {e}"));
     }
 
+    /// v62.0.0 (GB-fix1; CC 2.6.1.11, CC 5.3.4) — **import the genesis this
+    /// build bakes** ([`BAKED_BUNDLES`](crate::federation::edition2::genesis::BAKED_BUNDLES))
+    /// through the import door, under the baked object id as its anchor
+    /// ([`import_baked_genesis`](crate::federation::edition2::genesis::import_baked_genesis)):
+    /// only when this node holds no genesis bundle (idempotent on reopen; a
+    /// node holding a later bundle of the lineage, or any bundle, is left as
+    /// it is). Importing is not accepting: the node stays rootless until
+    /// [`Self::accept_root`] (its own edge, or its owner's,
+    /// [`Self::accept_root_draft`]).
+    ///
+    /// # Errors
+    /// The import door's refusal of the baked bytes, unchanged; directory
+    /// reads.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn import_baked_genesis(
+        &self,
+    ) -> Result<crate::federation::edition2::genesis::BakedImport, crate::federation::Error> {
+        crate::federation::edition2::genesis::import_baked_genesis(
+            self.federation_directory().as_ref(),
+        )
+        .await
+    }
+
+    /// v62.0.0 (GB-fix1) — the open leg of [`Self::import_baked_genesis`]
+    /// ([`import_baked_genesis_at_boot`](crate::federation::edition2::genesis::import_baked_genesis_at_boot),
+    /// the one the Python wheel's open runs too).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub(crate) async fn import_baked_genesis_at_boot(
+        &self,
+    ) -> crate::federation::edition2::genesis::BootImport {
+        crate::federation::edition2::genesis::import_baked_genesis_at_boot(
+            self.federation_directory().as_ref(),
+        )
+        .await
+    }
+
+    /// No backend: nothing to import into.
+    #[cfg(not(any(feature = "postgres", feature = "sqlite")))]
+    #[cfg_attr(test, allow(dead_code))]
+    async fn import_baked_genesis_at_boot(&self) {}
+
     /// v62.0.0 (JSON-cut slice C) — **the boot's genesis read**: the bundles
     /// this node holds, read through Verify's bundle reader
     /// ([`genesis_in_force`](crate::federation::edition2::genesis::genesis_in_force)).
@@ -739,7 +784,20 @@ impl Engine {
             let dir = self.federation_directory();
             let held = crate::federation::edition2::genesis::genesis_in_force(dir.as_ref()).await;
             match held {
-                Ok(state) if state.is_held() => {}
+                // v62.0.0 (GB-fix1) — what is in force, by object id (the
+                // baked genesis on a fresh node): held, and not yet accepted
+                // unless the node's own edge says so (`root_standing`).
+                Ok(state) if state.is_held() => tracing::info!(
+                    posture = "genesis_held",
+                    bundles = ?state
+                        .tips()
+                        .iter()
+                        .map(|t| hex::encode(t.object_id))
+                        .collect::<Vec<_>>(),
+                    family_key_id = ?state.family_key_id(),
+                    "GENESIS HELD: the bundle(s) in force; the node is rooted only once it \
+                     accepts the root"
+                ),
                 Ok(_) => tracing::warn!(
                     posture = "pre_genesis",
                     "PRE-GENESIS BOOT: this node holds no ceg-genesis-bundle/2. It roots \
@@ -950,8 +1008,13 @@ impl Engine {
         // v61 — the open legs every open runs, the Python `Engine(...)`
         // included ([`Self::settle_at_open`]). Never boot-fatal.
         engine.settle_at_open().await;
+        // v62.0.0 (GB-fix1) — a fresh node imports the BAKED genesis through
+        // the import door (`Self::import_baked_genesis_at_boot`; never in lib
+        // unit tests, which root the test ceremony's bundle below).
+        #[cfg(not(test))]
+        let _ = engine.import_baked_genesis_at_boot().await;
         // v62.0.0 (JSON-cut slice C) — the genesis posture, read from the
-        // bundles held (never seeded). Never boot-fatal.
+        // bundles held. Never boot-fatal.
         engine.report_genesis_at_boot().await;
         // v62.0.0 (JSON-cut slice C) — lib unit tests only: root the test
         // ceremony's bundle/2 (`Self::install_test_genesis_at_boot`).
@@ -1032,8 +1095,13 @@ impl Engine {
         // v61 — the open legs every open runs, the Python `Engine(...)`
         // included ([`Self::settle_at_open`]). Never boot-fatal.
         engine.settle_at_open().await;
+        // v62.0.0 (GB-fix1) — a fresh node imports the BAKED genesis through
+        // the import door (`Self::import_baked_genesis_at_boot`; never in lib
+        // unit tests, which root the test ceremony's bundle below).
+        #[cfg(not(test))]
+        let _ = engine.import_baked_genesis_at_boot().await;
         // v62.0.0 (JSON-cut slice C) — the genesis posture, read from the
-        // bundles held (never seeded). Never boot-fatal.
+        // bundles held. Never boot-fatal.
         engine.report_genesis_at_boot().await;
         // v62.0.0 (JSON-cut slice C) — lib unit tests only: root the test
         // ceremony's bundle/2 (`Self::install_test_genesis_at_boot`).
@@ -13563,8 +13631,9 @@ mod tests {
         assert!(engine.genesis_posture().await.entrenched());
     }
 
-    /// v62.0.0 (ruling: v62.0 carries NO compiled-in genesis bundle; v62.1
-    /// bakes the ceremony's) — **a fresh v62.0 engine is pre-genesis**, on
+    /// v62.0.0 (GB-fix1: v62.0 bakes the real genesis, imported at open by
+    /// every constructor but this one) — **a `with_signer_pre_genesis` engine
+    /// is pre-genesis**, on
     /// sqlite and postgres: it holds no bundle, so no serve node is seated,
     /// no identity-ref is canonical (ruling C), the canonical listing is
     /// empty, and the posture reads `pre_genesis`. The fresh node is
@@ -13572,8 +13641,8 @@ mod tests {
     /// exactly [`Engine::with_signer`] (in lib tests the other constructors
     /// install the test ceremony at boot). Replaces v13.4.0's
     /// `fresh_engine_auto_loads_2of3_canonical_server` (CIRISPersist#390),
-    /// which asserted the earlier baked-v4 auto-load; v62.1 re-adds that
-    /// witness against the baked ceremony bundle.
+    /// which asserted the earlier baked-v4 auto-load; the baked ceremony
+    /// bundle's import is `baked_genesis_invariants` (I2469, I2470).
     async fn assert_fresh_engine_is_pre_genesis(dsn: &str, tag: &str) {
         let engine = Engine::with_signer_pre_genesis(test_signer(), dsn)
             .await

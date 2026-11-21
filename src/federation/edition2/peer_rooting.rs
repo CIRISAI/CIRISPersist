@@ -525,6 +525,9 @@ fn missing_ids(missing: &[MissingKey]) -> Vec<String> {
             MissingKey::Voice { kid, .. } => identity_ref(kid),
             MissingKey::Record(r) => format!("record:{}", hex::encode(r)),
             MissingKey::Bundle(b) => format!("bundle:{}", hex::encode(b)),
+            // v62.0.0 (PIN-fix5b; CIRISVerify 23.4.1) — a composer's target row
+            // (a key-chain reading never yields it; named if one does).
+            MissingKey::Row(r) => format!("row:{}", hex::encode(r)),
             // `MissingKey` is non_exhaustive.
             other => format!("{other:?}"),
         })

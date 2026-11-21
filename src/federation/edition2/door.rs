@@ -189,13 +189,37 @@ fn waiting(missing: &[MissingKey]) -> Error {
                 ciris_verify_core::edition2::genesis::GENESIS_BUNDLE_TYP,
                 hex::encode(b)
             ),
-            // v62.0.0 (PIN-fix2; CIRISVerify 23.4.1) — a composer whose target
-            // row is not held: the row it waits on, by id.
+            // A composer's unheld target never reaches here from the row
+            // door ([`waiting_at`] holds it as a target wait); named by id if
+            // another caller passes one.
             MissingKey::Row(r) => format!("row:{}", hex::encode(r)),
             other => format!("{other:?}"),
         })
         .unwrap_or_else(|| "<unnamed key>".to_owned());
     Error::unknown_signer(&named, PLANE)
+}
+
+/// v62.0.0 (PIN-fix5b; CIRISVerify 23.4.1) — **the row door's wait**: a
+/// `withdraws` / `recants` whose TARGET row is not held (Verify's
+/// `MissingKey::Row`) waits on that row, not on a key. It is HELD with the
+/// target-unheld reason (`link_unheld`, `federation_withdraws_target_unheld`,
+/// the same wait `ingest::check_composer_target` and the dimension gate give
+/// it), declares the target row as its read so the target's landing re-folds
+/// it, and names the row. Any other missing link is [`waiting`]'s retryable
+/// unknown-signer error.
+fn waiting_at(bytes: &[u8], missing: &[MissingKey]) -> Error {
+    if let Some(MissingKey::Row(r)) = missing.iter().find(|m| matches!(m, MissingKey::Row(_))) {
+        super::fold::reads(super::fold::Dep::Row(RowId(*r)));
+        return super::fold::hold(
+            super::fold::reason::LINK_UNHELD,
+            Error::WithdrawsTargetUnheld {
+                attestation_id: RowId::of_statement(bytes)
+                    .map_or_else(|| "<unread row>".to_owned(), |id| id.hex()),
+                target_attestation_id: hex::encode(r),
+            },
+        );
+    }
+    waiting(missing)
 }
 
 /// The refusal of a key that is not a key of the statement's `iss`.
@@ -475,7 +499,7 @@ pub fn admit_row(
                 Verdict::Invalid(i) => {
                     return Err(refuse(token::STATEMENT_INVALID, invalid_label(&i)));
                 }
-                Verdict::Waiting { missing } => return Err(waiting(&missing)),
+                Verdict::Waiting { missing } => return Err(waiting_at(bytes, &missing)),
             }
         }
         // v62.0.0 (R1; CIRISVerify 23.3.1, CC 4.4.3.12 "two consents") —
@@ -512,7 +536,7 @@ pub fn admit_row(
                 Verdict::Invalid(i) => {
                     return Err(refuse(token::STATEMENT_INVALID, invalid_label(&i)));
                 }
-                Verdict::Waiting { missing } => return Err(waiting(&missing)),
+                Verdict::Waiting { missing } => return Err(waiting_at(bytes, &missing)),
             }
         }
         // v62.0.0 (SL-fix3c; CC 4.4.3.12) — a floor family's act stated in
@@ -544,7 +568,27 @@ pub fn admit_row(
         FamilyVerdict::FamilyInvalid(f) => {
             return Err(refuse(token::FAMILY_INVALID, fault_label(&f)));
         }
-        FamilyVerdict::Waiting(missing) => return Err(waiting(&missing)),
+        // v62.0.0 (PIN-fix5b; CIRISVerify 23.4.1) — a `withdraws` / `recants`
+        // waiting ONLY on its TARGET row (`MissingKey::Row`: its leaf, and so
+        // its authorship, are the target's, which is not held). The statement
+        // itself must be Valid; it is admitted pending its target, and the
+        // put door's FIRST gate (`ingest::check_composer_target`, inside the
+        // fold attempt) holds it `link_unheld`, statement kept, reading the
+        // target row: when the target lands the row re-folds and is admitted
+        // again WITH its target (`SelectContext.target`), Verify's full
+        // verdict. Never a missing signer key.
+        FamilyVerdict::Waiting(missing)
+            if !missing.is_empty() && missing.iter().all(|m| matches!(m, MissingKey::Row(_))) =>
+        {
+            match verify_row_statement(bytes, keys) {
+                Verdict::Valid(row) => (row, None),
+                Verdict::Invalid(i) => {
+                    return Err(refuse(token::STATEMENT_INVALID, invalid_label(&i)));
+                }
+                Verdict::Waiting { missing } => return Err(waiting_at(bytes, &missing)),
+            }
+        }
+        FamilyVerdict::Waiting(missing) => return Err(waiting_at(bytes, &missing)),
     };
     // Step 3b: the key is of the identity it signs as. Verify's reader has
     // asked the same directory already (23.3.0); this is the same answer.

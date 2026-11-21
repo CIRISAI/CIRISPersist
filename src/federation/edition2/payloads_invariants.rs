@@ -2067,7 +2067,10 @@ fn i2926_a_composer_is_checked_by_the_composer_rule() {
     use super::payloads::check_by_id;
     use ciris_verify_core::namespace_match::family_id;
     let occ = family_id("identity:occurrence");
-    for kind in ["withdraws", "recants", "supersedes"] {
+    // v62.0.0 (PIN-fix5) — the composer rule is a retraction's
+    // (`withdraws` / `recants`); a `supersedes` takes its family's check
+    // (I2434).
+    for kind in ["withdraws", "recants"] {
         check_by_id(&occ, kind, &composer())
             .unwrap_or_else(|e| panic!("I2926 a {kind} of an occurrence passes: {e}"));
         // The target family's own member is not a composer's.
@@ -2118,7 +2121,7 @@ fn i2926_a_composer_is_checked_by_the_composer_rule() {
         family_id("group:roster"),
         occ.clone(),
     ] {
-        for kind in ["withdraws", "recants", "supersedes"] {
+        for kind in ["withdraws", "recants"] {
             check_by_id(&fam, kind, &counted).unwrap_or_else(|e| {
                 panic!("I2926 a counted {kind} (target + head, no author) of {fam} passes: {e}")
             });
@@ -2149,6 +2152,83 @@ fn i2926_a_composer_is_checked_by_the_composer_rule() {
         super::payloads::COMPOSER_ROW_TYPES,
         &super::ingest::COMPOSER_ROW_TYPES[..],
         "I2926 the door's composer types are ingest's"
+    );
+}
+
+/// I2434 (v62.0.0, PIN-fix5; the Constitution's ruling of 2026-11-21, CC
+/// 2.4.1; CIRISVerify 23.4.1) — a `supersedes` is a replacement statement:
+/// its FAMILY's payload check, with `refs.target` required and the `also`
+/// roles closed. A `supersedes` of an occurrence carrying the occurrence's
+/// own members passes; one carrying a member the family does not define, one
+/// naming no target, and one with an `also` role outside (ack | cites) are
+/// refused. (A family that differs from its target's is the door's HOLD,
+/// `composer_family_mismatch`, read from the target row: not this pure
+/// check.)
+#[test]
+fn i2434_a_supersedes_is_checked_by_its_family() {
+    use super::payloads::check_by_id;
+    use ciris_verify_core::namespace_match::family_id;
+    let occ = family_id("identity:occurrence");
+    let replacement = with(
+        &occurrence(),
+        vec![(
+            "refs",
+            refs(vec![
+                ("head", ref2(&[0x9e; 32])),
+                ("target", ref2(&[0xe0; 32])),
+            ]),
+        )],
+        &[],
+    );
+    check_by_id(&occ, "supersedes", &replacement)
+        .unwrap_or_else(|e| panic!("I2434 a supersedes with its family's own members passes: {e}"));
+    let e = check_by_id(
+        &occ,
+        "supersedes",
+        &with(&replacement, vec![("nonsense", ms(1))], &[]),
+    )
+    .unwrap_err();
+    assert_eq!(
+        reason(&e),
+        malformed_row::EDITION2_PAYLOAD_INVALID,
+        "I2434 a member the family does not define is refused"
+    );
+    let e = check_by_id(&occ, "supersedes", &occurrence()).unwrap_err();
+    assert_eq!(
+        reason(&e),
+        malformed_row::EDITION2_PAYLOAD_INVALID,
+        "I2434 a supersedes names the row it replaces (refs.target)"
+    );
+    assert!(
+        e.to_string().contains("refs.target is required"),
+        "I2434 named: {e}"
+    );
+    let e = check_by_id(
+        &occ,
+        "supersedes",
+        &with(
+            &replacement,
+            vec![(
+                "refs",
+                refs(vec![
+                    ("head", ref2(&[0x9e; 32])),
+                    ("target", ref2(&[0xe0; 32])),
+                    ("also", map(vec![("thread", ref_set(0xe2))])),
+                ]),
+            )],
+            &[],
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(
+        reason(&e),
+        malformed_row::EDITION2_PAYLOAD_INVALID,
+        "I2434 the also roles stay closed"
+    );
+    // The retraction rule still refuses the family's members on a withdraws.
+    assert!(
+        check_by_id(&occ, "withdraws", &replacement).is_err(),
+        "I2434 a withdraws carries common members only"
     );
 }
 

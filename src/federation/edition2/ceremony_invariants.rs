@@ -62,7 +62,9 @@
 //!   passes the fixture bundle encoded as a bake and refuses a bake whose
 //!   seat has no hint by Verify's name.
 //! - I2293 (pure, from disk): every bundle this build bakes
-//!   (`genesis::BAKED_BUNDLES`, empty in v62.0) passes the bake gate, and no
+//!   (`genesis::BAKED_BUNDLES`: the real genesis since GB-fix1) passes the
+//!   bake gate at a pinned instant, each is ONE include in the BAKED_BUNDLES
+//!   initializer (of a file under `edition2/baked/`), and no other
 //!   `include_bytes!` / `include_str!` in `src/` names a genesis file outside
 //!   `tests/vectors/`: a bake added anywhere but `BAKED_BUNDLES` fails the
 //!   build's test lane.
@@ -1389,7 +1391,10 @@ fn i2292_the_bake_gate_fails_an_undialable_seat_by_name() {
 #[test]
 fn i2293_every_bake_runs_the_gate() {
     for (name, bytes) in super::genesis::BAKED_BUNDLES {
-        super::genesis::check_baked_bundle(bytes, chrono::Utc::now())
+        // v62.0.0 (GB-fix1) — a pinned instant (an hour after the real
+        // genesis's t0), never the wall clock: the seat's record ends
+        // 2027-11-21 and a wall-clock gate would decay on that date.
+        super::genesis::check_baked_bundle(bytes, super::baked_genesis_invariants::pinned_at())
             .unwrap_or_else(|e| panic!("I2293: baked bundle {name}: {e:?}"));
     }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1398,8 +1403,12 @@ fn i2293_every_bake_runs_the_gate() {
         .unwrap()
         .to_owned();
     let needles = [concat!("include", "_bytes!"), concat!("include", "_str!")];
+    // v62.0.0 (GB-fix1) — the ONE sanctioned site: the `BAKED_BUNDLES`
+    // initializer in `edition2/genesis.rs` (the bake this gate runs on).
+    let sanctioned = std::path::Path::new("federation/edition2/genesis.rs");
     let mut stack = vec![root];
     let mut found = Vec::new();
+    let mut baked_here = 0usize;
     while let Some(dir) = stack.pop() {
         for e in std::fs::read_dir(&dir).unwrap() {
             let path = e.unwrap().path();
@@ -1411,9 +1420,27 @@ fn i2293_every_bake_runs_the_gate() {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
+            let is_sanctioned = path.ends_with(sanctioned);
+            let mut in_baked = false;
             for (n, line) in text.lines().enumerate() {
                 let code = line.trim_start();
                 if code.starts_with("//") {
+                    continue;
+                }
+                if is_sanctioned && code.starts_with("pub const BAKED_BUNDLES") {
+                    in_baked = true;
+                }
+                if in_baked {
+                    if needles.iter().any(|x| code.contains(x)) {
+                        assert!(
+                            code.contains("\"baked/"),
+                            "I2293: a baked bundle is vendored under edition2/baked/: {code}"
+                        );
+                        baked_here += 1;
+                    }
+                    if code.ends_with("];") {
+                        in_baked = false;
+                    }
                     continue;
                 }
                 let lower = code.to_ascii_lowercase();
@@ -1430,6 +1457,12 @@ fn i2293_every_bake_runs_the_gate() {
         found.is_empty(),
         "I2293: a genesis file is included outside tests/vectors/ and outside \
          genesis::BAKED_BUNDLES (bake it there, where the gate runs): {found:?}"
+    );
+    // v62.0.0 (GB-fix1) — and every entry of BAKED_BUNDLES is found there.
+    assert_eq!(
+        baked_here,
+        super::genesis::BAKED_BUNDLES.len(),
+        "I2293: each baked bundle is one include in the BAKED_BUNDLES initializer"
     );
 }
 

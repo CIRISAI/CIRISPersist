@@ -16,6 +16,11 @@
 //! - a withdrawal of a row NOT held: the gate does not run on nothing; the
 //!   composer waits (`federation_withdraws_target_unheld`, held `link_unheld`).
 //!
+//! **I2435** (PIN-fix5b): through the statement door, a withdrawal whose
+//! target is not held is HELD `link_unheld`, naming the target (never the
+//! missing-signer-key error Verify's `MissingKey::Row` used to be rendered
+//! as), and concludes once the target lands.
+//!
 //! [`composer_gate_dimension`]: super::attestation_admit::composer_gate_dimension
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -98,6 +103,59 @@ pub(crate) mod bodies {
             .expect_err("I2433 an unheld target is waited for");
         assert_eq!(e.kind(), "federation_withdraws_target_unheld", "I2433: {e}");
     }
+
+    /// I2435 (v62.0.0, PIN-fix5b; CIRISVerify 23.4.1 `MissingKey::Row`) — a
+    /// withdrawal whose TARGET is not held is HELD on the target (reason
+    /// `link_unheld`, naming the target row, statement kept), never refused
+    /// as a missing signer key; when the target lands, it re-folds and
+    /// concludes.
+    pub(crate) async fn i2435_body(d: &dyn FederationDirectory, s: &str) {
+        use crate::federation::edition2::fold::reason::LINK_UNHELD;
+        use crate::federation::edition2::ingest::StatementOutcome;
+        use crate::federation::edition2::names::RowId;
+        let seed = format!("i2435-{s}");
+        ts::register_hybrid_key_as(
+            d,
+            &seed,
+            &seed,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        let by = e2::kid(&seed);
+        let target = scores(&by, "evidence:safety_battery:capture:a3:c:v1");
+        let w = e2::composer_of(attestation_type::WITHDRAWS, &target, &seed);
+        let w_id = RowId::of_statement(&e2::carried_statement(&w).expect("a statement"))
+            .expect("a row id");
+        let out = e2::put_signed(d, &w).await;
+        assert!(
+            matches!(out, Ok(StatementOutcome::Pending { .. })),
+            "I2435 a withdrawal of an unheld target is HELD, not refused: {out:?}"
+        );
+        let held = d
+            .fold_held(&w_id)
+            .await
+            .expect("reads")
+            .expect("I2435 the withdrawal is held");
+        assert_eq!(held.reason, LINK_UNHELD, "I2435 the target-unheld reason");
+        assert!(
+            held.detail.contains(&e2::rid(&target)),
+            "I2435 the hold names the target row: {}",
+            held.detail
+        );
+        assert!(
+            !held.detail.contains("registered federation key"),
+            "I2435 never a missing signer key: {}",
+            held.detail
+        );
+        // The target lands: the withdrawal re-folds and concludes.
+        e2::put_signed(d, &target)
+            .await
+            .expect("I2435 the target lands");
+        assert!(
+            d.fold_held(&w_id).await.expect("reads").is_none(),
+            "I2435 the withdrawal concluded once its target arrived"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -115,6 +173,31 @@ mod runners {
             .unwrap();
         b.run_migrations().await.unwrap();
         super::bodies::i2433_body(&b, &suffix()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i2435_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::bodies::i2435_body(&b, &suffix()).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i2435_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::bodies::i2435_body(&b, &suffix()).await;
     }
 
     #[cfg(feature = "postgres")]

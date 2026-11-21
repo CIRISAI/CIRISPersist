@@ -59,19 +59,41 @@ use crate::verify::PythonJsonDumpsCanonicalizer;
 const POSTGRES_ONLY_MSG: &str = "this build has no postgres backend — build \
 ciris-persist with feature `pyo3` (not `pyo3-sqlite`) for postgres";
 
-/// v62.0.0 (JSON-cut slice D, with C2's boot) — the wheel boots
-/// **pre-genesis**, as `Engine::with_signer` does: no baked JSON genesis is
-/// seeded and nothing is rooted until a `ceg-genesis-bundle/2` arrives at the
-/// import door. At boot it only reports the posture: when no bundle Verify
-/// reads Valid is held (or the held bundles cannot be read), it logs the
-/// `pre_genesis` banner. Never fatal.
+/// v62.0.0 (JSON-cut slice D, with C2's boot; GB-fix1) — the wheel's open
+/// reports the genesis posture after [`import_baked_genesis_at_open`]: the
+/// bundle(s) in force (`genesis_held`), or, when no bundle Verify reads Valid
+/// is held (or the held bundles cannot be read), the `pre_genesis` banner.
+/// Never fatal.
+/// v62.0.0 (GB-fix1) — the wheel's open imports the baked genesis on a store
+/// that holds no bundle: the Engine's open leg, the ONE function
+/// (`edition2::genesis::import_baked_genesis_at_boot`). Importing is not
+/// accepting: nothing is rooted until the node accepts the root.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn import_baked_genesis_at_open<F>(dir: &F)
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    let _ = crate::federation::edition2::genesis::import_baked_genesis_at_boot(dir).await;
+}
+
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 async fn report_genesis_at_boot<F>(dir: &F)
 where
     F: crate::federation::FederationDirectory + ?Sized,
 {
     match crate::federation::edition2::genesis::genesis_in_force(dir).await {
-        Ok(state) if state.is_held() => {}
+        // v62.0.0 (GB-fix1) — what is in force (the baked genesis on a fresh
+        // store): held, not accepted.
+        Ok(state) if state.is_held() => tracing::info!(
+            posture = "genesis_held",
+            bundles = ?state
+                .tips()
+                .iter()
+                .map(|t| hex::encode(t.object_id))
+                .collect::<Vec<_>>(),
+            "GENESIS HELD: the bundle(s) in force; the node is rooted only once it accepts the \
+             root"
+        ),
         Ok(_) => tracing::warn!(
             posture = "pre_genesis",
             "PRE-GENESIS BOOT: this node holds no ceg-genesis-bundle/2. It roots nothing until \
@@ -1852,6 +1874,7 @@ impl PyEngine {
                                 .map_err(|e| PyRuntimeError::new_err(format!("migrations: {e}")))?;
                             // v62.0.0 (JSON-cut slice D, with C2's boot) — boot
                             // pre-genesis: no bundle/1 seed; report the posture.
+                            import_baked_genesis_at_open(&pg).await;
                             report_genesis_at_boot(&pg).await;
                             Ok::<_, PyErr>(Arc::new(pg))
                         })
@@ -1907,6 +1930,7 @@ impl PyEngine {
                                 .map_err(|e| PyRuntimeError::new_err(format!("migrations: {e}")))?;
                             // v62.0.0 (JSON-cut slice D, with C2's boot) — boot
                             // pre-genesis: no bundle/1 seed; report the posture.
+                            import_baked_genesis_at_open(&sq).await;
                             report_genesis_at_boot(&sq).await;
                             Ok::<_, PyErr>(Arc::new(sq))
                         })

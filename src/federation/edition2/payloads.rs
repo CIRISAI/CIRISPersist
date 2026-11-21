@@ -1386,6 +1386,10 @@ pub const COMPOSER_ROW_TYPES: &[&str] = &["withdraws", "recants", "supersedes"];
 /// it composes), the `also` roles closed. Whatever the target family's list
 /// says, a composer carries none of that family's members.
 ///
+/// v62.0.0 (PIN-fix5) — for a `withdraws` / `recants` only
+/// (`emit::carries_no_dimension`); a `supersedes` takes its family's check
+/// ([`check_by_id`]).
+///
 /// # Errors
 /// `edition2_payload_invalid`, naming the member.
 pub fn check_composer(row_type: &str, payload: &Value) -> Result<(), Error> {
@@ -1422,8 +1426,22 @@ pub fn check_by_id(family_id: &str, row_type: &str, payload: &Value) -> Result<(
     // v62.0.0 (wave P1e; CC ruling) — every decimal in the payload is
     // normalised, on every family and every row type.
     check_body_numbers(payload)?;
-    if COMPOSER_ROW_TYPES.contains(&row_type) {
+    // v62.0.0 (PIN-fix5; the Constitution's ruling of 2026-11-21, CC 2.4.1;
+    // CIRISVerify 23.4.1) — ONE predicate decides the path,
+    // `emit::carries_no_dimension` (Verify's `is_composer`): a `withdraws` /
+    // `recants` states its common members only ([`check_composer`]). A
+    // `supersedes` is a REPLACEMENT statement carrying its own full payload:
+    // it takes its FAMILY's check below (members, leaves, closed values, the
+    // `also` roles closed), and still names the row it replaces
+    // (`refs.target` REQUIRED). Its family must be its target's: that is
+    // read from another row, so it is the door's hold
+    // (`ingest::check_composer_target`, `composer_family_mismatch`), not
+    // here.
+    if super::emit::carries_no_dimension(row_type) {
         return check_composer(row_type, payload);
+    }
+    if COMPOSER_ROW_TYPES.contains(&row_type) {
+        require_target(row_type, payload)?;
     }
     match family_by_id(family_id) {
         Some(f) => check(f.family, payload),
@@ -1454,6 +1472,20 @@ pub fn check_by_id(family_id: &str, row_type: &str, payload: &Value) -> Result<(
             }
             Ok(())
         }
+    }
+}
+
+/// v62.0.0 (PIN-fix5) — a row that replaces another (`supersedes`) names it
+/// by `refs.target`: refused `edition2_payload_invalid` without one.
+fn require_target(row_type: &str, payload: &Value) -> Result<(), Error> {
+    let names: Vec<Name> =
+        names_of(payload).map_err(|e| refuse(format!("{row_type}: refs: {e:?}")))?;
+    if names.iter().any(|n| n.role == "target") {
+        Ok(())
+    } else {
+        Err(refuse(format!(
+            "{row_type}: refs.target is required: the row it replaces"
+        )))
     }
 }
 

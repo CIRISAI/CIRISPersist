@@ -413,6 +413,8 @@ fn missing_label(missing: &[MissingKey]) -> String {
             format!("waiting{COLON}voice{COLON}{}", hex::encode(kid))
         }
         Some(MissingKey::Bundle(b)) => format!("waiting{COLON}bundle{COLON}{}", hex::encode(b)),
+        // v62.0.0 (PIN-fix5b; CIRISVerify 23.4.1) — a composer's target row.
+        Some(MissingKey::Row(r)) => format!("waiting{COLON}row{COLON}{}", hex::encode(r)),
         other => format!("{other:?}"),
     }
 }
