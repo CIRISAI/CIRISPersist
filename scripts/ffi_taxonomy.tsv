@@ -569,7 +569,6 @@ Engine	durability_deficit_json	epistemic
 Engine	put_custody_ack	testimonial	self_audit
 Engine	read_stream_chunk_as	deontic	
 Engine	rebind_key_record	deontic	
-Engine	rebind_self_federation_key	deontic	
 Engine	rebuild_signed_wire_index	testimonial	upstream_attestation
 Engine	receive_and_persist	testimonial	upstream_attestation
 Engine	register_consumer	structural	

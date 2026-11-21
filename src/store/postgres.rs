@@ -11623,7 +11623,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     async fn list_accord_proposals_by_payload(
         &self,
         payload_sha256: &str,
-    ) -> Result<Vec<ciris_verify_core::accord_live_quorum::AccordProposal>, crate::federation::Error>
+    ) -> Result<Vec<crate::federation::accord_quorum::AccordProposal>, crate::federation::Error>
     {
         let client = self
             .get_client()
@@ -18919,8 +18919,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
             let received_at: chrono::DateTime<chrono::Utc> =
                 row.safe_get_with("received_at", crate::federation::BlobError::Backend)?;
             let chunk_root = crate::federation::stream_sth::root_hash_from_bytes(&root_vec)?;
-            let signature =
-                crate::federation::stream_receipt::deserialize_receipt_signature(&signature_blob)?;
+            let composite_signature =
+                crate::federation::stream_receipt::stored_receipt_composite(signature_blob)?;
             let receipt = crate::federation::stream_receipt::DeliveryReceipt {
                 stream_id: stream_id.to_string(),
                 subscriber_key_id,
@@ -18935,7 +18935,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     )
                 })?,
                 chunk_root,
-                signature,
+                composite_signature,
             };
             out.push(crate::federation::stream_receipt::StoredDeliveryReceipt {
                 receipt,

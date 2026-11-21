@@ -1217,6 +1217,9 @@ LONE_VERIFY = re.compile(
     # `RetiredMemberPairSignature`, serde-identical stand-ins)
     r"|\b(?:TransportBindingSignature|ThresholdSignature|LocalSelfSigner|SelfSigner|"
     r"HybridSigningIdentity|produce_signed_identity_occurrence)\b"
+    # v62.0.0 (VA-pair-signing) — the producer side: a separate-pair signer
+    # and the lone ML-DSA-65 signer (a peer verifies ONE composite)
+    r"|\b(?:sign_hybrid|sign_ml_dsa_65)\b"
     r"|\bHybridPolicy\s*::\s*[A-Za-z_]\w*"
     r"|\.verify_strict\s*\("
     r"|\bed25519_dalek::Verifier\b"
@@ -1810,6 +1813,12 @@ def _self_test() -> int:
         ("Verify's pair producer named in production is red (BH-fix3)",
          {"src/federation/w.rs": "pub async fn p() { let _ = produce_signed_identity_occurrence(&s, e).await; }\n"},
          "a standalone component verify (`produce_signed_identity_occurrence"),
+        ("a separate-pair signer in production is red (VA-pair-signing)",
+         {"src/federation/w.rs": "pub async fn s(l: &L, m: &[u8]) { let _ = l.sign_hybrid(m).await; }\n"},
+         "a standalone component verify (`sign_hybrid"),
+        ("a lone ML-DSA-65 signer in production is red (VA-pair-signing)",
+         {"src/federation/w.rs": "pub async fn sign_ml_dsa_65(m: &[u8]) -> Vec<u8> { m.to_vec() }\n"},
+         "a standalone component verify (`sign_ml_dsa_65"),
         ("the local stand-in is not Verify's type (BH-fix3)",
          {"src/federation/w.rs": "pub struct S { pub q: Vec<RetiredMemberPairSignature>, pub s: RetiredPairSignature }\n"},
          None),

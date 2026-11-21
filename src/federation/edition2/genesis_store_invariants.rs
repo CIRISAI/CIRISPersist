@@ -1049,7 +1049,8 @@ mod real_custody {
         TestCeremonyV2,
     };
     use super::super::fixture_genesis_custody::{
-        HOLDER_CHAINS_HEX, SERIAL_BASE, SERIAL_CHAINS_HEX, SHARED_SERIAL_CHAIN_HEX,
+        HOLDER_CHAINS_HEX, MALFORMED_SERIAL_CHAIN_HEX, SERIAL_BASE, SERIAL_CHAINS_HEX,
+        SHARED_SERIAL_CHAIN_HEX,
     };
     use super::super::fixture_genesis_real_custody::{
         RealHolder, GENESIS_2_SHA256, REAL_CHAIN_HEX, REAL_CHAIN_SHA256, REAL_HOLDERS,
@@ -1558,6 +1559,58 @@ mod real_custody {
         assert_eq!(yubikey_serial(&[]), None);
     }
 
+    /// **I2172** (VA-custody; CIRISVerify 23.3.3) — a leaf whose serial
+    /// extension is no DER INTEGER is refused by the judge, not read as "no
+    /// serial": Verify's `CustodyError::SerialMalformed` ("the 9c serial
+    /// extension is not a DER INTEGER fitting u32"). Compared by the error's
+    /// text, so it COMPILES on 23.3.2 too, where the leaf verifies (serial
+    /// `None`): ignored until VA-repin, which deletes the `#[ignore]`.
+    #[test]
+    #[ignore = "VA-repin: green on CIRISVerify 23.3.3 only (custody_serial_malformed); the re-pin deletes this ignore"]
+    fn i2172_a_malformed_serial_extension_is_refused_by_the_judge() {
+        let chain: Vec<Vec<u8>> = MALFORMED_SERIAL_CHAIN_HEX.iter().map(|h| der(h)).collect();
+        // Holder 1's Ed25519 half: seed [101; 32] (the generator's `ed_pub(1)`).
+        let ed = {
+            use ciris_crypto::ClassicalSigner as _;
+            ciris_crypto::Ed25519Signer::from_seed(&[101; 32])
+                .expect("I2172: an Ed25519 seed")
+                .public_key()
+                .expect("I2172: the public key")
+        };
+        let e = verify(&chain[0], &chain[1..], &mock_attestation_root_der(), &ed)
+            .expect_err("I2172: a malformed serial extension is refused");
+        assert!(
+            e.to_string()
+                .contains("serial extension is not a DER INTEGER"),
+            "I2172: refused as a malformed serial, by name: {e}"
+        );
+        // The persist reader names no device from it (never a serial).
+        assert_eq!(yubikey_serial(&chain[0]), None, "I2172: no serial read");
+    }
+
+    /// **I2173** (VA-custody; sqlite, postgres; CIRISVerify 23.3.3) —
+    /// through `put_genesis_bundle`, a first bundle whose holder 1 carries the
+    /// malformed-serial chain is refused `genesis_holder_custody` /
+    /// `custody_serial_malformed` and nothing is stored. Ignored until
+    /// VA-repin (on 23.3.2 the bundle is placed).
+    pub(super) async fn body_malformed_serial(d: &dyn FederationDirectory) {
+        add_test_attestation_root(mock_attestation_root_der());
+        let spec = CeremonySpec::standard();
+        let chain: Vec<Vec<u8>> = MALFORMED_SERIAL_CHAIN_HEX.iter().map(|h| der(h)).collect();
+        let t = with_holder1(&spec, bstrs(&chain));
+        let e = offer(d, &t).await;
+        assert_eq!(
+            reason(&e),
+            malformed_row::GENESIS_HOLDER_CUSTODY,
+            "I2173: {e:?}"
+        );
+        assert!(
+            message(&e).starts_with("custody_serial_malformed"),
+            "I2173: refused by name: {e:?}"
+        );
+        still_pre_genesis(d, &t, "malformed serial").await;
+    }
+
     fn holder(seed: u8, mldsa: u8, ed: u8, chain: Vec<Vec<u8>>) -> HolderOverride {
         HolderOverride {
             seed,
@@ -1623,6 +1676,24 @@ mod real_custody {
 async fn i2395_sqlite() {
     let d = sqlite().await;
     Box::pin(real_custody::body_one_device(&d)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+#[ignore = "VA-repin: green on CIRISVerify 23.3.3 only (custody_serial_malformed); the re-pin deletes this ignore"]
+async fn i2173_sqlite() {
+    let d = sqlite().await;
+    Box::pin(real_custody::body_malformed_serial(&d)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+#[ignore = "VA-repin: green on CIRISVerify 23.3.3 only (custody_serial_malformed); the re-pin deletes this ignore"]
+async fn i2173_postgres() {
+    let Some(d) = postgres().await else {
+        return;
+    };
+    Box::pin(real_custody::body_malformed_serial(&d)).await;
 }
 
 #[cfg(feature = "postgres")]

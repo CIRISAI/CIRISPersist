@@ -10,11 +10,10 @@
 //!   bound.
 //! - **I2256** (opt-out) — the same, but R's own bind carries
 //!   `onion_relay: {opt_out: true}`: refused `opted_out`.
-//! - **I2257** (no contact representable, no stranger) — R owned by another
-//!   person (a contact of B, never of A's owner): refused
-//!   `relay_contact_grant_not_representable`; an unowned R sharing no root:
-//!   refused `no_consent_from_owner`; neither is a carrier, and the onion arm
-//!   gives nothing without a root.
+//! - **I2257** (no grant, no stranger) — R owned by another person with no
+//!   grant from A's owner: refused `no_grant_from_owner`; an unowned R
+//!   sharing no root: refused `no_grant_from_owner`; neither is a carrier,
+//!   and the onion arm gives nothing without a root.
 //! - **I2258** (seat arm) — R a seat of the bundle in force: eligible, arm
 //!   `seat`.
 //! - **I2259** (rooted, own-node, no shared root) — once A's node is ROOTED,
@@ -128,13 +127,13 @@ pub(crate) async fn body(d: &dyn FederationDirectory, node_seed: &str, tag: &str
     .await;
     let v = resolve_transit_eligibility(d, &a, &theirs).await.unwrap();
     assert!(
-        !v.eligible && v.refusal == Some(TransitRefusal::RelayContactGrantNotRepresentable),
-        "[{tag}] I2257: a node of another owner is no carrier until a contact grant exists: {v:?}"
+        !v.eligible && v.refusal == Some(TransitRefusal::NoGrantFromOwner),
+        "[{tag}] I2257: a node of another owner with no grant from A's owner: {v:?}"
     );
     let stranger = relay(d, &format!("rl4-stranger-{tag}-{run}"), None, 0x61, vec![]).await;
     let v = resolve_transit_eligibility(d, &a, &stranger).await.unwrap();
     assert!(
-        !v.eligible && v.refusal == Some(TransitRefusal::NoConsentFromOwner),
+        !v.eligible && v.refusal == Some(TransitRefusal::NoGrantFromOwner),
         "[{tag}] I2257: a stranger is not a carrier, and no root means no onion arm: {v:?}"
     );
 
@@ -171,6 +170,188 @@ pub(crate) async fn body(d: &dyn FederationDirectory, node_seed: &str, tag: &str
         v.eligible && v.arm == Some(TransitArm::OwnNode),
         "[{tag}] I2259: a rooted node uses its own node with no shared root: {v:?}"
     );
+}
+
+/// A live `consent:replication:v1` grant by `author` (a seed) naming `peer`
+/// (an identity-ref), any scope, at `at_s` (POSIX s, inside the author's
+/// key window from 0). Its stored row.
+async fn grant(
+    d: &dyn FederationDirectory,
+    author: &str,
+    peer: &str,
+    at_s: i64,
+) -> crate::federation::Attestation {
+    use crate::federation::grant_scope_invariants::bodies::row;
+    use crate::federation::types::attestation_type;
+    let at = chrono::DateTime::<chrono::Utc>::from_timestamp(at_s, 0).expect("an instant");
+    let r = row(
+        &uuid::Uuid::new_v4().to_string(),
+        author,
+        author,
+        author,
+        attestation_type::SCORES,
+        serde_json::json!({
+            "dimension": crate::federation::consent_peer_set::DIMENSION,
+            "payload": {"grants": "replication", "attestation_prefixes": ["rl5:"]},
+        }),
+        vec![peer.to_owned()],
+        at,
+    );
+    e2::put_signed(d, &r)
+        .await
+        .unwrap_or_else(|e| panic!("{author}'s grant naming {peer}: {e}"));
+    d.get_attestation(&r.attestation_id)
+        .await
+        .unwrap()
+        .expect("the grant is held")
+}
+
+/// `author` withdraws its grant `g`.
+async fn withdraw(d: &dyn FederationDirectory, author: &str, g: &crate::federation::Attestation) {
+    let w = e2::composer_of(
+        crate::federation::types::attestation_type::WITHDRAWS,
+        g,
+        author,
+    );
+    e2::put_signed(d, &w)
+        .await
+        .unwrap_or_else(|e| panic!("{author} withdraws its grant: {e}"));
+}
+
+/// **I2260–I2266** — the contact arm (RL-fix5; CC 5.4.6, the
+/// Constitution's ruling: `consent:replication:v1` IS the contact grant),
+/// on A's directory, with the two grants arriving in either order
+/// (`r_first`):
+///
+/// - I2260 one grant alone is not a contact (`no_grant_from_owner` /
+///   `no_reciprocal_grant`);
+/// - I2261 mutual grants plus R's relay offer: eligible, arm `contact`,
+///   each grant naming the OTHER side's OWNER (the node bound to it);
+/// - I2262 mutual grants but R opted out: `opted_out`;
+/// - I2263 a rooted A with no root shared with R still gets `contact`;
+/// - I2264 withdrawing either grant ends it, by the failed conjunct's name.
+pub(crate) async fn contact_body(
+    d: &dyn FederationDirectory,
+    node_seed: &str,
+    tag: &str,
+    r_first: bool,
+) {
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let owner_a = format!("rl5-owner-a-{tag}-{run}");
+    let owner_r = format!("rl5-owner-r-{tag}-{run}");
+    e2::put_key(d, &owner_a, &["user"]).await;
+    e2::put_key(d, &owner_r, &["user"]).await;
+    let a = e2::put_key(d, node_seed, &["node"]).await;
+    own_key(d, &owner_a, &a, node_seed).await;
+    let r = relay(
+        d,
+        &format!("rl5-relay-{tag}-{run}"),
+        Some(&owner_r),
+        0x91,
+        vec![],
+    )
+    .await;
+    let quiet = relay(
+        d,
+        &format!("rl5-quiet-{tag}-{run}"),
+        Some(&owner_r),
+        0xA1,
+        vec![("onion_relay", opt_out())],
+    )
+    .await;
+    let (ka, kr) = (e2::kid(&owner_a), e2::kid(&owner_r));
+    // I2260 — one side alone.
+    let (g_a, g_r) = if r_first {
+        let g_r = grant(d, &owner_r, &ka, 1_790_000_000).await;
+        let v = resolve_transit_eligibility(d, &a, &r).await.unwrap();
+        assert!(
+            !v.eligible && v.refusal == Some(TransitRefusal::NoGrantFromOwner),
+            "[{tag}] I2260: R's grant alone is not A's yes: {v:?}"
+        );
+        (grant(d, &owner_a, &kr, 1_790_000_100).await, g_r)
+    } else {
+        let g_a = grant(d, &owner_a, &kr, 1_790_000_000).await;
+        let v = resolve_transit_eligibility(d, &a, &r).await.unwrap();
+        assert!(
+            !v.eligible && v.refusal == Some(TransitRefusal::NoReciprocalGrant),
+            "[{tag}] I2260: A's grant alone is not a contact: {v:?}"
+        );
+        (g_a, grant(d, &owner_r, &ka, 1_790_000_100).await)
+    };
+    // I2261 — mutual, each naming the other side's owner.
+    let v = resolve_transit_eligibility(d, &a, &r).await.unwrap();
+    assert!(
+        v.eligible && v.arm == Some(TransitArm::Contact) && v.refusal.is_none(),
+        "[{tag}] I2261: mutual grants and R's offer make R a contact carrier: {v:?}"
+    );
+    // I2262 — mutual, but R opted out.
+    let v = resolve_transit_eligibility(d, &a, &quiet).await.unwrap();
+    assert!(
+        !v.eligible && v.refusal == Some(TransitRefusal::OptedOut),
+        "[{tag}] I2262: a contact that opted out carries nobody: {v:?}"
+    );
+    // I2263 — A rooted; R shares no root: still the contact arm.
+    super::fixture_trust_root::rooted_trust_root(
+        d,
+        &super::fixture_genesis::HOLDER_SEEDS,
+        "quorum:2/3",
+    )
+    .await;
+    let v = resolve_transit_eligibility(d, &a, &r).await.unwrap();
+    assert!(
+        v.eligible && v.arm == Some(TransitArm::Contact),
+        "[{tag}] I2263: a rooted node keeps the contact arm with no shared root: {v:?}"
+    );
+    // I2264 — a withdrawal ends it going forward.
+    if r_first {
+        withdraw(d, &owner_a, &g_a).await;
+        let v = resolve_transit_eligibility(d, &a, &r).await.unwrap();
+        assert!(
+            !v.eligible && v.refusal == Some(TransitRefusal::NoGrantFromOwner),
+            "[{tag}] I2264: A's owner withdrew its grant: {v:?}"
+        );
+    } else {
+        withdraw(d, &owner_r, &g_r).await;
+        let v = resolve_transit_eligibility(d, &a, &r).await.unwrap();
+        assert!(
+            !v.eligible && v.refusal == Some(TransitRefusal::NoReciprocalGrant),
+            "[{tag}] I2264: R's owner withdrew its grant: {v:?}"
+        );
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2260_to_i2264_contact_arm_sqlite() {
+    use crate::store::Backend as _;
+    for r_first in [false, true] {
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let node = "rl5-node-sqlite";
+        b.set_node_key_id(e2::kid(node));
+        Box::pin(contact_body(&b, node, "sqlite", r_first)).await;
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2260_to_i2264_contact_arm_postgres() {
+    use crate::store::Backend as _;
+    for r_first in [false, true] {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let node = "rl5-node-postgres";
+        b.set_node_key_id(e2::kid(node));
+        Box::pin(contact_body(&b, node, "postgres", r_first)).await;
+    }
 }
 
 #[cfg(feature = "sqlite")]

@@ -6101,40 +6101,6 @@ impl PyEngine {
         })
     }
 
-    /// v44.7.0 (CIRISPersist#864) — the SELF-HEAL door, see
-    /// `Engine::rebind_self_federation_key`: rebind THIS engine's own
-    /// registration (the row `register_self_federation_key` minted) so its
-    /// envelope binds its subject (#659), the claim copied from the stored
-    /// row. `identity_type` names the row the caller believes it holds; a
-    /// mismatch is `rebind_changes_record`. Returns `RebindOutcome` JSON.
-    fn rebind_self_federation_key(&self, py: Python<'_>, identity_type: &str) -> PyResult<String> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let backend = match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
-            };
-            let signer = self.signer.clone();
-            let local_signer = self.local_signer.clone();
-            let runtime = self.runtime.clone();
-            let identity_type = identity_type.to_owned();
-            let engine = shared_view(backend, signer, local_signer)?;
-            let outcome = py.detach(move || {
-                runtime.block_on(async move {
-                    engine
-                        .rebind_self_federation_key(&identity_type)
-                        .await
-                        .map_err(federation_err_to_py)
-                })
-            })?;
-            serde_json::to_string(&outcome).map_err(|e| {
-                PyValueError::new_err(format!("rebind_self_federation_key outcome encode: {e}"))
-            })
-        })
-    }
-
     /// v44.7.0 (CIRISPersist#864) — the registration claims `key_id` has
     /// REPLACED through a rebind, oldest first, as a JSON array of
     /// `KeyRegistrationHistoryRow`. Empty for a key never rebound.
@@ -11877,54 +11843,15 @@ impl PyEngine {
         // before it is decoded once the switch is on (inert until slice F).
         crate::federation::edition2::door::refuse_earlier_form("family")
             .map_err(federation_err_to_py)?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let value: serde_json::Value = serde_json::from_str(payload_json)
-                .map_err(|e| PyValueError::new_err(format!("family decode: {e}")))?;
-            let family: crate::federation::Family = serde_json::from_value(value.clone())
-                .map_err(|e| PyValueError::new_err(format!("family decode: {e}")))?;
-            let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) =
-                extract_authority_fields(&value);
-            // v21.0.0 (#502 E4 followup) — self-sign when unsigned (node
-            // authors its own family; local API, not the wire). See
-            // put_community_json.
-            let self_sign = authority_key_id.is_empty();
-            let signer = self.signer.clone();
-            let local_signer = self.local_signer.clone();
-            let backend = self.backend.clone();
-            py.detach(move || {
-                let backend = match &backend {
-                    #[cfg(feature = "postgres")]
-                    BackendDispatch::Postgres(b) => {
-                        crate::engine::BackendDispatch::Postgres(b.clone())
-                    }
-                    #[cfg(feature = "sqlite")]
-                    BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
-                };
-                let engine = shared_view(backend, signer, local_signer)?;
-                runtime.block_on(async move {
-                    if self_sign {
-                        engine
-                            .put_family_self_signed(family)
-                            .await
-                            .map_err(federation_err_to_py)
-                    } else {
-                        engine
-                            .federation_directory()
-                            .put_family(crate::federation::SignedFamily {
-                                family,
-                                authority_key_id,
-                                scrub_signature_classical,
-                                scrub_signature_pqc,
-                                supersede_proof: None,
-                                cosignatures: Vec::new(),
-                            })
-                            .await
-                            .map_err(federation_err_to_py)
-                    }
-                })
-            })
-        })
+        // v62.0.0 (VA-pair-signing) — the decode, the node's self-signed
+        // earlier-form record (`Engine::put_family_self_signed`, a separate
+        // Ed25519 + ML-DSA-65 pair) and the signed JSON door are DELETED: a
+        // family is an edition-2 `group:roster` statement through the
+        // statement door.
+        let _ = (py, payload_json);
+        Err(federation_err_to_py(
+            crate::federation::edition2::door::earlier_form_signature("family"),
+        ))
     }
 
     /// v10.4.0 (CIRISPersist#290) — admit a `Community` row, symmetric to
@@ -11949,76 +11876,15 @@ impl PyEngine {
         // before it is decoded once the switch is on (inert until slice F).
         crate::federation::edition2::door::refuse_earlier_form("community")
             .map_err(federation_err_to_py)?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let value: serde_json::Value = serde_json::from_str(payload_json)
-                .map_err(|e| PyValueError::new_err(format!("community decode: {e}")))?;
-            let community: crate::federation::Community = serde_json::from_value(value.clone())
-                .map_err(|e| PyValueError::new_err(format!("community decode: {e}")))?;
-            let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) =
-                extract_authority_fields(&value);
-            // v50.0.0 (CIRISPersist#926) — the co-signatures a trust-root row
-            // carries (a JSON list of `{authority_key_id,
-            // scrub_signature_classical, scrub_signature_pqc}` over the same
-            // signing envelope). Absent = none; malformed is refused, never
-            // read as none.
-            let cosignatures: Vec<crate::federation::RosterCosignature> =
-                match value.get("cosignatures") {
-                    None | Some(serde_json::Value::Null) => Vec::new(),
-                    Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
-                        PyValueError::new_err(format!("community cosignatures decode: {e}"))
-                    })?,
-                };
-            if authority_key_id.is_empty() && !cosignatures.is_empty() {
-                return Err(PyValueError::new_err(
-                    "community cosignatures need the authority signature they sit beside \
-                     (authority_key_id is empty)",
-                ));
-            }
-            // v21.0.0 (#502 E4 followup) — self-sign when the caller supplies
-            // no authority signature: this is the NODE creating a community it
-            // is the authority for (a local wheel API, not a wire path), so the
-            // node signs the record's canonical form with its own registered
-            // key. A pre-signed payload (authority_key_id present) is used
-            // as-is.
-            let self_sign = authority_key_id.is_empty();
-            let signer = self.signer.clone();
-            let local_signer = self.local_signer.clone();
-            let backend = self.backend.clone();
-            py.detach(move || {
-                let backend = match &backend {
-                    #[cfg(feature = "postgres")]
-                    BackendDispatch::Postgres(b) => {
-                        crate::engine::BackendDispatch::Postgres(b.clone())
-                    }
-                    #[cfg(feature = "sqlite")]
-                    BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
-                };
-                let engine = shared_view(backend, signer, local_signer)?;
-                runtime.block_on(async move {
-                    if self_sign {
-                        engine
-                            .put_community_self_signed(community)
-                            .await
-                            .map_err(federation_err_to_py)
-                    } else {
-                        engine
-                            .federation_directory()
-                            .put_community(crate::federation::SignedCommunity {
-                                community,
-                                authority_key_id,
-                                scrub_signature_classical,
-                                scrub_signature_pqc,
-                                supersede_proof: None,
-                                cosignatures,
-                                lineage: Vec::new(),
-                            })
-                            .await
-                            .map_err(federation_err_to_py)
-                    }
-                })
-            })
-        })
+        // v62.0.0 (VA-pair-signing) — the decode, the node's self-signed
+        // earlier-form record (`Engine::put_community_self_signed`, a separate
+        // Ed25519 + ML-DSA-65 pair) and the signed JSON door are DELETED: a
+        // community is an edition-2 `group:roster` statement through the
+        // statement door.
+        let _ = (py, payload_json);
+        Err(federation_err_to_py(
+            crate::federation::edition2::door::earlier_form_signature("community"),
+        ))
     }
 
     /// v51.0.0 (CIRISPersist#938) — the witness plane's view of a root this
@@ -32229,37 +32095,6 @@ fn derived_err_to_py(e: crate::derived::Error) -> PyErr {
     }
 }
 
-/// v21.0.0 (CIRISPersist#502 E4) — extract the additive `authority_key_id` /
-/// `scrub_signature_classical` / `scrub_signature_pqc` fields from a flat
-/// payload JSON `Value` (the SAME value also decoded into the bare
-/// `Family`/`Community`/etc. record — those types tolerate the extra fields,
-/// serde ignores unknown keys by default). Absent fields default to
-/// empty/`None`: an old/unsigned caller's payload decodes fine and is then
-/// rejected FAIL-CLOSED at `put_family`/`put_community` (empty
-/// authority_key_id never resolves; empty/absent signature never verifies) —
-/// never silently admitted.
-fn extract_authority_fields(value: &serde_json::Value) -> (String, String, Option<String>) {
-    let authority_key_id = value
-        .get("authority_key_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_owned();
-    let scrub_signature_classical = value
-        .get("scrub_signature_classical")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_owned();
-    let scrub_signature_pqc = value
-        .get("scrub_signature_pqc")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
-    (
-        authority_key_id,
-        scrub_signature_classical,
-        scrub_signature_pqc,
-    )
-}
-
 /// #249 Cut G1 / CC 4.4.3.2.8 #308 — parse a cohort wire token
 /// (`"self"`/`"family"`/`"community"`/`"affiliations"`) for the uniform cohort
 /// FFI. `ValueError` for a non-rostered scope.
@@ -37973,10 +37808,6 @@ fn panic_count() -> u64 {
 fn install_panic_logger() -> bool {
     crate::debug::install_panic_logger()
 }
-
-/// v61 (CC 2.6.2) — I-IFP-10: the Python open settles stored instant forms.
-#[cfg(test)]
-mod instant_form_open_tests;
 
 /// v62.0.0 (CC 2.7) — I3607: a wait reaches Python as `Waiting`, keeping the
 /// type it had.

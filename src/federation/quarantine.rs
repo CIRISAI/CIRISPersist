@@ -2259,6 +2259,12 @@ pub(crate) mod test_support {
     ///   proof, read today, gives the verdict it gave when live) — a self-declared minor; an
     ///   assured-adult proof that lapsed BEFORE D's `asserted_at`: it lifts
     ///   nothing; D is held `minor_appointment_void`.
+    ///
+    /// MinorSuspend.tla (final, CIRISKernel PR #11) names: Inv_StoreFold —
+    /// I2034, I2035, I2055; Inv_NewestStands — I2040, I2041, I2044;
+    /// Inv_TieLowestIdWins — I2055; Inv_GraduationLeavesVoid — I2043, I2865;
+    /// Inv_HigherLevelOutranks — I2035; Inv_EqualLevelMinorWins — I2042.
+    ///
     /// - **I2034** (suspension by the subject's own row; MinorSuspend.tla
     ///   Inv_Fold, Inv_RetractedOut) — an assured adult,
     ///   D (counted), a later SELF-declared minor: the band lowers to minor
@@ -3007,7 +3013,8 @@ pub(crate) mod test_support {
             "({suffix}) I2045: the present-tense read agrees"
         );
 
-        // ── I2055 (K2-fix20; CC 3.5.1 rule 3): one witness, two age rows
+        // ── I2055 (K2-fix20; CC 3.5.1 rule 3; MinorSuspend.tla
+        // Inv_TieLowestIdWins and Inv_StoreFold): one witness, two age rows
         // about one person at ONE instant: the lowest `attestation_id`
         // (the node-computed row id's lowercase hex) is the witness's current
         // row, whatever its band, in either arrival order. The ids are

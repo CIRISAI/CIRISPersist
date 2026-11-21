@@ -631,7 +631,7 @@ mod tests {
             let roster: std::collections::BTreeSet<String> =
                 (1..=n).map(|i| format!("d{i}")).collect();
             let r = p.resolve(&roster, "d1");
-            let sm = ciris_verify_core::accord_genesis::strict_majority;
+            let sm = crate::federation::admission::strict_majority;
             assert_eq!(r.enact, sm(n), "enact at {n}");
             assert_eq!(r.cancel, Some(sm(n - 1).max(1)), "cancel at {n}");
             assert_eq!(r.floor, Some(1), "floor at {n}");

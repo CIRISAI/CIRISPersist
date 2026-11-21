@@ -48,8 +48,11 @@ fn envelope(tag: &str) -> serde_json::Value {
 /// `bytes ‖ ed25519_sig`), from the signer's own deterministic component
 /// keys.
 fn proof_with_pairs(env: &serde_json::Value, signers: &[&str]) -> GroupSupersedeProof {
-    let bytes = ciris_verify_core::accord_genesis::accord_family_signing_bytes(env)
-        .expect("the change envelope canonicalizes");
+    // v62.0.0 (VA-steward-purge) — the change envelope's signing bytes are
+    // its JCS (CIRISVerify 23.3.2's `accord_family_signing_bytes` was
+    // `jcs::canonicalize`, removed in 23.3.3): the same bytes, as setup.
+    let bytes =
+        ciris_verify_core::jcs::canonicalize(env).expect("the change envelope canonicalizes");
     GroupSupersedeProof {
         prior_persist_row_hash: String::new(),
         change_envelope: env.clone(),

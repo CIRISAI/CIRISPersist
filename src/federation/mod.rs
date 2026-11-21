@@ -3544,7 +3544,7 @@ pub(crate) fn assert_change_envelope_matches(
 /// on the stated grounds that its *sole* caller
 /// (`Engine::emit_attestation_assemble`) carried the same gate and it would
 /// otherwise be dead code. v25.1.0 (CIRISPersist#582) added a SECOND caller —
-/// [`attestation_emit::assemble_and_put`] — and that one is **not** gated, so
+/// `attestation_emit::assemble_and_put` (deleted v62.0.0) — and that one is **not** gated, so
 /// from that release the crate stopped compiling with no backend feature at
 /// all: `cargo check`, and CI's `cargo nextest run --test
 /// wire_format_fixtures` default leg, both fail with "cannot find function
@@ -9079,7 +9079,7 @@ pub trait FederationDirectory: Send + Sync {
     ///    other group the same checks minus that pin (the group's protocol is
     ///    its own choice, CC 4.4.3.4.2): distinct member `key_id`s; the new
     ///    roster resolves to **distinct pubkeys** (one-seat, via verify's
-    ///    [`roster_from_envelope`](ciris_verify_core::accord_genesis::roster_from_envelope));
+    ///    [`roster_from_envelope`](group_membership_change::roster_from_envelope));
     ///    `family_key_id` unchanged; the new `consensus_protocol` a canonical
     ///    form; **anti-replay** `supersedes.prior_member_key_ids` equals the
     ///    actual prior roster.
@@ -9112,7 +9112,7 @@ pub trait FederationDirectory: Send + Sync {
     /// pin set for the active roster ∪ the new roster (resolved via
     /// [`Self::lookup_public_key`]); authorization is exactly as strong as it.
     /// [`Error::InvalidArgument`] on any failed check — a structural refusal
-    /// wraps the verify-side `AccordGenesisError`; an insufficient signer set
+    /// wraps persist's `group_membership_change::AccordGenesisError`; an insufficient signer set
     /// carries the evaluator's detail; an unevaluable protocol names the
     /// reason. The `self` cohort has no quorum.
     async fn verify_membership_quorum(
@@ -9121,7 +9121,6 @@ pub trait FederationDirectory: Send + Sync {
         group_key_id: &str,
         change_envelope: &serde_json::Value,
     ) -> Result<(), Error> {
-        use ciris_verify_core::accord_genesis as ag;
         use ciris_verify_core::threshold::ThresholdMember;
         let refuse = |detail: String| {
             Error::InvalidArgument(format!(
@@ -9249,11 +9248,12 @@ pub trait FederationDirectory: Send + Sync {
                     refuse(e.to_string()),
                 )
             })?;
-            ag::roster_from_envelope(change_envelope, &directory)
+            group_membership_change::roster_from_envelope(change_envelope, &directory)
                 .map_err(|e| held(unauthorized, refuse(e.to_string())))?
         } else {
-            let new_roster = ag::roster_from_envelope(change_envelope, &directory)
-                .map_err(|e| held(unauthorized, refuse(e.to_string())))?;
+            let new_roster =
+                group_membership_change::roster_from_envelope(change_envelope, &directory)
+                    .map_err(|e| held(unauthorized, refuse(e.to_string())))?;
             if change_envelope.get("family_key_id") != prior_envelope.get("family_key_id") {
                 return Err(held(
                     unauthorized,
@@ -9272,8 +9272,9 @@ pub trait FederationDirectory: Send + Sync {
             new_roster
         };
         // 2. One seat on the prior roster (verify's derivation).
-        let prior_roster = ag::roster_from_envelope(&prior_envelope, &directory)
-            .map_err(|e| held(unauthorized, refuse(e.to_string())))?;
+        let prior_roster =
+            group_membership_change::roster_from_envelope(&prior_envelope, &directory)
+                .map_err(|e| held(unauthorized, refuse(e.to_string())))?;
         if !prior_entrenched {
             // Anti-replay (verify's structural gate does this for the
             // entrenched arm): the change names the roster it supersedes.
@@ -11538,7 +11539,7 @@ pub trait FederationDirectory: Send + Sync {
     /// reads ONLY the cursor and never calls back into `get_accord_proposal`.
     ///
     /// That last property is the reason this returns the verify-core
-    /// [`AccordProposal`](ciris_verify_core::accord_live_quorum::AccordProposal)
+    /// [`AccordProposal`](accord_quorum::AccordProposal)
     /// rather than a `StoredProposal`. The caller needs the digest and nothing
     /// else, and the wider type forced the default to re-read each hit through
     /// a method the FFI capsule surfaces as `Unsupported` — a default that
@@ -11547,7 +11548,7 @@ pub trait FederationDirectory: Send + Sync {
     async fn list_accord_proposals_by_payload(
         &self,
         payload_sha256: &str,
-    ) -> Result<Vec<ciris_verify_core::accord_live_quorum::AccordProposal>, Error> {
+    ) -> Result<Vec<accord_quorum::AccordProposal>, Error> {
         Ok(self
             .list_signed_accord_quorum_evidence_since(None, u32::MAX)
             .await?
@@ -13562,7 +13563,7 @@ pub enum Error {
 
     /// v13.1.0 (CIRISPersist#377, FSD Trust Root m-of-n) — a canonical
     /// withdraw/supersede was REFUSED because its accord live-quorum authority
-    /// [`AccordDecision`](ciris_verify_core::accord_live_quorum::AccordDecision)
+    /// [`AccordDecision`](accord_quorum::AccordDecision)
     /// did not verify: either `authorized == false` (no m-of-n family quorum
     /// verdict) or its `proposal.payload_sha256` does not commit to the
     /// persist-computed canonical payload for THIS operation + target (a replay

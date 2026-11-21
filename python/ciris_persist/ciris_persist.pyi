@@ -1460,9 +1460,6 @@ class Engine:
     def rebind_key_record(self, signed_key_record_json: str) -> str:
         """(derived) deontic — v44.7.0 (CIRISPersist#864) — the local REBIND door, see Engine::rebind_key_record. signed_key_record_json is the holder's self-signed re-signing of..."""
 
-    def rebind_self_federation_key(self, identity_type: str) -> str:
-        """(derived) deontic — v44.7.0 (CIRISPersist#864) — the SELF-HEAL door, see Engine::rebind_self_federation_key: rebind THIS engine's own registration (the row register_se..."""
-
     def register_federation_key(
         self,
         signed_key_record_json: str,
@@ -1704,10 +1701,11 @@ class Engine:
         ``{"eligible": bool, "valid_until": ..., "via_root": ..., "arm": ...,
         "refusal": ...}``. v62.0.0 (RL-fix4): carriage by consent, no root
         needed for ``arm == "own_node"``; ``arm`` is ``"own_node"`` |
-        ``"seat"`` | ``"onion_root"`` (``"contact"`` reserved); ``refusal`` is
+        ``"seat"`` | ``"contact"`` (RL-fix5: mutual ``consent:replication:v1``
+        grants plus the relay's offer) | ``"onion_root"``; ``refusal`` is
         ``"self_hop"`` | ``"not_in_directory"`` | ``"not_a_node_key"`` |
-        ``"no_relay_offer"`` | ``"opted_out"`` | ``"no_consent_from_owner"`` |
-        ``"relay_contact_grant_not_representable"`` | ``"expired"`` |
+        ``"no_relay_offer"`` | ``"opted_out"`` | ``"no_grant_from_owner"`` |
+        ``"no_reciprocal_grant"`` | ``"expired"`` |
         ``"unreadable"``. It says nothing about federation-tier serving.
 
         **The refusal arm is a TRUTHY string.** ``'{"eligible": false}'`` is a

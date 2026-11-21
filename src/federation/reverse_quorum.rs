@@ -582,7 +582,7 @@ impl ReverseQuorumPolicy {
     /// node's OWN roster.
     #[must_use]
     pub fn dismissal_threshold(&self, roster_size: usize) -> usize {
-        let floor = ciris_verify_core::accord_genesis::strict_majority(roster_size);
+        let floor = crate::federation::admission::strict_majority(roster_size);
         (self.m as usize).max(floor).max(1)
     }
 
@@ -635,7 +635,7 @@ impl ReverseQuorumPolicy {
     /// in a commons.
     #[must_use]
     pub fn steward_ruling_threshold(&self, duty_holders: usize) -> usize {
-        ciris_verify_core::accord_genesis::strict_majority(duty_holders).max(1)
+        crate::federation::admission::strict_majority(duty_holders).max(1)
     }
 }
 
@@ -2302,7 +2302,7 @@ mod tests {
                 // The undo side is floored at a strict majority — a policy
                 // string can never talk it down.
                 assert!(
-                    dismissal >= ciris_verify_core::accord_genesis::strict_majority(roster).max(1),
+                    dismissal >= crate::federation::admission::strict_majority(roster).max(1),
                     "dismissal must never fall below a strict majority \
                      (roster={roster}, m={m}, dismissal={dismissal})"
                 );
@@ -2323,7 +2323,7 @@ mod tests {
     #[test]
     fn the_protective_side_is_never_floored_at_a_strict_majority() {
         let p = policy(2, 9, 3600);
-        let majority = ciris_verify_core::accord_genesis::strict_majority(9);
+        let majority = crate::federation::admission::strict_majority(9);
         assert_eq!(p.reversal_threshold(9), 2, "two means two");
         assert!(
             p.reversal_threshold(9) < majority,
@@ -2685,7 +2685,7 @@ mod tests {
                      needs {m} (respondents={respondents}, required={required})"
                 );
                 assert!(
-                    required >= ciris_verify_core::accord_genesis::strict_majority(respondents),
+                    required >= crate::federation::admission::strict_majority(respondents),
                     "…and never below a strict majority of those who answered"
                 );
                 // BOTH sides can never reach the threshold at once, so the
@@ -2740,7 +2740,7 @@ mod tests {
     #[test]
     fn an_empty_duty_holder_set_can_never_rule() {
         assert_eq!(
-            ciris_verify_core::accord_genesis::strict_majority(0),
+            crate::federation::admission::strict_majority(0),
             1,
             "the property this module relies on lives in verify — if a re-pin \
              ever makes this 0, `steward_ruling_threshold`'s clamp becomes the \

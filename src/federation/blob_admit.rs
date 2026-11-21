@@ -688,9 +688,8 @@ async fn store_receipt_checked<D: BlobFloorStore>(
         receipt: &receipt,
         k_i64,
         epoch_i64,
-        signature_blob: serde_json::to_vec(&receipt.signature).map_err(|e| {
-            BlobError::Backend(format!("delivery receipt signature serialize: {e}"))
-        })?,
+        // v62.0.0 (VA-pair-carriers) — the composite's raw bytes.
+        signature_blob: receipt.composite_signature.clone(),
         received_at: crate::host::clock::now(),
     };
     match dir.store_delivery_receipt(planned).await? {

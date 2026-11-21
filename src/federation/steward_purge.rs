@@ -1743,7 +1743,7 @@ where
 
 /// The authorisation: a `takedown_notice` envelope and its WHOLE cosignature
 /// set, each a hybrid signature over `JCS(envelope)`
-/// (`accord_family_signing_bytes`).
+/// ([`notice_signing_bytes`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StewardPurgeNotice {
     /// The signed envelope.
@@ -1771,13 +1771,18 @@ pub struct NoticeTerms {
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// The JCS bytes the cosigners sign (and the notice id hashes).
+/// The JCS bytes the cosigners sign (and the notice id hashes): RFC 8785
+/// over the envelope (`jcs::canonicalize`). v62.0.0 (VA-steward-purge) —
+/// CIRISVerify 23.3.3 removes `accord_genesis::accord_family_signing_bytes`
+/// with the pair producers; it was `jcs::canonicalize` itself (CIRISVerify v23.3.2
+/// `accord_genesis.rs` l.157–159), so the bytes, and every notice id, are
+/// unchanged.
 ///
 /// # Errors
 ///
 /// [`token::UNAUTHORISED`] when the envelope does not canonicalize.
 pub fn notice_signing_bytes(envelope: &serde_json::Value) -> Result<Vec<u8>, Error> {
-    ciris_verify_core::accord_genesis::accord_family_signing_bytes(envelope).map_err(|e| {
+    ciris_verify_core::jcs::canonicalize(envelope).map_err(|e| {
         unauthorised(
             None,
             unauthorised_reason::NOTICE_MALFORMED,
@@ -3960,4 +3965,34 @@ pub(crate) fn mock_trace_refusal(attestation_id: &str) -> Error {
                        refuses it (CC 3.1.5, CIRISConstitution#166)",
         }),
     )
+}
+
+/// v62.0.0 (VA-steward-purge) — the notice's signing bytes are RFC 8785
+/// JCS over its envelope (what CIRISVerify 23.3.2's
+/// `accord_family_signing_bytes` was), so every notice id is unchanged by
+/// the move onto `jcs::canonicalize`.
+#[cfg(test)]
+mod signing_bytes_tests {
+    /// I2174 — `notice_signing_bytes` is the envelope's JCS, and the notice
+    /// id its SHA-256: members sorted at every depth, no whitespace.
+    #[test]
+    fn i2174_notice_signing_bytes_are_the_envelopes_jcs() {
+        let env = serde_json::json!({
+            "selection_digest": "ab",
+            "basis": "steward_purge",
+            "claimant_key_id": "root",
+            "counts": {"z": 2, "a": 1},
+        });
+        let bytes = super::notice_signing_bytes(&env).expect("I2174: canonicalizes");
+        assert_eq!(
+            String::from_utf8(bytes.clone()).unwrap(),
+            r#"{"basis":"steward_purge","claimant_key_id":"root","counts":{"a":1,"z":2},"selection_digest":"ab"}"#,
+            "I2174: the JCS bytes"
+        );
+        assert_eq!(
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes)),
+            "52db530dfce446470958ec6c362f038f4edbe94228632470be99c981d4125dff",
+            "I2174: the notice id over them"
+        );
+    }
 }

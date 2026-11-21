@@ -214,7 +214,7 @@ where
             .map(|t| t.with_timezone(&chrono::Utc) <= now)
             .unwrap_or(false);
         if !decision.decision.authorized
-            || p.action != ciris_verify_core::accord_live_quorum::AccordAction::RosterChange
+            || p.action != super::accord_quorum::AccordAction::RosterChange
             || p.family_key_id != accord
             || p.prior_family_digest != held.persist_row_hash
             || !closed
@@ -274,7 +274,7 @@ where
             format!(
                 "yes-cosigns from fewer than a strict majority of the standing roster \
                  ({} of {})",
-                ciris_verify_core::accord_genesis::strict_majority(standing.len()),
+                crate::federation::admission::strict_majority(standing.len()),
                 standing.len()
             ),
         );

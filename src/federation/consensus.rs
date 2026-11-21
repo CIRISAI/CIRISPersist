@@ -448,11 +448,11 @@ fn evaluate_counted<'a>(b: &Ballot<'a>, elig: &[&'a Seat], got: &[&'a Seat]) -> 
         if b.direction == Direction::Remove && b.subject.is_some() {
             let voices = got.iter().filter(|s| !is_subject(b, s)).count();
             let others: Vec<&&Seat> = elig.iter().filter(|s| !is_subject(b, s)).collect();
-            return if voices == others.len() && 2 * voices > n {
+            return if voices == others.len() && super::admission::is_strict_majority(voices, n) {
                 Verdict::Admit
             } else {
                 // Every other member, and never fewer than a strict majority.
-                let need = others.len().max(n / 2 + 1);
+                let need = others.len().max(super::admission::strict_majority(n));
                 short(
                     format!(
                         "unanimous removal: {voices} of the {} other members signed, of \
@@ -477,7 +477,7 @@ fn evaluate_counted<'a>(b: &Ballot<'a>, elig: &[&'a Seat], got: &[&'a Seat]) -> 
         };
     }
     if p == cp::MAJORITY {
-        return if 2 * got.len() > n {
+        return if super::admission::is_strict_majority(got.len(), n) {
             Verdict::Admit
         } else {
             short(
@@ -486,7 +486,7 @@ fn evaluate_counted<'a>(b: &Ballot<'a>, elig: &[&'a Seat], got: &[&'a Seat]) -> 
                     got.len()
                 ),
                 got.len(),
-                n / 2 + 1,
+                super::admission::strict_majority(n),
                 elig,
             )
         };
@@ -810,7 +810,7 @@ pub fn required_signatures_at(
         return Some(roster_size.max(1));
     }
     if protocol == cp::MAJORITY {
-        return Some(roster_size / 2 + 1);
+        return Some(super::admission::strict_majority(roster_size));
     }
     if protocol.starts_with(cp::REVERSE_QUORUM_PREFIX) {
         return super::reverse_quorum::ReverseQuorumPolicy::parse(protocol)

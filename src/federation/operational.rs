@@ -1195,47 +1195,6 @@ pub mod test_support {
         Ok(())
     }
 
-    /// v47.3.0 (#901, I156) — register `key_id` as the YubiKey PIV member `m`
-    /// attests: its signed custody attestation as the evidence, and the
-    /// record's hybrid pubkeys either the member's own (`pubkeys_from = None`:
-    /// the chain names the record's key) or the deterministic test pair for
-    /// `pubkeys_from = Some(label)` (the chain names a key the record does
-    /// not carry — the shape Layer B exists to refuse; the door does not walk
-    /// the chain, so it admits this). A `NODE` row, through the local door.
-    // verify-core's `test_support` (the mock CA) exists only under ITS test cfg —
-    // never in a `test-anchor` build of persist.
-    #[cfg(test)]
-    pub async fn register_key_record_from_mock_member(
-        directory: &dyn crate::federation::FederationDirectory,
-        key_id: &str,
-        m: &ciris_verify_core::accord_custody_attestation::test_support::MockAttestedMember,
-        pubkeys_from: Option<&str>,
-    ) -> Result<(), crate::federation::Error> {
-        let evidence = serde_json::to_value(&m.attestation).map_err(|e| {
-            crate::federation::Error::Backend(format!("custody attestation to json: {e}"))
-        })?;
-        let mut rec = typed_key_record(
-            key_id,
-            crate::federation::types::identity_type::NODE,
-            Some(evidence),
-        );
-        match pubkeys_from {
-            None => {
-                rec.pubkey_ed25519_base64 = m.member.ed25519_public_key_base64.clone();
-                rec.pubkey_ml_dsa_65_base64 = m.member.mldsa65_public_key_base64.clone();
-            }
-            Some(label) => {
-                let (ed_pk, mldsa_pk) =
-                    crate::federation::tier_ingest::test_support::hybrid_pubkeys(label);
-                rec.pubkey_ed25519_base64 = ed_pk;
-                rec.pubkey_ml_dsa_65_base64 = mldsa_pk;
-            }
-        }
-        directory
-            .put_public_key(crate::federation::types::SignedKeyRecord { record: rec })
-            .await
-    }
-
     /// The established mock Android-StrongBox `attestation_evidence` value the
     /// #513 hardware-attestation gate accepts in test builds (shape + a fresh
     /// `nonce_captured_at`; the cert chain is not cryptographically walked

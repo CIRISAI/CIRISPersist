@@ -16560,14 +16560,35 @@ where
 ///
 /// The ONE spelling of the rule. The co-scrub core
 /// ([`verify_accord_family_coscrub_typed`]), the destructive re-tally
-/// ([`verify_canonical_withdraw_authority`]) and the replicated-evidence
+/// (`verify_withdrawal_authority_over_roster`) and the replicated-evidence
 /// receive gate (`accord_carriage`) all count through it, and a consumer's
 /// wire gate (CIRISEdge's `verify_accord_carrier`) calls it instead of
 /// restating the rule as a constant. An empty roster answers `1`, which no
 /// signature set over an empty roster can meet: fail-closed.
 #[must_use]
 pub const fn accord_threshold(roster_size: usize) -> usize {
-    roster_size / 2 + 1
+    strict_majority(roster_size)
+}
+
+/// v62.0.0 (VA-genesis-fns; Eric's rule) — **the strict majority of `n`**,
+/// `⌊n/2⌋ + 1` (3→2, 4→3, 5→3), with no minimum roster: the ONE arithmetic
+/// every majority count in persist routes to (the accord's
+/// [`accord_threshold`], a room's `majority` protocol, a reverse-quorum
+/// floor, a two-path threshold). The body is a one-line seam: VA-repin
+/// swaps it to `ciris_verify_core::edition2::strict_majority` (23.3.3) and
+/// nothing else changes.
+#[must_use]
+pub const fn strict_majority(n: usize) -> usize {
+    n / 2 + 1
+}
+
+/// v62.0.0 (VA-genesis-fns) — **is `yes` a strict majority of `n`**
+/// (`2·yes > n`, i.e. `yes ≥ ⌊n/2⌋ + 1`)? The predicate twin of
+/// [`strict_majority`]; seam to `ciris_verify_core::edition2::is_strict_majority`
+/// at VA-repin.
+#[must_use]
+pub const fn is_strict_majority(yes: usize, n: usize) -> bool {
+    yes > n / 2
 }
 
 /// v60.1.0 (CIRISPersist#1117; TR-fix1) — the accord threshold over THIS
@@ -16620,7 +16641,7 @@ where
 ///    their PINNED directory pubkeys ([`ThresholdMember`](ciris_verify_core::threshold::ThresholdMember)).
 /// 4. [`list_accord_participations`](super::FederationDirectory::list_accord_participations)`(proposal_digest)`
 ///    are the STORED, per-write-verified votes; re-tally them with verify-core
-///    [`tally_live_quorum`](ciris_verify_core::accord_live_quorum::tally_live_quorum)
+///    `tally_live_quorum` (CIRISVerify `accord_live_quorum`, removed in 23.3.3)
 ///    (each participation's hybrid signature + proposal-digest + seat binding is
 ///    re-checked; signers resolve ONLY in the pinned roster; deduped by member).
 /// 5. Require `tally.yes` ≥ a **strict majority of the live accord roster**
@@ -16706,7 +16727,7 @@ async fn verify_canonical_authority_over_roster(
 /// #377 authority core, exported for
 /// [`accord_carriage`](super::accord_carriage)'s local withdrawal projection.
 ///
-/// Identical machinery to [`verify_canonical_withdraw_authority`] — stored
+/// Identical machinery to the deleted v13 withdraw authority — stored
 /// proposal, HUMANITY_ACCORD family scope, persist-computed payload binding,
 /// a fresh `tally_live_quorum` over persist's OWN stored participations, and
 /// the strict-majority destructive threshold — parameterized on `op` so the

@@ -48,8 +48,8 @@
 
 use std::collections::BTreeSet;
 
+use crate::federation::admission::strict_majority;
 use chrono::{DateTime, Duration, Utc};
-use ciris_verify_core::accord_genesis::strict_majority;
 
 /// What a proposal does to the roster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

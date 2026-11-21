@@ -1784,7 +1784,8 @@ async fn receipt_refused_body<B: FederationDirectory + BlobStorage + Sync>(d: &B
     );
 }
 
-/// I3163–I3164, with `ROOT` published at tree size 3 and `ROOT_B` at 4.
+/// I3163–I3164 (and I2128, the receipt is its composite), with `ROOT`
+/// published at tree size 3 and `ROOT_B` at 4.
 async fn receipt_lands_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) {
     let s = key(160);
     let si = iref(&s);
@@ -1808,6 +1809,59 @@ async fn receipt_lands_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) 
         d.get_attestation(&rid(&st).hex()).await.unwrap().is_some(),
         "I3163 the signed receipt row"
     );
+    // v62.0.0 (VA-receipt-composite, I2128) — the receipt carries the
+    // statement's ONE composite, whole, as stored and as listed; it verifies
+    // as a composite under the subscriber's live key record over the
+    // statement's Sig_structure; and no pair-shaped member is served.
+    {
+        let Ok(Value::Tag(18, inner)) = ciris_verify_core::cde::decode(&st) else {
+            panic!("I2128: a tag-18 COSE_Sign1");
+        };
+        let parts = inner.as_array().expect("I2128: the COSE_Sign1 array");
+        let (protected, payload, signature) = (
+            parts[0].as_bytes().expect("I2128: protected"),
+            parts[2].as_bytes().expect("I2128: payload"),
+            parts[3].as_bytes().expect("I2128: signature"),
+        );
+        assert_eq!(
+            listed[0].composite_signature.as_slice(),
+            signature,
+            "I2128: the listed receipt carries the statement's composite, whole"
+        );
+        assert_eq!(
+            listed[0].composite_signature.len(),
+            ciris_crypto::composite::SIGNATURE_LEN,
+            "I2128: one composite"
+        );
+        let tbs = ciris_verify_core::edition2::sig_structure(protected, payload);
+        super::composite_verify::verify_composite_via_directory(
+            d,
+            &tbs,
+            &si,
+            &listed[0].composite_signature,
+            super::composite_verify::now_ms(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("I2128: verifies as a composite under the key record: {e}"));
+        let stored = d
+            .list_stored_delivery_receipts_for(STREAM, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored[0].receipt.composite_signature, listed[0].composite_signature,
+            "I2128: stored as the composite"
+        );
+        let json = serde_json::to_value(&stored[0]).unwrap();
+        assert!(
+            json.get("composite_signature")
+                .is_some_and(serde_json::Value::is_string),
+            "I2128: one base64 member"
+        );
+        assert!(
+            json.get("signature").is_none(),
+            "I2128: no pair-shaped member is served"
+        );
+    }
     let equivocal = sign(
         &s,
         &si,

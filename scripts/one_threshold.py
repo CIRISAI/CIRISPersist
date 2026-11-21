@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
-"""one_threshold.py: the holders' strict majority has ONE spelling (no cargo).
+"""one_threshold.py: a strict majority has ONE spelling (no cargo).
 
     scripts/one_threshold.py check        exit 1 on a second spelling
     scripts/one_threshold.py --self-test  the gate's own witnesses
 
 v62.0.0 (TR-fix1; Eric's rule, CC 4.2.6): an accord act counts at a strict
-majority of the STANDING roster (2·yes > N, never a fixed 2 or 3). That count
-is `admission::accord_threshold(n) = n / 2 + 1`, over the holders of the
-genesis bundle in force (`accord_threshold_now`). A second function that
-spells `x / 2 + 1` is how the copies drifted before (trust_root_group's
-`holders_required`, transport_rebind's `required_count`).
+majority of the STANDING roster (2·yes > N, never a fixed 2 or 3):
+`admission::accord_threshold(n)`, over the holders of the genesis bundle in
+force (`accord_threshold_now`).
 
-The scan reads production code only. It uses earlier_form_doors.py's
-stripper, so comments, literals and test-gated code are blanked. It fails on
-any `<expr> / 2 + 1` outside ALLOWED. ALLOWED holds the ONE spelling and the
-majorities of OTHER rosters (a room's `majority` protocol is the group's own
-count, not the holders'), each by (file, enclosing fn). An ALLOWED entry that
-no longer matches is red too, so the list cannot outlive its sites.
+v62.0.0 (VA-genesis-fns): every strict majority in persist routes to ONE pair
+of helpers in `admission.rs`: `strict_majority(n) = n / 2 + 1` (its count)
+and `is_strict_majority(yes, n) = yes > n / 2` (its predicate). This covers
+the accord's `accord_threshold`, a room's `majority` protocol, a
+reverse-quorum floor and a two-path threshold. Each body is a one-line seam:
+VA-repin swaps it to Verify's `edition2::strict_majority` /
+`is_strict_majority`.
+
+Red in production code (stripped by earlier_form_doors.py: comments,
+literals and test-gated code blanked) outside ALLOWED:
+
+- `x / 2 + 1`, the count;
+- `2 * x > n` and `x > n / 2`, the predicate;
+- a call to, or an import of, Verify's `accord_genesis::strict_majority`,
+  `edition2::strict_majority` or `edition2::is_strict_majority`.
+
+ALLOWED holds the two seams, by (file, enclosing fn). An ALLOWED entry that no
+longer matches anything is red too, so the list cannot outlive its sites.
 
 v62.0.0 (SM-fix1) — and no FIXED count stands in for it. Also red, in the
 same production code (test and `test-anchor` code excepted, as above):
@@ -28,7 +38,6 @@ same production code (test and `test-anchor` code excepted, as above):
   - `QuorumPolicy::new(<int>, <int>)`, `ThresholdPolicy::new(<int>, <int>)`
     or `accord_threshold(<int>)`: a threshold over a fixed roster size.
 """
-import os
 import re
 import sys
 import tempfile
@@ -37,16 +46,22 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import earlier_form_doors as efd  # noqa: E402
 
-PATTERN = re.compile(r"[A-Za-z_][\w.()]*\s*/\s*2\s*\+\s*1\b")
+COUNT = re.compile(r"[A-Za-z_][\w.()]*\s*/\s*2\s*\+\s*1\b")
+PREDICATE = re.compile(
+    r"\b2\s*\*\s*[A-Za-z_][\w.()]*\s*>(?!=)\s*[A-Za-z_]"
+    r"|[A-Za-z_][\w.()]*\s*>\s*[A-Za-z_][\w.()]*\s*/\s*2\b(?!\s*\+)"
+)
+# a call or an import (`use ...::accord_genesis::strict_majority;`)
+VERIFY_CALL = re.compile(
+    r"\b(?:accord_genesis|edition2)\s*::\s*(?:\{[^}]*\b)?(?:is_)?strict_majority\b"
+)
 
 # (file, enclosing fn): why
 ALLOWED = {
-    ("src/federation/admission.rs", "accord_threshold"):
-        "THE spelling of the holders' strict majority",
-    ("src/federation/consensus.rs", "evaluate_counted"):
-        "a room's `majority` / unanimous-removal protocol (the group's own roster)",
-    ("src/federation/consensus.rs", "required_signatures_at"):
-        "a room's `majority` protocol (the group's own roster)",
+    ("src/federation/admission.rs", "strict_majority"):
+        "THE count (seam to Verify's edition2::strict_majority at VA-repin)",
+    ("src/federation/admission.rs", "is_strict_majority"):
+        "THE predicate (seam to Verify's edition2::is_strict_majority at VA-repin)",
 }
 
 
@@ -150,79 +165,79 @@ def scan(base: Path) -> list[str]:
     used: set[tuple[str, str]] = set()
     for rel in tree.glob("src/**/*.rs"):
         code = tree.code(rel) or ""
-        for m in PATTERN.finditer(code):
+        hits = []
+        for m in COUNT.finditer(code):
             # `bytes * 3 / 2 + 1`-style growth factors are not a majority.
-            if re.search(r"\*\s*\d+\s*\)?\s*$", code[max(0, m.start() - 12):m.start() + len(m.group(0).split("/")[0])]):
+            head = code[max(0, m.start() - 12):m.start() + len(m.group(0).split("/")[0])]
+            if re.search(r"\*\s*\d+\s*\)?\s*$", head):
                 continue
+            hits.append((m, "a second spelling of a strict-majority count"))
+        for m in PREDICATE.finditer(code):
+            hits.append((m, "a second spelling of a strict-majority test"))
+        for m in VERIFY_CALL.finditer(code):
+            hits.append((m, "a direct call to Verify's strict majority"))
+        for m, what in hits:
             fn = enclosing_fn(code, m.start())
             key = (rel, fn)
-            line = code.count("\n", 0, m.start()) + 1
             if key in ALLOWED:
                 used.add(key)
                 continue
-            red.append(f"{rel}:{line} ({fn}): a second spelling of a strict majority "
-                       f"`{m.group(0)}`; call admission::accord_threshold, or list a "
-                       f"non-holder roster in ALLOWED with why")
+            line = code.count("\n", 0, m.start()) + 1
+            red.append(f"{rel}:{line} ({fn}): {what} `{m.group(0).strip()}`; call "
+                       f"admission::strict_majority / is_strict_majority (or accord_threshold)")
     for key in sorted(set(ALLOWED) - used):
         red.append(f"{key[0]} ({key[1]}): an ALLOWED entry no longer matches a site; delete it")
     red.extend(scan_fixed(base, tree))
     return red
 
 
+SEAMS = ("pub const fn strict_majority(n: usize) -> usize { n / 2 + 1 }\n"
+         "pub const fn is_strict_majority(y: usize, n: usize) -> bool { y > n / 2 }\n"
+         "pub const fn accord_threshold(n: usize) -> usize { strict_majority(n) }\n")
+SEAMS_AT_REPIN = ("pub const fn strict_majority(n: usize) -> usize { ciris_verify_core::edition2::strict_majority(n) }\n"
+                  "pub const fn is_strict_majority(y: usize, n: usize) -> bool { ciris_verify_core::edition2::is_strict_majority(y, n) }\n")
+
+
+def tree(extra: dict[str, str], admission: str = SEAMS) -> dict[str, str]:
+    files = {"src/lib.rs": "pub mod federation;\n",
+             "src/federation/mod.rs": "pub mod admission;\npub mod other;\n",
+             "src/federation/admission.rs": admission,
+             "src/federation/other.rs": "\n"}
+    files.update(extra)
+    return files
+
+
 def self_test() -> int:
     cases = [
-        ("the one spelling passes",
-         {"src/lib.rs": "pub mod federation;\n",
-          "src/federation/mod.rs": "pub mod admission;\npub mod consensus;\n",
-          "src/federation/admission.rs": "pub const fn accord_threshold(n: usize) -> usize { n / 2 + 1 }\n",
-          "src/federation/consensus.rs": "fn evaluate_counted(n: usize) -> usize { n / 2 + 1 }\nfn required_signatures_at(n: usize) -> usize { n / 2 + 1 }\n"},
-         0),
-        ("a second holders' spelling is red",
-         {"src/lib.rs": "pub mod federation;\n",
-          "src/federation/mod.rs": "pub mod admission;\npub mod consensus;\npub mod edition2;\n",
-          "src/federation/admission.rs": "pub const fn accord_threshold(n: usize) -> usize { n / 2 + 1 }\n",
-          "src/federation/consensus.rs": "fn evaluate_counted(n: usize) -> usize { n / 2 + 1 }\nfn required_signatures_at(n: usize) -> usize { n / 2 + 1 }\n",
-          "src/federation/edition2.rs": "pub const fn required_count(holders: usize) -> usize { holders / 2 + 1 }\n"},
-         1),
-        ("a spelling in a comment, a literal or a test is not production",
-         {"src/lib.rs": "pub mod federation;\n",
-          "src/federation/mod.rs": "pub mod admission;\npub mod consensus;\n",
-          "src/federation/admission.rs": "pub const fn accord_threshold(n: usize) -> usize { n / 2 + 1 }\n// x / 2 + 1\nconst S: &str = \"n / 2 + 1\";\n#[cfg(test)]\nmod t { fn f(n: usize) -> usize { n / 2 + 1 } }\n",
-          "src/federation/consensus.rs": "fn evaluate_counted(n: usize) -> usize { n / 2 + 1 }\nfn required_signatures_at(n: usize) -> usize { n / 2 + 1 }\n"},
-         0),
+        ("the two seams pass", tree({}), 0),
+        ("the seams at the re-pin pass", tree({}, SEAMS_AT_REPIN), 0),
+        ("a second count is red",
+         tree({"src/federation/other.rs": "pub const fn required_count(h: usize) -> usize { h / 2 + 1 }\n"}), 1),
+        ("a second predicate (2 * x > n) is red",
+         tree({"src/federation/other.rs": "fn ok(v: usize, n: usize) -> bool { 2 * v > n }\n"}), 1),
+        ("a second predicate (x > n / 2) is red",
+         tree({"src/federation/other.rs": "fn ok(v: usize, n: usize) -> bool { v > n / 2 }\n"}), 1),
+        ("a direct Verify call is red",
+         tree({"src/federation/other.rs": "fn m(n: usize) -> usize { ciris_verify_core::accord_genesis::strict_majority(n) }\n"}), 1),
+        ("an import of Verify's helper is red",
+         tree({"src/federation/other.rs": "use ciris_verify_core::accord_genesis::strict_majority;\n"}), 1),
+        ("a grouped import of Verify's helper is red",
+         tree({"src/federation/other.rs": "use ciris_verify_core::edition2::{is_strict_majority, Digest32};\n"}), 1),
+        ("a growth factor is not a majority",
+         tree({"src/federation/other.rs": "fn g(b: usize) -> usize { (b * 3) / 2 + 1 }\n"}), 0),
+        ("comments, literals and tests are not production",
+         tree({"src/federation/other.rs": "// x / 2 + 1\nconst S: &str = \"2 * v > n\";\n#[cfg(test)]\nmod t { fn f(n: usize) -> usize { n / 2 + 1 } }\n"}), 0),
         # v62.0.0 (SM-fix1) — fixed counts.
         ("a fixed quorum literal default in production is red",
-         {"src/lib.rs": "pub mod federation;\n",
-          "src/federation/mod.rs": "pub mod admission;\npub mod consensus;\npub mod gmc;\n",
-          "src/federation/admission.rs": "pub const fn accord_threshold(n: usize) -> usize { n / 2 + 1 }\n",
-          "src/federation/consensus.rs": "fn evaluate_counted(n: usize) -> usize { n / 2 + 1 }\nfn required_signatures_at(n: usize) -> usize { n / 2 + 1 }\n",
-          "src/federation/gmc.rs": "const P: &str = \"quorum:2/3\";\nfn f(e: &V) -> &str { e.get(\"cp\").unwrap_or(P) }\n"},
-         1),
+         tree({"src/federation/other.rs": "const P: &str = \"quorum:2/3\";\nfn f(e: &V) -> &str { e.get(\"cp\").unwrap_or(P) }\n"}), 1),
         ("a byte or raw fixed literal is red too",
-         {"src/lib.rs": "pub mod federation;\n",
-          "src/federation/mod.rs": "pub mod admission;\npub mod consensus;\npub mod gmc;\n",
-          "src/federation/admission.rs": "pub const fn accord_threshold(n: usize) -> usize { n / 2 + 1 }\n",
-          "src/federation/consensus.rs": "fn evaluate_counted(n: usize) -> usize { n / 2 + 1 }\nfn required_signatures_at(n: usize) -> usize { n / 2 + 1 }\n",
-          "src/federation/gmc.rs": "const P: &[u8] = b\"quorum:2/3\";\nconst Q: &str = r\"quorum:3/5\";\n"},
-         2),
+         tree({"src/federation/other.rs": "const P: &[u8] = b\"quorum:2/3\";\nconst Q: &str = r\"quorum:3/5\";\n"}), 2),
         ("a fixed literal in a comment, a format, a test or test-anchor code is not",
-         {"src/lib.rs": "pub mod federation;\n",
-          "src/federation/mod.rs": "pub mod admission;\npub mod consensus;\n",
-          "src/federation/admission.rs": "pub const fn accord_threshold(n: usize) -> usize { n / 2 + 1 }\n// \"quorum:2/3\"\nfn f(m: usize, n: usize) -> String { format!(\"quorum:{m}/{n}\") }\n#[cfg(test)]\nmod t { const P: &str = \"quorum:2/3\"; }\n#[cfg(feature = \"test-anchor\")]\npub fn seed() -> &'static str { \"quorum:2/3\" }\n",
-          "src/federation/consensus.rs": "fn evaluate_counted(n: usize) -> usize { n / 2 + 1 }\nfn required_signatures_at(n: usize) -> usize { n / 2 + 1 }\n"},
-         0),
+         tree({"src/federation/other.rs": "// \"quorum:2/3\"\nfn f(m: usize, n: usize) -> String { format!(\"quorum:{m}/{n}\") }\n#[cfg(test)]\nmod t { const P: &str = \"quorum:2/3\"; }\n#[cfg(feature = \"test-anchor\")]\npub fn seed() -> &'static str { \"quorum:2/3\" }\n"}), 0),
         ("a fixed threshold call is red; one over n is not",
-         {"src/lib.rs": "pub mod federation;\n",
-          "src/federation/mod.rs": "pub mod admission;\npub mod consensus;\n",
-          "src/federation/admission.rs": "pub const fn accord_threshold(n: usize) -> usize { n / 2 + 1 }\nfn g() -> usize { accord_threshold(3) }\nfn h() -> Q { QuorumPolicy::new(2, 3) }\nfn k(n: usize) -> usize { accord_threshold(n) }\n",
-          "src/federation/consensus.rs": "fn evaluate_counted(n: usize) -> usize { n / 2 + 1 }\nfn required_signatures_at(n: usize) -> usize { n / 2 + 1 }\n"},
-         2),
+         tree({"src/federation/other.rs": "fn g() -> usize { accord_threshold(3) }\nfn h() -> Q { QuorumPolicy::new(2, 3) }\nfn k(n: usize) -> usize { accord_threshold(n) }\n"}), 2),
         ("a stale ALLOWED entry is red",
-         {"src/lib.rs": "pub mod federation;\n",
-          "src/federation/mod.rs": "pub mod admission;\npub mod consensus;\n",
-          "src/federation/admission.rs": "pub const fn accord_threshold(n: usize) -> usize { n / 2 + 1 }\n",
-          "src/federation/consensus.rs": "fn evaluate_counted(n: usize) -> usize { n / 2 + 1 }\n"},
-         1),
+         tree({}, "pub const fn strict_majority(n: usize) -> usize { n / 2 + 1 }\n"), 1),
     ]
     bad = 0
     for name, files, want in cases:

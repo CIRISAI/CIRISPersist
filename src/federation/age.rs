@@ -1644,4 +1644,96 @@ mod tests {
             "I2054: no age row is Unknown"
         );
     }
+
+    /// v62.0.0 (K2-fix21) — **I2058: MinorSuspend.tla Inv_TieLowestIdWins,
+    /// pure** (the store witness is I2055): one signer, two age rows at ONE
+    /// instant; the lowest `attestation_id` is the signer's current row
+    /// whatever its band, in either slice order, at the witness and at the
+    /// self rung; and Inv_NewestStands: a strictly newer row of the same
+    /// signer wins over any id.
+    #[test]
+    fn i2058_tie_lowest_id_wins_table() {
+        use std::collections::HashSet;
+        let t0 = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).expect("t0");
+        let none: HashSet<String> = HashSet::new();
+        let all = |_: &super::super::types::Attestation| true;
+        let band = |rows: &[super::super::types::Attestation]| {
+            band_fine_of_rows(rows, &none, all, all).coarsen()
+        };
+        let minor = "age_assurance:provider:minor:v1";
+        let adult = "age_assurance:provider:adult:v1";
+        for (lo_tok, hi_tok, want) in [
+            (minor, adult, AgeBand::Minor),
+            (adult, minor, AgeBand::Adult),
+        ] {
+            let lo = row("0000aa", "w", "t", lo_tok, t0, None);
+            let hi = row("ffff00", "w", "t", hi_tok, t0, None);
+            assert_eq!(
+                band(&[lo.clone(), hi.clone()]),
+                want,
+                "I2058 Inv_TieLowestIdWins: lower id {lo_tok}"
+            );
+            assert_eq!(
+                band(&[hi.clone(), lo.clone()]),
+                want,
+                "I2058 Inv_TieLowestIdWins: other order, lower id {lo_tok}"
+            );
+            // Inv_NewestStands: the higher-id row one second LATER wins.
+            let mut newer = hi.clone();
+            newer.asserted_at = t0 + chrono::Duration::seconds(1);
+            let want_newer = if hi_tok == minor {
+                AgeBand::Minor
+            } else {
+                AgeBand::Adult
+            };
+            assert_eq!(
+                band(&[lo, newer]),
+                want_newer,
+                "I2058 Inv_NewestStands: a newer row beats a lower id"
+            );
+        }
+        // The self rung: the subject's two declarations at one instant.
+        let sm = row(
+            "0001",
+            "t",
+            "t",
+            "age_self_declared:band:minor:v1",
+            t0,
+            None,
+        );
+        let sa = row(
+            "0002",
+            "t",
+            "t",
+            "age_self_declared:band:adult:v1",
+            t0,
+            None,
+        );
+        assert_eq!(
+            band(&[sa.clone(), sm.clone()]),
+            AgeBand::Minor,
+            "I2058: self, minor id lower"
+        );
+        let sm2 = row(
+            "0002",
+            "t",
+            "t",
+            "age_self_declared:band:minor:v1",
+            t0,
+            None,
+        );
+        let sa2 = row(
+            "0001",
+            "t",
+            "t",
+            "age_self_declared:band:adult:v1",
+            t0,
+            None,
+        );
+        assert_eq!(
+            band(&[sm2, sa2]),
+            AgeBand::Unknown,
+            "I2058: self, adult id lower: the self adult is current and raises nothing"
+        );
+    }
 }

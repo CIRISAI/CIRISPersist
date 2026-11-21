@@ -34,8 +34,8 @@
 //!   own identity (the user, its owner, authors; the agent voices), the
 //!   owner binding is stated first; nothing is left to sign.
 //! - **I3541** — `Engine::sign_draft` signs a drafted statement with the
-//!   engine's composite key and a second node admits it; `sign_hybrid` is
-//!   `EarlierFormShut` once the doors are shut.
+//!   engine's composite key and a second node admits it (v62.0.0,
+//!   VA-pair-signing: `sign_hybrid` is deleted).
 //! - **I3542** — `state_community_founding` is `Pending` while a listed
 //!   member has not voiced the founding roster, and lands on that member's
 //!   voice (drafted, signed by its engine). **I3543** —
@@ -48,8 +48,7 @@
 //!   voice lands it at federation, authored by the owner.
 //!
 //! Mutations: drop the re-stamp in `enter_mesh` (sqlite / postgres), and
-//! I3521 reds; route an edition-2 row through `custody_for`, and I3520 reds
-//! on `custody_for`'s refusal; restate the widening at the prior's scope,
+//! I3521 reds; (v62.0.0: `custody_for` is deleted, VA-pair-signing); restate the widening at the prior's scope,
 //! and I3522 reds on `AudienceNotWider`.
 
 pub(crate) mod bodies {
@@ -733,12 +732,6 @@ pub(crate) mod bodies {
         b.put_edition2_statement(&st, None)
             .await
             .expect("I3541: B admits the signed draft");
-        // The earlier form, behind the switch.
-        let refused = a.sign_hybrid(b"earlier").await;
-        assert!(
-            matches!(refused, Err(crate::engine::SignError::EarlierFormShut)),
-            "I3541: {refused:?}"
-        );
     }
 
     /// A member's voice over `a`'s held voice of `row_id`: the same payload,

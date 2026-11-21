@@ -51,10 +51,8 @@ const RECEIPT_SIGNING_DOMAIN: &[u8] = b"ciris-delivery-receipt/v1";
 /// A subscriber's signed delivery acknowledgement for one chunk.
 ///
 /// `Serialize`/`Deserialize` is the FFI boundary shape (PyO3
-/// `put_delivery_receipt` takes the receipt as a JSON string).
-/// `chunk_root` serializes as a 32-element byte array; `signature`
-/// reuses the `ciris_crypto::HybridSignature` serde shape shared with
-/// [`SignedTreeHead`](ciris_verify_core::transparency::SignedTreeHead).
+/// `list_delivery_receipts_for` serves it as JSON). `chunk_root` serializes
+/// as a 32-element byte array; `composite_signature` as standard base64.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeliveryReceipt {
     /// The stream this receipt is for (`log_id`-equivalent `stream:<id>`
@@ -69,9 +67,14 @@ pub struct DeliveryReceipt {
     pub k: u64,
     /// The committed STH root the subscriber saw at `tree_size >= k`.
     pub chunk_root: [u8; 32],
-    /// Subscriber's hybrid Ed25519 + ML-DSA-65 signature over
-    /// [`receipt_signing_bytes`].
-    pub signature: ciris_crypto::HybridSignature,
+    /// v62.0.0 (VA-pair-carriers) — the subscriber's ONE composite
+    /// signature (ML-DSA-65-Ed25519, CC 2.6.1.7, 3373 bytes): its
+    /// `delivery_receipt:{stream_id}` statement's signature, verified by the
+    /// edition-2 door. It replaces the earlier `signature`, a
+    /// `ciris_crypto::HybridSignature` holding the two halves and the two
+    /// public keys.
+    #[serde(with = "crate::federation::serde_bytes_b64")]
+    pub composite_signature: Vec<u8>,
 }
 
 /// v52.0.0 (CIRISPersist#953) — a receipt as the store HOLDS it: the signed
@@ -175,18 +178,23 @@ pub fn receipt_signing_bytes_of(receipt: &DeliveryReceipt) -> Vec<u8> {
     )
 }
 
-/// v62.0.0 — decode a stored receipt `signature_blob` (the `HybridSignature`
-/// JSON bytes).
+/// v62.0.0 (VA-pair-carriers) — a stored receipt's `signature_blob`: the
+/// composite signature's raw bytes, held as they arrived. A blob of any
+/// other length is refused (it is not a composite; the earlier layout held a
+/// `HybridSignature`'s JSON, which no v62 store holds).
 ///
 /// # Errors
-/// [`BlobError::Backend`](crate::federation::BlobError::Backend) on a blob that
-/// is not one.
-pub fn deserialize_receipt_signature(
-    bytes: &[u8],
-) -> Result<ciris_crypto::HybridSignature, crate::federation::BlobError> {
-    serde_json::from_slice(bytes).map_err(|e| {
-        crate::federation::BlobError::Backend(format!("receipt signature deserialize: {e}"))
-    })
+/// [`BlobError::Backend`](crate::federation::BlobError::Backend) for a blob
+/// that is not a composite signature.
+pub fn stored_receipt_composite(bytes: Vec<u8>) -> Result<Vec<u8>, crate::federation::BlobError> {
+    if bytes.len() != ciris_crypto::composite::SIGNATURE_LEN {
+        return Err(crate::federation::BlobError::Backend(format!(
+            "stored receipt signature is {} bytes, not a {}-byte composite",
+            bytes.len(),
+            ciris_crypto::composite::SIGNATURE_LEN
+        )));
+    }
+    Ok(bytes)
 }
 
 // v62.0.0 (F0-cp5; RULINGS "composite signatures only") — the earlier
@@ -333,20 +341,7 @@ mod tests {
             epoch: 9,
             k: 42,
             chunk_root: [0x5Au8; 32],
-            signature: ciris_crypto::HybridSignature {
-                crypto_kind: ciris_crypto::CRYPTO_KIND_CIRIS_V1,
-                classical: ciris_crypto::TaggedClassicalSignature {
-                    algorithm: ciris_crypto::ClassicalAlgorithm::Ed25519,
-                    signature: vec![1u8; 64],
-                    public_key: vec![2u8; 32],
-                },
-                pqc: ciris_crypto::TaggedPqcSignature {
-                    algorithm: ciris_crypto::PqcAlgorithm::MlDsa65,
-                    signature: vec![3u8; 3309],
-                    public_key: vec![4u8; 1952],
-                },
-                mode: ciris_crypto::SignatureMode::HybridRequired,
-            },
+            composite_signature: vec![7u8; ciris_crypto::composite::SIGNATURE_LEN],
         };
         let json = serde_json::to_string(&receipt).unwrap();
         let back: DeliveryReceipt = serde_json::from_str(&json).unwrap();
@@ -355,13 +350,18 @@ mod tests {
         assert_eq!(back.epoch, receipt.epoch);
         assert_eq!(back.k, receipt.k);
         assert_eq!(back.chunk_root, receipt.chunk_root);
+        assert_eq!(back.composite_signature, receipt.composite_signature);
+        // v62.0.0 (VA-pair-carriers, I2126) — the wire carries the composite
+        // as ONE base64 member, and no member of the earlier pair layout.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            back.signature.classical.signature,
-            receipt.signature.classical.signature
+            v["composite_signature"].as_str().map(str::len),
+            Some(4 * ciris_crypto::composite::SIGNATURE_LEN.div_ceil(3)),
+            "I2126: one base64 member"
         );
-        assert_eq!(
-            back.signature.pqc.signature,
-            receipt.signature.pqc.signature
+        assert!(
+            v.get("signature").is_none(),
+            "I2126: no earlier pair member"
         );
         // The canonical signing bytes survive the round-trip identically.
         assert_eq!(

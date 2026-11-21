@@ -2,6 +2,12 @@
 //! ATTESTATION-emit recipe, lifted out of [`crate::Engine`] so it has exactly
 //! ONE implementation.
 //!
+//! v62.0.0 (VA-pair-signing): the recipe below is history. A row is ONE
+//! edition-2 statement under the signer's composite key ([`produce_row`],
+//! [`emit_statement`]); the earlier hybrid-sign → `assemble_and_put` path is
+//! deleted, and [`assemble`] builds the earlier row SHAPE, unsigned, for the
+//! fixtures that restate it as a statement.
+//!
 //! `canonicalize → hash → hybrid-sign → assemble the 20-field
 //! [`Attestation`] → put_attestation` was previously reachable only through an
 //! [`Engine`](crate::Engine), which exists solely over the `sqlite` /
@@ -18,9 +24,9 @@
 //! engine's own derived identity — stays on the Engine, layered on top of the
 //! [`EmittedAttestation`] this module returns.
 
-use super::{Attestation, EmitAttestationInput, Error, FederationDirectory, SignedAttestation};
+use super::{Attestation, EmitAttestationInput, Error, FederationDirectory};
 
-/// What [`assemble_and_put`] produced, plus the two facts the Engine's
+/// What an emit produced, plus the two facts the Engine's
 /// post-emit consent chokepoint needs (so it never re-reads the row it just
 /// wrote).
 #[derive(Debug, Clone)]
@@ -135,39 +141,6 @@ pub fn stamp_and_canonicalize(
     canonicalize(&input.attestation_envelope.to_value())
 }
 
-/// Assemble the 20-field [`Attestation`] from an already-derived `key_id`
-/// (the attester/scrub — the #247 derived federation key_id, NEVER a caller
-/// alias), the `canonical` bytes, the computed hybrid `sig`, and `input`;
-/// then [`put_attestation`](FederationDirectory::put_attestation).
-///
-/// Both admission gates the emit chokepoint owns run here, so every emit path
-/// enforces them identically:
-///
-/// - [`validate_subject_key_ids`](super::validate_subject_key_ids)
-///   (CIRISPersist#293 / CC 2.6.3) — a non-canonical (uppercase / empty)
-///   subject id is refused before the row is assembled.
-/// - [`check_cohort_scope`](super::admission::check_cohort_scope)
-///   (CIRISPersist#527) — the recipient axis is VALIDATED, never defaulted.
-///   An empty scope must not be laundered into a federation-wide broadcast.
-pub async fn assemble_and_put<D>(
-    dir: &D,
-    key_id: String,
-    canonical: &[u8],
-    sig: ciris_crypto::HybridSignature,
-    input: EmitAttestationInput,
-) -> Result<EmittedAttestation, Error>
-where
-    D: FederationDirectory + Sync + ?Sized,
-{
-    let (row, emitted) = assemble(key_id, canonical, sig, input)?;
-    // v41.0.0 (#804) — the emit recipe publishes a row this node authored and
-    // signed a few lines above; charging it as a peer write metered the node
-    // against a budget written to stop strangers flooding it.
-    dir.put_attestation_authored(SignedAttestation { attestation: row })
-        .await?;
-    Ok(emitted)
-}
-
 /// v30.0.0 (CIRISPersist#601 item 3 / CIRISPersist#596 item 3) — **the recipe
 /// WITHOUT the put.**
 ///
@@ -198,10 +171,9 @@ where
 pub fn assemble(
     key_id: String,
     canonical: &[u8],
-    sig: ciris_crypto::HybridSignature,
     input: EmitAttestationInput,
 ) -> Result<(Attestation, EmittedAttestation), Error> {
-    let (row, emitted) = assemble_any_row_type(key_id, canonical, sig, input)?;
+    let (row, emitted) = assemble_any_row_type(key_id, canonical, input)?;
     // v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot at the
     // mint, for the same reason: a row assembled and put later fails where it
     // was built. Uncounted; the put door counts what it admits.
@@ -212,10 +184,8 @@ pub fn assemble(
 fn assemble_any_row_type(
     key_id: String,
     canonical: &[u8],
-    sig: ciris_crypto::HybridSignature,
     input: EmitAttestationInput,
 ) -> Result<(Attestation, EmittedAttestation), Error> {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use sha2::{Digest, Sha256};
 
     super::validate_subject_key_ids(&input.subject_key_ids)?;
@@ -328,11 +298,15 @@ fn assemble_any_row_type(
         expires_at,
         attestation_envelope: envelope_value,
         original_content_hash,
-        scrub_signature_classical: B64.encode(&sig.classical.signature),
-        scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
+        // v62.0.0 (VA-pair-signing) — UNSIGNED: no separate Ed25519 +
+        // ML-DSA-65 pair is minted. The row is the earlier form's SHAPE only;
+        // its authority, when it is offered, is the edition-2 statement a
+        // fixture signs from it (`fixture_switch::try_put_row`).
+        scrub_signature_classical: String::new(),
+        scrub_signature_pqc: None,
         scrub_key_id: key_id.clone(),
         scrub_timestamp: signed_at.unwrap_or(now),
-        pqc_completed_at: Some(signed_at.unwrap_or(now)),
+        pqc_completed_at: None,
         persist_row_hash: String::new(),
         subject_key_ids: input.subject_key_ids,
         withdraws_admission_rule: None,
@@ -360,8 +334,10 @@ fn assemble_any_row_type(
 }
 
 /// The whole recipe over an explicit
-/// [`LocalSigner`](crate::signing::LocalSigner) and a bare directory:
-/// canonicalize → hybrid-sign → [`assemble_and_put`].
+/// [`LocalSigner`](crate::signing::LocalSigner) and a bare directory: one
+/// edition-2 statement under the signer's composite key, through the
+/// statement door ([`emit_statement`]). v62.0.0 (VA-pair-signing): the
+/// earlier hybrid-sign → `assemble_and_put` recipe is deleted.
 ///
 /// `attesting_key_id` / `scrub_key_id` are derived from the signer itself
 /// ([`LocalSigner::derived_key_id`](crate::signing::LocalSigner::derived_key_id)),

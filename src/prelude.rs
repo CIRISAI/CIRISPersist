@@ -85,8 +85,8 @@ pub use crate::derived::{
 
 // Local signing surface (v0.4.2, CIRISPersist#17). Federation
 // peers signing as their deployment's local identity construct
-// `LocalSigner` from filesystem seeds and call `sign_ed25519` /
-// `sign_ml_dsa_65` / `sign_hybrid`.
+// `LocalSigner` from filesystem seeds and call `sign_composite` (v62.0.0:
+// the lone `sign_ml_dsa_65` and the separate-pair `sign_hybrid` are deleted).
 pub use crate::signing::{LocalSigner, LocalSignerConfig, LocalSignerError};
 
 // Verify primitives. The full surface edge needs to compose a

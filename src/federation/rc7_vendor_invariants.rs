@@ -31,7 +31,6 @@ pub(crate) mod bodies {
     use crate::federation::attestation_emit::{assemble, stamp_and_canonicalize};
     use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::envelope::EnvelopeCore;
-    use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::USER;
     use crate::federation::types::{cohort_scope, EmitAttestationInput};
     use crate::federation::{Attestation, FederationDirectory};
@@ -40,16 +39,13 @@ pub(crate) mod bodies {
     /// (`e2::kid(alias)`); `alias` is the test seed the edition-2 statement
     /// is signed with.
     pub(crate) struct Who {
-        pub signer: std::sync::Arc<crate::signing::LocalSigner>,
         pub key: String,
         pub alias: String,
     }
 
     pub(crate) async fn who<B: FederationDirectory + Sync>(b: &B, alias: &str) -> Who {
-        let signer = ts::local_signer(alias);
         let key = e2::put_key(b, alias, &[USER]).await;
         Who {
-            signer,
             key,
             alias: alias.to_owned(),
         }
@@ -62,9 +58,10 @@ pub(crate) mod bodies {
     /// A row as a peer would send it, assembled past the emit gates
     /// (earlier-shaped; [`put`] offers it as `w`'s edition-2 statement).
     async fn signed(w: &Who, mut i: EmitAttestationInput) -> Attestation {
+        // v62.0.0 (VA-pair-signing) — the earlier row SHAPE, unsigned:
+        // [`put`] offers it as `w`'s edition-2 statement.
         let canonical = stamp_and_canonicalize(&mut i, &w.key, chrono::Utc::now()).unwrap();
-        let sig = w.signer.sign_hybrid(&canonical).await.unwrap();
-        assemble(w.key.clone(), &canonical, sig, i).unwrap().0
+        assemble(w.key.clone(), &canonical, i).unwrap().0
     }
 
     /// `row` as `w`'s edition-2 statement through the statement door; the

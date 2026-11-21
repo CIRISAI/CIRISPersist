@@ -65,7 +65,7 @@ use crate::federation::custody_ack::CustodyState;
 use crate::federation::key_grant::{KeyGrantAxis, KeyGrantRow};
 use crate::federation::stream_receipt::DeliveryReceipt;
 use crate::federation::types::{
-    cohort_scope as cs, IdentityOccurrenceRevocation, KeyRecord, Revocation, SignedAttestation,
+    cohort_scope as cs, IdentityOccurrenceRevocation, Revocation, SignedAttestation,
     SignedRevocation,
 };
 use crate::federation::{malformed_row, Error, FederationDirectory};
@@ -696,36 +696,33 @@ pub fn revocation_of(
     Ok(revocation)
 }
 
-/// The composite signature's two halves: ML-DSA-65 (3309 bytes) then
-/// Ed25519 (64), the composite's order.
-fn composite_halves(statement: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+/// v62.0.0 (VA-pair-carriers) — the statement's composite signature (its
+/// fourth member), whole: ONE ML-DSA-65-Ed25519 composite (CC 2.6.1.7).
+/// `None` when the bytes are not a statement or the signature is not a
+/// composite (Verify's named layout, `composite::signature_halves`).
+fn composite_signature(statement: &[u8]) -> Option<Vec<u8>> {
     let sig = match cde::decode(statement).ok()? {
         Value::Tag(18, inner) => inner.as_array()?.get(3)?.as_bytes()?.to_vec(),
         _ => return None,
     };
-    // v62.0.0 (C5-fix3): the one composite split, by Verify's named layout.
-    let (mldsa, ed) = super::composite::signature_halves(&sig)?;
-    Some((mldsa.to_vec(), ed.to_vec()))
+    super::composite::signature_halves(&sig)?;
+    Some(sig)
 }
 
 /// **A `delivery_receipt:{stream_id}` statement as the [`DeliveryReceipt`]
 /// it states**: `stream_id` (equal to the `{stream_id}` leaf), the
 /// subscriber (`iss`, equal to `sub`), `epoch`, `k`, `chunk_root`. The
-/// receipt store's `HybridSignature` is the statement's composite signature
-/// in its two halves, beside the subscriber's two held public keys
-/// (`subscriber`, its `federation_keys` projection). The edition-2 door
+/// receipt carries the statement's composite signature WHOLE, as one field
+/// (v62.0.0, VA-pair-carriers: no longer split into a `HybridSignature`'s
+/// two halves beside the subscriber's two public keys). The edition-2 door
 /// verified the statement; no inner signed object exists (CC 8.11.30 is
 /// the earlier layout).
 ///
 /// # Errors
 /// `edition2_payload_invalid` for a missing or ill-typed member, a stream
 /// that is not the leaf, a subscriber that is not the row's `sub`, or a
-/// subscriber with no ML-DSA-65 half.
-pub fn delivery_receipt_of(
-    row: &AdmittedRow,
-    subscriber: &KeyRecord,
-) -> Result<DeliveryReceipt, Error> {
-    use base64::Engine as _;
+/// signature that is not a composite.
+pub fn delivery_receipt_of(row: &AdmittedRow) -> Result<DeliveryReceipt, Error> {
     let p = &row.payload;
     let stream_id = req_text(p, "stream_id")?;
     if text_of(p, "dimension")
@@ -745,40 +742,15 @@ pub fn delivery_receipt_of(
         .get_text("chunk_root")
         .and_then(digest_bytes)
         .ok_or_else(|| invalid("`chunk_root` is required (a hash digest)"))?;
-    let (pqc_sig, ed_sig) = composite_halves(&row.bytes)
+    let composite_signature = composite_signature(&row.bytes)
         .ok_or_else(|| invalid("the statement's signature is not a composite"))?;
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let ed_pk = b64
-        .decode(&subscriber.pubkey_ed25519_base64)
-        .map_err(|e| Error::Backend(format!("subscriber Ed25519 half: {e}")))?;
-    let pqc_pk = subscriber
-        .pubkey_ml_dsa_65_base64
-        .as_deref()
-        .ok_or_else(|| invalid("the subscriber holds no ML-DSA-65 half"))
-        .and_then(|k| {
-            b64.decode(k)
-                .map_err(|e| Error::Backend(format!("subscriber ML-DSA-65 half: {e}")))
-        })?;
     Ok(DeliveryReceipt {
         stream_id: stream_id.to_owned(),
         subscriber_key_id: row.iss.clone(),
         epoch: req_u64(p, "epoch")?,
         k: req_u64(p, "k")?,
         chunk_root,
-        signature: ciris_crypto::HybridSignature {
-            crypto_kind: ciris_crypto::CRYPTO_KIND_CIRIS_V1,
-            classical: ciris_crypto::TaggedClassicalSignature {
-                algorithm: ciris_crypto::ClassicalAlgorithm::Ed25519,
-                signature: ed_sig,
-                public_key: ed_pk,
-            },
-            pqc: ciris_crypto::TaggedPqcSignature {
-                algorithm: ciris_crypto::PqcAlgorithm::MlDsa65,
-                signature: pqc_sig,
-                public_key: pqc_pk,
-            },
-            mode: ciris_crypto::SignatureMode::HybridRequired,
-        },
+        composite_signature,
     })
 }
 
@@ -1283,10 +1255,11 @@ async fn put_delivery_receipt<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let Some(subscriber) = dir.lookup_public_key(&row.iss).await? else {
+    // The subscriber's key is held (the retryable ordering gap otherwise).
+    if dir.lookup_public_key(&row.iss).await?.is_none() {
         return Err(Error::unknown_signer(&row.iss, PLANE));
-    };
-    let receipt = delivery_receipt_of(row, &subscriber)?;
+    }
+    let receipt = delivery_receipt_of(row)?;
     // v62.0.0 (wave GC4; CC 2.7.3) — the receipt door's JOIN and
     // equivocation steps read other rows (the stream, the subscriber's other
     // receipts): they run inside the door's fold attempt

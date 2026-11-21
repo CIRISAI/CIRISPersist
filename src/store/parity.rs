@@ -981,7 +981,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v62.0.0 (slice D) — decodes a stored delivery receipt's signature
     // bytes (the substrate's own row), split from the STH decoder when heads
     // became composites.
-    ("deserialize_receipt_signature", Class::Plumbing),
+    ("stored_receipt_composite", Class::Plumbing),
     ("deserialize_signature", Class::Plumbing),
     ("deserialize_witness_signatures", Class::Plumbing),
     ("entry_as_stored", Class::Plumbing),

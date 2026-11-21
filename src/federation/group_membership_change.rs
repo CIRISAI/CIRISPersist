@@ -21,11 +21,130 @@
 //! [`AccordGenesisError`] values (their `Display` text is unchanged, so every
 //! refusal persist renders reads as it did).
 
-use ciris_verify_core::accord_genesis::{accord_consensus_protocol, AccordGenesisError};
+// v62.0.0 (VA-genesis-fns) — `AccordGenesisError`, `roster_from_envelope`
+// and `accord_consensus_protocol` are persist-local (below): CIRISVerify
+// 23.3.3 deletes them from `accord_genesis`. (SM-fix1 removed this file's last
+// use of `HUMANITY_ACCORD_FAMILY_KEY_ID`, the prior-envelope default.)
 use ciris_verify_core::threshold::{Role, ThresholdMember};
 use serde_json::{json, Value};
 
 use super::edition2::fold as e2fold;
+
+/// v62.0.0 (VA-genesis-fns) — **the membership-change refusals**, a
+/// persist-local stand-in for CIRISVerify 23.3.2's
+/// `accord_genesis::AccordGenesisError` (23.3.3 deletes it), with the
+/// variants this module and [`roster_from_envelope`] raise. The `Display`
+/// text of each is byte-identical to Verify's, so every refusal persist
+/// renders reads as it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccordGenesisError {
+    /// The envelope is malformed.
+    MalformedEnvelope {
+        /// What was wrong.
+        detail: String,
+    },
+    /// The roster lists the same `key_id` more than once.
+    DuplicateMemberKeyId {
+        /// The repeated `key_id`.
+        key_id: String,
+    },
+    /// One public key occupies two seats.
+    DuplicateFounderKey {
+        /// The `member_id` whose key duplicates an earlier member's.
+        member_id: String,
+    },
+    /// A member's `key_id` has no pinned entry in the supplied directory.
+    MemberNotInDirectory {
+        /// The missing member `key_id`.
+        key_id: String,
+    },
+    /// The `consensus_protocol` is not a strict majority (`2·M > N`).
+    WeakQuorum {
+        /// The declared M.
+        m: usize,
+        /// The declared N.
+        n: usize,
+    },
+}
+
+impl std::fmt::Display for AccordGenesisError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MalformedEnvelope { detail } => {
+                write!(f, "malformed accord family envelope: {detail}")
+            }
+            Self::DuplicateMemberKeyId { key_id } => {
+                write!(f, "roster lists key_id {key_id:?} more than once")
+            }
+            Self::DuplicateFounderKey { member_id } => write!(
+                f,
+                "founder {member_id:?} reuses another founder's public key (one key, multiple seats)"
+            ),
+            Self::MemberNotInDirectory { key_id } => write!(
+                f,
+                "family member {key_id:?} has no pinned entry in the supplied directory"
+            ),
+            Self::WeakQuorum { m, n } => write!(
+                f,
+                "consensus_protocol quorum:{m}/{n} is not a strict majority (need 2·M > N)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AccordGenesisError {}
+
+/// v62.0.0 (VA-genesis-fns) — the strict-majority `quorum:M/N` for an
+/// `n`-member group, `M` from persist's ONE majority helper
+/// ([`strict_majority`](super::admission::strict_majority)): a persist-local
+/// copy of CIRISVerify 23.3.2's `accord_genesis::accord_consensus_protocol`
+/// (23.3.3 deletes it), the same text.
+#[must_use]
+pub fn accord_consensus_protocol(n: usize) -> String {
+    format!("quorum:{}/{n}", super::admission::strict_majority(n))
+}
+
+/// v62.0.0 (VA-genesis-fns) — **a group envelope's roster**, resolved to its
+/// pinned members: a persist-local copy of CIRISVerify 23.3.2's
+/// `accord_genesis::roster_from_envelope` (23.3.3 deletes it), the same
+/// fail-closed checks in the same order (no members; a repeated `key_id`; a
+/// member with no directory entry; one key in two seats). It marks no fold
+/// condition, as Verify's did not ([`resolve_members`] does, for the
+/// structure gate).
+///
+/// # Errors
+/// The first failing check.
+pub fn roster_from_envelope(
+    envelope: &Value,
+    directory: &[ThresholdMember],
+) -> Result<Vec<ThresholdMember>, AccordGenesisError> {
+    let member_ids = envelope_member_key_ids(envelope)?;
+    if member_ids.is_empty() {
+        return Err(AccordGenesisError::MalformedEnvelope {
+            detail: "group has no members".to_string(),
+        });
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for k in &member_ids {
+        if !seen.insert(k.as_str()) {
+            return Err(AccordGenesisError::DuplicateMemberKeyId { key_id: k.clone() });
+        }
+    }
+    let roster = member_ids
+        .iter()
+        .map(|key_id| {
+            directory
+                .iter()
+                .find(|m| &m.member_id == key_id)
+                .cloned()
+                .ok_or(AccordGenesisError::MemberNotInDirectory {
+                    key_id: key_id.clone(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    reject_duplicate_member_keys(&roster)?;
+    Ok(roster)
+}
 
 /// v62.0.0 (SM-fix1) — a string member a prior envelope must carry. Absent
 /// or ill-typed is a REFUSAL (malformed is a refusal, not absence): v22

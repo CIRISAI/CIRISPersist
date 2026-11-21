@@ -1620,14 +1620,14 @@ pub enum DirectoryOp {
     /// arm refuses `Unsupported` and reads nothing. APPEND-ONLY (Growth).
     PutAccordDecision {
         /// `decision`.
-        decision: ciris_verify_core::accord_live_quorum::AccordDecision,
+        decision: accord_quorum::AccordDecision,
     },
     /// v61.4.2 (the capsule stub sweep) — the former `FederationDirectory::put_accord_participation`.
     /// v62.0.0 (CC rc20): RETIRED with the accord live-quorum records; the
     /// arm refuses `Unsupported` and reads nothing. APPEND-ONLY (Growth).
     PutAccordParticipation {
         /// `participation`.
-        participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
+        participation: accord_quorum::AccordParticipation,
         /// `standing_roster`.
         standing_roster: Vec<ciris_verify_core::threshold::ThresholdMember>,
     },
@@ -1636,7 +1636,7 @@ pub enum DirectoryOp {
     /// arm refuses `Unsupported` and reads nothing. APPEND-ONLY (Growth).
     PutAccordProposal {
         /// `proposal`.
-        proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
+        proposal: accord_quorum::AccordProposal,
         /// `authority_signature`.
         authority_signature: Option<serde_json::Value>,
     },
@@ -9460,9 +9460,11 @@ mod tests {
         // PX-fix1). GROWTH; ABI stays 14.
         // v62.0.0 (4h-regen) — re-pinned over 4h: RL-fix2c's `ServeStanding`
         // appended (and TR-fix2's changes). ABI stays 14 (ruled).
+        // v62.0.0 (4i-regen) — re-pinned over 4i: VA-quorum's local accord
+        // types (three type-path texts; the wire is identical). ABI stays 14.
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "08a938e242cd0fe75515a939ea8a5d5a75a208f78d1e87b04776585d07a4b05f",
+            "0ee7ba2203666e3acfb0a72fda0e9073ffe014b3fc17962cfb4fcb2472777170",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \

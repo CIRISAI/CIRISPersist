@@ -60,6 +60,10 @@ OID_SERIAL = "1.3.6.1.4.1.41482.3.7"
 # Holder n's serial in SERIAL_CHAINS; SHARED_SERIAL gives holder 2 holder 1's.
 SERIAL_HOLDERS = [1, 2, 3]
 SERIAL_BASE = 1000
+# v62.0.0 (VA-custody) — a serial extension value that is no DER INTEGER (an
+# OCTET STRING): CIRISVerify 23.3.3 refuses it `custody_serial_malformed`;
+# 23.3.2 read it as "no serial".
+MALFORMED_SERIAL_VALUE = b"\x04\x01\x07"
 
 
 def der_uint(n):
@@ -107,7 +111,7 @@ def ed_pub(n):
     return k.public_key().public_bytes(ser.Encoding.Raw, ser.PublicFormat.Raw)
 
 
-def yubikey_chain(ed_pub_bytes, n, ca=ROOT, fips=True, touch=2, serial=None):
+def yubikey_chain(ed_pub_bytes, n, ca=ROOT, fips=True, touch=2, serial=None, serial_raw=None):
     f9k = Ed25519PrivateKey.from_private_bytes(sha(b"f9" + bytes([n]) + ca.cn.encode()))
     f9cn = "YubiKey PIV Attestation f9 (MOCK %d)" % n
     f9 = cert(f9cn, ca.cn, f9k.public_key(), ca.key, 100 + n, [(OID_FIPS, b"")] if fips else [])
@@ -118,7 +122,8 @@ def yubikey_chain(ed_pub_bytes, n, ca=ROOT, fips=True, touch=2, serial=None):
         f9k,
         200 + n,
         [(OID_FW, b"\x04\x03\x05\x07\x04"), (OID_TOUCH, b"\x04\x02\x01" + bytes([touch]))]
-        + ([] if serial is None else [(OID_SERIAL, der_uint(serial))]),
+        + ([] if serial is None else [(OID_SERIAL, der_uint(serial))])
+        + ([] if serial_raw is None else [(OID_SERIAL, serial_raw)]),
     )
     return [leaf, f9]
 
@@ -140,6 +145,10 @@ def main():
     second = {n: yubikey_chain(ed_pub(n + SECOND_RECOVERED_OFFSET), n) for n in HOLDERS}
     serials = {n: yubikey_chain(ed_pub(n), n, serial=SERIAL_BASE + n) for n in SERIAL_HOLDERS}
     shared = yubikey_chain(ed_pub(2), 2, serial=SERIAL_BASE + 1)
+    # v62.0.0 (VA-custody; CIRISVerify 23.3.3 `custody_serial_malformed`) —
+    # holder 1's chain whose serial extension is an OCTET STRING, not a DER
+    # INTEGER.
+    malformed = yubikey_chain(ed_pub(1), 1, serial_raw=MALFORMED_SERIAL_VALUE)
     if a.check_verify:
         d = pathlib.Path(a.check_verify)
         case = json.loads((d / "genesis_bundles_v2.json").read_text())
@@ -248,6 +257,21 @@ def main():
         "/// v62.0.0 (C4-fix2; CC 4.2.3) — holder 2's chain whose leaf names holder",
         "/// 1's serial (`SERIAL_BASE + 1`): a distinct leaf, the same device.",
         "pub const SHARED_SERIAL_CHAIN_HEX: [&str; 2] = [",
+        "    concat!(",
+        rust_bytes(leaf, " " * 8),
+        "    ),",
+        "    concat!(",
+        rust_bytes(f9, " " * 8),
+        "    ),",
+        "];",
+        "",
+    ]
+    leaf, f9 = malformed
+    out += [
+        "/// v62.0.0 (VA-custody; CIRISVerify 23.3.3) — holder 1's chain whose leaf's",
+        "/// serial extension (`1.3.6.1.4.1.41482.3.7`) is an OCTET STRING, not a DER",
+        "/// INTEGER: refused `custody_serial_malformed` from Verify 23.3.3 on.",
+        "pub const MALFORMED_SERIAL_CHAIN_HEX: [&str; 2] = [",
         "    concat!(",
         rust_bytes(leaf, " " * 8),
         "    ),",

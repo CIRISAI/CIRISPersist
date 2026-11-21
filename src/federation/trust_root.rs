@@ -1307,7 +1307,7 @@ where
 /// be `infrastructure`.
 pub(crate) fn family_charter_threshold(family: &super::types::Family, roster_size: usize) -> usize {
     use super::types::consensus_protocol as cp;
-    let floor = ciris_verify_core::accord_genesis::strict_majority(roster_size);
+    let floor = crate::federation::admission::strict_majority(roster_size);
     let protocol = family.consensus_protocol.as_str();
     let policy = if protocol.starts_with(cp::REVERSE_QUORUM_PREFIX) {
         roster_size
@@ -2973,9 +2973,11 @@ pub struct TransitEligibility {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransitArm {
-    /// RESERVED: `R` is a consented contact of `A`'s owner. NEVER produced
-    /// in v62.0: the contact grant has no edition-2 row family yet
-    /// (Constitution names it); see [`TransitRefusal::RelayContactGrantNotRepresentable`].
+    /// v62.0.0 (RL-fix5; CC 5.4.6, the Constitution's ruling) — `R` is a
+    /// CONTACT of `A`'s owner that offers relay: MUTUAL live
+    /// `consent:replication:v1` grants (`A`'s owner names `R` or `R`'s owner;
+    /// `R`'s owner names `A`'s owner or `A`) and `R`'s own relay offer. No
+    /// root is required.
     Contact,
     /// `R` is one of `A`'s owner's own nodes (one live owner, the same on
     /// both). No root is required, rooted or rootless alike.
@@ -3004,14 +3006,14 @@ pub enum TransitRefusal {
     NoRelayOffer,
     /// `R`'s own live bind carries the opt-out marker (CC 3.3.6.2).
     OptedOut,
-    /// `R` is not one of `A`'s owner's nodes, is not a seat, and shares no
-    /// root with `A`; `R` has no live owner a contact grant could name.
-    NoConsentFromOwner,
-    /// `R` has a live owner other than `A`'s: only a contact grant from `A`'s
-    /// owner could make it a carrier, and that grant has no edition-2 row
-    /// yet. Until Constitution names the family, a rootless node relays only
-    /// through its owner's own nodes (and seats).
-    RelayContactGrantNotRepresentable,
+    /// v62.0.0 (RL-fix5) — no live `consent:replication:v1` grant of `A`'s
+    /// owner (or of `A`) names `R`, or names `R`'s owner with `R` bound to
+    /// it (and `R` is no seat, no own node, shares no root).
+    NoGrantFromOwner,
+    /// v62.0.0 (RL-fix5) — `A`'s owner granted `R`, but no live grant of
+    /// `R`'s owner (or of `R`) names `A`'s owner or `A`: a one-way grant does
+    /// not make `R` a contact for carriage.
+    NoReciprocalGrant,
     /// The bound the eligible arm counted has already passed.
     Expired,
     /// A read failed: denied (a transport gate never fails open).
@@ -3218,48 +3220,6 @@ where
         signer_seated,
         edge_exists,
     })
-}
-
-/// v36.3.0 (CIRISPersist#731) — **may this node relay THIS accord
-/// participation?** The object names its own root and its own signer, so
-/// neither is a caller's to nominate.
-///
-/// [`may_relay_accord_object`] takes `root_ref` as a parameter, which is the
-/// same shape v36.2.0 removed one level down: before that release the roster
-/// was caller-supplied, and the fix was to let persist answer *"what is root
-/// R's roster"*. It did not answer **"which R?"**
-///
-/// It has to, because a caller that nominates the wrong root gets a
-/// **confidently wrong answer in the permissive direction**: pass a root this
-/// node happens to trust, whose roster happens to seat the signer, and the
-/// verdict is `may_relay() == true` for an object belonging to a DIFFERENT
-/// accord. The predicate cannot detect that, because it was never given the
-/// object.
-///
-/// [`AccordParticipation`] carries `family_key_id` (*"the accord family this
-/// decision is for"*) and `member_id` — both inside the signed bytes the
-/// threshold signature covers. So this reads the root and the signer from the
-/// object and ignores anything the caller might have preferred.
-///
-/// Fail-closed exactly as [`may_relay_accord_object`]: an object naming a root
-/// this node holds no family for yields `roster_resolvable: false` — *"I
-/// cannot judge"*, which is distinct from *"the signer is not seated"* and
-/// refuses either way.
-pub async fn may_relay_accord_participation<F>(
-    directory: &F,
-    self_key_id: &str,
-    participation: &ciris_verify_core::accord_live_quorum::AccordParticipation,
-) -> Result<RelayVerdict, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    may_relay_accord_object(
-        directory,
-        self_key_id,
-        &participation.member_id,
-        &participation.family_key_id,
-    )
-    .await
 }
 
 /// v37.0.0 (CIRISPersist#733) — **which accord does this row claim to belong
@@ -3536,7 +3496,8 @@ pub fn check_accord_root_binding(row: &Attestation) -> Result<(), Error> {
 /// attestation?** The row names its own root and its own signer, so neither is
 /// a caller's to nominate.
 ///
-/// The attestation analogue of [`may_relay_accord_participation`], and the
+/// The attestation analogue of the retired participation relay verb (v62.0.0
+/// VA-quorum: deleted with Verify 23.3.3's `accord_live_quorum`), and the
 /// plane CIRISEdge's relay gate actually serves: participations travel the
 /// `AccordQuorumEvidence` cursor, while `accord:*` ATTESTATIONS travel the
 /// Summary/Diff/Fetch flow the gate sits on.
@@ -3848,12 +3809,10 @@ pub async fn resolve_transit_eligibility_over_roster(
 ///    is not stricter than the text);
 /// 5. **onion-root arm:** the shared-root walk ([`transit_eligibility_walk`],
 ///    unchanged): `R` validly trusts a root `A` validly trusts;
-/// 6. **EXTENSION POINT (contact arm):** a consented contact of `A`'s owner
-///    is a carrier too (CC 5.4.6), but the contact grant has no edition-2
-///    row family yet. Until Constitution names it, an `R` with another live
-///    owner is refused [`TransitRefusal::RelayContactGrantNotRepresentable`]
-///    and an unowned one [`TransitRefusal::NoConsentFromOwner`]. Insert the
-///    arm HERE, before the refusal, and produce [`TransitArm::Contact`].
+/// 6. **contact arm** (RL-fix5, before the onion arm): mutual live
+///    `consent:replication:v1` grants ([`contact_grants`]), no root; its
+///    failed conjunct names a refusal ([`TransitRefusal::NoGrantFromOwner`],
+///    [`TransitRefusal::NoReciprocalGrant`]).
 ///
 /// `valid_until` comes from signer-stamped rows only: `R`'s key record
 /// window and its live binds' signed `valid_until` (the onion arm keeps its
@@ -3913,17 +3872,123 @@ async fn transit_eligibility_by_consent(
         }
         return Ok(TransitEligibility::by(TransitArm::OwnNode, bound));
     }
-    // 5. the onion-root arm (the shared-root walk, unchanged).
+    // 5. the contact arm (RL-fix5): mutual live grants, no root.
+    let contact = contact_grants(
+        directory,
+        user_key_id,
+        mine.as_deref(),
+        peer_key_id,
+        theirs.as_deref(),
+        now,
+    )
+    .await?;
+    if let Ok(grant_bound) = contact {
+        let bound = earlier_bound(
+            earlier_bound(peer.valid_until, offer.and_then(|o| o.valid_until)),
+            grant_bound,
+        );
+        if expired(bound) {
+            return Ok(TransitEligibility::refused(TransitRefusal::Expired));
+        }
+        return Ok(TransitEligibility::by(TransitArm::Contact, bound));
+    }
+    // 6. the onion-root arm (the shared-root walk, unchanged).
     let (rooted, _) = transit_eligibility_walk(directory, user_key_id, peer_key_id).await?;
     if rooted.eligible {
         return Ok(rooted);
     }
-    // 6. EXTENSION POINT: the contact arm (see the doc above).
-    Ok(TransitEligibility::refused(if theirs.is_some() {
-        TransitRefusal::RelayContactGrantNotRepresentable
-    } else {
-        TransitRefusal::NoConsentFromOwner
+    // Not eligible: the contact arm's failed conjunct names why.
+    Ok(TransitEligibility::refused(match contact {
+        Err(reason) => reason,
+        Ok(_) => TransitRefusal::NoGrantFromOwner,
     }))
+}
+
+/// v62.0.0 (RL-fix5; CC 5.4.6, the Constitution's ruling: `consent:replication:v1`
+/// IS the contact grant) — **are `A` and `R` contacts by mutual grant?**
+/// `Ok(bound)` when BOTH hold, `bound` the later of each side's matching
+/// grants' signed `expires_at` (one grant suffices per side), the earlier of
+/// the two sides:
+///
+/// 1. a live grant of `A` or of `A`'s owner names `R`, or names `R`'s owner
+///    (`R` bound to it), else [`TransitRefusal::NoGrantFromOwner`];
+/// 2. a live grant of `R` or of `R`'s owner names `A`'s owner, or names `A`
+///    (`A` bound to it), else [`TransitRefusal::NoReciprocalGrant`].
+///
+/// "A grant of X" is persist's existing consent read: X's own live grants
+/// and its stewards' grants FOR it (`consent_by_humans::live_egress_grants_by_principals`,
+/// the rows behind `consent_peers_by_principals` / `send_set_for`), plus the
+/// owner's own live grants (`list_live_consent_grants_by(owner)`). That path
+/// applies NO scope filter, so none is bypassed: any scope counts (carrying
+/// sealed ciphertext delivers none of the grant's content). "Live" is the
+/// revocation-folded projection the reads serve, and a grant whose signed
+/// `expires_at` has passed counts for nothing.
+///
+/// # Errors
+/// Directory reads.
+async fn contact_grants(
+    directory: &dyn FederationDirectory,
+    a: &str,
+    a_owner: Option<&str>,
+    r: &str,
+    r_owner: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Result<Option<chrono::DateTime<chrono::Utc>>, TransitRefusal>, Error> {
+    let a_rows = grants_of(directory, a, a_owner).await?;
+    let mut a_targets = vec![r];
+    a_targets.extend(r_owner);
+    let Some(a_bound) = latest_bound_naming(&a_rows, &a_targets, now) else {
+        return Ok(Err(TransitRefusal::NoGrantFromOwner));
+    };
+    let r_rows = grants_of(directory, r, r_owner).await?;
+    let mut r_targets = vec![a];
+    r_targets.extend(a_owner);
+    let Some(r_bound) = latest_bound_naming(&r_rows, &r_targets, now) else {
+        return Ok(Err(TransitRefusal::NoReciprocalGrant));
+    };
+    Ok(Ok(earlier_bound(a_bound, r_bound)))
+}
+
+/// The live `consent:replication:v1` grants of `node` (its own and its
+/// stewards' for it) and of its owner.
+async fn grants_of(
+    directory: &dyn FederationDirectory,
+    node: &str,
+    owner: Option<&str>,
+) -> Result<Vec<Attestation>, Error> {
+    let mut rows =
+        super::consent_by_humans::live_egress_grants_by_principals(directory, node).await?;
+    if let Some(o) = owner {
+        rows.extend(directory.list_live_consent_grants_by(o).await?);
+    }
+    Ok(rows)
+}
+
+/// The latest signed bound of the unexpired `rows` naming any of `targets`
+/// in `subject_key_ids`: `None` when none names one; `Some(None)` when one is
+/// unbounded.
+fn latest_bound_naming(
+    rows: &[Attestation],
+    targets: &[&str],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Option<chrono::DateTime<chrono::Utc>>> {
+    let mut best: Option<Option<chrono::DateTime<chrono::Utc>>> = None;
+    for g in rows {
+        if g.expires_at.is_some_and(|t| t <= now)
+            || !g
+                .subject_key_ids
+                .iter()
+                .any(|s| targets.contains(&s.as_str()))
+        {
+            continue;
+        }
+        best = Some(match (best, g.expires_at) {
+            (Some(None), _) | (_, None) => None,
+            (Some(Some(a)), Some(b)) => Some(a.max(b)),
+            (None, Some(b)) => Some(b),
+        });
+    }
+    best
 }
 
 /// v62.0.0 (RL-fix4) — `key`'s ONE live owner, or `None` (unowned, or two
@@ -5352,7 +5417,7 @@ mod charter_threshold_tests {
     /// as the reference the refactor onto `consensus::required_signatures` is
     /// measured against.
     fn pre_v49(cp: &str, roster_size: usize) -> usize {
-        let floor = ciris_verify_core::accord_genesis::strict_majority(roster_size);
+        let floor = crate::federation::admission::strict_majority(roster_size);
         let policy = match cp {
             "founder_only" | "majority" => floor,
             "unanimous" => roster_size,

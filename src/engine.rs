@@ -174,7 +174,7 @@ pub struct Engine {
     /// v2.12.0 (CIRISPersist#112) — preserved `LocalSigner`, when the
     /// Engine was constructed from one. The `signer` field above is
     /// the hybrid `HardwareSigner` trait object (post v1.13.0 / #92);
-    /// for [`Engine::sign_hybrid`] we need the underlying
+    /// for [`Engine::sign_composite`] we need the underlying
     /// [`LocalSigner`](crate::signing::LocalSigner) to reach
     /// `sign_hybrid` (which combines Ed25519 + ML-DSA-65 into a
     /// [`HybridSignature`](ciris_crypto::HybridSignature)). When the
@@ -213,7 +213,7 @@ pub struct Engine {
     trace_signers: Arc<[Arc<crate::signing::LocalSigner>]>,
 }
 
-/// v2.12.0 (CIRISPersist#112) — error from [`Engine::sign_hybrid`].
+/// v2.12.0 (CIRISPersist#112) — error from [`Engine::sign_composite`].
 #[derive(Debug, thiserror::Error)]
 pub enum SignError {
     /// The Engine has no `LocalSigner` to reach Ed25519 + ML-DSA-65
@@ -226,29 +226,19 @@ pub enum SignError {
     /// [`Engine::with_signer_arcs`] (or rebuild a LocalSigner from
     /// `PyEngine::keyring_signer()`'s
     /// [`KeyringSignerHandle`](crate::signing::KeyringSignerHandle))
-    /// for `sign_hybrid` to be available.
+    /// for `sign_composite` to be available.
     #[error(
-        "Engine has no LocalSigner — sign_hybrid requires construction via with_signer / \
+        "Engine has no LocalSigner — sign_composite requires construction via with_signer / \
          with_signer_arcs, not from_shared. Cohabitation consumers can rebuild a LocalSigner \
          from PyEngine::keyring_signer()."
     )]
     LocalSignerUnavailable,
 
-    /// The underlying [`LocalSigner::sign_hybrid`] call failed —
+    /// The underlying [`LocalSigner::sign_composite`] call failed —
     /// typically [`LocalSignerError::PqcNotConfigured`](crate::signing::LocalSignerError::PqcNotConfigured)
     /// when the engine's local signer is Ed25519-only.
     #[error(transparent)]
     LocalSigner(#[from] crate::signing::LocalSignerError),
-
-    /// v62.0.0 (v62 P8) — the earlier-form hybrid signature (Ed25519 over
-    /// the bytes, ML-DSA-65 over bytes ‖ ed25519_sig) once the earlier-form
-    /// doors are shut: this node signs edition-2 statements only
-    /// ([`Engine::sign_composite`], [`Engine::sign_draft`]).
-    #[error(
-        "earlier_form_object: sign_hybrid produces the earlier form, and the earlier-form doors \
-         are shut; sign a statement (Engine::sign_draft / sign_composite) (CC 2.6.1.12)"
-    )]
-    EarlierFormShut,
 }
 
 /// v6.5.0 (CIRISPersist#183, CEG §8.1.12.7) — one occurrence (app or
@@ -851,7 +841,7 @@ impl Engine {
     /// raw seed is read into the process when the signer is hardware-backed.
     ///
     /// `local_signer` is `None` (as in [`Engine::from_shared`]), so
-    /// [`Engine::sign_hybrid`] is unavailable on Engines built this way — a
+    /// [`Engine::sign_composite`] is unavailable on Engines built this way — a
     /// hardware signer performs its own signing through the [`HardwareSigner`]
     /// trait. This is the from-scratch counterpart to `from_shared` (which is
     /// cohabitation-only and runs no migrations).
@@ -904,7 +894,7 @@ impl Engine {
     /// [`ciris_crypto::HybridSignature`] — Ed25519 from the
     /// [`HardwareSigner`], ML-DSA-65 from the [`PqcSigner`](ciris_keyring::PqcSigner) — so the
     /// storage-tier scrub signature (the produce/promote path that calls
-    /// [`Engine::sign_hybrid`]) is hybrid **without ever unsealing the
+    /// [`Engine::sign_composite`]) is hybrid **without ever unsealing the
     /// Ed25519 key**.
     ///
     /// The `LocalSigner` is composed via
@@ -916,7 +906,7 @@ impl Engine {
     /// [`HardwareSigner::current_alias`].
     ///
     /// When `pqc` is `None`, the Engine behaves like a non-PQC
-    /// [`Engine::with_signer`]: [`Engine::sign_hybrid`] returns
+    /// [`Engine::with_signer`]: [`Engine::sign_composite`] returns
     /// [`SignError::LocalSigner(LocalSignerError::PqcNotConfigured)`](crate::signing::LocalSignerError::PqcNotConfigured).
     pub async fn with_hardware_signer_hybrid(
         classical: Arc<dyn HardwareSigner>,
@@ -1073,7 +1063,7 @@ impl Engine {
 
     /// v2.12.0 (CIRISPersist#112) — variant of [`Engine::from_shared`]
     /// that ALSO propagates the host's `LocalSigner`, enabling
-    /// [`Engine::sign_hybrid`] on the resulting Engine. The
+    /// [`Engine::sign_composite`] on the resulting Engine. The
     /// process-singleton accessor
     /// [`current_rust_engine`](crate::current_rust_engine) uses this
     /// when the host singleton has a LocalSigner (the typical
@@ -2910,52 +2900,10 @@ impl Engine {
         }
     }
 
-    /// v2.12.0 (CIRISPersist#112) — hybrid-sign canonical bytes with
-    /// the Engine's classical (Ed25519) + PQC (ML-DSA-65) identity.
-    /// Returns the standard
-    /// [`HybridSignature`](ciris_crypto::HybridSignature) shape
-    /// persist's signed-envelope discipline uses everywhere
-    /// (`federation_keys.scrub_signature_*`, V046
-    /// `delivery_attestation.signature_*`, etc.).
-    ///
-    /// Same closure pattern as [`Engine::receive_and_persist`] /
-    /// [`Engine::storage_summary`]: persist owns the underlying
-    /// primitive ([`LocalSigner::sign_hybrid`]); persist exposes a
-    /// clean Engine facade so co-resident Rust consumers
-    /// (CIRISLensCore client-mode trace signing, EgressFilter
-    /// re-signing) don't reach past the
-    /// `Arc<dyn HardwareSigner>` abstraction.
-    ///
-    /// Returns [`SignError::LocalSignerUnavailable`] when the Engine
-    /// was constructed via [`Engine::from_shared`] (no LocalSigner
-    /// propagation — the cohabitation accessor path); rebuild the
-    /// caller-side LocalSigner from
-    /// `PyEngine::keyring_signer()`'s
-    /// [`KeyringSignerHandle`](crate::signing::KeyringSignerHandle) in that
-    /// case. Returns
-    /// [`SignError::LocalSigner(LocalSignerError::PqcNotConfigured)`](crate::signing::LocalSignerError::PqcNotConfigured)
-    /// when the Engine has a LocalSigner but no PQC identity
-    /// configured (Ed25519-only deployments).
-    pub async fn sign_hybrid(
-        &self,
-        message: &[u8],
-    ) -> Result<ciris_crypto::HybridSignature, SignError> {
-        // v62.0.0 (v62 P8) — the earlier form, only behind the switch.
-        if crate::federation::edition2::door::earlier_form_doors_shut() {
-            return Err(SignError::EarlierFormShut);
-        }
-        let local = self
-            .local_signer
-            .as_ref()
-            .ok_or(SignError::LocalSignerUnavailable)?;
-        let sig = local.sign_hybrid(message).await?;
-        Ok(sig)
-    }
-
     /// v62.0.0 (v62 P8; CC 2.6.1) — **this engine's composite signature**
     /// (ML-DSA-65 ‖ Ed25519, one atomic signature) over `message`, which
     /// for a statement is its COSE `Sig_structure`. The edition-2 successor
-    /// of [`Self::sign_hybrid`].
+    /// of [`Self::sign_composite`].
     ///
     /// # Errors
     /// [`SignError::LocalSignerUnavailable`] without a local signer;
@@ -3305,123 +3253,6 @@ impl Engine {
         }
     }
 
-    /// v44.7.0 (CIRISPersist#864, `FSD/KEY_RECORD_REBIND.md` §4) — the
-    /// SELF-HEAL door: rebind THIS engine's own registration (the key
-    /// `register_self_federation_key` minted) without re-registering. The
-    /// claim is copied from the STORED row — `identity_ref`, `valid_from`,
-    /// `valid_until`, roles, evidence — so nothing but the envelope binding
-    /// and the signatures can move; `identity_type` is taken as an argument
-    /// only so a caller states which row it believes it holds, and a
-    /// mismatch is `RebindChangesRecord` before anything is signed. A row
-    /// that already binds its subject is `Unchanged`; a row not under this
-    /// engine's keys is `PubkeySwap`; no row is `RecordAbsent`. Otherwise the
-    /// envelope is bound (`bind_subject_into_envelope`), hashed and signed
-    /// exactly as `register_self_federation_key` does, and offered to
-    /// [`rebind_key_record`](Self::rebind_key_record) — one rule, one door.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn rebind_self_federation_key(
-        &self,
-        identity_type: &str,
-    ) -> Result<crate::federation::register::RebindOutcome, crate::federation::Error> {
-        use crate::federation::register::{KeyRefusalReason, RebindOutcome};
-        use crate::verify::canonical::ceg_produce_canonicalize;
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use sha2::{Digest, Sha256};
-
-        let key_id = self.local_derived_key_id().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("rebind_self derive key_id: {e}"))
-        })?;
-        let directory = self.federation_directory();
-        let Some(existing) = directory.lookup_public_key(&key_id).await? else {
-            return Ok(RebindOutcome::Refused {
-                reason: KeyRefusalReason::RecordAbsent,
-            });
-        };
-        if existing.identity_type != identity_type {
-            return Ok(RebindOutcome::Refused {
-                reason: KeyRefusalReason::RebindChangesRecord,
-            });
-        }
-        if crate::federation::admission::verify_envelope_binds_subject(&existing).is_ok() {
-            return Ok(RebindOutcome::Unchanged);
-        }
-        let pubkey = self.signer.public_key().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("rebind_self signer public_key: {e}"))
-        })?;
-        let pubkey_ed25519_base64 = B64.encode(&pubkey);
-        let pqc_pubkey_b64 = match self.local_signer.as_ref() {
-            Some(ls) => ls.pqc_public_key_b64().await.map_err(|e| {
-                crate::federation::Error::Backend(format!("rebind_self pqc public_key: {e}"))
-            })?,
-            None => None,
-        };
-        if existing.pubkey_ed25519_base64 != pubkey_ed25519_base64
-            || existing.pubkey_ml_dsa_65_base64 != pqc_pubkey_b64
-        {
-            return Ok(RebindOutcome::Refused {
-                reason: KeyRefusalReason::PubkeySwap,
-            });
-        }
-
-        let mut registration_envelope = existing.registration_envelope.clone();
-        // v61 (CC 2.6.2) — the expiry binds as `.sssZ`, at the
-        // millisecond; the record carries the same truncated instant.
-        let valid_until = existing
-            .valid_until
-            .map(crate::federation::admission::truncate_to_substrate_resolution);
-        let valid_until_text = valid_until.map(crate::federation::admission::render_signed_instant);
-        crate::federation::admission::bind_subject_into_envelope(
-            &mut registration_envelope,
-            &key_id,
-            identity_type,
-            &pubkey_ed25519_base64,
-            pqc_pubkey_b64.as_deref(),
-            valid_until_text.as_deref(),
-        )
-        .map_err(crate::federation::Error::InvalidArgument)?;
-        let canonical = ceg_produce_canonicalize(&registration_envelope).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!(
-                "rebind_self registration_envelope canonicalize: {e}"
-            ))
-        })?;
-        let original_content_hash = hex::encode(Sha256::digest(&canonical));
-        let now = {
-            use chrono::Timelike as _;
-            let dt = crate::host::clock::now();
-            let micros = dt.nanosecond() / 1000;
-            dt.with_nanosecond(micros * 1000).unwrap_or(dt)
-        };
-        let (scrub_signature_classical, scrub_signature_pqc, pqc_completed_at) =
-            if pqc_pubkey_b64.is_some() {
-                let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
-                    crate::federation::Error::Backend(format!("rebind_self hybrid sign: {e}"))
-                })?;
-                (
-                    B64.encode(&sig.classical.signature),
-                    Some(B64.encode(&sig.pqc.signature)),
-                    Some(now),
-                )
-            } else {
-                let classical_sig = self.signer.sign(&canonical).await.map_err(|e| {
-                    crate::federation::Error::Backend(format!("rebind_self classical sign: {e}"))
-                })?;
-                (B64.encode(&classical_sig), None, None)
-            };
-        let record = crate::federation::KeyRecord {
-            registration_envelope,
-            original_content_hash,
-            scrub_signature_classical,
-            scrub_signature_pqc,
-            scrub_timestamp: now,
-            pqc_completed_at,
-            persist_row_hash: String::new(),
-            valid_until,
-            ..existing
-        };
-        self.rebind_key_record(crate::federation::SignedKeyRecord { record })
-            .await
-    }
-
     /// v19.2.0 (CIRISPersist#493) — the node's own content-tier
     /// self-encryption pubkeys (x25519 + ML-KEM-768), derived internally
     /// from the engine's local signing seed via `ciris_crypto::self_enc`.
@@ -3441,64 +3272,15 @@ impl Engine {
         signer.self_enc_pubkeys()
     }
 
-    /// v21.0.0 (CIRISPersist#502 E4 followup) — put a `community` the NODE
-    /// authors, SELF-SIGNING the authority signature with the node's own
-    /// registered key. `put_community_json` (a local create-my-community
-    /// wheel API, not a wire path) uses this when the caller supplies no
-    /// authority signature — the node IS the authority for a community it
-    /// creates, so it signs the record's canonical form
-    /// (`ceg_produce_canonicalize(signing_envelope)`) exactly as the
-    /// admission gate re-verifies it.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn put_community_self_signed(
-        &self,
-        community: crate::federation::types::Community,
-    ) -> Result<(), crate::federation::Error> {
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        // v62.0.0 (v62 P8) — the earlier form, only behind the switch; the
-        // edition-2 producer is `Self::state_community_founding`.
-        crate::federation::edition2::door::refuse_earlier_form("put_community_self_signed")?;
-        let authority_key_id = self
-            .local_derived_key_id()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("self-sign community: {e}")))?;
-        let canonical =
-            crate::verify::canonical::ceg_produce_canonicalize(&community.signing_envelope())
-                .map_err(|e| crate::federation::Error::Backend(format!("canonicalize: {e}")))?;
-        let sig = self
-            .sign_hybrid(&canonical)
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("self-sign community: {e}")))?;
-        let signed = crate::federation::SignedCommunity {
-            community,
-            authority_key_id,
-            scrub_signature_classical: B64.encode(&sig.classical.signature),
-            scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
-            supersede_proof: None,
-            cosignatures: Vec::new(),
-            lineage: Vec::new(),
-        };
-        match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => {
-                crate::federation::FederationDirectory::put_community(&**b, signed).await
-            }
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => {
-                crate::federation::FederationDirectory::put_community(&**b, signed).await
-            }
-        }
-    }
-
     /// v62.0.0 (v62 P8; CC 2.4.1.1, T1's group plane) — **found a community
     /// on the clean mesh**: its roster version 1 (`group:roster`, `sub` = the
     /// community key, `edition2::group::roster_payload`) signed by this
     /// engine's composite key (`sign_row`) and offered through the statement
     /// door (`put_statement`). `Row` when it landed; `Pending` while members
     /// the founding roster lists have not voiced it (each voices the same
-    /// payload; `group::roster_payload` gives it to them). Replaces
-    /// [`Self::put_community_self_signed`], which is the earlier form, kept
-    /// behind the switch.
+    /// payload; `group::roster_payload` gives it to them). It replaced
+    /// `put_community_self_signed`, the earlier form, deleted in v62.0.0
+    /// (VA-pair-signing).
     ///
     /// # Errors
     /// `composite_signing_unavailable`; the group door's refusals.
@@ -3582,48 +3364,6 @@ impl Engine {
             BackendDispatch::Postgres(b) => state(b.as_ref(), signer, &event).await,
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => state(b.as_ref(), signer, &event).await,
-        }
-    }
-
-    /// v21.0.0 (#502 E4 followup) — the `put_family` twin of
-    /// [`Self::put_community_self_signed`].
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn put_family_self_signed(
-        &self,
-        family: crate::federation::types::Family,
-    ) -> Result<(), crate::federation::Error> {
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        // v62.0.0 (v62 P8) — the earlier form, only behind the switch; the
-        // edition-2 producer is `Self::state_family_founding`.
-        crate::federation::edition2::door::refuse_earlier_form("put_family_self_signed")?;
-        let authority_key_id = self
-            .local_derived_key_id()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("self-sign family: {e}")))?;
-        let canonical =
-            crate::verify::canonical::ceg_produce_canonicalize(&family.signing_envelope())
-                .map_err(|e| crate::federation::Error::Backend(format!("canonicalize: {e}")))?;
-        let sig = self
-            .sign_hybrid(&canonical)
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("self-sign family: {e}")))?;
-        let signed = crate::federation::SignedFamily {
-            family,
-            authority_key_id,
-            scrub_signature_classical: B64.encode(&sig.classical.signature),
-            scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
-            supersede_proof: None,
-            cosignatures: Vec::new(),
-        };
-        match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => {
-                crate::federation::FederationDirectory::put_family(&**b, signed).await
-            }
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => {
-                crate::federation::FederationDirectory::put_family(&**b, signed).await
-            }
         }
     }
 
@@ -3837,15 +3577,12 @@ impl Engine {
     /// signer of the row's attester, when the caller holds it; the engine's own
     /// composed signer stands in when this node IS the attester.
     ///
-    /// Who signs is [`Self::custody_for`]'s one decision:
-    ///
-    /// | row | signer in hand | custody |
-    /// |---|---|---|
-    /// | signed at write by another key | — | node **co-scrubs** (`additional_scrubs`, `cosigned_at`) |
-    /// | signed at write by this node | — | the existing base scrub is re-offered |
-    /// | unsigned, attested by this node | — | this node signs as the actor |
-    /// | unsigned, attested by another key | that key's signer | the actor signs now |
-    /// | unsigned, attested by another key | none | **`AwaitingActor`** — it waits |
+    /// v62.0.0 (VA-pair-signing): a row crosses on its own edition-2
+    /// statement (`TierPromotionCustody::Statement`), or an earlier-form
+    /// local row is RESTATED as one (`restate_local_row`, signed by its
+    /// actor's composite key). The earlier-form custody table (a node
+    /// co-scrub, a re-offered base scrub, an actor's separate pair; the
+    /// deleted `custody_for`) is gone.
     ///
     /// Everything the directory then verifies and refuses is in
     /// [`crate::federation::crossing`]. Returns the typed
@@ -3912,23 +3649,16 @@ impl Engine {
                 ));
             }
         }
-        // v62.0.0 (v62 P8) — the earlier form crosses only while its doors
-        // are open. Once they are shut, an earlier-form local row (unsigned,
-        // or signed over its JCS image at write) is RESTATED: its members as
-        // an edition-2 statement at its scope, signed by its actor's
-        // composite key through `sign_row` and admitted through the statement
-        // door (`put_statement`), exactly as P3 restates a local hard_case.
-        // The local row stays local; `Crossed` names the stated row.
-        if crate::federation::edition2::door::earlier_form_doors_shut() {
-            return self.restate_local_row(&row, actor).await;
-        }
-        let Some(custody) = self.custody_for(&row, actor).await? else {
-            return Ok(MeshCrossingOutcome::AwaitingActor {
-                age_ms: (crate::host::clock::now() - row.asserted_at).num_milliseconds(),
-                attestation_id: row.attestation_id,
-            });
-        };
-        dir.enter_mesh(attestation_id, ci, &custody).await
+        // v62.0.0 (v62 P8; VA-pair-signing) — an earlier-form local row
+        // (unsigned, or signed over its JCS image at write) is RESTATED: its
+        // members as an edition-2 statement at its scope, signed by its
+        // actor's composite key through `sign_row` and admitted through the
+        // statement door (`put_statement`), exactly as P3 restates a local
+        // hard_case. The local row stays local; `Crossed` names the stated
+        // row. The earlier-form crossing (`custody_for`: a JCS re-offer, a
+        // node co-scrub or an actor's separate Ed25519 + ML-DSA-65 pair) is
+        // DELETED: it ran only while the earlier-form doors were open.
+        self.restate_local_row(&row, actor).await
     }
 
     /// v62.0.0 (v62 P8) — **a local-tier, `self`-scoped `scores` row about
@@ -4097,9 +3827,7 @@ impl Engine {
         actor: Option<&crate::signing::LocalSigner>,
         strip: &[String],
     ) -> Result<crate::federation::MeshCrossingOutcome, crate::federation::Error> {
-        use crate::federation::{
-            attestation_emit, crossing, Error, MeshCrossingOutcome, SignedAttestation,
-        };
+        use crate::federation::{crossing, Error};
         let dir = self.federation_directory();
         let prior = dir
             .get_attestation(prior_attestation_id)
@@ -4112,63 +3840,15 @@ impl Engine {
         // Cheapest refusal first: no signing for a target that cannot be a
         // widening.
         crossing::check_strictly_wider(&prior, ci.recipient_see.cohort_scope())?;
-        // v62.0.0 (v62 P8) — an edition-2 prior widens by RESTATEMENT (its
-        // payload at the wider audience, signed by its actor through
-        // `sign_row`, admitted through `put_statement`); and once the
-        // earlier-form doors are shut, nothing below (a JCS `supersedes`
-        // signed over `stamp_and_canonicalize`) runs at all.
-        if crate::federation::edition2::emit::carried_statement(&prior).is_some()
-            || crate::federation::edition2::door::earlier_form_doors_shut()
-        {
-            return self.widen_by_restatement(&prior, ci, actor, strip).await;
-        }
-        let node = self
-            .local_derived_key_id()
-            .await
-            .map_err(|e| Error::Backend(format!("widen_audience derive key_id: {e}")))?;
-        let actor = if prior.attesting_key_id == node {
-            None
-        } else {
-            match actor {
-                Some(a) if a.federation_id().await == prior.attesting_key_id => Some(a),
-                Some(a) => {
-                    return Err(Error::CustodyIsNotTheActor {
-                        attestation_id: prior.attestation_id,
-                        attesting_key_id: prior.attesting_key_id,
-                        scrub_key_id: a.federation_id().await,
-                    })
-                }
-                None => {
-                    return Ok(MeshCrossingOutcome::AwaitingActor {
-                        age_ms: (crate::host::clock::now() - prior.asserted_at).num_milliseconds(),
-                        attestation_id: prior.attestation_id,
-                    })
-                }
-            }
-        };
-        // ONE instant for both: `widened_at` (the act) and whatever
-        // `stamp_and_canonicalize` still needs to fill.
-        let now = crate::host::clock::now();
-        let mut input = crossing::build_widening(&prior, &ci.recipient_see, strip, now)?;
-        let canonical =
-            attestation_emit::stamp_and_canonicalize(&mut input, &prior.attesting_key_id, now)?;
-        let sig = match actor {
-            Some(a) => a.sign_hybrid(&canonical).await.map_err(|e| {
-                Error::Backend(format!("widen_audience: the actor's signer failed: {e}"))
-            })?,
-            None => self
-                .sign_hybrid(&canonical)
-                .await
-                .map_err(|e| Error::Backend(format!("widen_audience sign_hybrid: {e}")))?,
-        };
-        let (row, _emitted) =
-            attestation_emit::assemble(prior.attesting_key_id.clone(), &canonical, sig, input)?;
-        dir.widen_audience(
-            prior_attestation_id,
-            ci,
-            SignedAttestation { attestation: row },
-        )
-        .await
+        // v62.0.0 (v62 P8; VA-pair-signing) — a prior widens by RESTATEMENT:
+        // its payload at the wider audience, signed by its actor through
+        // `sign_row` (one composite), admitted through `put_statement`. The
+        // earlier-form widening (a JCS `supersedes` signed with a separate
+        // Ed25519 + ML-DSA-65 pair and assembled by
+        // `attestation_emit::assemble`) is DELETED: it ran only while the
+        // earlier-form doors were open.
+        let _ = dir;
+        self.widen_by_restatement(&prior, ci, actor, strip).await
     }
 
     /// v62.0.0 (v62 P8; CC 4.4.3.3.1 / 8.1.5 on the clean mesh) — **widen an
@@ -4217,106 +3897,6 @@ impl Engine {
         crossing::widen_by_restatement(&*dir, prior, ci, signer, strip).await
     }
 
-    /// **The one place that decides who signs a tier crossing.** See the table
-    /// on [`Self::enter_mesh`]. `Ok(None)` is "the actor is not in hand" — the
-    /// row waits. A signer that is in hand but is NOT the attester is refused
-    /// rather than ignored: a caller handing over the wrong key is a bug worth
-    /// surfacing, not a reason to wait.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    async fn custody_for(
-        &self,
-        row: &crate::federation::Attestation,
-        actor: Option<&crate::signing::LocalSigner>,
-    ) -> Result<Option<crate::federation::TierPromotionCustody>, crate::federation::Error> {
-        use crate::federation::{
-            crossing, types::ScrubSig, AttestationReseal, Error, TierPromotionCustody,
-        };
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-
-        // v62.0.0 (v62 P8) — the earlier-form custody (a JCS re-offer, a JCS
-        // co-scrub, a JCS actor signature) exists only behind the
-        // earlier-form switch, and never for an edition-2 row, which crosses
-        // on its own statement (`Self::enter_mesh`).
-        crate::federation::edition2::door::refuse_earlier_form("enter_mesh")?;
-        if crate::federation::edition2::emit::carried_statement(row).is_some() {
-            return Err(Error::InvalidArgument(format!(
-                "custody_for: {} is an edition-2 row; it crosses on its own statement",
-                row.attestation_id
-            )));
-        }
-        let node = self
-            .local_derived_key_id()
-            .await
-            .map_err(|e| Error::Backend(format!("custody_for derive key_id: {e}")))?;
-        let mut envelope = row.attestation_envelope.clone();
-        let (bytes, hash) = crossing::canonical_bytes(&mut envelope)?;
-        let node_is_actor = row.attesting_key_id == node;
-
-        if !row.scrub_signature_classical.is_empty() {
-            if node_is_actor {
-                // Signed at write by this node: the base scrub already IS the
-                // actor's. Re-offer it; the directory re-verifies it.
-                return Ok(Some(TierPromotionCustody::ActorSigned(AttestationReseal {
-                    attestation_envelope: envelope,
-                    original_content_hash: row.original_content_hash.clone(),
-                    scrub_signature_classical: row.scrub_signature_classical.clone(),
-                    scrub_signature_pqc: row.scrub_signature_pqc.clone(),
-                    scrub_key_id: row.scrub_key_id.clone(),
-                    scrub_timestamp: row.scrub_timestamp,
-                })));
-            }
-            let sig = self
-                .sign_hybrid(&bytes)
-                .await
-                .map_err(|e| Error::Backend(format!("custody_for co-scrub sign_hybrid: {e}")))?;
-            return Ok(Some(TierPromotionCustody::NodeCoScrub(ScrubSig {
-                scrub_key_id: node,
-                scrub_signature_classical: B64.encode(&sig.classical.signature),
-                scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
-                // The co-signer stamps the moment it signed (CC 2.6.7), here,
-                // where the signature is actually produced — not at the
-                // crossing, which writes this instant into the row and must
-                // write the same one on every backend.
-                cosigned_at: Some(crate::federation::admission::render_signed_instant(
-                    crate::host::clock::now(),
-                )),
-            })));
-        }
-        let (scrub_key_id, sig) = if node_is_actor {
-            let sig = self
-                .sign_hybrid(&bytes)
-                .await
-                .map_err(|e| Error::Backend(format!("custody_for sign_hybrid: {e}")))?;
-            (node, sig)
-        } else {
-            match actor {
-                Some(a) if a.derived_key_id() == row.attesting_key_id => {
-                    let sig = a.sign_hybrid(&bytes).await.map_err(|e| {
-                        Error::Backend(format!("custody_for: the actor's signer failed: {e}"))
-                    })?;
-                    (a.derived_key_id(), sig)
-                }
-                Some(a) => {
-                    return Err(Error::CustodyIsNotTheActor {
-                        attestation_id: row.attestation_id.clone(),
-                        attesting_key_id: row.attesting_key_id.clone(),
-                        scrub_key_id: a.derived_key_id(),
-                    })
-                }
-                None => return Ok(None),
-            }
-        };
-        Ok(Some(TierPromotionCustody::ActorSigned(AttestationReseal {
-            attestation_envelope: envelope,
-            original_content_hash: hash,
-            scrub_signature_classical: B64.encode(&sig.classical.signature),
-            scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
-            scrub_key_id,
-            scrub_timestamp: crate::federation::admission::truncate_to_substrate_resolution(
-                crate::host::clock::now(),
-            ),
-        })))
-    }
     /// re-cut in v39.0.0 over the two crossing verbs. Fires at both ends of
     /// the #509 design: right after THIS node admits a self-authored
     /// `consent:replication:v1` grant ([`Self::emit_attestation`]'s (c) hook)
@@ -4646,7 +4226,7 @@ impl Engine {
     ///
     /// Canonicalize ([`ceg_produce_canonicalize`](crate::verify::canonical::ceg_produce_canonicalize))
     /// → SHA-256 (`original_content_hash`) → hybrid-sign
-    /// ([`LocalSigner::sign_hybrid`](crate::signing::LocalSigner::sign_hybrid),
+    /// ([`LocalSigner::sign_composite`](crate::signing::LocalSigner::sign_composite),
     /// Ed25519 + ML-DSA-65 bound, the v9.0.0 / CC 5.3.2.4.3.1 PQC
     /// requirement) → assemble the 20-field
     /// [`Attestation`](crate::federation::Attestation) →
@@ -4713,7 +4293,7 @@ impl Engine {
     /// [`Attestation`](crate::federation::Attestation)
     /// → [`put_attestation`](crate::federation::FederationDirectory::put_attestation)
     /// recipe as [`Self::emit_attestation`], but signs via
-    /// [`Self::sign_hybrid`] and derives `attesting_key_id`/`scrub_key_id`
+    /// [`Self::sign_composite`] and derives `attesting_key_id`/`scrub_key_id`
     /// from [`Self::local_derived_key_id`] — so it works for **software**
     /// ([`Self::with_signer`]) AND **hardware-hybrid**
     /// ([`Self::with_hardware_signer_hybrid`]) engines alike.
@@ -14578,8 +14158,8 @@ mod tests {
     /// signature, and it verifies under the composite key built from the PQC
     /// half's public key and the HARDWARE signer's Ed25519 key. `sign_draft`
     /// assembles a statement whose signature member verifies over the
-    /// draft's `sig_structure` under the same key. The earlier-form
-    /// `sign_hybrid` is refused `EarlierFormShut` once the doors are shut.
+    /// draft's `sig_structure` under the same key. v62.0.0 (VA-pair-signing):
+    /// the earlier-form `sign_hybrid` is deleted.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn with_hardware_signer_hybrid_composes_valid_composite_sig() {
@@ -14649,12 +14229,8 @@ mod tests {
             )
             .expect("I2685: the statement's signature verifies over the sig_structure");
 
-        // (3) the earlier form, behind the switch.
-        let refused = engine.sign_hybrid(message).await;
-        assert!(
-            matches!(refused, Err(SignError::EarlierFormShut)),
-            "I2685: sign_hybrid is refused once the doors are shut: {refused:?}"
-        );
+        // (3) v62.0.0 (VA-pair-signing): `sign_hybrid` is DELETED; there is no
+        // earlier-form signer left to refuse.
     }
 
     /// A `with_hardware_signer_hybrid` Engine built WITHOUT a PQC half

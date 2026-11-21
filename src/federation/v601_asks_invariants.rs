@@ -746,3 +746,33 @@ mod tests {
         );
     }
 }
+
+/// **I2235** (VA-genesis-fns; Eric's rule) — persist's ONE majority pair: for
+/// every roster size, `strict_majority(n)` is the least count that is more
+/// than half (`2·m > n ≥ 2·(m − 1)`), `is_strict_majority(yes, n)` holds
+/// exactly from it, `accord_threshold` is it, and the local
+/// `accord_consensus_protocol` reads `quorum:{m}/{n}` (Verify 23.3.2's text).
+#[test]
+fn i2235_the_majority_helpers_agree() {
+    use crate::federation::admission::{accord_threshold, is_strict_majority, strict_majority};
+    for n in 0..64usize {
+        let m = strict_majority(n);
+        assert!(
+            2 * m > n && 2 * (m - 1) <= n,
+            "I2235: strict_majority({n}) = {m}"
+        );
+        assert_eq!(accord_threshold(n), m, "I2235: accord_threshold({n})");
+        for yes in 0..=n + 1 {
+            assert_eq!(
+                is_strict_majority(yes, n),
+                yes >= m,
+                "I2235: is_strict_majority({yes}, {n})"
+            );
+        }
+    }
+    assert_eq!(
+        crate::federation::group_membership_change::accord_consensus_protocol(3),
+        "quorum:2/3",
+        "I2235: the local accord_consensus_protocol"
+    );
+}

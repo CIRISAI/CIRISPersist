@@ -297,29 +297,6 @@ pub fn recompute_and_assert_root(
     Ok(())
 }
 
-/// v31.0.0 (CIRISPersist#657) — the base64 halves of a bound-hybrid
-/// signature, one projection for the producer, the witnesses and the
-/// receipts. v62.0.0: the delivery receipts' signature (still the hybrid
-/// shape; heads and cosignatures are composites).
-///
-/// A [`WitnessSignature`] carries the same
-/// [`HybridSignature`](ciris_crypto::HybridSignature) shape over the same
-/// [`SignedTreeHead::signing_bytes_of`] bytes, so it must be decomposed the
-/// same way — including the `ClassicalOnly ⇒ None` arm, which is what makes a
-/// classical-only cosignature fail hybrid-Strict instead of silently verifying
-/// on one leg. Two spellings of this projection would be one of them drifting.
-#[must_use]
-pub fn hybrid_signature_b64_parts(sig: &ciris_crypto::HybridSignature) -> (String, Option<String>) {
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine as _;
-    let ed25519_sig_b64 = B64.encode(&sig.classical.signature);
-    let pqc_sig_b64 = match sig.mode {
-        ciris_crypto::SignatureMode::ClassicalOnly => None,
-        _ => Some(B64.encode(&sig.pqc.signature)),
-    };
-    (ed25519_sig_b64, pqc_sig_b64)
-}
-
 /// v4.1 (Cut C1b) — RFC 6962 inclusion proof for `leaf_index` against a
 /// tree of `tree_size` leaves, built from the stream's chunk hashes.
 ///

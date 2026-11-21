@@ -331,7 +331,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 4.5.3	CLM-takedown	CIRISPersist	src/cirisnode/takedown_handler.rs#process_takedown_admission	ciris-persist@61.4.2	413adffa1807a69095ec8254e54b2cef5473a9d3ca5b35c2c12fb44ffe66f36a
 5.3.2.3	CLM-merge	CIRISPersist	src/federation/admission.rs#check_partner_record_revision	ciris-persist@61.4.2	10fc804caeac4d5942e32bc5573e7496b58c6e20cd876d869a484852f501e898
 5.3.2.4	CLM-attestation-tier	CIRISPersist	src/federation/admission.rs#check_local_tier_eligibility	ciris-persist@61.4.2	b59ae20eeeac2468014fb3e6069c4a34fef175629375f759c99f0ce7bcb66ba2
-5.3.2.6	CLM-local	CIRISPersist	src/engine.rs#Engine::enter_mesh	ciris-persist@61.4.2	09f6b289db0e13bab2fb637a933c74e1655729f8b87b75114dd0d00af95fac24
+5.3.2.6	CLM-local	CIRISPersist	src/engine.rs#Engine::enter_mesh	ciris-persist@61.4.2	e808938011f859085bdcd97eca96b33895e9e8524b5fd21f90c3d9f292b3c4b8
 5.3.3.1	CLM-stream	CIRISPersist	src/federation/stream_seal.rs#seal_stream_chunk	ciris-persist@61.4.2	e8d3b7980a274442d862f956dff7b76a1e87de9eb993d29eef7d1ee18d6b1f1a
 5.3.3.1	CLM-stream	CIRISPersist	src/federation/stream_seal.rs#open_stream_chunk	ciris-persist@61.4.2	aa90d067ef3a7ee7097144b49b5f4a4990bd0f6f9f1f36fdcdeb2f41267d99a0
 5.3.3.11	CLM-delivery	CIRISPersist	src/store/sqlite.rs#put_delivery_receipt	ciris-persist@61.4.2	3cd1358aa3ef697d965c9bd42d68ecae9a45ed04fce52f02e9c28fb22d2deb1f

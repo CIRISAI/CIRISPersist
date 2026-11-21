@@ -347,7 +347,7 @@ where
         super::edition2::group::vouched_quorum_signers(&proof.change_envelope).unwrap_or_default();
     let signed: std::collections::BTreeSet<&String> =
         standing.iter().filter(|k| vouched.contains(*k)).collect();
-    Ok(signed.len() >= ciris_verify_core::accord_genesis::strict_majority(standing.len()))
+    Ok(signed.len() >= crate::federation::admission::strict_majority(standing.len()))
 }
 
 /// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
@@ -1656,9 +1656,9 @@ pub mod test_support {
         })
     }
 
-    /// v39.0.0 — widen `prior` to `scope` by a `supersedes` signed by the
-    /// prior's attester (its deterministic test key), through the ONE widening
-    /// path (`FederationDirectory::widen_audience`). `strip` names payload
+    /// v39.0.0 — widen `prior` to `scope` by a `supersedes` (v62.0.0: the
+    /// earlier row shape, unsigned) through the ONE widening path
+    /// (`FederationDirectory::widen_audience`). `strip` names payload
     /// members omitted on the way (listed in `differs_in`).
     pub async fn widen<D: crate::federation::FederationDirectory + ?Sized>(
         dir: &D,
@@ -1672,12 +1672,10 @@ pub mod test_support {
         let mut input = crossing::build_widening(prior, &ci.recipient_see, strip, now)?;
         let canonical =
             attestation_emit::stamp_and_canonicalize(&mut input, &prior.attesting_key_id, now)?;
-        let sig = local_signer(&prior.attesting_key_id)
-            .sign_hybrid(&canonical)
-            .await
-            .expect("test signer signs");
+        // v62.0.0 (VA-pair-signing) — the earlier-form widening row, unsigned
+        // (no separate pair is minted); the door refuses the earlier form.
         let (row, _) =
-            attestation_emit::assemble(prior.attesting_key_id.clone(), &canonical, sig, input)?;
+            attestation_emit::assemble(prior.attesting_key_id.clone(), &canonical, input)?;
         dir.widen_audience(
             &prior.attestation_id,
             &ci,
@@ -3446,6 +3444,13 @@ pub mod test_support {
     /// minor-band STANDING protections, in both arrival orders** (class 2,
     /// judged against the rows held now, `age::age_band_held`):
     ///
+    /// Invariant names (CIRISKernel StandingProtection, PR #11): I2048 and
+    /// I2049 witness Inv_NoMinorAnnounced, Prop_MinorPullsBack and
+    /// Prop_WithdrawalRestores; I2050 Prop_MinorPullsBack and
+    /// Prop_WithdrawalRestores on the CC 3.2 owner count; I2057 the
+    /// graduation case (MinorSuspend Inv_NewestStands on a standing
+    /// protection).
+    ///
     /// - **I2048** — a federation owner-binding lands (the owner has no age
     ///   row: it counts); THEN the owner self-declares minor: the promotion
     ///   re-folds to HELD (`minor_owner_binding_at_federation`), owns
@@ -3456,6 +3461,11 @@ pub mod test_support {
     /// - **I2056** (K2-fix20) — `age::may_publish_federation_rendezvous`:
     ///   no age row allows; a held minor row refuses, for the person and for
     ///   the node they own; withdrawn allows.
+    /// - **I2057** (K2-fix21; graduation, Constitution 2026-11-20) — a minor
+    ///   row, then the SAME signer's later adult row, held under a
+    ///   federation owner-binding: the newer row is the signer's current
+    ///   row, the band is no longer minor, and the promotion is restored
+    ///   with NO withdrawal.
     /// - **I2050** — a `self`-scope owner-binding (no announce): the owner
     ///   later reads minor, and the binding counts for nothing (`owner_of`
     ///   `None`); withdrawn, it counts again. The other order too.
@@ -3634,6 +3644,41 @@ pub mod test_support {
             owner(n4.clone()).await,
             Some(e2::kid(&o4)),
             "({suffix}) I2050: counts"
+        );
+
+        // ── I2057 (K2-fix21; StandingProtection graduation): a minor row,
+        // then the SAME signer's later self-declared adult row; the
+        // federation binding concludes again with no withdrawal (the newer
+        // row stands: the self-declared adult raises nothing, but it is the
+        // subject's current row, so the band reads no minor).
+        let (o6, n6) = (k("o6"), k("n6"));
+        register_user_role_key(dir, &o6).await;
+        register_hybrid_key(dir, &n6).await;
+        let b6 = binding(&o6, &n6, cohort_scope::FEDERATION);
+        put_sealed_owner_binding(dir, &b6, &n6)
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2057: the binding lands: {e}"));
+        let m6 = declare_minor(o6.clone()).await;
+        assert!(
+            held_minor(b6.clone()).await && owner(n6.clone()).await.is_none(),
+            "({suffix}) I2057: the minor row holds the promotion (Prop_MinorPullsBack)"
+        );
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut grown = bare_attestation(&id, &o6, &o6, &serde_json::json!({ "id": id }));
+        grown.attestation_type = "age_self_declared:band:adult:v1".to_owned();
+        grown.asserted_at = m6.asserted_at + chrono::Duration::seconds(1);
+        grown.scrub_timestamp = grown.asserted_at;
+        seal_row_in_place(&o6, &mut grown);
+        e2::put_signed(dir, &grown)
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2057: the later self-declaration: {e}"));
+        assert!(
+            !held_minor(b6.clone()).await && owner(n6.clone()).await == Some(e2::kid(&o6)),
+            "({suffix}) I2057: the same signer's newer row stands; restored with no withdrawal"
+        );
+        assert!(
+            owns(o6.clone(), n6.clone()).await,
+            "({suffix}) I2057: discoverable again"
         );
 
         // ── I2056 (K2-fix20; CC 5.4.6 rc22) — the producing node's
@@ -4904,7 +4949,7 @@ pub mod test_support {
             return founders.into_iter().take(1).collect();
         }
         if p == cp::MAJORITY {
-            return take(all.len() / 2 + 1);
+            return take(crate::federation::admission::strict_majority(all.len()));
         }
         if let Some(need) = crate::federation::consensus::required_signatures(p, all.len()) {
             return take(need);
@@ -5030,7 +5075,7 @@ pub mod test_support {
             return founders.into_iter().take(1).collect();
         }
         if p == cp::MAJORITY {
-            return take(all.len() / 2 + 1);
+            return take(crate::federation::admission::strict_majority(all.len()));
         }
         if let Some(need) = crate::federation::consensus::required_signatures(p, all.len()) {
             return take(need);

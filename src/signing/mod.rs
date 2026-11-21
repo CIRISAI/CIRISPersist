@@ -31,12 +31,10 @@
 //! // Hot-path Ed25519 sign.
 //! let sig: [u8; 64] = signer.sign_ed25519(canonical_bytes)?;
 //!
-//! // Cold-path ML-DSA-65 sign (3309 bytes; FIPS 204 final).
-//! let pqc_sig: Vec<u8> = signer.sign_ml_dsa_65(canonical_bytes).await?;
-//!
-//! // Hybrid (Ed25519 + ML-DSA-65 over canonical || classical_sig)
-//! // matching CIRISVerify's HybridSignature spec.
-//! let hybrid = signer.sign_hybrid(canonical_bytes).await?;
+//! // The composite (ML-DSA-65-Ed25519, CC 2.6.1.7): the one signature a
+//! // peer verifies. v62.0.0 (VA-pair-signing): the lone ML-DSA-65 signer and
+//! // the separate-pair `sign_hybrid` are deleted.
+//! let composite: Vec<u8> = signer.sign_composite(canonical_bytes).await?;
 //! ```
 //!
 //! # Both-or-neither PQC config
@@ -45,8 +43,7 @@
 //! without the other returns
 //! [`LocalSignerError::PqcConfigInconsistent`]. When neither is
 //! configured, the signer is Ed25519-only —
-//! [`LocalSigner::sign_ml_dsa_65`] and
-//! [`LocalSigner::sign_hybrid`] return
+//! [`LocalSigner::sign_composite`] returns
 //! [`LocalSignerError::PqcNotConfigured`].
 //!
 //! # Seed-management discipline
@@ -63,10 +60,6 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use ciris_crypto::{
-    ClassicalAlgorithm, HybridSignature, PqcAlgorithm, SignatureMode, TaggedClassicalSignature,
-    TaggedPqcSignature, CRYPTO_KIND_CIRIS_V1,
-};
 use ciris_keyring::{HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ed25519_dalek::{Signer as _, SigningKey};
 
@@ -130,7 +123,7 @@ pub enum LocalSignerError {
         detail: String,
     },
 
-    /// `sign_ml_dsa_65` or `sign_hybrid` called when the signer
+    /// `sign_composite` called when the signer
     /// was constructed without PQC config.
     #[error("PQC local not configured (set pqc_key_id + pqc_key_path)")]
     PqcNotConfigured,
@@ -147,7 +140,7 @@ pub enum LocalSignerError {
     /// the structural case where the synchronous
     /// [`LocalSigner::sign_ed25519`] hot-path is called on a hardware
     /// classical signer (whose `sign` is async): use
-    /// [`LocalSigner::sign_hybrid`] instead.
+    /// [`LocalSigner::sign_composite`] instead.
     #[error("classical (Ed25519) sign: {0}")]
     ClassicalSign(String),
     /// v19.2.0 (CIRISPersist#493) — self-enc derivation requires the raw
@@ -448,7 +441,7 @@ impl LocalSigner {
     /// ([`ClassicalSigner::Hardware`]) signs through the async
     /// [`HardwareSigner`] trait, so it returns
     /// [`LocalSignerError::ClassicalSign`] here — use
-    /// [`Self::sign_hybrid`] (the deliverable path for a hardware-hybrid
+    /// [`Self::sign_composite`] (the deliverable path for a hardware-hybrid
     /// signer). The software-identity caller that uses this hot path (the
     /// secrets client) always holds a plaintext signer.
     pub fn sign_ed25519(&self, message: &[u8]) -> Result<[u8; 64], LocalSignerError> {
@@ -456,80 +449,10 @@ impl LocalSigner {
             ClassicalSigner::Plaintext(sk) => Ok(sk.sign(message).to_bytes()),
             ClassicalSigner::Hardware { .. } => Err(LocalSignerError::ClassicalSign(
                 "synchronous sign_ed25519 is unavailable for a hardware-custodied classical key \
-                 (its HardwareSigner::sign is async); use sign_hybrid"
+                 (its HardwareSigner::sign is async); use sign_composite"
                     .to_string(),
             )),
         }
-    }
-
-    /// ML-DSA-65 sign canonical bytes. Returns the 3309-byte
-    /// signature (FIPS 204 final). Async because the underlying
-    /// `PqcSigner` trait is async — HW post-quantum signers may
-    /// require async I/O when they land.
-    ///
-    /// Returns [`LocalSignerError::PqcNotConfigured`] if the signer
-    /// was constructed without PQC config.
-    pub async fn sign_ml_dsa_65(&self, message: &[u8]) -> Result<Vec<u8>, LocalSignerError> {
-        let signer = self
-            .pqc_signer
-            .as_ref()
-            .ok_or(LocalSignerError::PqcNotConfigured)?;
-        signer
-            .sign(message)
-            .await
-            .map_err(|e| LocalSignerError::PqcSign(format!("{e}")))
-    }
-
-    /// Hybrid sign canonical bytes — Ed25519 over `message`, then
-    /// ML-DSA-65 over `(message || classical_sig)` (the bound
-    /// signature pattern that prevents stripping attacks). Returns
-    /// the canonical [`HybridSignature`] shape persist already uses
-    /// for federation rows.
-    ///
-    /// Lens-core detection events are federation evidence and want
-    /// hybrid sigs at v0.1.0 to match the posture edge envelopes
-    /// ship with. This is the convenience composition of
-    /// `sign_ed25519` + `sign_ml_dsa_65` + bound-payload assembly.
-    ///
-    /// Returns [`LocalSignerError::PqcNotConfigured`] if the signer
-    /// was constructed without PQC config.
-    pub async fn sign_hybrid(&self, message: &[u8]) -> Result<HybridSignature, LocalSignerError> {
-        let signer = self
-            .pqc_signer
-            .as_ref()
-            .ok_or(LocalSignerError::PqcNotConfigured)?;
-
-        // v7.1.0 (#224): the Ed25519 half dispatches on the classical
-        // signer — plaintext signs in-process, hardware signs through
-        // the sealed HardwareSigner (custody preserved, never unsealed).
-        let classical_sig = self.classical.sign(message).await?;
-        let mut bound = Vec::with_capacity(message.len() + classical_sig.len());
-        bound.extend_from_slice(message);
-        bound.extend_from_slice(&classical_sig);
-
-        let pqc_sig = signer
-            .sign(&bound)
-            .await
-            .map_err(|e| LocalSignerError::PqcSign(format!("{e}")))?;
-        let pqc_pk = signer
-            .public_key()
-            .await
-            .map_err(|e| LocalSignerError::PqcSign(format!("{e}")))?;
-
-        Ok(HybridSignature {
-            crypto_kind: CRYPTO_KIND_CIRIS_V1,
-            classical: TaggedClassicalSignature {
-                algorithm: ClassicalAlgorithm::Ed25519,
-                signature: classical_sig.to_vec(),
-                public_key: self.classical.public_key_bytes().to_vec(),
-            },
-            pqc: TaggedPqcSignature {
-                algorithm: PqcAlgorithm::MlDsa65,
-                signature: pqc_sig,
-                public_key: pqc_pk,
-            },
-            mode: SignatureMode::HybridRequired,
-        })
     }
 
     /// v62.0.0 (slice D) — the CC 2.6.1.7 composite ML-DSA-65-Ed25519
@@ -582,7 +505,7 @@ impl LocalSigner {
     /// `ciris_crypto::self_enc` (HKDF-SHA256, the same derivation the
     /// KEM-open/decrypt side re-runs on the same seed) — so
     /// `published enc pubkey ⟷ decrypt privkey` holds BY CONSTRUCTION,
-    /// exactly as `local_derived_key_id` + `sign_hybrid` already
+    /// exactly as `local_derived_key_id` + `sign_composite` already
     /// guarantee for the signing identity. Public halves only; the
     /// private halves are derived, dropped, and zeroized here — the raw
     /// seed never crosses the API (CIRISServer#313: the reverse-path KEX
@@ -1055,8 +978,11 @@ mod tests {
         assert!(matches!(err, LocalSignerError::PqcConfigInconsistent));
     }
 
+    /// v62.0.0 (VA-pair-signing) — the lone ML-DSA-65 signer is deleted;
+    /// without PQC config the composite signer is the one that answers
+    /// `PqcNotConfigured`.
     #[test]
-    fn sign_ml_dsa_65_without_pqc_config_returns_typed_error() {
+    fn sign_composite_without_pqc_config_returns_typed_error() {
         let f = write_seed(&[0x42u8; 32]);
         let signer = LocalSigner::from_config(&LocalSignerConfig {
             key_id: "test".into(),
@@ -1067,7 +993,7 @@ mod tests {
         .expect("load");
         let rt = tokio::runtime::Runtime::new().unwrap();
         let err = rt
-            .block_on(async { signer.sign_ml_dsa_65(b"hello").await })
+            .block_on(async { signer.sign_composite(b"hello").await })
             .unwrap_err();
         assert!(matches!(err, LocalSignerError::PqcNotConfigured));
     }

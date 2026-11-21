@@ -555,7 +555,7 @@ async fn uncovered_accord_decisions<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let action = ciris_verify_core::accord_live_quorum::AccordAction::RosterChange.as_str();
+    let action = super::accord_quorum::AccordAction::RosterChange.as_str();
     let proposals = directory
         .list_accord_proposals_by_anchor(action, head_digest)
         .await?;

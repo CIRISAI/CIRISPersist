@@ -135,6 +135,17 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+/// v62.0.0 (VA-custody; CIRISVerify 23.3.3 removes the accord custody
+/// attestation bundle) — the `kind` of a generation-custody attestation, as
+/// held evidence and the ceremony's producer spell it (CIRISVerify v23.3.2
+/// `accord_custody_attestation::ACCORD_CUSTODY_ATTESTATION_KIND`, l.87).
+pub const ACCORD_CUSTODY_ATTESTATION_KIND: &str = "accord_holder_custody_attestation";
+
+/// v62.0.0 (VA-custody) — the custody tier the real ceremony asserts, as a
+/// stored policy and its evidence spell it (CIRISVerify v23.3.2
+/// `accord_custody_attestation::CUSTODY_TIER_PORTABLE_2FA`, l.90).
+pub const CUSTODY_TIER_PORTABLE_2FA: &str = "portable_2fa";
+
 use chrono::{DateTime, Utc};
 use ciris_keyring::{HardwareType, PlatformAttestation};
 use serde::{Deserialize, Serialize};
@@ -241,11 +252,7 @@ impl Default for HardwareAttestationPolicy {
             // v23.1.0 (CIRISPersist#554) — the tier the real ceremony
             // asserts. Sourced from verify's const so persist and the
             // producer cannot drift on the spelling.
-            accepted_custody_tiers: [
-                ciris_verify_core::accord_custody_attestation::CUSTODY_TIER_PORTABLE_2FA.to_owned(),
-            ]
-            .into_iter()
-            .collect(),
+            accepted_custody_tiers: [CUSTODY_TIER_PORTABLE_2FA.to_owned()].into_iter().collect(),
             // v47.3.0 (CIRISPersist#901) — the Yubico root the holder-hardware
             // leg walks YubiKey PIV chains against (Layer B). The real pinned
             // root by default; a witness swaps in a mock CA's root.
@@ -466,7 +473,7 @@ pub struct GenerationCustodyAttestation {
     /// Relay-envelope schema tag — [`ciris_verify_core::ceg_outbox::SCHEMA`].
     pub schema: String,
     /// The CEG object kind; must be
-    /// [`ciris_verify_core::accord_custody_attestation::ACCORD_CUSTODY_ATTESTATION_KIND`].
+    /// [`ACCORD_CUSTODY_ATTESTATION_KIND`].
     pub kind: String,
     /// The signing identity's federation `key_id`.
     pub key_id: String,
@@ -1017,7 +1024,6 @@ impl HardwareAttestationPolicy {
         key_id: &str,
         att: &GenerationCustodyAttestation,
     ) -> Result<(), Error> {
-        use ciris_verify_core::accord_custody_attestation::ACCORD_CUSTODY_ATTESTATION_KIND;
         use ciris_verify_core::ceg_outbox::SCHEMA as CEG_SCHEMA;
 
         // Every refusal below is TYPED and names the failing check. A custody
@@ -1985,7 +1991,7 @@ mod tests {
         let chain = [0x30u8, 0x82, 0x02, 0x00];
         serde_json::json!({
             "schema": ciris_verify_core::ceg_outbox::SCHEMA,
-            "kind": ciris_verify_core::accord_custody_attestation::ACCORD_CUSTODY_ATTESTATION_KIND,
+            "kind": super::ACCORD_CUSTODY_ATTESTATION_KIND,
             "key_id": holder,
             "created_at": "2026-06-23T03:16:34Z",
             "body": {

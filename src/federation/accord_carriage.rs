@@ -77,7 +77,7 @@
 //! must equal a digest the receiver computes itself from `(op, target_key_id)`
 //! — never one the sender supplies.
 
-use ciris_verify_core::accord_live_quorum::{AccordParticipation, AccordProposal};
+use super::accord_quorum::{AccordParticipation, AccordProposal};
 
 use super::admission::{
     accord_holder_roster, canonical_withdrawal_payload_sha256, op_withdraw_role,

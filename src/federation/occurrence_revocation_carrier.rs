@@ -397,7 +397,7 @@ where
     Ok(RosterCount {
         roster: roster.len(),
         signed,
-        need: ciris_verify_core::accord_genesis::strict_majority(roster.len()),
+        need: crate::federation::admission::strict_majority(roster.len()),
     })
 }
 
