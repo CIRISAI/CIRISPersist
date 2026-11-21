@@ -321,8 +321,10 @@ pub(crate) async fn switch_over(dsn: &str, alias: &str, owner_seed: &str) {
         .expect("reads")
         .expect("the owner's acceptance is held");
     // v62.0.0 (RL-fix17) — the owner's `withdraws`, signed with the LITERAL
-    // root as its `sub` (as its target's) and the target's `dimension`
-    // restated (Verify 23.4.0: a composer of a leaf family restates it).
+    // root as its `sub` (as its target's). v62.0.0 (PIN-fix4; CIRISVerify
+    // 23.4.1): it states NO `dimension` (a `withdraws` carries none and is
+    // refused `malformed:dimension` if it does; its leaf is its target's,
+    // read from the held target). 23.4.0 needed it restated.
     // `e2::composer_of` ran the target's subject through the fixture codec
     // (`subject_of` → `kid_or_keep`), which reads "humanity-accord" as a SEED
     // and names a key of that name: the 4vh run's withdrawal was never of the
@@ -331,14 +333,13 @@ pub(crate) async fn switch_over(dsn: &str, alias: &str, owner_seed: &str) {
         use ciris_verify_core::cde::Value;
         let acc_ms = u64::try_from(acceptance.asserted_at.timestamp_millis()).unwrap_or(0);
         let at = now_ms().max(acc_ms + 1);
-        let Value::Map(mut m) = super::typed::withdraws_payload(&owner, &id, at) else {
+        let Value::Map(m) = super::typed::withdraws_payload(&owner, &id, at) else {
             panic!("I2465: a withdraws payload is a map");
         };
-        m.push((
-            Value::Text("dimension".to_owned()),
-            Value::Text(crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION.to_owned()),
-        ));
-        m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
+        assert!(
+            !m.iter().any(|(k, _)| k.as_text() == Some("dimension")),
+            "I2465: the withdrawal states no dimension"
+        );
         ciris_verify_core::edition2::sign_row_statement(
             &super::fixture_switch::signing_key(owner_seed),
             &owner,

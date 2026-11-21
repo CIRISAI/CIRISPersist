@@ -42,15 +42,13 @@ fn score(k: &CompositeSigningKey, at: u64) -> Vec<u8> {
 }
 
 fn withdraws(k: &CompositeSigningKey, family: &str, target: &RowId, at: u64) -> Vec<u8> {
-    let mut m = vec![
+    // v62.0.0 (PIN-fix4; CIRISVerify 23.4.1) — a `withdraws` states no
+    // dimension under any family; its leaf is its target's.
+    let m = vec![
         ("asserted_at", Value::Uint(at)),
         ("author", Value::Text(iref(k))),
         ("refs", map(vec![("target", ref2(&target.0))])),
     ];
-    // A dimension is carried only under the family that binds it.
-    if family == SCORE_FAM {
-        m.push(("dimension", Value::Text(SCORE_DIM.into())));
-    }
     sign_row_statement(k, &iref(k), &iref(k), "withdraws", family, &map(m), vec![]).unwrap()
 }
 
@@ -238,10 +236,8 @@ fn withdraws_revocation(k: &CompositeSigningKey, target: &RowId, at_ms: u64) -> 
     let m = map(vec![
         ("asserted_at", Value::Uint(at_ms)),
         ("author", Value::Text(iref(k))),
-        (
-            "dimension",
-            Value::Text("revocation:agent:compromise:v1".into()),
-        ),
+        // v62.0.0 (PIN-fix4; CIRISVerify 23.4.1) — no dimension: a `withdraws`
+        // carries none; its leaf is its target's.
         ("refs", map(vec![("target", ref2(&target.0))])),
     ]);
     sign_row_statement(

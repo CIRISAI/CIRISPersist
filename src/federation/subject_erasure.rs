@@ -425,8 +425,9 @@ where
 /// payload)`: `sub` = `iss`, the family the target's own (a composer carries
 /// its target's family, CC-READING(next-edition)), and the composer payload
 /// (common members only): `asserted_at`, `refs.target` = the target's row id,
-/// the target's `dimension`, and `author` = `iss` when the family is
-/// authored. Who may withdraw is NOT decided here: the one withdraws
+/// and `author` = `iss` when the family is authored (read with the target's
+/// `dimension`, which the withdrawal itself does not state: CIRISVerify
+/// 23.4.1). Who may withdraw is NOT decided here: the one withdraws
 /// predicate decides at the door (rule 1 for the producer; rules 2–4 never
 /// reach an adverse `detection:*` row).
 ///
@@ -459,9 +460,10 @@ pub fn withdraws_statement_parts(
         (text("asserted_at"), Value::Uint(asserted_at_ms)),
         (text("refs"), super::edition2::emit::refs_target(&digest)),
     ];
-    if let Some(d) = dimension {
-        m.push((text("dimension"), text(d)));
-    }
+    // v62.0.0 (PIN-fix4; CIRISVerify 23.4.1) — a `withdraws` states NO
+    // `dimension` (Verify refuses one, `malformed:dimension`; its leaf is its
+    // target's, read from the held target). The target's dimension still
+    // decides whether the family is authored here, as at the door.
     if super::edition2::emit::family_is_authored(&family, dimension) {
         m.push((text("author"), text(iss)));
     }
