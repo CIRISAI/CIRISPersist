@@ -35,9 +35,11 @@
 //! - **I4226** — the BYPASS the root-grant exclusion closes: a counted root
 //!   grant whose FIRST voice (its `attesting_key_id`) is a keyed trust root
 //!   this node accepts, landed by two holders but NOT accepted by the
-//!   grantee, confers nothing: neither as a grant BY that key (the older
-//!   delegation loop) nor by family quorum. Dropping either exclusion turns
-//!   this red (the delegation loop would return the keyed root).
+//!   grantee, confers nothing as a grant BY that key (the older delegation
+//!   loop). After KR-fix4 (only holders voice a counted root row once its
+//!   bundle is held) the shape is built in the one order still open: the
+//!   keyed root's voice kept BEFORE the bundle (KR-fix3a-w1). Where the store
+//!   does not keep it, the witness asserts the first voice is a holder's.
 
 use chrono::{DateTime, Utc};
 use ciris_crypto::composite::CompositeSigningKey;
@@ -485,16 +487,66 @@ pub(crate) async fn i4225_a_node_that_does_not_accept_the_root(d: &dyn Federatio
 
 /// **I4226.** The directory's node key is set (the keyed root's fixture
 /// needs it); `node` is that key.
+///
+/// v62.0.0 (KR-fix3a-w1, after KR-fix4) — KR-fix4 refuses a non-holder's
+/// voice of a counted root row at the door once its bundle is held, so the
+/// only order that can make a non-holder the row's first voice is the one
+/// KR-fix4 leaves open: the voice arrives BEFORE the bundle (kept, then held
+/// `refold_refused` when the bundle lands, served to no holder), and the
+/// holders then land the same row (KR-fix4's I4214). The row's
+/// `attesting_key_id` is its primary voice: the first held voice by
+/// statement id that verifies (`voices::primary_voice`), so the grant's
+/// instant is chosen so that the keyed root's statement id sorts before the
+/// first holder's. Where the store keeps that early voice the bypass shape
+/// is CONSTRUCTIBLE and is witnessed; where the door does not keep it (its
+/// retryable wait), it is unreachable on that store and the witness asserts
+/// that instead (the first voice is a holder's).
 pub(crate) async fn i4226_an_unaccepted_root_grant_never_confers_by_its_first_voice(
     d: &dyn FederationDirectory,
     node: &str,
 ) {
-    use super::fixture_genesis::HOLDER_SEEDS;
-    let head = install_v2(d).await.expect("I4226: installs").object_id;
-    // A keyed trust root THIS node accepts (the W1b fixture).
+    use super::fixture_genesis::{DAY_MS, HOLDER_SEEDS};
+    use super::fixture_trust_root::ROOT_SEED;
+    use super::receipts::statement_id_of;
+    let c = bundle_v2();
+    let head = c.object_id;
+    let (worker_seed, owner_seed) = ("w-px-i4226", "o-px-i4226");
+    let worker = e2::put_key(d, worker_seed, &["node"]).await;
+    let root_key = e2::put_key(d, ROOT_SEED, &["user"]).await;
+    // An instant whose keyed-root voice sorts before holder 1's by
+    // statement id (deterministic: the bytes are the fixture's).
+    let base = c.spec.t0_ms + DAY_MS;
+    let (at, first) = (0..64u64)
+        .map(|k| base + k)
+        .find_map(|at| {
+            let first = grant_voice(
+                &e2::signing_key(ROOT_SEED),
+                &root_key,
+                &worker,
+                SCOPE_F,
+                &head,
+                at,
+            );
+            let holder = holder_grant(c, 0, &worker, SCOPE_F, &head, at);
+            (statement_id_of(&first) < statement_id_of(&holder)).then_some((at, first))
+        })
+        .expect("I4226: an instant at which the keyed root's voice sorts first");
+    let id = row_of(&first);
+    // Before the bundle: kept (held), or the door's retryable wait.
+    let kept = put_statement(d, &first, None, INGEST_TIER).await.is_ok();
+    assert_eq!(
+        install_v2(d).await.expect("I4226: installs").object_id,
+        head,
+        "I4226: the bundle the voice names"
+    );
+    // A keyed trust root at that key, which THIS node accepts (W1b).
     let r = super::fixture_trust_root::try_rooted_trust_root(d, &HOLDER_SEEDS, "quorum:2/3")
         .await
         .expect("I4226: a keyed root this node accepts");
+    assert_eq!(
+        r.root, root_key,
+        "I4226 premise: the root is the early voice's key"
+    );
     assert!(
         crate::federation::trust_root::trust_root_valid(d, node, &r.root, later())
             .await
@@ -502,21 +554,13 @@ pub(crate) async fn i4226_an_unaccepted_root_grant_never_confers_by_its_first_vo
             .valid,
         "I4226 premise: this node accepts the keyed root"
     );
-    let at = grant_instant(d).await;
-    let (worker, owner) = worker_with_owner(d, "px-i4226").await;
-    // The keyed root's voice first (a non-holder: it counts nothing), then
-    // two holders land the row.
-    let first = grant_voice(
-        &e2::signing_key(&r.root_seed),
-        &r.root,
-        &worker,
-        SCOPE_F,
-        &head,
-        at,
-    );
-    let id = row_of(&first);
-    let _ = put_statement(d, &first, None, INGEST_TIER).await;
-    let c = bundle_v2();
+    e2::put_key(d, owner_seed, &["user"]).await;
+    crate::federation::admission::steward_liveness_test_support::bind_machine_owner(
+        d,
+        owner_seed,
+        worker_seed,
+    )
+    .await;
     for i in 0..2 {
         put_statement(
             d,
@@ -532,10 +576,22 @@ pub(crate) async fn i4226_an_unaccepted_root_grant_never_confers_by_its_first_vo
         .await
         .expect("I4226 reads")
         .expect("I4226: two holders land the grant");
-    assert_eq!(
-        grant.attesting_key_id, r.root,
-        "I4226 premise: the row's first voice (its attesting_key_id) is the keyed root"
-    );
+    if kept {
+        // CONSTRUCTIBLE: the bypass shape. Dropping the delegation-loop
+        // exclusion would confer it as a grant BY the keyed root.
+        assert_eq!(
+            grant.attesting_key_id, r.root,
+            "I4226: the early (kept) voice is the row's first voice"
+        );
+    } else {
+        // UNREACHABLE on this store: no non-holder voice was kept, so the
+        // first voice is a holder's (the exclusion stays, defence in depth).
+        assert!(
+            c.holder_identity_refs().contains(&grant.attesting_key_id),
+            "I4226: with no non-holder voice kept, the first voice is a holder's: {}",
+            grant.attesting_key_id
+        );
+    }
     // Not accepted: nothing confers, by no plane.
     for scope in [SCOPE_F, "infra:attest"] {
         assert!(
@@ -548,7 +604,7 @@ pub(crate) async fn i4226_an_unaccepted_root_grant_never_confers_by_its_first_vo
     }
     // Accepted: it confers through the bundle-root arm only, or not at all
     // (this node has not accepted the bundle root) — never as Delegation.
-    owner_accepts(d, &owner, &grant, "I4226").await;
+    owner_accepts(d, owner_seed, &grant, "I4226").await;
     if let Some(g) = capability_roots_to_trusted_root(d, node, &worker, SCOPE_F, later())
         .await
         .expect("I4226 reads")

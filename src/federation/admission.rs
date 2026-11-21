@@ -5401,6 +5401,72 @@ pub const ROOT_GRANT_REFUSED: &str = "root_grant_refused";
 /// so the scope can never become covered and there is nothing to wait for.
 pub const CONFERRAL_OUTSIDE_CHARTER_SCOPE: &str = "conferral_outside_charter_scope";
 
+/// v62.0.0 (KR-fix4; CC 3.2) — the prefix of the REFUSAL of a voice of a
+/// counted root row (a grant from the root, or the root's counted withdrawal
+/// of one) whose signer is not a holder of the bundle the row names
+/// (`root_voice_not_a_holder: …`). A refusal, never a hold: who holds a
+/// bundle is the bundle's own bytes, so the signer can never become one of
+/// its holders and there is nothing to wait for. Nothing of the voice is
+/// kept.
+pub const ROOT_VOICE_NOT_A_HOLDER: &str = "root_voice_not_a_holder";
+
+/// v62.0.0 (KR-fix4; CC 3.2) — **the door of a counted root row's voice:
+/// its signer is a holder of the bundle the row names.** Run on every voice
+/// of a trust-family statement with no `author` that names a `refs.head`,
+/// before anything is kept (`edition2::typed::put_trust_statement`), whether
+/// the row is new, still short, or already landed.
+///
+/// - The named bundle is a held Valid placement and the signer is one of its
+///   holders (`trust_root_group::bundle_holders`): admitted. A holder of the
+///   NAMED bundle whom a later bundle removed is still a holder of THAT
+///   bundle; whether its voice is in time is the count's question
+///   (`voices_before_successor`), unchanged.
+/// - The named bundle is held and the signer is not one of its holders:
+///   refused [`ROOT_VOICE_NOT_A_HOLDER`]. Nothing is kept, so a stranger can
+///   neither open a counted root row nor add a voice to one.
+/// - The named bundle is not held yet: nothing to judge against. The voice
+///   goes on to the gate, which holds it on the bundle
+///   ([`check_root_grant_counted`]); when the bundle lands the row re-folds
+///   and the gate refuses a row no holder has voiced.
+/// - A statement this node already holds (a re-fold re-running the row's
+///   first voice) is not judged here: the gate judges the row by all its
+///   voices, so a non-holder's voice kept before the bundle arrived cannot
+///   take a holder's row down with it.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] prefixed [`ROOT_VOICE_NOT_A_HOLDER`]; directory
+/// reads.
+pub async fn check_root_voice_signer(
+    directory: &dyn super::FederationDirectory,
+    voice: &super::edition2::door::AdmittedRow,
+) -> Result<(), Error> {
+    if !super::edition2::typed::is_trust_family(&voice.family) || voice.author.is_some() {
+        return Ok(());
+    }
+    let Some(head) = super::edition2::names::single(&voice.names, "head") else {
+        return Ok(());
+    };
+    let state = super::edition2::genesis::genesis_in_force(directory).await?;
+    let Some(holders) = super::edition2::trust_root_group::bundle_holders(&state, &head.0) else {
+        return Ok(());
+    };
+    if holders.contains(&voice.iss) {
+        return Ok(());
+    }
+    if directory
+        .edition2_voices(&voice.row_id)
+        .await?
+        .contains(&voice.bytes)
+    {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "{ROOT_VOICE_NOT_A_HOLDER}: {} is not a holder of the genesis bundle {} this counted row          names: only that bundle's holders voice a row counted over it (CC 3.2)",
+        voice.iss,
+        head.hex()
+    )))
+}
+
 /// v62.0.0 (KR-fix2; CC 3.2: "A grant from the root is a row counted over the
 /// holders of the bundle in force, and it names the bundle it is counted
 /// over") — is `row` **a counted grant from the root**: a statement-carrying
@@ -5601,6 +5667,27 @@ pub async fn check_root_grant_counted(
             head.hex()
         )));
     };
+    // v62.0.0 (KR-fix4) — a row NO holder of the named bundle has voiced is
+    // refused by name, never held short: only that bundle's holders voice it,
+    // and none has. (A fresh non-holder voice is refused before this, at the
+    // door: `check_root_voice_signer`. This is the row kept while its bundle
+    // was not held, judged when the bundle lands.) Every voice is read here,
+    // in time or not: a holder's late voice is a holder's voice, and the
+    // count below says it is late.
+    {
+        let state = super::edition2::genesis::genesis_in_force(directory).await?;
+        let holders =
+            super::edition2::trust_root_group::bundle_holders(&state, &head.0).unwrap_or_default();
+        let voices = super::edition2::voices::row_voices(directory, row).await?;
+        if !voices.iter().any(|v| holders.contains(&v.iss)) {
+            return Err(Error::InvalidArgument(format!(
+                "{ROOT_VOICE_NOT_A_HOLDER}: grant {} to {} carries no voice of a holder of the                  genesis bundle {} it names (CC 3.2)",
+                row.attestation_id,
+                row.attested_key_id,
+                head.hex()
+            )));
+        }
+    }
     // A refusal that marks no fold condition: nothing of the grant is kept.
     if let Some(token) = &reading.outside_charter {
         return Err(Error::InvalidArgument(format!(

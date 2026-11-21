@@ -1416,6 +1416,11 @@ where
     // own (which made the subject's voice a self-loop `delegates_to` the
     // charter gate refused). Short of its signers the row is held
     // (`count_short`); a held row's further voice is a `Voice`.
+    // v62.0.0 (KR-fix4; CC 3.2) — a voice of a COUNTED root row (it names a
+    // bundle in `refs.head`) is admitted only from a holder of that bundle:
+    // refused by name before anything is kept, on a new row, a short one and
+    // a landed one alike.
+    crate::federation::admission::check_root_voice_signer(dir.as_dyn_directory(), row).await?;
     let out = Box::pin(super::voices::put_counted_row(
         dir,
         row,

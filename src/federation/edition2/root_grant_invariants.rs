@@ -1164,8 +1164,10 @@ pub(crate) async fn i4210_an_unrooted_node_serves_a_held_grant_to_the_named_hold
     }
 
     // A NON-holder's voice of a counted grant naming the same bundle (its own
-    // row: another scope): the door keeps it, short, and it is NOT served to
-    // the holders. Only a holder's own voice crosses from an unrooted node.
+    // row: another scope). KR-fix4: the door REFUSES it by name and keeps
+    // nothing, so there is nothing of it to serve. (Before KR-fix4 it was
+    // kept short and this leg asserted it was served to no holder; a
+    // non-holder's voice kept before its bundle arrived is I4214's.)
     let pushed = grant_voice(
         &e2::signing_key("s-i4210"),
         &stranger,
@@ -1175,23 +1177,22 @@ pub(crate) async fn i4210_an_unrooted_node_serves_a_held_grant_to_the_named_hold
         at,
     );
     let pushed_id = row_of(&pushed);
-    let o = put_statement(u, &pushed, None, INGEST_TIER)
-        .await
-        .expect("I4210: a non-holder's voice of a counted grant is kept, short");
-    assert!(pending(&o), "I4210: no holder has voiced it: {o:?}");
-    assert_eq!(
+    refused_not_a_holder(
+        put_statement(u, &pushed, None, INGEST_TIER).await,
+        "I4210: a non-holder's voice of a counted grant",
+    );
+    assert!(
         u.edition2_voices(&pushed_id)
             .await
             .expect("I4210: the voices")
-            .len(),
-        1,
-        "I4210: the non-holder's voice is held"
+            .is_empty(),
+        "I4210: nothing of the non-holder's voice is kept"
     );
     for (name, holder) in [("holder 2", &h2), ("holder 3", &h3), ("holder 1", &h1)] {
         assert_eq!(
             served_of(u, holder, &pushed_id).await.0,
             0,
-            "I4210: {name} is not served a non-holder's voice by an unrooted node"
+            "I4210: {name} is served nothing of it"
         );
     }
     // The holder's own voice is still served (the pushed row changed nothing).
@@ -1200,6 +1201,287 @@ pub(crate) async fn i4210_an_unrooted_node_serves_a_held_grant_to_the_named_hold
         1,
         "I4210: holder 2 is still served holder 1's voice"
     );
+}
+
+/// The door refused a voice by name, `root_voice_not_a_holder`.
+fn refused_not_a_holder(out: Result<StatementOutcome, crate::federation::Error>, what: &str) {
+    match out {
+        Err(e)
+            if e.to_string()
+                .contains(crate::federation::admission::ROOT_VOICE_NOT_A_HOLDER) => {}
+        other => panic!("{what}: expected root_voice_not_a_holder, got {other:?}"),
+    }
+}
+
+/// **I4213.** With the named bundle HELD, a non-holder's voice of a counted
+/// grant from the root is refused by name and nothing is kept: on a row
+/// nobody has voiced, on a row one holder has voiced (still short), and on a
+/// landed row. The holders' own voices of the same row are untouched.
+pub(crate) async fn i4213_a_non_holders_voice_is_refused(d: &dyn FederationDirectory) {
+    let c = bundle_v2();
+    install_v2(d).await.expect("I4213: the bundle installs");
+    let head = c.object_id;
+    let (worker, _) = worker_with_owner(d, "i4213").await;
+    let at = grant_instant(d).await;
+    let stranger = e2::put_key(d, "s-i4213", &["user"]).await;
+    // The stranger's voice is a voice of the SAME row the holders voice (one
+    // payload, one row id).
+    let pushed = grant_voice(
+        &e2::signing_key("s-i4213"),
+        &stranger,
+        &worker,
+        ATTEST_BUILD,
+        &head,
+        at,
+    );
+    let id = row_of(&pushed);
+    assert_eq!(
+        id,
+        row_of(&holder_grant(c, 0, &worker, ATTEST_BUILD, &head, at)),
+        "I4213: one row"
+    );
+    let voices = || async {
+        d.edition2_voices(&id)
+            .await
+            .expect("I4213: the voices")
+            .len()
+    };
+
+    // Nobody has voiced it: refused, nothing kept, nothing held.
+    refused_not_a_holder(
+        put_statement(d, &pushed, None, INGEST_TIER).await,
+        "I4213: a non-holder opens a counted root row",
+    );
+    assert_eq!(voices().await, 0, "I4213: nothing is kept");
+    assert!(
+        why(d, &id).await.is_none() && held(d, &id).await.is_none(),
+        "I4213: no row is held and none landed"
+    );
+
+    // One holder has voiced it (short): the non-holder's voice is refused.
+    let o = put_statement(
+        d,
+        &holder_grant(c, 0, &worker, ATTEST_BUILD, &head, at),
+        None,
+        INGEST_TIER,
+    )
+    .await
+    .expect("I4213: holder 1's voice is kept");
+    assert!(pending(&o), "I4213: one of three: {o:?}");
+    refused_not_a_holder(
+        put_statement(d, &pushed, None, INGEST_TIER).await,
+        "I4213: a non-holder joins a short row",
+    );
+    assert_eq!(voices().await, 1, "I4213: only holder 1's voice is kept");
+
+    // Landed: still refused.
+    put_statement(
+        d,
+        &holder_grant(c, 1, &worker, ATTEST_BUILD, &head, at),
+        None,
+        INGEST_TIER,
+    )
+    .await
+    .expect("I4213: holder 2's voice");
+    assert!(held(d, &id).await.is_some(), "I4213: two holders land it");
+    refused_not_a_holder(
+        put_statement(d, &pushed, None, INGEST_TIER).await,
+        "I4213: a non-holder joins a landed row",
+    );
+    assert_eq!(voices().await, 2, "I4213: the two holders' voices only");
+}
+
+/// **I4214.** The other order: the voice arrives BEFORE the bundle it names.
+/// A non-holder's voice cannot be judged yet. Either the door keeps nothing
+/// (its retryable wait) or it holds the voice on the bundle. When the bundle
+/// lands the row is judged: it does not land, it is no longer waiting on a
+/// count (`refold_refused`, naming `root_voice_not_a_holder`), it is served
+/// to no holder, and re-offering the voice is refused. The holders' own
+/// voices of the same row then land it: a non-holder's early voice does not
+/// take the row down.
+pub(crate) async fn i4214_a_non_holders_voice_before_the_bundle(d: &dyn FederationDirectory) {
+    let c = bundle_v2();
+    let head = c.object_id;
+    // From the bundle's own instant (no bundle is held here yet).
+    let at = c.spec.t0_ms + super::fixture_genesis::DAY_MS;
+    let worker = e2::put_key(d, "w-i4214", &["node"]).await;
+    let stranger = e2::put_key(d, "s-i4214", &["user"]).await;
+    let pushed = grant_voice(
+        &e2::signing_key("s-i4214"),
+        &stranger,
+        &worker,
+        ATTEST_BUILD,
+        &head,
+        at,
+    );
+    let id = row_of(&pushed);
+    let kept = match put_statement(d, &pushed, None, INGEST_TIER).await {
+        Err(_) => false,
+        Ok(o) => {
+            assert!(pending(&o), "I4214: nothing lands before the bundle: {o:?}");
+            true
+        }
+    };
+    assert_eq!(
+        install_v2(d)
+            .await
+            .expect("I4214: the bundle installs")
+            .object_id,
+        head,
+        "I4214: the bundle the voice names"
+    );
+    assert!(
+        held(d, &id).await.is_none(),
+        "I4214: a row only a non-holder voiced never lands"
+    );
+    if kept {
+        let h = super::fold::why_held(d, &id)
+            .await
+            .expect("I4214: why_held")
+            .expect("I4214: the kept row is held");
+        assert_eq!(
+            h.reason,
+            super::fold::reason::REFOLD_REFUSED,
+            "I4214: judged when the bundle landed, no longer waiting on a count: {h:?}"
+        );
+        assert!(
+            h.detail
+                .contains(crate::federation::admission::ROOT_VOICE_NOT_A_HOLDER),
+            "I4214: refused by name: {h:?}"
+        );
+        for i in 0..3 {
+            assert_eq!(
+                served_of(d, c.holder_identity_ref(i), &id).await.0,
+                0,
+                "I4214: holder {} is not served a non-holder's voice",
+                i + 1
+            );
+        }
+    }
+    // Re-offered after the bundle: refused by name, in either case.
+    refused_not_a_holder(
+        put_statement(d, &pushed, None, INGEST_TIER).await,
+        "I4214: the non-holder's voice re-offered after the bundle",
+    );
+    // The holders' own voices of the same row land it.
+    for i in 0..2 {
+        put_statement(
+            d,
+            &holder_grant(c, i, &worker, ATTEST_BUILD, &head, at),
+            None,
+            INGEST_TIER,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("I4214: holder {}'s voice: {e}", i + 1));
+    }
+    assert!(
+        held(d, &id).await.is_some(),
+        "I4214: two holders land the row; held {:?}",
+        why(d, &id).await
+    );
+}
+
+/// Nothing is held under row `id`.
+async fn no_voice_kept(d: &dyn FederationDirectory, id: &RowId) {
+    assert!(
+        d.edition2_voices(id).await.expect("the voices").is_empty(),
+        "nothing of a non-holder's re-bind voice is kept"
+    );
+}
+
+/// **I4216.** A held grant is served from a ROOTED node by the ordinary
+/// commons rule (`serve::commons_servable`), not by the root-holder arm: the
+/// node reaches a root (the runner gave it a node key; W1b's fixture roots
+/// it), holder 1's voice is held short, and the listing serves it to holder 2
+/// and to a third party alike, with nothing counted as waiting for a root.
+/// (The unrooted half is I4210: only the named bundle's holders are served.)
+pub(crate) async fn i4216_a_rooted_node_serves_a_held_grant(d: &dyn FederationDirectory) {
+    let c = bundle_v2();
+    install_v2(d).await.expect("I4216: the bundle installs");
+    e2::rooted_trust_root(d, &super::fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
+    let (worker, _) = worker_with_owner(d, "i4216").await;
+    let at = grant_instant(d).await;
+    let voice = holder_grant(c, 0, &worker, ATTEST_BUILD, &c.object_id, at);
+    let id = row_of(&voice);
+    let o = put_statement(d, &voice, None, INGEST_TIER)
+        .await
+        .expect("I4216: holder 1's voice is kept");
+    assert!(pending(&o), "I4216: one of three is short: {o:?}");
+    assert!(held(d, &id).await.is_none(), "I4216: held, not landed");
+    let stranger = e2::put_key(d, "s-i4216", &["user"]).await;
+    for (name, requester) in [
+        ("holder 2", c.holder_identity_ref(1).to_owned()),
+        ("a third party", stranger),
+    ] {
+        let (voices, waiting) = served_of(d, &requester, &id).await;
+        assert_eq!(
+            voices, 1,
+            "I4216: a rooted node serves the held grant to {name}"
+        );
+        assert_eq!(
+            waiting, 0,
+            "I4216: the node is rooted: nothing waits for a root ({name})"
+        );
+    }
+}
+
+/// **I4215.** The seat RE-BIND door, both orders: a non-holder's voice is
+/// never kept. With the named bundle held it is refused
+/// (`reserved_family_unseated`); before the bundle it is the retryable wait,
+/// which keeps nothing, and after the bundle lands the same voice is refused.
+pub(crate) async fn i4215_a_non_holders_rebind_voice(
+    with: &dyn FederationDirectory,
+    without: &dyn FederationDirectory,
+) {
+    use super::transport_rebind::{REBIND_FAMILY, REBIND_ROW_TYPE, TRANSIT_MEMBER};
+    let c = bundle_v2();
+    let seat = &c.seats[0];
+    let mut rebound = seat.transit_xwing_pubkey.to_vec();
+    rebound[0] ^= 0x2f;
+    let payload = map(vec![
+        ("asserted_at", Value::Uint(c.asserted_at_ms + 1_000)),
+        ("refs", map(vec![("head", row_ref(&c.object_id))])),
+        (TRANSIT_MEMBER, Value::Bytes(rebound)),
+    ]);
+    let pushed = |iss: &str| {
+        sign_row_statement(
+            &e2::signing_key("s-i4215"),
+            iss,
+            &seat.identity_ref,
+            REBIND_ROW_TYPE,
+            REBIND_FAMILY,
+            &payload,
+            vec![],
+        )
+        .expect("I4215: a non-holder signs a re-bind")
+    };
+    // The bundle held: refused.
+    install_v2(with).await.expect("I4215: the bundle installs");
+    let stranger = e2::put_key(with, "s-i4215", &["user"]).await;
+    let v = pushed(&stranger);
+    let id = row_of(&v);
+    match put_statement(with, &v, None, INGEST_TIER).await {
+        Err(e) if e.kind() != "federation_attester_key_unknown" => {}
+        other => panic!("I4215: a non-holder's re-bind over a held bundle: {other:?}"),
+    }
+    no_voice_kept(with, &id).await;
+
+    // The bundle not held: the retryable wait, nothing kept; then refused.
+    let stranger = e2::put_key(without, "s-i4215", &["user"]).await;
+    let v = pushed(&stranger);
+    match put_statement(without, &v, None, INGEST_TIER).await {
+        Err(e) if e.kind() == "federation_attester_key_unknown" => {}
+        other => panic!("I4215: a re-bind over a bundle not held waits: {other:?}"),
+    }
+    no_voice_kept(without, &id).await;
+    install_v2(without)
+        .await
+        .expect("I4215: the bundle installs");
+    match put_statement(without, &v, None, INGEST_TIER).await {
+        Err(e) if e.kind() != "federation_attester_key_unknown" => {}
+        other => panic!("I4215: judged when the bundle is held: {other:?}"),
+    }
+    no_voice_kept(without, &id).await;
 }
 
 /// **I4212.** A holder on a SECOND node finds a pending seat re-bind and
@@ -1553,6 +1835,32 @@ mod sqlite {
         .await;
     }
 
+    on_one!(
+        i4213_a_non_holders_voice_is_refused_sqlite,
+        i4213_a_non_holders_voice_is_refused
+    );
+    on_one!(
+        i4214_a_non_holders_voice_before_the_bundle_sqlite,
+        i4214_a_non_holders_voice_before_the_bundle
+    );
+
+    #[tokio::test]
+    async fn i4216_a_rooted_node_serves_a_held_grant_sqlite() {
+        use crate::federation::edition2::fixture_switch as e2;
+        let n = store().await;
+        n.set_node_key_id(e2::put_key(&n, "n-i4216", &["node"]).await);
+        Box::pin(super::i4216_a_rooted_node_serves_a_held_grant(&n)).await;
+    }
+
+    #[tokio::test]
+    async fn i4215_a_non_holders_rebind_voice_sqlite() {
+        Box::pin(super::i4215_a_non_holders_rebind_voice(
+            &store().await,
+            &store().await,
+        ))
+        .await;
+    }
+
     #[tokio::test]
     async fn i4212_a_holder_finds_a_pending_rebind_on_a_second_node_sqlite() {
         Box::pin(
@@ -1655,6 +1963,31 @@ mod postgres {
         .await
         .expect("I4211: a postgres Engine");
         Box::pin(super::i4211_the_engine_verbs(&e)).await;
+    }
+
+    on_one!(
+        i4213_a_non_holders_voice_is_refused_postgres,
+        i4213_a_non_holders_voice_is_refused
+    );
+    on_one!(
+        i4214_a_non_holders_voice_before_the_bundle_postgres,
+        i4214_a_non_holders_voice_before_the_bundle
+    );
+
+    #[tokio::test]
+    async fn i4216_a_rooted_node_serves_a_held_grant_postgres() {
+        use crate::federation::edition2::fixture_switch as e2;
+        let Some(n) = store().await else { return };
+        n.set_node_key_id(e2::put_key(&n, "n-i4216", &["node"]).await);
+        Box::pin(super::i4216_a_rooted_node_serves_a_held_grant(&n)).await;
+    }
+
+    #[tokio::test]
+    async fn i4215_a_non_holders_rebind_voice_postgres() {
+        let (Some(a), Some(b)) = (store().await, store().await) else {
+            return;
+        };
+        Box::pin(super::i4215_a_non_holders_rebind_voice(&a, &b)).await;
     }
 
     #[tokio::test]
