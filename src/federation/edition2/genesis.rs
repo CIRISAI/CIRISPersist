@@ -564,9 +564,10 @@ impl GenesisInForce {
     /// force (every tip seats it alike, [`Self::holders`])?
     #[must_use]
     pub fn is_holder(&self, identity_ref: &str) -> bool {
-        self.holders()
+        // v62.0.0 (KB-fix1) — the one holder reader.
+        super::trust_root_group::holders_in_force(self)
             .iter()
-            .any(|h| h.identity_ref == identity_ref)
+            .any(|h| h == identity_ref)
     }
 
     /// The keys the bundle in force seats, by identity-ref: each holder and
@@ -615,12 +616,19 @@ impl GenesisInForce {
                 }
             }
         };
+        // v62.0.0 (KB-fix1) — through the one holder reader
+        // (`trust_root_group::holders_in_force`), so halts, root validity,
+        // durable mesh config and grants read one holder set. The roster
+        // keeps each holder's KEY from the placement (a halt is counted by
+        // identity-ref AND key).
+        let in_force = super::trust_root_group::holders_in_force(self);
         Some(HaltRoster::new(
             accord_root.to_owned(),
             bundle,
             common
                 .holders
                 .iter()
+                .filter(|h| in_force.contains(&h.identity_ref))
                 .map(|h| RosterHolder {
                     identity_ref: h.identity_ref.clone(),
                     key: h.key.clone(),
@@ -851,7 +859,7 @@ pub fn bundle_in_force_read_key() -> String {
 /// (`recovery_signer::refuse_recovery_key_signer` runs on each), so the key
 /// there would put every row of the node in `ceg_fold_reads` and re-fold
 /// all of them on every placement. Nor by `is_bundle_holder` or
-/// `bundle_holder_refs`, which `trust_root_valid` and the standing cache
+/// `admission::accord_holder_roster`, which `trust_root_valid` and the standing cache
 /// walk for every row a trusted root's conferral gates.
 pub fn reads_bundle_in_force() {
     super::fold::reads(super::fold::Dep::Family(GENESIS_BUNDLE_TYP.to_owned()));

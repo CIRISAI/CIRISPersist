@@ -1536,7 +1536,11 @@ pub(crate) async fn i3248_i3249_trust_root_valid_and_the_walk(d: &dyn Federation
         "I3248: the founders' custody evidence (CC 4.2.2.1) is attested: {v:?}"
     );
     assert!(v.valid, "I3248: valid: {v:?}");
-    assert_eq!(v.root_kind, RootKind::Community, "I3248: the community arm");
+    assert_eq!(
+        v.root_kind,
+        RootKind::Key,
+        "I3248 (KB-fix1): a keyed root at the room's id; the room is no root"
+    );
 
     // I3249 — a capability the root confers reaches it.
     let subject_seed = "w1b-cap-subject";

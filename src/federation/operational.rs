@@ -2701,9 +2701,9 @@ pub mod test_support {
         let verdict =
             trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
         assert!(
-            verdict.valid && verdict.root_kind == RootKind::Community,
-            "({tag}) (d) a founded, chartered threshold root the node has accepted IS a valid \
-             trust root, on the community arm: {verdict:?}"
+            verdict.valid && verdict.root_kind == RootKind::Key,
+            "({tag}) (d) KB-fix1: the room is no root; the key at its id, chartered by its \
+             own self-edge and accepted by the node, is a valid KEYED root: {verdict:?}"
         );
         let subject_seed = format!("{tag}-subject");
         let grant_id = crate::federation::edition2::fixture_trust_root::put_conferral(
@@ -3082,7 +3082,8 @@ pub mod test_support {
             .await
             .expect("walk B");
         assert!(
-            vb.valid && vb.edge_exists && vb.root_kind == RootKind::Community,
+            // KB-fix1: a keyed root at a room's id (the room is no root).
+            vb.valid && vb.edge_exists && vb.root_kind == RootKind::Key,
             "({tag}) valid once the node emits its own edge: {vb:?}"
         );
         let grant = capability_roots_to_trusted_root(
@@ -3574,9 +3575,9 @@ pub mod test_support {
         let v = trust_root_valid(directory, &node, &ctl.root, crate::host::clock::now()).await?;
         assert_eq!(
             v.root_kind,
-            RootKind::Community,
-            "({tag}) CONTROL: the community arm, whose charter leg reads the root's own \
-             self-edge: {v:?}"
+            RootKind::Key,
+            "({tag}) CONTROL (KB-fix1): the key arm, whose charter leg reads the root's own \
+             self-edge (the room at its id is no root): {v:?}"
         );
         assert!(
             v.valid,
@@ -3694,8 +3695,9 @@ pub mod test_support {
             trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
         assert_eq!(
             verdict.root_kind,
-            RootKind::Community,
-            "({tag}) the shared root really is the threshold (community) arm: {verdict:?}"
+            RootKind::Key,
+            "({tag}) KB-fix1: the shared root is a keyed root at the room's id (the room is \
+             no root): {verdict:?}"
         );
         assert!(verdict.valid, "({tag}) …and it is valid: {verdict:?}");
 

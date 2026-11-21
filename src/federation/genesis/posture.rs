@@ -431,7 +431,7 @@ fn roster_leg(
             "a fork of the genesis (two Valid first bundles): a reader roots on neither              (CC 2.6.1.11)",
         ));
     }
-    if g.holders().is_empty() {
+    if crate::federation::edition2::trust_root_group::holders_in_force(g).is_empty() {
         return Err(GenesisFault::absent(
             GenesisLeg::Anchor,
             "the tips of the genesis in force share no holder under one key (CC 2.6.1.11)",

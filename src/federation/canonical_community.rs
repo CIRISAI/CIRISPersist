@@ -1458,7 +1458,7 @@ where
     // v62.0.0 (wave W1) — the edition-2 inputs: the holders of the genesis
     // bundle in force (the holder arm and the birth's count) and the held
     // `group:roster` voices of the community (a version's signers).
-    let bundle_holders = super::edition2::trust_root_group::bundle_holder_refs(directory).await?;
+    let bundle_holders = super::admission::accord_holder_roster(directory).await?;
     feed("bundle_holders", &serde_json::json!(bundle_holders));
     let roster_voices: Vec<String> = super::edition2::trust_root_group::roster_statements(
         directory,
@@ -2595,6 +2595,46 @@ where
             },
         ))
     };
+    // v62.0.0 (KB-fix1; CC 3.2 at rc22 `87abd2d`, T4a) — an edge accepting
+    // the BUNDLE root names the lineage by its `family_key_id` and, for
+    // audit, the bundle it attached on by object id: any bundle of that
+    // lineage this node holds Valid. It is judged on its first admission only
+    // and never again, so a later bundle of the lineage (an amend, a re-seat,
+    // a recovery) needs no re-acceptance. A named bundle this node does not
+    // hold yet waits for the import door (the bundle-in-force read, RL-fix6).
+    let in_force = super::edition2::genesis::genesis_in_force(directory).await?;
+    if in_force.family_key_id() == Some(root) {
+        super::edition2::genesis::reads_bundle_in_force();
+        let presented = envelope
+            .get(paths::ATTACHED_HEAD_DIGEST)
+            .and_then(|v| v.as_str());
+        let labeled = super::admission::envelope_dimension(envelope)
+            == Some(super::trust_root::TRUST_ACCEPTS_DIMENSION);
+        if door == AttachDoor::Replicated && (presented.is_some() || !labeled) {
+            return Ok(());
+        }
+        if edge_already_admitted(directory, attestation_id, attesting_key_id, root, envelope)
+            .await?
+        {
+            return Ok(());
+        }
+        return match presented {
+            None if labeled => Err(Error::TrustRootHeadUnnamed {
+                root_key_id: root.to_owned(),
+                detail: format!(
+                    "a new acceptance edge of the bundle root {root} names the bundle it attaches \
+                     on (`{}`): the object id of a bundle of that lineage (CC 3.2 T4a)",
+                    paths::ATTACHED_HEAD_DIGEST
+                ),
+            }),
+            None => Ok(()),
+            Some(p) if in_force.valid.iter().any(|b| hex::encode(b.object_id) == p) => Ok(()),
+            Some(p) => refuse(format!(
+                "the presented bundle {p} is no bundle of the lineage {root} this node holds: \
+                 the edge waits for that bundle at the import door"
+            )),
+        };
+    }
     // The lineage head the attach is judged against is the WITNESSED head the
     // fold serves (PR #943 review): with a witnessed H1 and an unwitnessed H2
     // held, a consumer attaches under H1 — comparing with the raw stored H2
@@ -2914,8 +2954,11 @@ where
 
 /// `Some(accord family id)` when `community_key_id` is a ROOTED earlier-form
 /// trust-root community; `Some(community_key_id)` itself for a ROOTED
-/// edition-2 trust root (W1b: it is its own root) — the community arm of
-/// [`trust_root_valid`](super::trust_root::trust_root_valid).
+/// edition-2 trust-root room.
+///
+/// v62.0.0 (KB-fix1; CC 3.2 at rc22 `87abd2d`) — ROOM standing only: a room
+/// is no trust root, and [`trust_root_valid`](super::trust_root::trust_root_valid)
+/// no longer reads this as a root source (its community arm is deleted).
 ///
 /// # Errors
 ///

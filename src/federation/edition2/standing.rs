@@ -53,7 +53,9 @@ pub fn accord_standing_in(
     accord_root: &str,
 ) -> bool {
     in_force.family_key_id() == Some(accord_root)
-        && in_force.holders().iter().any(|h| h.identity_ref == signer)
+        && super::trust_root_group::holders_in_force(in_force)
+            .iter()
+            .any(|h| h == signer)
 }
 
 /// v62.0.0 (P4, I3082) — **accord-holder standing, from the bundle in force.**

@@ -78,6 +78,11 @@ mod fold_gc8_invariants;
 // v62.0.0 (RL-fix1; CC 5.3.4) — a rootless node runs the P2P mesh (I2240–I2243).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod rootless_mesh_invariants;
+// v62.0.0 (KB-fix1; CC 3.2 at rc22 `87abd2d`) — the root is the bundle's
+// lineage: acceptance by `family_key_id`, validity, rooting and the mesh-config
+// author read the bundle in force (I2400–I2404).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod root_is_the_bundle_invariants;
 // v62.0.0 (RL-fix7; CC 2.6.1.11) — the accord's facts are the bundle in force:
 // its charter row and roster versions are refused by name (I2350–I2353).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -184,6 +189,9 @@ mod halt_lifecycle_invariants;
 // root, over the holders of the bundle it names (I4200–I4204).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod root_grant_invariants;
+// v62.0.0 (KR-fix3a) — `infra:attest:{family}` on the capability walk.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod scope_resolution_invariants;
 // v62.0.0 (BH-fix3) — I2125: an identity template is signed by an accord
 // holder, in its own domain.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]

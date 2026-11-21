@@ -939,7 +939,7 @@ pub async fn import_offer_into_throwaway(
     };
     Ok(ImportedOffer {
         placed: admission.placed,
-        holders: g.holders().iter().map(|h| h.identity_ref.clone()).collect(),
+        holders: crate::federation::edition2::trust_root_group::holders_in_force(&g),
         seats,
         invocations,
         halt_latched,

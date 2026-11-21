@@ -559,6 +559,30 @@ async fn root_arm<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (KB-fix2; CC 3.2 at rc22 `87abd2d`) — the BUNDLE root: the
+    // lineage of the bundle in force, named by its `family_key_id`. Its leg
+    // is the reader's own chain accepting it (`bundle_root_accepted`: the
+    // owner's, else the reader's, live labelled edge; the bundle's charter
+    // and recovery commitments, Verify-placed). T7's margin is over the
+    // holders in force: `Stalled` when losing one holder would leave the
+    // rest short of the strict majority. No room chain is read for it.
+    if let Some(holders) = trust_root::bundle_root_holders(dir, root).await? {
+        if !Box::pin(trust_root::bundle_root_accepted(dir, reader, root, t)).await? {
+            return Ok(Some(Arm::NotRooted(NotRootedReason::NoAcceptanceEdge {
+                root: Some(root.to_owned()),
+            })));
+        }
+        let n = holders.len();
+        return Ok(Some(
+            if n > crate::federation::admission::strict_majority(n) {
+                Arm::Rooted
+            } else {
+                Arm::Stalled
+            },
+        ));
+    }
+    // A KEYED root (a self-charter signed by the root's key) keeps its legs
+    // as they were, kept until the keyed-root question is ruled.
     let (standing, legs) = canonical_community::reader_standing(dir, Some(reader), root, t).await?;
     // A chain that holds is judged on its legs; a NotRooted answer with legs
     // Some failed a T3 leg over a chain that held (`reader_standing`).
@@ -676,13 +700,30 @@ pub async fn peer_rooting<F: FederationDirectory + ?Sized>(
     } else if in_force.is_canonical(peer_identity_ref) {
         seats.push((Plane::Ceremony, RootedVia::ServeSeat, accepted.clone()));
     }
+    // v62.0.0 (KB-fix2; CC 3.2 at rc22 `87abd2d`) — a delegation seat under
+    // the BUNDLE root stands on the root's grant: a row counted over the
+    // holders of the bundle it names (KR-fix2's `root_grant_of`: the named
+    // bundle held Valid, the count met before its successor, the charter
+    // covering the scope) and accepted by the grantee (or a machine
+    // grantee's owner). Its root is that bundle's `family_key_id`, never the
+    // holder who authored it (the walk's arm, KR-fix3a, reads it the same
+    // way). Every other grant names its root by its granter's key.
     let grants =
         trust_root::live_conferral_rows(dir, peer_identity_ref, trust_root::INFRA_SERVE_SCOPE, t)
             .await?;
     let mut granters: Vec<String> = Vec::new();
     for g in grants {
-        if !granters.contains(&g.attesting_key_id) {
-            granters.push(g.attesting_key_id);
+        let granter = if crate::federation::admission::is_counted_root_grant_row(&g) {
+            match crate::federation::admission::root_grant_of(dir.as_dyn_directory(), &g, t).await?
+            {
+                Some(rg) if rg.accepted => rg.family_key_id,
+                _ => continue,
+            }
+        } else {
+            g.attesting_key_id
+        };
+        if !granters.contains(&granter) {
+            granters.push(granter);
         }
     }
     if !granters.is_empty() {

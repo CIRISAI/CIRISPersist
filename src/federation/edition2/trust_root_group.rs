@@ -49,11 +49,9 @@ pub async fn is_bundle_holder<F>(dir: &F, key_id: &str) -> Result<bool, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    Ok(genesis_in_force(dir)
-        .await?
-        .holders()
+    Ok(holders_in_force(&genesis_in_force(dir).await?)
         .iter()
-        .any(|h| h.identity_ref == key_id))
+        .any(|h| h == key_id))
 }
 
 /// v62.0.0 (TR-fix2; CC rc21 3.2 T7 "The active founder set", conditions
@@ -123,23 +121,6 @@ where
     Ok((true, next))
 }
 
-/// The identity-refs of the holders of the bundle in force (empty: none
-/// held). An input of the standing cache's key.
-///
-/// # Errors
-/// Directory read failures.
-pub async fn bundle_holder_refs<F>(dir: &F) -> Result<Vec<String>, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    Ok(genesis_in_force(dir)
-        .await?
-        .holders()
-        .iter()
-        .map(|h| h.identity_ref.clone())
-        .collect())
-}
-
 /// **The birth's accord count**: the distinct holders of the bundle in force
 /// among `signers`, against [`accord_threshold`](crate::federation::admission::accord_threshold). With no bundle held the
 /// roster is empty and the count is never met.
@@ -154,10 +135,10 @@ where
     F: FederationDirectory + ?Sized,
 {
     // v62.0.0 (RL-fix6) — a birth counted short over no (or an earlier)
-    // bundle's holders re-folds at a placement. `bundle_holder_refs` itself
+    // bundle's holders re-folds at a placement. `accord_holder_roster` itself
     // does not declare it: it is also the standing cache's key input.
     super::genesis::reads_bundle_in_force();
-    let holders = bundle_holder_refs(dir).await?;
+    let holders = crate::federation::admission::accord_holder_roster(dir).await?;
     Ok(holders_count(&holders, signers))
 }
 

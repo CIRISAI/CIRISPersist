@@ -35,7 +35,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 3.2	CLM-nsproc-pre-rotation-commitment-trust	CIRISPersist	src/federation/trust_root.rs#check_trust_charter_admission	ciris-persist@61.4.2	21672f70ad12e59a8223b1ba2ff6cc14fc6e3b771ae27b80b4332bb642554f00
 3.2	CLM-halt-not-a-trust-leg	CIRISPersist	src/federation/trust_root.rs#trust_root_valid	ciris-persist@61.4.2	77bdec66e6f4de6c6d6f73c386175d7944bada93bb6467818fbe5a1f68583b87
 3.2	CLM-halt-not-a-trust-leg	CIRISPersist	src/federation/trust_root.rs#transit_eligibility_walk	ciris-persist@61.4.2	0404b513e4b2d3a31bf70f91dbf23c250f1aeb42c6dfddac71c5b25f64c2a1b3
-3.2	CLM-standing-verdict	CIRISPersist	src/federation/edition2/peer_rooting.rs#peer_rooting	ciris-persist@61.4.2	20a036e5af963d82c878c3d7dc942f5a95efb0d85bd5201fc713654d00640acf
+3.2	CLM-standing-verdict	CIRISPersist	src/federation/edition2/peer_rooting.rs#peer_rooting	ciris-persist@61.4.2	16053f30f67554299fcd14a5392134e2d93f017f966982c3e4093582e96edf46
 3.2	CLM-trust-not-membership	CIRISPersist	src/federation/admission.rs#check_user_target_steward_binding_admission	ciris-persist@61.4.2	7f4401f0c4f1d8a35a5ae34b61df0cd735c38e2bb9c7a0b521d444e3b2d26a5b
 3.2	CLM-nsproc-steward-bound-predicate-trust	CIRISPersist	src/federation/admission.rs#is_steward_bound	ciris-persist@61.4.2	3217545f608288d5c87f66dab040b9dc69f1afbba1cf06082d35316a42649e40
 3.2	CLM-nsproc-steward-bindings-read-fold-trust	CIRISPersist	src/engine.rs#steward_bindings_of	ciris-persist@61.4.2	7df0174b73d2b30230164aca2e1572afaec173ac61d27c4e6d99b61b19418441
@@ -88,7 +88,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 # (`evidence_cc_impl_pointers_resolve`) requires a definition for every src/
 # row regardless of decimal, so a rename fails our build even before CC sees
 # it. Proposed CLM names are suggestions, not claims.
-3.2	CLM-conferral-plane-named	CIRISPersist	src/federation/trust_root.rs#ConferralPlane	ciris-persist@61.4.2	1afc84286f5617fc6e10e99ee1a4af636da57a3da25fd436b5bd2e5dd3573631
+3.2	CLM-conferral-plane-named	CIRISPersist	src/federation/trust_root.rs#ConferralPlane	ciris-persist@61.4.2	a4e9e22d06f45c076d4245eb4dc55de0242bfc2f40df40ae21def6eab6072b0d
 3.2	CLM-drill-freshness-signal-not-gate	CIRISPersist	src/federation/trust_root.rs#DrillFreshness	ciris-persist@61.4.2	f91ac61fc2df3bc82e7a3eceb1e35a783c0ba9bc5789ede42ba69d17aaa0b7f9
 3.2	CLM-transit-eligibility-shared-root	CIRISPersist	src/federation/trust_root.rs#resolve_transit_eligibility	ciris-persist@61.4.2	11add97658bd6d68fd1400597227218422967d4dbacb88ead9f1b3aa10c69bd2
 3.4.7	CLM-key-refusal-names-its-branch	CIRISPersist	src/federation/register.rs#KeyRefusalReason	ciris-persist@61.4.2	c3f42ebd67ae0439310a9c91fc072e3a01b298941dcc7c49813e0b61e26e1e2e
@@ -126,7 +126,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 3.2	CLM-infrastructure-does-not-vote	CIRISPersist	src/federation/mod.rs#community_node_bearing_seats	ciris-persist@61.4.2	44bc20a58a1dd4dd16e8d33591cbde53ec7ab86450630cd4471aa311b227d64f
 3.2	CLM-infrastructure-quorum-m-of-n	CIRISPersist	src/federation/admission.rs#check_infrastructure_consensus_protocol	ciris-persist@61.4.2	5472c3b82f2af28566dad06b448b92d67f18ba00e7b45d258a372a122df5c4bf
 3.2	CLM-infrastructure-quorum-m-of-n	CIRISPersist	src/federation/admission.rs#check_infrastructure_quorum_strict_majority	ciris-persist@61.4.2	741064152df2a8c285438cc7535116db9d682494880bb73a7d4bebd24e9b80de
-3.2	CLM-family-root-charter	CIRISPersist	src/federation/trust_root.rs#ConferralPlane	ciris-persist@61.4.2	1afc84286f5617fc6e10e99ee1a4af636da57a3da25fd436b5bd2e5dd3573631
+3.2	CLM-family-root-charter	CIRISPersist	src/federation/trust_root.rs#ConferralPlane	ciris-persist@61.4.2	a4e9e22d06f45c076d4245eb4dc55de0242bfc2f40df40ae21def6eab6072b0d
 3.2	CLM-family-root-charter	CIRISPersist	src/federation/trust_root.rs#family_quorum_over	ciris-persist@61.4.2	0c50dfaccac854415ad9aca4d3484709c29b9cc090cebe761fd4dcbb586d92c8
 3.2	CLM-family-root-charter	CIRISPersist	src/federation/trust_root.rs#check_family_charter_admission	ciris-persist@61.4.2	36dad129085524bbdf1d8efd847b573e8574122ebea723165a0bd8897da59e26
 4.1.1	CLM-delegation-depth-default	CIRISPersist	src/federation/topology.rs#DEFAULT_DELEGATION_DEPTH	ciris-persist@61.4.2	a5186eead186970cc78aa539dd9683ca642647fc76f2be3329511288b75ccade
@@ -184,11 +184,11 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 4.4.3.19	CLM-issuance-scope	CIRISPersist	src/federation/key_grant.rs#admit_replicated_key_grant	ciris-persist@61.4.2	59abb9cc801d99a51b211af9dd8dcbe3671a86c7daf98a9a11a8f538436737d7
 4.4.3.34	CLM-trust-root	CIRISPersist	src/federation/trust_root.rs#check_trust_charter_admission	ciris-persist@61.4.2	21672f70ad12e59a8223b1ba2ff6cc14fc6e3b771ae27b80b4332bb642554f00
 4.4.3.34	CLM-trust-root	CIRISPersist	src/federation/trust_root.rs#trust_root_valid	ciris-persist@61.4.2	77bdec66e6f4de6c6d6f73c386175d7944bada93bb6467818fbe5a1f68583b87
-4.4.3.34	CLM-trust-root	CIRISPersist	src/federation/trust_root.rs#ConferralPlane	ciris-persist@61.4.2	1afc84286f5617fc6e10e99ee1a4af636da57a3da25fd436b5bd2e5dd3573631
+4.4.3.34	CLM-trust-root	CIRISPersist	src/federation/trust_root.rs#ConferralPlane	ciris-persist@61.4.2	a4e9e22d06f45c076d4245eb4dc55de0242bfc2f40df40ae21def6eab6072b0d
 4.4.3.34	CLM-trust-root	CIRISPersist	src/federation/trust_root.rs#resolve_transit_eligibility	ciris-persist@61.4.2	11add97658bd6d68fd1400597227218422967d4dbacb88ead9f1b3aa10c69bd2
 4.5.5	CLM-scope-attenuation	CIRISPersist	src/federation/admission.rs#scope_covers	ciris-persist@61.4.2	c0d29b5f4d6f022fd3aa2561315851556a11dbb23aa7904826b322e5ee092c37
 4.5.5	CLM-scope-attenuation	CIRISPersist	src/federation/admission.rs#delegation_scope_grants	ciris-persist@61.4.2	9d19ea7e0dbf24f2404f3515c122113faa76449f5b5de10538d06f8644c6c062
-3.2	CLM-attach-freshness	CIRISPersist	src/federation/canonical_community.rs#check_attach_freshness	ciris-persist@61.4.2	3994b13869bcc89e6c626e7da9febd165358e4571d156b794bd418dfc045b241
+3.2	CLM-attach-freshness	CIRISPersist	src/federation/canonical_community.rs#check_attach_freshness	ciris-persist@61.4.2	f5a4ece0dad778dc06826a6c7663bf5e1f0125b02c25ee0025369d7f21473848
 3.2	CLM-attach-freshness	CIRISPersist	src/federation/envelope.rs#ATTACH_WINDOW_SECS	ciris-persist@61.4.2	587421cb5cbd49923981c219ca7e16e079a9be47c8c275219aca41bcc0ed96c7
 3.2	CLM-witnessed-lineage	CIRISPersist	src/federation/lineage_witness.rs#witnessed	ciris-persist@61.4.2	6e69c4e8acee12ad19c02520267525b85114971441e44ac3c1cd064ef7cef5d3
 3.2	CLM-witnessed-lineage	CIRISPersist	src/federation/canonical_community.rs#witnessed_head	ciris-persist@61.4.2	405530311e14808c6e927f5ce23cc4ea13cd2e8b24e9d64e0ea76f6aacc8fdeb

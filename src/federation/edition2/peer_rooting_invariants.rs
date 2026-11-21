@@ -456,3 +456,201 @@ async fn i2216_i2224_postgres() {
     b.set_node_key_id(node);
     Box::pin(body(&b)).await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+//  KB-fix2 — the BUNDLE root (CC 3.2 at rc22 `87abd2d`)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// **I2405–I2409** — the peer verdict when the root a reader accepts is the
+/// bundle's lineage, named by its `family_key_id` (no room, no W1b root):
+///
+/// - **I2405** a ROOTLESS reader (no bundle held): a holder waits
+///   `no_genesis_or_root_lineage_held`, and the verdict names the plane that
+///   waits: the mesh planes cross, the federation tier does not (CC 5.3.4).
+/// - **I2406** the bundle in force, the reader accepting nothing: the holder
+///   is `no_acceptance_edge` (no root named: the reader accepts none).
+/// - **I2407** the reader's own edge to the bundle root (by `family_key_id`,
+///   naming the bundle in force): a holder is `Rooted` via `AccordHolder` and
+///   a serve seat via `ServeSeat`, both on the ceremony plane, and the root a
+///   host reads is `"humanity-accord"`.
+/// - **I2408** a later bundle of the lineage: the same verdict, no
+///   re-acceptance.
+/// - **I2409** a delegation seat under the bundle root's counted grant
+///   ([`delegation_seat_body`]).
+pub(crate) async fn bundle_root_body(d: &dyn FederationDirectory) {
+    let seed = "kb2-reader-node";
+    let reader = e2::kid(seed);
+    let c = fixture_genesis::bundle_v2();
+    let holder = c.holder_identity_ref(0).to_owned();
+    let seat = c.serve_node_identity_ref(0).to_owned();
+
+    // I2405 — rootless.
+    let v = verdict(d, &reader, &holder, composite(&c.holder_key(0)), now_ms()).await;
+    assert_eq!(
+        v,
+        PeerRooting::CannotTellYet {
+            missing: CannotTellYet::NoGenesisOrRootLineageHeld
+        },
+        "I2405: a rootless reader cannot tell yet"
+    );
+    assert!(
+        v.mesh_planes_may_cross() && !v.federation_tier_may_cross(),
+        "I2405: the plane that waits is the federation tier; the mesh planes cross"
+    );
+
+    fixture_genesis::install_v2(d)
+        .await
+        .expect("the ceremony installs");
+    let _ = e2::put_key(d, seed, &["node"]).await;
+    let root = fixture_genesis::FAMILY_KEY_ID.to_owned();
+
+    // I2406 — no acceptance.
+    let v = verdict(d, &reader, &holder, composite(&c.holder_key(0)), now_ms()).await;
+    assert_eq!(
+        not_rooted(&v),
+        &NotRootedReason::NoAcceptanceEdge { root: None },
+        "I2406: the reader accepts no root (a ceremony seat reaches only accepted roots)"
+    );
+
+    // I2407 — the reader accepts the bundle root.
+    let tip = {
+        let g = super::genesis::genesis_in_force(d).await.expect("genesis");
+        hex::encode(g.tips().first().expect("a tip").object_id)
+    };
+    let edge = super::fixture_trust_root::bundle_acceptance_statement(
+        d,
+        &e2::signing_key(seed),
+        &reader,
+        &tip,
+    )
+    .await
+    .expect("I2407: the edge signs");
+    e2::put_statement(d, &edge)
+        .await
+        .expect("I2407: the acceptance edge lands");
+    let at = now_ms();
+    let v = verdict(d, &reader, &holder, composite(&c.holder_key(0)), at).await;
+    assert_eq!(
+        rooted(&v, "I2407 holder"),
+        (root.clone(), Plane::Ceremony, RootedVia::AccordHolder),
+        "I2407: a holder, under the bundle root"
+    );
+    let v = verdict(d, &reader, &seat, ClaimedKeyWire::Kid(c.seats[0].kid), at).await;
+    assert_eq!(
+        rooted(&v, "I2407 seat"),
+        (root.clone(), Plane::Ceremony, RootedVia::ServeSeat),
+        "I2407: a serve seat, under the bundle root"
+    );
+
+    // I2408 — a later bundle: no re-acceptance.
+    let later = fixture_genesis::later_v2(
+        fixture_genesis::bundle_v2(),
+        &[1, 2, 3, 4, 5, 6, 7],
+        &fixture_genesis::SERVE_NODE_SEEDS,
+        &[1, 2, 3, 4, 5, 6, 7],
+    );
+    fixture_genesis::install_ceremony_v2(d, &later)
+        .await
+        .expect("I2408: the later bundle installs");
+    let v = verdict(d, &reader, &holder, composite(&c.holder_key(0)), now_ms()).await;
+    assert_eq!(
+        rooted(&v, "I2408 holder"),
+        (root, Plane::Ceremony, RootedVia::AccordHolder),
+        "I2408: still Rooted across the lineage"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2405_i2408_bundle_root_sqlite() {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(bundle_root_body(&b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2405_i2408_bundle_root_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::empty_dsn() else {
+        return;
+    };
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(bundle_root_body(&b)).await;
+}
+
+/// **I2409** — a DELEGATION seat under the bundle root (KB-fix2 on KR-fix2's
+/// counted grant and KR-fix3a's wiring): a `node` worker granted
+/// `infra:serve` by two of the three holders of the bundle in force (a row
+/// counted over the bundle it names, `refs.head`) is `peer_no_conferral` for
+/// a reader accepting the bundle root until the worker's OWNER accepts the
+/// grant; then it is `Rooted` on the delegation plane via `ConferredSeat`,
+/// and its root is the bundle's `family_key_id`, never the holder who
+/// authored the first voice.
+pub(crate) async fn delegation_seat_body(d: &dyn FederationDirectory) {
+    use super::scope_resolution_invariants as sr;
+    fixture_genesis::install_v2(d)
+        .await
+        .expect("the ceremony installs");
+    let reader = sr::accepting_node(d, "kb2-delegation-reader").await;
+    let (worker, owner_seed) = sr::worker_with_owner(d, "kb2del").await;
+    let head = super::genesis::genesis_in_force(d)
+        .await
+        .expect("genesis")
+        .tips()
+        .first()
+        .expect("a tip")
+        .object_id;
+    let at = sr::grant_instant(d).await;
+    let grant = sr::land_grant(d, &worker, INFRA_SERVE_SCOPE, &head, at, "I2409").await;
+    let claim = || ClaimedKeyWire::Kid(e2::kid_digest("w-kb2del"));
+
+    let v = verdict(d, &reader, &worker, claim(), now_ms()).await;
+    assert!(
+        matches!(not_rooted(&v), NotRootedReason::NoConferral { .. }),
+        "I2409: an unaccepted root grant confers nothing: {v:?}"
+    );
+
+    sr::owner_accepts(d, &owner_seed, &grant, "I2409").await;
+    let v = verdict(d, &reader, &worker, claim(), now_ms()).await;
+    assert_eq!(
+        rooted(&v, "I2409 worker"),
+        (
+            fixture_genesis::FAMILY_KEY_ID.to_owned(),
+            Plane::Delegation,
+            RootedVia::ConferredSeat
+        ),
+        "I2409: the accepted root grant seats the worker under the bundle root"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2409_delegation_seat_sqlite() {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(delegation_seat_body(&b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2409_delegation_seat_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::empty_dsn() else {
+        return;
+    };
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(delegation_seat_body(&b)).await;
+}

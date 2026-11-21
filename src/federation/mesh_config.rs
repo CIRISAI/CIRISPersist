@@ -1698,6 +1698,19 @@ where
     if root_ref == author {
         return Ok(AuthorAuthority::Inherent);
     }
+    // v62.0.0 (KB-fix1; CC 3.2 at rc22 `87abd2d`, CC 4.2.1) — the bundle
+    // root acts through its holders in force: an author that is one of them
+    // is the root acting on the delegation plane (an emergency stands on one
+    // holder, 72 h; a durable setting is counted below,
+    // `root_quorum_reached`). Any other author is not authorized by this
+    // root: a keyless lineage confers by no row of its own id.
+    if let Some(holders) = super::trust_root::bundle_root_holders(directory, root_ref).await? {
+        return Ok(if holders.iter().any(|h| h == author) {
+            AuthorAuthority::Inherent
+        } else {
+            AuthorAuthority::None
+        });
+    }
     // The root's conferrals to the author and the root's composers naming
     // them — the rows the tombstone fold and the filter below read (the
     // trust-root walks' shape, v53.1.7).
@@ -1815,6 +1828,16 @@ where
     // legitimate signer can answer and a squatted key id can. On a pre-genesis
     // node that turned a strict-majority count into a string comparison. Absence of the family
     // row is not permission to use a weaker rule about it.
+    // v62.0.0 (KB-fix1; CC 3.2 at `87abd2d`, CC 4.2.1 rule 3) — the bundle
+    // root's own quorum: the row's distinct voices among the holders of the
+    // bundle in force, at the accord's threshold (the one strict-majority
+    // seam). It replaces the family-row reading below, which no v62 door
+    // can satisfy for the accord.
+    if let Some(holders) = super::trust_root::bundle_root_holders(directory, root_ref).await? {
+        let counted =
+            super::edition2::voices::counted_roster_signers(directory, row, &holders).await?;
+        return Ok(counted.len() >= super::admission::accord_threshold(holders.len()));
+    }
     match super::trust_root::resolve_family_root(directory, root_ref).await? {
         Some(family) => Ok(
             super::trust_root::family_quorum_over(directory, row, &family)
@@ -4128,6 +4151,178 @@ mod tests {
                 setting.key
             );
         }
+    }
+
+    /// v62.0.0 (KB-fix1; CC 3.2 at rc22 `87abd2d`, CC 4.2.1 rule 3) —
+    /// **I2410–I2411: a durable setting rooted at the BUNDLE root lands at
+    /// the accord's threshold over the holders in force.** The node accepts
+    /// the bundle root (its `family_key_id`); a holder authors a COLD durable
+    /// restriction (no ratified emergency):
+    ///
+    /// - **I2410** one holder's voice of three is short:
+    ///   `durable_without_root_quorum` (`root_quorum_reached`'s bundle arm);
+    /// - **I2411** a second holder's voice of the same row: two of three is
+    ///   the strict majority, and the row is admitted.
+    ///
+    /// BELIEVED (unbuilt): that the second holder's voice is stored by the
+    /// statement door as a voice of the row; the precondition is asserted, so
+    /// a red names the voice store, not the count.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn bundle_root_durable_body(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::edition2::fixture_genesis as fg;
+        use crate::federation::edition2::fixture_switch as e2;
+        use ciris_verify_core::cde::Value;
+        use MeshConfigKey as K;
+        fg::install_v2(dir)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] the ceremony installs: {e}"));
+        let root = fg::FAMILY_KEY_ID;
+        let in_force = crate::federation::edition2::genesis::genesis_in_force(dir)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] the genesis reads: {e}"));
+        let tip = hex::encode(in_force.tips().first().expect("a tip").object_id);
+        let node_seed = format!("kb1-mc-node-{}", &tag[..tag.len().min(8)]);
+        let node = e2::put_key(dir, &node_seed, &["node"]).await;
+        let edge = crate::federation::edition2::fixture_trust_root::bundle_acceptance_statement(
+            dir,
+            &e2::signing_key(&node_seed),
+            &node,
+            &tip,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the acceptance edge signs: {e}"));
+        e2::put_statement(dir, &edge)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] the node accepts the bundle root: {e}"));
+
+        let now = Utc::now();
+        let base = MeshConfigBaseline::owner_defaults();
+        let author = fg::identity_ref_of(fg::HOLDER_SEEDS[0]);
+        let a = Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: author.clone(),
+            attested_key_id: root.to_owned(),
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: None,
+            asserted_at: now - Duration::hours(1),
+            expires_at: None,
+            attestation_envelope: mesh_config_envelope(
+                K::FeatureAvStreams,
+                0,
+                root,
+                MeshConfigForm::Durable,
+                None,
+                "kb1-holders-in-force",
+                None,
+                "congestion",
+            ),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: author.clone(),
+            scrub_timestamp: now - Duration::hours(1),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+            tier: attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        let st =
+            e2::statement_of_with_key(&a, &fg::test_key(fg::HOLDER_SEEDS[0]), &e2::family_of(&a));
+        let row = e2::row_of_statement(&st, crate::federation::edition2::ingest::INGEST_TIER);
+        let door = |row: &Attestation| {
+            let row = row.clone();
+            let node = node.clone();
+            let base = base.clone();
+            async move {
+                record_mesh_config_row(dir, &node, &base, &row, now)
+                    .await
+                    .unwrap_or_else(|e| panic!("[{tag}] the door errored: {e}"))
+            }
+        };
+        assert_eq!(
+            door(&row).await,
+            MeshConfigOutcome::Refused {
+                reason: MeshConfigRefusalReason::DurableWithoutRootQuorum
+            },
+            "[{tag}] I2410: one holder of three is short of the strict majority"
+        );
+
+        // A second holder's voice over the same payload.
+        let voice = {
+            let (protected, payload) =
+                crate::federation::edition2::liveness::statement_parts(&st).expect("a statement");
+            let text = |k: i64| {
+                protected
+                    .get_int(k)
+                    .and_then(Value::as_text)
+                    .expect("a header member")
+                    .to_owned()
+            };
+            let sub = protected
+                .get_int(15)
+                .and_then(|c| c.get_int(2))
+                .and_then(Value::as_text)
+                .expect("sub")
+                .to_owned();
+            let key = fg::test_key(fg::HOLDER_SEEDS[1]);
+            ciris_verify_core::edition2::sign_row_statement(
+                &key,
+                &fg::identity_ref_of(fg::HOLDER_SEEDS[1]),
+                &sub,
+                &text(-70001),
+                &text(-70002),
+                &payload,
+                vec![],
+            )
+            .expect("the second voice signs")
+        };
+        let _ = e2::put_statement(dir, &voice).await;
+        let row_id = crate::federation::edition2::voices::carried_row_id(&row).expect("a row id");
+        let holders = crate::federation::admission::accord_holder_roster(dir)
+            .await
+            .expect("the holders read");
+        assert!(
+            crate::federation::edition2::voices::roster_voices(dir, &row_id, &holders)
+                .await
+                .expect("voices read")
+                .contains(&fg::identity_ref_of(fg::HOLDER_SEEDS[1])),
+            "[{tag}] precondition: the second holder's voice is held for the row"
+        );
+        assert_eq!(
+            door(&row).await,
+            MeshConfigOutcome::Admitted,
+            "[{tag}] I2411: two of three holders in force is the accord's threshold"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i2410_bundle_root_durable_sqlite() {
+        use crate::store::Backend;
+        let dir = crate::store::SqliteBackend::open_in_memory()
+            .await
+            .expect("sqlite");
+        dir.run_migrations().await.expect("migrations");
+        Box::pin(bundle_root_durable_body(&dir, "sq")).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i2410_bundle_root_durable_postgres() {
+        use crate::store::Backend;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let dir = crate::store::PostgresBackend::connect(&dsn)
+            .await
+            .expect("pg");
+        dir.run_migrations().await.expect("migrations");
+        Box::pin(bundle_root_durable_body(&dir, "pg")).await;
     }
 
     #[cfg(feature = "sqlite")]

@@ -433,6 +433,36 @@ fn acceptance_statement_by(
     )
 }
 
+/// v62.0.0 (KB-fix1; CC 3.2 at rc22 `87abd2d`) — `iss`'s `trust:accepts:v1`
+/// edge to the BUNDLE root: it names the lineage by the `family_key_id` of
+/// the bundle in force and, for audit, the bundle it attaches on by object id
+/// (`head_hex`), signed by `key`, stated one minute after the bundle's newest
+/// tip or one second into `iss`'s own key window, whichever is later. Returns
+/// the statement (not put).
+///
+/// # Errors
+/// No bundle in force; a signing failure.
+pub async fn bundle_acceptance_statement<D>(
+    dir: &D,
+    key: &CompositeSigningKey,
+    iss: &str,
+    head_hex: &str,
+) -> Result<Vec<u8>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let in_force = genesis_in_force(dir).await?;
+    let root = in_force
+        .family_key_id()
+        .ok_or_else(|| refused("acceptance", "no bundle in force"))?
+        .to_owned();
+    let mut at = conferral_instant(dir).await? - 30_000;
+    if let Some(rec) = dir.lookup_public_key(iss).await? {
+        at = at.max(e2::ms(rec.valid_from).saturating_add(1_000));
+    }
+    acceptance_statement_by(key, iss, &root, head_hex, at)
+}
+
 /// **Another party accepts the root**: `iss`'s `trust:accepts:v1` edge to
 /// `r.root`, signed by `key` (e.g. a bundle seat's
 /// `fixture_genesis::test_key(seed)` signing as its identity-ref), naming the

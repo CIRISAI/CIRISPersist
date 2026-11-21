@@ -174,6 +174,17 @@ where
         return Ok(false);
     };
     for root in crate::federation::trust_root::accepted_roots_of(dir, node).await? {
+        // v62.0.0 (KB-fix1; CC 3.2 at rc22 `87abd2d`) — the root a node
+        // accepts is the bundle's lineage: a live acceptance of the
+        // `family_key_id` of the bundle in force roots the node
+        // (`bundle_root_accepted`). No room chain is read for it.
+        if Box::pin(crate::federation::trust_root::bundle_root_accepted(
+            dir, node, &root, now,
+        ))
+        .await?
+        {
+            return Ok(true);
+        }
         let (standing, _) = Box::pin(reader_standing(dir, Some(node), &root, now)).await?;
         if matches!(
             standing,

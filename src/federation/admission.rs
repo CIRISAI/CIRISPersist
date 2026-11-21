@@ -6358,19 +6358,19 @@ where
         return Ok(false);
     }
     fold_reads_key(&row.attested_key_id);
-    let family = match directory.lookup_family(&row.attested_key_id).await {
-        Ok(f) => f.is_some(),
-        Err(Error::Unsupported { .. }) => false,
-        Err(e) => return Err(e),
-    };
-    if family {
+    // v62.0.0 (SW-fix1, I2190) — a directory that cannot answer
+    // (`Unsupported`) fails the read; it is never "no group".
+    if directory
+        .lookup_family(&row.attested_key_id)
+        .await?
+        .is_some()
+    {
         return Ok(true);
     }
-    match directory.lookup_community(&row.attested_key_id).await {
-        Ok(c) => Ok(c.is_some()),
-        Err(Error::Unsupported { .. }) => Ok(false),
-        Err(e) => Err(e),
-    }
+    Ok(directory
+        .lookup_community(&row.attested_key_id)
+        .await?
+        .is_some())
 }
 
 /// v62.0.0 (AU-fix1) — the group whose roster version `head` names, when
@@ -17219,12 +17219,13 @@ pub(crate) async fn accord_holder_roster<F>(directory: &F) -> Result<Vec<String>
 where
     F: super::FederationDirectory + ?Sized,
 {
+    // v62.0.0 (KB-fix1) — THE one async reader of "the holders in force"
+    // (`trust_root_group::bundle_holder_refs`, its identical twin, is
+    // deleted), through the one pure reader `holders_in_force`.
     let in_force = super::edition2::genesis::genesis_in_force(directory).await?;
-    Ok(in_force
-        .holders()
-        .iter()
-        .map(|h| h.identity_ref.clone())
-        .collect())
+    Ok(super::edition2::trust_root_group::holders_in_force(
+        &in_force,
+    ))
 }
 
 /// v60.1.0 (CIRISPersist#1117; CC 4.2.6 / CC 4.5.1.2, rc10) — **the accord
@@ -19864,11 +19865,10 @@ pub async fn duty_holders_for_federation(
     // whose tips seat no holder in common: refused, never an empty set.
     let in_force = super::edition2::genesis::genesis_in_force(directory).await?;
     if in_force.is_held() {
-        let holders: std::collections::HashSet<String> = in_force
-            .holders()
-            .iter()
-            .map(|h| h.identity_ref.clone())
-            .collect();
+        let holders: std::collections::HashSet<String> =
+            super::edition2::trust_root_group::holders_in_force(&in_force)
+                .into_iter()
+                .collect();
         if holders.is_empty() {
             return Err(Error::InvalidArgument(
                 "federation-scope duty-holders are the holders of the genesis bundle in force, \
