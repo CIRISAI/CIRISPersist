@@ -5,6 +5,30 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.4.3] - 2026-11-21
+
+Read telemetry can name more callers. A host credits its reads to a caller label so that workload can be attributed and shed in an emergency; the label set held 32, CIRISEdge names 26 of them, and that left CIRISServer about 5. Reads past the cap are counted under `other`, so on a busy node most of the server's reads could not be told apart.
+
+### Changed
+
+- **`MAX_CALLER_LABELS` is 128, was 32** (`src/observe/mod.rs`). The per-caller table is a fixed static: 2 backends × 19 doors × 129 slots × 24 bytes, about 118 KB (was about 30 KB). The read path is unchanged: one atomic add per read made under a caller scope.
+
+### Added
+
+- **`caller_label_refusals`** on `TelemetrySnapshot`, and as a key of `Engine.telemetry_snapshot()` in Python. It is how many times a caller label that was not yet interned was refused a slot because the set was full. Those reads are counted under `other`.
+  - It counts refusals, not distinct labels: persist keeps no record of a refused label's name. A host that makes each `Caller` once and reuses it sees one per refused label; one that re-makes an overflowed label sees one per re-make.
+  - A host naming `other` itself, and a label already interned, are not counted.
+
+### Adoption notes (CIRISEdge, CIRISServer)
+
+- A snapshot can now list up to 128 caller labels plus `other` and `unattributed` for each `(backend, door)`, where it listed up to 32. Only rows that counted a read are listed.
+- `TelemetrySnapshot` gains a field. A consumer that builds one with a struct literal needs it; one that reads fields does not. The Python dict gains a key.
+- A label still holds its slot for the life of the process, and persist does not check what a label means: do not use a peer id, a key id or any other unbounded value as a label.
+
+### Tested
+
+- I1583 (the cap, now read from the constant) and I1586 (the snapshot's keys) carry the new count: a refusal is counted for each new label that finds the set full, a repeat of an overflowed label included; a re-made interned label and the host's own `other` are not.
+
 ## [61.4.2] - 2026-11-19
 
 An agent's voice or video call could not join. The directory capsule proxy (`OpsDirectory`) answered `Unsupported` for 35 `FederationDirectory` methods, so persist's folds and doors failed, or read "nothing there", at the first one they touched on an agent install. Call joins refused 503 (`directory ops proxy: method list_community_membership_widenings_for has no DirectoryOp`, then `list_group_versions has no DirectoryOp`). This release routes every one of them across the capsule. The proxy has no `Unsupported` stub of its own left.
