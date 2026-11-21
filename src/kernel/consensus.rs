@@ -28,9 +28,7 @@
 use super::law::{seat_law, SEAT_FOUNDER, SEAT_MEMBER};
 use super::view::{KRow, NoCut, RowId, SeatFields};
 use super::Answer;
-use crate::federation::consensus::{
-    eligible_seats, quorum_need, Ballot, Direction, RUBRIC_UNIFORM_HALF,
-};
+use crate::federation::consensus::{eligible_seats, quorum_need, Ballot, Direction};
 use crate::federation::types::consensus_protocol as cp;
 use ciris_kernel::layers;
 use ciris_kernel::seat::{seat_rule, Conf, Obj, SeatKind};
@@ -136,14 +134,10 @@ fn arm_over(b: &Ballot<'_>, elig: &[&crate::federation::consensus::Seat]) -> Res
     if let Some(rubric) = p.strip_prefix(cp::WEIGHTED_PREFIX) {
         let person =
             |s: &crate::federation::consensus::Seat| b.persons.seat_person(&s.key_id).to_owned();
-        if rubric == RUBRIC_UNIFORM_HALF {
-            return Ok(Arm {
-                word: "weighted",
-                counted,
-                need: Some(n.div_ceil(2)),
-                weights: elig.iter().map(|s| (person(s), 1)).collect(),
-            });
-        }
+        // v62.0.0 (SD-fix3) — no built-in rubric (the former `uniform_half`,
+        // ⌈n/2⌉): a weighted arm counts only by the rubric the record
+        // declares (CC 3.3.4: "the threshold is a whole number carried on the
+        // group's signed record").
         let Some(decl) = b
             .policy_blob
             .and_then(|pb| pb.get("rubrics"))

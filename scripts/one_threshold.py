@@ -37,6 +37,18 @@ same production code (test and `test-anchor` code excepted, as above):
     `"quorum:{m}/{n}"` is not matched;
   - `QuorumPolicy::new(<int>, <int>)`, `ThresholdPolicy::new(<int>, <int>)`
     or `accord_threshold(<int>)`: a threshold over a fixed roster size.
+
+v62.0.0 (SD-fix2; CLEAN-standing.md §0.9) — four more spellings the
+patterns above miss, held as a RATCHET (today's sites, by (rule, file,
+enclosing fn) with their count; a new site, a grown count, or a count that
+fell without lowering its entry is red, so the list only shrinks):
+  - `fraction`: `num * n / den + 1` and `(num * n).div_ceil(den)` (a strict
+    majority is the fraction 1/2 spelled this way);
+  - `doubling`: `checked_mul(2)` (the predicate `2m > n` via a doubled count);
+  - `half`: `div_ceil(2)` and `as f64 / 2.0` (a HALF, which is not a
+    majority for an even n), except a byte length's `.len().div_ceil(2)`;
+  - `margin`: `>= m.saturating_add(1)` / `>= m + 1` / `n > strict_majority(n)`
+    (the T7 liveness margin, to become one `standing::margin`).
 """
 import re
 import sys
@@ -72,6 +84,60 @@ def enclosing_fn(code: str, at: int) -> str:
         if body and body[0] <= at <= body[1]:
             best = m.group(1)
     return best or "<top>"
+
+
+# v62.0.0 (SD-fix2) — the four spellings above, as a ratchet.
+MORE = {
+    "fraction": re.compile(
+        r"\b[A-Za-z_]\w*\s*\*\s*[A-Za-z_][\w.()]*\s*/\s*[A-Za-z_][\w.()]*\s*\+\s*1\b"
+        r"|\.div_ceil\(\s*[A-Za-z_]\w*\s*\)"),
+    "doubling": re.compile(r"\bchecked_mul\(\s*2\s*\)"),
+    "half": re.compile(r"(?<!\.len\(\))\.div_ceil\(\s*2\s*\)|\bas\s+f64\s*/\s*2\.0\b"),
+    "margin": re.compile(r">=\s*[A-Za-z_][\w.()]*\.saturating_add\(\s*1\s*\)|>=\s*[A-Za-z_]\w*\s*\+\s*1\b"
+                         r"|\b[A-Za-z_]\w*\s*>\s*(?:[\w:]+::)?strict_majority\("),
+}
+# (rule, file, fn): (count, why) at the root passes' end tree 46157719. SHRINK ONLY.
+MORE_RATCHET = {
+    ("fraction", "src/federation/two_path.rs", "votes"):
+        (2, "the corridor's Fraction arms (CLEAN §3 does-not-fit 3: prove every config is 1/2, or Rule::Fraction)"),
+    ("doubling", "src/federation/group_membership_change.rs", "quorum_threshold_from_envelope"):
+        (1, "the accord envelope's WeakQuorum 2m <= n; -> is_strict_majority(m, n)"),
+    # SD-fix3 removed `weighted:uniform_half` (consensus::eval_weighted and
+    # kernel::consensus::arm_over): Constitution 11-21, "A count is the strict
+    # majority or a threshold the record states."
+    ("half", "src/fountain/eviction.rs", "keep_count"):
+        (1, "not a vote: the midpoint of an eviction range"),
+    ("margin", "src/federation/canonical_community.rs", "is_live"):
+        (1, "the T7 margin active >= M + 1; -> standing::margin"),
+    ("margin", "src/federation/canonical_community.rs", "compute_standing"):
+        (1, "the T7 margin active >= M + 1; -> standing::margin"),
+    ("margin", "src/federation/edition2/peer_rooting.rs", "root_arm"):
+        (1, "KB-fix2: the bundle holders' T7 margin n > strict_majority(n); -> standing::margin"),
+}
+
+
+def scan_more(tree, ratchet=None) -> list[str]:
+    """v62.0.0 (SD-fix2) — the MORE spellings against MORE_RATCHET."""
+    ratchet = MORE_RATCHET if ratchet is None else ratchet
+    found: dict[tuple[str, str, str], int] = {}
+    for rel in tree.glob("src/**/*.rs"):
+        code = tree.code(rel) or ""
+        for rule, pat in MORE.items():
+            for m in pat.finditer(code):
+                key = (rule, rel, enclosing_fn(code, m.start()))
+                found[key] = found.get(key, 0) + 1
+    red: list[str] = []
+    for key, n in sorted(found.items()):
+        if key not in ratchet:
+            red.append(f"{key[1]} ({key[2]}): a new `{key[0]}` spelling of a count; call "
+                       f"admission::strict_majority / is_strict_majority, or (reviewed) ratchet it")
+        elif n > ratchet[key][0]:
+            red.append(f"{key[1]} ({key[2]}): `{key[0]}` grew from {ratchet[key][0]} to {n}")
+    for key, (n, _) in sorted(ratchet.items()):
+        if found.get(key, 0) < n:
+            red.append(f"{key[1]} ({key[2]}): `{key[0]}` shrank from {n} to {found.get(key, 0)}; "
+                       f"lower (or delete) its MORE_RATCHET entry")
+    return red
 
 
 # v62.0.0 (SM-fix1) — a fixed count in production code.
@@ -158,7 +224,7 @@ def scan_fixed(base: Path, tree) -> list[str]:
     return red
 
 
-def scan(base: Path) -> list[str]:
+def scan(base: Path, more_ratchet=None) -> list[str]:
     # test-anchor code (never in a wheel) is test code, as the LONE scan reads it
     tree = efd.Tree(base, anchored=True)
     red: list[str] = []
@@ -188,6 +254,7 @@ def scan(base: Path) -> list[str]:
     for key in sorted(set(ALLOWED) - used):
         red.append(f"{key[0]} ({key[1]}): an ALLOWED entry no longer matches a site; delete it")
     red.extend(scan_fixed(base, tree))
+    red.extend(scan_more(tree, more_ratchet))
     return red
 
 
@@ -240,13 +307,32 @@ def self_test() -> int:
          tree({}, "pub const fn strict_majority(n: usize) -> usize { n / 2 + 1 }\n"), 1),
     ]
     bad = 0
-    for name, files, want in cases:
+    sd = {("fraction", "src/federation/other.rs", "v"): (1, "fixture")}
+    more_cases = [
+        ("SD-fix2: a fraction-spelled majority is red",
+         tree({"src/federation/other.rs": "fn v(num: usize, n: usize, den: usize) -> usize { num * n / den + 1 }\n"}), 1, {}),
+        ("SD-fix2: a ratcheted fraction passes",
+         tree({"src/federation/other.rs": "fn v(num: usize, n: usize, den: usize) -> usize { num * n / den + 1 }\n"}), 0, sd),
+        ("SD-fix2: a grown ratcheted site is red",
+         tree({"src/federation/other.rs": "fn v(a: usize, n: usize, d: usize) -> usize { a * n / d + 1 + (a * n).div_ceil(d) }\n"}), 1, sd),
+        ("SD-fix2: a stale ratchet entry is red", tree({}), 1, sd),
+        ("SD-fix2: a doubled predicate is red",
+         tree({"src/federation/other.rs": "fn w(m: usize, n: usize) -> bool { m.checked_mul(2).is_some_and(|t| t > n) }\n"}), 1, {}),
+        ("SD-fix2: a half is red; a byte length's half is not",
+         tree({"src/federation/other.rs": "fn h(n: usize, s: &str) -> usize { n.div_ceil(2) + s.len().div_ceil(2) }\n"}), 1, {}),
+        ("SD-fix2: a margin over strict_majority is red",
+         tree({"src/federation/other.rs": "fn l(n: usize) -> bool { n > strict_majority(n) }\n"}), 1, {}),
+        ("SD-fix2: a T7 margin is red",
+         tree({"src/federation/other.rs": "fn l(a: usize, m: usize) -> bool { a >= m.saturating_add(1) }\n"}), 1, {}),
+    ]
+    cases = [(n, f, w, {}) for n, f, w in cases] + more_cases
+    for name, files, want, more in cases:
         with tempfile.TemporaryDirectory() as d:
             for rel, text in files.items():
                 p = Path(d) / rel
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_text(text)
-            got = len(scan(Path(d)))
+            got = len(scan(Path(d), more))
             ok = got == want
             bad += not ok
             print(("ok  " if ok else "FAIL"), name, f"(reds {got}, want {want})")

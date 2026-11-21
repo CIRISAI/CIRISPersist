@@ -937,7 +937,13 @@ mod steward_purge_invariants;
 // v62.0.0 (CW-fix1) — I2167: an appointment in one room confers nothing in another.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod cross_room_invariants;
+// v62.0.0 (SD-fix1) — I5300–I5302: a room's duty walk reads its edges at the act's instant.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod moderation_instant_invariants;
 pub mod takedown_tombstone;
+// v62.0.0 (SD-fix3) — I5304: no consensus rubric is built in (uniform_half removed).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod weighted_rubric_invariants;
 // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — erasure is the subject's
 // withdraws; the replicated fact is the tombstone.
 pub mod subject_erasure;

@@ -26,6 +26,7 @@ job, because a broken instrument produces a report that looks like evidence.
 | evidence pointers | `scripts/evidence_pointers.py check` (+ `_test.py`) | certify fast stage (`evidenceptr`); ci.yml `lint`; ci-hygiene `evidence-pointers` (daily) | **GATE** |
 | earlier-form doors | `scripts/earlier_form_doors.py check` (+ `--self-test`) | certify fast stage (`earlierform`); ci.yml `lint` | **GATE** |
 | one strict-majority spelling, no fixed count | `scripts/one_threshold.py check` (+ `--self-test`) | certify fast stage (`onethreshold`); ci.yml `lint` | **GATE** |
+| one reader per standing question (a shrinking ratchet; a duty walk at the act's instant) | `scripts/one_standing.py check` (+ `--self-test`, `list`) | certify fast stage (`onestanding`); ci.yml `lint` | **GATE** |
 | Constitution pointers | `scripts/evidence_pointers.py register <claims.tsv>` | certify fast stage (`evidenceptrcc`, when a Constitution checkout is found) | **report** |
 
 Installing the cargo tools locally:

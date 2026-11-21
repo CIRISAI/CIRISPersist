@@ -82,6 +82,10 @@ Comment-only strippers (`observe/tests.rs::strip_comments`, `durability_invarian
 | the CP2 ignores | `#[ignore = "v62-CP2: needs EARLIER_FORM_DOORS_SHUT"]` parks a test that needs the doors shut. The switch is read from `edition2/door.rs` (production code). While it is `false` the marker is allowed. Once it is `true`, any marker left in `src/` or `tests/` is red. A marker spelled other than exactly (`v62-CP2…`) is red at any time. A marker in a comment is not an attribute. `earlier_form_doors.py unignore` deletes the markers, and refuses while the switch is off. |
 | `--self-test` | Fixture trees. Each negative names the red it must produce: a door with no row; the refusal removed, commented out, in a string, under an `if`, behind `&&`, or only in test code under four spellings; one backend skipping the hop; a stale row; an exemption without a reason; a host door through an exempt trait door; a retired arm that reads its object again. |
 
+## The standing ratchet (v62.0.0, SD-fix2)
+
+`scripts/one_standing.py` holds the standing questions to a closed, shrinking set of readers: the founder role, the bundle's holders, the delegation walkers, the `quorum:M/N` parse, decision-time roster reads at the host clock, reserved roles read off `identity_type`, and have/need/of result shapes. Every site found today is a `RATCHET` entry `(rule, file, fn): (count, why)`. A new site, a grown count, or a count that fell without its entry being lowered is red, so the list only shrinks as the readers collapse onto one `standing::` module. One rule is not a ratchet: inside the room-duty fns that judge an act (`MAY_ACT`), a walk that reads its edges timelessly is red at every site (SD-fix1; CC 4.5.5). `one_threshold.py` carries the same ratchet (`MORE_RATCHET`) for four more spellings of a count: a fraction, a doubled predicate, a half, and the T7 margin. Both run `--self-test` first, in certify's fast stage and ci.yml `lint`. `one_standing.py list` prints the current sites as entries to paste after a shrink.
+
 ## Inventory
 
 Classes:

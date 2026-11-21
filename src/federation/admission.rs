@@ -10646,6 +10646,7 @@ async fn scoped_delegation_reach(
         policy,
         band_at,
         CommunityWalk::Any,
+        None,
     )
     .await
 }
@@ -10657,6 +10658,16 @@ async fn scoped_delegation_reach(
 /// confers nothing in any room); `Unscoped` follows only edges naming no
 /// room (so a room appointment confers no federation-scope or
 /// content-subject duty); `Any` is the generic walk.
+///
+/// v62.0.0 (SD-fix1; CC 4.5.5 "Authority is judged over the act's own
+/// causal past", CC 2.7.7, CC 2.4.1.3) — `act_at`: the signed instant of the
+/// act being judged. `Some(t)` is the lens's `as_of`: an edge asserted after
+/// `t`, expired at `t` (`expires_at`), or whose signed term is closed at `t`
+/// confers nothing, and a `withdraws`/`recants` asserted after `t` does not
+/// reach back over the act. `None` (the generic wrapper
+/// [`scoped_delegation_reach`] only) is the timeless walk. Before SD-fix1 the
+/// three duty callers passed their instant only as `band_at`, so an expired
+/// appointment still conferred and a later withdrawal un-made a past act.
 #[allow(clippy::too_many_arguments)]
 async fn scoped_delegation_reach_in(
     directory: &dyn super::FederationDirectory,
@@ -10667,6 +10678,7 @@ async fn scoped_delegation_reach_in(
     policy: DelegationWalkPolicy,
     band_at: Option<chrono::DateTime<chrono::Utc>>,
     walk: CommunityWalk<'_>,
+    act_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<ScopedReach, Error> {
     let (community_id, community_rule) = match walk {
         CommunityWalk::Any => (None, CommunityRule::Compat),
@@ -10682,7 +10694,7 @@ async fn scoped_delegation_reach_in(
     // [`scoped_delegation_reach_at`] instead — never this wrapper.
     let lens = if is_issuance_scope(scope_token) {
         DelegationWalkLens {
-            as_of: Some(crate::host::clock::now()),
+            as_of: Some(act_at.unwrap_or_else(crate::host::clock::now)),
             band_at,
             community_id,
             community_rule,
@@ -10690,6 +10702,8 @@ async fn scoped_delegation_reach_in(
         }
     } else {
         DelegationWalkLens {
+            // SD-fix1 — the act's instant, when the caller judges an act.
+            as_of: act_at,
             band_at,
             community_id,
             community_rule,
@@ -19370,6 +19384,8 @@ pub async fn is_named_moderator(
             DelegationWalkPolicy::MODERATION_DUTY,
             Some(at),
             CommunityWalk::In(community_id),
+            // SD-fix1 — the edges, too, at the instant asked about.
+            Some(at),
         )
         .await?
         .hit_target
@@ -19424,6 +19440,8 @@ pub async fn moderators_of(
             DelegationWalkPolicy::MODERATION_DUTY,
             Some(at),
             CommunityWalk::In(community_id),
+            // SD-fix1 — the edges, too, at the instant asked about.
+            Some(at),
         )
         .await?
         .reached;
@@ -19714,9 +19732,11 @@ pub async fn check_moderation_admission(
             duty,
             MAX_MODERATION_DELEGATION_DEPTH,
             DelegationWalkPolicy::MODERATION_DUTY,
-            // K2-fix16 (T8): the seat is judged at the act's own instant.
+            // K2-fix16 (T8): the seat is judged at the act's own instant;
+            // SD-fix1: the band AND the edges (as_of), not the band alone.
             Some(at),
             walk,
+            Some(at),
         )
         .await?
         .hit_target

@@ -1747,6 +1747,16 @@ jobs:
           set -euo pipefail
           python3 scripts/one_threshold.py --self-test
           python3 scripts/one_threshold.py check
+      # v62.0.0 (SD-fix2; CLEAN-standing.md §6) — the standing questions
+      # (roster, founders, duty holders, bundle holders, walks, protocol
+      # parse, count shapes) have a closed, shrinking set of readers, and a
+      # room-duty act's walk reads its edges at the act's instant. From disk,
+      # no cargo; its witnesses first.
+      - name: one reader per standing question, a shrinking ratchet (from disk)
+        run: |
+          set -euo pipefail
+          python3 scripts/one_standing.py --self-test
+          python3 scripts/one_standing.py check
       # #934 — the size counter behind evidence/size.tsv (fixtures, no
       # cargo). The size DELTA itself is a report (ci-hygiene.yml, reports.yml);
       # this step only proves the instrument counts what it claims to.

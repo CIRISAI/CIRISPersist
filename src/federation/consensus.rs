@@ -29,11 +29,6 @@ use super::types::consensus_protocol as cp;
 /// evaluator and the rest of admission read one constant.
 pub use super::admission::MEMBER_ROLE_FOUNDER;
 
-/// The built-in rubric CC 4.4.3.4.2.1 describes as the way to express "M grows
-/// with the roster": every eligible member weighs 1 and the threshold is
-/// `ceil(roster / 2)`. Resolvable without a declaration.
-pub const RUBRIC_UNIFORM_HALF: &str = "uniform_half";
-
 /// A rubric's per-seat weight function.
 type WeightFn = Box<dyn Fn(&Seat) -> f64>;
 
@@ -629,9 +624,13 @@ pub(crate) fn parse_quorum_tail(tail: &str) -> Option<(u32, u32)> {
 /// A declared rubric: `{ "weights": {key_id | "role:{r}" → w}, "default_weight": w,
 /// "threshold": x }` or `"threshold_fraction": f` (of the eligible total).
 fn eval_weighted(b: &Ballot<'_>, elig: &[&Seat], got: &[&Seat], rubric: &str) -> Verdict {
-    let (weight_of, threshold): (WeightFn, f64) = if rubric == RUBRIC_UNIFORM_HALF {
-        (Box::new(|_| 1.0), (elig.len() as f64 / 2.0).ceil())
-    } else {
+    // v62.0.0 (SD-fix3; Constitution, 2026-11-21: "A count is the strict
+    // majority or a threshold the record states") — no rubric is built in.
+    // The former `uniform_half` (⌈n/2⌉, a HALF, not stated on any record) is
+    // gone: `weighted:{rubric}` counts only by the rubric the group's record
+    // declares, and a count that grows with the roster is `majority`
+    // (CC 4.4.3.18).
+    let (weight_of, threshold): (WeightFn, f64) = {
         let Some(decl) = b
             .policy_blob
             .and_then(|pb| pb.get("rubrics"))
@@ -1142,17 +1141,56 @@ mod tests {
         assert!(!eval("majority", &r, &["x", "y", "z"], None, Add).admits());
     }
 
+    /// v62.0.0 (SD-fix3; I5303) — no built-in rubric: an undeclared
+    /// `weighted:uniform_half` is unevaluable at n = 2 and n = 4 (it once
+    /// admitted at ⌈n/2⌉: 1 of 2, 2 of 4), `majority` needs the strict
+    /// majority there (2 of 2, 3 of 4), and a rubric DECLARED under that name
+    /// counts by the threshold the record states.
     #[test]
-    fn weighted_uniform_half_and_declared() {
+    fn weighted_is_declared_only_and_no_rubric_is_built_in() {
         use Direction::Add;
+        let two = seats(&[("a", Some("founder")), ("b", None)]);
         let r = seats(&[
             ("a", Some("founder")),
             ("b", None),
             ("c", None),
             ("d", None),
         ]);
-        assert!(eval("weighted:uniform_half", &r, &["a", "b"], None, Add).admits());
-        assert!(!eval("weighted:uniform_half", &r, &["a"], None, Add).admits());
+        for (roster, all) in [(&two, &["a", "b"][..]), (&r, &["a", "b", "c", "d"][..])] {
+            for k in 1..=all.len() {
+                assert!(
+                    matches!(
+                        eval("weighted:uniform_half", roster, &all[..k], None, Add),
+                        Verdict::Unevaluable { .. }
+                    ),
+                    "I5303: undeclared uniform_half is no rule ({k} of {})",
+                    all.len()
+                );
+            }
+        }
+        assert!(
+            !eval(cp::MAJORITY, &two, &["a"], None, Add).admits(),
+            "I5303: 1 of 2 is short"
+        );
+        assert!(
+            eval(cp::MAJORITY, &two, &["a", "b"], None, Add).admits(),
+            "I5303: 2 of 2"
+        );
+        assert!(
+            !eval(cp::MAJORITY, &r, &["a", "b"], None, Add).admits(),
+            "I5303: 2 of 4 is short"
+        );
+        assert!(
+            eval(cp::MAJORITY, &r, &["a", "b", "c"], None, Add).admits(),
+            "I5303: 3 of 4"
+        );
+        let stated =
+            serde_json::json!({"rubrics": {"uniform_half": {"default_weight": 1, "threshold": 2}}});
+        assert!(
+            eval("weighted:uniform_half", &r, &["a", "b"], Some(&stated), Add).admits(),
+            "I5303: a rubric the record states counts by its stated threshold"
+        );
+        assert!(!eval("weighted:uniform_half", &r, &["a"], Some(&stated), Add).admits());
         let blob = serde_json::json!({"rubrics": {"votes": {
             "weights": {"a": 3, "role:member": 1}, "default_weight": 1, "threshold": 4}}});
         assert!(eval("weighted:votes", &r, &["a", "b"], Some(&blob), Add).admits());
