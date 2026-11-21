@@ -31095,7 +31095,10 @@ mod tests {
             "rl2c-backend",
         )
         .await;
-        crate::federation::quarantine::test_support::exercise_admin_ops(&backend, &suffix).await;
+        Box::pin(
+            crate::federation::quarantine::test_support::exercise_admin_ops(&backend, &suffix),
+        )
+        .await;
     }
 
     /// v30.8.0 (CIRISConstitution#87) — the POSTGRES leg.

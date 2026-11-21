@@ -116,6 +116,41 @@ where
     let Some(iss) = iss else {
         return Ok(false);
     };
+    // v62.0.0 (SL-fix3c; CC 4.4.3.12) — a COUNTED act against a member in a
+    // one-seat affiliation, still gathering its voices, reaches the room's
+    // designated officials whatever scope it is placed at: the countersign is
+    // theirs to give, and a voice they never receive can never conclude.
+    if let Some(peer) = requester {
+        if super::typed::is_floor_family(family) && payload.get_text("author").is_none() {
+            if let Some(input) = super::typed::floor_act_of_payload(family, &payload) {
+                let at = payload
+                    .get_text("asserted_at")
+                    .and_then(Value::as_u64)
+                    .and_then(|ms| i64::try_from(ms).ok())
+                    .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                    .unwrap_or_else(crate::host::clock::now);
+                let probe = payload
+                    .get_text("claimant")
+                    .and_then(Value::as_text)
+                    .unwrap_or(iss);
+                if let Some(room) = crate::federation::affiliation_config::floor_affiliation(
+                    dir,
+                    input.as_act(),
+                    probe,
+                    at,
+                )
+                .await?
+                {
+                    if crate::federation::affiliation_config::designated_official_keys(&room)
+                        .unwrap_or_default()
+                        .contains(peer)
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
     scope_servable(dir, iss, sub, statement, &payload, requester).await
 }
 
@@ -240,6 +275,15 @@ where
         }
         crate::federation::group_plane::GroupKind::Community => {
             if let Some(c) = dir.lookup_community(&group).await? {
+                // v62.0.0 (SL-fix3c; CC 4.4.3.12) — an affiliation's
+                // designated officials, the keys its record names to
+                // countersign an act against a member, hold its record and
+                // roster too: a node that cannot read the room cannot judge
+                // the countersign it is asked for.
+                party.extend(
+                    crate::federation::affiliation_config::designated_official_keys(&c)
+                        .unwrap_or_default(),
+                );
                 party.extend(
                     c.members
                         .into_iter()

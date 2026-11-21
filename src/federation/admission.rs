@@ -12092,6 +12092,16 @@ pub(crate) async fn check_withdraws_admission_against(
     // v62.0.0 (AU-fix1; CC 2.7.11 "The end") — an `admission:unit` row is
     // withdrawn by its author, or a counted one by the same count; no other
     // rule reaches it.
+    // v62.0.0 (SL-fix3d; CC 4.4.3.12 as ruled 11-21: "it takes two voices
+    // to hold power over a member and one to lay it down") — a countersigned
+    // act in a one-seat affiliation is withdrawn by EITHER voice alone.
+    if let Some(decided) = Box::pin(super::affiliation_config::check_floor_act_withdrawal(
+        directory, row, target,
+    ))
+    .await?
+    {
+        return Ok(decided);
+    }
     if let Some(rule) = check_admission_unit_withdrawal(directory, row, target).await? {
         return Ok(Some(rule));
     }
@@ -19539,6 +19549,98 @@ pub fn moderation_subject_digest(
         })
 }
 
+/// v62.0.0 (SL-fix2, SL-fix3b; CC 4.5.5, CC 4.4.3.12) — **the first of
+/// `candidates` that holds `duty`** over `duty_holders` (CW-fix1's
+/// community-tagged roots: a room's act walks only edges naming the room, a
+/// federation-scope act only unscoped edges) at `at`
+/// ([`check_moderation_admission`], as itself or on a live scoped chain):
+/// `Ok(Ok(signer))`; `Ok(Err(refusal))` (the first candidate's
+/// `DelegatedScopeUnauthorized`) when none does; `Err` for any other
+/// failure. The ONE loop the `slash` gate and the stored-attester rule
+/// ([`slash_act_decider`]) share, so the voice the gate admitted an act on
+/// and the voice the row names as its actor are one answer.
+///
+/// # Errors
+/// Directory reads and any refusal that is not `DelegatedScopeUnauthorized`.
+pub(crate) async fn first_duty_holder_voice(
+    directory: &dyn super::FederationDirectory,
+    duty_holders: &DutyHolders,
+    duty: &str,
+    dimension: &str,
+    at: chrono::DateTime<chrono::Utc>,
+    candidates: &[String],
+) -> Result<Result<String, Error>, Error> {
+    let mut refusal: Option<Error> = None;
+    for signer in candidates {
+        match check_moderation_admission(directory, signer, duty_holders, duty, dimension, at).await
+        {
+            Ok(()) => return Ok(Ok(signer.clone())),
+            Err(e @ Error::DelegatedScopeUnauthorized { .. }) => {
+                refusal.get_or_insert(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Err(refusal.unwrap_or_else(|| {
+        Error::DelegatedScopeUnauthorized {
+            signer: candidates.first().cloned().unwrap_or_default(),
+            on_behalf_of: dimension.to_owned(),
+            scope: duty.to_owned(),
+        }
+    })))
+}
+
+/// v62.0.0 (SL-fix3b; CC 4.4.3.12) — **the voice that decided a counted
+/// `slash` act in `community_id`**: among `candidates`, the deciding seat's
+/// own voices first (`deciding_seats` holds them), then the rest in
+/// identity-ref order, the first that holds `slash` there at `at`
+/// ([`first_duty_holder_voice`]). `None` when none does. The stored attester
+/// of such a row (`edition2::voices::primary_voice`): a designated official's
+/// countersign never becomes the actor, whatever the arrival or key order.
+///
+/// # Errors
+/// Directory reads.
+pub(crate) async fn slash_act_decider(
+    directory: &dyn super::FederationDirectory,
+    community: &super::Community,
+    dimension: &str,
+    at: chrono::DateTime<chrono::Utc>,
+    candidates: &std::collections::BTreeSet<String>,
+) -> Result<Option<String>, Error> {
+    let seats = Box::pin(super::affiliation_config::deciding_seats(
+        directory, community, at,
+    ))
+    .await?;
+    let ordered: Vec<String> = candidates
+        .iter()
+        .filter(|c| seats.contains(*c))
+        .chain(candidates.iter().filter(|c| !seats.contains(*c)))
+        .cloned()
+        .collect();
+    // v62.0.0 (CW-fix1 merge) — the room's roots, tagged with the room: the
+    // walk follows only edges NAMING it, so a slash holder of another room
+    // is never this act's deciding seat.
+    let holders = DutyHolders::of_community(
+        &community.community_key_id,
+        duty_holders_for_community(
+            directory,
+            &community.community_key_id,
+            DELEGATION_SCOPE_SLASH,
+        )
+        .await?,
+    );
+    Ok(first_duty_holder_voice(
+        directory,
+        &holders,
+        DELEGATION_SCOPE_SLASH,
+        dimension,
+        at,
+        &ordered,
+    )
+    .await?
+    .ok())
+}
+
 /// v8.7.1 (CIRISPersist#233, CEG RC24/RC25 §11.10) — `put_attestation`
 /// entry point for the **report → `scores`** half of the moderation gate.
 /// A no-op (`Ok(())`) for any attestation that is not a `scores` row on a
@@ -19675,18 +19777,90 @@ pub async fn check_delegated_duty_scores_admission(
     // them are OTHER rows: an emitter with no standing is HELD
     // `delegated_scope_unauthorized`, re-folded when a chain or the roster
     // changes. A malformed subject digest (above) is the row's own bytes.
-    fold_held(
-        fold::reason::gc1::DELEGATED_SCOPE_UNAUTHORIZED,
-        check_moderation_admission(
-            directory,
-            &row.attesting_key_id,
-            &duty_holders,
-            duty,
-            dimension,
-            row.asserted_at,
+    if duty != DELEGATION_SCOPE_SLASH {
+        return fold_held(
+            fold::reason::gc1::DELEGATED_SCOPE_UNAUTHORIZED,
+            check_moderation_admission(
+                directory,
+                &row.attesting_key_id,
+                &duty_holders,
+                duty,
+                dimension,
+                row.asserted_at,
+            )
+            .await,
+        );
+    }
+    // v62.0.0 (SL-fix2; CC 4.4.3.12) — the `slash` acts (`quarantine:*`,
+    // `slashing:*`) are acts against a member: in an AFFILIATION with ONE
+    // deciding seat they count only countersigned by a key outside that seat
+    // (`affiliation_config::check_one_voice_countersign`, the one door
+    // `membership:removal` already asks). There CC's family cell makes the
+    // row COUNTED (`group=affiliations & seats=one => counted`), so it
+    // carries several voices and no author, and its projected attester is
+    // whichever voice the door reads first. The duty is therefore asked of
+    // the row's voices in turn (its attester first): the first that holds
+    // `slash` is the deciding seat's voice, and the countersign is asked
+    // over every voice. An authored row (every other case) has one voice,
+    // its author's, so this is exactly the one check above.
+    let voices = super::edition2::voices::row_voice_issuers(directory, row).await?;
+    let candidates: Vec<String> = std::iter::once(row.attesting_key_id.clone())
+        .chain(
+            voices
+                .iter()
+                .filter(|v| **v != row.attesting_key_id)
+                .cloned(),
         )
-        .await,
+        .collect();
+    let decider = match first_duty_holder_voice(
+        directory,
+        &duty_holders,
+        duty,
+        dimension,
+        row.asserted_at,
+        &candidates,
     )
+    .await
+    {
+        Ok(Ok(signer)) => signer,
+        Ok(Err(refusal)) | Err(refusal) => {
+            return Err(fold_hold(
+                fold::reason::gc1::DELEGATED_SCOPE_UNAUTHORIZED,
+                refusal,
+            ))
+        }
+    };
+    // v62.0.0 (SL-fix3a) — the floor's one reading
+    // (`affiliation_config::floor_affiliation`): a held affiliation with ONE
+    // deciding seat at the row's instant, the same answer the door's
+    // authorship context gave.
+    let Some(community) = super::affiliation_config::floor_affiliation(
+        directory,
+        super::affiliation_config::FloorAct::Slash { community_id },
+        &decider,
+        row.asserted_at,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let mut signers = voices;
+    signers.insert(row.attesting_key_id.clone());
+    // v62.0.0 (SL-fix3d; CC 4.4.3.12 as ruled) — an official that has
+    // withdrawn its own countersign no longer countersigns: the act counts
+    // only while both voices stand.
+    let signers = Box::pin(super::affiliation_config::standing_voices(
+        directory, &community, row, signers,
+    ))
+    .await?;
+    Box::pin(super::affiliation_config::check_one_voice_countersign(
+        directory,
+        &community,
+        &decider,
+        &signers,
+        row.asserted_at,
+    ))
+    .await
 }
 
 /// v58.0.0 (CIRISPersist#1094 item 3) — the envelope member a

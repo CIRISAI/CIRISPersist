@@ -1122,7 +1122,7 @@ async fn i3298_withdrawn_owner_binding_ends_ownership_postgres() {
     Box::pin(unbind_rebind_body(&b)).await;
 }
 
-/// v62.0.0 (WD-fix1) — **I2163: a placer's lone `withdraws` of a duty edge
+/// v62.0.0 (WD-fix1) — **I5013: a placer's lone `withdraws` of a duty edge
 /// lands, and the seat ends from its instant; a stranger's is not admitted.**
 /// A lone founder seats `x` (the authored edge, `x`'s voice); a stranger's
 /// withdraws of the edge does not land and `x` stays seated; the founder's
@@ -1158,7 +1158,7 @@ pub(crate) async fn placer_withdraws_alone_body(d: &dyn FederationDirectory) {
             e2::land_with_voices(d, &edge, &[x]).await,
             Ok(StatementOutcome::Row { .. })
         ),
-        "I2163: the lone founder seats x"
+        "I5013: the lone founder seats x"
     );
     let seated = |at: chrono::DateTime<chrono::Utc>| {
         let cid = cid.clone();
@@ -1168,7 +1168,7 @@ pub(crate) async fn placer_withdraws_alone_body(d: &dyn FederationDirectory) {
                 .expect("is_named_moderator")
         }
     };
-    assert!(seated(chrono::Utc::now()).await, "I2163: x is seated");
+    assert!(seated(chrono::Utc::now()).await, "I5013: x is seated");
     let held = d
         .get_attestation(&e2::rid(&edge))
         .await
@@ -1178,30 +1178,30 @@ pub(crate) async fn placer_withdraws_alone_body(d: &dyn FederationDirectory) {
     let o = e2::put_signed(d, &by_stranger).await;
     assert!(
         !matches!(o, Ok(StatementOutcome::Row { .. })),
-        "I2163: a stranger's withdraws does not land: {o:?}"
+        "I5013: a stranger's withdraws does not land: {o:?}"
     );
-    assert!(seated(chrono::Utc::now()).await, "I2163: x stays seated");
+    assert!(seated(chrono::Utc::now()).await, "I5013: x stays seated");
     let by_placer = e2::composer_of(attestation_type::WITHDRAWS, &held, f);
     let o = e2::put_signed(d, &by_placer).await;
     assert!(
         matches!(o, Ok(StatementOutcome::Row { new: true, .. })),
-        "I2163: the placer's lone withdraws lands: {o:?}"
+        "I5013: the placer's lone withdraws lands: {o:?}"
     );
     assert!(
         !seated(chrono::Utc::now() + chrono::Duration::seconds(1)).await,
-        "I2163: the seat ends from the withdrawal"
+        "I5013: the seat ends from the withdrawal"
     );
 }
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-async fn i2163_placer_withdraws_alone_sqlite() {
+async fn i5013_placer_withdraws_alone_sqlite() {
     Box::pin(placer_withdraws_alone_body(&sqlite().await)).await;
 }
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
-async fn i2163_placer_withdraws_alone_postgres() {
+async fn i5013_placer_withdraws_alone_postgres() {
     let Some(b) = postgres().await else {
         return;
     };

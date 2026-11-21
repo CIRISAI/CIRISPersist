@@ -958,7 +958,32 @@ where
 ///
 /// # Errors
 /// As [`put_statement`] after admission.
-pub async fn put_admitted_row<F>(
+///
+/// v62.0.0 (BF22, pass 4m4) — returns a `dyn Future + Send`, not an `async
+/// fn`'s opaque type. Every row store passes through here, and so do the
+/// fold's re-conclusions, the voice and affiliation walks and the key-grant
+/// projection that call back into a store door, which reaches here again:
+/// with an opaque future, proving a store door (or a store open) `Send`
+/// walked that whole cycle and overflowed the compiler's recursion depth
+/// (E0275), in persist and in any host that `tokio::spawn`s it. The type
+/// ends at this box.
+pub fn put_admitted_row<'a, F>(
+    dir: &'a F,
+    admitted: &'a AdmittedRow,
+    tier: &'a str,
+    replicated: bool,
+    origin: crate::federation::replication::admission::WriteOrigin,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StatementOutcome, Error>> + Send + 'a>>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Box::pin(put_admitted_row_body(
+        dir, admitted, tier, replicated, origin,
+    ))
+}
+
+/// [`put_admitted_row`]'s body.
+async fn put_admitted_row_body<F>(
     dir: &F,
     admitted: &AdmittedRow,
     tier: &str,

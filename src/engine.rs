@@ -4898,7 +4898,13 @@ impl Engine {
                 Some((rid.0, family))
             }
         };
-        crate::federation::edition2::emit::draft_from_envelope(
+        // v62.0.0 (SL-fix3c; CC 4.4.3.12) — drafted against this node's
+        // held rooms: in a one-seat affiliation a quarantine marker, a
+        // slashing verdict or a takedown notice is drafted COUNTED (the
+        // seat's voice; a designated official countersigns it with
+        // `voice_draft` / `voice_held_row`).
+        crate::federation::edition2::emit::draft_from_envelope_in(
+            &*self.federation_directory(),
             &kid,
             signer_iss,
             sub,
@@ -4907,6 +4913,7 @@ impl Engine {
             asserted_at_ms,
             target.as_ref().map(|(r, f)| (r, f.as_str())),
         )
+        .await
     }
 
     /// v62.0.0 (AU-fix2; CC 2.7.11) — **the LIVE `admission:unit` rows about

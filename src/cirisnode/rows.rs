@@ -1013,6 +1013,21 @@ impl crate::Engine {
                     },
                 ))
             }
+            // v62.0.0 (SL-fix3c; CC 4.4.3.12) — in an affiliation with one
+            // deciding seat the verdict is stated COUNTED: this engine's
+            // voice is the seat's, kept until a designated official
+            // countersigns the same row.
+            Some(h) if h.reason == crate::federation::edition2::fold::reason::COUNT_SHORT => {
+                Err(Error::NotAuthorized(format!(
+                    "{}: slashing row {id} is this seat's voice, kept until a designated \
+                     official countersigns it (CC 4.4.3.12): the official's node lists it with \
+                     held_rows_for(role `{}`) and adds its voice (voice_held_row, or \
+                     voice_draft + submit_voice); {}",
+                    crate::federation::affiliation_config::AFFILIATION_COUNTERSIGN_MISSING,
+                    crate::federation::affiliation_config::AFFILIATION_COUNTERSIGN_ROLE,
+                    h.detail
+                )))
+            }
             Some(h) => Err(Error::NotAuthorized(format!(
                 "slashing row {id} is held ({}): {}",
                 h.reason, h.detail

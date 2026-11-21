@@ -82,6 +82,280 @@ pub const ROLE_TERM_CEILING_SECONDS: i64 = ROLE_TERM_CEILING_DAYS as i64 * 86_40
 /// carries no countersign from a key outside that seat.
 pub const AFFILIATION_COUNTERSIGN_MISSING: &str = "affiliation_countersign_missing";
 
+/// v62.0.0 (SL-fix3c; CC 4.4.3.12) — the voice role a designated official
+/// fills on a counted act against a member in a one-seat affiliation
+/// (`edition2::second_signer_voice::held_rows_for`'s `role`): its
+/// countersign. Not a family's second-signer role: the families name none.
+pub const AFFILIATION_COUNTERSIGN_ROLE: &str = "affiliation_countersign";
+
+/// v62.0.0 (SL-fix2; CC 4.4.3.12) — **an affiliation's deciding seats** at
+/// `at`: its active founders, or its active members where it names no
+/// founder (the roster as authorized at `at`). The ONE reading of "the
+/// deciding seat": [`check_one_voice_countersign`] asks it, and the door's
+/// authorship context for the `slash` families (`edition2::typed::family_context`,
+/// CC's `seats=one` selector) counts it, so the cell that makes a row counted
+/// and the gate that asks for its countersign agree on how many seats there
+/// are. Before v62.0.0 the door counted every listed member.
+///
+/// # Errors
+/// Directory reads.
+pub async fn deciding_seats<F>(
+    dir: &F,
+    community: &Community,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<BTreeSet<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let roster = Box::pin(super::authorized_community_roster_at(dir, community, at)).await?;
+    let founders: BTreeSet<String> = roster
+        .iter()
+        .filter(|m| m.role.as_deref() == Some(super::admission::MEMBER_ROLE_FOUNDER))
+        .map(|m| m.key_id.clone())
+        .collect();
+    Ok(if founders.is_empty() {
+        roster.into_iter().map(|m| m.key_id).collect()
+    } else {
+        founders
+    })
+}
+
+/// v62.0.0 (SL-fix3a) — **an act against a member** that CC 4.4.3.12's
+/// one-seat floor reaches at the edition-2 door, by the input that names the
+/// room it is taken in. `membership:removal` is decided by the roster door
+/// (`check_community_roster_authority_verdict`), not here.
+#[derive(Debug, Clone, Copy)]
+pub enum FloorAct<'a> {
+    /// A `quarantine:{state}` marker or a `slashing:{outcome}` verdict: the
+    /// room is the row's `community_id`.
+    Slash {
+        /// The row's `community_id`.
+        community_id: &'a str,
+    },
+    /// A `takedown_notice:{basis}`: the room is a community the content's
+    /// HELD binding rows place it in (never a community or scope the notice
+    /// itself names: a signer-chosen input must not decide how many seats the
+    /// signer needs), and the act is against a member only when the actor is
+    /// not a signed subject of the content (an author's own takedown is its
+    /// own act, as a resignation is).
+    Takedown {
+        /// The notice's `content_sha256` (64 hex).
+        content_sha256: &'a str,
+    },
+}
+
+/// v62.0.0 (SL-fix3a; CC 4.4.3.12) — **the one-seat affiliation whose floor
+/// binds `act` by `actor` at `at`**, or `None`: a HELD record declaring
+/// `cohort_scope: affiliations` whose [`deciding_seats`] at `at` number
+/// exactly one. Never a plain community, never a room of two or more deciding
+/// seats, never a room this node does not hold.
+///
+/// The ONE reading: the door's authorship context (`edition2::typed::family_context`:
+/// CC's `group=affiliations & seats=one => counted` arm), the countersign
+/// gates (`admission::check_delegated_duty_scores_admission`,
+/// `takedown_tombstone::check_takedown_notice_row_admission`), the stored
+/// attester (`edition2::voices::primary_voice`), the official's listing
+/// (`second_signer_voice::held_rows_for`, role `affiliation_countersign`)
+/// and the producer all ask it, so the cell that makes a row counted and the
+/// gate that asks for its countersign cannot disagree.
+///
+/// # Errors
+/// Directory reads; a held record whose cohort does not parse.
+///
+/// v62.0.0 (BF22, pass 4m4) — returns a `dyn Future + Send`, not an `async
+/// fn`'s opaque type. This fn is reached again through its own takedown arm
+/// (`content_binding` -> the tombstone and admission walks -> here), and an
+/// opaque future carries its whole callee tree in its type: proving a store
+/// open `Send` overflowed the compiler's recursion depth (E0275) in persist
+/// and in any host that `tokio::spawn`s an open. The type ends at this box.
+pub fn floor_affiliation<'a, F>(
+    dir: &'a F,
+    act: FloorAct<'a>,
+    actor: &'a str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Option<Community>, Error>> + Send + 'a>,
+>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Box::pin(floor_affiliation_body(dir, act, actor, at))
+}
+
+/// [`floor_affiliation`]'s body.
+async fn floor_affiliation_body<F>(
+    dir: &F,
+    act: FloorAct<'_>,
+    actor: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<Community>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let candidates: Vec<String> = match act {
+        FloorAct::Slash { community_id } => {
+            if community_id.is_empty() {
+                return Ok(None);
+            }
+            vec![community_id.to_owned()]
+        }
+        FloorAct::Takedown { content_sha256 } => {
+            let Some(binding) = Box::pin(super::takedown_tombstone::content_binding(
+                dir.as_dyn_directory(),
+                content_sha256,
+            ))
+            .await?
+            else {
+                return Ok(None);
+            };
+            if binding.subjects.contains(actor) {
+                return Ok(None);
+            }
+            binding.communities.into_iter().collect()
+        }
+    };
+    for c in candidates {
+        super::edition2::fold::reads(super::edition2::fold::Dep::key(&c));
+        let Some(record) = dir.lookup_community(&c).await? else {
+            continue;
+        };
+        if declared_cohort(&record)? != Cohort::Affiliations {
+            continue;
+        }
+        if Box::pin(deciding_seats(dir, &record, at)).await?.len() == 1 {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
+}
+
+/// v62.0.0 (SL-fix3d; CC 4.4.3.12 as ruled 11-21) — **the voices of a
+/// countersigned act that still stand**: `voices` less every designated
+/// official of `room` that has withdrawn its own countersign of `row` (a
+/// held `withdraws` it authored naming the row). The act is a decision only
+/// while both voices stand, so the countersign gates count these. The
+/// withdrawal touches the row it names (`refs.target`), so the act re-folds
+/// when it lands and un-concludes forward; what was done under it stands.
+///
+/// # Errors
+/// Directory reads.
+pub async fn standing_voices<F>(
+    dir: &F,
+    room: &Community,
+    row: &super::Attestation,
+    voices: BTreeSet<String>,
+) -> Result<BTreeSet<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let officials = designated_official_keys(room)?;
+    if officials.is_empty() || row.attestation_id.is_empty() {
+        return Ok(voices);
+    }
+    if let Some(dep) = super::edition2::fold::Dep::row_hex(&row.attestation_id) {
+        super::edition2::fold::reads(dep);
+    }
+    let withdrawn: BTreeSet<String> = dir
+        .list_composers_referencing_any(std::slice::from_ref(&row.attestation_id), None, None)
+        .await?
+        .into_iter()
+        .filter(|w| w.attestation_type == super::types::attestation_type::WITHDRAWS)
+        .map(|w| w.attesting_key_id)
+        .filter(|k| officials.contains(k))
+        .collect();
+    Ok(voices
+        .into_iter()
+        .filter(|v| !withdrawn.contains(v))
+        .collect())
+}
+
+/// v62.0.0 (SL-fix3d; CC 4.4.3.12 as ruled 11-21: "it takes two voices to
+/// hold power over a member and one to lay it down") — **the `withdraws` of
+/// a countersigned act** (a counted quarantine marker, slashing verdict or
+/// takedown notice in a one-seat affiliation, [`floor_affiliation`]).
+/// `Ok(None)`: `target` is no such act (the caller's rules apply).
+///
+/// - by the act's actor (its stored attester, the deciding seat): rule 1,
+///   the seat retracting its own decision;
+/// - by a designated official that voiced it: admitted UNSTAMPED
+///   (`Some(None)`): it retires nothing itself (the retraction folds honour
+///   only the producer and a stamp), it withdraws the official's own voice,
+///   which [`standing_voices`] then stops counting, so the act un-concludes
+///   forward and waits for a countersign again;
+/// - by anyone else: refused `WithdrawsNotAdmitted`.
+///
+/// # Errors
+/// [`Error::WithdrawsNotAdmitted`]; directory reads.
+pub async fn check_floor_act_withdrawal<F>(
+    dir: &F,
+    row: &super::Attestation,
+    target: &super::Attestation,
+) -> Result<Option<Option<u8>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if row.attestation_type != super::types::attestation_type::WITHDRAWS
+        || !super::edition2::voices::carried_is_counted(target)
+    {
+        return Ok(None);
+    }
+    let env = &target.attestation_envelope;
+    let text = |k: &str| env.get(k).and_then(serde_json::Value::as_str).unwrap_or("");
+    let dimension = text("dimension");
+    let act = if dimension.starts_with(super::admission::QUARANTINE_DIMENSION_PREFIX)
+        || dimension.starts_with(super::admission::SLASHING_DIMENSION_PREFIX)
+    {
+        FloorAct::Slash {
+            community_id: text(super::quarantine::field::COMMUNITY_ID),
+        }
+    } else if dimension.starts_with(super::takedown_tombstone::NOTICE_DIMENSION_PREFIX) {
+        FloorAct::Takedown {
+            content_sha256: text("content_sha256"),
+        }
+    } else {
+        return Ok(None);
+    };
+    let Some(room) = Box::pin(floor_affiliation(
+        dir,
+        act,
+        &target.attesting_key_id,
+        target.asserted_at,
+    ))
+    .await?
+    else {
+        return Ok(None);
+    };
+    if row.attesting_key_id == target.attesting_key_id {
+        return Ok(Some(Some(1)));
+    }
+    let voiced = super::edition2::voices::row_voice_issuers(dir.as_dyn_directory(), target).await?;
+    if designated_official_keys(&room)?.contains(&row.attesting_key_id)
+        && voiced.contains(&row.attesting_key_id)
+    {
+        return Ok(Some(None));
+    }
+    Err(Error::WithdrawsNotAdmitted {
+        issuer: row.attesting_key_id.clone(),
+        target_attestation_id: target.attestation_id.clone(),
+        beyond_delegation_depth_cap: false,
+    })
+}
+
+/// v62.0.0 (SL-fix3c) — the designated officials of `community` (the keys
+/// that may countersign an act against a member in a one-seat affiliation,
+/// CC 4.4.3.12). Empty for a record with no affiliation config.
+///
+/// # Errors
+/// A malformed config record.
+pub fn designated_official_keys(community: &Community) -> Result<BTreeSet<String>, Error> {
+    Ok(affiliation_config_of(community)?
+        .and_then(|c| c.designated_officials)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|o| o.key_id)
+        .collect())
+}
+
 /// v61 S2 (CIRISPersist#1143; CC rc14 4.4.3.2.8,
 /// `CLM-affiliation-one-voice-countersign`) — **one voice does not act
 /// against a member alone.** Where an affiliation has ONE deciding seat (its
@@ -125,26 +399,11 @@ where
     // seats' person records are other rows: declared, so the act re-folds
     // when one changes.
     super::edition2::fold::reads(super::edition2::fold::Dep::key(&community.community_key_id));
-    let roster = Box::pin(super::authorized_community_roster_at(dir, community, at)).await?;
-    let founders: BTreeSet<String> = roster
-        .iter()
-        .filter(|m| m.role.as_deref() == Some(super::admission::MEMBER_ROLE_FOUNDER))
-        .map(|m| m.key_id.clone())
-        .collect();
-    let seats: BTreeSet<String> = if founders.is_empty() {
-        roster.into_iter().map(|m| m.key_id).collect()
-    } else {
-        founders
-    };
+    let seats = Box::pin(deciding_seats(dir, community, at)).await?;
     if seats.len() != 1 {
         return Ok(());
     }
-    let officials: BTreeSet<String> = affiliation_config_of(community)?
-        .and_then(|c| c.designated_officials)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|o| o.key_id)
-        .collect();
+    let officials = designated_official_keys(community)?;
     for k in seats.iter().chain(&officials) {
         super::edition2::fold::reads(super::edition2::fold::Dep::key(k));
     }

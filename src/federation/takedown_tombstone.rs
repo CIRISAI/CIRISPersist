@@ -312,6 +312,21 @@ fn is_legacy_notice_contribution(envelope: &serde_json::Value) -> bool {
 ///
 /// The reason, as a string; the callers wrap it in their own refusal.
 pub fn notice_row_shape(row: &super::Attestation) -> Result<NoticeRowShape, String> {
+    notice_row_shape_as(row, &row.attesting_key_id)
+}
+
+/// v62.0.0 (SL-fix3a; CC 4.4.3.12) — [`notice_row_shape`] with the claimant
+/// checked against `actor` instead of the row's projected attester: a
+/// COUNTED notice (a one-seat affiliation's, its voices the seat's and an
+/// official's) is the claimant's act whichever voice the door read first.
+///
+/// # Errors
+///
+/// As [`notice_row_shape`].
+pub fn notice_row_shape_as(
+    row: &super::Attestation,
+    actor: &str,
+) -> Result<NoticeRowShape, String> {
     let env = &row.attestation_envelope;
     let dimension = super::admission::envelope_dimension(env)
         .ok_or_else(|| "the notice row carries no dimension".to_owned())?;
@@ -350,11 +365,10 @@ pub fn notice_row_shape(row: &super::Attestation) -> Result<NoticeRowShape, Stri
         return Err("content_sha256 is not 64 lowercase hex".to_owned());
     }
     let claimant_key_id = s("claimant_key_id")?;
-    if claimant_key_id != row.attesting_key_id {
+    if claimant_key_id != actor {
         return Err(format!(
-            "claimant_key_id {claimant_key_id:?} is not the row's signer {:?} (CC 3.3.2: the \
-             federation_keys row issuing the notice)",
-            row.attesting_key_id
+            "claimant_key_id {claimant_key_id:?} is not the row's signer {actor:?} (CC 3.3.2: the \
+             federation_keys row issuing the notice)"
         ));
     }
     for k in ["jurisdiction", "good_faith_statement", "claim_text"] {
@@ -414,12 +428,60 @@ pub async fn check_takedown_notice_row_admission(
     if let Some(d) = super::admission::envelope_dimension(&row.attestation_envelope) {
         super::admission::check_registered_family_not_held(d)?;
     }
-    let shape = notice_row_shape(row).map_err(|reason| {
+    // v62.0.0 (SL-fix3a; CC 4.4.3.12) — a COUNTED notice (no `author`: a
+    // one-seat affiliation's act against a member's content, its voices the
+    // seat's and a designated official's) is the CLAIMANT's act whichever
+    // voice the door read first. Until the claimant's own voice is held the
+    // row is short of its count (held `count_short`), never refused.
+    let counted = super::edition2::voices::carried_is_counted(row);
+    let mut voices: std::collections::BTreeSet<String> = if counted {
+        super::edition2::voices::row_voice_issuers(directory, row).await?
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    voices.insert(row.attesting_key_id.clone());
+    let claimant = row
+        .attestation_envelope
+        .get("claimant_key_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let actor = if counted && voices.contains(&claimant) {
+        claimant.clone()
+    } else {
+        row.attesting_key_id.clone()
+    };
+    if counted && !voices.contains(&claimant) {
+        super::edition2::voices::note_short();
+        return Err(refused(
+            token::UNAUTHORISED,
+            serde_json::json!({
+                "notice_id": row.attestation_id,
+                "claimant": claimant,
+                "reason": "a counted notice is its claimant's act, and the claimant has not \
+                           voiced it yet: kept short of its count (CC 2.6.1.9, CC 4.4.3.12)",
+            }),
+        ));
+    }
+    let shape = notice_row_shape_as(row, &actor).map_err(|reason| {
         refused(
             token::UNAUTHORISED,
             serde_json::json!({"notice_id": row.attestation_id, "reason": reason}),
         )
     })?;
+    // v62.0.0 (SL-fix3a) — a notice placed at a group scope (`community` /
+    // `affiliations`) addresses the rooms its content is bound into under
+    // that cohort: a held room declaring another cohort is the shared
+    // cohort-mismatch fold condition (`affiliation_config::check_group_cohort`,
+    // held `federation_affiliation_cohort_mismatch`, re-folded when the record
+    // changes). The notice's scope never decides the seat count.
+    if let Ok(cohort) = super::cohort::Cohort::from_token(&row.cohort_scope) {
+        if let Some(binding) = content_binding(directory, &shape.content_sha256).await? {
+            for community in &binding.communities {
+                super::affiliation_config::check_group_cohort(directory, cohort, community).await?;
+            }
+        }
+    }
     // v62.0.0 (wave GC2; CC 2.7.3) — everything above is the row's own
     // bytes (a door refusal). The authority below reads OTHER rows (the rows
     // binding the content, the duty seats, the takedown chains): a notice it
@@ -429,7 +491,7 @@ pub async fn check_takedown_notice_row_admission(
     // fold attempt (the earlier-form door) `hold` is the plain refusal.
     takedown_authority(
         directory,
-        &row.attesting_key_id,
+        &actor,
         &shape.content_sha256,
         &shape.legal_basis,
         // K2-fix16 (T8): the notice's seat is judged at its own instant.
@@ -446,7 +508,36 @@ pub async fn check_takedown_notice_row_admission(
             }
         }
         other => other,
-    })
+    })?;
+    // v62.0.0 (SL-fix3a; CC 4.4.3.12) — a takedown of a member's content in
+    // a one-seat affiliation counts only countersigned by a key outside the
+    // seat: the shared floor reading, then the one countersign door
+    // (`membership:removal`'s and the slash acts').
+    if let Some(room) = super::affiliation_config::floor_affiliation(
+        directory,
+        super::affiliation_config::FloorAct::Takedown {
+            content_sha256: &shape.content_sha256,
+        },
+        &actor,
+        row.asserted_at,
+    )
+    .await?
+    {
+        // v62.0.0 (SL-fix3d) — a withdrawn countersign no longer counts.
+        let voices = Box::pin(super::affiliation_config::standing_voices(
+            directory, &room, row, voices,
+        ))
+        .await?;
+        Box::pin(super::affiliation_config::check_one_voice_countersign(
+            directory,
+            &room,
+            &actor,
+            &voices,
+            row.asserted_at,
+        ))
+        .await?;
+    }
+    Ok(())
 }
 
 /// v62.0.0 (wave GC2) — the fold reason of a takedown authority refusal: its

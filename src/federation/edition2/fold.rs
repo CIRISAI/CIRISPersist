@@ -1637,7 +1637,19 @@ where
     F: FederationDirectory + ?Sized,
 {
     if dir.fold_any_refolding().await? {
-        let report = Box::pin(refold_all(dir)).await?;
+        // v62.0.0 (BF22, pass 4m4) — the re-fold's future TYPE ends here.
+        // Every host awaits this through a store open (`run_migrations` on
+        // both backends), and an `async fn` future carries its whole callee
+        // tree in its type: once the fold's admission walks grew past the
+        // default recursion depth (the slashing countersign paths, pass
+        // 4m4), proving an open `Send` overflowed (E0275) in persist AND in
+        // any host crate that `tokio::spawn`s it. A `dyn Future + Send` is
+        // proved once, here, and the open path's type stops at the box, so
+        // deeper folds behind it do not reach a host's Send proof.
+        let refold: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<RefoldReport, Error>> + Send + '_>,
+        > = Box::pin(refold_all(dir));
+        let report = refold.await?;
         tracing::info!(
             steps = report.steps,
             concluded = report.concluded.len(),

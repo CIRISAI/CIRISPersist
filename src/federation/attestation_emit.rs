@@ -509,13 +509,23 @@ where
     }
     let is_grant_dimension = super::admission::envelope_dimension(&envelope)
         == Some(super::consent_grammar::GRANT_DIMENSION);
-    let author = super::edition2::emit::family_is_authored(
-        &family,
-        envelope
-            .get("dimension")
-            .and_then(serde_json::Value::as_str),
-    )
-    .then_some(iss.as_str());
+    // v62.0.0 (SL-fix3c; CC 4.4.3.12) — a floor family's act in a one-seat
+    // affiliation is stated COUNTED (no `author`): the seat's voice, kept
+    // until a designated official countersigns it
+    // (`edition2::emit::floor_counted`, the door's own reading).
+    let authored =
+        match super::edition2::emit::floor_counted(dir, &family, &envelope, &iss, asserted_at_ms)
+            .await?
+        {
+            Some(counted) if !composer => !counted,
+            _ => super::edition2::emit::family_is_authored(
+                &family,
+                envelope
+                    .get("dimension")
+                    .and_then(serde_json::Value::as_str),
+            ),
+        };
+    let author = authored.then_some(iss.as_str());
     // v62.0.0 (E12, round 3) — a composer's payload is the common members
     // and `refs` only (`payloads::check_composer`). The earlier envelope's
     // composer bookkeeping (`withdraws_attestation_envelope`: `kind`,

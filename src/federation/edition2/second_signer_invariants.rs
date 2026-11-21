@@ -132,65 +132,65 @@ fn i2847_roles_are_read_under_the_act_selector() {
     );
 }
 
-/// v62.0.0 (WD-fix1) — **I2162: a retraction composer takes no second
+/// v62.0.0 (WD-fix1) — **I5012: a retraction composer takes no second
 /// signer from its target's family.** A lone `withdraws` (and `recants`) of
 /// a two-voice delegation names NO role; a `supersedes` of it keeps the
 /// family's roles; a COUNTED withdrawal (no author) names none either, and
 /// keeps its count at `check_counted_withdrawal` (DC-fix1's I2145).
 #[test]
-fn i2162_a_retraction_takes_no_second_signer() {
+fn i5012_a_retraction_takes_no_second_signer() {
     use crate::federation::edition2::emit::DELEGATES_TO_FAMILY;
     use crate::federation::types::attestation_type;
     let mut a = ts::bare_attestation(
-        "i2162-d",
-        "i2162-owner",
-        "i2162-agent",
-        &serde_json::json!({ "id": "i2162-d", "kind": "delegates_to" }),
+        "i5012-d",
+        "i5012-owner",
+        "i5012-agent",
+        &serde_json::json!({ "id": "i5012-d", "kind": "delegates_to" }),
     );
     a.attestation_type = attestation_type::DELEGATES_TO.to_owned();
     let edge = second_signer_roles(&e2::statement_of_family(
         &a,
-        "i2162-owner",
+        "i5012-owner",
         DELEGATES_TO_FAMILY,
     ));
     assert!(
         !edge.is_empty(),
-        "I2162 control: the edge itself waits for its delegate"
+        "I5012 control: the edge itself waits for its delegate"
     );
     for kind in [attestation_type::WITHDRAWS, attestation_type::RECANTS] {
         let mut w = a.clone();
         w.attestation_type = kind.to_owned();
         let roles = second_signer_roles(&e2::statement_of_family(
             &w,
-            "i2162-owner",
+            "i5012-owner",
             DELEGATES_TO_FAMILY,
         ));
         assert!(
             roles.is_empty(),
-            "I2162: a lone {kind} concludes on its author: {roles:?}"
+            "I5012: a lone {kind} concludes on its author: {roles:?}"
         );
     }
     let mut sup = a.clone();
     sup.attestation_type = attestation_type::SUPERSEDES.to_owned();
     let roles = second_signer_roles(&e2::statement_of_family(
         &sup,
-        "i2162-owner",
+        "i5012-owner",
         DELEGATES_TO_FAMILY,
     ));
     assert!(
         !roles.is_empty(),
-        "I2162: a supersedes restates content and keeps the roles"
+        "I5012: a supersedes restates content and keeps the roles"
     );
     let mut counted = a.clone();
     counted.attestation_type = attestation_type::WITHDRAWS.to_owned();
     let roles = second_signer_roles(&e2::counted_statement_of_family(
         &counted,
-        "i2162-owner",
+        "i5012-owner",
         DELEGATES_TO_FAMILY,
     ));
     assert!(
         roles.is_empty(),
-        "I2162: a counted withdrawal names no voice role (its count is elsewhere)"
+        "I5012: a counted withdrawal names no voice role (its count is elsewhere)"
     );
 }
 

@@ -249,6 +249,18 @@ pub(crate) mod affiliation_floor_invariants;
 pub(crate) mod composer_rank_invariants;
 #[cfg(test)]
 mod consent_sweep_plan_invariants;
+/// v62.0.0 (SL-fix3b; CC 4.4.3.12) — I4150–I4153: a countersigned act's
+/// stored actor is the deciding seat.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod countersign_actor_invariants;
+/// v62.0.0 (SL-fix3c; CC 4.4.3.12) — I4160–I4164: two hosts make a
+/// one-seat affiliation's countersigned act through the planes.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod countersign_two_node_invariants;
+/// v62.0.0 (SL-fix3d; CC 4.4.3.12 as ruled) — I4180–I4183: an official
+/// withdraws its countersign alone; the act un-concludes, back to waiting.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod countersign_withdrawal_invariants;
 /// v53.1.0 (CIRISPersist#979) — I480–I487: a chunk of a withdrawn file is
 /// judged by its file.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -314,10 +326,18 @@ mod retraction_invariants;
 /// v61 S2 (CIRISPersist#1161) — I1512: room moderation in CC's shape.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod room_moderation_invariants;
+/// v62.0.0 (SL-fix2; CC 4.4.3.12) — I4130–I4135: a one-seat affiliation's
+/// `slash` act counts only countersigned from outside the seat.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod slash_countersign_invariants;
 /// v62.0.0 (SL-fix1; CC 3.4.7, CC 4.5.5) — I4120–I4126: a slashing verdict
 /// counts only from a holder of the `slash` duty.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod slashing_duty_invariants;
+/// v62.0.0 (SL-fix3a; CC 4.4.3.12) — I4140–I4145: a one-seat affiliation's
+/// takedown of a member's content counts only countersigned.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod takedown_countersign_invariants;
 // v53.0.0 (CIRISPersist#969) — I310–I319: one DEK per (stream, epoch).
 /// v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — affiliations: the declared
 /// cohort and the typed config record (I592–I594).

@@ -234,6 +234,50 @@ fn authoring_statement(voices: &[Vec<u8>]) -> Option<&Vec<u8>> {
         .or_else(|| voices.first())
 }
 
+/// v62.0.0 (SL-fix3c; CC 4.4.3.12) — the keys that may countersign the
+/// counted floor-family act `st` states (the designated officials of the
+/// one-seat affiliation `affiliation_config::floor_affiliation` finds it taken
+/// in), or `None` when `st` is no such act.
+async fn countersign_parties<F>(dir: &F, st: &[u8]) -> Result<Option<Vec<String>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some((protected, payload)) = statement_parts(st) else {
+        return Ok(None);
+    };
+    let Some(family) = protected.get_int(-70002).and_then(Value::as_text) else {
+        return Ok(None);
+    };
+    if !super::typed::is_floor_family(family) || payload.get_text("author").is_some() {
+        return Ok(None);
+    }
+    let Some(input) = super::typed::floor_act_of_payload(family, &payload) else {
+        return Ok(None);
+    };
+    let at = payload
+        .get_text("asserted_at")
+        .and_then(Value::as_u64)
+        .and_then(|ms| i64::try_from(ms).ok())
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .unwrap_or_else(crate::host::clock::now);
+    let iss = statement_iss(st).unwrap_or_default();
+    let probe = payload
+        .get_text("claimant")
+        .and_then(Value::as_text)
+        .map_or(iss, str::to_owned);
+    let Some(room) =
+        crate::federation::affiliation_config::floor_affiliation(dir, input.as_act(), &probe, at)
+            .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        crate::federation::affiliation_config::designated_official_keys(&room)?
+            .into_iter()
+            .collect(),
+    ))
+}
+
 /// The most held rows one [`held_rows_for`] page returns.
 pub const MAX_HELD_ROWS_PAGE: u32 = 1000;
 
@@ -310,6 +354,32 @@ where
                     author: statement_iss(st).unwrap_or_default(),
                     sub: sub.clone(),
                     role: member.to_owned(),
+                    parties,
+                    reason: held.reason.clone(),
+                    detail: held.detail.clone(),
+                    statement: st.clone(),
+                });
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+            continue;
+        }
+        // v62.0.0 (SL-fix3c; CC 4.4.3.12) — a COUNTED act against a member
+        // in a one-seat affiliation (a quarantine marker, a slashing verdict,
+        // a takedown notice) waits for a designated official's countersign:
+        // no second-signer role (the family names none), the role
+        // `affiliation_countersign`, its parties the room's officials.
+        if let Some(parties) = countersign_parties(dir, st).await? {
+            let r = crate::federation::affiliation_config::AFFILIATION_COUNTERSIGN_ROLE;
+            if role.is_none_or(|want| want == r) && parties.iter().any(|p| p == key) {
+                out.push(HeldRow {
+                    row_id: row_id.hex(),
+                    family: family.clone(),
+                    row_type: row_type.clone(),
+                    author: statement_iss(st).unwrap_or_default(),
+                    sub: sub.clone(),
+                    role: r.to_owned(),
                     parties,
                     reason: held.reason.clone(),
                     detail: held.detail.clone(),

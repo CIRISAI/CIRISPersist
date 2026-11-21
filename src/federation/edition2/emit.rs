@@ -712,6 +712,131 @@ pub fn draft_from_envelope(
     asserted_at_ms: u64,
     target: Option<(&Digest32, &str)>,
 ) -> Result<Draft, Error> {
+    draft_from_envelope_as(
+        kid,
+        iss,
+        sub,
+        row_type,
+        envelope,
+        asserted_at_ms,
+        target,
+        None,
+    )
+}
+
+/// v62.0.0 (SL-fix3c; CC 4.4.3.12) — **[`draft_from_envelope`] against the
+/// directory**: a floor family's act (a quarantine marker, a slashing verdict,
+/// a takedown notice) is drafted COUNTED (no `author`: the seat's voice, to
+/// be countersigned) exactly when [`floor_counted`] finds the one-seat
+/// affiliation it is taken in at the draft's own instant, and AUTHORED
+/// otherwise. Every other family is [`draft_from_envelope`]'s.
+///
+/// # Errors
+/// As [`draft_from_envelope`]; directory reads.
+#[allow(clippy::too_many_arguments)]
+pub async fn draft_from_envelope_in<F>(
+    dir: &F,
+    kid: &Digest32,
+    iss: &str,
+    sub: &str,
+    row_type: &str,
+    envelope: &serde_json::Value,
+    asserted_at_ms: u64,
+    target: Option<(&Digest32, &str)>,
+) -> Result<Draft, Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    let family = family_for(row_type, target.map(|(_, f)| f), envelope, None)?;
+    let counted = if super::payloads::COMPOSER_ROW_TYPES.contains(&row_type) {
+        None
+    } else {
+        floor_counted(dir, &family, envelope, iss, asserted_at_ms).await?
+    };
+    draft_from_envelope_as(
+        kid,
+        iss,
+        sub,
+        row_type,
+        envelope,
+        asserted_at_ms,
+        target,
+        counted.map(|c| !c),
+    )
+}
+
+/// v62.0.0 (SL-fix3c; CC 4.4.3.12) — **is a floor family's act COUNTED
+/// here?** `Some(true)` when `affiliation_config::floor_affiliation` finds the
+/// one-seat affiliation the act named by `envelope` (its `community_id`, or a
+/// takedown's `content_sha256` and `claimant_key_id`) is taken in, by `iss`,
+/// at `asserted_at_ms`; `Some(false)` for a floor family it does not;
+/// `None` for any other family (its cell is the vendored one). The same
+/// function the door's authorship context and the countersign gates ask.
+///
+/// # Errors
+/// Directory reads.
+pub async fn floor_counted<F>(
+    dir: &F,
+    family: &str,
+    envelope: &serde_json::Value,
+    iss: &str,
+    asserted_at_ms: u64,
+) -> Result<Option<bool>, Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    use crate::federation::affiliation_config::{floor_affiliation, FloorAct};
+    if !super::typed::is_floor_family(family) {
+        return Ok(None);
+    }
+    let text = |k: &str| {
+        envelope
+            .get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let at = i64::try_from(asserted_at_ms)
+        .ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .unwrap_or_else(crate::host::clock::now);
+    let (act, actor) =
+        if family == ciris_verify_core::namespace_match::family_id(super::typed::TAKEDOWN_PREFIX) {
+            let claimant = match text("claimant_key_id") {
+                "" => iss,
+                c => c,
+            };
+            (
+                FloorAct::Takedown {
+                    content_sha256: text("content_sha256"),
+                },
+                claimant,
+            )
+        } else {
+            (
+                FloorAct::Slash {
+                    community_id: text(crate::federation::quarantine::field::COMMUNITY_ID),
+                },
+                iss,
+            )
+        };
+    Ok(Some(
+        floor_affiliation(dir, act, actor, at).await?.is_some(),
+    ))
+}
+
+/// [`draft_from_envelope`] with the authorship decided by the caller when
+/// `authored` is given (the directory's answer, [`draft_from_envelope_in`]).
+#[allow(clippy::too_many_arguments)]
+fn draft_from_envelope_as(
+    kid: &Digest32,
+    iss: &str,
+    sub: &str,
+    row_type: &str,
+    envelope: &serde_json::Value,
+    asserted_at_ms: u64,
+    target: Option<(&Digest32, &str)>,
+    authored_override: Option<bool>,
+) -> Result<Draft, Error> {
     let family = family_for(row_type, target.map(|(_, f)| f), envelope, None)?;
     // v62.0.0 (AU-fix2; CC 2.7.11 P2:952) — an `admission:unit` row that
     // names its roster head (`head`) is COUNTED: "absent on a counted row,
@@ -721,12 +846,14 @@ pub fn draft_from_envelope(
     let counted_admission =
         family == super::payloads::ADMISSION_UNIT_FAMILY && envelope.get("head").is_some();
     let authored = !counted_admission
-        && family_is_authored(
-            &family,
-            envelope
-                .get("dimension")
-                .and_then(serde_json::Value::as_str),
-        );
+        && authored_override.unwrap_or_else(|| {
+            family_is_authored(
+                &family,
+                envelope
+                    .get("dimension")
+                    .and_then(serde_json::Value::as_str),
+            )
+        });
     let drop: &[&str] = if super::payloads::COMPOSER_ROW_TYPES.contains(&row_type) {
         COMPOSER_EARLIER_MEMBERS
     } else {

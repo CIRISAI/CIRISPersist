@@ -507,6 +507,32 @@ pub fn admit_row(
                 Verdict::Waiting { missing } => return Err(waiting(&missing)),
             }
         }
+        // v62.0.0 (SL-fix3c; CC 4.4.3.12) — a floor family's act stated in
+        // the wrong form for the room it is taken in names the form the door
+        // wants, so a host whose view of the room was stale knows what to
+        // re-draft.
+        FamilyVerdict::FamilyInvalid(FamilyFault::AuthorColumn)
+            if protected
+                .get_int(-70002)
+                .and_then(Value::as_text)
+                .is_some_and(super::typed::is_floor_family) =>
+        {
+            let wants = if ctx.seats == Some(1)
+                && ctx.group
+                    == Some(ciris_verify_core::edition2::family::select::Group::Affiliations)
+            {
+                "this act is COUNTED here (an affiliation with one deciding seat, CC \
+                 4.4.3.12): state it with no `author`, as the seat's voice, and have a \
+                 designated official add its voice over the same payload"
+            } else {
+                "this act is AUTHORED here (no one-seat affiliation floor applies): state it \
+                 with `author` = its signer"
+            };
+            return Err(refuse(
+                token::FAMILY_INVALID,
+                format!("{}: {wants}", fault_label(&FamilyFault::AuthorColumn)),
+            ));
+        }
         FamilyVerdict::FamilyInvalid(f) => {
             return Err(refuse(token::FAMILY_INVALID, fault_label(&f)));
         }

@@ -154,6 +154,18 @@ pub fn typed_plane_of(row_type: &str, family: &str) -> Option<TypedPlane> {
 #[must_use]
 pub fn typed_plane_of_row(row: &AdmittedRow) -> Option<TypedPlane> {
     let plane = typed_plane_of(&row.row_type, &row.family)?;
+    // v62.0.0 (SL-fix3a; CC 4.4.3.12, CC 2.6.1.9) — a COUNTED takedown
+    // notice that is no steward purge (no `author`: a one-seat affiliation's
+    // act against a member's content) is counted by its voices, so it takes
+    // the attestation tail that keeps each voice and re-runs the gates over
+    // all of them (`voices::put_counted_row`), not the typed single-statement
+    // put. The gates are the same `put_attestation` gates either way.
+    if plane == TypedPlane::Takedown
+        && !is_steward_purge(row)
+        && row.payload.get_text("author").is_none()
+    {
+        return None;
+    }
     if plane == TypedPlane::Revocation
         && row
             .payload
@@ -181,6 +193,55 @@ fn is_slash_family(family: &str) -> bool {
         || family == namespace_match::family_id(SLASHING_NAMESPACE_FAMILY)
 }
 
+/// v62.0.0 (SL-fix3a; CC 4.4.3.12) — is `family` (a header family id) one of
+/// the families an act against a member rides that the one-seat floor
+/// reaches at this door: the two `slash` families and
+/// `takedown_notice:{basis}`? (`membership:removal` is the roster door's.)
+pub(crate) fn is_floor_family(family: &str) -> bool {
+    is_slash_family(family) || family == namespace_match::family_id(TAKEDOWN_PREFIX)
+}
+
+/// The input of `affiliation_config::floor_affiliation` a floor family's
+/// payload names, owned: a slash act's `community_id`, a takedown's content
+/// digest (64 hex).
+pub(crate) enum FloorInput {
+    /// A slash act's `community_id` (empty when it names none).
+    Slash(String),
+    /// A takedown notice's `content_sha256`.
+    Takedown(String),
+}
+
+impl FloorInput {
+    /// As the borrowed act.
+    #[must_use]
+    pub(crate) fn as_act(&self) -> crate::federation::affiliation_config::FloorAct<'_> {
+        use crate::federation::affiliation_config::FloorAct;
+        match self {
+            Self::Slash(c) => FloorAct::Slash { community_id: c },
+            Self::Takedown(d) => FloorAct::Takedown { content_sha256: d },
+        }
+    }
+}
+
+/// The floor input `payload` names under `family`, or `None` (not a floor
+/// family, or a takedown naming no readable digest).
+pub(crate) fn floor_act_of_payload(family: &str, payload: &Value) -> Option<FloorInput> {
+    if is_slash_family(family) {
+        return Some(FloorInput::Slash(
+            text_of(payload, crate::federation::quarantine::field::COMMUNITY_ID)
+                .unwrap_or("")
+                .to_owned(),
+        ));
+    }
+    if family == namespace_match::family_id(TAKEDOWN_PREFIX) {
+        return payload
+            .get_text("content_sha256")
+            .and_then(digest_hex)
+            .map(FloorInput::Takedown);
+    }
+    None
+}
+
 /// v62.0.0 (T2-fix3) — **the selector keys a typed family's authorship cell
 /// reads, from the statement's bytes alone**, for an admit that supplies
 /// none (`door::door_context`; a key already `Some` is kept):
@@ -196,8 +257,10 @@ fn is_slash_family(family: &str) -> bool {
 ///   carries no author by CC 2.6.1.3, so a re-admission of held bytes reaches
 ///   the verdict it was admitted under.
 /// - `quarantine:{state}` and (v62.0.0, SL-fix1) `slashing:{outcome}`: an
-///   AUTHORED statement is the authored arm's (`seats = 0`); a counted one
-///   needs the held community ([`family_context`]).
+///   AUTHORED statement is the authored arm's (`seats = 0`); a COUNTED one
+///   (no `author`, v62.0.0 SL-fix2) is the counted arm's (`group =
+///   affiliations`, `seats = 1`), the only arm a counted row can have been
+///   admitted under.
 pub fn fill_context_from_bytes(
     bytes: &[u8],
     ctx: &mut ciris_verify_core::edition2::family::SelectContext,
@@ -209,29 +272,23 @@ pub fn fill_context_from_bytes(
     let Some(family) = protected.get_int(-70002).and_then(Value::as_text) else {
         return;
     };
-    if family == namespace_match::family_id(TAKEDOWN_PREFIX) {
-        if ctx.group.is_none() {
-            ctx.group = match text_of(&payload, "cohort_scope") {
-                Some(cs::FAMILY) => Some(Group::Family),
-                Some(cs::COMMUNITY) => Some(Group::Community),
-                Some(cs::AFFILIATIONS) => Some(Group::Affiliations),
-                _ => None,
-            };
-        }
-        if ctx.seats.is_none() && ctx.group.is_none() {
+    if is_floor_family(family) && ctx.group.is_none() && ctx.seats.is_none() {
+        // v62.0.0 (K2-fix13, SL-fix2, SL-fix3a) — a re-admission of a held
+        // statement of a family CC 4.4.3.12's floor reaches, with no
+        // directory: an `author` is the authored arm's own column, so the
+        // one-seat-affiliation arm reads false; a counted statement carries
+        // no author (CC 2.6.1.3), and the cell's only counted arm (beside a
+        // takedown's `steward_purge` leaf) is `group=affiliations &
+        // seats=one`, so its held bytes read that arm again, the verdict they
+        // were admitted under. Never the statement's own `cohort_scope`: a
+        // signer-chosen member does not decide how many seats it needs.
+        if payload.get_text("author").is_some() {
+            ctx.group = Some(Group::Community);
             ctx.seats = Some(0);
+        } else {
+            ctx.group = Some(Group::Affiliations);
+            ctx.seats = Some(1);
         }
-    } else if is_slash_family(family)
-        && ctx.group.is_none()
-        && ctx.seats.is_none()
-        && payload.get_text("author").is_some()
-    {
-        // v62.0.0 (K2-fix13) — a re-admission of a held AUTHORED marker,
-        // with no directory: an `author` is the authored arm's own column
-        // (the counted arm has none), so the one-seat-affiliation test reads
-        // false. A counted marker's context needs the held community
-        // ([`family_context`]).
-        ctx.seats = Some(0);
     } else if family == namespace_match::family_id(OCCURRENCE_REVOCATION_PREFIX)
         && ctx.identity.is_none()
     {
@@ -301,50 +358,44 @@ where
                     .collect(),
             );
         }
-    } else if family == namespace_match::family_id(TAKEDOWN_PREFIX) {
-        let group = match text_of(&payload, "cohort_scope") {
-            Some(cs::FAMILY) => Some(Group::Family),
-            Some(cs::COMMUNITY) => Some(Group::Community),
-            Some(cs::AFFILIATIONS) => Some(Group::Affiliations),
-            _ => None,
-        };
-        ctx.group = group;
-        ctx.seats = match group {
-            None => Some(0),
-            Some(Group::Affiliations) => match text_of(&payload, "community_id") {
-                Some(c) => dir
-                    .lookup_community(c)
-                    .await?
-                    .map(|head| u64::try_from(head.members.len()).unwrap_or(u64::MAX)),
-                None => None,
-            },
-            Some(_) => None,
-        };
-    } else if is_slash_family(family) {
-        // v62.0.0 (K2-fix13; CC rc21 family model, `quarantine:{state}`:
-        // `group=affiliations & seats=one => counted ; authored`) — `group`
-        // is the cohort the held record of the marker's `community_id`
-        // declares, and `seats` an affiliation's members at that head. A
-        // community this node does not hold is no group here: no deciding
-        // seats (`seats = 0`), so the affiliation arm reads false, as for a
-        // takedown notice placed at no group.
-        let held = match text_of(&payload, crate::federation::quarantine::field::COMMUNITY_ID) {
-            Some(c) => dir.lookup_community(c).await?,
+    } else if is_floor_family(family) {
+        // v62.0.0 (K2-fix13, SL-fix2, SL-fix3a; CC 4.4.3.12, CC rc21 family
+        // model: `quarantine:{state}`, `slashing:{outcome}` and
+        // `takedown_notice:{basis}` all state `group=affiliations &
+        // seats=one => counted`) — the arm holds exactly when
+        // `affiliation_config::floor_affiliation` finds the one-seat
+        // affiliation the act is taken in, at the statement's own instant:
+        // the HELD record of the row's `community_id` (a slash act) or of a
+        // community the content's held binding places it in (a takedown; not
+        // the author's own), counted by its DECIDING seats. The same function
+        // the countersign gates ask. Never the statement's own `cohort_scope`
+        // (a signer-chosen member), never every listed member (which made a
+        // one-seat affiliation with members read `authored`).
+        let at = payload
+            .get_text("asserted_at")
+            .and_then(Value::as_u64)
+            .map(|ms| ms_instant("asserted_at", ms))
+            .transpose()?
+            .unwrap_or_else(crate::host::clock::now);
+        let actor = super::occurrence::statement_iss(bytes).unwrap_or_default();
+        let floor = match floor_act_of_payload(family, &payload) {
+            Some(act) => {
+                crate::federation::affiliation_config::floor_affiliation(
+                    dir,
+                    act.as_act(),
+                    &actor,
+                    at,
+                )
+                .await?
+            }
             None => None,
         };
-        match held {
-            Some(head) => {
-                let affiliations = crate::federation::affiliation_config::declared_cohort(&head)?
-                    == crate::federation::cohort::Cohort::Affiliations;
-                ctx.group = Some(if affiliations {
-                    Group::Affiliations
-                } else {
-                    Group::Community
-                });
-                ctx.seats =
-                    affiliations.then(|| u64::try_from(head.members.len()).unwrap_or(u64::MAX));
-            }
-            None => ctx.seats = Some(0),
+        if floor.is_some() {
+            ctx.group = Some(Group::Affiliations);
+            ctx.seats = Some(1);
+        } else {
+            ctx.group = Some(Group::Community);
+            ctx.seats = Some(0);
         }
     }
     Ok(ctx)

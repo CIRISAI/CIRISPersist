@@ -112,6 +112,18 @@ pub fn carried_voice(row: &Attestation) -> Option<Voice> {
     voice_of(&hex::decode(h).ok()?, &row_id)
 }
 
+/// v62.0.0 (SL-fix3a) — does `row` carry a COUNTED statement (one whose
+/// payload states no `author`: each signer is one voice over it, CC 2.6.1.3 /
+/// 2.6.1.9)? `false` for an authored statement and for a row carrying none.
+#[must_use]
+pub fn carried_is_counted(row: &Attestation) -> bool {
+    super::emit::carried_statement(row)
+        .and_then(|st| {
+            super::liveness::statement_parts(&st).map(|(_, p)| p.get_text("author").is_none())
+        })
+        .unwrap_or(false)
+}
+
 /// The DISTINCT signers (`iss`) among `row_id`'s voices that are members of
 /// `roster` (identity-refs, as the typed group rows hold them).
 ///
@@ -219,6 +231,69 @@ pub(crate) fn note_short() {
     super::fold::note(super::fold::reason::COUNT_SHORT);
 }
 
+/// v62.0.0 (SL-fix3b; CC 4.4.3.12) — **the actor of a counted act against a
+/// member in a one-seat affiliation**, or `None` (not such an act): the
+/// identity-ref of the voice the row must name as its attester.
+///
+/// - a takedown notice: its signed `claimant` (the notice's own member);
+/// - a quarantine marker or a slashing verdict: the voice that decided it,
+///   the deciding seat's own first (`admission::slash_act_decider`, the loop
+///   the `slash` gate admits it by), among every voice held and the one
+///   offered now.
+///
+/// The floor is `affiliation_config::floor_affiliation`, the one reading the
+/// door's authorship context and the countersign gates ask.
+async fn floor_actor<F>(dir: &F, admitted: &AdmittedRow) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(input) = super::typed::floor_act_of_payload(&admitted.family, &admitted.payload)
+    else {
+        return Ok(None);
+    };
+    let at = i64::try_from(admitted.asserted_at_ms)
+        .ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .unwrap_or_else(crate::host::clock::now);
+    let claimant = admitted
+        .payload
+        .get_text("claimant")
+        .and_then(ciris_verify_core::cde::Value::as_text)
+        .map(str::to_owned);
+    let probe = claimant.clone().unwrap_or_else(|| admitted.iss.clone());
+    let Some(room) =
+        crate::federation::affiliation_config::floor_affiliation(dir, input.as_act(), &probe, at)
+            .await?
+    else {
+        return Ok(None);
+    };
+    if let super::typed::FloorInput::Takedown(_) = input {
+        return Ok(claimant);
+    }
+    let mut candidates: BTreeSet<String> = dir
+        .edition2_voices(&admitted.row_id)
+        .await?
+        .iter()
+        .filter_map(|st| voice_of(st, &admitted.row_id))
+        .map(|v| v.iss)
+        .collect();
+    candidates.insert(admitted.iss.clone());
+    let dimension = admitted
+        .payload
+        .get_text("dimension")
+        .and_then(ciris_verify_core::cde::Value::as_text)
+        .unwrap_or("")
+        .to_owned();
+    crate::federation::admission::slash_act_decider(
+        dir.as_dyn_directory(),
+        &room,
+        &dimension,
+        at,
+        &candidates,
+    )
+    .await
+}
+
 /// The voice that should project the typed row: the author's own voice for an
 /// authored row (a second signer's consent never becomes the row's
 /// attester), else the first held voice that is still admitted, else the
@@ -230,6 +305,38 @@ where
 {
     if admitted.author.as_deref() == Some(admitted.iss.as_str()) {
         return Ok(admitted.clone());
+    }
+    // v62.0.0 (SL-fix3b; CC 4.4.3.12) — a COUNTED act against a member in a
+    // one-seat affiliation (a quarantine marker, a slashing verdict, a
+    // takedown notice) is the deciding seat's act, countersigned: its stored
+    // attester is the seat's voice ([`floor_actor`]) whatever the arrival or
+    // key order, so a countersigning official is never the row's
+    // `attesting_key_id` (the withdraws Rule 1 producer, quarantine's
+    // per-holder fold and `decided_by`). The row is written once, when it
+    // concludes: a held row has no typed row to name anyone.
+    if admitted.author.is_none() {
+        if let Some(actor) = floor_actor(dir, admitted).await? {
+            if admitted.iss == actor {
+                return Ok(admitted.clone());
+            }
+            for st in dir.edition2_voices(&admitted.row_id).await? {
+                let Some(v) = voice_of(&st, &admitted.row_id) else {
+                    continue;
+                };
+                if v.iss != actor {
+                    continue;
+                }
+                let keys = super::ingest::held_keys_for(dir, &st).await?;
+                if let Ok(p) = super::door::admit_row(
+                    &st,
+                    &keys,
+                    Some(&admitted.row_id.0),
+                    ciris_verify_core::edition2::family::SelectContext::default(),
+                ) {
+                    return Ok(p);
+                }
+            }
+        }
     }
     for st in dir.edition2_voices(&admitted.row_id).await? {
         let Some(v) = voice_of(&st, &admitted.row_id) else {

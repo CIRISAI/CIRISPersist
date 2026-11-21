@@ -28990,8 +28990,10 @@ mod tests {
             "rl2c-backend",
         )
         .await;
-        crate::federation::quarantine::test_support::exercise_admin_ops(&backend, "sqlite-qa")
-            .await;
+        Box::pin(
+            crate::federation::quarantine::test_support::exercise_admin_ops(&backend, "sqlite-qa"),
+        )
+        .await;
     }
 
     /// v30.10.0 (CIRISPersist#632) — the SQLITE leg of the federation
