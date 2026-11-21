@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 169 delegations, generated. Every one: fault first, then delegate.
+// 172 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -310,6 +310,22 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.edition2_rows_naming(named, role).await
+    }
+    async fn edition2_statement(&self, statement_id: &[u8; 32]) -> Result<Option<Vec<u8>>, Error> {
+        if let Some(e) = self.faulted("edition2_statement") {
+            return Err(e);
+        }
+        self.inner.edition2_statement(statement_id).await
+    }
+    async fn edition2_statement_ids_since(
+        &self,
+        after: Option<&[u8; 32]>,
+        limit: u32,
+    ) -> Result<Vec<String>, Error> {
+        if let Some(e) = self.faulted("edition2_statement_ids_since") {
+            return Err(e);
+        }
+        self.inner.edition2_statement_ids_since(after, limit).await
     }
     async fn edition2_statements_about(
         &self,
@@ -1278,6 +1294,14 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.project_key_grant_row(row).await
+    }
+    async fn purge_attestation_projections(&self, attestation_id: &str) -> Result<(), Error> {
+        if let Some(e) = self.faulted("purge_attestation_projections") {
+            return Err(e);
+        }
+        self.inner
+            .purge_attestation_projections(attestation_id)
+            .await
     }
     async fn purge_attestation_v31(&self, attestation_id: &str) -> Result<bool, Error> {
         if let Some(e) = self.faulted("purge_attestation_v31") {

@@ -775,6 +775,20 @@ class Engine:
         agent's one counted owner) or "none"; first match wins. Verify the
         shutdown's composite first (domain "ciris.emergency_shutdown.v1")."""
 
+    def identity_template_v1_message(self, manifest_sha256_hex: str, manifest_size: int, signer_identity: str) -> bytes:
+        """v62.0.0 — the 32-byte identity template message (v1):
+        sha256(JCS({"domain": "ciris.identity_template.v1", "manifest_sha256",
+        "manifest_size", "signer_identity"})). A holder signs it in the
+        "ciris.identity_template.v1" domain."""
+
+    def verify_identity_template_v1(self, statement_digest: bytes, signer_identity: str, composite_sig: bytes) -> None:
+        """v62.0.0 — verify an identity template signature (v1): the digest is
+        32 bytes (ValueError otherwise), the signer must be an accord holder of
+        the genesis bundle in force (`accord_manifest_signer_not_holder`), and
+        the ONE composite over the "ciris.identity_template.v1" domain
+        preimage must verify under that holder's live edition-2 key. Raises on
+        refusal."""
+
     def verify_accord_manifest_v2(self, manifest_sha256_hex: str, manifest_size: int, signer_identity: str, composite_sig: bytes) -> None:
         """v62.0.0 — verify an accord manifest signature (v2): the signer must
         be an accord holder of the genesis bundle in force
@@ -972,9 +986,6 @@ class Engine:
 
     def cohort_swap_member(self, cohort: str, group_key_id: str, out_key_id: str, in_member_json: str, revoke_spec_json: str, admit_spec_json: str) -> bool:
         """(derived) deontic — #249 Cut G1 (§6) — atomically swap out_key_id for the [crate::federation::cohort::RosterMember] in in_member_json (revoke then add) in a family/com..."""
-
-    def cohort_verify_membership_quorum(self, cohort: str, group_key_id: str, change_envelope_json: str, signatures_json: str) -> None:
-        """(derived) deontic — #249 Cut G3 (§4/§5), robust on G3.5 — verify a membership change is authorized by the group's current roster under the group's OWN consensus_protoc..."""
 
     def community_dek_set_key_state(self, community_key_id: str, epoch: int, state: str) -> None:
         """(derived) deontic — v43.0.0 (§11.6) — transition a community DEK epoch's key state: enabled / disabled / destroyed. Destroy refuses while any object on this node is st..."""
@@ -1815,13 +1826,15 @@ class Engine:
         steward_ed25519_pub_b64: str,
         steward_ml_dsa_65_pub_b64: str,
     ) -> str:
-        """v3.8.0 — verify a ``SkillImportManifest`` against a trusted steward's
-        Ed25519 + ML-DSA-65 pubkey PAIR (hybrid; both must verify).
+        """v3.8.0; v62.0.0 — **REFUSES every manifest.** A ``SkillImportManifest``
+        is the earlier bound-pair form (a separate Ed25519 + ML-DSA-65 signature),
+        which v62 does not verify. Edition 2 carries a skill import as a
+        ``provenance:skill_import:{source}`` row: one composite statement through
+        the statement door.
 
-        Returns ``'{"valid": true, "source": ..., ...}'`` on success and
-        **RAISES** with the structured reason on signature or canonicalisation
-        failure. So the failure mode here is an exception, not a falsy return —
-        do not wrap it in a bare ``except`` that continues.
+        Raises:
+            RuntimeError: always, ``skill_import verify failed: skill_import:
+                earlier_form_object: ...``.
         """
 
     def verify_storage_budget_v1(self, wire_json: str, ed25519_pubkey_base64: str, ml_dsa_65_pubkey_base64: str) -> bool:
@@ -2229,9 +2242,6 @@ class Engine:
 
     def respond_hybrid_kex_b64(self, recipient_x25519_priv_b64: str, recipient_mlkem768_priv_b64: str, recipient_mlkem768_pub_b64: str, handshake_msg_json: str) -> str:
         """(derived) ontological — v3.8.0 — respond side of hybrid KEX. Returns the matching session key as JSON."""
-
-    def root_binding(self, key_id: str, claimed_pubkey_ed25519_base64: str) -> str:
-        """(derived) ontological — Cold-start binding-rooting primitive (CIRISPersist#94)."""
 
     def seal_trace_statement(self, trace_json: str, trace_level: str) -> tuple[bytes, bytes]:
         """(derived) ontological — v62.0.0 (wave P7; CC 3.1.5) — scrub a trace with persist's own scrubber and seal the scrubbed bytes as its `trace:complete:v1` row."""

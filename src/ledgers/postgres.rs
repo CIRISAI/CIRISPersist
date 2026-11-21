@@ -952,8 +952,7 @@ mod tests {
             seq: 7,
             head_hash: hash.into(),
             signature_key_id: "owner".into(),
-            signature_classical_base64: "c2ln".into(),
-            signature_pqc_base64: None,
+            signature_composite_base64: "c2ln".into(),
         };
         let ev = detect_double_head(&mk("hash-a"), &mk("hash-b")).unwrap();
         let id1 = svc.record_fork_evidence(&ev).await.unwrap();

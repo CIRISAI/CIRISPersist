@@ -447,42 +447,62 @@ impl VocabularyTighteningReport {
 
 /// Build the `supersedes` composer envelope for one retired row. Carries the
 /// tightening provenance so the retirement explains itself from the row.
+///
+/// v62.0.0 (LF-fix1) — a composer's payload is the common members and
+/// `refs.target` only (`edition2::payloads::check_composer`, CC 2.4.1.1), so
+/// the provenance rides the common free-form `body` member (CC 2.6.1.10):
+/// the sentence under `body.note` (bounded, [`BODY_NOTE_MAX`]) and each
+/// provenance member under `body` by its own name. Stated at the top (the
+/// earlier `withdrawal_reason` and five named members) the statement door
+/// refused every composer this sweep signed, so no row was ever retired.
+///
+/// [`BODY_NOTE_MAX`]: crate::federation::edition2::payloads::BODY_NOTE_MAX
 fn supersedes_envelope(
     target: &VocabularyTightening,
     original_attestation_id: &str,
     replacement_attestation_id: &str,
 ) -> crate::federation::envelope::EnvelopeCore {
-    let mut extra = serde_json::Map::new();
-    extra.insert(
+    let mut note = format!(
+        "vocabulary tightening {} ({}): {:?} is non-conformant at {}",
+        target.tightening_id, target.citation, target.non_conformant, target.field_path
+    );
+    // `body.note` is at most BODY_NOTE_MAX bytes; the full provenance is in
+    // the named members beside it, so a long sentence is cut, never refused.
+    let mut cut = crate::federation::edition2::payloads::BODY_NOTE_MAX.min(note.len());
+    while !note.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    note.truncate(cut);
+    let mut body = serde_json::Map::new();
+    body.insert("note".to_string(), serde_json::Value::String(note));
+    body.insert(
         "vocabulary_tightening_id".to_string(),
         serde_json::Value::String(target.tightening_id.clone()),
     );
-    extra.insert(
+    body.insert(
         "vocabulary_tightening_citation".to_string(),
         serde_json::Value::String(target.citation.clone()),
     );
-    extra.insert(
+    body.insert(
         "tightened_field_path".to_string(),
         serde_json::Value::String(target.field_path.clone()),
     );
-    extra.insert(
+    body.insert(
         "tightened_from".to_string(),
         serde_json::Value::String(target.non_conformant.clone()),
     );
-    extra.insert(
+    body.insert(
         "tightened_to".to_string(),
         serde_json::Value::String(target.conformant.clone()),
     );
-    extra.insert(
+    body.insert(
         "replacement_attestation_id".to_string(),
         serde_json::Value::String(replacement_attestation_id.to_string()),
     );
+    let mut extra = serde_json::Map::new();
+    extra.insert("body".to_string(), serde_json::Value::Object(body));
     crate::federation::envelope::EnvelopeCore {
         references_attestation_id: Some(original_attestation_id.to_string()),
-        withdrawal_reason: Some(format!(
-            "vocabulary tightening {} ({}): {:?} is non-conformant at {}",
-            target.tightening_id, target.citation, target.non_conformant, target.field_path
-        )),
         extra,
         ..Default::default()
     }
@@ -655,7 +675,7 @@ where
                                 && c.attested_key_id == row.attested_key_id
                                 && c.attestation_type == row.attestation_type
                                 && c.cohort_scope == row.cohort_scope
-                                && c.attestation_envelope == tightened
+                                && same_claim(&c.attestation_envelope, &tightened)
                         })
                         .map(|c| c.attestation_id.clone());
                     Plan::Tighten {
@@ -767,6 +787,22 @@ where
 
     report.elapsed_ms = u32::try_from(t0.elapsed().as_millis()).unwrap_or(u32::MAX);
     Ok(report)
+}
+
+/// v62.0.0 (LF-fix1) — are two envelopes the same claim? An edition-2 row's
+/// envelope carries its own statement (`ceg_statement`), which names the row
+/// and so differs between a row and its replacement by construction: the
+/// comparison leaves it (and the earlier form's `row` mirror) out.
+fn same_claim(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    fn claim(v: &serde_json::Value) -> serde_json::Value {
+        let mut v = v.clone();
+        if let Some(o) = v.as_object_mut() {
+            o.remove(crate::federation::edition2::ingest::STATEMENT_MEMBER);
+            o.remove(crate::federation::envelope::paths::ROW);
+        }
+        v
+    }
+    claim(a) == claim(b)
 }
 
 fn record_skip(
@@ -1227,14 +1263,22 @@ mod sweep_tests {
                     Some(action.attestation_id.as_str()),
                     "the composer names the row it retires"
                 );
+                // v62 (LF-fix1): a composer states the common members only,
+                // so the provenance reads back under the common `body`.
                 assert_eq!(
-                    comp.attestation_envelope["vocabulary_tightening_id"],
+                    comp.attestation_envelope["body"]["vocabulary_tightening_id"],
                     target.tightening_id.as_str(),
                     "the retirement explains itself from the row"
                 );
                 assert_eq!(
-                    comp.attestation_envelope["replacement_attestation_id"],
+                    comp.attestation_envelope["body"]["replacement_attestation_id"],
                     replacement_attestation_id.as_str()
+                );
+                assert!(
+                    comp.attestation_envelope["body"]["note"]
+                        .as_str()
+                        .is_some_and(|n| n.contains(target.tightening_id.as_str())),
+                    "…and says why in words"
                 );
             }
         }

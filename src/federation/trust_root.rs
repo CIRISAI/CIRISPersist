@@ -709,9 +709,9 @@ fn holder_fingerprint(
 }
 
 /// The pure evaluation (FSD §2): Layer A through the policy's structural
-/// legs; Layer B through the ONE chain walk persist already has
-/// ([`super::admission::verify_member_fips_custody_against`], the pinned
-/// root taken from the policy) for a YubiKey PIV custody attestation.
+/// legs; Layer B from the chain walks `check_structure` already ran (the
+/// Android and edition-2 custody arms). v62.0.0 (BH-fix3): the v1
+/// generation-custody walk is deleted (earlier-form evidence).
 fn evaluate_holder_hardware(
     rec: &super::types::KeyRecord,
     policy: &super::hardware_attestation::HardwareAttestationPolicy,
@@ -776,17 +776,22 @@ fn evaluate_holder_hardware(
             refusal: None,
         };
     }
-    let (layer_b, refusal) =
-        match super::admission::verify_member_fips_custody_against(rec, &policy.yubico_root_der) {
-            Ok(_) => (Some(true), None),
-            Err(why) => (Some(false), Some(why)),
-        };
+    // v62.0.0 (BH-fix3) — the v1 `GenerationCustody` evidence (a YubiKey
+    // custody CEG object walked by Verify's `verify_accord_custody_attestation`)
+    // is the earlier form: no v62 record carries it (an edition-2 record's
+    // custody is `Edition2Custody`, above, and a seated holder's was gated by
+    // the genesis bundle reader). Its walk is deleted; a record that still
+    // names it is reported, never measured.
     HolderHardware {
         key_id: rec.key_id.clone(),
         class: Some(HardwareType::ExternalSecureElement),
         layer_a: true,
-        layer_b,
-        refusal,
+        layer_b: Some(false),
+        refusal: Some(format!(
+            "{}: v1 generation-custody evidence is the earlier form; an edition-2 \
+             record carries its custody as Edition2Custody",
+            super::malformed_row::EDITION2_EARLIER_FORM_OBJECT
+        )),
     }
 }
 

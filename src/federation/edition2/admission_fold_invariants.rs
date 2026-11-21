@@ -252,88 +252,28 @@ pub(crate) async fn deadmission_on_the_revocation_plane_body(
     node: &str,
 ) {
     use crate::federation::admission::{check_peer_deadmission, DELEGATION_SCOPE_SLASH};
-    use crate::federation::trust_root::{
-        TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION, TRUST_CONFERS_DIMENSION,
-    };
-    use crate::federation::types::{attestation_tier, cohort_scope};
     let (root, peer) = ("gc1-dr-root", "gc1-dr-peer");
     e2::put_key(d, node, &[identity_type::NODE]).await;
-    e2::put_key(d, root, &[identity_type::NODE]).await;
     e2::put_key(d, peer, &[identity_type::NODE]).await;
     // The node's `slash` conferral from a root it trusts (I3081's shape):
     // revoking another's key needs it (`check_revocation_authority`).
-    let lit = |from: &str, to: &str, envelope: serde_json::Value| {
-        let now = crate::host::clock::now();
-        Attestation {
-            attestation_id: String::new(),
-            attesting_key_id: e2::kid(from),
-            attested_key_id: e2::kid(to),
-            attestation_type: attestation_type::DELEGATES_TO.to_owned(),
-            weight: Some(1.0),
-            asserted_at: now,
-            expires_at: None,
-            attestation_envelope: envelope,
-            original_content_hash: String::new(),
-            scrub_signature_classical: String::new(),
-            scrub_signature_pqc: None,
-            scrub_key_id: e2::kid(from),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            subject_key_ids: Vec::new(),
-            withdraws_admission_rule: None,
-            cohort_scope: cohort_scope::FEDERATION.to_owned(),
-            tier: attestation_tier::FEDERATION.to_owned(),
-            promoted_at: None,
-            additional_scrubs: Vec::new(),
-        }
-    };
-    let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&[
-        "gc1-dr-root-successor".to_owned(),
-    ])
-    .expect("I3676: commitment");
-    for (from, to, envelope) in [
-        (
-            root,
-            root,
-            serde_json::json!({
-                "dimension": TRUST_CHARTER_DIMENSION,
-                "scope": ["infra:serve", "infra:attest"],
-                "pre_rotation_commitment": commitment,
-            }),
-        ),
-        (
-            node,
-            root,
-            serde_json::json!({"dimension": TRUST_ACCEPTS_DIMENSION, "scope": ["infra:serve"]}),
-        ),
-        (
-            root,
-            node,
-            serde_json::json!({
-                "dimension": TRUST_CONFERS_DIMENSION,
-                "scope": [DELEGATION_SCOPE_SLASH],
-            }),
-        ),
-    ] {
-        let confers = envelope
-            .get("dimension")
-            .and_then(serde_json::Value::as_str)
-            == Some(TRUST_CONFERS_DIMENSION);
-        let edge = e2::try_put_row(d, &lit(from, to, envelope), from)
-            .await
-            .unwrap_or_else(|e| panic!("I3676: the trust edge {from} -> {to}: {e:?}"));
-        // G0-fix4 — Verify's `confers` rule asks the delegate for a second
-        // voice (`delegate: sub`, CC 2.6.1.9). Without the node's voice the
-        // slash conferral was held, the revocation door's authority rule
-        // found no conferral, and the de-admission was held (I3676 red).
-        if confers {
-            let st = e2::carried_statement(&edge).expect("I3676: the conferral's statement");
-            e2::put_statement(d, &e2::voice_of(&st, to))
-                .await
-                .expect("I3676: the node's own voice on its conferral");
-        }
-    }
+    //
+    // RT-fix1 — the root is a ROOTED edition-2 trust root (the shared
+    // conferral fixture: the bundle in force, an `infrastructure` community
+    // founded by its holders, the charter, this node's acceptance), and the
+    // grant carries the node's own voice (G0-fix4; CC 2.6.1.9) and its bound
+    // owner's (a node key is a machine key, CC 4.4.3.19). The earlier body
+    // chartered a bare `node` KEY root by hand, whose grant rooted nowhere.
+    // The fixture returns only once the grant reaches the root through this
+    // node.
+    crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+        d,
+        node,
+        root,
+        node,
+        DELEGATION_SCOPE_SLASH,
+    )
+    .await;
     // A peer write is admitted before the de-admission.
     let from_peer = crate::federation::tier_ingest::test_support::bare_attestation(
         "gc1-dr-from-peer",

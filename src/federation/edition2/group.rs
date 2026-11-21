@@ -293,6 +293,31 @@ pub(crate) fn vouched_envelope(
     }
 }
 
+/// v62.0.0 (BH-fix1) — run `fut` under a vouch for `change_envelope` whose
+/// voices are `signers`, as the edition-2 door's `put_roster_record` does
+/// once it has verified each voice's composite statement. Test code only:
+/// the witnesses of the vouch-only quorum counts (I2120, I2121).
+#[cfg(test)]
+pub(crate) async fn with_quorum_vouch<Fut>(
+    change_envelope: serde_json::Value,
+    signers: &[&str],
+    fut: Fut,
+) -> Fut::Output
+where
+    Fut: std::future::Future,
+{
+    let vouch = Vouch {
+        envelope_hash: String::new(),
+        voices: signers
+            .iter()
+            .map(|s| ((*s).to_owned(), String::new()))
+            .collect(),
+        change_envelope: Some(change_envelope),
+        short: AtomicBool::new(false),
+    };
+    VOUCH.scope(Arc::new(vouch), fut).await
+}
+
 /// **The supersede quorum's vouch**: the voices' signers, when the vouch in
 /// scope names exactly `change_envelope`. `None` otherwise (the quorum's
 /// signatures are verified as before).

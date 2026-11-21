@@ -81,6 +81,20 @@ pub mod bodies {
         Ok(id)
     }
 
+    /// v62.0.0 (LF-fix1) — [`put_raw`], returning the door's last outcome: a
+    /// witness that must tell a HELD edge from a seated one reads it.
+    async fn put_raw_outcome(
+        d: &dyn FederationDirectory,
+        granter: &str,
+        recipient: &str,
+        envelope: serde_json::Value,
+    ) -> Result<crate::federation::edition2::ingest::StatementOutcome, Error> {
+        let row = raw_edge(granter, recipient, envelope);
+        crate::federation::edition2::fixture_switch::land_delegation(d, &row)
+            .await
+            .map(|(outcome, _unvoiced)| outcome)
+    }
+
     /// The sealed `delegates_to(granter → recipient)` [`put_raw`] offers.
     fn raw_edge(
         granter: &str,
@@ -160,6 +174,57 @@ pub mod bodies {
         if let Err(e) = r {
             panic!("{what}: must be admitted, got {} ({e})", e.kind());
         }
+    }
+
+    /// v62.0.0 (LF-fix1; wave GC1, CC 2.7.3) — **an edge that is term-bound
+    /// only BECAUSE of the affiliation it names is HELD, not refused**: the
+    /// affiliation's charter is another row, so the verdict must not depend
+    /// on which arrived first (`check_delegation_term_admission` splits door
+    /// from fold). Asserts the edge is `Pending`, held for
+    /// `delegation_term_required`, and that the held detail is the gate's own
+    /// refusal naming `want` (the rule). Returns that detail.
+    async fn expect_held_for_the_term(
+        d: &dyn FederationDirectory,
+        r: Result<crate::federation::edition2::ingest::StatementOutcome, Error>,
+        want: &str,
+        what: &str,
+    ) -> String {
+        use crate::federation::edition2::ingest::StatementOutcome;
+        let row = match r {
+            Ok(StatementOutcome::Pending { row_id, .. }) => row_id,
+            other => panic!("{what}: expected the edge HELD (Pending), got {other:?}"),
+        };
+        let why = crate::federation::edition2::fold::why_held(d, &row)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{what}: the edge is held with a reason"));
+        assert_eq!(
+            why.reason,
+            crate::federation::edition2::fold::reason::gc1::DELEGATION_TERM_REQUIRED,
+            "{what}: the hold names the gate ({})",
+            why.detail
+        );
+        assert!(
+            why.detail.contains(&format!("({want})")),
+            "{what}: the held refusal names the rule {want}: {}",
+            why.detail
+        );
+        why.detail
+    }
+
+    /// A `delegates_to` from `from` to `to` IS stored (the edge seated: a
+    /// held edge has no row).
+    async fn assert_edge(d: &dyn FederationDirectory, from: &str, to: &str, what: &str) {
+        let (from, to) = (e2::kid(from), e2::kid_or_keep(to));
+        assert!(
+            d.list_attestations_by(&from)
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.attestation_type == attestation_type::DELEGATES_TO
+                    && r.attested_key_id == to),
+            "{what}: the edge must be stored (seated, not held)"
+        );
     }
 
     /// No `delegates_to` from `from` to `to` is stored.
@@ -437,6 +502,13 @@ pub mod bodies {
             }
             e
         };
+        // v62.0.0 (LF-fix1; wave GC1, CC 2.7.3): these edges are not
+        // term-bearing by their own bytes (`act_on_behalf`); they are bound
+        // only because the affiliation they name is held, and that charter is
+        // ANOTHER row. So the gate HOLDS them (`delegation_term_required`,
+        // re-folded when the charter changes) instead of refusing: the edge
+        // is Pending, the hold carries the gate's refusal with its rule, and
+        // NO edge is stored. The in-term edge seats.
         for (what, until, want) in [
             ("no term", None, Some(rule::TERM_MISSING)),
             (
@@ -448,31 +520,39 @@ pub mod bodies {
         ] {
             let r = recipient();
             ts::register_hybrid_key_as(d, &r, &r, identity_type::PRIMITIVE).await;
-            let got = put_raw(d, &aff_keys[0], &r, in_group(&aff, until)).await;
+            let got = put_raw_outcome(d, &aff_keys[0], &r, in_group(&aff, until)).await;
             let what = format!("[{tag}] I1231(7) an edge in the affiliation's hierarchy, {what}");
             match want {
-                Some(w) => expect_refused(got, w, &what),
-                None => expect_admitted(got, &what),
+                Some(w) => {
+                    let detail = expect_held_for_the_term(d, got, w, &what).await;
+                    // The held refusal names the bound it broke: the
+                    // charter's 90 days, not the ceiling. Kills: the bound
+                    // chosen for the wrong rule.
+                    if w == rule::OVER_ROLE_TERM {
+                        assert!(
+                            detail.contains(&format!("the bound is {}s", 90 * 86_400)),
+                            "{what}: the held refusal names the role_term bound: {detail}"
+                        );
+                    }
+                    assert_no_edge(d, &aff_keys[0], &r, &what).await;
+                }
+                None => {
+                    if let Err(e) = got {
+                        panic!("{what}: must be admitted, got {} ({e})", e.kind());
+                    }
+                    assert_edge(d, &aff_keys[0], &r, &what).await;
+                }
             }
-        }
-        // The refusal names the bound it broke: the charter's 90 days, not
-        // the ceiling. Kills: the bound chosen for the wrong rule.
-        let r = recipient();
-        ts::register_hybrid_key_as(d, &r, &r, identity_type::PRIMITIVE).await;
-        match put_raw(d, &aff_keys[0], &r, in_group(&aff, Some(now + day * 100))).await {
-            Err(Error::DelegationTermRequired { detail, .. }) => assert!(
-                detail.contains(&format!("the bound is {}s", 90 * 86_400)),
-                "[{tag}] I1231(7): the refusal names the role_term bound: {detail}"
-            ),
-            other => panic!("[{tag}] I1231(7): expected an over-role-term refusal, got {other:?}"),
         }
         // A plain community has no hierarchy and no charter term.
         let r = recipient();
         ts::register_hybrid_key_as(d, &r, &r, identity_type::PRIMITIVE).await;
+        let what = format!("[{tag}] I1231(7) an edge naming a plain community, no term");
         expect_admitted(
             put_raw(d, &plain_keys[0], &r, in_group(&plain, None)).await,
-            &format!("[{tag}] I1231(7) an edge naming a plain community, no term"),
+            &what,
         );
+        assert_edge(d, &plain_keys[0], &r, &what).await;
 
         // (8) Not gated: an owner-binding (CC 3.2 governs its lapse) even when
         // it grants `sub_delegation`. Kills: dropping the owner-binding

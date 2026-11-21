@@ -1498,31 +1498,30 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v55.0.0 (CIRISPersist#989) — sqlite: the holding claim's INSERT inside
     // the caller's transaction. Storage, as `insert_holding_claim_tx`.
     // v62.0.0 (red round 3, X1) — the v62 waves' propagated calls.
-    // The earlier-form switch (`edition2::door`, slice F's flip): refuses an
-    // earlier-form object by name once the doors are shut.
-    ("refuse_earlier_form", Class::Gate),
-    ("refuse_earlier_form_row", Class::Gate),
+    // The earlier-form switch (`edition2::door`, slice F's flip):
+    // `refuse_earlier_form` / `refuse_earlier_form_row` are classified once,
+    // at the head of this table (v62 BF15: the merged duplicate removed).
     // Wave O1 / P1 (CC 3.3.6 rc21): an occurrence never binds a machine key
     // to a person, refused by name.
     ("check_identity_set_exclusion", Class::Gate),
     // Wave P7: a held trace blob that does not bind its row refuses the row.
     ("project_trace_row_from_held_blob", Class::Gate),
-    // Wave T2: a holding claim that does not parse refuses the put.
-    ("holding_claim_of", Class::Gate),
+    // Wave T2: a holding claim that does not parse refuses the put
+    // (`holding_claim_of`, classified once above with T2-fix11).
     // Wave T2: the commons put's edition-2 form (the claim through the
     // statement door), a shared plan (`SHARED_PLANS`).
     // Plumbing: a hex row id parsed to an `Option` (it refuses nothing),
     // the fold's interrupted re-fold repair at open (wave G0), the
     // tx-level store of an occurrence the plan admitted (wave O1), the
     // edition-2 served-bytes lookup by id, the restamp of a promoted row's
-    // serve position, and the blob plane's head read and conditional reap.
+    // serve position. (The blob plane's head read and conditional reap,
+    // `blob_head` / `delete_blob_unless_claimed`, are classified once above
+    // with T2-fix11; v62 BF15 removed the merged duplicates.)
     ("row_id_of_hex", Class::Plumbing),
     ("repair_at_open", Class::Plumbing),
     ("sqlite_store_edition2_occurrence", Class::Plumbing),
     ("pg_store_edition2_occurrence", Class::Plumbing),
     ("lookup_by_id", Class::Plumbing),
-    ("blob_head", Class::Plumbing),
-    ("delete_blob_unless_claimed", Class::Plumbing),
 ];
 
 /// One reviewed, written-down reason a single backend's gate sequence differs

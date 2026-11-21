@@ -75,7 +75,6 @@ pyo3	cohort_revoke_member	refuses	trait:*	-
 pyo3	cohort_supersede_group	refuses	trait:*	-
 pyo3	cohort_supersede_group_with_quorum	refuses	trait:*	-
 pyo3	cohort_swap_member	refuses	trait:*	-
-pyo3	cohort_verify_membership_quorum	exempt	-	verification only, writes nothing (as trait verify_membership_quorum)
 pyo3	continuity_record	exempt	-	agent-local store of an unsigned record; no signed object is admitted
 pyo3	correlation_record	exempt	-	agent-local store of an unsigned record; no signed object is admitted
 pyo3	deferral_record	exempt	-	agent-local store of an unsigned record; no signed object is admitted

@@ -4083,11 +4083,12 @@ mod tests {
             let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
                 crate::signing::LocalSignerHardwareAdapter::new(node_local.clone()),
             );
-            let engine = crate::Engine::from_shared_with_local(
+            let engine = crate::Engine::try_from_shared_with_local(
                 crate::engine::BackendDispatch::Sqlite(backend.clone()),
                 signer,
                 Some(foreign_local),
-            );
+            )
+            .expect("a shared engine view: no node_key_conflict");
             // v62.0.0 (P8) — the fourth argument is the author's pen (none).
             let err = match engine
                 .publish_self_occurrence(

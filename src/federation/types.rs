@@ -200,7 +200,7 @@ pub mod identity_type {
     /// **anchor-scrub-signed** — `scrub_key_id != key_id` AND
     /// `scrub_key_id`'s Ed25519 pubkey ∈ the pinned HUMANITY_ACCORD anchor
     /// ([`ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor`],
-    /// the SAME terminus [`super::super::rooting::root_binding`] and
+    /// the SAME terminus `root_binding` (deleted v62.0.0) and
     /// [`super::super::register::verify_key_registration`] /
     /// `adopt_scrub_upgrade` verify). A **self-signed** record
     /// (`scrub_key_id == key_id`) carrying `canonical`, or one scrubbed by a
@@ -3191,7 +3191,7 @@ pub struct SignedIdentityOccurrence {
     pub signed_envelope: serde_json::Value,
     /// The detached hybrid signature over `JCS(signed_envelope)` (Ed25519 over
     /// the bytes; ML-DSA-65 over `bytes ‖ ed25519_sig`).
-    pub signature: ciris_verify_core::transport_binding::TransportBindingSignature,
+    pub signature: crate::federation::types::RetiredPairSignature,
 }
 
 /// v52.0.0 (CIRISPersist#930) — **one admitted occurrence assertion**, as the
@@ -3360,6 +3360,41 @@ pub struct SignedFamily {
     pub cosignatures: Vec<RosterCosignature>,
 }
 
+/// v62.0.0 (BH-fix3; RULINGS "composite signatures only") — **the earlier
+/// separate-pair signature, as a WIRE-ONLY stand-in**: an Ed25519 signature
+/// and an ML-DSA-65 signature (over `msg ‖ ed25519_sig`), both base64. It is
+/// serde-identical to the Verify type it replaces
+/// (`transport_binding::TransportBindingSignature`), so the earlier-form
+/// JSON objects that still name a signature column (the signed occurrence,
+/// transport destination and touch claim, the occurrence-revocation carrier)
+/// keep their wire shape. Nothing verifies it: every door that receives one
+/// refuses the earlier form by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredPairSignature {
+    /// The Ed25519 half, base64 standard.
+    pub ed25519_signature_base64: String,
+    /// The ML-DSA-65 half, base64 standard; absent while hybrid-pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mldsa65_signature_base64: Option<String>,
+}
+
+/// v62.0.0 (BH-fix3) — [`RetiredPairSignature`] naming the member that made
+/// it: the wire-only stand-in for Verify's `threshold::ThresholdSignature`,
+/// serde-identical, in the earlier quorum lists (`GroupSupersedeProof::
+/// quorum_signatures`, a steward purge notice's `cosignatures`, the
+/// `supersede_*_with_quorum` host verbs). Nothing counts it: an edition-2
+/// quorum is its vouched voices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredMemberPairSignature {
+    /// The member that produced it.
+    pub member_id: String,
+    /// The Ed25519 half, base64 standard.
+    pub ed25519_signature_base64: String,
+    /// The ML-DSA-65 half, base64 standard; absent while hybrid-pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mldsa65_signature_base64: Option<String>,
+}
+
 /// v49.0.0 (CIRISPersist#910.5, `FSD/ROOM_ROSTER_AUTHORITY.md` §10 item 5) —
 /// what a peer needs to apply a group amendment it did not witness: the
 /// version it replaces, the membership-change envelope the prior roster
@@ -3381,7 +3416,7 @@ pub struct GroupSupersedeProof {
     /// the prior roster co-signed.
     pub change_envelope: serde_json::Value,
     /// The prior roster's hybrid signatures over `change_envelope`'s JCS bytes.
-    pub quorum_signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
+    pub quorum_signatures: Vec<crate::federation::types::RetiredMemberPairSignature>,
 }
 
 /// One member of a [`Community`] — an IDENTITY key plus when they
@@ -4656,7 +4691,7 @@ pub struct SignedTouchClaim {
     /// over the bytes; ML-DSA-65 over `bytes ‖ ed25519_sig`) — the same
     /// container type [`crate::federation::self_at_login::SignedTransportDestination`] and the
     /// occurrence/revocation planes use.
-    pub signature: ciris_verify_core::transport_binding::TransportBindingSignature,
+    pub signature: crate::federation::types::RetiredPairSignature,
     /// MANDATORY privacy row — see the struct-level docs. One of
     /// [`cohort_scope::SELF`] / [`cohort_scope::FAMILY`] /
     /// [`cohort_scope::COMMUNITY`] / [`cohort_scope::AFFILIATIONS`] /
@@ -4671,7 +4706,7 @@ impl SignedTouchClaim {
     /// / `target_kind` / `fresh_as_of` (RFC-3339) / `signer_form` /
     /// `attesting_key_id` / `cohort_scope`. A producer (or this crate's
     /// `#[cfg(test)]` fixtures — see
-    /// [`crate::federation::freshness::test_support`]) builds this,
+    /// `freshness::test_support`, deleted in v62.0.0 BH-fix3) builds this,
     /// JCS-canonicalizes it, signs it, and puts the resulting value into
     /// [`Self::signed_envelope`] verbatim. Mirrors [`Family::signing_envelope`]:
     /// the admission gate never rebuilds the envelope from the typed

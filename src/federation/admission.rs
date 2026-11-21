@@ -2198,6 +2198,35 @@ pub async fn can_accept_for_itself(
     Ok(true)
 }
 
+/// v62.0.0 (K2-fix14; an admission gate's outcome must not depend on WHEN a
+/// node evaluates it) — [`can_accept_for_itself`] with the age band read as
+/// a function of the HELD rows ([`super::age::age_band_as_of`]`(.., None)`:
+/// expiry judged at the newest held age evidence, never the reader's
+/// clock). It declares `key:<key_id>`, so a gate that asked it re-folds when
+/// an age row about `key_id` lands or is withdrawn. For the gates; the
+/// read-side callers keep the present-tense [`can_accept_for_itself`].
+///
+/// # Errors
+/// Directory reads.
+pub async fn can_accept_for_itself_held(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+) -> Result<bool, Error> {
+    use super::age::{age_band_as_of, AgeBand};
+    let Some(rec) = directory.lookup_public_key(key_id).await? else {
+        return Ok(true);
+    };
+    if identity_type::set_contains(&rec.identity_type, identity_type::NODE) {
+        return Ok(false);
+    }
+    if identity_type::set_contains(&rec.identity_type, identity_type::USER)
+        && age_band_as_of(directory, key_id, None).await? == AgeBand::Minor
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// v30.8.0 (CIRISConstitution#87) — is this envelope a **claim of CUSTODY** over
 /// its target, as opposed to a capability conferral?
 ///
@@ -7154,34 +7183,18 @@ pub fn check_encryption_pubkeys(
     Ok(())
 }
 
-/// v14.0.0 (CIRISPersist#418, occurrence-KEX arc 2/4) — the SIGNED-occurrence
-/// admission gate: cryptographically prove the content-tier KEX pubkeys (+
-/// transport binding) belong to the identity BEFORE any write, closing the
-/// silent content-MITM where a consented replication peer could fabricate a
-/// victim's occurrence. Fail-secure; called by every `put_identity_occurrence`
-/// (HTTP + wire — one gate).
+/// v62.0.0 (BH-fix1; RULINGS "composite signatures only") — the earlier
+/// signed identity occurrence (transport-bound, CIRISPersist#418, or
+/// content-only, #851) is signed with the separate Ed25519 + ML-DSA-65 pair
+/// (Verify's `verify_transport_binding` / `ThresholdSignature`) over
+/// `JCS(signed_envelope)`. Its verify is DELETED: an occurrence reaching here
+/// is refused by name (`earlier_form_object`). The door
+/// (`put_identity_occurrence`) refuses the earlier form first; an occurrence
+/// is an edition-2 `identity:occurrence` statement through the door
+/// (`edition2::occurrence`).
 ///
-/// **Authority is `signed_envelope`, never the sender's typed projection.** The
-/// hybrid signature covers `JCS(signed_envelope)` only; persist therefore parses
-/// the authoritative `transport_destination` / `encryption_pubkeys` / ids FROM
-/// that envelope and REJECTS if the typed `identity_occurrence` diverges — else
-/// an attacker sends an envelope carrying the victim's keys but a typed
-/// projection carrying its own, and the MITM reopens.
-///
-/// Verifies, each fail-closed:
-/// 1. `signed_envelope` carries a `transport_destination` (REQUIRED — every
-///    signed occurrence binds transport, #418) + optional `encryption_pubkeys`;
-/// 2. the typed projection's transport/enc keys + ids EQUAL the envelope's;
-/// 3. [`verify_transport_binding`] is authentic against the PINNED federation
-///    signing key of `attesting_key_id` (hybrid sig, §5.6.8.8.2 C4, dest_hash
-///    recompute) — `UnknownSigner` / bad sig / C4 / `Malformed` ⇒ reject;
-/// 4. `signer_acts_for`: `attesting_key_id` is the occurrence's own
-///    `identity_key_id` OR an already-active occurrence key of the same identity.
-///
-/// NOT feature-gated: backend-agnostic (verify-core only); a
-/// `cfg(any(postgres,sqlite))` gate here broke reduced-feature builds (darwin
-/// no-postgres, the default-feature manifest bin) with E0425 while the retired
-/// memory backend called it.
+/// # Errors
+/// Always the earlier-form signature refusal.
 pub async fn verify_signed_identity_occurrence<D>(
     directory: &D,
     signed: &crate::federation::types::SignedIdentityOccurrence,
@@ -7189,355 +7202,10 @@ pub async fn verify_signed_identity_occurrence<D>(
 where
     D: super::FederationDirectory + ?Sized,
 {
-    use ciris_verify_core::threshold::ThresholdMember;
-    use ciris_verify_core::transport_binding::{
-        verify_transport_binding, EncryptionPubkeys as VEnc, TransportBinding, TransportDestination,
-    };
-
-    let row = &signed.identity_occurrence;
-    let env = &signed.signed_envelope;
-
-    // (1) Parse the AUTHORITATIVE transport_destination from the signed envelope.
-    let str_field = |obj: &serde_json::Value, k: &str| -> Result<String, Error> {
-        obj.get(k)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_owned())
-            .ok_or_else(|| {
-                Error::malformed_row(
-                    "identity_occurrence",
-                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
-                    format!("signed identity_occurrence envelope missing string field `{k}`"),
-                )
-            })
-    };
-    // CIRISPersist#851 (BLOB_REPLICATION.md §20.2) — the CONTENT-ONLY form: no
-    // transport destination (the node's transport identity lives on its own
-    // plane), content-KEM pubkeys REQUIRED, verified as the signed revocation
-    // is (hybrid 1-of-1 over JCS(envelope) against the pinned key), then the
-    // same `signer_acts_for` — with the owner-binding lift for a node signing
-    // its own occurrence. Transport-bound occurrences keep #418's path below.
-    let td_env = match env.get("transport_destination") {
-        Some(v) if !v.is_null() => v,
-        _ => return verify_content_only_identity_occurrence(directory, signed).await,
-    };
-    let transport_destination = TransportDestination {
-        reticulum_x25519_pubkey_base64: str_field(td_env, "reticulum_x25519_pubkey")?,
-        reticulum_ed25519_pubkey_base64: str_field(td_env, "reticulum_ed25519_pubkey")?,
-        destination_hash_base64: str_field(td_env, "destination_hash")?,
-        app_name: str_field(td_env, "app_name")?,
-        aspects: td_env
-            .get("aspects")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|s| s.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default(),
-    };
-    // Optional content-KEM half, from the envelope.
-    let encryption_pubkeys = match env.get("encryption_pubkeys") {
-        Some(e) if !e.is_null() => Some(VEnc {
-            x25519_base64: str_field(e, "x25519_base64")?,
-            ml_kem_768_base64: str_field(e, "ml_kem_768_base64")?,
-        }),
-        _ => None,
-    };
-
-    // (2) The typed projection persist will STORE must equal the envelope — the
-    // signature only covers the envelope, so a divergent projection is a MITM.
-    let diverges = |what: &str| {
-        Error::malformed_row(
-            "identity_occurrence",
-            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
-            format!(
-                "signed identity_occurrence: typed {what} diverges from the signed envelope \
-                 (rejected)"
-            ),
-        )
-    };
-    if str_field(env, "identity_key_id")? != row.identity_key_id {
-        return Err(diverges("identity_key_id"));
-    }
-    if str_field(env, "occurrence_key_id")? != row.occurrence_key_id {
-        return Err(diverges("occurrence_key_id"));
-    }
-    match row.transport_binding.as_ref() {
-        Some(tb)
-            if tb.reticulum_x25519_pubkey_base64
-                == transport_destination.reticulum_x25519_pubkey_base64
-                && tb.reticulum_ed25519_pubkey_base64
-                    == transport_destination.reticulum_ed25519_pubkey_base64
-                && tb.destination_hash_base64 == transport_destination.destination_hash_base64 => {}
-        _ => return Err(diverges("transport_destination")),
-    }
-    // v21.17.1 (CIRISPersist#541) — compare BOTH content-KEM halves. The
-    // envelope carries `x25519_base64` AND `ml_kem_768_base64`; comparing only
-    // x25519 was a FAIL-OPEN gap — a diverged post-quantum KEM key on the typed
-    // row (e.g. rewritten by an unsigned `put_identity_occurrence_local`) was
-    // silently ACCEPTED, unlike every other divergence in this class which
-    // fails closed. Both halves must equal the signed envelope, as a pair.
-    let env_enc = encryption_pubkeys
-        .as_ref()
-        .map(|e| (e.x25519_base64.clone(), e.ml_kem_768_base64.clone()));
-    let row_enc = row
-        .encryption_pubkeys
-        .as_ref()
-        .map(|e| (e.x25519_base64.clone(), e.ml_kem_768_base64.clone()));
-    if env_enc != row_enc {
-        return Err(diverges("encryption_pubkeys"));
-    }
-
-    // PR #852 review — a producer that stamps `asserted_at` into the
-    // envelope (every persist producer does) binds the typed instant too.
-    if let Some(at) = env.get("asserted_at").and_then(|v| v.as_str()) {
-        if !same_instant_ms(at, row.asserted_at) {
-            return Err(diverges("asserted_at"));
-        }
-        super::operational::check_skew_bound(row.asserted_at, crate::host::clock::now())?;
-    }
-    // (3) Verify the hybrid signature against the signer's PINNED federation key.
-    let Some(signer_key) = directory
-        .lookup_public_key(&signed.attesting_key_id)
-        .await?
-    else {
-        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
-        // bad signature: retryable once the signer's Key row lands.
-        return Err(Error::unknown_signer(
-            &signed.attesting_key_id,
-            "identity_occurrence",
-        ));
-    };
-    let key_directory = vec![ThresholdMember {
-        member_id: signer_key.key_id.clone(),
-        ed25519_public_key_base64: signer_key.pubkey_ed25519_base64.clone(),
-        mldsa65_public_key_base64: signer_key.pubkey_ml_dsa_65_base64.clone(),
-        role: None,
-    }];
-    let binding = TransportBinding {
-        attesting_key_id: signed.attesting_key_id.clone(),
-        signed_envelope: env.clone(),
-        transport_destination,
-        encryption_pubkeys,
-        signature: signed.signature.clone(),
-    };
-    let verdict = verify_transport_binding(&binding, &key_directory).map_err(|e| {
-        Error::malformed_row(
-            "identity_occurrence",
-            super::malformed_row::ENVELOPE_NOT_CANONICAL,
-            format!("signed identity_occurrence canonicalize: {e}"),
-        )
-    })?;
-    if !verdict.authentic {
-        return Err(Error::SignatureInvalid(format!(
-            "signed identity_occurrence for {} not authentic: {:?}",
-            row.occurrence_key_id, verdict.reason
-        )));
-    }
-
-    // (4) signer_acts_for — the signer is the identity itself, or an already-
-    // active occurrence of the same identity (a peer can't sign a victim's
-    // occurrence with its own unrelated key).
-    check_signer_acts_for(
-        directory,
-        &signed.attesting_key_id,
-        &row.identity_key_id,
+    let _ = (directory, signed);
+    Err(super::edition2::door::earlier_form_signature(
         "identity_occurrence",
-    )
-    .await
-}
-
-/// PR #852 review (rounds one and four) — an envelope instant (RFC 3339)
-/// equals a typed instant at millisecond precision, the producer's, AND the
-/// typed instant carries nothing below the millisecond: the signature covers
-/// the millisecond rendering only, and `IdentityOccurrenceRevocation::revokes`
-/// compares the typed instant exactly, so an unsigned sub-millisecond part
-/// would let a relay move an occurrence across a same-millisecond revocation.
-/// Unparseable ⇒ not equal.
-///
-/// v61 (CC 2.6.2, strict) — the envelope's spelling must be `.sssZ`; an
-/// instant written in any other form is not equal to anything.
-fn same_instant_ms(envelope: &str, typed: chrono::DateTime<chrono::Utc>) -> bool {
-    typed.timestamp_subsec_nanos().is_multiple_of(1_000_000)
-        && crate::verify::canonical_validation::validate_canonical_datetime(envelope).is_ok()
-        && chrono::DateTime::parse_from_rfc3339(envelope)
-            .map(|e| e.timestamp_millis() == typed.timestamp_millis())
-            .unwrap_or(false)
-}
-
-/// CIRISPersist#851 (`BLOB_REPLICATION.md` §20.2) — the content-only signed
-/// occurrence gate: the envelope carries `encryption_pubkeys` and no
-/// `transport_destination`. Verified exactly as
-/// [`verify_signed_identity_occurrence_revocation`] verifies its envelope:
-/// 1. the typed projection EQUALS the envelope (ids, KEM pubkeys — both
-///    halves — and `transport_binding: None`);
-/// 2. the hybrid signature over `JCS(signed_envelope)` at threshold 1-of-1
-///    against the PINNED federation pubkeys of `attesting_key_id`;
-/// 3. [`check_signer_acts_for`] with the row's own occurrence key, so a node
-///    may vouch for its own occurrence through a live owner binding.
-async fn verify_content_only_identity_occurrence<D>(
-    directory: &D,
-    signed: &crate::federation::types::SignedIdentityOccurrence,
-) -> Result<(), Error>
-where
-    D: super::FederationDirectory + ?Sized,
-{
-    use ciris_verify_core::threshold::{
-        verify_threshold_signatures, ThresholdMember, ThresholdSignature,
-    };
-    let row = &signed.identity_occurrence;
-    let env = &signed.signed_envelope;
-    let str_field = |k: &str| -> Result<String, Error> {
-        env.get(k)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_owned())
-            .ok_or_else(|| {
-                Error::malformed_row(
-                    "identity_occurrence",
-                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
-                    format!("signed identity_occurrence envelope missing string field `{k}`"),
-                )
-            })
-    };
-    let diverges = |what: &str| {
-        Error::malformed_row(
-            "identity_occurrence",
-            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
-            format!(
-                "signed identity_occurrence: typed {what} diverges from the signed envelope \
-                 (rejected)"
-            ),
-        )
-    };
-    // (1) The envelope must carry the content-KEM pubkeys — a content-only
-    // occurrence with neither transport nor keys binds nothing.
-    let Some(enc) = env.get("encryption_pubkeys").filter(|e| !e.is_null()) else {
-        return Err(Error::malformed_row(
-            "identity_occurrence",
-            super::malformed_row::ENVELOPE_MEMBER_MISSING,
-            "signed identity_occurrence must carry a transport_destination (occurrence-KEX \
-             #418) or encryption_pubkeys (content-only, CIRISPersist#851)",
-        ));
-    };
-    let env_enc = (
-        enc.get("x25519_base64")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .ok_or_else(|| diverges("encryption_pubkeys.x25519_base64"))?,
-        enc.get("ml_kem_768_base64")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .ok_or_else(|| diverges("encryption_pubkeys.ml_kem_768_base64"))?,
-    );
-    if str_field("identity_key_id")? != row.identity_key_id {
-        return Err(diverges("identity_key_id"));
-    }
-    if str_field("occurrence_key_id")? != row.occurrence_key_id {
-        return Err(diverges("occurrence_key_id"));
-    }
-    // The envelope's attester IS the wrapper's signer (the transport-bound
-    // path's SubjectMismatch rule) — the signed bytes and the persisted
-    // attribution name one principal (PR #852 review round two).
-    if str_field("attesting_key_id")? != signed.attesting_key_id {
-        return Err(diverges("attesting_key_id"));
-    }
-    if row.transport_binding.is_some() {
-        return Err(diverges("transport_destination"));
-    }
-    let row_enc = row
-        .encryption_pubkeys
-        .as_ref()
-        .map(|e| (e.x25519_base64.clone(), e.ml_kem_768_base64.clone()));
-    if row_enc.as_ref() != Some(&env_enc) {
-        return Err(diverges("encryption_pubkeys"));
-    }
-    // Every persisted field the backends read back — `asserted_at` is the
-    // last-signed-wins / revocation-freshness clock — is bound to the
-    // envelope, or a relay could forward-date a typed row under a valid
-    // signature (PR #852 review). Instants compare at millisecond precision,
-    // the producer's.
-    if str_field("device_class")? != row.device_class {
-        return Err(diverges("device_class"));
-    }
-    if !same_instant_ms(&str_field("asserted_at")?, row.asserted_at) {
-        return Err(diverges("asserted_at"));
-    }
-    // The signed instant is bounded: a compromised node with a live binding
-    // must not date its occurrence into the future to out-rank authentic
-    // replacements and escape a later revocation (PR #852 review, round
-    // five). The same clock-skew tolerance every stamped write gets.
-    super::operational::check_skew_bound(row.asserted_at, crate::host::clock::now())?;
-    match (
-        env.get("valid_until").filter(|v| !v.is_null()),
-        row.valid_until,
-    ) {
-        (None, None) => {}
-        (Some(v), Some(t)) if v.as_str().is_some_and(|v| same_instant_ms(v, t)) => {}
-        _ => return Err(diverges("valid_until")),
-    }
-    match (
-        env.get("hardware_attestation").filter(|v| !v.is_null()),
-        row.hardware_attestation.as_deref(),
-    ) {
-        (None, None) => {}
-        (Some(v), Some(h)) if v.as_str() == Some(h) => {}
-        _ => return Err(diverges("hardware_attestation")),
-    }
-    // (2) Hybrid signature over JCS(envelope), 1-of-1 against the pinned key.
-    // Hybrid-ONLY (operator directive; CC 5.3.2.4.3.1): a signature without
-    // its ML-DSA-65 half is refused before any verification is attempted —
-    // never verified classically.
-    if signed.signature.mldsa65_signature_base64.is_none() {
-        return Err(Error::SignatureInvalid(format!(
-            "signed identity_occurrence for {} carries no ML-DSA-65 signature; the plane is \
-             hybrid-only (CC 5.3.2.4.3.1)",
-            row.occurrence_key_id
-        )));
-    }
-    let Some(signer_key) = directory
-        .lookup_public_key(&signed.attesting_key_id)
-        .await?
-    else {
-        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
-        // bad signature: retryable once the signer's Key row lands.
-        return Err(Error::unknown_signer(
-            &signed.attesting_key_id,
-            "identity_occurrence",
-        ));
-    };
-    let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
-        Error::malformed_row(
-            "identity_occurrence",
-            super::malformed_row::ENVELOPE_NOT_CANONICAL,
-            format!("signed identity_occurrence canonicalize: {e}"),
-        )
-    })?;
-    let members = [ThresholdMember {
-        member_id: signer_key.key_id.clone(),
-        ed25519_public_key_base64: signer_key.pubkey_ed25519_base64.clone(),
-        mldsa65_public_key_base64: signer_key.pubkey_ml_dsa_65_base64.clone(),
-        role: None,
-    }];
-    let sigs = [ThresholdSignature {
-        member_id: signed.attesting_key_id.clone(),
-        ed25519_signature_base64: signed.signature.ed25519_signature_base64.clone(),
-        mldsa65_signature_base64: signed.signature.mldsa65_signature_base64.clone(),
-    }];
-    if verify_threshold_signatures(&bytes, &members, &sigs, 1).is_err() {
-        return Err(Error::SignatureInvalid(format!(
-            "signed identity_occurrence for {} not authentic (hybrid 1-of-1 over JCS(envelope) \
-             failed against the pinned key of {})",
-            row.occurrence_key_id, signed.attesting_key_id
-        )));
-    }
-    // (3) signer_acts_for, with the owner-binding lift for the row's own key.
-    check_signer_acts_for(
-        directory,
-        &signed.attesting_key_id,
-        &row.identity_key_id,
-        "identity_occurrence",
-    )
-    .await
+    ))
 }
 
 /// v16.0.0 (#421) — **THE `signer_acts_for` check**, shared by the signed
@@ -7636,318 +7304,26 @@ where
     Ok(())
 }
 
-/// v62.0.0 (CC rc20 3.3.6.2, CIRISPersist#1274) — the in-row rule for the two
-/// X-Wing keys of a signed transport destination. Each key decodes to exactly
-/// 1216 bytes ([`xwing_pubkey_from_envelope`](crate::federation::self_at_login::xwing_pubkey_from_envelope)),
-/// and each half must differ from every other key the row carries: the
-/// Reticulum link x25519, the transport ed25519, the signer's pinned Ed25519
-/// and ML-DSA-65, the earlier-form transit pair's two halves, the halves of
-/// `encryption_pubkeys` when the row carries them, and the other X-Wing key's
-/// halves. The transit key is checked against everything but the hop key; the
-/// hop key against everything, the transit key included, so a collision
-/// between the two is refused under the hop key's token, as CC 3.3.6.2 names
-/// it ("A half equal to either half of `transit_xwing_pubkey` …").
-fn check_xwing_keys_in_row(
-    env: &serde_json::Value,
-    row: &crate::federation::self_at_login::TransportDestination,
-    transit_pair: Option<&crate::federation::self_at_login::TransitKexPair>,
-    signer: &super::KeyRecord,
-) -> Result<(), Error> {
-    use crate::federation::self_at_login::{
-        check_xwing_halves, xwing_pubkey_from_envelope, XWingKeyRole,
-        ONION_HOP_XWING_PUBKEY_MEMBER, TRANSIT_XWING_PUBKEY_MEMBER,
-    };
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-    let transit = xwing_pubkey_from_envelope(env, TRANSIT_XWING_PUBKEY_MEMBER)?;
-    let hop = xwing_pubkey_from_envelope(env, ONION_HOP_XWING_PUBKEY_MEMBER)?;
-    if transit.is_none() && hop.is_none() {
-        return Ok(());
-    }
-    let dec = |s: Option<&str>| s.and_then(|s| B64.decode(s).ok());
-    let mut keys: Vec<Vec<u8>> = Vec::new();
-    keys.extend(dec(row.transport_x25519_pubkey_base64.as_deref()));
-    keys.extend(dec(row.transport_ed25519_pubkey_base64.as_deref()));
-    keys.extend(dec(Some(&signer.pubkey_ed25519_base64)));
-    keys.extend(dec(signer.pubkey_ml_dsa_65_base64.as_deref()));
-    if let Some(p) = transit_pair {
-        keys.push(p.x25519.to_vec());
-        keys.push(p.ml_kem_768.to_vec());
-    }
-    if let Some(enc) = env.get("encryption_pubkeys") {
-        for m in ["x25519_base64", "ml_kem_768_base64"] {
-            keys.extend(dec(enc.get(m).and_then(|v| v.as_str())));
-        }
-    }
-    let refuse = |r: crate::federation::self_at_login::XWingReuseRefusal, member: &str| {
-        Error::malformed_row(
-            "transport_destination",
-            r.as_str(),
-            format!(
-                "signed transport_destination: a half of `{member}` is another key on the same \
-                 row; the X-Wing key must be key-separated (CC 3.3.6.2)"
-            ),
-        )
-    };
-    if let Some(t) = &transit {
-        check_xwing_halves(XWingKeyRole::Transit, t, keys.iter().map(Vec::as_slice))
-            .map_err(|r| refuse(r, TRANSIT_XWING_PUBKEY_MEMBER))?;
-    }
-    if let Some(h) = &hop {
-        let mut with_transit: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-        if let Some(t) = &transit {
-            with_transit.push(t.ml_kem_768());
-            with_transit.push(t.x25519());
-        }
-        check_xwing_halves(XWingKeyRole::OnionHop, h, with_transit)
-            .map_err(|r| refuse(r, ONION_HOP_XWING_PUBKEY_MEMBER))?;
-    }
-    Ok(())
-}
-
-/// v17.0.0 (CIRISPersist#443) — the SIGNED transport-destination admission
-/// gate: the route-plane mirror of
-/// [`verify_signed_identity_occurrence_revocation`], closing the
-/// **route-hijack confused deputy** (CIRISEdge#336): before this the
-/// replication plane applied a bare unsigned `TransportDestination` through
-/// the plain local upsert, so any cohort node could overwrite the durable
-/// route — with an attacker-chosen `binding_provenance: Rooted` — for any
-/// key_id. Fail-secure; called by every `put_signed_transport_destination`
-/// (all three backends — one gate) BEFORE any write.
+/// v62.0.0 (BH-fix1; RULINGS "composite signatures only") — the earlier
+/// signed transport destination's signature is the separate Ed25519 +
+/// ML-DSA-65 pair (Verify's `ThresholdSignature`) over `JCS(signed_envelope)`.
+/// Its verify is DELETED, with the in-row X-Wing reuse rule that ran only on
+/// this earlier-form row: a route reaching here is refused by name
+/// (`earlier_form_object`). The door (`put_signed_transport_destination`)
+/// refuses the earlier form first; a seat's transport key is the ingested
+/// bundle/2 binding or a counted `transport:canonical_rebind`
+/// (`edition2::transport_rebind`).
 ///
-/// **Authority is `signed_envelope`, never the sender's typed projection** —
-/// the #418 discipline verbatim. `binding_provenance` in particular is read
-/// ONLY from the verified envelope. Verifies, each fail-closed:
-/// 1. the envelope carries `occurrence_key_id` / `transport_kind` /
-///    `destination` / `asserted_at` / `epoch` (+ optional `retired_at`,
-///    transport pubkeys, `binding_provenance`), and the typed projection
-///    persist will store EQUALS them (a divergent projection is the hijack
-///    reopening). `last_seen_at` is advisory liveness, not signed material.
-///    v56.0.0 (#1077) — an optional `transit_kex_pubkeys` pair is read from
-///    the envelope only ([`crate::federation::self_at_login::transit_kex_pair_from_envelope`]: 32 / 1184 bytes,
-///    both or neither) and its x25519 must not be the row's Reticulum link
-///    x25519.
-/// 2. the detached hybrid signature over `JCS(signed_envelope)` verifies at
-///    threshold **1-of-1** against the PINNED federation pubkeys of
-///    `attesting_key_id` ([`verify_threshold_signatures`] — RequireHybrid; a
-///    classical-only route assertion does not count);
-/// 3. `signer_acts_for`: the signer IS the route's `occurrence_key_id` or a
-///    key bound as an occurrence of it ([`check_signer_acts_for`]) — a peer
-///    cannot assert (or retire) a victim's route with its own unrelated key.
-///
-/// NOT feature-gated: backend-agnostic (the #418 cfg lesson).
-///
-/// [`verify_threshold_signatures`]: ciris_verify_core::threshold::verify_threshold_signatures
+/// # Errors
+/// Always the earlier-form signature refusal.
 pub async fn verify_signed_transport_destination(
     directory: &dyn super::FederationDirectory,
     signed: &crate::federation::self_at_login::SignedTransportDestination,
 ) -> Result<(), Error> {
-    use ciris_verify_core::threshold::{
-        verify_threshold_signatures, ThresholdMember, ThresholdSignature,
-    };
-
-    let row = &signed.transport_destination;
-    let env = &signed.signed_envelope;
-    // v61 (CIRISPersist#1122, steward ruling 2026-10-24) — an agent
-    // announces no route; it is reached through its node's binding.
-    crate::federation::transport_routes::check_route_key_not_agent(directory, row).await?;
-
-    // (1) Authoritative fields FROM the signed envelope; the typed projection
-    // must equal them (the signature covers only the envelope).
-    let str_field = |k: &str| -> Result<String, Error> {
-        env.get(k)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_owned())
-            .ok_or_else(|| {
-                Error::malformed_row(
-                    "transport_destination",
-                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
-                    format!("signed transport_destination envelope missing string field `{k}`"),
-                )
-            })
-    };
-    let parse_ts = |k: &str, s: &str| -> Result<chrono::DateTime<chrono::Utc>, Error> {
-        // v61 (CC 2.6.2, strict) — only `.sssZ` verifies.
-        crate::verify::canonical_validation::validate_canonical_datetime(s).map_err(|e| {
-            Error::malformed_row(
-                "transport_destination",
-                super::malformed_row::ENVELOPE_MEMBER_INVALID,
-                format!("signed transport_destination envelope `{k}` is not CC 2.6.2 form: {e}"),
-            )
-        })?;
-        chrono::DateTime::parse_from_rfc3339(s)
-            .map(|t| t.with_timezone(&chrono::Utc))
-            .map_err(|e| {
-                Error::malformed_row(
-                    "transport_destination",
-                    super::malformed_row::ENVELOPE_MEMBER_INVALID,
-                    format!("signed transport_destination envelope `{k}` not RFC-3339: {e}"),
-                )
-            })
-    };
-    // Optional string field: absent/null ⇒ None; a non-string is malformed.
-    let opt_str_field = |k: &str| -> Result<Option<String>, Error> {
-        match env.get(k) {
-            None | Some(serde_json::Value::Null) => Ok(None),
-            Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
-            Some(_) => Err(Error::malformed_row(
-                "transport_destination",
-                super::malformed_row::ENVELOPE_MEMBER_INVALID,
-                format!("signed transport_destination envelope `{k}` must be a string"),
-            )),
-        }
-    };
-    let diverges = |what: &str| {
-        Error::malformed_row(
-            "transport_destination",
-            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
-            format!(
-                "signed transport_destination: typed {what} diverges from the signed envelope \
-                 (rejected)"
-            ),
-        )
-    };
-    if str_field("occurrence_key_id")? != row.occurrence_key_id {
-        return Err(diverges("occurrence_key_id"));
-    }
-    if str_field("transport_kind")? != row.transport_kind {
-        return Err(diverges("transport_kind"));
-    }
-    if str_field("destination")? != row.destination {
-        return Err(diverges("destination"));
-    }
-    if parse_ts("asserted_at", &str_field("asserted_at")?)? != row.asserted_at {
-        return Err(diverges("asserted_at"));
-    }
-    // `epoch` is the anti-rollback clock — REQUIRED in the envelope (a
-    // serde-default 0 in the typed projection must not be silently trusted).
-    let env_epoch = env.get("epoch").and_then(|v| v.as_u64()).ok_or_else(|| {
-        Error::malformed_row(
-            "transport_destination",
-            super::malformed_row::ENVELOPE_MEMBER_MISSING,
-            "signed transport_destination envelope missing unsigned-integer field `epoch`",
-        )
-    })?;
-    if env_epoch != row.epoch {
-        return Err(diverges("epoch"));
-    }
-    // `retired_at` is the tombstone — a divergence here is a resurrection
-    // (or fabricated retirement) attack.
-    let env_retired = match opt_str_field("retired_at")? {
-        Some(s) => Some(parse_ts("retired_at", &s)?),
-        None => None,
-    };
-    if env_retired != row.retired_at {
-        return Err(diverges("retired_at"));
-    }
-    if opt_str_field("transport_ed25519_pubkey_base64")? != row.transport_ed25519_pubkey_base64 {
-        return Err(diverges("transport_ed25519_pubkey_base64"));
-    }
-    if opt_str_field("transport_x25519_pubkey_base64")? != row.transport_x25519_pubkey_base64 {
-        return Err(diverges("transport_x25519_pubkey_base64"));
-    }
-    // `binding_provenance` comes ONLY from the verified envelope (the AV-42 /
-    // #336 hijack asserted `Rooted` on an unauthenticated wire field). An
-    // ABSENT token reads `Rooted` per the V100 back-compat rule, so a typed
-    // `Advisory` with an envelope that omits the field DIVERGES. v52.0.0 — an
-    // UNKNOWN token refuses (it read `Rooted` until then: fail-open).
-    let env_provenance = crate::federation::self_at_login::BindingProvenance::from_token(
-        opt_str_field("binding_provenance")?.as_deref(),
-    )?;
-    if env_provenance != row.binding_provenance {
-        return Err(diverges("binding_provenance"));
-    }
-    // v56.0.0 (CIRISPersist#1077, CC 3.3.6.2 rc8) — the optional transit KEX
-    // pair, read by THE one reading the accessor also uses: exact 32 / 1184
-    // bytes, both members or neither. It is envelope-only (never a projection
-    // field), so there is no typed divergence to check; terminal on the bytes.
-    let transit_pair = crate::federation::self_at_login::transit_kex_pair_from_envelope(env)?;
-    // Key separation (CC 3.3.6.2, normative and admission-enforced): the
-    // transit x25519 must not be the row's own Reticulum link x25519, the one
-    // reuse checkable from these bytes. Signing keys are a different algorithm
-    // and not byte-comparable (CC 3.3.6.1). That in-row rule is the WHOLE
-    // admission duty (CIRISPersist#1078): the identity's other keys live on
-    // another plane, an arrival-order-dependent read, and are judged at use by
-    // `self_at_login::transit_kex_pair_for`.
-    if let Some(pair) = &transit_pair {
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        let link = row
-            .transport_x25519_pubkey_base64
-            .as_deref()
-            .and_then(|s| B64.decode(s).ok());
-        // v59.0.0 (CIRISPersist#1106) — the one rule,
-        // `self_at_login::check_transit_kex_pair`.
-        let others = crate::federation::self_at_login::TransitKexOtherKeys {
-            transport_identity: link.into_iter().collect(),
-            ..Default::default()
-        };
-        if crate::federation::self_at_login::check_transit_kex_pair(pair, &others).is_err() {
-            return Err(Error::malformed_row(
-                "transport_destination",
-                super::malformed_row::TRANSIT_KEX_KEY_REUSE,
-                "signed transport_destination: `transit_kex_pubkeys.x25519_base64` is the same \
-                 key as the Reticulum link `transport_x25519_pubkey_base64`; the transit pair \
-                 must be key-separated (CC 3.3.6.2)",
-            ));
-        }
-    }
-
-    // (2) Hybrid signature over JCS(signed_envelope) against the PINNED
-    // federation pubkeys of the claimed signer, threshold 1-of-1.
-    let Some(signer_key) = directory
-        .lookup_public_key(&signed.attesting_key_id)
-        .await?
-    else {
-        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
-        // bad signature: retryable once the signer's Key row lands.
-        return Err(Error::unknown_signer(
-            &signed.attesting_key_id,
-            "transport_destination",
-        ));
-    };
-    // v62.0.0 (CC rc20 3.3.6.2, CIRISPersist#1274) — the two X-Wing keys,
-    // envelope-only, each exactly 1216 bytes, with the per-half reuse rule
-    // against every other key on the row. CC 3.3.6.2: "The reuse refusals read
-    // the key's halves, bytes 0..1184 and bytes 1184..1216. A half equal to
-    // either half of `transit_xwing_pubkey`, to either half of
-    // `encryption_pubkeys` on the same row, to the transport x25519 or
-    // ed25519, or to the signer's pinned keys is refused."
-    check_xwing_keys_in_row(env, row, transit_pair.as_ref(), &signer_key)?;
-    let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
-        Error::malformed_row(
-            "transport_destination",
-            super::malformed_row::ENVELOPE_NOT_CANONICAL,
-            format!("signed transport_destination canonicalize: {e}"),
-        )
-    })?;
-    let members = [ThresholdMember {
-        member_id: signer_key.key_id.clone(),
-        ed25519_public_key_base64: signer_key.pubkey_ed25519_base64.clone(),
-        mldsa65_public_key_base64: signer_key.pubkey_ml_dsa_65_base64.clone(),
-        role: None,
-    }];
-    let sigs = [ThresholdSignature {
-        member_id: signed.attesting_key_id.clone(),
-        ed25519_signature_base64: signed.signature.ed25519_signature_base64.clone(),
-        mldsa65_signature_base64: signed.signature.mldsa65_signature_base64.clone(),
-    }];
-    if verify_threshold_signatures(&bytes, &members, &sigs, 1).is_err() {
-        return Err(Error::SignatureInvalid(format!(
-            "signed transport_destination for ({}, {}) not authentic (hybrid 1-of-1 over \
-             JCS(envelope) failed against the pinned key of {})",
-            row.occurrence_key_id, row.transport_kind, signed.attesting_key_id
-        )));
-    }
-
-    // (3) signer_acts_for — THE shared check ([`check_signer_acts_for`]),
-    // with the route's `occurrence_key_id` as the subject: the signer is the
-    // route's own key, or a key bound as an occurrence of it.
-    check_signer_acts_for(
-        directory,
-        &signed.attesting_key_id,
-        &row.occurrence_key_id,
+    let _ = (directory, signed);
+    Err(super::edition2::door::earlier_form_signature(
         "transport_destination",
-    )
-    .await
+    ))
 }
 
 /// v21.6.0 (CIRISPersist#519 item 2a-iii, CEG `namespace_supersets.json` §
@@ -9036,275 +8412,22 @@ where
     crate::federation::verify_row_hybrid_signature(directory, resealed).await
 }
 
-/// v21.6.0 (CIRISPersist#519 item 2a-iii) — the SIGNED touch-claim
-/// admission gate: the freshness-floor mirror of
-/// [`verify_signed_transport_destination`], closing the same class of hole
-/// (an unsigned/forged touch could otherwise jump anyone's liveness floor
-/// forward at will). Fail-secure; called by every `put_touch_claim` (all
-/// three backends — one gate) BEFORE any write, ALONGSIDE — never instead
-/// of — [`verify_touch_claim_admission`] (the future-skew guard): a
-/// touch-claim admits ONLY when the hybrid signature verifies AND the skew
-/// guard passes.
+/// v62.0.0 (BH-fix1; RULINGS "composite signatures only") — the earlier
+/// signed touch claim's signature is the separate Ed25519 + ML-DSA-65 pair
+/// (Verify's `ThresholdSignature`) over `JCS(signed_envelope)`, and its
+/// `NOfMCosigned` tally is a list of such pairs. Their verify is DELETED: a
+/// claim reaching here is refused by name (`earlier_form_object`). The door
+/// (`put_touch_claim`) refuses the earlier form first; a touch claim is
+/// node-local in edition 2 (RULINGS, "Kinds").
 ///
-/// **Authority is `signed_envelope`, never the sender's typed projection**
-/// — the #418 discipline verbatim. Verifies, each fail-closed:
-/// 1. the envelope carries `target_key_id` / `target_kind` / `fresh_as_of`
-///    / `signer_form` / `attesting_key_id` / `cohort_scope`, and the typed
-///    projection persist will store EQUALS them (a divergent projection is
-///    the MITM reopening);
-/// 2. `cohort_scope` is one of the closed-set values
-///    ([`check_cohort_scope`]) — touch-claims are cohort-scoped and
-///    consent-gated by construction (the MANDATORY privacy row: an
-///    unrestricted read-receipt trail is an access-pattern surveillance
-///    surface, worst-case `trace:*` leaking who reads whose reasoning);
-/// 3. the detached hybrid signature over `JCS(signed_envelope)` verifies at
-///    threshold **1-of-1** against the PINNED federation pubkeys of
-///    `attesting_key_id` ([`verify_threshold_signatures`] — RequireHybrid;
-///    a classical-only touch does not count);
-/// 4. the **signer-form relationship**
-///    ([`crate::federation::types::SignerForm`]):
-///    [`SelfTouch`](crate::federation::types::SignerForm::SelfTouch)
-///    requires the signer to BE the touched `target_key_id` or a
-///    registered occurrence of it — the same "own clock / dead-man's-
-///    switch" bar [`check_signer_acts_for`] already draws elsewhere;
-///    [`WitnessTouch`](crate::federation::types::SignerForm::WitnessTouch) /
-///    [`NOfMCosigned`](crate::federation::types::SignerForm::NOfMCosigned)
-///    require an attester INDEPENDENT of the target — the OPPOSITE bar (a
-///    witness cannot be the thing it is witnessing).
-///
-/// **Known limitation (deliberate, documented, not built here):**
-/// `NOfMCosigned` verifies IDENTICALLY to `WitnessTouch` (a single
-/// independent attester, 1-of-1). The wire shape this cut ships — one
-/// `attesting_key_id` + one
-/// [`ciris_verify_core::transport_binding::TransportBindingSignature`],
-/// mirroring [`crate::federation::self_at_login::SignedTransportDestination`]
-/// exactly per the #519 item 2a-iii brief — has no multi-signer envelope to
-/// tally an actual m-of-n quorum over. Real collusion-resistant n-of-m
-/// aggregation needs a wire-shape change (a signer set + threshold, like
-/// [`ciris_verify_core::threshold::ThresholdSignature`] used as a LIST
-/// rather than a single value) and is a follow-up.
-///
-/// NOT feature-gated: backend-agnostic (the #418 cfg lesson).
-///
-/// [`verify_threshold_signatures`]: ciris_verify_core::threshold::verify_threshold_signatures
+/// # Errors
+/// Always the earlier-form signature refusal.
 pub async fn verify_signed_touch_claim(
     directory: &dyn super::FederationDirectory,
     claim: &crate::federation::types::SignedTouchClaim,
 ) -> Result<(), Error> {
-    use ciris_verify_core::threshold::{
-        verify_threshold_signatures, ThresholdMember, ThresholdSignature,
-    };
-
-    let env = &claim.signed_envelope;
-
-    // (1) Authoritative fields FROM the signed envelope; the typed
-    // projection must equal them (the signature covers only the envelope).
-    let str_field = |k: &str| -> Result<String, Error> {
-        env.get(k)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_owned())
-            .ok_or_else(|| {
-                Error::malformed_row(
-                    "touch_claim",
-                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
-                    format!("signed touch_claim envelope missing string field `{k}`"),
-                )
-            })
-    };
-    let diverges = |what: &str| {
-        Error::malformed_row(
-            "touch_claim",
-            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
-            format!(
-                "signed touch_claim: typed {what} diverges from the signed envelope (rejected)"
-            ),
-        )
-    };
-    if str_field("target_key_id")? != claim.target_key_id {
-        return Err(diverges("target_key_id"));
-    }
-    if str_field("target_kind")? != claim.target_kind {
-        return Err(diverges("target_kind"));
-    }
-    let env_fresh_str = str_field("fresh_as_of")?;
-    // v61 (CC 2.6.2, strict) — only `.sssZ` verifies.
-    crate::verify::canonical_validation::validate_canonical_datetime(&env_fresh_str).map_err(
-        |e| {
-            Error::malformed_row(
-                "touch_claim",
-                super::malformed_row::ENVELOPE_MEMBER_INVALID,
-                format!("signed touch_claim envelope `fresh_as_of` is not CC 2.6.2 form: {e}"),
-            )
-        },
-    )?;
-    let env_fresh_as_of = chrono::DateTime::parse_from_rfc3339(&env_fresh_str)
-        .map(|t| t.with_timezone(&chrono::Utc))
-        .map_err(|e| {
-            Error::malformed_row(
-                "touch_claim",
-                super::malformed_row::ENVELOPE_MEMBER_INVALID,
-                format!("signed touch_claim envelope `fresh_as_of` not RFC-3339: {e}"),
-            )
-        })?;
-    if env_fresh_as_of != claim.fresh_as_of {
-        return Err(diverges("fresh_as_of"));
-    }
-    if str_field("signer_form")? != claim.signer_form.as_str() {
-        return Err(diverges("signer_form"));
-    }
-    if str_field("attesting_key_id")? != claim.attesting_key_id {
-        return Err(diverges("attesting_key_id"));
-    }
-    if str_field("cohort_scope")? != claim.cohort_scope {
-        return Err(diverges("cohort_scope"));
-    }
-
-    // (2) MANDATORY privacy row: cohort_scope must be a closed-set value.
-    check_cohort_scope(&claim.cohort_scope)?;
-
-    // (3) Hybrid signature over JCS(signed_envelope) against the PINNED
-    // federation pubkeys of the claimed signer, threshold 1-of-1.
-    let Some(signer_key) = directory.lookup_public_key(&claim.attesting_key_id).await? else {
-        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
-        // bad signature: retryable once the signer's Key row lands.
-        return Err(Error::unknown_signer(
-            &claim.attesting_key_id,
-            "touch_claim",
-        ));
-    };
-    // v21.10.0 (#519 b2) — the signature bytes are over the envelope WITHOUT
-    // the `touch_cosignatures` set: co-signatures cannot be inside the bytes
-    // they sign (the fixed-point the reclaim quorum solves the same way). For
-    // SelfTouch/WitnessTouch the field is absent, so this is a no-op clone.
-    let sig_env = {
-        let mut e = env.clone();
-        if let Some(obj) = e.as_object_mut() {
-            obj.remove(crate::federation::freshness::TOUCH_COSIGNATURES_FIELD);
-        }
-        e
-    };
-    let bytes = crate::verify::canonical::ceg_produce_canonicalize(&sig_env).map_err(|e| {
-        Error::malformed_row(
-            "touch_claim",
-            super::malformed_row::ENVELOPE_NOT_CANONICAL,
-            format!("signed touch_claim canonicalize: {e}"),
-        )
-    })?;
-    let members = [ThresholdMember {
-        member_id: signer_key.key_id.clone(),
-        ed25519_public_key_base64: signer_key.pubkey_ed25519_base64.clone(),
-        mldsa65_public_key_base64: signer_key.pubkey_ml_dsa_65_base64.clone(),
-        role: None,
-    }];
-    let sigs = [ThresholdSignature {
-        member_id: claim.attesting_key_id.clone(),
-        ed25519_signature_base64: claim.signature.ed25519_signature_base64.clone(),
-        mldsa65_signature_base64: claim.signature.mldsa65_signature_base64.clone(),
-    }];
-    if verify_threshold_signatures(&bytes, &members, &sigs, 1).is_err() {
-        return Err(Error::SignatureInvalid(format!(
-            "signed touch_claim for ({}, {}) not authentic (hybrid 1-of-1 over JCS(envelope) \
-             failed against the pinned key of {})",
-            claim.target_key_id, claim.target_kind, claim.attesting_key_id
-        )));
-    }
-
-    // (4) signer-form relationship — the opposite bars `SelfTouch` and
-    // `WitnessTouch`/`NOfMCosigned` draw.
-    use crate::federation::types::SignerForm;
-    match claim.signer_form {
-        SignerForm::SelfTouch => {
-            check_signer_acts_for(
-                directory,
-                &claim.attesting_key_id,
-                &claim.target_key_id,
-                "touch_claim",
-            )
-            .await?;
-        }
-        SignerForm::WitnessTouch | SignerForm::NOfMCosigned => {
-            if claim.attesting_key_id == claim.target_key_id {
-                return Err(Error::SignatureInvalid(format!(
-                    "signed touch_claim: signer_form {:?} requires an attester independent of \
-                     the touched target {} — a witness cannot be the thing it witnesses",
-                    claim.signer_form, claim.target_key_id
-                )));
-            }
-        }
-    }
-
-    // (5) v21.10.0 (CIRISPersist#519 b2) — NOfMCosigned is a real m-of-n
-    // TALLY, not the 1-of-1 above. The primary attester (verified in step 3)
-    // counts as one signer; the envelope's `touch_cosignatures` extra carries
-    // the rest. Each co-signature must verify (hybrid, over the SAME
-    // JCS(envelope) bytes) against the co-signer's OWN pinned federation key,
-    // and every signer must be DISTINCT and INDEPENDENT of the target — so a
-    // forged "death finding" needs to corrupt >= NOFM_MIN_COSIGNERS+1 distinct
-    // real keys, not one. (SelfTouch / WitnessTouch ignore this field.)
-    if claim.signer_form == SignerForm::NOfMCosigned {
-        use crate::federation::freshness::{NOFM_MIN_COSIGNERS, TOUCH_COSIGNATURES_FIELD};
-        let cosigs_val = env.get(TOUCH_COSIGNATURES_FIELD).ok_or_else(|| {
-            Error::SignatureInvalid(format!(
-                "signed touch_claim: signer_form NOfMCosigned requires a `{TOUCH_COSIGNATURES_FIELD}` \
-                 co-signature set in the signed envelope"
-            ))
-        })?;
-        let cosigs: Vec<ThresholdSignature> =
-            serde_json::from_value(cosigs_val.clone()).map_err(|e| {
-                Error::malformed_row(
-                    "touch_claim",
-                    super::malformed_row::ENVELOPE_MEMBER_INVALID,
-                    format!(
-                        "signed touch_claim: `{TOUCH_COSIGNATURES_FIELD}` is not a \
-                         threshold-signature array: {e}"
-                    ),
-                )
-            })?;
-        // Distinct + independent-of-target signer set, primary included.
-        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        seen.insert(claim.attesting_key_id.clone());
-        let mut distinct_cosigners = 0usize;
-        for cs in &cosigs {
-            if cs.member_id == claim.target_key_id {
-                return Err(Error::SignatureInvalid(format!(
-                    "signed touch_claim: NOfMCosigned co-signer {} is the touched target — \
-                     independence required",
-                    cs.member_id
-                )));
-            }
-            if !seen.insert(cs.member_id.clone()) {
-                // duplicate (or equals the primary) — does not add to the tally.
-                continue;
-            }
-            let Some(cs_key) = directory.lookup_public_key(&cs.member_id).await? else {
-                // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
-                // bad signature: retryable once the signer's Key row lands.
-                return Err(Error::unknown_signer(&cs.member_id, "touch_claim_cosigner"));
-            };
-            let cs_member = [ThresholdMember {
-                member_id: cs_key.key_id.clone(),
-                ed25519_public_key_base64: cs_key.pubkey_ed25519_base64.clone(),
-                mldsa65_public_key_base64: cs_key.pubkey_ml_dsa_65_base64.clone(),
-                role: None,
-            }];
-            let cs_sig = [cs.clone()];
-            if verify_threshold_signatures(&bytes, &cs_member, &cs_sig, 1).is_err() {
-                return Err(Error::SignatureInvalid(format!(
-                    "signed touch_claim: NOfMCosigner {}'s signature is not authentic over the \
-                     touch envelope",
-                    cs.member_id
-                )));
-            }
-            distinct_cosigners += 1;
-        }
-        if distinct_cosigners < NOFM_MIN_COSIGNERS {
-            return Err(Error::SignatureInvalid(format!(
-                "signed touch_claim: NOfMCosigned needs >= {NOFM_MIN_COSIGNERS} distinct valid \
-                 co-signer(s) beyond the primary attester; got {distinct_cosigners}"
-            )));
-        }
-    }
-    Ok(())
+    let _ = (directory, claim);
+    Err(super::edition2::door::earlier_form_signature("touch_claim"))
 }
 
 /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
@@ -11054,11 +10177,20 @@ async fn scoped_delegation_reach_at(
             // v62.0.0 (K2-fix11; an appointment made to a minor is VOID) — the
             // duty walk never counts a void duty edge
             // (`age::duty_edge_void_for_minor`, the write gate's one
-            // predicate, over the edge's community's OPEN duty set). It declares the fold read `key:<recipient>`, so a
-            // minor row landing about the recipient re-folds every fold that
-            // walked this edge, and a read-time walk (`is_named_moderator`)
-            // sees it at once.
-            if super::age::duty_edge_void_for_minor(directory, &r).await? {
+            // predicate, over the edge's community's OPEN duty set). v62.0.0
+            // (K2-fix14; CC 4.5.4 "No `K` is a user with the `minor` band") —
+            // nor a SUSPENDED one: not void, but its target's band resolves
+            // `minor` FROM AN AGE ROW at THIS walk's instant
+            // (`age::duty_edge_standing`; the timeless lens reads as of the
+            // newest held age evidence), never the reader's clock, so a fold
+            // that walked this edge and a read-time `is_named_moderator`
+            // agree. A suspended edge counts again, unrevived, once the
+            // reading lifts. Both declare the fold read `key:<recipient>`,
+            // so a T age row or retraction landing re-folds every fold that
+            // walked this edge.
+            if super::age::duty_edge_standing(directory, &r, lens.as_of).await?
+                != super::age::DutyEdgeStanding::Counted
+            {
                 if to_target {
                     out.target_edge_missing_scope = true;
                 }
@@ -12018,6 +11150,33 @@ pub async fn check_withdraws_admission_at(
     fold_reads_row(target_id);
     let resolved =
         crate::federation::cosign::resolve_withdraws_target(directory, target_id).await?;
+    // v62.0.0 (LF-fix2, P5; CC 2.4.1.1 "Never withdrawn") — no attestation
+    // row under the id: the edition-2 statement store is read under it, on
+    // every plane. A statement held on a plane no `withdraws` retracts (an
+    // entity revocation, an occurrence revocation, a cosignature, a key
+    // grant) SETTLES the withdrawal: not admitted, read from the target's
+    // statement, which never changes (its plane is its family's). It waited
+    // `link_unheld` for an attestation row that never comes. A statement not
+    // held still waits (below); a retractable one behaves as before.
+    if resolved.is_none() {
+        if let Some(family) =
+            crate::federation::cosign::held_unretractable_target(directory, target_id).await?
+        {
+            tracing::debug!(
+                target_id,
+                family = %family,
+                "withdraws names a statement on a never-withdrawn plane (CC 2.4.1.1): not admitted"
+            );
+            return Err(fold_hold(
+                fold::reason::WITHDRAWS_NOT_ADMITTED,
+                Error::WithdrawsNotAdmitted {
+                    issuer: row.attesting_key_id.clone(),
+                    target_attestation_id: target_id.to_owned(),
+                    beyond_delegation_depth_cap: false,
+                },
+            ));
+        }
+    }
     // v61.3.0 — a COSIGNED withdraws is a group's retraction of a cosigned
     // event; with neither the row nor an alias held it is the retryable
     // ordering gap, never admitted inert (nothing would recheck it).
@@ -14850,7 +14009,7 @@ pub async fn check_owner_binding_roster_fresh(
 /// This wrapper pins the trusted anchor to the HUMANITY_ACCORD holder keyset
 /// (A1/B1/C1) via
 /// [`ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor`] — the
-/// SAME terminus [`super::rooting::root_binding`] and
+/// SAME terminus `root_binding` (deleted v62.0.0) and
 /// [`super::register::verify_key_registration`] verify against. Use
 /// [`check_canonical_role_admission_over_roster`] to inject a different accord
 /// roster (tests).
@@ -15698,25 +14857,34 @@ async fn verify_accord_family_coscrub_typed<F>(
 where
     F: super::FederationDirectory + ?Sized,
 {
-    use ciris_verify_core::threshold::{
-        verify_quorum_policy, QuorumPolicy, Role, ThresholdMember, ThresholdSignature,
+    // v62.0.0 (BH-fix2; RULINGS "composite signatures only", "a co-scrub is a
+    // counted voice") — the accord's co-scrub of a key record is the accord
+    // holders' VOICES on that record's edition-2 row: each one composite
+    // statement over the same payload, verified at the door when it arrived
+    // (`edition2::voices`). The earlier form, the record's scrub set read as
+    // separate Ed25519 + ML-DSA-65 pairs and checked by Verify's
+    // `verify_quorum_policy` against each holder's component halves, is
+    // DELETED. A record that carries no edition-2 statement confers nothing.
+    //
+    // The earlier step (2b), that the co-scrub's JSON envelope names its
+    // subject (`verify_envelope_binds_subject`), has no counterpart here: the
+    // voices are over the row id computed from THIS record's own statement
+    // bytes, so they name the subject by construction.
+    let Some(row_id) = edition2_record_row_id(row) else {
+        return Err(CoscrubFailure::Refused(format!(
+            "{}: key record {:?} carries no edition-2 statement; its co-scrub would be a \
+             separate-pair scrub set, which v62 does not verify",
+            super::malformed_row::EDITION2_EARLIER_FORM_OBJECT,
+            row.key_id
+        )));
     };
 
-    // (2b) v31.0.0 (CIRISPersist#659) — **THE CO-SCRUB MUST NAME THE SUBJECT IT
-    // CONFERS ON.** FIRST, before a single roster lookup: everything below is a
-    // question about the SIGNERS, and until this ran there was no question
-    // about the SUBJECT anywhere on the path. Asking it first also makes the
-    // refusal deterministic — a subject-blind envelope is refused identically
-    // whether the roster resolves, whether the custody floor is met, and
-    // whether the signatures are real. See `verify_envelope_binds_subject`.
-    verify_envelope_binds_subject(row).map_err(CoscrubFailure::Refused)?;
-
-    // (3) Standing founder roster = the accord family resolved to their PINNED
-    // directory pubkeys (never caller-supplied keys). Skip any that don't
-    // resolve; `n` tracks the LIVE roster so the policy is dynamic.
-    // #513: under `require_fips_custody`, membership additionally requires a
-    // verified FIPS custody attestation — the hardware anti-Sybil floor.
-    let mut roster: Vec<ThresholdMember> = Vec::with_capacity(roster_key_ids.len());
+    // (3) Standing founder roster = the accord holders whose keys resolve in
+    // THIS directory (never caller-supplied keys); `n` tracks the LIVE roster
+    // so the policy is dynamic. #513: under `require_fips_custody`, membership
+    // additionally requires a verified FIPS custody attestation — the
+    // hardware anti-Sybil floor.
+    let mut roster: Vec<String> = Vec::with_capacity(roster_key_ids.len());
     let mut custody_rejected: Vec<String> = Vec::new();
     for kid in roster_key_ids {
         if let Some(rec) = directory
@@ -15730,21 +14898,13 @@ where
                     continue;
                 }
             }
-            roster.push(ThresholdMember {
-                member_id: rec.key_id,
-                ed25519_public_key_base64: rec.pubkey_ed25519_base64,
-                mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64,
-                role: Some(Role::Founder),
-            });
+            roster.push(kid.clone());
         }
     }
     let n = roster.len();
 
-    // (4) Strict-majority policy over the live roster (2-of-3 today; 3-of-4 if
-    // the family grows), floored at `min_quorum` (#513: 3 for canonicals — a
-    // hardware-bound, touch-required, distinct-human scarcity mechanism).
-    // `verify_quorum_policy` re-validates `2·M > N` and `N == founder_count`,
-    // so this is NOT a frozen constant.
+    // (4) Strict majority over the live roster (2-of-3 today; 3-of-4 if the
+    // family grows), floored at `min_quorum` (#513: 3 for canonicals).
     let m = std::cmp::max(accord_threshold(n), min_quorum);
     if m > n {
         return Err(CoscrubFailure::Refused(format!(
@@ -15760,41 +14920,33 @@ where
             }
         )));
     }
-    let policy = QuorumPolicy::new(m, n);
 
-    // (6) The exact canonical bytes the scrubs signed = JCS(registration_envelope)
-    // — the IDENTICAL function the single-scrub verify uses, so a base-field
-    // scrub and an `additional_scrubs` entry are over byte-identical content.
-    let bytes = crate::verify::canonical::ceg_produce_canonicalize(&row.registration_envelope)
-        .map_err(|e| {
-            CoscrubFailure::Refused(format!("registration_envelope canonicalize failed: {e}"))
-        })?;
-
-    // (5) The record's full scrub set → threshold signatures (member_id =
-    // scrub_key_id; a self-scrub's member_id is not in the founder roster, so it
-    // is silently not counted — self can never confer).
-    let sigs: Vec<ThresholdSignature> = row
-        .scrubs()
-        .into_iter()
-        .map(|s| ThresholdSignature {
-            member_id: s.scrub_key_id,
-            ed25519_signature_base64: s.scrub_signature_classical,
-            mldsa65_signature_base64: s.scrub_signature_pqc,
-        })
-        .collect();
-
-    // (7) m-of-n over the accord family. Non-forgeable: verify_quorum_policy
-    // cryptographically verifies each hybrid sig and counts ONLY distinct
-    // founders — a claimed-but-unsigned / garbage scrub does not count.
-    verify_quorum_policy(&bytes, &roster, &sigs, policy).map_err(|e| {
-        CoscrubFailure::Refused(format!(
-            "accord family m-of-n not met ({m}-of-{n}): {e}",
-            m = policy.m,
-            n = policy.n
-        ))
-    })?;
-
+    // (5) m-of-n over the accord family: the DISTINCT roster members among
+    // the row's held voices. A self-voice is not a roster member's, so self
+    // can never confer.
+    let voiced = super::edition2::voices::roster_voices(directory, &row_id, &roster)
+        .await
+        .map_err(CoscrubFailure::Lookup)?;
+    if voiced.len() < m {
+        return Err(CoscrubFailure::Refused(format!(
+            "accord family m-of-n not met ({m}-of-{n}): {} accord holder voice(s) on the \
+             record's row",
+            voiced.len()
+        )));
+    }
     Ok(())
+}
+
+/// v62.0.0 (BH-fix2) — the edition-2 row id of a key record's own
+/// statement, computed from the statement bytes the projection carries
+/// (`registration_envelope.ceg_statement`), never from a peer-chosen
+/// string. `None` for a record with no edition-2 statement.
+fn edition2_record_row_id(row: &super::KeyRecord) -> Option<super::edition2::names::RowId> {
+    let statement = row
+        .registration_envelope
+        .get(super::edition2::ingest::STATEMENT_MEMBER)?
+        .as_str()?;
+    super::edition2::names::RowId::of_statement(&hex::decode(statement).ok()?)
 }
 
 /// **CIRISPersist#422 (CIRISVerify#185) — the `infra:attest`-role admission
@@ -17102,9 +16254,6 @@ async fn verify_canonical_authority_over_roster(
     successor_key_id: Option<&str>,
     roster_key_ids: &[String],
 ) -> Result<String, Error> {
-    use ciris_verify_core::accord_live_quorum::tally_live_quorum;
-    use ciris_verify_core::threshold::ThresholdMember;
-
     let invalid = |reason: String| Error::CanonicalWithdrawalAuthorityInvalid {
         key_id: target_key_id.to_owned(),
         reason,
@@ -17155,56 +16304,19 @@ async fn verify_canonical_authority_over_roster(
         )));
     }
 
-    // (3) Standing roster = accord holders resolved to their PINNED directory
-    //     pubkeys (never caller-supplied keys).
-    let mut roster: Vec<ThresholdMember> = Vec::with_capacity(roster_key_ids.len());
-    for kid in roster_key_ids {
-        if let Some(rec) = directory.lookup_public_key(kid).await? {
-            roster.push(ThresholdMember {
-                member_id: rec.key_id,
-                ed25519_public_key_base64: rec.pubkey_ed25519_base64,
-                mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64,
-                role: None,
-            });
-        }
-    }
-
-    // (4) Re-tally persist's own stored, per-write-verified participations. Each
-    //     is re-verified (sig + proposal-digest + seat) against the pinned roster.
-    let participations: Vec<_> = directory
-        .list_accord_participations(proposal_digest)
-        .await?
-        .into_iter()
-        .map(|s| s.participation)
-        .collect();
-    let tally = tally_live_quorum(&proposal, &participations, &roster)
-        .map_err(|e| invalid(format!("live-quorum tally failed (fail-closed): {e:?}")))?;
-
-    // (5) Destructive threshold = **strict majority of the LIVE accord roster**
-    // (CIRISPersist#383 follow-up — was a frozen 2/3). Derived via verify's
-    // `QuorumPolicy` (`2·M > N`, no M==1 escape), so withdraw/supersede tracks
-    // the family the same way canonical *add* does (2-of-3 today, 3-of-4 if the
-    // family grows) — never a hardcoded constant.
-    let n = roster.len();
-    let policy = ciris_verify_core::threshold::QuorumPolicy::new(accord_threshold(n), n);
-    policy.validate().map_err(|e| {
-        invalid(format!(
-            "accord roster quorum policy invalid ({n} holders): {e:?}"
-        ))
-    })?;
-    if tally.yes < policy.m {
-        return Err(invalid(format!(
-            "insufficient accord quorum: {yes} YES vote(s) among the live set {live:?}, but a \
-             canonical withdraw/supersede requires a strict majority of the accord family \
-             (>= {m} of {n})",
-            yes = tally.yes,
-            live = tally.live_set,
-            m = policy.m,
-            n = policy.n,
-        )));
-    }
-
-    Ok(proposal.digest())
+    // (3)–(5) v62.0.0 (BH-fix2; RULINGS "composite signatures only") — the
+    // re-tally (`tally_live_quorum`: each stored participation's SEPARATE
+    // Ed25519 + ML-DSA-65 pair verified against the holder's component
+    // halves) is DELETED. The proposal, participation and decision records
+    // are retired (CC rc20: a roster change is a later genesis bundle) and
+    // have no write door, so (1) already refuses on a v62 store; a proposal
+    // that is somehow held still authorises nothing.
+    let _ = (proposal, roster_key_ids);
+    Err(invalid(format!(
+        "{}: the accord live-quorum records are retired (CC rc20); a canonical withdraw or \
+         supersede is not authorised by a tally of separate-pair participations",
+        super::malformed_row::EDITION2_EARLIER_FORM_OBJECT
+    )))
 }
 
 /// v13.1.0 (CIRISPersist#377) — verify a PLAIN-WITHDRAW authority binds a
@@ -20671,7 +19783,7 @@ pub async fn check_minor_owner_binding_not_announced(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
 ) -> Result<(), Error> {
-    use super::age::{age_band, AgeBand};
+    use super::age::{age_band_as_of, AgeBand};
     if row.cohort_scope != super::types::cohort_scope::FEDERATION {
         return Ok(());
     }
@@ -20715,7 +19827,7 @@ pub async fn check_minor_owner_binding_not_announced(
     // rows (age witnesses about it; `age_band` declares `key:<granter>`): a
     // minor's announced binding is HELD `minor_owner_binding_at_federation`,
     // and re-folds when a witness lands or is withdrawn.
-    if age_band(directory, &row.attesting_key_id).await? == AgeBand::Minor {
+    if age_band_as_of(directory, &row.attesting_key_id, None).await? == AgeBand::Minor {
         return Err(fold_hold(
             fold::reason::gc1::MINOR_OWNER_BINDING_AT_FEDERATION,
             Error::WriteScopeRefused(
@@ -20734,7 +19846,7 @@ pub async fn check_user_target_steward_binding_admission(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
 ) -> Result<(), Error> {
-    use super::age::{age_band, AgeBand};
+    use super::age::{age_band_as_of, AgeBand};
     if row.attestation_type != attestation_type::DELEGATES_TO {
         return Ok(());
     }
@@ -20810,7 +19922,7 @@ pub async fn check_user_target_steward_binding_admission(
     // EXCEPT the single narrow CC 3.4.12 adult-incapacity aperture, which
     // this dispatches to. An unverified age is neither (presumption of
     // sovereignty).
-    let target_band = age_band(directory, &row.attested_key_id).await?;
+    let target_band = age_band_as_of(directory, &row.attested_key_id, None).await?;
     // v30.8.0 (CIRISConstitution#87) — the discriminator applies PER AGE BAND,
     // because it is about who can accept for themselves.
     //
@@ -20823,7 +19935,7 @@ pub async fn check_user_target_steward_binding_admission(
     // age. That let an unmarked delegation to a MINOR through as a conferral —
     // the guardianship gate never ran. Caught by
     // `minor_guardianship_grant_and_withdraw_end_to_end`.
-    if can_accept_for_itself(directory, &row.attested_key_id).await?
+    if can_accept_for_itself_held(directory, &row.attested_key_id).await?
         && !is_custody_claim_envelope(&row.attestation_envelope)
     {
         return Ok(());
@@ -20863,7 +19975,7 @@ pub async fn check_user_target_steward_binding_admission(
     };
     let granter_is_adult_user =
         identity_type::set_contains(&granter.identity_type, identity_type::USER)
-            && age_band(directory, &row.attesting_key_id).await? == AgeBand::Adult;
+            && age_band_as_of(directory, &row.attesting_key_id, None).await? == AgeBand::Adult;
     if !granter_is_adult_user {
         return Err(steward_binding_fold(
             Error::UserTargetStewardBindingForbidden {
@@ -21040,7 +20152,7 @@ pub async fn check_adult_incapacity_binding(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
 ) -> Result<(), Error> {
-    use super::age::{age_band, AgeBand};
+    use super::age::{age_band_as_of, AgeBand};
     use crate::federation::capacity::{
         binding_field, is_protected_domain, legitimacy_source, tier, T2_REVIEW_CADENCE_DAYS,
     };
@@ -21068,7 +20180,7 @@ pub async fn check_adult_incapacity_binding(
     let steward_is_adult_user = match directory.lookup_public_key(&row.attesting_key_id).await? {
         Some(rec) => {
             identity_type::set_contains(&rec.identity_type, identity_type::USER)
-                && age_band(directory, &row.attesting_key_id).await? == AgeBand::Adult
+                && age_band_as_of(directory, &row.attesting_key_id, None).await? == AgeBand::Adult
         }
         None => false,
     };
@@ -26841,6 +25953,15 @@ pub(crate) mod r2_test_support {
     ///    by the emitter;
     /// 3. the root **confers** `scope` on the emitter — `trust:confers:v1`.
     ///
+    /// v62.0.0 (RT-fix1) — the root is a ROOTED edition-2 trust root (W1b's
+    /// `fixture_trust_root`, at the caller's `root` seed): the genesis bundle
+    /// in force and an `infrastructure` community founded at the root's key by
+    /// the bundle's holders stand behind rows 1 and 2. A bare key chartering
+    /// itself is no root a v62 reader trusts, so its grant rooted nowhere and
+    /// every row that needed the conferral was HELD. The helper returns only
+    /// once `capability_roots_to_trusted_root(node, subject, scope)` roots at
+    /// that root ([`confer_scope_from_trusted_root_at`]).
+    ///
     /// Shared rather than copied per backend: a fixture that builds this graph
     /// slightly differently on one backend would prove the gate works there and
     /// silently not test it elsewhere, which is this repo's recurring class.
@@ -26851,24 +25972,23 @@ pub(crate) mod r2_test_support {
         subject: &str,
         scope: &str,
     ) {
-        // The rows are deterministic (today's UTC midnight, inside an agent
-        // key's default window), so re-asserting the shared charter / accept
-        // row is the same statement.
-        //
         // v62.0.0 (E12-fix4) — DATED FROM THE KEY WINDOWS: a row asserted
         // before its signer's (or, for a voice, its voicer's) `key:record`
-        // starts is outside that key's window, so the instant is the latest of
-        // midnight and every signer's record start (plus one second). A
-        // caller whose keys were registered today (an engine's own key, a
-        // `put_key_with` start) is no longer dated before them; a default
-        // window (180 days back) keeps today's midnight, unchanged.
-        ensure_conferral_keys(dir, node, root).await;
-        let midnight = {
-            use chrono::TimeZone as _;
-            let today = chrono::Utc::now().date_naive();
-            chrono::Utc.from_utc_datetime(&today.and_hms_opt(0, 0, 0).expect("midnight"))
-        };
-        let mut now = midnight;
+        // starts is outside that key's window, so the grant's instant is no
+        // earlier than every held record's start (plus one second). A caller
+        // whose keys were registered today (an engine's own key, a
+        // `put_key_with` start) is not dated before them.
+        //
+        // RT-fix1 — and never the wall clock: the earlier floor was today's
+        // UTC midnight. The floor is now the bundle in force's
+        // ([`confer_scope_from_trusted_root_at`]: its newest tip + 90 s, the
+        // instant W1b states a grant at), which a default node / agent window
+        // (180 days back) and a person's key (no start) both cover. The same
+        // arguments give the same statement, so a second call re-states
+        // nothing. The node's and the root's keys are registered by the
+        // rooted root's own fixture when missing.
+        let mut now = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(0)
+            .expect("confer_scope_from_trusted_root: the epoch");
         for k in [node, root, subject] {
             let held = dir
                 .lookup_public_key(&crate::federation::edition2::fixture_switch::kid_or_keep(k))
@@ -26960,28 +26080,34 @@ pub(crate) mod r2_test_support {
         super::owner_of(dir, &key).await.ok().flatten()
     }
 
-    /// The node's and the root's keys, live as edition-2 `agent` keys unless
-    /// already held (a caller may pass the node's own engine key, whose
-    /// record is already held). Ids are identity-refs (`e2::kid_or_keep`).
-    async fn ensure_conferral_keys(dir: &dyn FederationDirectory, node: &str, root: &str) {
-        use crate::federation::edition2::fixture_switch as e2;
-        for k in [node, root] {
-            if dir
-                .lookup_public_key(&e2::kid_or_keep(k))
-                .await
-                .ok()
-                .flatten()
-                .is_none()
-            {
-                e2::put_key(dir, k, &[crate::federation::types::identity_type::AGENT]).await;
-            }
-        }
-    }
-
-    /// v62.0.0 (K2-fix11) — [`confer_scope_from_trusted_root`] with the three
-    /// rows dated at `at`, for a witness that anchors its instants to a key
-    /// window instead of today's midnight. `at` must sit inside the node's
-    /// and the root's key windows.
+    /// v62.0.0 (K2-fix11, RT-fix1) — [`confer_scope_from_trusted_root`] with
+    /// the grant dated at `now`, or at the bundle in force's newest tip + 90 s
+    /// when `now` is earlier (never before the root's own rows), for a
+    /// witness that anchors its instants to a key window. That instant must
+    /// sit inside the subject's key window (and a machine subject's
+    /// owner's).
+    ///
+    /// RT-fix1 — **the root is ROOTED.** `root` (a seed, or a kid E0 minted)
+    /// names W1b's rooted trust root at that seed
+    /// (`fixture_trust_root::try_rooted_trust_root_at_seed`): the genesis
+    /// bundle in force, an `infrastructure` community at the root's key
+    /// founded by the bundle's three holders (`quorum:2/3`), the root's
+    /// charter, and THIS node's acceptance naming the held head; every one of
+    /// those rows is dated from the bundle in force, never the wall clock, and
+    /// a second call for the same root re-states nothing. The grant is the
+    /// root's `trust:confers:v1` statement (`confers_statement`), then the
+    /// subject's own voice (`delegate = sub`, CC 2.6.1.9) and, for a MACHINE
+    /// subject, its bound owner's (`delegate_owner`, CC 4.4.3.19).
+    ///
+    /// POSTCONDITION (the K2-fix13 pattern): it returns only once
+    /// `capability_roots_to_trusted_root(node, subject, scope)` roots at this
+    /// root, so a conferral that confers nothing stops HERE, naming the
+    /// grant's fold reason, instead of at a caller's later band or row assert.
+    ///
+    /// # Panics
+    /// The backend's node key is not `node` (the runner sets it:
+    /// `set_node_key_id(e2::kid(node))`); any door's refusal; a held grant;
+    /// the postcondition.
     pub(crate) async fn confer_scope_from_trusted_root_at(
         dir: &dyn FederationDirectory,
         node: &str,
@@ -26990,134 +26116,116 @@ pub(crate) mod r2_test_support {
         scope: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) {
-        use crate::federation::trust_root::{
-            test_pre_rotation_commitment, TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION,
-            TRUST_CONFERS_DIMENSION,
-        };
-        // v62 (E4, wave 4): every signer is an edition-2 key, registered only
-        // when missing (a caller may pass the node's own engine key, whose
-        // record is already held). Ids are identity-refs (`e2::kid_or_keep`).
+        use crate::federation::edition2::fixture_genesis::HOLDER_SEEDS;
         use crate::federation::edition2::fixture_switch as e2;
-        ensure_conferral_keys(dir, node, root).await;
+        use crate::federation::edition2::fixture_trust_root::{
+            confers_statement, try_rooted_trust_root_at_seed,
+        };
+        use crate::federation::edition2::ingest::StatementOutcome;
+        let node_kid = e2::kid_or_keep(node);
+        let subject_kid = e2::kid_or_keep(subject);
+        // The asking party of every conferral walk is THIS node (CC
+        // 4.4.3.34), and the acceptance edge is the node's own: a backend
+        // whose node key is another id (or none) can reach no conferral.
+        assert_eq!(
+            dir.node_key_id().as_deref(),
+            Some(node_kid.as_str()),
+            "confer_scope_from_trusted_root: the runner gives the backend `{node}`'s identity \
+             first: set_node_key_id(e2::kid(\"{node}\"))"
+        );
+        // Rows 1 and 2, and what stands behind them: the bundle in force, the
+        // root community founded by its holders, the charter, this node's
+        // acceptance. Idempotent per directory and root seed.
+        let r = try_rooted_trust_root_at_seed(dir, root, &HOLDER_SEEDS, "quorum:2/3")
+            .await
+            .unwrap_or_else(|e| {
+                panic!("confer_scope_from_trusted_root: the rooted root at {root}: {e}")
+            });
+        // Row 3's instant: `now`, never before the root's own rows (W1b
+        // states a grant at the bundle's newest tip + 90 s; the root's rows
+        // at + 60 s). The same instant for the same arguments is the same
+        // statement.
+        let floor = crate::federation::edition2::genesis::genesis_in_force(dir)
+            .await
+            .expect("confer_scope_from_trusted_root: the bundle in force")
+            .tips()
+            .iter()
+            .map(|t| t.asserted_at)
+            .max()
+            .expect("confer_scope_from_trusted_root: a bundle tip")
+            + 90_000;
+        let at_ms = e2::ms(now).max(floor);
+        let now = i64::try_from(at_ms)
+            .ok()
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            .expect("confer_scope_from_trusted_root: the grant's instant");
         // v62.0.0 (E12-fix4; CC 4.4.3.19) — a MACHINE subject's grant waits
         // for its owner's voice, so an unowned machine subject is given one
-        // first ([`bind_owner_if_machine`]); `land_delegation` below then
-        // lands the owner's voice with the subject's.
+        // first ([`bind_owner_if_machine`]), bound at the grant's instant.
         bind_owner_if_machine(dir, subject, now).await;
-        // The same instant for the same arguments is the same statement — the
-        // node computes the same id, and the fixture skips a row it already
-        // holds.
-        let rows: [(&str, &str, serde_json::Value); 3] = [
-            (
-                root,
-                root,
-                serde_json::json!({
-                    "dimension": TRUST_CHARTER_DIMENSION,
-                    "scope": ["infra:serve", "infra:attest"],
-                    "pre_rotation_commitment":
-                        test_pre_rotation_commitment(&[format!("{}-successor", e2::seed_of(root))]).expect("commitment"),
-                }),
-            ),
-            (
-                node,
-                root,
-                serde_json::json!({"dimension": TRUST_ACCEPTS_DIMENSION, "scope": ["infra:serve"]}),
-            ),
-            (
-                root,
-                subject,
-                serde_json::json!({"dimension": TRUST_CONFERS_DIMENSION, "scope": [scope]}),
-            ),
-        ];
-        for (from, to, mut envelope) in rows {
-            // v60.0.0 (#1048) — a term-bearing edge carries a term (CC 2.4).
-            crate::federation::admission::with_test_term(&mut envelope, now);
-            let att = Attestation {
-                attestation_id: String::new(),
-                attesting_key_id: from.to_owned(),
-                attested_key_id: to.to_owned(),
-                attestation_type: crate::federation::types::attestation_type::DELEGATES_TO
-                    .to_owned(),
-                weight: None,
-                asserted_at: now,
-                expires_at: None,
-                attestation_envelope: envelope,
-                original_content_hash: String::new(),
-                scrub_signature_classical: String::new(),
-                scrub_signature_pqc: None,
-                scrub_key_id: from.to_owned(),
-                scrub_timestamp: now,
-                pqc_completed_at: None,
-                persist_row_hash: String::new(),
-                subject_key_ids: Vec::new(),
-                withdraws_admission_rule: None,
-                cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
-                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
-                promoted_at: None,
-                additional_scrubs: Vec::new(),
-            };
-            let row = e2::row_of(&att, from);
-            if dir
-                .get_attestation(&e2::rid(&row))
-                .await
-                .ok()
-                .flatten()
-                .is_some()
-            {
-                continue;
+        let grant = confers_statement(&r, &subject_kid, &[scope], at_ms);
+        let grant_id = e2::row_id_of(&grant);
+        if dir
+            .get_attestation(&grant_id.hex())
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            // The grant, the subject's voice, and a machine subject's bound
+            // owner's (an AGENT's owner read from its edition-2 agent owner
+            // binding, [`machine_owner_of`]).
+            let mut voicers = vec![subject_kid.clone()];
+            if let Some(owner) = machine_owner_of(dir, &subject_kid, now).await {
+                voicers.push(owner);
             }
-            let confers = row.attestation_envelope.get("dimension")
-                == Some(&serde_json::Value::from(TRUST_CONFERS_DIMENSION));
-            // v62 (E4 round 3; CC 2.6.1.9): Verify's `confers` rule asks the
-            // subject for a second voice (`delegate: sub`), and a MACHINE
-            // subject's owner for another (`delegate_owner: owner_of_sub`,
-            // CC 4.4.3.19); without them the grant is held and confers
-            // nothing. v62.0.0 (E12-fix4): E0's `land_delegation` gives exactly
-            // those voices (the author's statement, the subject's voice, and a
-            // machine subject's bound owner's), as every own-act grant lands.
-            let out = if confers {
-                // The voices `land_delegation` gives, with an AGENT subject's
-                // owner read from its edition-2 agent owner binding
-                // (`agent_owner_of`, which `land_delegation`'s `owner_of`
-                // does not read).
-                let mut voices = vec![to.to_owned()];
-                if let Some(owner) = machine_owner_of(dir, to, now).await {
-                    voices.push(owner);
-                }
-                let refs: Vec<&str> = voices.iter().map(String::as_str).collect();
-                e2::land_with_voices(dir, &row, &refs)
+            let mut out = e2::put_statement(dir, &grant)
+                .await
+                .unwrap_or_else(|e| panic!("the conferral must admit: {e}"));
+            for v in &voicers {
+                out = e2::put_statement(dir, &e2::voice_of(&grant, v))
                     .await
-                    .unwrap_or_else(|e| panic!("the conferral and its voices must admit: {e}"))
-            } else {
-                e2::put_signed(dir, &row)
-                    .await
-                    .unwrap_or_else(|e| panic!("conferral row must admit: {e}"))
-            };
-            // v62.0.0 (E12-fix4) — a HELD edge confers nothing, and a caller's
-            // "conferred" leg then fails far from the cause (#611's chain
-            // comes back empty; a detector's row is refused
-            // `ReservedPrefixEmitterMismatch`). Name the held edge and the
-            // fold's reason here.
-            if let crate::federation::edition2::ingest::StatementOutcome::Pending {
-                row_id, ..
-            } = &out
-            {
+                    .unwrap_or_else(|e| panic!("the conferral's voice by {v} must admit: {e}"));
+            }
+            // v62.0.0 (E12-fix4) — a HELD grant confers nothing, and a
+            // caller's "conferred" leg then fails far from the cause. Name
+            // the fold's reason here.
+            if let StatementOutcome::Pending { row_id, .. } = &out {
                 let why = crate::federation::edition2::fold::why_held(dir, row_id)
                     .await
                     .ok()
                     .flatten();
                 panic!(
-                    "confer_scope_from_trusted_root: the {:?} edge {from} -> {to} at {now} is HELD, \
-                     not landed: {why:?}{}",
-                    row.attestation_envelope.get("dimension"),
-                    if confers {
-                        " (a machine subject needs its owner bound before the grant: \
-                         `steward_liveness_test_support::bind_machine_owner`)"
-                    } else {
-                        ""
-                    }
+                    "confer_scope_from_trusted_root: the grant {} -> {subject_kid} ({scope}) at \
+                     {at_ms} ms is HELD, not landed: {why:?} (a machine subject needs its owner \
+                     bound before the grant: \
+                     `steward_liveness_test_support::bind_machine_owner`)",
+                    r.root
                 );
             }
+        }
+        // RT-fix1 — the postcondition: the grant reaches the root through
+        // THIS node.
+        let rooted = crate::federation::trust_root::capability_roots_to_trusted_root(
+            dir,
+            &node_kid,
+            &subject_kid,
+            scope,
+        )
+        .await
+        .expect("confer_scope_from_trusted_root: capability_roots_to_trusted_root");
+        if !rooted.as_ref().is_some_and(|g| g.root_key_id == r.root) {
+            let why = crate::federation::edition2::fold::why_held(dir, &grant_id)
+                .await
+                .ok()
+                .flatten();
+            panic!(
+                "confer_scope_from_trusted_root postcondition NOT met: {subject_kid}'s {scope} \
+                 does not root at {} through node {node_kid}: walk = {rooted:?}; the grant {} is \
+                 held: {why:?}",
+                r.root,
+                grant_id.hex()
+            );
         }
     }
 

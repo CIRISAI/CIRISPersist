@@ -3801,6 +3801,24 @@ mod tests {
         )
         .await
         .unwrap_or_else(|e| panic!("the root confers {scope} on {key_id}: {e}"));
+        // RT-fix1 — the postcondition (the K2-fix13 pattern): the grant
+        // reaches the root through THIS node, so a conferral that confers
+        // nothing stops here and not at a later band / row assert.
+        let node = crate::federation::FederationDirectory::node_key_id(backend)
+            .expect("put_conferred_key: the node key is set above");
+        let rooted = crate::federation::trust_root::capability_roots_to_trusted_root(
+            backend,
+            &node,
+            &e2::kid(key_id),
+            scope,
+        )
+        .await
+        .expect("put_conferred_key: capability_roots_to_trusted_root");
+        assert!(
+            rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
+            "put_conferred_key: {key_id}'s {scope} roots at {} through node {node}: {rooted:?}",
+            r.root
+        );
     }
 
     /// Register a key with a chosen `identity_type` (e.g. `user` / `witness` /
@@ -3824,7 +3842,8 @@ mod tests {
         a
     }
 
-    /// age_band resolution: witness adult OUTRANKS self minor; self minor
+    /// age_band resolution: a self-declared minor LOWERS a witness adult
+    /// (v62.0.0 K2-fix14, CC 3.4.11 read-union); self minor
     /// alone → Minor; self adult alone → Unknown (ratchet ignores self-adult);
     /// witness minor → Minor; no attestation → Unknown; expired witness
     /// attestation ignored.
@@ -3883,7 +3902,9 @@ mod tests {
             AgeBand::Minor
         );
 
-        // A witness ADULT attestation OUTRANKS the self-declared minor → Adult.
+        // v62.0.0 (K2-fix14; CC 3.4.11: "a subject's declaration of a lower
+        // band lowers the reading and never raises it") — a witness ADULT
+        // does not lift the subject's own self-declared minor → Minor.
         put_voiced(
             &backend,
             &fix_age_attestation(
@@ -3897,8 +3918,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             age_band(&backend, &e2::kid("ab-subj")).await.unwrap(),
-            AgeBand::Adult,
-            "the witness rung must outrank a self-declared minor",
+            AgeBand::Minor,
+            "a self-declared minor lowers the witness reading (CC 3.4.11)",
         );
     }
 
@@ -4105,26 +4126,31 @@ mod tests {
         put_typed_key(&backend, "wts-T", "user").await; // the subject
         put_typed_key(&backend, "wts-P", "user").await; // plain (non-witness) user
 
-        // Baseline: T self-declares MINOR (the non-reserved self rung still
-        // admits attester==attested — it is subject-signed by design).
+        // Baseline: T self-declares ADULT (the non-reserved self rung still
+        // admits attester==attested — it is subject-signed by design), which
+        // graduates nobody. v62.0.0 (K2-fix14): the baseline was a
+        // self-declared MINOR, but under CC 3.4.11 a subject's own minor
+        // band lowers any witness reading, so it would hide the graduation
+        // this table witnesses.
         put_voiced(
             &backend,
             &fix_age_attestation(
-                "wts-self-minor",
+                "wts-self-adult",
                 "wts-T",
                 "wts-T",
-                "age_self_declared:band:minor:v1",
+                "age_self_declared:band:adult:v1",
             ),
         )
         .await
         .expect("subject-signed self rung admits");
         assert_eq!(
             age_band(&backend, &e2::kid("wts-T")).await.unwrap(),
-            AgeBand::Minor
+            AgeBand::Unknown
         );
 
         // CROSS-SUBJECT witness graduation: W attests T adult — ADMITTED, and
-        // T's band graduates (witness outranks T's own self-declared minor).
+        // T's band graduates (a self-declared adult raises nothing; the witness
+        // does).
         put_voiced(
             &backend,
             &fix_age_attestation(

@@ -3552,4 +3552,6 @@ pub use super::fixture_occurrence::{
 // `delivery_receipt_statement`, `cosign_statement`), as `e2::..`.
 pub use super::typed_fixtures::*;
 // v62.0.0 (wave W1b) — a ROOTED edition-2 trust root (`W1.api.md`).
-pub use super::fixture_trust_root::{rooted_trust_root, try_rooted_trust_root, RootedTrustRoot};
+pub use super::fixture_trust_root::{
+    rooted_trust_root, try_rooted_trust_root, try_rooted_trust_root_at_seed, RootedTrustRoot,
+};

@@ -8,7 +8,9 @@ form (v62.0.0, JSON-cut slice F; CC 2.6.1.12 "nothing carries", CC 8.11).
     scripts/earlier_form_doors.py unignore     CP2 only: delete every CP2 ignore
                                                (refused while the switch is off)
     scripts/earlier_form_doors.py release-check  red while any
-                                               `v62-CP2 rewrite pending` test
+                                               `v62-CP2 rewrite pending` test,
+                                               `pending` door row or
+                                               LONE_VERIFY_PENDING entry
                                                remains (release.sh stage 2)
 
 A GATE, FROM DISK, NO CARGO. Slice F shuts the earlier-form doors with one
@@ -311,6 +313,9 @@ def brace_pairs(s: str) -> dict[int, int]:
 # and is read as production. P is evaluated, not pattern-matched, so no
 # spelling of a test-only cfg is missed; a cfg naming `test` that does not
 # parse is refused (UnknownTestGate) rather than guessed.
+# v62.0.0 (BH-fix1) — persist's "test-only, NEVER in a published wheel" fence
+# (Cargo.toml); the LONE_VERIFY scan reads code under it as test code.
+ANCHOR_FEATURE = "test-anchor"
 TEST_FN_ATTR = re.compile(r"#\s*\[\s*(?:test|tokio\s*::\s*test\b[^\]]*)\s*\]")
 CFG_ATTR = re.compile(r"#\s*\[\s*cfg\s*\(")
 ANY_ATTR = re.compile(r"#\s*!?\s*\[")
@@ -335,10 +340,15 @@ def _attr_end(code: str, k: int) -> int:
     return len(code)
 
 
-def _cfg_can(pred: str) -> tuple[bool, bool]:
+def _cfg_can(pred: str, anchored: bool = False) -> tuple[bool, bool]:
     """(can be true, can be false) of a cfg predicate with `test` false and
-    every other atom free. Raises ValueError when it does not parse."""
-    toks = re.findall(r"[A-Za-z_]\w*|[(),=]|\S", pred)
+    every other atom free. Raises ValueError when it does not parse.
+
+    `anchored` (v62.0.0, BH-fix1; the LONE_VERIFY scan only): `pred` is RAW
+    text (its literals intact) and `feature = "test-anchor"` is false too —
+    persist's "test-only, NEVER in a published wheel" fence (Cargo.toml), so
+    `cfg(any(test, feature = "test-anchor"))` is test code there."""
+    toks = re.findall(r'"[^"\n]*"|[A-Za-z_]\w*|[(),=]|\S', pred)
     pos = 0
 
     def node() -> tuple[bool, bool]:
@@ -366,6 +376,12 @@ def _cfg_can(pred: str) -> tuple[bool, bool]:
             raise ValueError(t)
         if pos < len(toks) and toks[pos] == "=":
             pos += 1  # `feature = "x"`: the literal is blanked to nothing
+            lit = None
+            if pos < len(toks) and toks[pos].startswith('"'):
+                lit = toks[pos]
+                pos += 1
+            if anchored and t == "feature" and lit == '"' + ANCHOR_FEATURE + '"':
+                return False, True
             return True, True
         if t == "test":
             return False, True
@@ -380,21 +396,25 @@ def _cfg_can(pred: str) -> tuple[bool, bool]:
     return r
 
 
-def test_attrs(code: str, path: str):
-    """Yield (start, end) of every attribute that makes its item test-only."""
+def test_attrs(code: str, path: str, raw: str | None = None):
+    """Yield (start, end) of every attribute that makes its item test-only.
+    With `raw` (the unstripped text, same offsets) the predicate is read from
+    it and `feature = "test-anchor"` counts as test (`_cfg_can(anchored)`)."""
     for m in TEST_FN_ATTR.finditer(code):
         yield m.start(), m.end()
     for m in CFG_ATTR.finditer(code):
         end = _attr_end(code, m.start())
-        inner = code[m.end():end].rstrip()
+        src = raw if raw is not None else code
+        inner = src[m.end():end].rstrip()
         inner = inner[:-1].rstrip()  # the attribute's `]`
         if not inner.endswith(")"):
             continue
         pred = inner[:-1]  # the cfg's `)`
-        if not re.search(r"\btest\b", pred):
+        if not re.search(r"\btest\b", pred) and not (
+                raw is not None and re.search(r'"' + re.escape(ANCHOR_FEATURE) + r'"', pred)):
             continue
         try:
-            can_true, _ = _cfg_can(pred)
+            can_true, _ = _cfg_can(pred, anchored=raw is not None)
         except ValueError:
             line = code.count("\n", 0, m.start()) + 1
             raise UnknownTestGate(
@@ -403,19 +423,22 @@ def test_attrs(code: str, path: str):
             yield m.start(), end
 
 
-def strip_tests(code: str, path: str) -> tuple[str, set[str]]:
+def strip_tests(code: str, path: str, raw: str | None = None) -> tuple[str, set[str]]:
     """`code` (already literal-stripped) with every test-gated item blanked;
     and the names of `mod x;` declarations that are test-gated (whole test
-    files). Raises UnknownTestGate on a test cfg this gate cannot read."""
+    files). Raises UnknownTestGate on a test cfg this gate cannot read. With
+    `raw`, `feature = "test-anchor"` gates count as test (`test_attrs`)."""
     # an inner `#![cfg(P)]` gates the whole file
     for m in re.finditer(r"#\s*!\s*\[\s*cfg\s*\(", code):
-        outer = code[:m.start()] + "#" + " " * (code.index("[", m.start()) - m.start() - 1) + code[code.index("[", m.start()):]
-        if any(a == m.start() for a, _ in test_attrs(outer, path)):
+        def outer_of(s: str) -> str:
+            return s[:m.start()] + "#" + " " * (s.index("[", m.start()) - m.start() - 1) + s[s.index("[", m.start()):]
+        outer = outer_of(code)
+        if any(a == m.start() for a, _ in test_attrs(outer, path, outer_of(raw) if raw is not None else None)):
             return re.sub(r"[^\n]", " ", code), set()
     out = list(code)
     pairs = brace_pairs(code)
     test_mods: set[str] = set()
-    for a_start, a_end in sorted(test_attrs(code, path)):
+    for a_start, a_end in sorted(test_attrs(code, path, raw)):
         k = a_end
         # past further attributes and whitespace to the item
         while True:
@@ -448,8 +471,11 @@ class Tree:
     """src/ under a root, each file stripped once (comments, literals, test
     code). A file whose `mod` is test-gated reads as empty."""
 
-    def __init__(self, base: Path):
+    def __init__(self, base: Path, anchored: bool = False):
         self.base = base
+        # v62.0.0 (BH-fix1) — the LONE_VERIFY scan's tree: `feature =
+        # "test-anchor"` code (never in a published wheel) is test code too.
+        self.anchored = anchored
         self._code: dict[str, str] = {}
         self._test_files: set[str] | None = None
         self._parent_mods: dict[str, tuple[None, set[str]]] = {}
@@ -491,7 +517,8 @@ class Tree:
                 test = True
             else:
                 raw = (self.base / prel).read_text(encoding="utf-8", errors="replace")
-                _, mods = self._parent_mods.get(prel) or strip_tests(strip(raw), prel)
+                _, mods = self._parent_mods.get(prel) or strip_tests(
+                    strip(raw), prel, raw if self.anchored else None)
                 self._parent_mods[prel] = (None, mods)
                 test = name in mods
         (self._test_files if test else self._not_test).add(rel)
@@ -506,7 +533,7 @@ class Tree:
                 self._code[rel] = ""
             else:
                 raw = p.read_text(encoding="utf-8", errors="replace")
-                self._code[rel], _ = strip_tests(strip(raw), rel)
+                self._code[rel], _ = strip_tests(strip(raw), rel, raw if self.anchored else None)
         return self._code[rel]
 
     def glob(self, pattern: str) -> list[str]:
@@ -1127,7 +1154,11 @@ def release_check(base: Path) -> int:
     pending = [(k, v) for k, v in read_rows(base, []).items() if v[0] == "pending"]
     for (surface, door), (_, _, note) in pending:
         print(f"RED  {TSV}: {surface} `{door}` is pending its migration ({note})")
-    n = len(left) + len(pending)
+    # v62.0.0 (BH-fix1) — a known separate-pair verify awaiting its owner.
+    lone = lone_verify_pending(base)
+    for e in lone:
+        print(f"RED  {e}")
+    n = len(left) + len(pending) + len(lone)
     print("GREEN: no v62-CP2 rewrite or door pending" if not n else f"RED: {n} pending")
     return 0 if not n else 1
 
@@ -1166,43 +1197,116 @@ LONE_VERIFY = re.compile(
     r"\b(?:verify_hybrid|verify_hybrid_via_directory|verify_hybrid_with_policy|"
     r"verify_trace_hybrid|verify_ed25519_only_with_policy|"
     # v62.0.0 (F0-cp8) — the earlier envelope verify, deleted with its 24 sites
-    r"verify_envelope_hybrid_signature)\s*\("
+    r"verify_envelope_hybrid_signature|"
+    # v62.0.0 (BH-fix1) — Verify's SEPARATE-PAIR verifiers: an Ed25519
+    # signature plus an ML-DSA-65 signature over `msg ‖ ed_sig`
+    # (`ThresholdSignature`), checked against a key's component halves:
+    # directly, under a quorum policy, inside the transport binding, along a
+    # provenance chain (`HybridPolicy`), in an accord participation tally, or
+    # in a steward-signed skill-import manifest
+    r"verify_threshold_signatures|verify_threshold_signatures_with_policy|"
+    r"verify_quorum_policy|verify_transport_binding|verify_provenance_chain\w*|"
+    r"tally_live_quorum|verify_skill_import_manifest)\s*\("
     r"|\b(?:HybridVerifier|Ed25519Verifier|MlDsa65Verifier|MlDsa65SoftwareVerifier)\b"
+    # v62.0.0 (BH-fix1) — a pair built to be checked, and a hybrid policy
+    # chosen for a verify
+    r"|\bThresholdSignature\s*\{"
+    # v62.0.0 (BH-fix3) — Verify's pair-world TYPES and producers, which
+    # Verify 23.3.3 removes: persist names none of them in production (the
+    # earlier-form wire columns use `types::RetiredPairSignature` /
+    # `RetiredMemberPairSignature`, serde-identical stand-ins)
+    r"|\b(?:TransportBindingSignature|ThresholdSignature|LocalSelfSigner|SelfSigner|"
+    r"HybridSigningIdentity|produce_signed_identity_occurrence)\b"
+    r"|\bHybridPolicy\s*::\s*[A-Za-z_]\w*"
     r"|\.verify_strict\s*\("
     r"|\bed25519_dalek::Verifier\b"
 )
 # The deliberate standalone verifies, each with why. Nothing else may verify a
 # lone component (the media chunk trailer, CC 5.3.3.5, is Edge's).
 LONE_VERIFY_ALLOWED = {
+    # v62.0.0 (BH-fix2, re-checked against CC v1.0-rc21) — CC 2.7.11: a host
+    # trusts a Transparency Service by its owner's `transparency` edge, which
+    # carries `service_key` as "a COSE key with its algorithm, or an identity
+    # reference whose key is its key:record"; "a receipt whose protected
+    # algorithm is not that key's does not verify". Receipts are RFC 9942
+    # COSE receipts (CC 2.6.1.11), unsigned by the statement's signer and
+    # outside the row id. So the algorithm is the SERVICE's, named by the CC,
+    # and every host that holds a receipt verifies it under that key; the
+    # identity-reference arm is composite only (`ALG_COMPOSITE`). The
+    # earlier audit allowance is gone: F0-cp8 made audit entries composite
+    # (`audit::verify`), and the stale check would refuse it now.
     "src/federation/edition2/receipts.rs":
-        "SCITT receipts (RFC 9942) under a trusted transparency service's own COSE key; not a "
-        "CIRIS identity's component",
+        "SCITT receipts (RFC 9942) under a trusted Transparency Service's own key, a COSE key "
+        "with its algorithm per CC 2.7.11 (identity-reference keys composite only); not a CIRIS "
+        "identity's component",
 }
+# v62.0.0 (BH-fix1) — a separate-pair verify that is KNOWN and owned, keyed by
+# (file, the matched name): `check` passes it, `release-check` is red while
+# any remains (as a `pending` door row is), and an entry whose file no longer
+# holds that name is red (stale). Keyed by name, not by file, so a NEW pair
+# verify in the same file is still red.
+LONE_VERIFY_PENDING: dict[tuple[str, str], str] = {
+    # v62.0.0 (BH-fix2) — empty: the accord co-scrub now counts edition-2
+    # voices, the two live-quorum re-tallies are deleted, and the skill-import
+    # manifest verb refuses by name (Verify's ruling: edition 2 carries it as
+    # a `provenance:skill_import:{source}` row).
+}
+# The self-test's own pending entry: the fixture tree only (see self_test).
+SELF_TEST_PENDING = ("src/ffi/fixture_pending.rs", "verify_skill_import_manifest")
+
+
+def _lone_name(text: str) -> str:
+    """The matched name, bare: `verify_quorum_policy(` -> `verify_quorum_policy`,
+    `ThresholdSignature {` -> `ThresholdSignature`, `HybridPolicy::Strict`
+    -> `HybridPolicy::Strict`, `.verify_strict(` -> `verify_strict`."""
+    return re.sub(r"\s+", "", text).strip(".({")
 
 
 def lone_verify_errors(tree: "Tree") -> list[str]:
     """Every production standalone component verify outside
-    [`LONE_VERIFY_ALLOWED`] is red; an allow-list entry whose file no longer
-    holds one is red too (stale)."""
+    [`LONE_VERIFY_ALLOWED`] / [`LONE_VERIFY_PENDING`] is red; an allow or
+    pending entry that no longer matches anything is red too (stale). Test
+    code, including `feature = "test-anchor"` code, is not production here."""
     errors = []
     found: set[str] = set()
-    for rel in tree.glob("src/**/*.rs"):
-        code = tree.code(rel)
+    pending_found: set[tuple[str, str]] = set()
+    atree = Tree(tree.base, anchored=True)
+    for rel in atree.glob("src/**/*.rs"):
+        code = atree.code(rel)
         if not code:
             continue
         for m in LONE_VERIFY.finditer(code):
             if rel in LONE_VERIFY_ALLOWED:
                 found.add(rel)
                 continue
+            key = (rel, _lone_name(m.group(0)))
+            if key in LONE_VERIFY_PENDING:
+                pending_found.add(key)
+                continue
             line = code.count("\n", 0, m.start()) + 1
             errors.append(f"{rel}:{line}: a standalone component verify (`{m.group(0).strip()}`): "
                           f"v62 verifies ONE composite (composite_verify / sig19); a lone "
-                          f"Ed25519 or ML-DSA-65 half, or the bound-hybrid pair, never verifies")
+                          f"Ed25519 or ML-DSA-65 half, or a separate or bound pair, never verifies")
     for rel in sorted(set(LONE_VERIFY_ALLOWED) - found):
-        if tree.code(rel) is not None:
+        if atree.code(rel) is not None:
             errors.append(f"{rel}: in LONE_VERIFY_ALLOWED but holds no standalone verify; "
                           f"remove the entry")
+    for rel, name in sorted(set(LONE_VERIFY_PENDING) - pending_found):
+        if atree.code(rel) is not None:
+            errors.append(f"{rel}: `{name}` in LONE_VERIFY_PENDING but no longer matched; "
+                          f"remove the entry")
     return errors
+
+
+def lone_verify_pending(base: Path) -> list[str]:
+    """`release-check`'s view: every LONE_VERIFY_PENDING entry still matched."""
+    atree = Tree(base, anchored=True)
+    left = []
+    for (rel, name), why in sorted(LONE_VERIFY_PENDING.items()):
+        code = atree.code(rel)
+        if code and any(_lone_name(m.group(0)) == name for m in LONE_VERIFY.finditer(code)):
+            left.append(f"{rel}: `{name}` is a pending separate-pair verify ({why})")
+    return left
 
 
 def check(base: Path) -> tuple[list[str], dict]:
@@ -1463,6 +1567,16 @@ def _write_fixture(d: Path, overrides: dict[str, str] | None = None) -> None:
 
 
 def self_test() -> int:
+    # v62.0.0 (BH-fix2) — the pending mechanism is witnessed on a fixture-only
+    # entry, so it stays tested while the real list is empty.
+    LONE_VERIFY_PENDING[SELF_TEST_PENDING] = "the self-test's fixture entry; owner: self-test"
+    try:
+        return _self_test()
+    finally:
+        del LONE_VERIFY_PENDING[SELF_TEST_PENDING]
+
+
+def _self_test() -> int:
     cases: list[tuple[str, dict[str, str], str | None]] = [
         ("the fixture is green", {}, None),
         # every negative names the substring its red must carry: a red for
@@ -1656,6 +1770,52 @@ def self_test() -> int:
         ("an allow-listed standalone verify passes, and a stale entry is red (F0-cp7)",
          {"src/federation/edition2/receipts.rs": "fn f() {}\n"},
          "in LONE_VERIFY_ALLOWED but holds no standalone verify"),
+        ("a separate-pair verify in production is red (BH-fix1)",
+         {"src/federation/w.rs": "pub fn v(b: &[u8], m: &[M], s: &[S]) -> bool {\n    ciris_verify_core::threshold::verify_threshold_signatures(b, m, s, 1).is_ok()\n}\n"},
+         "a standalone component verify (`verify_threshold_signatures("),
+        ("a quorum-policy pair verify in production is red (BH-fix1)",
+         {"src/federation/w.rs": "pub fn v() { let _ = verify_quorum_policy(&b, &r, &s, p); }\n"},
+         "a standalone component verify (`verify_quorum_policy("),
+        ("the transport binding's pair verify in production is red (BH-fix1)",
+         {"src/federation/w.rs": "pub fn v() { let _ = verify_transport_binding(&b, &d); }\n"},
+         "a standalone component verify (`verify_transport_binding("),
+        ("a pair built in production is red (BH-fix1)",
+         {"src/federation/w.rs": "pub fn v() -> T { ThresholdSignature { member_id: k, ed25519_signature_base64: e, mldsa65_signature_base64: None } }\n"},
+         "a standalone component verify (`ThresholdSignature {"),
+        ("a hybrid policy chosen in production is red (BH-fix1)",
+         {"src/federation/w.rs": "pub fn v() { walk(&c, &a, HybridPolicy::RequireHybrid, &[]); }\n"},
+         "a standalone component verify (`HybridPolicy::RequireHybrid"),
+        ("a pair verify under `cfg(any(test, feature = \"test-anchor\"))` is not production (BH-fix1)",
+         {"src/federation/w.rs": "#[cfg(any(test, feature = \"test-anchor\"))]\npub mod test_support {\n    pub fn v(b: &[u8]) { let _ = verify_threshold_signatures(b, &[], &[], 1); }\n}\n"},
+         None),
+        ("a pair verify under `cfg(feature = \"test-anchor\")` alone is not production (BH-fix1)",
+         {"src/federation/w.rs": "#[cfg(feature = \"test-anchor\")]\npub fn v(b: &[u8]) { let _ = verify_threshold_signatures(b, &[], &[], 1); }\n"},
+         None),
+        ("a pair verify under another feature is production (BH-fix1)",
+         {"src/federation/w.rs": "#[cfg(any(test, feature = \"anchor\"))]\npub fn v(b: &[u8]) { let _ = verify_threshold_signatures(b, &[], &[], 1); }\n"},
+         "a standalone component verify (`verify_threshold_signatures("),
+        ("a pair verify in a module file declared under the test-anchor cfg is not production (BH-fix1)",
+         {"src/federation/mod.rs": FIX_MOD.replace("pub mod door_x;\n", "pub mod door_x;\n#[cfg(any(test, feature = \"test-anchor\"))]\npub mod anchor_x;\n"),
+          "src/federation/anchor_x.rs": "pub fn v(b: &[u8]) { let _ = verify_threshold_signatures(b, &[], &[], 1); }\n"},
+         None),
+        ("a pending separate-pair verify passes `check` (BH-fix1)",
+         {"src/ffi/fixture_pending.rs": "pub fn v(m: &[u8], k: &K) { let _ = verify_skill_import_manifest(m, k); }\n"},
+         None),
+        ("a pending entry does not cover another name in its file (BH-fix1)",
+         {"src/ffi/fixture_pending.rs": "pub fn v(m: &[u8], k: &K) { let _ = verify_skill_import_manifest(m, k); let _ = verify_quorum_policy(m, k); }\n"},
+         "a standalone component verify (`verify_quorum_policy("),
+        ("Verify's pair type named in production is red (BH-fix3)",
+         {"src/federation/w.rs": "pub struct S { pub signature: ciris_verify_core::transport_binding::TransportBindingSignature }\n"},
+         "a standalone component verify (`TransportBindingSignature"),
+        ("Verify's pair producer named in production is red (BH-fix3)",
+         {"src/federation/w.rs": "pub async fn p() { let _ = produce_signed_identity_occurrence(&s, e).await; }\n"},
+         "a standalone component verify (`produce_signed_identity_occurrence"),
+        ("the local stand-in is not Verify's type (BH-fix3)",
+         {"src/federation/w.rs": "pub struct S { pub q: Vec<RetiredMemberPairSignature>, pub s: RetiredPairSignature }\n"},
+         None),
+        ("a stale pending entry is red (BH-fix1)",
+         {"src/ffi/fixture_pending.rs": "fn f() {}\n"},
+         "in LONE_VERIFY_PENDING but no longer matched"),
         ("a door's whole test-gated module file is not production",
          {"src/federation/some_invariants.rs": "pub fn plan_family() { refuse_earlier_form(\"x\"); }\n",
           TSV: FIX_TSV.replace("federation/door_x.rs::plan_family", "federation/some_invariants.rs::plan_family")},
@@ -1757,6 +1917,20 @@ def self_test() -> int:
         shutil.rmtree(d, ignore_errors=True)
     print(f"{'PASS' if ok else 'FAIL'} release-check with a pending door")
     failed += 0 if ok else 1
+    # release-check: red on a pending separate-pair verify (BH-fix1)
+    d = Path(tempfile.mkdtemp(prefix="efd-"))
+    try:
+        _write_fixture(d, {SWITCH_FILE: FIX_SWITCH.format("true"),
+                           "src/ffi/fixture_pending.rs":
+                               "pub fn v(m: &[u8], k: &K) { let _ = verify_skill_import_manifest(m, k); }\n"})
+        import contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = release_check(d)
+        ok = rc == 1
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    print(f"{'PASS' if ok else 'FAIL'} release-check with a pending separate-pair verify")
+    failed += 0 if ok else 1
     # unignore: refused while off, removes the attribute (not the comment) once on
     for shut, want_rc, want_left in (("false", 1, 1), ("true", 0, 0)):
         d = Path(tempfile.mkdtemp(prefix="efd-"))
@@ -1792,7 +1966,7 @@ def self_test() -> int:
             failed += 1
             for e in errors or ["(green)"]:
                 print(f"     got: {e}")
-    print(f"self-test: {len(cases) + 5 - failed}/{len(cases) + 5}")
+    print(f"self-test: {len(cases) + 6 - failed}/{len(cases) + 6}")
     return 0 if not failed else 1
 
 

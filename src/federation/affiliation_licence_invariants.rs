@@ -139,6 +139,34 @@ pub mod bodies {
         row
     }
 
+    /// v62.0.0 (LF-fix1; CC 2.7.3) — **the gate's token behind a [`put`]
+    /// result that must not conclude**: a refusal's `kind`, or, for a row the
+    /// door HELD on a fold condition, the fold's reason token spelled as that
+    /// kind (`federation_<reason>`: each reason token is the gate's former
+    /// refusal kind without the prefix, `fold::reason`). Panics when the row
+    /// was admitted. `put` reports a held row only after reading that no row
+    /// is stored under its id.
+    fn refused_or_held(r: Result<Attestation, Error>, what: &str) -> String {
+        match held_reason(&r) {
+            Some((reason, _detail)) => format!("federation_{reason}"),
+            None => kind_of(r, what),
+        }
+    }
+
+    /// v62.0.0 (LF-fix1) — is the revocation `revocation_id` held on the
+    /// revocation plane under the subject key digest `subject_digest`?
+    async fn revocation_held(
+        d: &dyn FederationDirectory,
+        subject_digest: &str,
+        revocation_id: &str,
+    ) -> bool {
+        d.revocations_for_subject(subject_digest)
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.revocation_id == revocation_id)
+    }
+
     fn kind_of(r: Result<Attestation, Error>, what: &str) -> String {
         match r {
             Ok(a) => panic!("{what}: must be refused, admitted {}", a.attestation_id),
@@ -1429,6 +1457,50 @@ pub mod bodies {
         .await;
         let at = base() - Duration::minutes(30);
         let named = |row: Attestation| placed(row, "federation", &[&holder]);
+        // v62.0.0 (LF-fix1; CIRISPersist#596 item 1) — the board's adverse
+        // row below is a `revocation:{entity_type}:{reason}` about a KEYED
+        // subject: the typed revocation plane, whose door asks the revoker's
+        // `slash` conferral from a root THIS node trusts
+        // (`check_revocation_authority`). So the runner gives the backend a
+        // node identity, the node holds a ROOTED trust root (W1b), and the
+        // root confers `slash` on the board with the board's own voice
+        // (`put_conferral`). Postcondition: the conferral reaches the root
+        // through this node, so a fixture that confers nothing fails here.
+        {
+            use crate::federation::admission::DELEGATION_SCOPE_SLASH;
+            use crate::federation::edition2::fixture_switch as e2;
+            let node = d.node_key_id().unwrap_or_else(|| {
+                panic!("[{tag}] I1218: the runner gives the backend a node identity")
+            });
+            let r = e2::rooted_trust_root(
+                d,
+                &crate::federation::edition2::fixture_genesis::HOLDER_SEEDS,
+                "quorum:2/3",
+            )
+            .await;
+            crate::federation::edition2::fixture_trust_root::put_conferral(
+                d,
+                &r,
+                &board,
+                &[DELEGATION_SCOPE_SLASH],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] I1218: the root confers slash on the board: {e}"));
+            let rooted = crate::federation::trust_root::capability_roots_to_trusted_root(
+                d,
+                &node,
+                &e2::kid(&board),
+                DELEGATION_SCOPE_SLASH,
+            )
+            .await
+            .expect("capability_roots_to_trusted_root");
+            assert!(
+                rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
+                "[{tag}] I1218 precondition: the board's slash roots at {} through this node: \
+                 {rooted:?}",
+                r.root
+            );
+        }
         let lic = must_put(
             d,
             &named(licence(&board, &holder, &board, "suspended", None, at)),
@@ -1439,7 +1511,13 @@ pub mod bodies {
         // carries its `revoked_at` and `effective_at` (both required, CC
         // rc21; `edition2::payloads`).
         let revoked = crate::federation::licensure_chain_invariants::bodies::rfc3339(at);
-        let adverse = must_put(
+        // v62.0.0 (LF-fix1) — a revocation about a keyed subject is the typed
+        // revocation plane's (`edition2::typed`): it lands as the
+        // [`Revocation`](crate::federation::Revocation) it states, held under
+        // the subject's key digest, and its statement; no row of the
+        // attestation plane carries its id. So the witness reads the door's
+        // outcome and the plane, not `get_attestation`.
+        let (adverse, adverse_out) = crate::federation::licensure_chain_invariants::bodies::offer(
             d,
             &named(with(
                 with(
@@ -1462,15 +1540,49 @@ pub mod bodies {
                 "effective_at",
                 revoked,
             )),
-            "I1218 a revocation row about the holder",
         )
-        .await;
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] I1218 a revocation row about the holder: {e}"));
+        if !matches!(adverse_out, Some(StatementOutcome::Row { .. })) {
+            let why = match &adverse_out {
+                Some(StatementOutcome::Pending { row_id, .. }) => {
+                    crate::federation::edition2::fold::why_held(d, row_id)
+                        .await
+                        .unwrap()
+                        .map(|h| format!("{}: {}", h.reason, h.detail))
+                }
+                _ => None,
+            };
+            panic!(
+                "[{tag}] I1218: the board's revocation must conclude (its slash is conferred): \
+                 {adverse_out:?}, held {why:?}"
+            );
+        }
+        let holder_digest = {
+            let rec = d
+                .lookup_public_key(&key_id(&holder))
+                .await
+                .unwrap()
+                .expect("the holder's key is held");
+            crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(
+                &rec.pubkey_ed25519_base64,
+            )
+            .expect("the holder's Ed25519 half")
+            .to_hex()
+        };
+        assert!(
+            revocation_held(d, &holder_digest, &adverse.attestation_id).await,
+            "[{tag}] I1218: the revocation is held on its plane, under the holder's key"
+        );
         let benign = must_put(
             d,
             &named(with(
                 licence(&board, &holder, &board, "issued", None, at),
                 "dimension",
-                serde_json::json!("endorsement:skill:v1"),
+                // v62 (LF-fix1): a REGISTERED family outside the adverse
+                // classes (`need:{domain}:{kind}`); `endorsement:` resolves
+                // to no registered family and the edition-2 door refuses it.
+                serde_json::json!("need:identity:handle:v1"),
             )),
             "I1218 a benign row about the holder",
         )
@@ -1482,16 +1594,81 @@ pub mod bodies {
         };
         // The subject may not withdraw a licence or a revocation about
         // itself. Kills: the carve-out missing `licensure:` / `revocation:`.
-        for (target, what) in [(&lic, "licensure"), (&adverse, "revocation")] {
-            let e = put(d, &withdraw(&holder, &target.attestation_id, 20))
+        // v62.0.0 (LF-fix1; wave GC1, CC 2.7.3) — the verdict over a HELD
+        // target reads that other row, so the door HOLDS a withdraws its
+        // issuer has no standing for (`withdraws_not_admitted`) instead of
+        // refusing it: `refused_or_held` reads the gate's token either way,
+        // and `put` reports that no row was stored.
+        let e = refused_or_held(
+            put(d, &withdraw(&holder, &lic.attestation_id, 20)).await,
+            "I1218 the subject withdraws its licence",
+        );
+        assert_eq!(
+            e, "federation_withdraws_not_admitted",
+            "[{tag}] I1218: a subject's withdraws against licensure"
+        );
+        assert!(
+            d.get_attestation(&lic.attestation_id)
                 .await
-                .expect_err("subject withdraws an adverse row");
+                .unwrap()
+                .is_some(),
+            "[{tag}] I1218: the licence stands"
+        );
+        // The revocation: its subject's withdraws concludes nothing, and the
+        // revocation stands (CC 2.4.1.1: an entity revocation is withdrawn by
+        // nobody). The typed plane holds no attestation row under the
+        // statement's id; v62.0.0 (LF-fix2, P5) the withdraws gate reads the
+        // statement store under it and SETTLES `withdraws_not_admitted` (it
+        // waited `link_unheld` forever).
+        // Strict (LF-fix2): the door's own outcome is HELD, the fold's reason
+        // is exactly `withdraws_not_admitted`, nothing concludes, and the held
+        // set (the pending sweep's input) carries it settled, never waiting.
+        {
+            use crate::federation::edition2::fold::{self, reason};
+            let (w, out) = crate::federation::licensure_chain_invariants::bodies::offer(
+                d,
+                &withdraw(&holder, &adverse.attestation_id, 20),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("[{tag}] I1218: the subject's withdraws of the revocation is held: {e}")
+            });
+            let Some(StatementOutcome::Pending { row_id: wid, .. }) = out else {
+                panic!(
+                    "[{tag}] I1218: a subject's withdraws against revocation concludes nothing: \
+                     {out:?}"
+                );
+            };
             assert_eq!(
-                e.kind(),
-                "federation_withdraws_not_admitted",
-                "[{tag}] I1218: a subject's withdraws against {what}"
+                fold::why_held(d, &wid).await.unwrap().map(|h| h.reason),
+                Some(reason::WITHDRAWS_NOT_ADMITTED.to_owned()),
+                "[{tag}] I1218: a subject's withdraws against revocation settles not admitted"
+            );
+            assert!(
+                d.get_attestation(&w.attestation_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "[{tag}] I1218: the withdraws concludes nothing"
+            );
+            fold::refold_all(d)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] I1218: refold_all: {e:?}"));
+            let page = fold::held_rows(d, None, fold::MAX_HELD_PAGE).await.unwrap();
+            let entry = page
+                .iter()
+                .find(|h| h.row_id == wid)
+                .unwrap_or_else(|| panic!("[{tag}] I1218: the settled withdraws is held"));
+            assert_eq!(
+                entry.reason,
+                reason::WITHDRAWS_NOT_ADMITTED,
+                "[{tag}] I1218: the held set carries the settle, never `link_unheld`"
             );
         }
+        assert!(
+            revocation_held(d, &holder_digest, &adverse.attestation_id).await,
+            "[{tag}] I1218: the revocation stands after its subject's withdraws"
+        );
         // Control: the subject may withdraw a benign row about itself (rule 2).
         must_put(
             d,
@@ -1520,12 +1697,12 @@ pub mod bodies {
             "I1218 the licensee files",
         )
         .await;
-        let e = put(d, &recon(&stranger, serde_json::json!({}), 14))
-            .await
-            .expect_err("a stranger files");
+        let e = refused_or_held(
+            put(d, &recon(&stranger, serde_json::json!({}), 14)).await,
+            "I1218 a stranger files",
+        );
         assert_eq!(
-            e.kind(),
-            "federation_delegated_scope_unauthorized",
+            e, "federation_delegated_scope_unauthorized",
             "[{tag}] I1218: a stranger has no standing on a licence"
         );
         // The ruling is the authority's. Kills: dropping the authority set
@@ -1536,15 +1713,16 @@ pub mod bodies {
             "I1218 the authority rules",
         )
         .await;
-        let e = put(
-            d,
-            &recon(&holder, serde_json::json!({ "outcome": "reversed" }), 9),
-        )
-        .await
-        .expect_err("the licensee rules");
+        let e = refused_or_held(
+            put(
+                d,
+                &recon(&holder, serde_json::json!({ "outcome": "reversed" }), 9),
+            )
+            .await,
+            "I1218 the licensee rules",
+        );
         assert_eq!(
-            e.kind(),
-            "federation_delegated_scope_unauthorized",
+            e, "federation_delegated_scope_unauthorized",
             "[{tag}] I1218: the licensee files but does not rule"
         );
         // The producer still withdraws its own licence (rule 1).
@@ -2046,12 +2224,50 @@ mod run {
         i1217_postgres,
         "i1217"
     );
-    on_both_backends!(
-        i1218_licence_contest_path,
-        i1218_sqlite,
-        i1218_postgres,
-        "i1218"
-    );
+    // v62.0.0 (LF-fix1) — I1218's revocation leg reads this node's own trust
+    // root (`check_revocation_authority`), so its runners give the backend a
+    // node identity: a `node` key E0 minted, live as an edition-2
+    // `key:record`. Same body on both backends.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1218_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let tag = format!("i1218-{}", suffix());
+        let node = crate::federation::edition2::fixture_switch::put_key(
+            &b,
+            &format!("node-{tag}"),
+            &[crate::federation::types::identity_type::NODE],
+        )
+        .await;
+        b.set_node_key_id(node);
+        super::bodies::i1218_licence_contest_path(&b, &tag).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1218_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let tag = format!("i1218-{}", suffix());
+        let node = crate::federation::edition2::fixture_switch::put_key(
+            &b,
+            &format!("node-{tag}"),
+            &[crate::federation::types::identity_type::NODE],
+        )
+        .await;
+        b.set_node_key_id(node);
+        super::bodies::i1218_licence_contest_path(&b, &tag).await;
+    }
     on_both_backends!(
         i1219_owner_binding_names_the_affiliation,
         i1219_sqlite,

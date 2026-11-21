@@ -10,35 +10,21 @@
 //! its own preimage (`verify::sig19`). A door that still receives the earlier
 //! pair refuses it by name (`federation::edition2::door::earlier_form_signature`).
 //!
-//! What remains are the two data types the retired capsule op
-//! (`DirectoryOp::VerifyHybridViaDirectory` / `DirectoryOpResult::HybridVerify`)
-//! still names in its append-only wire shape. Nothing verifies with them.
+//! What remains is the one data type the retired capsule result
+//! (`DirectoryOpResult::HybridVerify`) still names in its append-only wire
+//! shape, [`VerifyOutcome`]. Nothing verifies with it. The earlier
+//! `HybridPolicy` type is deleted (v62.0.0, CL-fix1); the name below is only
+//! an alias of the capsule's wire-only stand-in, so the retired op's `policy`
+//! member keeps its exact ABI-14 shape.
 //! `scripts/earlier_form_doors.py` fails if a bound-hybrid verifier returns.
 
 use std::time::Duration;
 
-/// The earlier hybrid-verify policy (wire shape only, v62.0.0).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum HybridPolicy {
-    /// Reject hybrid-pending rows. Both signatures REQUIRED.
-    /// Production posture for high-stakes domains.
-    Strict,
-    /// Accept hybrid-pending rows iff `row_age < window`. Matches
-    /// V004's eventual-consistency contract: a row written recently
-    /// enough that the cold-path sweep hasn't had time to fill in
-    /// the PQC component is acceptable.
-    SoftFreshness {
-        /// Maximum acceptable age of a hybrid-pending row.
-        window: Duration,
-    },
-    /// Always accept Ed25519-only verification. Development /
-    /// sovereign-mode posture; not for federation production.
-    ///
-    ///
-    /// v62.0.0 (F0-cp7): no verify reads it; it survives only in the
-    /// retired capsule op's wire shape.
-    Ed25519Fallback,
-}
+/// v62.0.0 (CL-fix1) — wire shape of a retired op; never evaluated. An alias
+/// of [`crate::ffi::directory_capsule::RetiredHybridPolicy`], kept at this
+/// path so `DirectoryOp::VerifyHybridViaDirectory`'s pinned field text is
+/// unchanged. No verify reads it.
+pub use crate::ffi::directory_capsule::RetiredHybridPolicy as HybridPolicy;
 
 /// Outcome of a successful `verify_hybrid` call. Distinguishes
 /// hybrid-verified (both signatures passed) from Ed25519-only

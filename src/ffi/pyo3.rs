@@ -1486,12 +1486,15 @@ impl PyEngine {
     /// of this `PyEngine` carrying the process-singleton's disk-pressure
     /// monitor, for the doors that run the WILL decision. The same shape
     /// `EngineCell::engine_view` builds; no second pool, runtime or signer.
-    fn hold_engine_view(&self) -> crate::Engine {
-        let mut engine = crate::Engine::from_shared_with_local(
+    ///
+    /// # Errors
+    /// `node_key_conflict` (`RuntimeError`, [`shared_view`]).
+    fn hold_engine_view(&self) -> PyResult<crate::Engine> {
+        let mut engine = shared_view(
             self.engine_dispatch(),
             self.signer.clone(),
             self.local_signer.clone(),
-        );
+        )?;
         let monitor = engine_slot().as_ref().and_then(|cell| {
             cell.disk_pressure
                 .lock()
@@ -1503,7 +1506,7 @@ impl PyEngine {
                 .with_disk_pressure_config_shared(monitor.config())
                 .with_disk_pressure_state_shared(monitor.subscribe());
         }
-        engine
+        Ok(engine)
     }
 
     /// v6.8.0 (CIRISPersist#149) / #846 — the accept decision for a COMMONS
@@ -1516,7 +1519,7 @@ impl PyEngine {
     /// Async on purpose — see [`Self::local_derived_key_id_async`]: the
     /// caller blocks on it inside its own `py.detach` span.
     async fn would_hold_commons_async(&self, attesting_key_id: &str) -> PyResult<()> {
-        let engine = self.hold_engine_view();
+        let engine = self.hold_engine_view()?;
         let provenance = crate::federation::BlobProvenance {
             author_key_id: attesting_key_id.to_owned(),
             cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
@@ -2425,7 +2428,7 @@ impl PyEngine {
         // V211 DDL ran in the field and the pass never did. Logged, never
         // fatal. The counts are also `settle_instant_forms_json()`.
         {
-            let open_engine = crate::Engine::from_shared_with_local(
+            let open_engine = shared_view(
                 match &backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
@@ -2438,7 +2441,7 @@ impl PyEngine {
                 },
                 signer.clone(),
                 local_signer.clone(),
-            );
+            )?;
             py.detach(|| runtime.block_on(open_engine.settle_at_open()));
         }
 
@@ -2608,11 +2611,11 @@ impl PyEngine {
                 // Build a temporary Engine view that shares the cell's
                 // backend + signer (the spawn_sweeper loop calls
                 // sweep_evictions_once on this Engine each tick).
-                let engine = crate::Engine::from_shared_with_local(
+                let engine = shared_view(
                     cell.engine_backend_dispatch(),
                     cell.signer.clone(),
                     cell.local_signer.clone(),
-                );
+                )?;
                 // Apply the snapshot config to the Engine — the
                 // sweeper loop reads cfg via Engine::sweep_evictions_once.
                 // We bypass with_replication_config (which connects)
@@ -2632,11 +2635,11 @@ impl PyEngine {
         // re-ack loop: always on when this engine can sign a claim (no budget
         // gate — a claim lapses after 72 h whatever the disk says).
         {
-            let engine = crate::Engine::from_shared_with_local(
+            let engine = shared_view(
                 cell.engine_backend_dispatch(),
                 cell.signer.clone(),
                 cell.local_signer.clone(),
-            );
+            )?;
             let _enter = cell.runtime.enter();
             if let Some(reack) = engine.spawn_reack_sweeper() {
                 *cell.reack_sweeper.lock().unwrap_or_else(|p| p.into_inner()) = Some(reack);
@@ -2872,7 +2875,7 @@ impl PyEngine {
         let cell = slot
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
-        cell.engine_view().set_self_key_id(key_id);
+        cell.engine_view()?.set_self_key_id(key_id);
         Ok(())
     }
 
@@ -2886,7 +2889,7 @@ impl PyEngine {
         let cell = slot
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
-        Ok(cell.engine_view().self_key_id())
+        Ok(cell.engine_view()?.self_key_id())
     }
 
     /// v22.0.0 (CIRISPersist#543 / ciris.ai/contextual-integrity) —
@@ -3831,9 +3834,10 @@ impl PyEngine {
         // which is the honest answer and the whole reason the band exists.
         let declared = match self_key_id {
             Some(s) => Some(s.to_owned()),
-            None => engine_slot()
-                .as_ref()
-                .and_then(|cell| cell.engine_view().self_key_id()),
+            None => match engine_slot().as_ref() {
+                Some(cell) => cell.engine_view()?.self_key_id(),
+                None => None,
+            },
         };
         let root = root_key_id.map(ToOwned::to_owned);
         let at = parse_rfc3339_arg("now", now)?;
@@ -3999,11 +4003,11 @@ impl PyEngine {
             std::mem::drop(existing.stop());
         }
         if now_active {
-            let engine = crate::Engine::from_shared_with_local(
+            let engine = shared_view(
                 cell.engine_backend_dispatch(),
                 cell.signer.clone(),
                 cell.local_signer.clone(),
-            )
+            )?
             .with_replication_config_shared(snapshot);
             let _enter = cell.runtime.enter();
             if let Some(sweeper) = engine.spawn_sweeper() {
@@ -4031,11 +4035,11 @@ impl PyEngine {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let engine = crate::Engine::from_shared_with_local(
+        let engine = shared_view(
             cell.engine_backend_dispatch(),
             cell.signer.clone(),
             cell.local_signer.clone(),
-        )
+        )?
         .with_replication_config_shared(snapshot);
         drop(slot);
         py.detach(move || {
@@ -4062,11 +4066,11 @@ impl PyEngine {
         let cell = slot
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
-        let engine = crate::Engine::from_shared_with_local(
+        let engine = shared_view(
             cell.engine_backend_dispatch(),
             cell.signer.clone(),
             cell.local_signer.clone(),
-        );
+        )?;
         drop(slot);
         py.detach(move || {
             runtime
@@ -4095,11 +4099,11 @@ impl PyEngine {
         let cell = slot
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
-        let engine = crate::Engine::from_shared_with_local(
+        let engine = shared_view(
             cell.engine_backend_dispatch(),
             cell.signer.clone(),
             cell.local_signer.clone(),
-        );
+        )?;
         drop(slot);
         py.detach(move || {
             let now = chrono::Utc::now();
@@ -4119,11 +4123,11 @@ impl PyEngine {
         let cell = slot
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
-        let engine = crate::Engine::from_shared_with_local(
+        let engine = shared_view(
             cell.engine_backend_dispatch(),
             cell.signer.clone(),
             cell.local_signer.clone(),
-        );
+        )?;
         drop(slot);
         py.detach(move || {
             runtime
@@ -4860,8 +4864,8 @@ impl PyEngine {
             };
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
                         .local_derived_key_id()
@@ -5063,8 +5067,8 @@ impl PyEngine {
             };
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
                         .install_storage_budget_v1(&wire_json, &ed_pub, &mldsa_pub)
@@ -5096,8 +5100,8 @@ impl PyEngine {
             };
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(
                     async move { engine.get_installed_storage_budget_json(&node_id).await },
                 )
@@ -5322,7 +5326,7 @@ impl PyEngine {
                     #[cfg(feature = "sqlite")]
                     BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
                 };
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                let engine = shared_view(backend, signer, local_signer)?;
                 runtime.block_on(async move {
                     let report = engine
                         .backfill_trace_attestations()
@@ -5363,23 +5367,23 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let backend = self.backend.clone();
             let signer = self.signer.clone();
-            let report = py
-                .detach(move || {
-                    let backend = match &backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(b) => {
-                            crate::engine::BackendDispatch::Postgres(b.clone())
-                        }
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(b) => {
-                            crate::engine::BackendDispatch::Sqlite(b.clone())
-                        }
-                    };
-                    let engine =
-                        crate::Engine::from_shared_with_local(backend, signer, Some(local_signer));
-                    runtime.block_on(async move { engine.promote_consented_backlog().await })
+            let report = py.detach(move || {
+                let backend = match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(b) => {
+                        crate::engine::BackendDispatch::Postgres(b.clone())
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+                };
+                let engine = shared_view(backend, signer, Some(local_signer))?;
+                runtime.block_on(async move {
+                    engine
+                        .promote_consented_backlog()
+                        .await
+                        .map_err(federation_err_to_py)
                 })
-                .map_err(federation_err_to_py)?;
+            })?;
             let dict = PyDict::new(py);
             dict.set_item("promoted", report.promoted)?;
             dict.set_item("widened", report.widened)?;
@@ -5768,11 +5772,25 @@ impl PyEngine {
                                         crate::engine::BackendDispatch::Sqlite(b.clone())
                                     }
                                 };
-                                let engine = crate::Engine::from_shared_with_local(
+                                // LF-fix2 (P4) — a best-effort chokepoint:
+                                // a `node_key_conflict` is logged like its
+                                // other failures (every door of the same
+                                // engine refuses on it typed).
+                                let engine = match crate::Engine::try_from_shared_with_local(
                                     backend,
                                     signer,
                                     Some(local_signer),
-                                );
+                                ) {
+                                    Ok(engine) => engine,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "receive_and_persist: consent-sweep chokepoint (a) \
+                                             skipped: no engine view"
+                                        );
+                                        return;
+                                    }
+                                };
                                 runtime.block_on(async move {
                                     if let Err(e) = engine.promote_consented_backlog().await {
                                         tracing::warn!(
@@ -6064,8 +6082,8 @@ impl PyEngine {
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
             let runtime = self.runtime.clone();
+            let engine = shared_view(backend, signer, local_signer)?;
             let outcome = py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
                         .rebind_key_record(record)
@@ -6098,8 +6116,8 @@ impl PyEngine {
             let local_signer = self.local_signer.clone();
             let runtime = self.runtime.clone();
             let identity_type = identity_type.to_owned();
+            let engine = shared_view(backend, signer, local_signer)?;
             let outcome = py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
                         .rebind_self_federation_key(&identity_type)
@@ -6263,8 +6281,8 @@ impl PyEngine {
             let local_signer = self.local_signer.clone();
             let runtime = self.runtime.clone();
             let statement = statement.to_vec();
+            let engine = shared_view(backend, signer, local_signer)?;
             let outcome = py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
                         .put_edition2_statement(&statement, offered)
@@ -6353,8 +6371,8 @@ impl PyEngine {
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
             let runtime = self.runtime.clone();
+            let engine = shared_view(backend, signer, local_signer)?;
             let statement = py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine.sign_draft(&draft).await.map_err(|e| {
                         federation_err_to_py(
@@ -6425,8 +6443,8 @@ impl PyEngine {
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
             let runtime = self.runtime.clone();
+            let engine = shared_view(backend, signer, local_signer)?;
             let sealed = py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move { engine.seal_trace(&trace, level).await })
             });
             let sealed = sealed.map_err(|e| ingest_err_to_py(e, "seal_trace_statement"))?;
@@ -6855,6 +6873,72 @@ impl PyEngine {
         })
     }
 
+    /// v62.0.0 (BH-fix3) — an identity template's signed message (v1): the
+    /// 32-byte SHA-256 of
+    /// `JCS({"domain": "ciris.identity_template.v1", "manifest_sha256",
+    /// "manifest_size", "signer_identity"})`
+    /// (`edition2::signing_domain::identity_template_v1_message`). A holder
+    /// signs `domain_preimage("ciris.identity_template.v1", this)` (86 bytes).
+    /// Raises `ValueError` for a malformed digest or an empty signer.
+    fn identity_template_v1_message<'py>(
+        &self,
+        py: Python<'py>,
+        manifest_sha256_hex: &str,
+        manifest_size: u64,
+        signer_identity: &str,
+    ) -> PyResult<Py<PyBytes>> {
+        catch_panic(|| {
+            let m = crate::federation::edition2::signing_domain::identity_template_v1_message(
+                manifest_sha256_hex,
+                manifest_size,
+                signer_identity,
+            )
+            .map_err(federation_err_to_py)?;
+            Ok(PyBytes::new(py, &m).unbind())
+        })
+    }
+
+    /// v62.0.0 (BH-fix3) — verify an identity template signature (v1), now:
+    /// `statement_digest` is the caller's 32 bytes
+    /// (`identity_template_v1_message`); `signer_identity` must be an accord
+    /// holder of the genesis bundle in force
+    /// (`accord_manifest_signer_not_holder` otherwise), and `composite_sig`
+    /// ONE composite over `domain_preimage("ciris.identity_template.v1",
+    /// digest)` under that holder's live edition-2 key
+    /// (`edition2::signing_domain::verify_identity_template_v1`). Returns
+    /// `None`; a refusal raises with its token.
+    fn verify_identity_template_v1(
+        &self,
+        py: Python<'_>,
+        statement_digest: &[u8],
+        signer_identity: &str,
+        composite_sig: &[u8],
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let (digest, who, sig) = (
+                statement_digest.to_vec(),
+                signer_identity.to_owned(),
+                composite_sig.to_vec(),
+            );
+            py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::edition2::signing_domain::verify_identity_template_v1(
+                        dir.as_ref(),
+                        &digest,
+                        &who,
+                        &sig,
+                        crate::federation::edition2::composite_verify::now_ms(),
+                    )
+                    .await
+                    .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
     /// v62.0.0 (P2c; CC 2.7, CC 3.1.5) — **the standing of every identity
     /// amendment about `agent`**, read now: FFI mirror of
     /// [`amendment_standings_for`](crate::federation::identity_amendment::amendment_standings_for).
@@ -7228,11 +7312,11 @@ impl PyEngine {
     fn settle_instant_forms_json(&self, py: Python<'_>) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
-            let engine = crate::Engine::from_shared_with_local(
+            let engine = shared_view(
                 self.engine_dispatch(),
                 self.signer.clone(),
                 self.local_signer.clone(),
-            );
+            )?;
             let pass = py
                 .detach(|| self.runtime.block_on(engine.settle_instant_forms()))
                 .map_err(federation_err_to_py)?;
@@ -7837,8 +7921,8 @@ impl PyEngine {
             let local_signer = self.local_signer.clone();
             let runtime = self.runtime.clone();
             let identity_type = identity_type.to_owned();
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
                         .register_self_federation_key(&identity_type, valid_until_dt, evidence)
@@ -7897,59 +7981,6 @@ impl PyEngine {
         })
     }
 
-    /// Cold-start binding-rooting primitive (CIRISPersist#94).
-    ///
-    /// Confirm a claimed `(key_id, pubkey)` binding against the
-    /// `federation_keys` directory and verify the row's recursive-
-    /// provenance chain up to a steward bootstrap. Replaces
-    /// trust-on-first-use.
-    ///
-    /// Returns the [`RootingVerdict`](crate::federation::RootingVerdict)
-    /// as a JSON string — `{"verdict":"confirmed", ...}` or
-    /// `{"verdict":"rejected","reason":...}`. A `Rejected` verdict is
-    /// NOT a Python exception: rooting always produces a typed verdict
-    /// (MISSION.md §1.6 — fail-honest), so the caller branches on the
-    /// `verdict` field rather than catching.
-    ///
-    /// CIRISEdge's resolver is Rust and calls
-    /// `crate::federation::root_binding` directly; this PyO3 wrapper
-    /// mirrors the `lookup_public_key` surface for the lens FastAPI
-    /// integration. **One implementation, both surfaces.**
-    fn root_binding(
-        &self,
-        py: Python<'_>,
-        key_id: &str,
-        claimed_pubkey_ed25519_base64: &str,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let key_id = key_id.to_owned();
-            let claimed = claimed_pubkey_ed25519_base64.to_owned();
-            py.detach(move || {
-                let verdict = match &self.backend {
-                    #[cfg(feature = "postgres")]
-                    BackendDispatch::Postgres(pg) => {
-                        let backend = pg.clone();
-                        runtime.block_on(async move {
-                            crate::federation::root_binding(&*backend, &key_id, &claimed).await
-                        })
-                    }
-                    #[cfg(feature = "sqlite")]
-                    BackendDispatch::Sqlite(sq) => {
-                        let backend = sq.clone();
-                        runtime.block_on(async move {
-                            crate::federation::root_binding(&*backend, &key_id, &claimed).await
-                        })
-                    }
-                };
-                serde_json::to_string(&verdict).map_err(|e| {
-                    PyRuntimeError::new_err(format!("RootingVerdict JSON encode: {e}"))
-                })
-            })
-        })
-    }
-
     /// Verify-consumable provenance read (CIRISVerify WS-4).
     ///
     /// Returns the `federation_keys` row for `key_id` plus its full
@@ -7962,9 +7993,8 @@ impl PyEngine {
     /// error) — the typed
     /// [`RootingRejection`](crate::federation::RootingRejection)
     /// `kind()` token is the error message. (The verifying primitive
-    /// `root_binding` folds these into a `Rejected` verdict instead;
-    /// this raw read surfaces them as an error since there is no
-    /// chain to return.)
+    /// `root_binding` is deleted, v62.0.0 BH-fix1: it walked earlier-form
+    /// separate-pair scrub signatures.)
     fn provenance_chain(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -8150,8 +8180,8 @@ impl PyEngine {
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
             let id = attestation_id.to_owned();
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
                         .enter_mesh(&id, &ci, None)
@@ -8185,8 +8215,8 @@ impl PyEngine {
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
             let id = prior_attestation_id.to_owned();
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
                         .widen_audience(&id, &ci, None, &strip)
@@ -8230,8 +8260,7 @@ impl PyEngine {
                     // hand-matching the dispatch here would be a second
                     // spelling, and it collapses to an infallible pattern in
                     // any single-backend build (the shipped wheel is both).
-                    let dir = crate::Engine::from_shared_with_local(backend, signer, local_signer)
-                        .federation_directory();
+                    let dir = shared_view(backend, signer, local_signer)?.federation_directory();
                     let row = dir
                         .get_attestation(&id)
                         .await
@@ -8305,11 +8334,7 @@ impl PyEngine {
                 )
             })?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(
-                    backend,
-                    signer,
-                    Some(local_signer.clone()),
-                );
+                let engine = shared_view(backend, signer, Some(local_signer.clone()))?;
                 runtime.block_on(async move {
                     engine
                         .emit_attestation(&local_signer, input)
@@ -8363,8 +8388,8 @@ impl PyEngine {
             // / PqcNotConfigured error honestly if the hybrid surface is
             // unavailable.
             let local_signer = self.local_signer.clone();
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
                         .emit_attestation_self(input)
@@ -8431,11 +8456,7 @@ impl PyEngine {
             let delegate = delegate_key_id.to_owned();
             let purpose = delegation_purpose.map(str::to_owned);
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(
-                    backend,
-                    signer,
-                    Some(local_signer.clone()),
-                );
+                let engine = shared_view(backend, signer, Some(local_signer.clone()))?;
                 runtime.block_on(async move {
                     engine
                         .grant_delegation(
@@ -8480,11 +8501,7 @@ impl PyEngine {
             let key = node_or_agent_key_id.to_owned();
             let purpose = delegation_purpose.map(str::to_owned);
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(
-                    backend,
-                    signer,
-                    Some(local_signer.clone()),
-                );
+                let engine = shared_view(backend, signer, Some(local_signer.clone()))?;
                 runtime.block_on(async move {
                     engine
                         .steward_bind(&local_signer, &key, infra_scopes, purpose.as_deref())
@@ -8509,8 +8526,8 @@ impl PyEngine {
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
             let id = row_id.to_owned();
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
                         .voice_status(&id)
@@ -8548,8 +8565,8 @@ impl PyEngine {
                 role.map(str::to_owned),
                 after.map(str::to_owned),
             );
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
                         .held_rows_for(key.as_deref(), role.as_deref(), after.as_deref(), limit)
@@ -8576,8 +8593,8 @@ impl PyEngine {
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
             let id = row_id.to_owned();
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
                         .voice_held_row(&id, None)
@@ -8602,8 +8619,8 @@ impl PyEngine {
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
             let (id, iss) = (row_id.to_owned(), signer_iss.to_owned());
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
                         .voice_draft(&id, &iss)
@@ -8628,8 +8645,8 @@ impl PyEngine {
             let backend = self.engine_backend();
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
                         .submit_voice(&statement)
@@ -8673,11 +8690,7 @@ impl PyEngine {
             let tier = binding_tier.map(str::to_owned);
             let petitioner = petitioner_key_id.map(str::to_owned);
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(
-                    backend,
-                    signer,
-                    Some(local_signer.clone()),
-                );
+                let engine = shared_view(backend, signer, Some(local_signer.clone()))?;
                 runtime.block_on(async move {
                     engine
                         .steward_bind_incapacity(
@@ -8731,11 +8744,7 @@ impl PyEngine {
             let moderator = moderator_key_id.to_owned();
             let duty = duty.to_owned();
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(
-                    backend,
-                    signer,
-                    Some(local_signer.clone()),
-                );
+                let engine = shared_view(backend, signer, Some(local_signer.clone()))?;
                 runtime.block_on(async move {
                     engine
                         .add_moderator(&local_signer, &community, &moderator, &duty, term)
@@ -8763,11 +8772,7 @@ impl PyEngine {
             let target = target_attestation_id.to_owned();
             let delegate = delegate_key_id.to_owned();
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(
-                    backend,
-                    signer,
-                    Some(local_signer.clone()),
-                );
+                let engine = shared_view(backend, signer, Some(local_signer.clone()))?;
                 runtime.block_on(async move {
                     engine
                         .revoke_delegation(&local_signer, &target, &delegate)
@@ -8798,11 +8803,7 @@ impl PyEngine {
             let moderator = moderator_key_id.to_owned();
             let duty = duty.to_owned();
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(
-                    backend,
-                    signer,
-                    Some(local_signer.clone()),
-                );
+                let engine = shared_view(backend, signer, Some(local_signer.clone()))?;
                 runtime.block_on(async move {
                     engine
                         .remove_moderator(&local_signer, &community, &target, &moderator, &duty)
@@ -8835,11 +8836,7 @@ impl PyEngine {
             let duty = duty.to_owned();
             let allegation = allegation_type.to_owned();
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(
-                    backend,
-                    signer,
-                    Some(local_signer.clone()),
-                );
+                let engine = shared_view(backend, signer, Some(local_signer.clone()))?;
                 runtime.block_on(async move {
                     engine
                         .file_moderation(&local_signer, &content, &community, &duty, &allegation)
@@ -11488,7 +11485,7 @@ impl PyEngine {
                     #[cfg(feature = "sqlite")]
                     BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
                 };
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                let engine = shared_view(backend, signer, local_signer)?;
                 runtime.block_on(async move {
                     if self_sign {
                         engine
@@ -11581,7 +11578,7 @@ impl PyEngine {
                     #[cfg(feature = "sqlite")]
                     BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
                 };
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                let engine = shared_view(backend, signer, local_signer)?;
                 runtime.block_on(async move {
                     if self_sign {
                         engine
@@ -12955,7 +12952,7 @@ impl PyEngine {
             let cell = slot
                 .as_ref()
                 .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
-            let engine = cell.engine_view();
+            let engine = cell.engine_view()?;
             drop(slot);
             py.detach(move || {
                 runtime.block_on(async move {
@@ -14246,8 +14243,8 @@ impl PyEngine {
             };
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
                         .put_custody_ack(
@@ -14657,7 +14654,7 @@ impl PyEngine {
                 }
             };
             let provenance = wire.provenance.into_provenance("adopt_sealed_blob_json")?;
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let out = runtime
@@ -14717,7 +14714,7 @@ impl PyEngine {
             let provenance = wire.provenance.into_provenance("adopt_sealed_chunk_json")?;
             let (stream_id, seq, epoch, size) =
                 (wire.stream_id, wire.seq, wire.epoch, wire.plaintext_size);
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let sha = runtime
@@ -14776,7 +14773,7 @@ impl PyEngine {
                 .provenance
                 .into_provenance("adopt_sealed_chunks_json")?;
             let (stream_id, epoch) = (wire.stream_id, wire.epoch);
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let items: Vec<crate::federation::AdoptChunkItem<'_>> = envelopes
@@ -14820,7 +14817,7 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             let node = node_key_id.to_owned();
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let row = runtime
@@ -14856,7 +14853,7 @@ impl PyEngine {
                 shas.push(parse_sha256_hex(h)?);
             }
             let stream = stream_id.to_owned();
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let sth = runtime
@@ -14893,7 +14890,7 @@ impl PyEngine {
             let sha = parse_sha256_hex(at_rest_sha256_hex)?;
             let viewer = viewer_key_id.to_owned();
             let aad = decode_aad_b64(caller_aad_b64)?;
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let view = runtime
@@ -14930,7 +14927,7 @@ impl PyEngine {
             let sha = parse_sha256_hex(at_rest_sha256_hex)?;
             let viewer = viewer_key_id.to_owned();
             let aad = decode_aad_b64(caller_aad_b64)?;
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let r = runtime
@@ -14958,7 +14955,7 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             let sha = parse_sha256_hex(manifest_sha256_hex)?;
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let rows = runtime
@@ -14987,7 +14984,7 @@ impl PyEngine {
         catch_panic(|| {
             let m = parse_sha256_hex(manifest_sha256_hex)?;
             let c = parse_sha256_hex(chunk_sha256_hex)?;
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime
@@ -15020,7 +15017,7 @@ impl PyEngine {
             let sha = parse_sha256_hex(at_rest_sha256_hex)?;
             let viewer = viewer_key_id.to_owned();
             let aad = decode_aad_b64(caller_aad_b64)?;
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let page = runtime
@@ -15069,7 +15066,7 @@ impl PyEngine {
             let provenance = wire
                 .provenance
                 .into_provenance("adopt_sealed_manifest_child_json")?;
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let sha = runtime
@@ -15095,7 +15092,7 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             let stream = stream_id.to_owned();
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let out = runtime
@@ -15146,7 +15143,7 @@ impl PyEngine {
                     )))
                 }
             };
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let out = runtime
@@ -15187,7 +15184,7 @@ impl PyEngine {
                     )
                 })?;
             let (manifest, chunks) = parse_put_blob_chunks_payload(&v.to_string())?;
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let sha = runtime
@@ -15228,7 +15225,7 @@ impl PyEngine {
             };
             let body = crate::federation::BlobBody::Inline(body.to_vec());
             let author = author_key_id.to_owned();
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let sha = runtime
@@ -15265,7 +15262,7 @@ impl PyEngine {
             })?;
             let manifest = plaintext_manifest_from_wire(wire.manifest)?;
             let author = wire.author_key_id;
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let sha = runtime
@@ -15295,7 +15292,7 @@ impl PyEngine {
             let wire: ProvenanceWire = serde_json::from_str(payload_json)
                 .map_err(|e| PyValueError::new_err(format!("would_hold_json decode: {e}")))?;
             let provenance = wire.into_provenance("would_hold_json")?;
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let decision =
@@ -15324,7 +15321,7 @@ impl PyEngine {
     fn hold_breadth(&self, py: Python<'_>) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime
@@ -23579,60 +23576,6 @@ impl PyEngine {
         })
     }
 
-    /// #249 Cut G3 (§4/§5), robust on G3.5 — verify a membership change is
-    /// authorized by the group's current roster under the group's OWN
-    /// `consensus_protocol` (v49.0.0, #908: verify checks structure, one-seat,
-    /// anti-replay and every signature; persist's one evaluator decides the
-    /// threshold). `change_envelope_json`
-    /// is the `cohort_build_membership_change_envelope` output the members
-    /// cosigned; `signatures_json` is a JSON array of
-    /// [`ciris_verify_core::threshold::ThresholdSignature`]. Returns `None` on
-    /// success; raises `ValueError` if not authorized.
-    fn cohort_verify_membership_quorum(
-        &self,
-        py: Python<'_>,
-        cohort: &str,
-        group_key_id: &str,
-        change_envelope_json: &str,
-        signatures_json: &str,
-    ) -> PyResult<()> {
-        self.ensure_usable()?;
-        let cohort = cohort_from_token(cohort)?;
-        let change_envelope: serde_json::Value = serde_json::from_str(change_envelope_json)
-            .map_err(|e| PyValueError::new_err(format!("change_envelope_json: {e}")))?;
-        let signatures: Vec<ciris_verify_core::threshold::ThresholdSignature> =
-            serde_json::from_str(signatures_json)
-                .map_err(|e| PyValueError::new_err(format!("signatures_json: {e}")))?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let group_key_id = group_key_id.to_owned();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    macro_rules! dispatch {
-                        ($backend:expr) => {{
-                            let b = $backend.clone();
-                            b.verify_membership_quorum(
-                                cohort,
-                                &group_key_id,
-                                &change_envelope,
-                                &signatures,
-                            )
-                            .await
-                            .map_err(federation_err_to_py)
-                        }};
-                    }
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => dispatch!(pg),
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
-                    }
-                })
-            })
-        })
-    }
-
     /// #249 Cut G3 (§3/§4/§5) — quorum-gated supersede: verify the current
     /// roster's strict-majority quorum cosigned `change_envelope_json`, then
     /// supersede `new_group_json` (raw `Family`/`Community`), recording the
@@ -23650,7 +23593,7 @@ impl PyEngine {
         let cohort = cohort_from_token(cohort)?;
         let change_envelope: serde_json::Value = serde_json::from_str(change_envelope_json)
             .map_err(|e| PyValueError::new_err(format!("change_envelope_json: {e}")))?;
-        let signatures: Vec<ciris_verify_core::threshold::ThresholdSignature> =
+        let signatures: Vec<crate::federation::types::RetiredMemberPairSignature> =
             serde_json::from_str(signatures_json)
                 .map_err(|e| PyValueError::new_err(format!("signatures_json: {e}")))?;
         use crate::federation::cohort::Cohort;
@@ -23843,7 +23786,7 @@ impl PyEngine {
         catch_panic(|| {
             let key_id = key_id.to_owned();
             let scope = cohort_scope.to_owned();
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             py.detach(move || {
                 let peers = self
                     .runtime
@@ -23910,7 +23853,7 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             let identity = identity_key_id.to_owned();
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             py.detach(move || {
                 let r = self
                     .runtime
@@ -23947,7 +23890,7 @@ impl PyEngine {
                 family_key_id.to_owned(),
                 new_member_identity_key_id.to_owned(),
             );
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             py.detach(move || {
                 let r = self
                     .runtime
@@ -23998,7 +23941,7 @@ impl PyEngine {
                 new_occurrence_key_id.to_owned(),
                 authority_key_id.to_owned(),
             );
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             py.detach(move || {
                 let r = self
                     .runtime
@@ -24046,7 +23989,7 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             let (comm, member) = (community_key_id.to_owned(), member_key_id.to_owned());
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             py.detach(move || {
                 let r = self
                     .runtime
@@ -24085,7 +24028,7 @@ impl PyEngine {
                          device_key_id, or neither",
                     )),
                 };
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             py.detach(move || {
                 let r = self
                     .runtime
@@ -24110,7 +24053,7 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             let key_id = key_id.to_owned();
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             py.detach(move || {
                 let peers = self
                     .runtime
@@ -24131,7 +24074,7 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             let identity = identity_key_id.to_owned();
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             py.detach(move || {
                 let standing = self
                     .runtime
@@ -24149,7 +24092,7 @@ impl PyEngine {
     fn execute_self_roster_due(&self, py: Python<'_>) -> PyResult<usize> {
         self.ensure_usable()?;
         catch_panic(|| {
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             py.detach(move || {
                 self.runtime
                     .block_on(engine.execute_self_roster_due())
@@ -24165,7 +24108,7 @@ impl PyEngine {
     fn execute_cosign_due(&self, py: Python<'_>) -> PyResult<usize> {
         self.ensure_usable()?;
         catch_panic(|| {
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             py.detach(move || {
                 self.runtime
                     .block_on(engine.execute_cosign_due())
@@ -24220,7 +24163,7 @@ impl PyEngine {
                 scope.to_owned(),
                 qualifier.map(str::to_owned),
             );
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             py.detach(move || {
                 let stance = self
                     .runtime
@@ -24277,7 +24220,7 @@ impl PyEngine {
                     ))
                 })?;
             let (a, sub) = (attester_key_id.to_owned(), subject_key_id.to_owned());
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             py.detach(move || {
                 let stance = self
                     .runtime
@@ -24331,7 +24274,7 @@ impl PyEngine {
                     ))
                 })?;
             let (a, sub) = (attester_key_id.to_owned(), subject_key_id.to_owned());
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             py.detach(move || {
                 let (state, basis) = self
                     .runtime
@@ -24373,7 +24316,7 @@ impl PyEngine {
                 scope.to_owned(),
                 qualifier.map(str::to_owned),
             );
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             py.detach(move || {
                 let stance = self
                     .runtime
@@ -24419,7 +24362,7 @@ impl PyEngine {
             None => chrono::Utc::now(),
         };
         catch_panic(|| {
-            let engine = self.hold_engine_view();
+            let engine = self.hold_engine_view()?;
             py.detach(move || {
                 let report = self
                     .runtime
@@ -28751,7 +28694,10 @@ impl PyEngine {
     }
 
     /// CC 3.3.10.1 L8, first shape — two owner-signed heads (JSON
-    /// `SignedHead` each) at one sequence number with different hashes.
+    /// `SignedHead` each: `{ledger_id, seq, head_hash, signature_key_id,
+    /// signature_composite_base64}`, ONE composite signature; v62 removes
+    /// the separate classical/pqc pair) at one sequence number with
+    /// different hashes. A head in the earlier pair shape fails to decode.
     /// Returns the JSON `ForkEvidence` in canonical order (transferable
     /// evidence must not depend on arrival order), or `None` when the
     /// heads do not constitute a fork.
@@ -30094,8 +30040,8 @@ impl PyEngine {
             let backend = self.engine_dispatch();
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     let report = engine
                         .tighten_vocabulary(&target, dry_run)
@@ -31133,10 +31079,12 @@ impl PyEngine {
 
     // ── skill_import (consumer-side manifest verification) ──
 
-    /// v3.8.0 — verify a `SkillImportManifest` against a trusted
-    /// steward Ed25519 + ML-DSA-65 pubkey pair. Returns JSON
-    /// `{"valid": true, "source": ..., ...}` on success; raises with
-    /// the structured reason on signature / canonicalization failure.
+    /// v3.8.0 — verify a `SkillImportManifest`; v62.0.0 (BH-fix2) — it
+    /// REFUSES every manifest, by name (`RuntimeError`, `skill_import verify
+    /// failed: skill_import: earlier_form_object: …`): the manifest is the
+    /// earlier bound-pair form, and edition 2 carries a skill import as a
+    /// `provenance:skill_import:{source}` row (one composite statement through
+    /// the statement door). Kept so the caller gets a named error.
     fn verify_skill_import_manifest_b64(
         &self,
         manifest_bytes_b64: &str,
@@ -32113,8 +32061,8 @@ impl PyEngine {
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
             let runtime = self.runtime.clone();
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     let out = call(engine).await.map_err(cirisnode_row_err_to_py)?;
                     let v = serde_json::to_value(&out)
@@ -32156,8 +32104,8 @@ impl PyEngine {
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
             let runtime = self.runtime.clone();
+            let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     let out = call(engine).await.map_err(federation_err_to_py)?;
                     serde_json::to_string(&out)
@@ -35107,7 +35055,9 @@ mod tests {
     #[serial_test::serial(engine_singleton)]
     fn current_rust_engine_none_when_no_engine() {
         clear_singleton_slot();
-        assert!(super::current_rust_engine().is_none());
+        assert!(super::current_rust_engine()
+            .expect("current_rust_engine: no node_key_conflict")
+            .is_none());
         assert!(super::current_runtime_handle().is_none());
     }
 
@@ -35122,8 +35072,12 @@ mod tests {
     fn current_rust_engine_shares_singleton_backend() {
         let cell_backend = install_test_sqlite_cell();
 
-        let e1 = super::current_rust_engine().expect("engine after install");
-        let e2 = super::current_rust_engine().expect("engine on second call");
+        let e1 = super::current_rust_engine()
+            .expect("current_rust_engine: no node_key_conflict")
+            .expect("engine after install");
+        let e2 = super::current_rust_engine()
+            .expect("current_rust_engine: no node_key_conflict")
+            .expect("engine on second call");
         // OnceLock cache → same `Arc<Engine>` allocation.
         assert!(
             Arc::ptr_eq(&e1, &e2),
@@ -35157,7 +35111,9 @@ mod tests {
 
         let cell_backend = install_test_sqlite_cell();
         let handle = super::current_runtime_handle().expect("runtime handle");
-        let engine = super::current_rust_engine().expect("engine");
+        let engine = super::current_rust_engine()
+            .expect("current_rust_engine: no node_key_conflict")
+            .expect("engine");
 
         // A read against an empty federation directory through the
         // Engine view returns Ok(None) — confirms the view is live.
@@ -35175,7 +35131,9 @@ mod tests {
 
         // After close(), the accessor must yield None.
         clear_singleton_slot();
-        assert!(super::current_rust_engine().is_none());
+        assert!(super::current_rust_engine()
+            .expect("current_rust_engine: no node_key_conflict")
+            .is_none());
     }
 
     /// v1.13.0 (#92) — backend conformance: `current_rust_engine`
@@ -35242,8 +35200,12 @@ mod tests {
         });
         *engine_slot() = Some(cell);
 
-        let e1 = super::current_rust_engine().expect("engine after install");
-        let e2 = super::current_rust_engine().expect("engine on second call");
+        let e1 = super::current_rust_engine()
+            .expect("current_rust_engine: no node_key_conflict")
+            .expect("engine after install");
+        let e2 = super::current_rust_engine()
+            .expect("current_rust_engine: no node_key_conflict")
+            .expect("engine on second call");
         assert!(Arc::ptr_eq(&e1, &e2), "cached Arc<Engine>");
 
         let engine_pg = e1.postgres_backend().expect("postgres backend on engine");
@@ -35262,14 +35224,18 @@ mod tests {
     #[serial_test::serial(engine_singleton)]
     fn current_rust_engine_none_after_close() {
         install_test_sqlite_cell();
-        assert!(super::current_rust_engine().is_some());
+        assert!(super::current_rust_engine()
+            .expect("current_rust_engine: no node_key_conflict")
+            .is_some());
         // Flip the closed flag without clearing the slot.
         if let Some(cell) = engine_slot().as_ref() {
             cell.closed
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         assert!(
-            super::current_rust_engine().is_none(),
+            super::current_rust_engine()
+                .expect("current_rust_engine: no node_key_conflict")
+                .is_none(),
             "closed engine must not be handed out"
         );
         assert!(super::current_runtime_handle().is_none());
@@ -35366,11 +35332,12 @@ mod tests {
             let signer: Arc<dyn HardwareSigner> = Arc::new(
                 crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
             );
-            let engine = crate::Engine::from_shared_with_local(
+            let engine = crate::Engine::try_from_shared_with_local(
                 crate::engine::BackendDispatch::Sqlite(sq.clone()),
                 signer,
                 Some(local),
-            );
+            )
+            .expect("a shared engine view: no node_key_conflict");
             // The node's REAL pubkeys: the crossing verifies the actor's
             // signature against the registered record.
             let registered = engine
@@ -35822,11 +35789,12 @@ mod tests {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let engine = crate::Engine::from_shared_with_local(
+        let engine = crate::Engine::try_from_shared_with_local(
             cell.engine_backend_dispatch(),
             cell.signer.clone(),
             cell.local_signer.clone(),
         )
+        .expect("a shared engine view: no node_key_conflict")
         .with_replication_config_shared(snapshot);
         let report = cell
             .runtime
@@ -36699,6 +36667,20 @@ mod lens_query_error {
 }
 pub use lens_query_error::LensQueryError;
 
+/// v62.0.0 (LF-fix2, P4) — **the one shared Engine view every PyO3 path
+/// builds**, through [`Engine::try_from_shared_with_local`](crate::Engine::try_from_shared_with_local):
+/// a `node_key_conflict` (the shared backend already knows a DIFFERENT
+/// identity-ref as its node key) is a Python `RuntimeError`, the class the
+/// engine-open errors use (`connect: ..`, `migrations: ..`), never a panic.
+fn shared_view(
+    backend: crate::engine::BackendDispatch,
+    signer: Arc<dyn ciris_keyring::HardwareSigner>,
+    local_signer: Option<Arc<crate::signing::LocalSigner>>,
+) -> PyResult<crate::Engine> {
+    crate::Engine::try_from_shared_with_local(backend, signer, local_signer)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
 /// v0.5.3 (CIRISPersist#27) — wrap a PyO3 method body with explicit
 /// panic catching. Converts any panic payload into a typed
 /// [`LensQueryError`] (derives from `Exception`, not `BaseException`)
@@ -36960,12 +36942,15 @@ impl EngineCell {
     /// read the snapshot cheaply (no statvfs per call); the
     /// force-evict-proxy sweep reads the config's family predicate.
     /// Shares the cell's backend + signer (no second pool).
-    fn engine_view(&self) -> crate::Engine {
-        let mut engine = crate::Engine::from_shared_with_local(
+    ///
+    /// # Errors
+    /// `node_key_conflict` (`RuntimeError`, [`shared_view`]).
+    fn engine_view(&self) -> PyResult<crate::Engine> {
+        let mut engine = shared_view(
             self.engine_backend_dispatch(),
             self.signer.clone(),
             self.local_signer.clone(),
-        );
+        )?;
         let cfg = self
             .replication_config
             .read()
@@ -36982,7 +36967,7 @@ impl EngineCell {
                 .with_disk_pressure_config_shared(monitor.config())
                 .with_disk_pressure_state_shared(monitor.subscribe());
         }
-        engine
+        Ok(engine)
     }
 }
 
@@ -37033,26 +37018,32 @@ impl EngineCell {
 ///
 /// Returns `None` when no engine is constructed yet, or after
 /// `close()` / `reset_engine()` cleared the slot.
-pub fn current_rust_engine() -> Option<Arc<crate::Engine>> {
+pub fn current_rust_engine() -> Result<Option<Arc<crate::Engine>>, crate::engine::EngineError> {
     let slot = engine_slot();
-    let cell = slot.as_ref()?;
+    let Some(cell) = slot.as_ref() else {
+        return Ok(None);
+    };
     if cell.closed.load(std::sync::atomic::Ordering::Acquire) {
-        return None;
+        return Ok(None);
     }
-    let engine = cell.rust_engine.get_or_init(|| {
-        // v2.12.0 (#112) — propagate the EngineCell's local_signer so
-        // `Engine::sign_hybrid` works on co-resident Rust consumers
-        // (CIRISLensCore client-mode trace signing, EgressFilter
-        // re-sign). The singleton already holds the LocalSigner;
-        // sharing it across the cohabitation boundary doesn't
-        // duplicate identity.
-        Arc::new(crate::Engine::from_shared_with_local(
-            cell.engine_backend_dispatch(),
-            cell.signer.clone(),
-            cell.local_signer.clone(),
-        ))
-    });
-    Some(engine.clone())
+    if let Some(engine) = cell.rust_engine.get() {
+        return Ok(Some(engine.clone()));
+    }
+    // v2.12.0 (#112) — propagate the EngineCell's local_signer so
+    // `Engine::sign_hybrid` works on co-resident Rust consumers
+    // (CIRISLensCore client-mode trace signing, EgressFilter
+    // re-sign). The singleton already holds the LocalSigner;
+    // sharing it across the cohabitation boundary doesn't
+    // duplicate identity.
+    // v62.0.0 (LF-fix2, P4) — built through the fallible constructor: a
+    // `node_key_conflict` is the caller's typed error, never a panic. A
+    // racing first call may build twice; the slot keeps one.
+    let built = Arc::new(crate::Engine::try_from_shared_with_local(
+        cell.engine_backend_dispatch(),
+        cell.signer.clone(),
+        cell.local_signer.clone(),
+    )?);
+    Ok(Some(cell.rust_engine.get_or_init(|| built).clone()))
 }
 
 /// v1.13.0 (CIRISPersist#92) — the process-singleton's long-lived

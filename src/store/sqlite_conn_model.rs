@@ -844,15 +844,14 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v54.0.0 (#994, Codex on PR #1050) — the V185 resume cursor.
     ("dag_link_backfill_cursor", ConnClass::Read),
     ("set_dag_link_backfill_cursor", ConnClass::Write),
-    // v54.0.0 (#995 row 2) — the scrub re-hydration CAS and its test seam.
-    ("test_seam_drop_key_additional_scrubs", ConnClass::Write),
     // v54.0.0 (#995 row 4, V184) — the rooms of a shared plaintext blob.
     ("blob_associations", ConnClass::Read),
     // v54.0.0 (#996) — the outbound queue's status-grouped COUNT.
     ("outbound_counts", ConnClass::Read),
     // v54.1.0 (CIRISPersist#1046) — the steward purge plane (V187): the
     // selection reads, the ledger header + tombstone writes, the delete doors
-    // `purge_finalize` drives, and the #1043 legacy-row test seam.
+    // `purge_finalize` drives. (The #1043 legacy-row seam is deleted in v62:
+    // its row cannot exist after the store delete.)
     ("purge_scan_attestations", ConnClass::Read),
     ("purge_trace_ids_for_llm_model", ConnClass::Read),
     ("purge_trace_ids_signed_by", ConnClass::Read),
@@ -865,9 +864,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("purge_delete_tombstoned_attestation", ConnClass::Write),
     ("purge_delete_tombstoned_trace", ConnClass::Write),
     ("purge_mark_finalized", ConnClass::Write),
-    ("test_seam_set_attestation_asserted_at", ConnClass::Write),
     ("test_seam_set_key_identity_type", ConnClass::Write),
-    ("test_seam_set_attestation_type", ConnClass::Write),
     ("test_seam_drop_purge_tombstone", ConnClass::Write),
     ("test_seam_factor_rollup_trace_counts", ConnClass::Read),
     // v55.0.0 (CIRISPersist#952) — the incremental plaintext DAG finalize.

@@ -13,7 +13,6 @@
 //! | `edition2/key_of_iss_v3.json` (**Verify 23.3.2**, 32 cases; R1-v2332; v2 retired) | `src/ciris-verify-core/tests/vectors/edition2/` |
 //! | `accord_halt/accord_halt_v2.json` (**Verify 23.3.0**; v1 retired) | `src/ciris-verify-core/tests/vectors/accord_halt/` |
 //! | `composite/mldsa65_ed25519_draft_kats.json` | `src/ciris-crypto/tests/vectors/composite/` |
-//! | `accord_lineage/accord_recovery_refusals_v1.json` | `src/ciris-verify-core/tests/vectors/accord_lineage/` |
 //! | `substrate_composite/composite_signatures_v1.json` | `src/ciris-verify-core/tests/vectors/substrate_composite/` |
 //!
 //! - **I1850** each file's SHA-256 is the pinned one (a silent edit, or a
@@ -24,6 +23,14 @@
 //!   forward §19 verifier ([`crate::verify::sig19::verify_sig19`], the
 //!   composite arm): every case verifies under the vector's composite key, and
 //!   every refusal is refused.
+//!
+//! v62.0.0 (BH-fix3): the earlier accord lineage's recovery refusals
+//! (`accord_lineage/accord_recovery_refusals_v1.json`, a bytes-only pin over
+//! the JSON lineage) are dropped with their orphaned v2 sibling and the
+//! `tests/vectors/accord_lineage/` files they built on: nothing replays them,
+//! and an edition-2 recovery is one recovery voice over bundle/2, which the
+//! genesis vectors' `recovery_*` cases cover (`genesis_bundles_v3.json`,
+//! I2301).
 //!
 //! - **I2360** (slice C3) the three Verify 23.3.0 files carry the case
 //!   counts they have at Verify tag 23.3.0 (ffd7af1).
@@ -65,13 +72,6 @@ const PINNED: &[(&str, &[u8], &str)] = &[
         "composite/mldsa65_ed25519_draft_kats.json",
         include_bytes!("../../tests/vectors/verify_v23/composite/mldsa65_ed25519_draft_kats.json"),
         "7dc03ce5e7da7d54c2e1616593bce53ff4a09b0cb52b787a0a6061a22eb102f3",
-    ),
-    (
-        "accord_lineage/accord_recovery_refusals_v1.json",
-        include_bytes!(
-            "../../tests/vectors/verify_v23/accord_lineage/accord_recovery_refusals_v1.json"
-        ),
-        "1c08942c4e6d4241d14f2eea3e4910f24c5f3497821191dd4d98bb144be12b92",
     ),
     (
         "substrate_composite/composite_signatures_v1.json",
@@ -116,8 +116,6 @@ fn i1850_verify_v23_vectors_are_pinned_by_sha256() {
         kats.get("jose_06").is_some() && kats.get("lamps_19").is_some(),
         "I1850: the composite KATs carry both profiles"
     );
-    let recovery = vector("accord_lineage/accord_recovery_refusals_v1.json");
-    assert_eq!(len_of(&recovery, "cases"), 5, "I1850: recovery refusals");
     let composite = vector("substrate_composite/composite_signatures_v1.json");
     assert_eq!(
         len_of(&composite, "cases"),

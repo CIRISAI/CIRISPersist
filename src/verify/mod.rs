@@ -28,8 +28,9 @@ pub use canonical_validation::{
 // v62.0.0 (F0-cp6e) — `verify_trace` and `PublicKeyDirectory` are removed.
 pub use ed25519::canonical_payload_value;
 // v62.0.0 (F0-cp7) — the bound-hybrid verify family is removed; only the
-// retired capsule op's wire types remain (`hybrid::{HybridPolicy,
-// VerifyOutcome}`), not re-exported.
+// retired capsule result's wire type remains (`hybrid::VerifyOutcome`), not
+// re-exported. `hybrid::HybridPolicy` is now only an alias of the capsule's
+// wire-only stand-in (CL-fix1).
 
 /// Verify-layer errors.
 #[derive(Debug, thiserror::Error)]

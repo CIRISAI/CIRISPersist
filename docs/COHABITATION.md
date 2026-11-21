@@ -347,7 +347,7 @@ cohabiting consumers never reach past `Arc<dyn HardwareSigner>` /
 - `Engine::node_core_service()` / `audit_service()` — per-substrate
   accessors.
 - `Engine::sign_hybrid(message)` — hybrid Ed25519 + ML-DSA-65 signing through
-  the engine's `LocalSigner`; `Engine::from_shared_with_local` carries that
+  the engine's `LocalSigner`; `Engine::try_from_shared_with_local` carries that
   signer through the cohabitation boundary.
 - `Engine::get_detection_events` / `get_edge_detection_events` /
   `subscribe_detection_events` — detection-event reads and a polling change

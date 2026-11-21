@@ -290,6 +290,119 @@ where
     }
 }
 
+/// v62.0.0 (BH-fix3) — the length of an identity template's statement
+/// digest, the message its holder signs.
+pub const IDENTITY_TEMPLATE_DIGEST_LEN: usize = 32;
+
+/// v62.0.0 (BH-fix3) — **an identity template's signed message (v1)**,
+/// [`accord_manifest_v2_message`]'s twin in the identity-template domain: the
+/// 32-byte SHA-256 of the RFC 8785 (JCS) image of
+/// `{"domain": "ciris.identity_template.v1", "manifest_sha256": <hex>,
+/// "manifest_size": <bytes>, "signer_identity": <the holder's identity-ref>}`.
+/// The holder signs [`domain_preimage`]`(IdentityTemplate, this)`, which is
+/// 24 + 4 + 26 + 32 = 86 bytes. The Agent may compute the message itself;
+/// this is the reference.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] for a `manifest_sha256` that is not 64 lowercase
+/// hex characters, or an empty `signer_identity`.
+pub fn identity_template_v1_message(
+    manifest_sha256_hex: &str,
+    manifest_size: u64,
+    signer_identity: &str,
+) -> Result<[u8; 32], Error> {
+    let hex_ok = manifest_sha256_hex.len() == 64
+        && manifest_sha256_hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !hex_ok {
+        return Err(Error::InvalidArgument(
+            "identity template: manifest_sha256 must be 64 lowercase hex characters".into(),
+        ));
+    }
+    if signer_identity.is_empty() {
+        return Err(Error::InvalidArgument(
+            "identity template: signer_identity is empty".into(),
+        ));
+    }
+    let statement = serde_json::json!({
+        "domain": SigningDomain::IdentityTemplate.tag(),
+        "manifest_sha256": manifest_sha256_hex,
+        "manifest_size": manifest_size,
+        "signer_identity": signer_identity,
+    });
+    let jcs = crate::verify::canonical::ceg_produce_canonicalize(&statement)
+        .map_err(|e| Error::InvalidArgument(format!("identity template canonicalize: {e}")))?;
+    Ok(Sha256::digest(&jcs).into())
+}
+
+/// v62.0.0 (BH-fix3) — **verify an identity template signature (v1)**, as
+/// [`verify_accord_manifest_v2`] verifies the accord manifest: the message is
+/// the caller's 32-byte statement digest ([`identity_template_v1_message`]);
+/// `signer_identity` must be a holder of the genesis bundle in force
+/// ([`GenesisInForce::is_holder`](super::genesis::GenesisInForce::is_holder)),
+/// checked HERE, in the verify; and `composite_sig` must be ONE composite over
+/// [`domain_preimage`]`(IdentityTemplate, digest)` under that holder's live
+/// edition-2 key at `at_ms`, resolved by identity-ref through the directory.
+/// The tokens are the accord manifest's.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] for a digest that is not
+/// [`IDENTITY_TEMPLATE_DIGEST_LEN`] bytes or an empty signer;
+/// [`Error::MalformedRow`] leading with [`ACCORD_MANIFEST_SIGNER_NOT_HOLDER`]
+/// (plane `identity_template`) for a signer that is not a holder; a composite
+/// refusal (another domain's signature, another signer's, other bytes) as
+/// [`Error::SignatureInvalid`] leading with its token; a directory failure as
+/// itself.
+pub async fn verify_identity_template_v1<F>(
+    dir: &F,
+    statement_digest: &[u8],
+    signer_identity: &str,
+    composite_sig: &[u8],
+    at_ms: u64,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if statement_digest.len() != IDENTITY_TEMPLATE_DIGEST_LEN {
+        return Err(Error::InvalidArgument(format!(
+            "identity template: the statement digest must be {IDENTITY_TEMPLATE_DIGEST_LEN} \
+             bytes, got {}",
+            statement_digest.len()
+        )));
+    }
+    if signer_identity.is_empty() {
+        return Err(Error::InvalidArgument(
+            "identity template: signer_identity is empty".into(),
+        ));
+    }
+    let in_force = super::genesis::genesis_in_force(dir).await?;
+    if !in_force.is_holder(signer_identity) {
+        return Err(Error::malformed_row(
+            "identity_template",
+            ACCORD_MANIFEST_SIGNER_NOT_HOLDER,
+            format!(
+                "{signer_identity} is not an accord holder of the genesis bundle in force; \
+                 an identity template is signed by a holder"
+            ),
+        ));
+    }
+    match verify_domain_composite_via_directory(
+        dir,
+        SigningDomain::IdentityTemplate,
+        statement_digest,
+        signer_identity,
+        composite_sig,
+        at_ms,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(CompositeVerifyError::Directory(e)) => Err(e),
+        Err(e) => Err(Error::SignatureInvalid(e.to_string())),
+    }
+}
+
 /// v62.0.0 (F0-cp10; ruling: authority from standing, not a key list) —
 /// **what standing a signer has over an agent**, the check an emergency
 /// shutdown needs after its composite verifies
@@ -392,6 +505,43 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **I2124 (BH-fix3) — the identity template's preimage, pinned byte for
+    /// byte**: the framing tag, `u32le(26)`, the tag
+    /// `ciris.identity_template.v1`, then the 32-byte statement digest (86
+    /// bytes); its message differs from the accord manifest's over the same
+    /// members (the `domain` member), and a malformed member is refused.
+    #[test]
+    fn i2124_the_identity_template_preimage_is_pinned() {
+        let digest = [0x11u8; 32];
+        let pre = domain_preimage(SigningDomain::IdentityTemplate, &digest);
+        let mut want = b"ciris.signing_domain/v1\0".to_vec();
+        want.extend_from_slice(&26u32.to_le_bytes());
+        want.extend_from_slice(b"ciris.identity_template.v1");
+        want.extend_from_slice(&digest);
+        assert_eq!(pre, want, "I2124: the framing");
+        assert_eq!(pre.len(), 86, "I2124: 24 + 4 + 26 + 32");
+        assert_eq!(
+            SigningDomain::from_tag("ciris.identity_template.v1").unwrap(),
+            SigningDomain::IdentityTemplate,
+            "I2124: the registered tag"
+        );
+        let hex = "ab".repeat(32);
+        let m = identity_template_v1_message(&hex, 10, "urn:x").unwrap();
+        let mut members =
+            b"{\"domain\":\"ciris.identity_template.v1\",\"manifest_sha256\":\"".to_vec();
+        members.extend_from_slice(hex.as_bytes());
+        members.extend_from_slice(b"\",\"manifest_size\":10,\"signer_identity\":\"urn:x\"}");
+        let expect: [u8; 32] = <Sha256 as sha2::Digest>::digest(&members).into();
+        assert_eq!(m, expect, "I2124: sha256 over the JCS of the four members");
+        assert_ne!(
+            m,
+            accord_manifest_v2_message(&hex, 10, "urn:x").unwrap(),
+            "I2124: the domain member separates the two messages"
+        );
+        assert!(identity_template_v1_message("AB", 10, "urn:x").is_err());
+        assert!(identity_template_v1_message(&hex, 10, "").is_err());
+    }
 
     /// **I2899 (the registry leg) — the closed set, pinned by position, one
     /// spelling per tag; the framing is exact.**

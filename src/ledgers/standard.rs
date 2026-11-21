@@ -135,7 +135,7 @@ pub enum LedgerEntryKind {
 /// One ledger entry — the hash-chained content, WITHOUT its signature.
 ///
 /// The owner-or-delegate signature covers [`entry_content_hash`] and rides
-/// alongside ([`SignedLedgerEntry`]); it is excluded from the preimage
+/// alongside the entry, never inside it: it is excluded from the preimage
 /// because a signature cannot cover itself, and excluded from the chain
 /// links so that re-signing identical content is not a fork.
 ///
@@ -166,21 +166,6 @@ pub struct LedgerEntry {
     /// exact CIRISPersist#727 shape, and this is a hash preimage where that
     /// ambiguity would be permanent.
     pub refs: Vec<String>,
-}
-
-#[allow(missing_docs)] // field names are the documentation on plain data shapes
-/// An entry together with its owner-or-delegate signature material.
-///
-/// This module does NOT verify these signatures — the admission door does,
-/// against the directory (hybrid, per the federation-tier rule). They are
-/// carried so fork evidence is complete: L8's proof is two owner-SIGNED
-/// heads, and evidence that drops the signatures stops being transferable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedLedgerEntry {
-    pub entry: LedgerEntry,
-    pub signature_key_id: String,
-    pub signature_classical_base64: String,
-    pub signature_pqc_base64: Option<String>,
 }
 
 /// The pinned content projection an entry is hashed over.
@@ -597,16 +582,22 @@ pub fn fold_canonical_bytes(fold: &ConservationFold) -> Result<Vec<u8>, LedgerEr
 
 #[allow(missing_docs)] // field names are the documentation on plain data shapes
 /// An owner-signed head as committed to the witness chain (L4) or presented
-/// by a peer. Signatures are carried opaquely — verified at the door, kept
-/// here so the evidence is complete.
+/// by a peer. The signature is carried opaquely, kept here so the evidence
+/// is complete and transferable; persist verifies nothing about it.
+///
+/// v62 (composite only): the owner's signature is ONE composite
+/// ML-DSA-65+Ed25519 signature (`signature_composite_base64`, 3373 bytes
+/// decoded) by the identity `signature_key_id` names. The earlier separate
+/// `signature_classical_base64` / `signature_pqc_base64` pair is gone, with
+/// no alias: an adjudicator holding the evidence verifies one composite
+/// through the directory, never a classical half alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedHead {
     pub ledger_id: String,
     pub seq: u64,
     pub head_hash: String,
     pub signature_key_id: String,
-    pub signature_classical_base64: String,
-    pub signature_pqc_base64: Option<String>,
+    pub signature_composite_base64: String,
 }
 
 #[allow(missing_docs)] // field names are the documentation on plain data shapes
@@ -1244,8 +1235,7 @@ mod tests {
             seq,
             head_hash: hash.into(),
             signature_key_id: "owner".into(),
-            signature_classical_base64: "c2ln".into(),
-            signature_pqc_base64: None,
+            signature_composite_base64: "c2ln".into(),
         }
     }
 

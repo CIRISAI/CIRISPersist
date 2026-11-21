@@ -1042,6 +1042,32 @@ pub fn earlier_form_signature(plane: &'static str) -> Error {
     )
 }
 
+/// v62.0.0 (BH-fix2; Verify's ruling) — the plane name of the skill-import
+/// manifest refusal ([`skill_import_manifest_refusal`]).
+pub const SKILL_IMPORT_PLANE: &str = "skill_import";
+
+/// v62.0.0 (BH-fix2; RULINGS "composite signatures only"; Verify's ruling) —
+/// **the refusal of a skill-import manifest.** Verify's `SkillImportManifest`
+/// is the earlier bound-pair form: an Ed25519 signature plus an ML-DSA-65
+/// signature over its JSON, checked against a steward key pair the caller
+/// passes in. It has no composite successor: in edition 2 a skill import is
+/// a ROW, family `provenance:skill_import:{source}`, ONE composite
+/// `COSE_Sign1` statement through the statement door. The host verb
+/// (`verify_skill_import_manifest_b64`) stays, refusing with this by name
+/// (`earlier_form_object`), so a caller gets a named error rather than a
+/// missing method.
+#[must_use]
+pub fn skill_import_manifest_refusal() -> Error {
+    Error::malformed_row(
+        SKILL_IMPORT_PLANE,
+        token::EARLIER_FORM_OBJECT,
+        "a skill_import manifest is the earlier bound-pair form (a separate Ed25519 + \
+         ML-DSA-65 signature over its JSON): v62 verifies no separate pair; edition 2 carries a \
+         skill import as a provenance:skill_import:{source} row, one composite COSE_Sign1 \
+         statement (CC 3.1.2, CC 2.6.1.12)",
+    )
+}
+
 /// **The one shared refusal every earlier-form door calls** (v62.0.0,
 /// JSON-cut slice A). `plane` names the door. It is inert until
 /// [`EARLIER_FORM_DOORS_SHUT`] is `true`; then it refuses

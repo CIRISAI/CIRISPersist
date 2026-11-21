@@ -49,9 +49,10 @@
 //!   about a held blob placed at another scope is refused
 //!   `custody_ack_scope_mismatch`. (v62.0.0, T2-fix10: the earlier-form
 //!   announce door `put_holding_claim` and its legs are deleted.)
-//! - **I718** — a retired `holds_bytes` row a node still holds is stored and
-//!   reported, never served and never read as a holder; one arriving from a
-//!   peer is refused.
+//! - **I718** — RETIRED, not reused (v62.0.0, CL-fix1): it witnessed a
+//!   retired `holds_bytes` row a node still held (built by a test seam that
+//!   rewrote a live claim's type). The upgrade deletes the earlier store and
+//!   no door writes the row (I709), so the seam and the witness are deleted.
 //! - **I719** — eviction retracts this node's own claims, at the claim's
 //!   scope, and nobody else's.
 //! - **I720** — a `public` room is Commons tier: its writes are plaintext and
@@ -67,8 +68,9 @@
 //!   (`scope_membership_unresolved`) and admitted when re-offered after it.
 //! - **I725** — the re-ack: a day-old claim on held bytes is renewed by one
 //!   pass, a claim on evicted bytes is not, and a second pass renews nothing.
-//! - **I726** — the upgrade conversion: this node's OWN retired rc6 claim on
-//!   bytes it holds is claimed once as custody:ack:v1; a peer's is inert.
+//! - **I726** — RETIRED, not reused (v62.0.0, CL-fix1): it witnessed the
+//!   upgrade conversion of this node's own retired rc6 claims, a row no v62
+//!   node holds (see I718).
 //! - **I721** — from disk: no production source builds a `holds_bytes` row
 //!   type; the stem is named only by the retired list
 //!   (`registry::RETIRED_CARRIER_STEMS`).
@@ -869,14 +871,10 @@ pub(crate) mod blob_bodies {
             .unwrap()
     }
 
-    /// The retired-type seam both blob backends carry.
-    pub(crate) trait LegacySeam {
-        fn set_type<'a>(
-            &'a self,
-            id: &'a str,
-            ty: &'a str,
-            envelope: Option<&'a serde_json::Value>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+    /// The access-column read both blob backends carry (v62.0.0, CL-fix1:
+    /// the retired-type `set_type` seam is deleted; the row it built cannot
+    /// exist after the store delete).
+    pub(crate) trait AccessSeam {
         /// The row's access-tracking columns `(access_count,
         /// last_accessed_at)`, read below every door (Codex r2 on #1065).
         fn access_stats<'a>(
@@ -885,19 +883,7 @@ pub(crate) mod blob_bodies {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (i64, String)> + Send + 'a>>;
     }
     #[cfg(feature = "sqlite")]
-    impl LegacySeam for crate::store::sqlite::SqliteBackend {
-        fn set_type<'a>(
-            &'a self,
-            id: &'a str,
-            ty: &'a str,
-            envelope: Option<&'a serde_json::Value>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-            Box::pin(async move {
-                self.test_seam_set_attestation_type(id, ty, envelope)
-                    .await
-                    .unwrap()
-            })
-        }
+    impl AccessSeam for crate::store::sqlite::SqliteBackend {
         fn access_stats<'a>(
             &'a self,
             sha: &'a [u8; 32],
@@ -917,19 +903,7 @@ pub(crate) mod blob_bodies {
         }
     }
     #[cfg(feature = "postgres")]
-    impl LegacySeam for crate::store::postgres::PostgresBackend {
-        fn set_type<'a>(
-            &'a self,
-            id: &'a str,
-            ty: &'a str,
-            envelope: Option<&'a serde_json::Value>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-            Box::pin(async move {
-                self.test_seam_set_attestation_type(id, ty, envelope)
-                    .await
-                    .unwrap()
-            })
-        }
+    impl AccessSeam for crate::store::postgres::PostgresBackend {
         fn access_stats<'a>(
             &'a self,
             sha: &'a [u8; 32],
@@ -1231,21 +1205,23 @@ pub(crate) mod blob_bodies {
 
     /// **I910** (v56.0.0, CIRISPersist#1071) — the re-ack pass is capped,
     /// oldest first, and nothing lapses. Five claims signed 70 h…66 h before
-    /// the first of three hourly passes, and one blob announced only under the
-    /// retired rc6 carrier: each pass signs at most
+    /// the first of three hourly passes: each pass signs at most
     /// [`HOLDING_CLAIM_REACK_MAX_PER_PASS`] (2 under test) claims; the first
-    /// renews the two OLDEST, the second the next two, the third the last
-    /// renewal and then the conversion (renewals before conversions); the
-    /// rest is `deferred`. Before every pass every claim is still live, and
-    /// after the third every claim is renewed (live 60 h later). Every read a
-    /// pass makes is one page of at most its limit, and none reads the node's
-    /// whole authored slice: the retired rows are sought by type prefix and
-    /// walked a page at a time.
+    /// renews the two OLDEST, the second the next two, the third the last;
+    /// the rest is `deferred`. Before every pass every claim is still live,
+    /// and after the third every claim is renewed (live 60 h later). Every
+    /// read a pass makes is one page of at most its limit, and none reads the
+    /// node's whole authored slice.
+    ///
+    /// v62.0.0 (CL-fix1): the earlier-form leg (one blob announced only under
+    /// the retired rc6 `holds_bytes` carrier, converted by the third pass) is
+    /// deleted with the `set_type` seam that built it: the upgrade deletes the
+    /// earlier store and no door writes that row, so no v62 node holds one.
     ///
     /// [`HOLDING_CLAIM_REACK_MAX_PER_PASS`]: crate::federation::holding_claim::HOLDING_CLAIM_REACK_MAX_PER_PASS
     pub(crate) async fn i910_the_reack_pass_is_capped_oldest_first<B>(b: &B, s: &str)
     where
-        B: BlobStorage + FederationDirectory + Sync + LegacySeam,
+        B: BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::attestation_query::FOLD_PAGE;
         use crate::federation::holding_claim::{
@@ -1279,39 +1255,12 @@ pub(crate) mod blob_bodies {
             .expect("I910 an aged claim");
             shas.push(sha);
         }
-        // One blob announced only under the retired rc6 carrier.
-        let bytes = format!("i910 legacy {s}").into_bytes();
-        let legacy = sha256_of(&bytes);
-        b.put_blob_signing_scoped(
-            cs::FEDERATION,
-            None,
-            &legacy,
-            BlobBody::Inline(bytes),
-            None,
-            &n.key,
-            &n.signer,
-            passes[0] - chrono::Duration::hours(1),
-            uuid::Uuid::new_v4(),
-        )
-        .await
-        .unwrap();
-        let claim = claims_of(b, &n.key, &legacy).await.remove(0);
-        let rc6 = serde_json::json!({
-            "kind": "holds_bytes", "evidence_refs": [hex::encode(legacy)],
-        });
-        b.set_type(
-            &claim.attestation_id,
-            &format!("holds_bytes:sha256:{}", &hex::encode(legacy)[..8]),
-            Some(&rc6),
-        )
-        .await;
-
         // (renewed, converted, deferred) per pass, and which claims each
         // pass renewed (by index, oldest = 0).
         let want = [
-            ((2, 0, 4), [0, 1]),
-            ((2, 0, 2), [2, 3]),
-            ((1, 1, 0), [4, 4]),
+            ((2, 0, 3), [0, 1]),
+            ((2, 0, 1), [2, 3]),
+            ((1, 0, 0), [4, 4]),
         ];
         for (k, (t, (counts, renewed))) in passes.iter().zip(want).enumerate() {
             for (i, sha) in shas.iter().enumerate() {
@@ -1364,11 +1313,6 @@ pub(crate) mod blob_bodies {
                 "I910 claim {i} was renewed before it lapsed"
             );
         }
-        assert_eq!(
-            b.list_holders(&legacy).await.unwrap(),
-            vec![n.key.clone()],
-            "I910 the retired claim was converted"
-        );
     }
 
     /// **I771** (Codex r2 on #1065) — the maintenance reads are not
@@ -1378,7 +1322,7 @@ pub(crate) mod blob_bodies {
     /// so a cold blob is not kept hot against the storage-budget sweeper.
     pub(crate) async fn i771_the_reack_scan_is_not_an_access<B>(b: &B, s: &str)
     where
-        B: BlobStorage + FederationDirectory + Sync + LegacySeam,
+        B: BlobStorage + FederationDirectory + Sync + AccessSeam,
     {
         use crate::federation::holding_claim::reack_own_claims;
         let n = node_as(b, &format!("i771-holder-{s}"), NODE).await;
@@ -1424,94 +1368,25 @@ pub(crate) mod blob_bodies {
         }
     }
 
-    /// **I726** — the upgrade conversion. A blob this node holds whose only
-    /// claim is its OWN retired rc6 row (the real rc6 envelope: `kind` and the
-    /// full digest in `evidence_refs`) is claimed once by the re-ack, at the
-    /// content's scope; a PEER's retired row about a blob this node holds
-    /// converts nothing (CC 2.4: inert); a second pass converts nothing.
-    pub(crate) async fn i726_the_reack_converts_its_own_retired_claims<B>(b: &B, s: &str)
-    where
-        B: BlobStorage + FederationDirectory + Sync + LegacySeam,
-    {
-        use crate::federation::holding_claim::reack_own_claims;
-        let n = node_as(b, &format!("i726-holder-{s}"), NODE).await;
-        let peer = node_as(b, &format!("i726-peer-{s}"), NODE).await;
-        let mut shas = Vec::new();
-        for (who, i) in [(&n, 0), (&peer, 1)] {
-            let bytes = format!("i726 bytes {i} {s}").into_bytes();
-            let sha = sha256_of(&bytes);
-            b.put_blob_signing_scoped(
-                cs::FEDERATION,
-                None,
-                &sha,
-                BlobBody::Inline(bytes),
-                None,
-                &who.key,
-                &who.signer,
-                chrono::Utc::now(),
-                uuid::Uuid::new_v4(),
-            )
-            .await
-            .unwrap();
-            // What a v54 node left: the same claim, as the rc6 carrier.
-            let claim = claims_of(b, &who.key, &sha).await.remove(0);
-            let rc6 = serde_json::json!({
-                "kind": "holds_bytes", "evidence_refs": [hex::encode(sha)],
-            });
-            b.set_type(
-                &claim.attestation_id,
-                &format!("holds_bytes:sha256:{}", &hex::encode(sha)[..8]),
-                Some(&rc6),
-            )
-            .await;
-            assert!(claims_of(b, &who.key, &sha).await.is_empty());
-            shas.push(sha);
-        }
-        let (own, peers) = (shas[0], shas[1]);
-        assert!(
-            b.list_holders(&own).await.unwrap().is_empty(),
-            "I726 dark after upgrade"
-        );
-        let now = chrono::Utc::now();
-        let r = reack_own_claims(b, &n.signer, now).await.unwrap();
-        assert_eq!(
-            (r.converted, r.failed),
-            (1, 0),
-            "I726 one conversion: {r:?}"
-        );
-        let c = claims_of(b, &n.key, &own).await;
-        assert_eq!(c.len(), 1);
-        assert_eq!(
-            c[0].cohort_scope,
-            cs::FEDERATION,
-            "I726 at the content's scope"
-        );
-        assert_eq!(b.list_holders(&own).await.unwrap(), vec![n.key.clone()]);
-        assert!(
-            claims_of(b, &n.key, &peers).await.is_empty()
-                && b.list_holders(&peers).await.unwrap().is_empty(),
-            "I726 a peer's retired row converts nothing"
-        );
-        let again = reack_own_claims(b, &n.signer, now).await.unwrap();
-        assert_eq!(again.converted, 0, "I726 once: {again:?}");
-        assert_eq!(claims_of(b, &n.key, &own).await.len(), 1);
-    }
-
     /// **I778** (Codex r3 on #1065) — no holding claim about withheld bytes.
     /// With **I802** (CIRISEdge v55): `blob_custody` reports `withheld` naming
     /// the notice; `list_holders`, `list_local_holders` and `list_held_by`
     /// name no holder of / no withheld blob; an ordinary blob is untouched.
     /// A counter-notice takedown keeps the bytes on disk through its window;
-    /// a blob this node announced only under the retired rc6 carrier (no
-    /// custody row yet) is NOT converted by the re-ack (counted `withheld`,
-    /// no `here` claim, still dark), `emit_holding_claim` called directly is
-    /// `Purged` naming the notice, and the custody-report door refuses `here`.
+    /// `emit_holding_claim` called directly is `Purged` naming the notice,
+    /// and the custody-report door refuses `here`.
+    ///
+    /// v62.0.0 (CL-fix1): the earlier-form leg (a blob announced only under
+    /// the retired rc6 `holds_bytes` carrier is not converted by the re-ack)
+    /// is deleted with the `set_type` seam that built the row: no v62 node
+    /// holds one (the upgrade deletes the earlier store). The withheld blob
+    /// here keeps its live claim, which no holder read names.
     pub(crate) async fn i778_no_holding_claim_about_withheld_bytes<B>(b: &B, s: &str)
     where
-        B: BlobStorage + FederationDirectory + Sync + LegacySeam,
+        B: BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::doors_takedown_invariants::bodies::{claimant, establish, notice};
-        use crate::federation::holding_claim::{emit_holding_claim, reack_own_claims};
+        use crate::federation::holding_claim::emit_holding_claim;
         let n = node_as(b, &format!("i778-holder-{s}"), NODE).await;
         let bytes = format!("i778 bytes {s}").into_bytes();
         let sha = sha256_of(&bytes);
@@ -1528,19 +1403,10 @@ pub(crate) mod blob_bodies {
         )
         .await
         .unwrap();
-        let claim = claims_of(b, &n.key, &sha).await.remove(0);
-        let rc6 = serde_json::json!({
-            "kind": "holds_bytes", "evidence_refs": [hex::encode(sha)],
-        });
-        b.set_type(
-            &claim.attestation_id,
-            &format!("holds_bytes:sha256:{}", &hex::encode(sha)[..8]),
-            Some(&rc6),
-        )
-        .await;
-        assert!(
-            claims_of(b, &n.key, &sha).await.is_empty(),
-            "I778 precondition"
+        assert_eq!(
+            claims_of(b, &n.key, &sha).await.len(),
+            1,
+            "I778 precondition: the holder's live claim"
         );
         // A counter-notice takedown: the bytes stay, withheld.
         let owner = claimant(0xa1);
@@ -1556,19 +1422,6 @@ pub(crate) mod blob_bodies {
         assert!(
             t.tombstoned && b.blob_head(&sha).await.unwrap().is_some(),
             "I778 held, withheld"
-        );
-        let r = reack_own_claims(b, &n.signer, chrono::Utc::now())
-            .await
-            .unwrap();
-        assert_eq!(
-            (r.converted, r.withheld, r.failed),
-            (0, 1, 0),
-            "I778 the conversion skips the withheld blob: {r:?}"
-        );
-        assert!(
-            claims_of(b, &n.key, &sha).await.is_empty()
-                && b.list_holders(&sha).await.unwrap().is_empty(),
-            "I778 no `here` claim: the holder stays dark"
         );
         let e = emit_holding_claim(b, &n.signer, &sha, chrono::Utc::now())
             .await
@@ -1692,116 +1545,6 @@ pub(crate) mod blob_bodies {
         );
     }
 
-    /// **I803** (Codex r4 on #1065; CIRISEdge's constraints) — the re-ack
-    /// sweeper's first pass runs after its START DELAY, inside the spawned
-    /// task: spawn returns at once; an upgraded node (a blob announced only
-    /// under the retired rc6 carrier, so dark to v55's holder reads) is not
-    /// converted before the delay, IS converted by shortly after it, and a
-    /// second retired claim seeded after that pass is converted by the next
-    /// interval tick; writes made while the sweeper runs succeed. Driven with
-    /// short real durations through `spawn_reack_sweeper_with` (the store's
-    /// reads run on the blocking pool, which paused tokio time does not
-    /// wait for).
-    pub(crate) async fn i803_the_reack_sweeper_converts_after_its_start_delay<B>(
-        engine: &crate::Engine,
-        b: &B,
-        s: &str,
-    ) where
-        B: BlobStorage + FederationDirectory + Sync + LegacySeam,
-    {
-        use std::time::{Duration, Instant};
-        const DELAY: Duration = Duration::from_millis(600);
-        const INTERVAL: Duration = Duration::from_millis(2500);
-        let me = engine.local_derived_key_id().await.unwrap();
-        // A blob this node announced, its claim left as the rc6 carrier.
-        let legacy = |tag: &'static str| {
-            let me = me.clone();
-            async move {
-                let bytes = format!("i803 {tag} {s}").into_bytes();
-                let sha = sha256_of(&bytes);
-                engine
-                    .put_blob_signing(
-                        &sha,
-                        BlobBody::Inline(bytes),
-                        None,
-                        &me,
-                        chrono::Utc::now(),
-                        uuid::Uuid::new_v4(),
-                    )
-                    .await
-                    .expect("I803 the node announces a blob");
-                let claim = claims_of(b, &me, &sha).await.remove(0);
-                let rc6 = serde_json::json!({
-                    "kind": "holds_bytes", "evidence_refs": [hex::encode(sha)],
-                });
-                b.set_type(
-                    &claim.attestation_id,
-                    &format!("holds_bytes:sha256:{}", &hex::encode(sha)[..8]),
-                    Some(&rc6),
-                )
-                .await;
-                assert!(b.list_holders(&sha).await.unwrap().is_empty(), "I803 dark");
-                sha
-            }
-        };
-        let first = legacy("first").await;
-        let listed = |sha: [u8; 32]| {
-            let me = me.clone();
-            async move { b.list_holders(&sha).await.unwrap().contains(&me) }
-        };
-        let t0 = Instant::now();
-        let sweeper = engine
-            .spawn_reack_sweeper_with(DELAY, INTERVAL)
-            .expect("I803 the engine has a PQC local signer");
-        assert!(
-            t0.elapsed() < Duration::from_millis(100),
-            "I803 spawn returns at once: {:?}",
-            t0.elapsed()
-        );
-        // A write while the sweeper runs succeeds.
-        let side = format!("i803 side {s}").into_bytes();
-        engine
-            .put_blob_signing(
-                &sha256_of(&side),
-                BlobBody::Inline(side),
-                None,
-                &me,
-                chrono::Utc::now(),
-                uuid::Uuid::new_v4(),
-            )
-            .await
-            .expect("I803 a concurrent write succeeds");
-        tokio::time::sleep(DELAY / 3).await;
-        assert!(!listed(first).await, "I803 no pass before the start delay");
-        // Converted by shortly after the delay (well before the interval).
-        let by = DELAY + Duration::from_millis(900);
-        while t0.elapsed() < by && !listed(first).await {
-            tokio::time::sleep(Duration::from_millis(40)).await;
-        }
-        assert!(
-            listed(first).await,
-            "I803 converted by the start delay ({DELAY:?}), not at the interval ({INTERVAL:?})"
-        );
-        let first_pass = t0.elapsed();
-        // The cadence: a second retired claim waits for the next tick.
-        let second = legacy("second").await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            !listed(second).await,
-            "I803 no pass between ticks ({:?} after the first)",
-            t0.elapsed() - first_pass
-        );
-        let next = DELAY + INTERVAL + Duration::from_millis(1500);
-        while t0.elapsed() < next && !listed(second).await {
-            tokio::time::sleep(Duration::from_millis(40)).await;
-        }
-        let _ = sweeper.stop().await;
-        assert!(
-            listed(second).await,
-            "I803 the interval tick converted the second"
-        );
-    }
-
     /// **I717** — the content's scope, at admission and at the announce door.
     pub(crate) async fn i717_the_claim_scope_is_the_contents<B>(b: &B, s: &str)
     where
@@ -1863,64 +1606,6 @@ pub(crate) mod blob_bodies {
             Some(crate::federation::holding_claim::CUSTODY_ACK_SCOPE_MISMATCH),
             "I717 the attestation door holds it for its scope"
         );
-    }
-
-    /// **I718** — a retired row a node holds.
-    pub(crate) async fn i718_a_held_retired_row_is_inert<B>(b: &B, s: &str)
-    where
-        B: BlobStorage + FederationDirectory + Sync + LegacySeam,
-    {
-        let n = node_as(b, &format!("i718-holder-{s}"), NODE).await;
-        let bytes = format!("i718 bytes {s}").into_bytes();
-        let sha = sha256_of(&bytes);
-        b.put_blob_signing_scoped(
-            cs::FEDERATION,
-            None,
-            &sha,
-            BlobBody::Inline(bytes),
-            None,
-            &n.key,
-            &n.signer,
-            chrono::Utc::now(),
-            uuid::Uuid::new_v4(),
-        )
-        .await
-        .unwrap();
-        let claim = claims_of(b, &n.key, &sha).await.remove(0);
-        let legacy_type = format!("holds_bytes:sha256:{}", &hex::encode(sha)[..8]);
-        b.set_type(&claim.attestation_id, &legacy_type, None).await;
-        assert!(
-            b.get_attestation(&claim.attestation_id)
-                .await
-                .unwrap()
-                .is_some(),
-            "I718 stored, not deleted"
-        );
-        let served = b.list_attestations_since(None, 100_000).await.unwrap();
-        assert!(
-            served
-                .iter()
-                .all(|r| r.attestation.attestation_id != claim.attestation_id),
-            "I718 never served (CC 2.4)"
-        );
-        assert!(
-            b.list_holders(&sha).await.unwrap().is_empty(),
-            "I718 never read as a holder"
-        );
-        let report = crate::federation::row_type::row_type_report(b)
-            .await
-            .unwrap();
-        assert!(
-            report
-                .held_unregistered
-                .iter()
-                .any(|h| h.attestation_type == legacy_type),
-            "I718 reported to the operator"
-        );
-        // v62 (E4 round 3): the earlier-form leg (a peer's retired JSON row,
-        // re-stamped under a fresh uuid, offered at the replicated door) is
-        // DELETED: an edition-2 row is its statement, stored under its row
-        // id, so that row cannot be built (ruling 4).
     }
 
     /// **I719** — eviction retracts this node's own claims only.
@@ -2185,55 +1870,6 @@ mod runners {
         Some(b)
     });
 
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn i803_the_reack_sweeper_converts_after_its_start_delay_sqlite() {
-        let alias = format!("i803-{}", suffix());
-        let engine = crate::Engine::with_signer_pre_genesis(
-            crate::federation::tier_ingest::test_support::local_signer(&alias),
-            "sqlite::memory:",
-        )
-        .await
-        .unwrap();
-        engine
-            .register_self_federation_key(crate::federation::types::identity_type::NODE, None, None)
-            .await
-            .unwrap();
-        let b = engine.sqlite_backend().unwrap().clone();
-        super::blob_bodies::i803_the_reack_sweeper_converts_after_its_start_delay(
-            &engine,
-            b.as_ref(),
-            &suffix(),
-        )
-        .await;
-    }
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test]
-    async fn i803_the_reack_sweeper_converts_after_its_start_delay_postgres() {
-        let Some(dsn) = crate::test_pg::empty_dsn() else {
-            return;
-        };
-        let alias = format!("i803-{}", suffix());
-        let engine = crate::Engine::with_signer_pre_genesis(
-            crate::federation::tier_ingest::test_support::local_signer(&alias),
-            &dsn,
-        )
-        .await
-        .unwrap();
-        engine
-            .register_self_federation_key(crate::federation::types::identity_type::NODE, None, None)
-            .await
-            .unwrap();
-        let b = engine.postgres_backend().unwrap().clone();
-        super::blob_bodies::i803_the_reack_sweeper_converts_after_its_start_delay(
-            &engine,
-            b.as_ref(),
-            &suffix(),
-        )
-        .await;
-    }
-
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     macro_rules! blob_runners {
         ($modname:ident, $fresh:expr) => {
@@ -2251,11 +1887,9 @@ mod runners {
                 }
                 one!(i715_the_commons_door_claims_at_federation);
                 one!(i717_the_claim_scope_is_the_contents);
-                one!(i718_a_held_retired_row_is_inert);
                 one!(i719_eviction_retracts_only_its_own_claims);
                 one!(i720_a_public_room_is_commons_tier);
                 one!(i725_the_reack_renews_what_is_held);
-                one!(i726_the_reack_converts_its_own_retired_claims);
                 one!(i771_the_reack_scan_is_not_an_access);
                 one!(i910_the_reack_pass_is_capped_oldest_first);
                 one!(i778_no_holding_claim_about_withheld_bytes);

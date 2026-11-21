@@ -1467,6 +1467,21 @@ pub(crate) mod test_support {
         node_seed: &str,
         tag: &str,
     ) -> String {
+        confer_age_witnesses(dir, node_seed, &[tag])
+            .await
+            .pop()
+            .expect("one witness")
+    }
+
+    /// v62.0.0 (K2-fix15) — [`confer_age_witness`] for several witnesses
+    /// under ONE rooted trust root (`rooted_trust_root` is stood up once per
+    /// directory): witness `i` is `"{tags[i]}-witness"`, its grant dated
+    /// `i` seconds after the first.
+    async fn confer_age_witnesses(
+        dir: &dyn FederationDirectory,
+        node_seed: &str,
+        tags: &[&str],
+    ) -> Vec<String> {
         use crate::federation::edition2::fixture_genesis::HOLDER_SEEDS;
         use crate::federation::edition2::fixture_trust_root::confers_statement;
         use crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE;
@@ -1476,15 +1491,8 @@ pub(crate) mod test_support {
             Some(node.as_str()),
             "confer_age_witness: the runner gives the backend `node_seed`'s identity"
         );
-        let witness = format!("{tag}-witness");
-        register_key(
-            dir,
-            &witness,
-            crate::federation::types::identity_type::WITNESS,
-        )
-        .await;
         let r = e2::rooted_trust_root(dir, &HOLDER_SEEDS, "quorum:2/3").await;
-        let at = crate::federation::edition2::genesis::genesis_in_force(dir)
+        let first = crate::federation::edition2::genesis::genesis_in_force(dir)
             .await
             .expect("the bundle in force")
             .tips()
@@ -1493,28 +1501,44 @@ pub(crate) mod test_support {
             .max()
             .expect("a bundle tip")
             + 90_000;
-        let grant = confers_statement(&r, &e2::kid(&witness), &[INFRA_ATTEST_ASSURANCE], at);
-        e2::put_statement(dir, &grant)
+        let mut out = Vec::new();
+        for (i, tag) in (0u64..).zip(tags.iter()) {
+            let witness = format!("{tag}-witness");
+            register_key(
+                dir,
+                &witness,
+                crate::federation::types::identity_type::WITNESS,
+            )
+            .await;
+            let grant = confers_statement(
+                &r,
+                &e2::kid(&witness),
+                &[INFRA_ATTEST_ASSURANCE],
+                first + i * 1_000,
+            );
+            e2::put_statement(dir, &grant)
+                .await
+                .unwrap_or_else(|e| panic!("confer_age_witness: the root's grant: {e}"));
+            e2::put_statement(dir, &e2::voice_of(&grant, &witness))
+                .await
+                .unwrap_or_else(|e| panic!("confer_age_witness: the witness's voice: {e}"));
+            let rooted = crate::federation::trust_root::capability_roots_to_trusted_root(
+                dir,
+                &node,
+                &e2::kid(&witness),
+                INFRA_ATTEST_ASSURANCE,
+            )
             .await
-            .unwrap_or_else(|e| panic!("confer_age_witness: the root's grant: {e}"));
-        e2::put_statement(dir, &e2::voice_of(&grant, &witness))
-            .await
-            .unwrap_or_else(|e| panic!("confer_age_witness: the witness's voice: {e}"));
-        let rooted = crate::federation::trust_root::capability_roots_to_trusted_root(
-            dir,
-            &node,
-            &e2::kid(&witness),
-            INFRA_ATTEST_ASSURANCE,
-        )
-        .await
-        .expect("capability_roots_to_trusted_root");
-        assert!(
-            rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
-            "confer_age_witness: the witness's {INFRA_ATTEST_ASSURANCE} roots at {} through this \
-             node: {rooted:?}",
-            r.root
-        );
-        witness
+            .expect("capability_roots_to_trusted_root");
+            assert!(
+                rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
+                "confer_age_witness: the witness's {INFRA_ATTEST_ASSURANCE} roots at {} through \
+                 this node: {rooted:?}",
+                r.root
+            );
+            out.push(witness);
+        }
+        out
     }
 
     /// An age row by `by` about `about` (`age_assurance:*` by a witness, or
@@ -1525,17 +1549,51 @@ pub(crate) mod test_support {
         about: &str,
         token: &str,
         at: DateTime<Utc>,
-    ) {
+    ) -> Attestation {
+        put_age_row_until(dir, by, about, token, at, None).await
+    }
+
+    /// v62.0.0 (K2-fix14) — [`put_age_row`] with an `expires_at`, stamped
+    /// BEFORE the seal (`expires_at` is a common payload member, so the
+    /// statement carries it).
+    async fn put_age_row_until(
+        dir: &dyn FederationDirectory,
+        by: &str,
+        about: &str,
+        token: &str,
+        at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Attestation {
         use crate::federation::tier_ingest::test_support as ts;
         let id = uuid::Uuid::new_v4().to_string();
         let mut a = ts::bare_attestation(&id, by, about, &serde_json::json!({ "id": id }));
         a.attestation_type = token.to_owned();
         a.asserted_at = at;
         a.scrub_timestamp = at;
+        a.expires_at = expires_at;
         ts::seal_row_in_place(by, &mut a);
         e2::put_signed(dir, &a)
             .await
             .unwrap_or_else(|e| panic!("the age row {token} about {about}: {e}"));
+        a
+    }
+
+    /// v62.0.0 (K2-fix14) — `by` withdraws the held age row `row` (an
+    /// edition-2 `withdraws` composer naming it, `e2::composer_of`). The
+    /// subject withdraws its own declaration; a witness its own verdict.
+    ///
+    /// # Panics
+    /// The composer does not land as a row.
+    async fn withdraw_age_row(dir: &dyn FederationDirectory, row: &Attestation, by: &str) {
+        use crate::federation::edition2::ingest::StatementOutcome;
+        let w = e2::composer_of(attestation_type::WITHDRAWS, row, by);
+        let out = e2::put_signed(dir, &w)
+            .await
+            .unwrap_or_else(|e| panic!("{by} withdraws its age row: {e}"));
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }),
+            "{by} withdraws its age row: {out:?}"
+        );
     }
 
     /// The founder's duty edge `delegates_to(slash, community_id: C)` onto
@@ -1827,13 +1885,16 @@ pub(crate) mod test_support {
     ///   false, and the marker is not admitted.
     /// - **I2865** (witness 9) — D, then an assured-adult proof: still void
     ///   (D predates every adult proof); a re-appointment D' after the proof
-    ///   SEATS.
+    ///   is not void but suspended while T's own minor declaration lowers the
+    ///   band (K2-fix14); T withdraws it and D' counts, while D stays void.
     /// - **I2866** (witness 9) — a BACKDATED D (dated before the adult proof,
     ///   put after it) is void.
     /// - **I2867** (clarification (a)) — D after a self-declared ADULT row,
     ///   with an earlier self-declared minor row and no assurance: void.
-    /// - **I2868** (clarification (b)) — an assured-adult row before D and a
-    ///   minor row asserted AFTER D: D stays seated.
+    /// - **I2868** (K2-fix14 reverses clarification (b)) — an assured-adult
+    ///   row before D and a self-declared minor row asserted AFTER D: D is
+    ///   not void but SUSPENDED (not counted); once the subject withdraws the
+    ///   row D counts again, with no re-appointment.
     /// - **I2869** (witness 9) — a pure guardianship (no duty scope) from an
     ///   assured-adult founder onto a minor still lands.
     ///
@@ -2006,8 +2067,9 @@ pub(crate) mod test_support {
             "({suffix}) I2864: the unseated minor's marker is not admitted"
         );
 
-        // ── I2865: D, then an assured-adult proof: still void; D' after it seats.
-        put_age_row(
+        // ── I2865: D, then an assured-adult proof: still void; D' after it
+        // seats once p2's own minor declaration no longer lowers the band.
+        let p2_minor = put_age_row(
             dir,
             p2,
             p2,
@@ -2031,10 +2093,27 @@ pub(crate) mod test_support {
              adult proof"
         );
         let d2 = edge(p2, true, late + hour * 10);
-        let out = land(d2, p2.clone()).await.expect("I2865: re-appointed");
+        let out = land(d2.clone(), p2.clone())
+            .await
+            .expect("I2865: re-appointed");
         assert!(
-            matches!(out, StatementOutcome::Row { .. }) && named(p2).await,
-            "({suffix}) I2865: the re-appointment after the adult proof seats: {out:?}"
+            matches!(out, StatementOutcome::Row { .. }) && !void_held(d2.clone()).await,
+            "({suffix}) I2865: the re-appointment after the adult proof is not void: {out:?}"
+        );
+        // K2-fix14 (CC 3.4.11: a self-declared minor band lowers the reading)
+        // — p2's own minor declaration still stands, so D' is SUSPENDED.
+        assert!(
+            !named(p2).await,
+            "({suffix}) I2865: D' is suspended while p2's own minor declaration stands"
+        );
+        withdraw_age_row(dir, &p2_minor, p2).await;
+        assert!(
+            named(p2).await && !void_held(d2).await,
+            "({suffix}) I2865: p2 withdraws it: D' counts, with no re-appointment"
+        );
+        assert!(
+            void_held(d.clone()).await,
+            "({suffix}) I2865: the void D is never revived, not even by the withdrawal"
         );
 
         // ── I2866: a backdated D is void.
@@ -2100,7 +2179,7 @@ pub(crate) mod test_support {
             matches!(out, StatementOutcome::Row { .. }),
             "({suffix}) I2868: {out:?}"
         );
-        put_age_row(
+        let p5_minor = put_age_row(
             dir,
             p5,
             p5,
@@ -2108,10 +2187,16 @@ pub(crate) mod test_support {
             late + hour * 15,
         )
         .await;
+        // K2-fix14 (reverses K2-fix11's I2868; CC 3.4.11 + CC 4.5.4 as ruled
+        // for rc22): not void, but SUSPENDED while the band resolves minor.
+        assert!(
+            !void_held(d.clone()).await && !named(p5).await,
+            "({suffix}) I2868: a later minor row suspends D (not void, not counted)"
+        );
+        withdraw_age_row(dir, &p5_minor, p5).await;
         assert!(
             !void_held(d).await && named(p5).await,
-            "({suffix}) I2868: a minor row asserted after D cannot unseat a properly \
-             appointed adult"
+            "({suffix}) I2868: withdrawn, D counts again with no re-appointment"
         );
 
         // ── I2869: a pure guardianship onto a minor still lands.
@@ -2130,6 +2215,703 @@ pub(crate) mod test_support {
         assert!(
             matches!(out, StatementOutcome::Row { .. }),
             "({suffix}) I2869: guardianship without a duty scope is unchanged: {out:?}"
+        );
+    }
+
+    /// v62.0.0 (K2-fix14; CC 3.2 rc21, CC 3.4.11, CC 4.5.4 as ruled for rc22)
+    /// — **I2032–I2037: VOID and SUSPENDED are two states, and neither reads
+    /// the wall clock.** On every backend. Every instant is `late` (the
+    /// founder key's window start + `OWNER_BINDING_OFFSET_DAYS`, about 30
+    /// days before the run) plus minutes / hours, so every `expires_at` below
+    /// is PAST when the witness reads: the reader's clock disagrees with the
+    /// instant each rule must use.
+    ///
+    /// - **I2032** (clock, void side) — an assured minor that lapsed before
+    ///   an assured-adult proof; the proof is dated before D and lapses AFTER
+    ///   D (and before the run). D is not void and counts; read today, after
+    ///   the proof lapsed, it STILL counts. Before K2-fix14 the void predicate
+    ///   read `expires_at > now` and voided D here.
+    /// - **I2033** (clock, void side) — a self-declared minor; an
+    ///   assured-adult proof that lapsed BEFORE D's `asserted_at`: it lifts
+    ///   nothing; D is held `minor_appointment_void`.
+    /// - **I2034** (suspension by the subject's own row) — an assured adult,
+    ///   D (counted), a later SELF-declared minor: the band lowers to minor
+    ///   (CC 3.4.11), D is SUSPENDED (no hold, not counted); the subject
+    ///   withdraws it and D counts again, with no re-appointment.
+    /// - **I2035** (suspension by a witness row; lifted by a newer one) — one
+    ///   witness: a provider adult, D (counted), its later provider minor
+    ///   (K2-fix15: its newer row stands), so D is suspended (and absent from
+    ///   `moderators_of`); its later government adult stands and D counts
+    ///   again, with no re-appointment. (The two-witness tie is I2042.)
+    /// - **I2036** (no record) — T has no age row at all: D counts and the
+    ///   band is `unknown`, never the CC 3.4.11 `under_13` default.
+    /// - **I2039** (the steward-binding gate) — a guardianship from a granter
+    ///   whose adult proof lapsed after the binding lands: the gate reads the
+    ///   held rows, not the clock.
+    /// - **I2040–I2043** (K2-fix15, `AGE_OWN_SERIES_NEWEST_WINS`) — one
+    ///   signer's newest row stands: the subject's newer self-declaration
+    ///   lifts its older minor one (I2040); a witness's newer adult lifts its
+    ///   own earlier minor (I2041); two DIFFERENT witnesses at an equal level
+    ///   still tie to minor, so D is suspended (I2042); a void D stays void
+    ///   after the subject's newer declaration (I2043).
+    /// - **I2044** (permanent supersession) — a witness's newest row EXPIRED
+    ///   leaves that witness no current row: neither its superseded adult nor
+    ///   its superseded minor returns.
+    /// - **I2045** (retraction) — the witness withdraws its newest row: the
+    ///   previous one stands.
+    /// - **I2037** (void is never revived) — a self-declared minor, D (void),
+    ///   an assured adult, then the subject withdraws the minor row: the band
+    ///   is adult now, but D stays void and is not counted.
+    pub(crate) async fn exercise_minor_void_instants(
+        engine: &crate::Engine,
+        node_seed: &str,
+        suffix: &str,
+    ) {
+        use crate::federation::admission::{is_named_moderator, moderators_of};
+        use crate::federation::age::{age_band, age_band_as_of, AgeBand};
+        use crate::federation::edition2::fold::{reason::gc1::MINOR_APPOINTMENT_VOID, why_held};
+        use crate::federation::edition2::ingest::StatementOutcome;
+        use crate::federation::edition2::names::RowId;
+        let directory = engine.federation_directory();
+        let dir: &dyn FederationDirectory = directory.as_ref();
+        let k = |n: &str| format!("q14-{n}-{suffix}");
+        let (founder, member, community) = (k("founder"), k("member"), k("commons"));
+        let people: Vec<String> = [
+            "t1", "t2", "t3", "t4", "t5", "t6", "g7", "w7", "u1", "u2", "u3", "u4", "v1", "v2",
+            "v3",
+        ]
+        .iter()
+        .map(|n| k(n))
+        .collect();
+        for x in [&founder, &member, &community]
+            .into_iter()
+            .chain(people.iter())
+        {
+            register_user_key(dir, x).await;
+        }
+        let base = DateTime::<Utc>::from_timestamp_millis(
+            i64::try_from(e2::key_window_start_ms(&founder)).expect("a window start fits i64"),
+        )
+        .expect("an instant");
+        let late = base
+            + chrono::Duration::days(
+                crate::federation::tier_ingest::test_support::OWNER_BINDING_OFFSET_DAYS,
+            );
+        let min = chrono::Duration::minutes(1);
+        let hour = chrono::Duration::hours(1);
+        assert!(
+            late + hour * 24 < crate::host::clock::now(),
+            "({suffix}) precondition: every instant of this witness is before the run"
+        );
+        // K2-fix15: two witnesses under one root (I2042 needs a second).
+        let (tag1, tag2) = (k("age"), k("age2"));
+        let ws = confer_age_witnesses(dir, node_seed, &[tag1.as_str(), tag2.as_str()]).await;
+        let (witness, witness2) = (ws[0].clone(), ws[1].clone());
+        put_age_row(
+            dir,
+            &witness,
+            &founder,
+            "age_assurance:provider:adult:v1",
+            late + min,
+        )
+        .await;
+        assert_eq!(
+            age_band(dir, &e2::kid(&founder)).await.expect("band"),
+            AgeBand::Adult,
+            "({suffix}) precondition: the founder is an assured adult"
+        );
+        found_commons(dir, &founder, &member, &community, base).await;
+        let community_k = e2::kid(&community);
+        let named = |who: &str| {
+            let who = e2::kid(who);
+            let community_k = community_k.clone();
+            async move {
+                is_named_moderator(dir, &who, &community_k, DELEGATION_SCOPE_SLASH)
+                    .await
+                    .expect("is_named_moderator")
+            }
+        };
+        let listed = |who: &str| {
+            let who = e2::kid(who);
+            let community_k = community_k.clone();
+            async move {
+                moderators_of(dir, &community_k, DELEGATION_SCOPE_SLASH)
+                    .await
+                    .expect("moderators_of")
+                    .contains(&who)
+            }
+        };
+        let band_timeless = |who: &str| {
+            let who = e2::kid(who);
+            async move {
+                age_band_as_of(dir, &who, None)
+                    .await
+                    .expect("age_band_as_of")
+            }
+        };
+        let land = |e: Attestation, by: String| async move {
+            e2::land_with_voices(dir, &e, &[by.as_str()]).await
+        };
+        let held_why = |e: Attestation| async move {
+            why_held(dir, &RowId(e2::rid_digest(&e)))
+                .await
+                .expect("read the hold")
+                .map(|w| w.reason)
+        };
+        let edge = |grantee: &str, at: DateTime<Utc>| {
+            founder_scoped_edge(&founder, &community_k, grantee, DELEGATION_SCOPE_SLASH, at)
+        };
+        let (t1, t2, t3, t4, t5, t6, g7, w7) = (
+            &people[0], &people[1], &people[2], &people[3], &people[4], &people[5], &people[6],
+            &people[7],
+        );
+        let (u1, u2, u3, u4) = (&people[8], &people[9], &people[10], &people[11]);
+        let (v1, v2, v3) = (&people[12], &people[13], &people[14]);
+
+        // ── I2032: the proof lapses AFTER D; read today, D still counts.
+        put_age_row_until(
+            dir,
+            &witness,
+            t1,
+            "age_assurance:provider:minor:v1",
+            late + min * 2,
+            Some(late + min * 30),
+        )
+        .await;
+        put_age_row_until(
+            dir,
+            &witness,
+            t1,
+            "age_assurance:provider:adult:v1",
+            late + hour,
+            Some(late + hour * 3),
+        )
+        .await;
+        assert_eq!(
+            age_band(dir, &e2::kid(t1)).await.expect("band"),
+            AgeBand::Unknown,
+            "({suffix}) I2032 precondition: by the reader's clock both rows lapsed"
+        );
+        assert_eq!(
+            age_band_as_of(dir, &e2::kid(t1), Some(late + hour * 2))
+                .await
+                .expect("band at D"),
+            AgeBand::Adult,
+            "({suffix}) I2032 precondition: at D the minor row had lapsed and the proof was live"
+        );
+        let d = edge(t1, late + hour * 2);
+        let out = land(d.clone(), t1.clone())
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2032: kept, not refused: {e}"));
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }),
+            "({suffix}) I2032: D, made while the proof was live, lands: {out:?}"
+        );
+        assert_eq!(
+            held_why(d).await,
+            None,
+            "({suffix}) I2032: no hold, though the proof lapsed before this read"
+        );
+        assert_eq!(
+            band_timeless(t1).await,
+            AgeBand::Adult,
+            "({suffix}) I2032: as of the newest held evidence the proof is live"
+        );
+        assert!(
+            named(t1).await,
+            "({suffix}) I2032: still counted after the proof's lapse: the reader's clock does \
+             not unseat"
+        );
+
+        // ── I2033: the proof had lapsed at D: it lifts nothing.
+        put_age_row(
+            dir,
+            t2,
+            t2,
+            "age_self_declared:band:minor:v1",
+            late + min * 2,
+        )
+        .await;
+        put_age_row_until(
+            dir,
+            &witness,
+            t2,
+            "age_assurance:provider:adult:v1",
+            late + hour * 4,
+            Some(late + hour * 5),
+        )
+        .await;
+        let d = edge(t2, late + hour * 6);
+        let out = land(d.clone(), t2.clone())
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2033: kept, not refused: {e}"));
+        assert!(
+            matches!(out, StatementOutcome::Pending { .. }),
+            "({suffix}) I2033: held: {out:?}"
+        );
+        assert_eq!(
+            held_why(d).await.as_deref(),
+            Some(MINOR_APPOINTMENT_VOID),
+            "({suffix}) I2033: a proof expired at D's asserted_at lifts nothing"
+        );
+        assert!(!named(t2).await, "({suffix}) I2033: no minor moderator");
+
+        // ── I2034: counted → SUSPENDED (own declaration) → counted (withdrawn).
+        put_age_row(
+            dir,
+            &witness,
+            t3,
+            "age_assurance:provider:adult:v1",
+            late + min * 2,
+        )
+        .await;
+        let d = edge(t3, late + hour * 7);
+        let out = land(d.clone(), t3.clone())
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2034: kept, not refused: {e}"));
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }) && named(t3).await,
+            "({suffix}) I2034: counted before the minor row: {out:?}"
+        );
+        let t3_minor = put_age_row(
+            dir,
+            t3,
+            t3,
+            "age_self_declared:band:minor:v1",
+            late + hour * 8,
+        )
+        .await;
+        assert_eq!(
+            band_timeless(t3).await,
+            AgeBand::Minor,
+            "({suffix}) I2034: a self-declared minor band lowers the reading (CC 3.4.11)"
+        );
+        assert_eq!(
+            held_why(d.clone()).await,
+            None,
+            "({suffix}) I2034: suspended is not void: no hold"
+        );
+        assert!(
+            !named(t3).await && !listed(t3).await,
+            "({suffix}) I2034: SUSPENDED: not counted while the band resolves minor"
+        );
+        withdraw_age_row(dir, &t3_minor, t3).await;
+        assert_eq!(
+            band_timeless(t3).await,
+            AgeBand::Adult,
+            "({suffix}) I2034: withdrawn, the witness reading stands"
+        );
+        assert!(
+            held_why(d).await.is_none() && named(t3).await && listed(t3).await,
+            "({suffix}) I2034: counted again, the same D, no re-appointment"
+        );
+
+        // ── I2035: counted → SUSPENDED (the witness's newer minor) → counted
+        // (its newer government adult).
+        put_age_row(
+            dir,
+            &witness,
+            t4,
+            "age_assurance:provider:adult:v1",
+            late + min * 2,
+        )
+        .await;
+        let d = edge(t4, late + hour * 9);
+        let out = land(d.clone(), t4.clone())
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2035: kept, not refused: {e}"));
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }) && named(t4).await,
+            "({suffix}) I2035: counted before the minor row: {out:?}"
+        );
+        put_age_row(
+            dir,
+            &witness,
+            t4,
+            "age_assurance:provider:minor:v1",
+            late + hour * 10,
+        )
+        .await;
+        assert_eq!(
+            band_timeless(t4).await,
+            AgeBand::Minor,
+            "({suffix}) I2035: the witness's newer minor row replaces its own adult one"
+        );
+        assert_ne!(
+            held_why(d.clone()).await.as_deref(),
+            Some(MINOR_APPOINTMENT_VOID),
+            "({suffix}) I2035: D post-dates a live adult proof: not void"
+        );
+        assert!(
+            !named(t4).await && !listed(t4).await,
+            "({suffix}) I2035: SUSPENDED: CC 4.5.4, no K is a user with the minor band"
+        );
+        put_age_row(
+            dir,
+            &witness,
+            t4,
+            "age_assurance:government:adult:v1",
+            late + hour * 11,
+        )
+        .await;
+        assert_eq!(
+            band_timeless(t4).await,
+            AgeBand::Adult,
+            "({suffix}) I2035: the witness's newer government adult stands"
+        );
+        assert!(
+            named(t4).await && listed(t4).await,
+            "({suffix}) I2035: counted again, the same D, no re-appointment"
+        );
+        assert_ne!(
+            held_why(d).await.as_deref(),
+            Some(MINOR_APPOINTMENT_VOID),
+            "({suffix}) I2035: never void"
+        );
+
+        // ── I2036: no age row at all: counted; the band is unknown.
+        let d = edge(t5, late + hour * 12);
+        let out = land(d.clone(), t5.clone())
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2036: kept, not refused: {e}"));
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }),
+            "({suffix}) I2036: {out:?}"
+        );
+        assert_eq!(
+            band_timeless(t5).await,
+            AgeBand::Unknown,
+            "({suffix}) I2036: absence resolves no band here, not under_13"
+        );
+        assert!(
+            held_why(d).await.is_none() && named(t5).await && listed(t5).await,
+            "({suffix}) I2036: a person with no age row stays appointable and counted"
+        );
+
+        // ── I2037: VOID is never revived, not by a proof, not by a withdrawal.
+        let t6_minor = put_age_row(
+            dir,
+            t6,
+            t6,
+            "age_self_declared:band:minor:v1",
+            late + min * 2,
+        )
+        .await;
+        let d = edge(t6, late + hour * 13);
+        let _ = land(d.clone(), t6.clone()).await;
+        put_age_row(
+            dir,
+            &witness,
+            t6,
+            "age_assurance:provider:adult:v1",
+            late + hour * 14,
+        )
+        .await;
+        withdraw_age_row(dir, &t6_minor, t6).await;
+        assert_eq!(
+            band_timeless(t6).await,
+            AgeBand::Adult,
+            "({suffix}) I2037 precondition: the band is adult now"
+        );
+        assert_eq!(
+            held_why(d).await.as_deref(),
+            Some(MINOR_APPOINTMENT_VOID),
+            "({suffix}) I2037: D stays void (a retracted minor row still counts for void)"
+        );
+        assert!(
+            !named(t6).await,
+            "({suffix}) I2037: a void appointment is never revived"
+        );
+
+        // ── I2039: the steward-binding GATE reads no clock. A guardianship
+        // (no duty) from g7, whose adult proof lapsed after the binding and
+        // before this run, onto a self-declared minor: the gate judges the
+        // granter's band from the held rows (as of the newest held evidence),
+        // so it lands; before K2-fix14 the gate's `age_band` read the clock,
+        // found no live proof and held it `granter_not_adult_user`.
+        put_age_row_until(
+            dir,
+            &witness,
+            g7,
+            "age_assurance:provider:adult:v1",
+            late + hour * 15,
+            Some(late + hour * 18),
+        )
+        .await;
+        put_age_row(
+            dir,
+            w7,
+            w7,
+            "age_self_declared:band:minor:v1",
+            late + hour * 15,
+        )
+        .await;
+        assert_eq!(
+            age_band(dir, &e2::kid(g7)).await.expect("band"),
+            AgeBand::Unknown,
+            "({suffix}) I2039 precondition: by the reader's clock g7's proof lapsed"
+        );
+        let g = founder_edge(g7, &community_k, w7, false, late + hour * 16);
+        let out = land(g.clone(), w7.clone())
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2039: kept, not refused: {e}"));
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }) && held_why(g).await.is_none(),
+            "({suffix}) I2039: the gate's outcome does not depend on when it runs: {out:?}"
+        );
+
+        // ── K2-fix15 (AGE_OWN_SERIES_NEWEST_WINS; CC 3.4.11 / 3.5.1): within
+        // ONE signer's series the newest row stands.
+        // I2040: a self-minor "at 15", then the SAME subject's later
+        // self-declaration plus a provider adult: adult, no withdrawal.
+        put_age_row(
+            dir,
+            u1,
+            u1,
+            "age_self_declared:band:minor:v1",
+            late + hour * 20,
+        )
+        .await;
+        put_age_row(
+            dir,
+            u1,
+            u1,
+            "age_self_declared:band:adult:v1",
+            late + hour * 21,
+        )
+        .await;
+        put_age_row(
+            dir,
+            &witness,
+            u1,
+            "age_assurance:provider:adult:v1",
+            late + hour * 21,
+        )
+        .await;
+        assert_eq!(
+            band_timeless(u1).await,
+            AgeBand::Adult,
+            "({suffix}) I2040: the subject's newer declaration replaces its older minor one"
+        );
+        let d = edge(u1, late + hour * 22);
+        let out = land(d.clone(), u1.clone())
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2040: kept, not refused: {e}"));
+        assert!(
+            matches!(out, StatementOutcome::Row { .. })
+                && held_why(d).await.is_none()
+                && named(u1).await,
+            "({suffix}) I2040: counted, with no withdrawal: {out:?}"
+        );
+
+        // I2041: the SAME witness's minor, then its later adult: adult.
+        put_age_row(
+            dir,
+            &witness,
+            u2,
+            "age_assurance:provider:minor:v1",
+            late + hour * 20,
+        )
+        .await;
+        put_age_row(
+            dir,
+            &witness,
+            u2,
+            "age_assurance:provider:adult:v1",
+            late + hour * 21,
+        )
+        .await;
+        assert_eq!(
+            band_timeless(u2).await,
+            AgeBand::Adult,
+            "({suffix}) I2041: a witness's newer assurance replaces its own earlier one"
+        );
+        let d = edge(u2, late + hour * 22);
+        let out = land(d.clone(), u2.clone())
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2041: kept, not refused: {e}"));
+        assert!(
+            matches!(out, StatementOutcome::Row { .. })
+                && held_why(d).await.is_none()
+                && named(u2).await,
+            "({suffix}) I2041: counted: {out:?}"
+        );
+
+        // I2042: witness A's minor, then witness B's adult, equal level:
+        // still minor (two signers: tie to minor). D is not void (an adult
+        // proof precedes it) but SUSPENDED.
+        put_age_row(
+            dir,
+            &witness,
+            u3,
+            "age_assurance:provider:minor:v1",
+            late + hour * 20,
+        )
+        .await;
+        put_age_row(
+            dir,
+            &witness2,
+            u3,
+            "age_assurance:provider:adult:v1",
+            late + hour * 21,
+        )
+        .await;
+        assert_eq!(
+            band_timeless(u3).await,
+            AgeBand::Minor,
+            "({suffix}) I2042: two witnesses at an equal level disagree: minor"
+        );
+        let d = edge(u3, late + hour * 22);
+        let out = land(d.clone(), u3.clone())
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2042: kept, not refused: {e}"));
+        assert!(
+            matches!(out, StatementOutcome::Row { .. }) && held_why(d).await.is_none(),
+            "({suffix}) I2042: not void: {out:?}"
+        );
+        assert!(
+            !named(u3).await && !listed(u3).await,
+            "({suffix}) I2042: SUSPENDED: not counted"
+        );
+
+        // I2043: a void D stays void after the subject's newer declaration.
+        put_age_row(
+            dir,
+            u4,
+            u4,
+            "age_self_declared:band:minor:v1",
+            late + hour * 20,
+        )
+        .await;
+        let d = edge(u4, late + hour * 21);
+        let _ = land(d.clone(), u4.clone()).await;
+        put_age_row(
+            dir,
+            u4,
+            u4,
+            "age_self_declared:band:adult:v1",
+            late + hour * 22,
+        )
+        .await;
+        put_age_row(
+            dir,
+            &witness,
+            u4,
+            "age_assurance:provider:adult:v1",
+            late + hour * 23,
+        )
+        .await;
+        assert_eq!(
+            band_timeless(u4).await,
+            AgeBand::Adult,
+            "({suffix}) I2043 precondition: the current band is adult"
+        );
+        assert_eq!(
+            held_why(d).await.as_deref(),
+            Some(MINOR_APPOINTMENT_VOID),
+            "({suffix}) I2043: the void rule reads the history, not the current row"
+        );
+        assert!(!named(u4).await, "({suffix}) I2043: never revived");
+
+        // ── I2044: supersession is permanent. One witness's newest row is
+        // its current row; once that row EXPIRES the witness has NO current
+        // row, and the older row it superseded never comes back.
+        // v1: the witness's adult, then its newer minor (lapsing by +3h).
+        put_age_row(
+            dir,
+            &witness,
+            v1,
+            "age_assurance:provider:adult:v1",
+            late + hour * 30,
+        )
+        .await;
+        put_age_row_until(
+            dir,
+            &witness,
+            v1,
+            "age_assurance:provider:minor:v1",
+            late + hour * 31,
+            Some(late + hour * 32),
+        )
+        .await;
+        let v1k = e2::kid(v1);
+        assert_eq!(
+            age_band_as_of(dir, &v1k, Some(late + hour * 31 + min))
+                .await
+                .expect("band"),
+            AgeBand::Minor,
+            "({suffix}) I2044: while live, the newer minor is the witness's current row"
+        );
+        assert_eq!(
+            age_band_as_of(dir, &v1k, Some(late + hour * 33))
+                .await
+                .expect("band"),
+            AgeBand::Unknown,
+            "({suffix}) I2044: expired, it leaves no current row: the adult does not return"
+        );
+        assert_eq!(
+            age_band(dir, &v1k).await.expect("band"),
+            AgeBand::Unknown,
+            "({suffix}) I2044: the present-tense read agrees"
+        );
+        // v2: the witness's minor, then its newer adult proof (lapsing).
+        put_age_row(
+            dir,
+            &witness,
+            v2,
+            "age_assurance:provider:minor:v1",
+            late + hour * 30,
+        )
+        .await;
+        put_age_row_until(
+            dir,
+            &witness,
+            v2,
+            "age_assurance:provider:adult:v1",
+            late + hour * 31,
+            Some(late + hour * 32),
+        )
+        .await;
+        assert_eq!(
+            age_band_as_of(dir, &e2::kid(v2), Some(late + hour * 33))
+                .await
+                .expect("band"),
+            AgeBand::Unknown,
+            "({suffix}) I2044: an expired adult proof does not re-minor the person"
+        );
+
+        // ── I2045: a RETRACTED newest row is un-said: the previous stands.
+        put_age_row(
+            dir,
+            &witness,
+            v3,
+            "age_assurance:provider:adult:v1",
+            late + hour * 30,
+        )
+        .await;
+        let v3_minor = put_age_row(
+            dir,
+            &witness,
+            v3,
+            "age_assurance:provider:minor:v1",
+            late + hour * 31,
+        )
+        .await;
+        assert_eq!(
+            band_timeless(v3).await,
+            AgeBand::Minor,
+            "({suffix}) I2045 precondition: the newer minor is current"
+        );
+        withdraw_age_row(dir, &v3_minor, &witness).await;
+        assert_eq!(
+            band_timeless(v3).await,
+            AgeBand::Adult,
+            "({suffix}) I2045: the witness withdraws it: its previous adult row stands"
+        );
+        assert_eq!(
+            age_band(dir, &e2::kid(v3)).await.expect("band"),
+            AgeBand::Adult,
+            "({suffix}) I2045: the present-tense read agrees"
         );
     }
 
@@ -3450,6 +4232,57 @@ mod cells_runners {
             .expect("postgres")
             .set_node_key_id(crate::federation::edition2::fixture_switch::kid(&node));
         Box::pin(super::test_support::exercise_declared_duty(
+            &engine, &node, &s,
+        ))
+        .await;
+    }
+
+    /// v62.0.0 (K2-fix14, K2-fix15) — I2032–I2043 on sqlite
+    /// (`test_support::exercise_minor_void_instants`).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i2032_i2037_minor_void_and_suspension_sqlite() {
+        let s = suffix();
+        let seed = format!("q14-engine-{s}");
+        let engine = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer(&seed),
+            "sqlite::memory:",
+        )
+        .await
+        .expect("engine");
+        let node = format!("q14-node-{s}");
+        engine
+            .sqlite_backend()
+            .expect("sqlite")
+            .set_node_key_id(crate::federation::edition2::fixture_switch::kid(&node));
+        Box::pin(super::test_support::exercise_minor_void_instants(
+            &engine, &node, &s,
+        ))
+        .await;
+    }
+
+    /// v62.0.0 (K2-fix14, K2-fix15) — I2032–I2043 on postgres.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i2032_i2037_minor_void_and_suspension_postgres() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let s = suffix();
+        let seed = format!("q14-engine-{s}");
+        let engine = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer(&seed),
+            &dsn,
+        )
+        .await
+        .expect("pg engine");
+        let node = format!("q14-node-{s}");
+        engine
+            .postgres_backend()
+            .expect("postgres")
+            .set_node_key_id(crate::federation::edition2::fixture_switch::kid(&node));
+        Box::pin(super::test_support::exercise_minor_void_instants(
             &engine, &node, &s,
         ))
         .await;

@@ -1715,11 +1715,12 @@ mod engine_bodies {
         // rebuild it: the report is signed by it, so the engine needs it.
         let local =
             crate::federation::tier_ingest::test_support::local_signer(&format!("em-a-{run}"));
-        let shared = crate::Engine::from_shared_with_local(
+        let shared = crate::Engine::try_from_shared_with_local(
             share(l.ba.clone()),
             l.engine_a.signer().clone(),
             Some(local),
-        );
+        )
+        .expect("a shared engine view: no node_key_conflict");
         forget(l.ba.as_ref());
         assert!(
             l.ba.node_key_id().is_none(),

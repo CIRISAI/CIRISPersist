@@ -960,7 +960,6 @@ async fn verify_founders_link_memo<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    use ciris_verify_core::threshold::ThresholdMember;
     let Some(prior_signed) = chain.last() else {
         return Err(Error::InvalidArgument(
             "a founders' link needs the chain up to its prior version".into(),
@@ -1049,50 +1048,16 @@ where
     // A version MAY still record a resigned founder; they count as nothing
     // here, so the link needs the others' quorum, and the row reads Stalled
     // until the record amends them out or re-seats them.
-    let bytes =
-        ciris_verify_core::accord_genesis::accord_family_signing_bytes(&proof.change_envelope)
-            .map_err(|e| Error::InvalidArgument(format!("founders' change envelope: {e}")))?;
+    // v62.0.0 (BH-fix1; RULINGS "composite signatures only") — the earlier
+    // form counted `proof.quorum_signatures`, each a separate Ed25519 +
+    // ML-DSA-65 pair verified against the founder's component halves. That
+    // verify is DELETED: a link's signers are its edition-2 voices only.
     let mut signers = std::collections::BTreeSet::new();
-    for sig in &proof.quorum_signatures {
-        if !prior_founders.contains(&sig.member_id.as_str())
-            || signers.contains(&sig.member_id)
-            || !memo
-                .founder_counts(
-                    directory,
-                    id,
-                    &sig.member_id,
-                    Some(amended_at),
-                    seated_since(chain, &sig.member_id),
-                )
-                .await?
-        {
-            continue;
-        }
-        let Some(rec) = memo.record(directory, &sig.member_id).await? else {
-            continue;
-        };
-        let member = ThresholdMember {
-            member_id: rec.key_id,
-            ed25519_public_key_base64: rec.pubkey_ed25519_base64,
-            mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64,
-            role: None,
-        };
-        if ciris_verify_core::threshold::verify_threshold_signatures(
-            &bytes,
-            std::slice::from_ref(&member),
-            std::slice::from_ref(sig),
-            1,
-        )
-        .is_ok()
-        {
-            signers.insert(sig.member_id.clone());
-        }
-    }
     // v62.0.0 (wave W1) — an edition-2 version carries no quorum signatures:
     // its voices are the held `group:roster` statements of the version (and
     // the vouched ones at its door), each verified at the edition-2 door.
-    // They count as a verified signature does above: a prior founder that
-    // counts at the link's instant.
+    // A voice counts when it is a prior founder that counts at the link's
+    // instant.
     let edition2_voices =
         super::edition2::trust_root_group::version_signers(directory, &next.community).await?;
     if let Some(voices) = &edition2_voices {
@@ -3886,136 +3851,11 @@ pub(crate) fn parse_quorum(s: &str) -> Option<(usize, usize)> {
 // (`server::edition2::trust_root_statements`); a node imports a genesis at
 // `edition2::genesis::put_genesis_bundle`.
 
-/// v54.1.0 (CIRISPersist#1046, CIRISConstitution#165 §1) — **the trust
-/// root's own `consensus_protocol` over a cosigned envelope that is NOT one of
-/// its own versions**: the steward purge's `takedown_notice`.
-///
-/// The question is asked about the SIGNERS, never the subject: the envelope is
-/// judged only as bytes (`accord_family_signing_bytes`, JCS), and the answer is
-/// the set of seats whose hybrid signature over those bytes verified, judged
-/// by the protocol (CC 2.4 rule 0, CC 3.2 T2; CIRISConstitution rc8@8c8f536).
-///
-/// - The row at `community_key_id` must be TRUST-ROOT GRADE and **ROOTED** now
-///   ([`stored_standing_at`], which answers `NotRooted` for a row that is not
-///   trust-root grade — the ONE grade check; only the trust root's takedown
-///   duty authorises a steward purge, CC 4.5.5). A stalled root is valid but non-admitting (CC
-///   3.2 T7): it confers nothing new, and an authorisation is something new.
-///   An unrooted squat authorises nothing.
-/// - Every offered signature must be a distinct SEAT of the held head (any
-///   member, whatever its role) whose hybrid signature verifies against that
-///   seat's stored key. One that does not is a refusal, not a discount:
-///   evidence that does not verify is never carried as decoration (the
-///   roster-row rule, I190 (b)).
-/// - WHICH seats count is the protocol's, never a hard-coded founders rule:
-///   the head's members under its own `cohort_subkind` (`infrastructure`
-///   makes only non-`node`-bearing founders eligible, CC 3.2 "infrastructure
-///   does not vote"), evaluated by [`super::consensus::evaluate`] with
-///   [`super::consensus::Direction::Add`] — a purge is not a protective
-///   removal, so no reverse-quorum single-signer arm applies.
-///
-/// # Errors
-///
-/// `Ok(Err((reason, detail)))` names why the signers do not authorise:
-/// `reason` is a [`unauthorised_reason`](super::steward_purge::unauthorised_reason)
-/// token (v55.0.0, CIRISPersist#1055) that separates an ordering gap (the
-/// root or a cosigner's key is not held yet) from a verdict, and `detail` is
-/// the prose. `Err` is a directory read failure.
-pub async fn trust_root_cosigners_over<F>(
-    directory: &F,
-    community_key_id: &str,
-    envelope: &serde_json::Value,
-    signatures: &[ciris_verify_core::threshold::ThresholdSignature],
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<Result<std::collections::BTreeSet<String>, (&'static str, String)>, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    use super::steward_purge::unauthorised_reason as why;
-    use ciris_verify_core::threshold::ThresholdMember;
-    let head = match trust_root_head(directory, community_key_id, now).await? {
-        Ok(head) => head,
-        Err(refusal) => return Ok(Err(refusal)),
-    };
-    if signatures.is_empty() {
-        return Ok(Err((
-            why::NO_COSIGNATURE,
-            "the notice carries no cosignature".to_owned(),
-        )));
-    }
-    let bytes = match ciris_verify_core::accord_genesis::accord_family_signing_bytes(envelope) {
-        Ok(b) => b,
-        Err(e) => {
-            return Ok(Err((
-                why::NOTICE_MALFORMED,
-                format!("the notice envelope does not canonicalize: {e}"),
-            )))
-        }
-    };
-    let mut memo = Memo::at(now);
-    let mut signers = std::collections::BTreeSet::new();
-    for sig in signatures {
-        fold::reads(Dep::key(&sig.member_id));
-        if !head
-            .community
-            .members
-            .iter()
-            .any(|m| m.key_id == sig.member_id)
-        {
-            note_fold_reason(why::NOT_A_SEAT);
-            return Ok(Err((
-                why::NOT_A_SEAT,
-                format!(
-                    "cosigner {:?} holds no seat on the trust root {community_key_id:?}",
-                    sig.member_id
-                ),
-            )));
-        }
-        if !signers.insert(sig.member_id.clone()) {
-            return Ok(Err((
-                why::DUPLICATE_COSIGNER,
-                format!("cosigner {:?} signed twice", sig.member_id),
-            )));
-        }
-        let Some(rec) = memo.record(directory, &sig.member_id).await? else {
-            note_fold_reason(why::COSIGNER_KEY_NOT_HELD);
-            return Ok(Err((
-                why::COSIGNER_KEY_NOT_HELD,
-                format!(
-                    "cosigner {:?} has no key record on this node",
-                    sig.member_id
-                ),
-            )));
-        };
-        let member = ThresholdMember {
-            member_id: rec.key_id,
-            ed25519_public_key_base64: rec.pubkey_ed25519_base64,
-            mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64,
-            role: None,
-        };
-        if ciris_verify_core::threshold::verify_threshold_signatures(
-            &bytes,
-            std::slice::from_ref(&member),
-            std::slice::from_ref(sig),
-            1,
-        )
-        .is_err()
-        {
-            return Ok(Err((
-                why::SIGNATURE_INVALID,
-                format!(
-                    "cosigner {:?}'s signature does not verify over the notice",
-                    sig.member_id
-                ),
-            )));
-        }
-    }
-    count_over_trust_root(directory, &head, signers, now).await
-}
-
 /// v62.0.0 (wave T2) — the trust root's ROOTED head, or why there is none
-/// (the refusal pair [`trust_root_cosigners_over`] answers). Shared by the
-/// cosigned-envelope count and the edition-2 voice count
-/// ([`trust_root_counts_voices`]).
+/// (a refusal pair, `(reason, detail)`), for the edition-2 voice count
+/// ([`trust_root_counts_voices`]). v62.0.0 (BH-fix1): the earlier
+/// cosigned-envelope count (`trust_root_cosigners_over`, separate Ed25519 +
+/// ML-DSA-65 pairs) is deleted.
 ///
 /// # Errors
 /// Directory reads.
@@ -4156,8 +3996,9 @@ where
 /// ([`count_over_trust_root`], the same count).
 ///
 /// # Errors
-/// `Ok(Err((reason, detail)))` as [`trust_root_cosigners_over`]; `Err` is a
-/// directory read failure.
+/// `Ok(Err((reason, detail)))` names why the voices do not authorise:
+/// `reason` is a [`unauthorised_reason`](super::steward_purge::unauthorised_reason)
+/// token; `Err` is a directory read failure.
 pub async fn trust_root_counts_voices<F>(
     directory: &F,
     community_key_id: &str,

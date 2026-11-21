@@ -1119,8 +1119,7 @@ pub use replication::hold::{
 pub use admission::{ConsentGateRefused, ConsentGatedClaim, ConsentGatedFamily};
 pub use group_amendment::{CommunityDoor, ReplicatedCommunityOutcome, ReplicatedCommunityRefusal};
 pub use rooting::{
-    provenance_chain, root_binding, ProvenanceChain, ProvenanceLink, RootingRejection,
-    RootingVerdict, MAX_PROVENANCE_DEPTH,
+    provenance_chain, ProvenanceChain, ProvenanceLink, RootingRejection, MAX_PROVENANCE_DEPTH,
 };
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub use schema_resolver::BlobBackedSchemaResolver;
@@ -3816,46 +3815,61 @@ pub trait FederationDirectory: Send + Sync {
     /// v62.0.0 (slice E2a, CC 2.6.1) — the held edition-2 statements of
     /// `family` whose CWT `sub` is `sub`, as received: the key plane reads a
     /// key's `key:record`s and `key:revocation`s through this
-    /// ([`edition2::ingest`]). Empty by default (a directory with no
-    /// edition-2 store holds none); the sqlite and postgres backends read
-    /// `ceg_statements`.
+    /// ([`edition2::ingest`]). Refuses by default (`Unsupported`): v62.0.0
+    /// (PX-fix1) — an empty default read "no key held" through the capsule
+    /// proxy, so `held_keys_for_kid` answered `NotHeld` for every key there.
+    /// The sqlite and postgres backends read `ceg_statements`; the proxy
+    /// routes it (`Edition2StatementsAbout`).
     async fn edition2_statements_about(
         &self,
         family: &str,
         sub: &str,
     ) -> Result<Vec<Vec<u8>>, Error> {
         let _ = (family, sub);
-        Ok(Vec::new())
+        Err(Error::Unsupported {
+            method: "edition2_statements_about",
+        })
     }
 
     /// v62.0.0 (slice E2a, CC 2.6.1.9) — every held voice of one edition-2
     /// row id: the statements over one payload that a counted row's fold
-    /// counts (`cosign:{state}` keys on `event_row_id`). Empty by default.
+    /// counts (`cosign:{state}` keys on `event_row_id`). Refuses by default
+    /// (`Unsupported`, PX-fix1); the proxy routes it (`Edition2Voices`).
     async fn edition2_voices(
         &self,
         row_id: &edition2::names::RowId,
     ) -> Result<Vec<Vec<u8>>, Error> {
         let _ = row_id;
-        Ok(Vec::new())
+        Err(Error::Unsupported {
+            method: "edition2_voices",
+        })
     }
 
     /// v62.0.0 (JSON-cut slice A, CC 2.6.1.3) — the held rows whose signed
     /// `refs` name `named` under `role` (`target`, `head`, `also:cites`, ...),
-    /// from `ceg_row_names`: node-computed ids only. Empty by default.
+    /// from `ceg_row_names`: node-computed ids only. Refuses by default
+    /// (`Unsupported`, PX-fix1); the proxy routes it (`Edition2RowsNaming`).
     async fn edition2_rows_naming(
         &self,
         named: &edition2::names::RowId,
         role: &str,
     ) -> Result<Vec<edition2::names::RowId>, Error> {
         let _ = (named, role);
-        Ok(Vec::new())
+        Err(Error::Unsupported {
+            method: "edition2_rows_naming",
+        })
     }
 
     /// v62.0.0 (slice E2a, CC 2.6.1.11) — every held voice of signed objects
-    /// of `typ` (`ceg-genesis-bundle/2`), as received. Empty by default.
+    /// of `typ` (`ceg-genesis-bundle/2`), as received. Refuses by default
+    /// (`Unsupported`): v62.0.0 (PX-fix1) — an empty default made
+    /// `genesis_in_force` over the capsule proxy read "no genesis held". The
+    /// proxy routes it (`Edition2Objects`).
     async fn edition2_objects(&self, typ: &str) -> Result<Vec<Vec<u8>>, Error> {
         let _ = typ;
-        Ok(Vec::new())
+        Err(Error::Unsupported {
+            method: "edition2_objects",
+        })
     }
 
     /// v62.0.0 (slice E2a) — store a verified object voice. A directory with
@@ -3920,14 +3934,19 @@ pub trait FederationDirectory: Send + Sync {
     }
 
     /// v62.0.0 (wave G0) — why `row_id` concludes nothing
-    /// (`ceg_fold_state`); `None` when it is concluded or not held. `None`
-    /// by default (no fold store).
+    /// (`ceg_fold_state`); `None` when it is concluded or not held. Refuses
+    /// by default (`Unsupported`): v62.0.0 (PX-fix1) — a `None` default read
+    /// every held-back row as concluded through the capsule proxy (a short
+    /// genesis bundle as in force, a held revocation as counted). The proxy
+    /// routes it (`FoldHeld`).
     async fn fold_held(
         &self,
         row_id: &edition2::names::RowId,
     ) -> Result<Option<edition2::fold::HeldReason>, Error> {
         let _ = row_id;
-        Ok(None)
+        Err(Error::Unsupported {
+            method: "fold_held",
+        })
     }
 
     /// v62.0.0 (v62 P8-fix5; CC 2.6.1.9, CC 2.7.3, CC 4.4.3.19) — **the
@@ -3979,37 +3998,70 @@ pub trait FederationDirectory: Send + Sync {
         edition2::second_signer_voice::submit_voice(self.as_dyn_directory(), statement).await
     }
 
+    /// v62.0.0 (LF-fix2, T5) — **the replicated statement door as ONE call**:
+    /// what [`edition2::ingest::apply_replicated_statement`] runs. A default
+    /// over this directory
+    /// ([`edition2::ingest::apply_replicated_statement_with_origin`] at
+    /// `WriteOrigin::Wire`); the capsule proxy routes it WHOLE as the
+    /// `ApplyReplicatedStatement` op, so the door's gates, its fold and its
+    /// receive-side hooks (the #916 owner-binding re-wrap,
+    /// [`Self::rewrap_own_epochs_for_device`]) run on the host's store.
+    /// Composed over the proxy instead, the fold's reads answered empty and
+    /// the re-wrap was the trait's no-op.
+    async fn replicated_statement_door(
+        &self,
+        statement: &[u8],
+        offered_id: &[u8; 32],
+    ) -> Result<edition2::ingest::ReplicatedStatementOutcome, Error> {
+        edition2::ingest::apply_replicated_statement_with_origin(
+            self.as_dyn_directory(),
+            statement,
+            offered_id,
+            crate::federation::replication::admission::WriteOrigin::Wire,
+        )
+        .await
+    }
+
     /// v62.0.0 (wave G0) — the held reasons in row-id order after `after`,
-    /// at most `limit`. Empty by default.
+    /// at most `limit`. Refuses by default (`Unsupported`, PX-fix1); the
+    /// proxy routes it (`FoldHeldPage`).
     async fn fold_held_page(
         &self,
         after: Option<&edition2::names::RowId>,
         limit: u32,
     ) -> Result<Vec<edition2::fold::HeldReason>, Error> {
         let _ = (after, limit);
-        Ok(Vec::new())
+        Err(Error::Unsupported {
+            method: "fold_held_page",
+        })
     }
 
     /// v62.0.0 (wave G0) — the rows (held or concluded) whose last fold
     /// evaluation read any of `read_keys` (`ceg_fold_reads`), distinct, in
-    /// row-id order. Empty by default.
+    /// row-id order. Refuses by default (`Unsupported`, PX-fix1); the proxy
+    /// routes it (`FoldDependents`).
     async fn fold_dependents(
         &self,
         read_keys: &[String],
     ) -> Result<Vec<edition2::names::RowId>, Error> {
         let _ = read_keys;
-        Ok(Vec::new())
+        Err(Error::Unsupported {
+            method: "fold_dependents",
+        })
     }
 
     /// v62.0.0 (wave G0 v4) — the fold's whole record of one row, held or
     /// concluded (`ceg_fold_state`): its first arrival, plane, slot and,
-    /// when held, why. `None` by default (no fold store).
+    /// when held, why. Refuses by default (`Unsupported`, PX-fix1); the proxy
+    /// routes it (`FoldState`).
     async fn fold_state(
         &self,
         row_id: &edition2::names::RowId,
     ) -> Result<Option<edition2::fold::FoldState>, Error> {
         let _ = row_id;
-        Ok(None)
+        Err(Error::Unsupported {
+            method: "fold_state",
+        })
     }
 
     /// v62.0.0 (wave G0 fix4) — set ONLY the reason of a row's fold state
@@ -4029,24 +4081,36 @@ pub trait FederationDirectory: Send + Sync {
     }
 
     /// v62.0.0 (wave G0 v4) — the CONCLUDED rows of one projection slot
-    /// (`ceg_fold_state.slot`), in row-id order. Empty by default.
+    /// (`ceg_fold_state.slot`), in row-id order. Refuses by default
+    /// (`Unsupported`, PX-fix1); the proxy routes it (`FoldSlotRows`).
     async fn fold_slot_rows(&self, slot: &str) -> Result<Vec<edition2::names::RowId>, Error> {
         let _ = slot;
-        Ok(Vec::new())
+        Err(Error::Unsupported {
+            method: "fold_slot_rows",
+        })
     }
 
     /// v62.0.0 (wave G0 v4) — does any HELD row (one that concludes
     /// nothing) sit in projection slot `slot`? The kept-but-not-served
-    /// bytes consult (`edition2::fold::bytes_servable`). `false` by default.
+    /// bytes consult (`edition2::fold::bytes_servable`). Refuses by default
+    /// (`Unsupported`): v62.0.0 (PX-fix1) — a `false` default (with
+    /// [`Self::fold_slot_rows`]' empty one) made `bytes_servable` over the
+    /// capsule proxy answer TRUE for bytes the fold holds back. The proxy
+    /// routes it (`FoldSlotHeld`).
     async fn fold_slot_held(&self, slot: &str) -> Result<bool, Error> {
         let _ = slot;
-        Ok(false)
+        Err(Error::Unsupported {
+            method: "fold_slot_held",
+        })
     }
 
     /// v62.0.0 (wave G0 v4) — is any row left `refolding` (an interrupted
-    /// re-fold, repaired at open)? `false` by default.
+    /// re-fold, repaired at open)? Refuses by default (`Unsupported`,
+    /// PX-fix1); the proxy routes it (`FoldAnyRefolding`).
     async fn fold_any_refolding(&self) -> Result<bool, Error> {
-        Ok(false)
+        Err(Error::Unsupported {
+            method: "fold_any_refolding",
+        })
     }
 
     /// v62.0.0 (wave G0 v4) — take one occurrence pair's current-state row
@@ -4142,22 +4206,28 @@ pub trait FederationDirectory: Send + Sync {
 
     /// v62.0.0 (JSON-cut slice B) — one held statement by its statement id,
     /// as received (CC 2.6.1.2): the point read behind the
-    /// [`edition2::store::STATEMENT_KIND`] wire kind.
+    /// [`edition2::store::STATEMENT_KIND`] wire kind. Refuses by default
+    /// (`Unsupported`, PX-fix1); the proxy routes it (`Edition2Statement`).
     async fn edition2_statement(&self, statement_id: &[u8; 32]) -> Result<Option<Vec<u8>>, Error> {
         let _ = statement_id;
-        Ok(None)
+        Err(Error::Unsupported {
+            method: "edition2_statement",
+        })
     }
 
     /// v62.0.0 (JSON-cut slice B) — the statement-id wire index: the held
     /// statement ids (lowercase hex) after `after`, in id order, at most
-    /// `limit`.
+    /// `limit`. Refuses by default (`Unsupported`, PX-fix1); the proxy routes
+    /// it (`Edition2StatementIdsSince`).
     async fn edition2_statement_ids_since(
         &self,
         after: Option<&[u8; 32]>,
         limit: u32,
     ) -> Result<Vec<String>, Error> {
         let _ = (after, limit);
-        Ok(Vec::new())
+        Err(Error::Unsupported {
+            method: "edition2_statement_ids_since",
+        })
     }
 
     // ── Public keys ────────────────────────────────────────────────
@@ -4643,8 +4713,10 @@ pub trait FederationDirectory: Send + Sync {
     /// leaves its epoch DIRTY in the V146 emission ledger, which the
     /// pending-`KeyGrant` loop every host runs signs and emits.
     ///
-    /// The default is a no-op: a directory with no community-DEK plane has no
-    /// epochs to re-wrap. The sqlite and postgres backends run
+    /// The default refuses (`Unsupported`; v62.0.0 PX-fix1 — it was a silent
+    /// no-op, so a door composed over the capsule proxy reported a re-wrap it
+    /// never ran; `rewrap_after_admission` logs the refusal and the
+    /// pending-`KeyGrant` sweep retries). The sqlite and postgres backends run
     /// [`at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices`](crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices)
     /// under their node key (none set: nothing is theirs to re-wrap).
     /// v53.0.0 (#963) — and, first, the self/family walk
@@ -4653,7 +4725,9 @@ pub trait FederationDirectory: Send + Sync {
     /// self/family keys this node holds.
     async fn rewrap_own_epochs_for_device(&self, owner: &str, device: &str) -> Result<(), Error> {
         let _ = (owner, device);
-        Ok(())
+        Err(Error::Unsupported {
+            method: "rewrap_own_epochs_for_device",
+        })
     }
 
     /// v55.0.0 (CIRISPersist#989, CC 3.3.2 rc7) — **whose content does this
@@ -4683,11 +4757,15 @@ pub trait FederationDirectory: Send + Sync {
     /// inserted or already held the row, so a row that reaches this node by
     /// any typed door carries its wrap with it.
     ///
-    /// The default is a no-op: a directory with no grant tables has nothing to
-    /// project into. The sqlite and postgres backends project.
+    /// The default refuses (`Unsupported`; v62.0.0 PX-fix1 — it was a silent
+    /// no-op, so a typed door composed over the capsule proxy admitted a
+    /// key-grant row whose wrap was never projected). The sqlite and postgres
+    /// backends project.
     async fn project_key_grant_row(&self, row: &Attestation) -> Result<(), Error> {
         let _ = row;
-        Ok(())
+        Err(Error::Unsupported {
+            method: "project_key_grant_row",
+        })
     }
 
     /// v41.0.0 (CIRISPersist#804) — **the privileged SYNC door**: admit a row
@@ -5510,11 +5588,15 @@ pub trait FederationDirectory: Send + Sync {
     ///   authority leak, and it is the reason this runs on every successful
     ///   purge rather than being left to a periodic rebuild.
     ///
-    /// Backends override; the default is a no-op for stores that hold no
-    /// such projections (memory).
+    /// Backends override; the default refuses (`Unsupported`; v62.0.0
+    /// PX-fix1 — it was a silent no-op, so a purge composed over the capsule
+    /// proxy left `consent_peer_set` authorising a peer whose grant is gone:
+    /// the authority leak above).
     async fn purge_attestation_projections(&self, attestation_id: &str) -> Result<(), Error> {
         let _ = attestation_id;
-        Ok(())
+        Err(Error::Unsupported {
+            method: "purge_attestation_projections",
+        })
     }
 
     /// v38.4.0 (CIRISPersist#768) — **reap attestations whose stated shelf
@@ -8885,11 +8967,14 @@ pub trait FederationDirectory: Send + Sync {
     /// 2. **One seat on the prior roster.** verify's `roster_from_envelope`
     ///    over the prior envelope (distinct ids, every member resolved, no
     ///    pubkey seated twice) — so one human cannot count twice.
-    /// 3. **Who signed.** Each submitted signature is checked by verify's
-    ///    [`verify_threshold_signatures`](ciris_verify_core::threshold::verify_threshold_signatures)
-    ///    at threshold 1 against the one prior member it names (hybrid,
-    ///    classical-only does not count — CC 5.3.2.4.3.1). The member ids that
-    ///    verified are the signer set.
+    /// 3. **Who signed.** v62.0.0 (BH-fix1; RULINGS "composite signatures
+    ///    only") — the prior members among the edition-2 door's vouched voices
+    ///    for exactly this change envelope
+    ///    (`edition2::group::vouched_quorum_signers`); each voice is ONE
+    ///    composite statement, verified when it arrived. The earlier caller-
+    ///    supplied signature list (separate Ed25519 + ML-DSA-65 pairs, Verify's
+    ///    `ThresholdSignature`) is gone with its verify: outside a vouch the
+    ///    signer set is empty.
     /// 4. **The threshold.** [`consensus::evaluate`] over the group's ACTIVE
     ///    roster with roles (a community's authorized fold,
     ///    [`Self::active_community_members`]; a family's
@@ -8916,7 +9001,6 @@ pub trait FederationDirectory: Send + Sync {
         cohort: cohort::Cohort,
         group_key_id: &str,
         change_envelope: &serde_json::Value,
-        signatures: &[ciris_verify_core::threshold::ThresholdSignature],
     ) -> Result<(), Error> {
         use ciris_verify_core::accord_genesis as ag;
         use ciris_verify_core::threshold::ThresholdMember;
@@ -9093,37 +9177,18 @@ pub trait FederationDirectory: Send + Sync {
             }
         }
 
-        // 3. Who signed: verify's hybrid threshold primitive, one member at a
-        //    time, so the member ids that verified are known (the aggregate
-        //    call returns only a count).
-        let bytes = ag::accord_family_signing_bytes(change_envelope)
-            .map_err(|e| refuse(format!("canonicalize: {e}")))?;
+        // 3. Who signed: the vouched voices (v62.0.0 BH-fix1). An edition-2
+        //    roster version's quorum is its voices: the edition-2 door vouches
+        //    for exactly this change envelope
+        //    (`edition2::group::vouched_quorum_signers`), and each voice's
+        //    composite statement was verified when it arrived. Counted only
+        //    where the signer holds a prior seat.
         let mut signers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        // v62.0.0 (wave T1) — an edition-2 roster version's quorum is its
-        // voices: the edition-2 door vouches for exactly this change envelope
-        // (`edition2::group::vouched_quorum_signers`), and each voice's
-        // statement was verified when it arrived. Counted only where the
-        // signer holds a prior seat, as a verified signature is below.
         if let Some(vouched) = edition2::group::vouched_quorum_signers(change_envelope) {
             for m in &prior_roster {
                 if vouched.contains(&m.member_id) {
                     signers.insert(m.member_id.clone());
                 }
-            }
-        }
-        for sig in signatures {
-            let Some(member) = prior_roster.iter().find(|m| m.member_id == sig.member_id) else {
-                continue;
-            };
-            if ciris_verify_core::threshold::verify_threshold_signatures(
-                &bytes,
-                std::slice::from_ref(member),
-                std::slice::from_ref(sig),
-                1,
-            )
-            .is_ok()
-            {
-                signers.insert(sig.member_id.clone());
             }
         }
 
@@ -9309,7 +9374,7 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         mut new: types::SignedFamily,
         change_envelope: serde_json::Value,
-        signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
+        signatures: Vec<crate::federation::types::RetiredMemberPairSignature>,
     ) -> Result<u32, Error> {
         // Verify-A-store-B guard: the quorum authorized `change_envelope`, so
         // the roster/protocol being stored MUST be exactly the one it
@@ -9366,20 +9431,12 @@ pub trait FederationDirectory: Send + Sync {
         family_dissolution::check_dissolve_is_terminal_only(&prior, &new.family)?;
         family_dissolution::check_dissolution_matches_envelope(&new.family, &change_envelope)?;
         if let Some(leaver) = family_dissolution::self_leave_member(&prior, &new.family) {
-            family_dissolution::verify_self_leave_signature(
-                self,
-                &prior,
-                &change_envelope,
-                &signatures,
-                leaver,
-            )
-            .await?;
+            family_dissolution::verify_self_leave_signature(&prior, &change_envelope, leaver)?;
         } else {
             self.verify_membership_quorum(
                 cohort::Cohort::Family,
                 &new.family.family_key_id,
                 &change_envelope,
-                &signatures,
             )
             .await?;
         }
@@ -9409,7 +9466,7 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         mut new: types::SignedCommunity,
         change_envelope: serde_json::Value,
-        signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
+        signatures: Vec<crate::federation::types::RetiredMemberPairSignature>,
     ) -> Result<u32, Error> {
         let members: std::collections::BTreeSet<&str> = new
             .community
@@ -9440,7 +9497,6 @@ pub trait FederationDirectory: Send + Sync {
                 cohort::Cohort::Community,
                 &new.community.community_key_id,
                 &change_envelope,
-                &signatures,
             )
             .await?;
         }
@@ -9478,7 +9534,7 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         mut new: types::SignedCommunity,
         change_envelope: serde_json::Value,
-        signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
+        signatures: Vec<crate::federation::types::RetiredMemberPairSignature>,
     ) -> Result<u32, Error> {
         let members: std::collections::BTreeSet<&str> = new
             .community
@@ -9496,7 +9552,6 @@ pub trait FederationDirectory: Send + Sync {
             cohort::Cohort::Affiliations,
             &new.community.community_key_id,
             &change_envelope,
-            &signatures,
         )
         .await?;
         let authorization = serde_json::json!({

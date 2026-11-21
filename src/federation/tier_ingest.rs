@@ -287,7 +287,6 @@ where
             super::cohort::Cohort::Family,
             &offered.family_key_id,
             &proof.change_envelope,
-            &proof.quorum_signatures,
         )
         .await
     {
@@ -325,9 +324,16 @@ where
 }
 
 /// Do distinct members of `standing` that make a strict majority of it sign
-/// `proof.change_envelope`? Each signature is verified against the member's
-/// REGISTERED pinned hybrid key, one member at a time, so a key counts once
-/// however many signatures name it.
+/// `proof.change_envelope`?
+///
+/// v62.0.0 (BH-fix1; RULINGS "composite signatures only") — a member signs
+/// with ONE composite statement, verified at the edition-2 door, which
+/// vouches for exactly this change envelope
+/// (`edition2::group::vouched_quorum_signers`); a key counts once however
+/// many voices name it. The earlier `proof.quorum_signatures` (separate
+/// Ed25519 + ML-DSA-65 pairs verified against each member's component
+/// halves) are not read: their verify is deleted, so outside a vouch nobody
+/// has signed.
 pub(crate) async fn standing_majority_signed_by<F>(
     directory: &F,
     standing: &[String],
@@ -336,39 +342,12 @@ pub(crate) async fn standing_majority_signed_by<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    use ciris_verify_core::accord_genesis as ag;
-    let Ok(bytes) = ag::accord_family_signing_bytes(&proof.change_envelope) else {
-        return Ok(false);
-    };
-    let mut signed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for key_id in standing {
-        let Some(rec) = directory.lookup_public_key(key_id).await? else {
-            continue;
-        };
-        let member = ciris_verify_core::threshold::ThresholdMember {
-            member_id: rec.key_id,
-            ed25519_public_key_base64: rec.pubkey_ed25519_base64,
-            mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64,
-            role: None,
-        };
-        let verified = proof
-            .quorum_signatures
-            .iter()
-            .filter(|sig| sig.member_id == member.member_id)
-            .any(|sig| {
-                ciris_verify_core::threshold::verify_threshold_signatures(
-                    &bytes,
-                    std::slice::from_ref(&member),
-                    std::slice::from_ref(sig),
-                    1,
-                )
-                .is_ok()
-            });
-        if verified {
-            signed.insert(member.member_id);
-        }
-    }
-    Ok(signed.len() >= ag::strict_majority(standing.len()))
+    let _ = directory;
+    let vouched =
+        super::edition2::group::vouched_quorum_signers(&proof.change_envelope).unwrap_or_default();
+    let signed: std::collections::BTreeSet<&String> =
+        standing.iter().filter(|k| vouched.contains(*k)).collect();
+    Ok(signed.len() >= ciris_verify_core::accord_genesis::strict_majority(standing.len()))
 }
 
 /// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
@@ -957,22 +936,6 @@ pub mod test_support {
         Box::new(MlDsa65Signer::from_seed(&seed_for(key_id)).expect("mldsa seed"))
     }
 
-    /// v54.1.0 (CIRISPersist#1042 follow-up) — `key_id`'s deterministic hybrid
-    /// signing identity, boxed (the ML-DSA secret is multi-KiB): the signer
-    /// whose pubkeys [`hybrid_pubkeys`] registers, for fixtures that sign
-    /// through verify's `produce_signed_identity_occurrence`.
-    pub fn hybrid_identity(
-        key_id: &str,
-    ) -> Box<ciris_verify_core::self_at_login::HybridSigningIdentity> {
-        Box::new(
-            ciris_verify_core::self_at_login::HybridSigningIdentity::new(
-                key_id,
-                ed_signer(key_id),
-                *mldsa_signer(key_id),
-            ),
-        )
-    }
-
     /// v59.0.0 (CIRISPersist#1103, CC 2.6.8) — a key id that names its own
     /// key: `<label padded to 32 bytes>-<fp>`. The test signer seeds from the
     /// FIRST 32 BYTES of an id, so the suffix does not move the key, and `fp`
@@ -1054,12 +1017,12 @@ pub mod test_support {
     pub fn threshold_sign(
         key_id: &str,
         bytes: &[u8],
-    ) -> ciris_verify_core::threshold::ThresholdSignature {
+    ) -> crate::federation::types::RetiredMemberPairSignature {
         let ed_sig = ed_signer(key_id).sign(bytes).expect("ed sign");
         let mut bound = bytes.to_vec();
         bound.extend_from_slice(&ed_sig);
         let pqc_sig = mldsa_signer(key_id).sign(&bound).expect("mldsa sign");
-        ciris_verify_core::threshold::ThresholdSignature {
+        crate::federation::types::RetiredMemberPairSignature {
             member_id: key_id.to_string(),
             ed25519_signature_base64: B64.encode(&ed_sig),
             mldsa65_signature_base64: Some(B64.encode(&pqc_sig)),
@@ -1848,87 +1811,6 @@ pub mod test_support {
             scrub_signature_pqc: pqc,
             supersede_proof: None,
             cosignatures,
-        }
-    }
-
-    /// v50.0.0 (CIRISPersist#925 review H1) — a SIGNED content-only
-    /// occurrence row `{identity → occurrence}` whose signer is `signer`
-    /// (registered with [`hybrid_pubkeys`]`(signer)`), asserted at
-    /// `asserted_at` (truncated to the millisecond, as the gate requires). The
-    /// same envelope `key_grant::publish_signed_content_only_occurrence` builds.
-    pub async fn signed_content_only_occurrence(
-        signer: &str,
-        identity: &str,
-        occurrence: &str,
-        asserted_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::federation::SignedIdentityOccurrence {
-        signed_content_only_occurrence_until(signer, identity, occurrence, asserted_at, None).await
-    }
-
-    /// CIRISPersist#1198 — [`signed_content_only_occurrence`] with a
-    /// `valid_until`, truncated to the millisecond as `asserted_at` is.
-    pub async fn signed_content_only_occurrence_until(
-        signer: &str,
-        identity: &str,
-        occurrence: &str,
-        asserted_at: chrono::DateTime<chrono::Utc>,
-        valid_until: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> crate::federation::SignedIdentityOccurrence {
-        let ms = |t: chrono::DateTime<chrono::Utc>| {
-            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis())
-                .expect("ms instant")
-        };
-        let asserted_at = ms(asserted_at);
-        let valid_until = valid_until.map(ms);
-        let x_pub = ciris_crypto::x25519::public_from_secret(&seed_for(occurrence));
-        let (_sk, ml_pub) = ciris_crypto::ml_kem::generate_keypair().expect("ml-kem keypair");
-        let enc = crate::federation::EncryptionPubkeys {
-            x25519_base64: B64.encode(x_pub),
-            ml_kem_768_base64: B64.encode(&ml_pub),
-        };
-        let envelope = serde_json::json!({
-            "attesting_key_id": signer,
-            "identity_key_id": identity,
-            "occurrence_key_id": occurrence,
-            "device_class": crate::federation::types::device_class::SERVER,
-            "encryption_pubkeys": {
-                "x25519_base64": enc.x25519_base64,
-                "ml_kem_768_base64": enc.ml_kem_768_base64,
-            },
-            "asserted_at": asserted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            "valid_until": valid_until
-                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
-            "hardware_attestation": serde_json::Value::Null,
-        });
-        let id = Box::new(
-            ciris_verify_core::self_at_login::HybridSigningIdentity::new(
-                signer,
-                ed_signer(signer),
-                *mldsa_signer(signer),
-            ),
-        );
-        let (signed_envelope, signature) =
-            ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
-                id.as_ref(),
-                envelope,
-            )
-            .await
-            .expect("sign occurrence envelope");
-        crate::federation::SignedIdentityOccurrence {
-            identity_occurrence: crate::federation::IdentityOccurrence {
-                identity_key_id: identity.to_owned(),
-                occurrence_key_id: occurrence.to_owned(),
-                device_class: crate::federation::types::device_class::SERVER.to_owned(),
-                hardware_attestation: None,
-                asserted_at,
-                valid_until,
-                encryption_pubkeys: Some(enc),
-                transport_binding: None,
-                persist_row_hash: String::new(),
-            },
-            attesting_key_id: signer.to_owned(),
-            signed_envelope,
-            signature,
         }
     }
 

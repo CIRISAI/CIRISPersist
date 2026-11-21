@@ -174,6 +174,28 @@ pub(crate) fn dtrace(stage: &str, op: &str) {
 /// executor capsule's `spawn` reconstructs.
 type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
+/// v62.0.0 (CL-fix1) — **wire shape of a retired op; never evaluated.** The
+/// `policy` member of the retired [`DirectoryOp::VerifyHybridViaDirectory`],
+/// kept so the ABI-14 op stays byte-identical on the wire (append-only: a
+/// retired op keeps its fields and refuses). Its serde encoding is the
+/// earlier `HybridPolicy`'s: the same variant names and fields. Persist's
+/// own hybrid-policy type is deleted and nothing reads this value: the op's
+/// arm refuses `Unsupported` before looking at it. Re-exported at the old
+/// path (`verify::hybrid::HybridPolicy`) only so the op's field text, which
+/// the structural-digest pin hashes, is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetiredHybridPolicy {
+    /// Wire value `"Strict"`.
+    Strict,
+    /// Wire value `{"SoftFreshness": {"window": …}}`.
+    SoftFreshness {
+        /// The earlier freshness window (never read).
+        window: std::time::Duration,
+    },
+    /// Wire value `"Ed25519Fallback"`.
+    Ed25519Fallback,
+}
+
 /// ABI version of [`DirectoryVTable`]. Bumped on any breaking change to
 /// the vtable's layout or function-pointer signatures.
 ///
@@ -1769,6 +1791,95 @@ pub enum DirectoryOp {
         /// The instant the key's liveness is read at (POSIX ms).
         at_ms: u64,
     },
+    /// v62.0.0 (PX-fix1) — [`FederationDirectory::edition2_statements_about`],
+    /// the first of the edition-2 and fold store READS appended here. Each
+    /// trait default answered empty / `None` / `false` through the consumer
+    /// proxy, so a free fold a consumer runs over it (`genesis_in_force`,
+    /// `held_keys_for_kid`, `bytes_servable`, `is_held_back`, ...) read
+    /// "nothing held"; each now crosses to the HOST's store, and the defaults
+    /// refuse `Unsupported`. Result rides `Edition2Statements`. APPEND-ONLY
+    /// (Growth).
+    Edition2StatementsAbout {
+        /// The statement family (`key:record`, ...).
+        family: String,
+        /// The CWT `sub`.
+        sub: String,
+    },
+    /// v62.0.0 (PX-fix1) — [`FederationDirectory::edition2_voices`]. Result
+    /// rides `Edition2Statements`. APPEND-ONLY (Growth).
+    Edition2Voices {
+        /// The row id.
+        row_id: [u8; 32],
+    },
+    /// v62.0.0 (PX-fix1) — [`FederationDirectory::edition2_rows_naming`].
+    /// Result rides `Edition2RowIds`. APPEND-ONLY (Growth).
+    Edition2RowsNaming {
+        /// The named row id.
+        named: [u8; 32],
+        /// The `refs` role.
+        role: String,
+    },
+    /// v62.0.0 (PX-fix1) — [`FederationDirectory::edition2_objects`]. Result
+    /// rides `Edition2Statements`. APPEND-ONLY (Growth).
+    Edition2Objects {
+        /// The object `typ` (`ceg-genesis-bundle/2`).
+        typ: String,
+    },
+    /// v62.0.0 (PX-fix1) — [`FederationDirectory::edition2_statement`].
+    /// Result rides `OptionalBytes`. APPEND-ONLY (Growth).
+    Edition2Statement {
+        /// The statement id.
+        statement_id: [u8; 32],
+    },
+    /// v62.0.0 (PX-fix1) — [`FederationDirectory::edition2_statement_ids_since`].
+    /// Result rides `Edition2StatementIds`. APPEND-ONLY (Growth).
+    Edition2StatementIdsSince {
+        /// Page after this statement id (`None`: from the first).
+        after: Option<[u8; 32]>,
+        /// At most this many.
+        limit: u32,
+    },
+    /// v62.0.0 (PX-fix1) — [`FederationDirectory::fold_held`]. Result rides
+    /// `FoldHeldReason`. APPEND-ONLY (Growth).
+    FoldHeld {
+        /// The row id.
+        row_id: [u8; 32],
+    },
+    /// v62.0.0 (PX-fix1) — [`FederationDirectory::fold_held_page`]. Result
+    /// rides `FoldHeldReasons`. APPEND-ONLY (Growth).
+    FoldHeldPage {
+        /// Page after this row id (`None`: from the first).
+        after: Option<[u8; 32]>,
+        /// At most this many.
+        limit: u32,
+    },
+    /// v62.0.0 (PX-fix1) — [`FederationDirectory::fold_dependents`]. Result
+    /// rides `Edition2RowIds`. APPEND-ONLY (Growth).
+    FoldDependents {
+        /// The read keys.
+        read_keys: Vec<String>,
+    },
+    /// v62.0.0 (PX-fix1) — [`FederationDirectory::fold_state`]. Result rides
+    /// `FoldStateOf`. APPEND-ONLY (Growth).
+    FoldState {
+        /// The row id.
+        row_id: [u8; 32],
+    },
+    /// v62.0.0 (PX-fix1) — [`FederationDirectory::fold_slot_rows`]. Result
+    /// rides `Edition2RowIds`. APPEND-ONLY (Growth).
+    FoldSlotRows {
+        /// The projection slot.
+        slot: String,
+    },
+    /// v62.0.0 (PX-fix1) — [`FederationDirectory::fold_slot_held`]. Result
+    /// rides `Bool`. APPEND-ONLY (Growth).
+    FoldSlotHeld {
+        /// The projection slot.
+        slot: String,
+    },
+    /// v62.0.0 (PX-fix1) — [`FederationDirectory::fold_any_refolding`].
+    /// Result rides `Bool`. APPEND-ONLY (Growth).
+    FoldAnyRefolding {},
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -2112,6 +2223,21 @@ pub enum DirectoryOpResult {
     /// read is the top-level `TypedErr` (verify could not run). APPEND-ONLY
     /// (Growth).
     CompositeVerify(Result<String, CompositeVerifyRefusal>),
+    /// v62.0.0 (PX-fix1) — `edition2_statements_about`, `edition2_voices`,
+    /// `edition2_objects`: statements as received. APPEND-ONLY (Growth).
+    Edition2Statements(Vec<Vec<u8>>),
+    /// v62.0.0 (PX-fix1) — `edition2_rows_naming`, `fold_dependents`,
+    /// `fold_slot_rows`: node-computed row ids. APPEND-ONLY (Growth).
+    Edition2RowIds(Vec<[u8; 32]>),
+    /// v62.0.0 (PX-fix1) — `edition2_statement_ids_since` (lowercase hex).
+    /// APPEND-ONLY (Growth).
+    Edition2StatementIds(Vec<String>),
+    /// v62.0.0 (PX-fix1) — `fold_held`. APPEND-ONLY (Growth).
+    FoldHeldReason(Option<Edition2HeldReason>),
+    /// v62.0.0 (PX-fix1) — `fold_held_page`. APPEND-ONLY (Growth).
+    FoldHeldReasons(Vec<Edition2HeldReason>),
+    /// v62.0.0 (PX-fix1) — `fold_state`. APPEND-ONLY (Growth).
+    FoldStateOf(Option<Edition2FoldState>),
 }
 
 /// v62.0.0 (F0-cp5) — a refusal of
@@ -2394,6 +2520,46 @@ impl From<crate::federation::edition2::ingest::ReplicatedStatementOutcome>
     }
 }
 
+/// v62.0.0 (LF-fix2, T5) — the consumer side: the proxy's
+/// `replicated_statement_door` reads the op's outcome back as the door's own.
+impl From<Edition2StatementOutcome> for crate::federation::edition2::ingest::StatementOutcome {
+    fn from(o: Edition2StatementOutcome) -> Self {
+        use crate::federation::edition2::names::RowId;
+        match o {
+            Edition2StatementOutcome::KeyPlane { row_id, new } => Self::KeyPlane {
+                row_id: RowId(row_id),
+                new,
+            },
+            Edition2StatementOutcome::Voice { row_id, new } => Self::Voice {
+                row_id: RowId(row_id),
+                new,
+            },
+            Edition2StatementOutcome::Row { row_id, new } => Self::Row {
+                row_id: RowId(row_id),
+                new,
+            },
+            Edition2StatementOutcome::Pending { row_id, new } => Self::Pending {
+                row_id: RowId(row_id),
+                new,
+            },
+        }
+    }
+}
+
+/// v62.0.0 (LF-fix2, T5) — [`Edition2ReplicatedOutcome`] back to the door's
+/// outcome (the proxy's `replicated_statement_door`).
+impl From<Edition2ReplicatedOutcome>
+    for crate::federation::edition2::ingest::ReplicatedStatementOutcome
+{
+    fn from(o: Edition2ReplicatedOutcome) -> Self {
+        match o {
+            Edition2ReplicatedOutcome::Admitted(s) => Self::Admitted(s.into()),
+            Edition2ReplicatedOutcome::Unchanged(s) => Self::Unchanged(s.into()),
+            Edition2ReplicatedOutcome::Refused { reason } => Self::Refused { reason },
+        }
+    }
+}
+
 /// The wire mirror of one tip of
 /// [`crate::federation::edition2::genesis::bundles_in_force`] (Verify's
 /// `GenesisPlacement`): the members PyO3's `bundles_in_force_json` serves,
@@ -2529,6 +2695,110 @@ impl From<&crate::federation::edition2::transport_rebind::HeldRebind> for Editio
             row_id: r.row_id.0,
             transit_xwing_pubkey: r.transit_xwing_pubkey.to_vec(),
             head: r.head.0,
+        }
+    }
+}
+
+/// v62.0.0 (PX-fix1) — the wire mirror of
+/// [`crate::federation::edition2::fold::HeldReason`]: why a held row
+/// concludes nothing. Both directions are total (the proxy rebuilds the
+/// reason the host's store read).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edition2HeldReason {
+    /// The row id.
+    pub row_id: [u8; 32],
+    /// The row's family.
+    pub family: String,
+    /// The tier the row concludes at.
+    pub tier: String,
+    /// Did the row first arrive through the replicated door?
+    pub replicated: bool,
+    /// Its plane.
+    pub plane: String,
+    /// The reason token.
+    pub reason: String,
+    /// The refusal the gate would have raised, as text.
+    pub detail: String,
+    /// The HOST's clock (POSIX µs) when the row was first held for this
+    /// reason.
+    pub since_us: i64,
+}
+
+impl From<&crate::federation::edition2::fold::HeldReason> for Edition2HeldReason {
+    fn from(h: &crate::federation::edition2::fold::HeldReason) -> Self {
+        Self {
+            row_id: h.row_id.0,
+            family: h.family.clone(),
+            tier: h.tier.clone(),
+            replicated: h.replicated,
+            plane: h.plane.clone(),
+            reason: h.reason.clone(),
+            detail: h.detail.clone(),
+            since_us: h.since_us,
+        }
+    }
+}
+
+impl From<Edition2HeldReason> for crate::federation::edition2::fold::HeldReason {
+    fn from(h: Edition2HeldReason) -> Self {
+        Self {
+            row_id: crate::federation::edition2::names::RowId(h.row_id),
+            family: h.family,
+            tier: h.tier,
+            replicated: h.replicated,
+            plane: h.plane,
+            reason: h.reason,
+            detail: h.detail,
+            since_us: h.since_us,
+        }
+    }
+}
+
+/// v62.0.0 (PX-fix1) — the wire mirror of
+/// [`crate::federation::edition2::fold::FoldState`]: the fold's whole record
+/// of one row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edition2FoldState {
+    /// The row id.
+    pub row_id: [u8; 32],
+    /// The row's family.
+    pub family: String,
+    /// The tier it first arrived at.
+    pub tier: String,
+    /// Did it first arrive through the replicated door?
+    pub replicated: bool,
+    /// Its plane.
+    pub plane: String,
+    /// Its projection slot.
+    pub slot: String,
+    /// `None`: concluded. `Some`: why it concludes nothing.
+    pub held: Option<Edition2HeldReason>,
+}
+
+impl From<&crate::federation::edition2::fold::FoldState> for Edition2FoldState {
+    fn from(f: &crate::federation::edition2::fold::FoldState) -> Self {
+        Self {
+            row_id: f.row_id.0,
+            family: f.family.clone(),
+            tier: f.tier.clone(),
+            replicated: f.replicated,
+            plane: f.plane.clone(),
+            slot: f.slot.clone(),
+            held: f.held.as_ref().map(Edition2HeldReason::from),
+        }
+    }
+}
+
+impl From<Edition2FoldState> for crate::federation::edition2::fold::FoldState {
+    fn from(f: Edition2FoldState) -> Self {
+        Self {
+            row_id: crate::federation::edition2::names::RowId(f.row_id),
+            family: f.family,
+            tier: f.tier,
+            replicated: f.replicated,
+            plane: f.plane,
+            slot: f.slot,
+            held: f.held.map(Into::into),
         }
     }
 }
@@ -2757,7 +3027,22 @@ pub fn earlier_form_op_plane(op: &DirectoryOp) -> Option<&'static str> {
         // v62.0.0 (ceremony gap 4) — the genesis import door.
         | DirectoryOp::PutGenesisBundle { .. }
         // v62.0.0 (ceremony gap 2) — the seat re-bind read.
-        | DirectoryOp::RebindHeldFor { .. } => None,
+        | DirectoryOp::RebindHeldFor { .. }
+        // v62.0.0 (PX-fix1) — the edition-2 and fold store reads: they read
+        // held statements and fold records, and carry no signed object.
+        | DirectoryOp::Edition2StatementsAbout { .. }
+        | DirectoryOp::Edition2Voices { .. }
+        | DirectoryOp::Edition2RowsNaming { .. }
+        | DirectoryOp::Edition2Objects { .. }
+        | DirectoryOp::Edition2Statement { .. }
+        | DirectoryOp::Edition2StatementIdsSince { .. }
+        | DirectoryOp::FoldHeld { .. }
+        | DirectoryOp::FoldHeldPage { .. }
+        | DirectoryOp::FoldDependents { .. }
+        | DirectoryOp::FoldState { .. }
+        | DirectoryOp::FoldSlotRows { .. }
+        | DirectoryOp::FoldSlotHeld { .. }
+        | DirectoryOp::FoldAnyRefolding { .. } => None,
         // TODO(json-cut): detection events are MESH (RULINGS "Planes"), but
         // no edition-2 detection door exists yet and the Rust door
         // (`derived::put_edge_detection_event`) is not wired to the
@@ -4210,6 +4495,88 @@ pub async fn dispatch_directory_op(
                 Err(e) => op_err_typed(&e),
             }
         }
+        // v62.0.0 (PX-fix1) — the edition-2 and fold store reads, answered
+        // by the host's own store (the defaults refuse `Unsupported`).
+        DirectoryOp::Edition2StatementsAbout { family, sub } => {
+            match dir.edition2_statements_about(&family, &sub).await {
+                Ok(v) => DirectoryOpResult::Edition2Statements(v),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::Edition2Voices { row_id } => {
+            let row_id = crate::federation::edition2::names::RowId(row_id);
+            match dir.edition2_voices(&row_id).await {
+                Ok(v) => DirectoryOpResult::Edition2Statements(v),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::Edition2RowsNaming { named, role } => {
+            let named = crate::federation::edition2::names::RowId(named);
+            match dir.edition2_rows_naming(&named, &role).await {
+                Ok(v) => DirectoryOpResult::Edition2RowIds(v.into_iter().map(|r| r.0).collect()),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::Edition2Objects { typ } => match dir.edition2_objects(&typ).await {
+            Ok(v) => DirectoryOpResult::Edition2Statements(v),
+            Err(e) => op_err_typed(&e),
+        },
+        DirectoryOp::Edition2Statement { statement_id } => {
+            match dir.edition2_statement(&statement_id).await {
+                Ok(v) => DirectoryOpResult::OptionalBytes(v),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::Edition2StatementIdsSince { after, limit } => {
+            match dir
+                .edition2_statement_ids_since(after.as_ref(), limit)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::Edition2StatementIds(v),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::FoldHeld { row_id } => {
+            let row_id = crate::federation::edition2::names::RowId(row_id);
+            match dir.fold_held(&row_id).await {
+                Ok(h) => {
+                    DirectoryOpResult::FoldHeldReason(h.as_ref().map(Edition2HeldReason::from))
+                }
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::FoldHeldPage { after, limit } => {
+            let after = after.map(crate::federation::edition2::names::RowId);
+            match dir.fold_held_page(after.as_ref(), limit).await {
+                Ok(v) => DirectoryOpResult::FoldHeldReasons(
+                    v.iter().map(Edition2HeldReason::from).collect(),
+                ),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::FoldDependents { read_keys } => match dir.fold_dependents(&read_keys).await {
+            Ok(v) => DirectoryOpResult::Edition2RowIds(v.into_iter().map(|r| r.0).collect()),
+            Err(e) => op_err_typed(&e),
+        },
+        DirectoryOp::FoldState { row_id } => {
+            let row_id = crate::federation::edition2::names::RowId(row_id);
+            match dir.fold_state(&row_id).await {
+                Ok(f) => DirectoryOpResult::FoldStateOf(f.as_ref().map(Edition2FoldState::from)),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::FoldSlotRows { slot } => match dir.fold_slot_rows(&slot).await {
+            Ok(v) => DirectoryOpResult::Edition2RowIds(v.into_iter().map(|r| r.0).collect()),
+            Err(e) => op_err_typed(&e),
+        },
+        DirectoryOp::FoldSlotHeld { slot } => match dir.fold_slot_held(&slot).await {
+            Ok(b) => DirectoryOpResult::Bool(b),
+            Err(e) => op_err_typed(&e),
+        },
+        DirectoryOp::FoldAnyRefolding {} => match dir.fold_any_refolding().await {
+            Ok(b) => DirectoryOpResult::Bool(b),
+            Err(e) => op_err_typed(&e),
+        },
     }
 }
 
@@ -6646,6 +7013,33 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
+    /// v62.0.0 (LF-fix2, T5) — the replicated statement door, routed WHOLE as
+    /// the `ApplyReplicatedStatement` op: its gates, its fold and its
+    /// receive-side hooks (the #916 owner-binding re-wrap, which this proxy
+    /// does not route as a method) run inside persist over the host's store.
+    /// A wait (`federation_attester_key_unknown`) crosses typed
+    /// (`TypedErr`, relayed by `run_op`); a lost race is the outcome's
+    /// `Refused`, never an error.
+    async fn replicated_statement_door(
+        &self,
+        statement: &[u8],
+        offered_id: &[u8; 32],
+    ) -> Result<crate::federation::edition2::ingest::ReplicatedStatementOutcome, Error> {
+        match self
+            .run_op(&DirectoryOp::ApplyReplicatedStatement {
+                statement: statement.to_vec(),
+                offered_row_id: *offered_id,
+            })
+            .await?
+        {
+            DirectoryOpResult::ReplicatedStatementOutcome(o) => Ok(o.into()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
     /// v62.0.0 (JSON-cut slice D) — the edition-2 serve listing, proxied.
     /// The trait default answers EMPTY, which a serving consumer would read
     /// as "nothing held" (the #1244 fail-open class), so the read crosses.
@@ -6668,6 +7062,242 @@ impl FederationDirectory for OpsDirectory {
                     bytes: s.bytes,
                 })
                 .collect()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    // ── v62.0.0 (PX-fix1) — the edition-2 and fold store reads, proxied ──
+    //
+    // Each trait default answered empty / `None` / `false`, so every free
+    // fold a consumer composes over this proxy (`genesis_in_force`,
+    // `held_keys_for_kid`, `bytes_servable`, `is_held_back`, the group serve
+    // filter, ...) read "nothing held" — fail-open (the #1244 class). Each
+    // read crosses to the host's store; the defaults now refuse.
+
+    async fn edition2_statements_about(
+        &self,
+        family: &str,
+        sub: &str,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        match self
+            .run_op(&DirectoryOp::Edition2StatementsAbout {
+                family: family.to_owned(),
+                sub: sub.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Edition2Statements(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn edition2_voices(
+        &self,
+        row_id: &crate::federation::edition2::names::RowId,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        match self
+            .run_op(&DirectoryOp::Edition2Voices { row_id: row_id.0 })
+            .await?
+        {
+            DirectoryOpResult::Edition2Statements(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn edition2_rows_naming(
+        &self,
+        named: &crate::federation::edition2::names::RowId,
+        role: &str,
+    ) -> Result<Vec<crate::federation::edition2::names::RowId>, Error> {
+        match self
+            .run_op(&DirectoryOp::Edition2RowsNaming {
+                named: named.0,
+                role: role.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Edition2RowIds(v) => Ok(v
+                .into_iter()
+                .map(crate::federation::edition2::names::RowId)
+                .collect()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn edition2_objects(&self, typ: &str) -> Result<Vec<Vec<u8>>, Error> {
+        match self
+            .run_op(&DirectoryOp::Edition2Objects {
+                typ: typ.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Edition2Statements(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn edition2_statement(&self, statement_id: &[u8; 32]) -> Result<Option<Vec<u8>>, Error> {
+        match self
+            .run_op(&DirectoryOp::Edition2Statement {
+                statement_id: *statement_id,
+            })
+            .await?
+        {
+            DirectoryOpResult::OptionalBytes(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn edition2_statement_ids_since(
+        &self,
+        after: Option<&[u8; 32]>,
+        limit: u32,
+    ) -> Result<Vec<String>, Error> {
+        match self
+            .run_op(&DirectoryOp::Edition2StatementIdsSince {
+                after: after.copied(),
+                limit,
+            })
+            .await?
+        {
+            DirectoryOpResult::Edition2StatementIds(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn fold_held(
+        &self,
+        row_id: &crate::federation::edition2::names::RowId,
+    ) -> Result<Option<crate::federation::edition2::fold::HeldReason>, Error> {
+        match self
+            .run_op(&DirectoryOp::FoldHeld { row_id: row_id.0 })
+            .await?
+        {
+            DirectoryOpResult::FoldHeldReason(h) => Ok(h.map(Into::into)),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn fold_held_page(
+        &self,
+        after: Option<&crate::federation::edition2::names::RowId>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::edition2::fold::HeldReason>, Error> {
+        match self
+            .run_op(&DirectoryOp::FoldHeldPage {
+                after: after.map(|r| r.0),
+                limit,
+            })
+            .await?
+        {
+            DirectoryOpResult::FoldHeldReasons(v) => Ok(v.into_iter().map(Into::into).collect()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn fold_dependents(
+        &self,
+        read_keys: &[String],
+    ) -> Result<Vec<crate::federation::edition2::names::RowId>, Error> {
+        match self
+            .run_op(&DirectoryOp::FoldDependents {
+                read_keys: read_keys.to_vec(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Edition2RowIds(v) => Ok(v
+                .into_iter()
+                .map(crate::federation::edition2::names::RowId)
+                .collect()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn fold_state(
+        &self,
+        row_id: &crate::federation::edition2::names::RowId,
+    ) -> Result<Option<crate::federation::edition2::fold::FoldState>, Error> {
+        match self
+            .run_op(&DirectoryOp::FoldState { row_id: row_id.0 })
+            .await?
+        {
+            DirectoryOpResult::FoldStateOf(f) => Ok(f.map(Into::into)),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn fold_slot_rows(
+        &self,
+        slot: &str,
+    ) -> Result<Vec<crate::federation::edition2::names::RowId>, Error> {
+        match self
+            .run_op(&DirectoryOp::FoldSlotRows {
+                slot: slot.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Edition2RowIds(v) => Ok(v
+                .into_iter()
+                .map(crate::federation::edition2::names::RowId)
+                .collect()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn fold_slot_held(&self, slot: &str) -> Result<bool, Error> {
+        match self
+            .run_op(&DirectoryOp::FoldSlotHeld {
+                slot: slot.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Bool(b) => Ok(b),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn fold_any_refolding(&self) -> Result<bool, Error> {
+        match self.run_op(&DirectoryOp::FoldAnyRefolding {}).await? {
+            DirectoryOpResult::Bool(b) => Ok(b),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -8139,9 +8769,14 @@ mod tests {
         // v62.0.0 (F0-cp5) — GROWTH: `VerifyCompositeViaDirectory` APPENDED;
         // `VerifyHybridViaDirectory` keeps its fields (its arm now refuses);
         // ABI stays 14. (X2 pass 4d: re-pinned over the integrated order.)
+        // v62.0.0 (PX-fix1) — GROWTH: the 13 edition-2 and fold store reads
+        // (`Edition2StatementsAbout` … `FoldAnyRefolding`) APPENDED after
+        // `VerifyCompositeViaDirectory`; ABI stays 14. (Another wave that
+        // appends ops re-pins over the MERGED order: the python port is
+        // FSD/v62_wip/parallel/tools/structural_digest.py.)
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "46ea3e96544eff31cddb1c974bc85fcf0e9d58ee813c63c9b8c8ab29f0c2ba02",
+            "97f8ce7e6bc3d732db8c72d303684c8da76506cc5e57954b4cda7155dcb82947",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -8219,8 +8854,11 @@ mod tests {
         // `VoiceOutcome`, `GenesisAdmission`, `RebindHeld`. GROWTH.
         assert_eq!(
             // v62.0.0 (F0-cp5) — GROWTH: `CompositeVerify` APPENDED.
+            // v62.0.0 (PX-fix1) — GROWTH: `Edition2Statements`,
+            // `Edition2RowIds`, `Edition2StatementIds`, `FoldHeldReason`,
+            // `FoldHeldReasons`, `FoldStateOf` APPENDED; ABI stays 14.
             structural_digest("DirectoryOpResult"),
-            "ce8099d4605263a57f7511078755a0bc6909fb77fe70a0075d05e97c0f3e7986",
+            "c41ae393fb69c755e4e84c8f2ea0e4ad773ca4b6eba17aeb92d4b55cb76d5335",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
@@ -8743,7 +9381,7 @@ mod tests {
             attesting_key_id: "nobody".into(),
             // No verifiable envelope/signature — the gate must refuse.
             signed_envelope: serde_json::json!({}),
-            signature: ciris_verify_core::transport_binding::TransportBindingSignature {
+            signature: crate::federation::types::RetiredPairSignature {
                 ed25519_signature_base64: String::new(),
                 mldsa65_signature_base64: None,
             },
@@ -11628,13 +12266,187 @@ mod tests {
                     })
                 },
             ),
+            // v62.0.0 (PX-fix1) — the edition-2 and fold store reads: each a
+            // leaf (the double delegates it), so the double fails the method
+            // itself; with no fault the proxy answers the host's store.
+            (
+                "edition2_statements_about",
+                "edition2_statements_about",
+                false,
+                DirectoryOp::Edition2StatementsAbout {
+                    family: "key:record".into(),
+                    sub: "x".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.edition2_statements_about("key:record", "x")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "edition2_voices",
+                "edition2_voices",
+                false,
+                DirectoryOp::Edition2Voices { row_id: [9u8; 32] },
+                |p| {
+                    Box::pin(async move {
+                        p.edition2_voices(&crate::federation::edition2::names::RowId([9u8; 32]))
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "edition2_rows_naming",
+                "edition2_rows_naming",
+                false,
+                DirectoryOp::Edition2RowsNaming {
+                    named: [9u8; 32],
+                    role: "target".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.edition2_rows_naming(
+                            &crate::federation::edition2::names::RowId([9u8; 32]),
+                            "target",
+                        )
+                        .await
+                        .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "edition2_objects",
+                "edition2_objects",
+                false,
+                DirectoryOp::Edition2Objects {
+                    typ: "ceg-genesis-bundle/2".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.edition2_objects("ceg-genesis-bundle/2")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "edition2_statement",
+                "edition2_statement",
+                false,
+                DirectoryOp::Edition2Statement {
+                    statement_id: [9u8; 32],
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.edition2_statement(&[9u8; 32])
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "edition2_statement_ids_since",
+                "edition2_statement_ids_since",
+                false,
+                DirectoryOp::Edition2StatementIdsSince {
+                    after: None,
+                    limit: 10,
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.edition2_statement_ids_since(None, 10)
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "fold_held",
+                "fold_held",
+                false,
+                DirectoryOp::FoldHeld { row_id: [9u8; 32] },
+                |p| {
+                    Box::pin(async move {
+                        p.fold_held(&crate::federation::edition2::names::RowId([9u8; 32]))
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "fold_held_page",
+                "fold_held_page",
+                false,
+                DirectoryOp::FoldHeldPage {
+                    after: None,
+                    limit: 10,
+                },
+                |p| {
+                    Box::pin(
+                        async move { p.fold_held_page(None, 10).await.map(|v| format!("{v:?}")) },
+                    )
+                },
+            ),
+            (
+                "fold_dependents",
+                "fold_dependents",
+                false,
+                DirectoryOp::FoldDependents {
+                    read_keys: vec!["x".into()],
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.fold_dependents(&["x".to_owned()])
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "fold_state",
+                "fold_state",
+                false,
+                DirectoryOp::FoldState { row_id: [9u8; 32] },
+                |p| {
+                    Box::pin(async move {
+                        p.fold_state(&crate::federation::edition2::names::RowId([9u8; 32]))
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "fold_slot_rows",
+                "fold_slot_rows",
+                false,
+                DirectoryOp::FoldSlotRows { slot: "x".into() },
+                |p| Box::pin(async move { p.fold_slot_rows("x").await.map(|v| format!("{v:?}")) }),
+            ),
+            (
+                "fold_slot_held",
+                "fold_slot_held",
+                false,
+                DirectoryOp::FoldSlotHeld { slot: "x".into() },
+                |p| Box::pin(async move { p.fold_slot_held("x").await.map(|v| format!("{v:?}")) }),
+            ),
+            (
+                "fold_any_refolding",
+                "fold_any_refolding",
+                false,
+                DirectoryOp::FoldAnyRefolding {},
+                |p| Box::pin(async move { p.fold_any_refolding().await.map(|v| format!("{v:?}")) }),
+            ),
         ];
         // v62.0.0 (L1-fix3) — + `held_rows_for`, `voice_status`; with O1 fix 5's
         // `edition2_roster_proposal` the table is 34 rows (`submit_voice` is
         // I1894's: its first act is a parse, no leaf to fail).
         // v62.0.0 (X2 pass 4d) — 31: F0's CP2 cut deleted the three earlier-form
         // accord doors (`put_accord_proposal` / `_participation` / `_decision`).
-        assert_eq!(table.len(), 31, "I1890: one row per routed method");
+        // v62.0.0 (PX-fix1) — 44: + the 13 edition-2 and fold store reads.
+        assert_eq!(table.len(), 44, "I1890: one row per routed method");
         let mut red = Vec::new();
         for (method, fault, write, op, call) in table {
             let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -12702,7 +13514,15 @@ mod tests {
     const GROUP_ROWS_991: &str = "v61 (#991): the framed kind is retired and its op left the \
                                   capsule at ABI 12; the record replicates as its group-plane \
                                   row through ApplyReplicatedAttestation";
+    const DOOR_HOOK_PX: &str = "v62.0.0 (PX-fix1): a write hook the host's own doors run \
+                                (the door crosses as its op and runs in persist's .so over \
+                                the host's store); its default was a silent Ok(()), so a door \
+                                composed over the proxy claimed a write it never made";
     const PROXY_UNSUPPORTED_ALLOWLIST: &[(&str, &str)] = &[
+        // v62.0.0 (PX-fix1) — the silent no-op hooks, now refusing.
+        ("rewrap_own_epochs_for_device", DOOR_HOOK_PX),
+        ("project_key_grant_row", DOOR_HOOK_PX),
+        ("purge_attestation_projections", DOOR_HOOK_PX),
         (
             "drop_group_tips",
             "v62.0.0 (wave T1): the merge's tip retirement is the edition-2 \
@@ -12949,6 +13769,168 @@ mod tests {
         );
     }
 
+    /// v62.0.0 (PX-fix1) — the trait defaults that answer a benign-looking
+    /// value (empty, `None`, `false`, `Ok(())`) and that the capsule proxy
+    /// may inherit, each with why. Every other such default is a fail-open
+    /// read through the proxy (I2180).
+    const PROXY_SILENT_DEFAULT_ALLOWLIST: &[(&str, &str)] = &[
+        (
+            "peer_quota_observation",
+            "a SYNC observability accessor of the backend's in-memory quota table; `None` is \
+             'this directory keeps no table', read by node_state as zero tracked peers, never \
+             as an admission or authority verdict",
+        ),
+        (
+            "trust_root_standing_cache",
+            "a SYNC accessor of the backend's verdict CACHE; `None` means no cache, so \
+             canonical_community recomputes every verdict over the proxy's routed reads — \
+             slower, never a different answer",
+        ),
+    ];
+
+    /// How one trait default answers when nothing overrides it (I2180).
+    #[derive(Debug, PartialEq, Eq)]
+    enum DefaultAnswer {
+        /// It refuses `Unsupported` (I1162's ground).
+        Unsupported,
+        /// It names `self`: a composition, answering through the methods it
+        /// calls (each of which this gate classifies at its own default).
+        Composes,
+        /// It answers only an error (`Err(Error::Backend(..))`): loud.
+        Refuses,
+        /// Anything else: an empty / `None` / `false` / `Ok(())` answer —
+        /// "nothing held" to every caller over the proxy.
+        Silent,
+    }
+
+    /// Classify one (comments and strings already blanked) default body.
+    fn default_answer(body: &str) -> DefaultAnswer {
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let names_self = body
+            .match_indices("self")
+            .any(|(i, m)| !body[..i].ends_with(ident) && !body[i + m.len()..].starts_with(ident));
+        if body.contains("Unsupported") {
+            DefaultAnswer::Unsupported
+        } else if names_self {
+            DefaultAnswer::Composes
+        } else if body.contains("Err(") && !body.contains("Ok(") {
+            DefaultAnswer::Refuses
+        } else {
+            DefaultAnswer::Silent
+        }
+    }
+
+    /// **I2180 (v62.0.0, PX-fix1) — no trait default answers SILENTLY
+    /// through the capsule proxy.** Every `FederationDirectory` method with a
+    /// default body the proxy does not override answers through that default.
+    /// One that answers empty / `None` / `false` / `Ok(())` without naming
+    /// `self` reads "nothing held" to every free fold a consumer composes over
+    /// the proxy: v62's `genesis_in_force` read no genesis,
+    /// `held_keys_for_kid` read `NotHeld`, `bytes_servable` answered TRUE for
+    /// held-back bytes. Such a default is routed (a proxy override), made to
+    /// refuse `Unsupported` (I1162 then lists it), or named on
+    /// [`PROXY_SILENT_DEFAULT_ALLOWLIST`] with why; an allowlisted name that
+    /// is no longer a silent default is stale. From disk, comments and
+    /// strings blanked, so a commented-out override or a `"Unsupported"` in
+    /// a message cannot pass for one.
+    ///
+    /// Blind spot (as I1162's): a COMPOSING default is not classified — it
+    /// answers through the methods it calls, which this gate classifies.
+    #[test]
+    fn i2180_no_trait_default_answers_silently_through_the_proxy() {
+        // The classifier, on the shapes it must tell apart.
+        for (body, want) in [
+            ("{ let _ = typ; Ok(Vec::new()) }", DefaultAnswer::Silent),
+            ("{ let _ = row_id; Ok(None) }", DefaultAnswer::Silent),
+            ("{ Ok(false) }", DefaultAnswer::Silent),
+            ("{ let _ = row; Ok(()) }", DefaultAnswer::Silent),
+            ("{ None }", DefaultAnswer::Silent),
+            ("{ let _ = itself; Ok(myself) }", DefaultAnswer::Silent),
+            (
+                "{ let _ = x; Err(Error::Unsupported { method: \"\" }) }",
+                DefaultAnswer::Unsupported,
+            ),
+            (
+                "{ Err(Error::Backend(\"\".into())) }",
+                DefaultAnswer::Refuses,
+            ),
+            (
+                "{ Ok(self.lookup_public_key(k).await?.is_some()) }",
+                DefaultAnswer::Composes,
+            ),
+            ("{ fold(self, k).await }", DefaultAnswer::Composes),
+        ] {
+            assert_eq!(default_answer(body), want, "I2180 classifier on {body}");
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |p: &str| {
+            crate::federation::blank_comments_and_strings(
+                &std::fs::read_to_string(root.join(p)).expect("read source"),
+            )
+        };
+        let tr = top_level_fns(
+            &read("src/federation/mod.rs"),
+            "pub trait FederationDirectory",
+        );
+        let px = top_level_fns(
+            &read("src/ffi/directory_capsule.rs"),
+            "impl FederationDirectory for OpsDirectory",
+        );
+        assert!(tr.len() > 200, "I2180 the trait scan found {}", tr.len());
+        assert!(px.len() > 100, "I2180 the proxy scan found {}", px.len());
+        // Recognizers: a routed read, a silent sync accessor, a composition.
+        for m in ["edition2_objects", "fold_slot_held", "held_rows_for"] {
+            assert!(px.contains_key(m), "I2180 recognizer: the proxy routes {m}");
+        }
+        let inherited = |name: &str| -> Option<DefaultAnswer> {
+            match (tr.get(name), px.contains_key(name)) {
+                (Some(Some(body)), false) => Some(default_answer(body)),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            inherited("peer_quota_observation"),
+            Some(DefaultAnswer::Silent),
+            "I2180 recognizer: a silent default is seen"
+        );
+        assert_eq!(
+            inherited("key_edition"),
+            Some(DefaultAnswer::Composes),
+            "I2180 recognizer: a composition is seen"
+        );
+
+        let silent: BTreeSet<&str> = tr
+            .keys()
+            .map(String::as_str)
+            .filter(|&n| inherited(n) == Some(DefaultAnswer::Silent))
+            .collect();
+        let allow: BTreeMap<&str, &str> = PROXY_SILENT_DEFAULT_ALLOWLIST.iter().copied().collect();
+        assert_eq!(
+            allow.len(),
+            PROXY_SILENT_DEFAULT_ALLOWLIST.len(),
+            "I2180 a duplicate allowlist entry"
+        );
+        assert!(
+            allow.values().all(|r| r.split_whitespace().count() >= 10),
+            "I2180 every allowlisted default carries its reason"
+        );
+        let unlisted: Vec<&&str> = silent.iter().filter(|m| !allow.contains_key(**m)).collect();
+        assert!(
+            unlisted.is_empty(),
+            "I2180 these trait defaults answer empty / None / false / Ok(()) through the \
+             capsule proxy, so every fold over it reads 'nothing held': {unlisted:?}. Route \
+             each (append a DirectoryOp, override it on OpsDirectory), make the default \
+             `Err(Error::Unsupported {{ .. }})`, or allowlist it WITH a reason"
+        );
+        let stale: Vec<&&str> = allow.keys().filter(|m| !silent.contains(**m)).collect();
+        assert!(
+            stale.is_empty(),
+            "I2180 allowlisted but no longer a silent default the proxy inherits \
+             (remove them): {stale:?}"
+        );
+    }
+
     /// v61.4.2 — the `FederationDirectory` methods CIRISEdge v45.1.6 calls
     /// from PRODUCTION code (`git grep` over `src/` at the tag: a `.method(`
     /// call outside `#[cfg(test)] mod`, `*test*` files, comments, and the two
@@ -13135,11 +14117,9 @@ mod proxy_gate {
             "`edition2::ingest::put_statement` is a free door persist runs over its own \
              directory, so every gate runs on the host's store; no trait method to proxy",
         ),
-        (
-            "ApplyReplicatedStatement",
-            "`edition2::ingest::apply_replicated_statement` is a free door persist runs over \
-             its own directory; no trait method to proxy",
-        ),
+        // v62.0.0 (LF-fix2, T5) — `ApplyReplicatedStatement` left this list:
+        // the proxy's `replicated_statement_door` builds it (the whole
+        // replicated door, routed).
         (
             "BundlesInForce",
             "`edition2::genesis::bundles_in_force` is a free fold over the held genesis \
@@ -14013,5 +14993,328 @@ mod wait_relay {
             matches!(odd, Error::Relayed { .. }),
             "I3602: still relayed, with its text"
         );
+    }
+}
+
+/// v62.0.0 (PX-fix1) — **the free folds read the HOST's store through the
+/// capsule proxy**, two-sided (backend ← capsule dispatch ← [`OpsDirectory`]),
+/// on sqlite and postgres. Before PX-fix1 every edition-2 and fold store read
+/// fell to a trait default that answered empty / `None` / `false` through the
+/// proxy, so a fold a consumer composed over it read "nothing held".
+///
+/// - **I2181** — after `fixture_genesis::install_v2` on the backend,
+///   `genesis_in_force` over the proxy reads the same genesis (its holders,
+///   seats and served lineage) as over the backend, and it is held.
+/// - **I2182** — `held_keys_for_kid` over the proxy reads every seat and
+///   holder key `Live` at its record's instant, as the backend does (it read
+///   `NotHeld` through the empty default).
+/// - **I2183** — each of the 13 routed reads answers through the proxy what
+///   the backend answers, non-empty where the bundle holds rows (the bundle
+///   objects, a seat's key records, a record row's voices, the statement-id
+///   index and a point read from it), and the folds over them
+///   (`bytes_servable`, `is_held_back`) agree.
+/// - **I2184** — a method the proxy does not route answers `Unsupported`
+///   naming itself, never an empty `Ok`: the three write hooks whose
+///   defaults were a silent `Ok(())`, and an inherited fold-store write.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod proxy_fail_open {
+    use super::*;
+    use crate::federation::edition2::liveness::Liveness;
+    use crate::federation::edition2::names::RowId;
+    use crate::federation::edition2::{fixture_genesis, fold, genesis, ingest};
+    use ciris_verify_core::edition2::identity_ref;
+    use ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY;
+
+    fn runtime() -> Arc<tokio::runtime::Runtime> {
+        // ML-DSA-65 verifies overflow a 2 MB stack: the body runs on these
+        // workers (spawned), never on the test thread.
+        Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("build tokio runtime"),
+        )
+    }
+
+    async fn body(dir: Arc<dyn FederationDirectory>, proxy: Arc<dyn FederationDirectory>) {
+        let d: &dyn FederationDirectory = dir.as_ref();
+        let p: &dyn FederationDirectory = proxy.as_ref();
+        let c = fixture_genesis::bundle_v2();
+        fixture_genesis::install_v2(d)
+            .await
+            .expect("I2181: the bundle installs on the backend");
+
+        // ── I2181 ──
+        let direct = genesis::genesis_in_force(d).await.expect("I2181: direct");
+        let via = genesis::genesis_in_force(p).await.expect("I2181: proxy");
+        assert!(direct.is_held(), "I2181: the backend holds the genesis");
+        assert!(via.is_held(), "I2181: the proxy reads a genesis held");
+        assert_eq!(via.held, direct.held, "I2181: held count");
+        assert_eq!(
+            format!("{:?}", via.holders()),
+            format!("{:?}", direct.holders()),
+            "I2181: the holders"
+        );
+        assert_eq!(
+            format!("{:?}", via.seats()),
+            format!("{:?}", direct.seats()),
+            "I2181: the seats"
+        );
+        assert_eq!(via.statements, direct.statements, "I2181: the lineage");
+        assert_eq!(
+            via.seats().len(),
+            c.seats.len(),
+            "I2181: every seat of the bundle"
+        );
+        assert!(!via.holders().is_empty(), "I2181: holders are read");
+
+        // ── I2182 ──
+        let kids: Vec<[u8; 32]> = c
+            .seats
+            .iter()
+            .map(|s| s.kid)
+            .chain(c.holders.iter().map(|h| h.kid))
+            .collect();
+        for kid in &kids {
+            let held_d = ingest::held_keys_for_kid(d, kid)
+                .await
+                .expect("I2182: direct");
+            let held_p = ingest::held_keys_for_kid(p, kid)
+                .await
+                .expect("I2182: proxy");
+            let valid = held_d
+                .valid_records(kid)
+                .expect("I2182: the backend holds a valid record");
+            let at = valid[0].record.asserted_at;
+            let (ld, lp) = (held_d.liveness(kid, at), held_p.liveness(kid, at));
+            assert!(
+                matches!(ld, Liveness::Live(_)),
+                "I2182: Live on the backend: {ld:?}"
+            );
+            assert!(
+                matches!(lp, Liveness::Live(_)),
+                "I2182: Live through the proxy (was NotHeld): {lp:?}"
+            );
+            assert_eq!(
+                format!("{lp:?}"),
+                format!("{ld:?}"),
+                "I2182: the same reading"
+            );
+        }
+
+        // ── I2183 ── each routed read: the proxy answers the host's store.
+        let objs = d
+            .edition2_objects(genesis::GENESIS_BUNDLE_TYP)
+            .await
+            .expect("I2183: direct objects");
+        assert!(!objs.is_empty(), "I2183: the bundle's voices are held");
+        assert_eq!(
+            p.edition2_objects(genesis::GENESIS_BUNDLE_TYP)
+                .await
+                .expect("I2183: proxy objects"),
+            objs,
+            "I2183: edition2_objects"
+        );
+        let seat = &c.seats[0];
+        let sub = identity_ref(&seat.kid);
+        let about = d
+            .edition2_statements_about(KEY_RECORD_FAMILY, &sub)
+            .await
+            .expect("I2183: direct about");
+        assert!(!about.is_empty(), "I2183: the seat's key record is held");
+        assert_eq!(
+            p.edition2_statements_about(KEY_RECORD_FAMILY, &sub)
+                .await
+                .expect("I2183: proxy about"),
+            about,
+            "I2183: edition2_statements_about"
+        );
+        let rec = RowId(seat.record.row_id);
+        let voices = d.edition2_voices(&rec).await.expect("I2183: direct voices");
+        assert!(!voices.is_empty(), "I2183: the record row has its voice");
+        assert_eq!(
+            p.edition2_voices(&rec).await.expect("I2183: proxy voices"),
+            voices,
+            "I2183: edition2_voices"
+        );
+        for role in ["target", "head", "subject"] {
+            assert_eq!(
+                p.edition2_rows_naming(&rec, role)
+                    .await
+                    .expect("I2183: proxy naming"),
+                d.edition2_rows_naming(&rec, role)
+                    .await
+                    .expect("I2183: direct naming"),
+                "I2183: edition2_rows_naming {role}"
+            );
+        }
+        let ids = d
+            .edition2_statement_ids_since(None, 1000)
+            .await
+            .expect("I2183: direct ids");
+        assert!(!ids.is_empty(), "I2183: the statement-id index is held");
+        assert_eq!(
+            p.edition2_statement_ids_since(None, 1000)
+                .await
+                .expect("I2183: proxy ids"),
+            ids,
+            "I2183: edition2_statement_ids_since"
+        );
+        let first: [u8; 32] = hex::decode(&ids[0])
+            .expect("I2183: hex")
+            .try_into()
+            .expect("I2183: 32 bytes");
+        let one = d
+            .edition2_statement(&first)
+            .await
+            .expect("I2183: direct point read");
+        assert!(one.is_some(), "I2183: the indexed statement is held");
+        assert_eq!(
+            p.edition2_statement(&first)
+                .await
+                .expect("I2183: proxy point read"),
+            one,
+            "I2183: edition2_statement"
+        );
+        let read_ok = |r: Result<String, Error>| r.expect("I2183: a fold read");
+        assert_eq!(
+            read_ok(p.fold_held_page(None, 100).await.map(|v| format!("{v:?}"))),
+            read_ok(d.fold_held_page(None, 100).await.map(|v| format!("{v:?}"))),
+            "I2183: fold_held_page"
+        );
+        for row in [rec, RowId(c.object_id), RowId([9u8; 32])] {
+            assert_eq!(
+                read_ok(p.fold_held(&row).await.map(|v| format!("{v:?}"))),
+                read_ok(d.fold_held(&row).await.map(|v| format!("{v:?}"))),
+                "I2183: fold_held"
+            );
+            assert_eq!(
+                read_ok(p.fold_state(&row).await.map(|v| format!("{v:?}"))),
+                read_ok(d.fold_state(&row).await.map(|v| format!("{v:?}"))),
+                "I2183: fold_state"
+            );
+        }
+        let slot = fold::blob_slot(&[7u8; 32]);
+        assert_eq!(
+            p.fold_slot_rows(&slot)
+                .await
+                .expect("I2183: proxy slot rows"),
+            d.fold_slot_rows(&slot)
+                .await
+                .expect("I2183: direct slot rows"),
+            "I2183: fold_slot_rows"
+        );
+        assert_eq!(
+            p.fold_slot_held(&slot)
+                .await
+                .expect("I2183: proxy slot held"),
+            d.fold_slot_held(&slot)
+                .await
+                .expect("I2183: direct slot held"),
+            "I2183: fold_slot_held"
+        );
+        let keys = vec![format!("key:{sub}")];
+        assert_eq!(
+            p.fold_dependents(&keys).await.expect("I2183: proxy deps"),
+            d.fold_dependents(&keys).await.expect("I2183: direct deps"),
+            "I2183: fold_dependents"
+        );
+        assert_eq!(
+            p.fold_any_refolding()
+                .await
+                .expect("I2183: proxy refolding"),
+            d.fold_any_refolding()
+                .await
+                .expect("I2183: direct refolding"),
+            "I2183: fold_any_refolding"
+        );
+        assert_eq!(
+            fold::bytes_servable(p, &[7u8; 32])
+                .await
+                .expect("I2183: proxy servable"),
+            fold::bytes_servable(d, &[7u8; 32])
+                .await
+                .expect("I2183: direct servable"),
+            "I2183: bytes_servable"
+        );
+        for v in &c.voices {
+            assert_eq!(
+                fold::is_held_back(p, v)
+                    .await
+                    .expect("I2183: proxy held back"),
+                fold::is_held_back(d, v)
+                    .await
+                    .expect("I2183: direct held back"),
+                "I2183: is_held_back"
+            );
+        }
+
+        // ── I2184 ── an unrouted method refuses by name through the proxy.
+        let named = |r: Result<(), Error>, want: &str| match r {
+            Err(Error::Unsupported { method }) => {
+                assert_eq!(method, want, "I2184: the refusal names the method")
+            }
+            other => panic!("I2184 {want}: through the proxy answered {other:?}, not Unsupported"),
+        };
+        named(
+            p.rewrap_own_epochs_for_device("owner", "device").await,
+            "rewrap_own_epochs_for_device",
+        );
+        named(
+            p.purge_attestation_projections("no-such-row").await,
+            "purge_attestation_projections",
+        );
+        named(
+            p.put_fold_reason(&RowId([9u8; 32]), None).await.map(|_| ()),
+            "put_fold_reason",
+        );
+    }
+
+    fn run(rt: &Arc<tokio::runtime::Runtime>, dir: Arc<dyn FederationDirectory>) {
+        let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
+            rt.clone(),
+        ));
+        let proxy =
+            build_ops_directory(build_persist_directory(dir.clone()), executor).expect("abi ok");
+        rt.block_on(rt.spawn(body(dir, proxy)))
+            .expect("the witness body");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn i2181_to_i2184_folds_read_the_host_through_the_proxy_sqlite() {
+        let rt = runtime();
+        let b = rt.block_on(async {
+            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .expect("open sqlite");
+            crate::store::backend::Backend::run_migrations(&b)
+                .await
+                .expect("migrate");
+            b
+        });
+        run(&rt, Arc::new(b));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn i2181_to_i2184_folds_read_the_host_through_the_proxy_pg() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let rt = runtime();
+        let b = rt.block_on(async {
+            let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+                .await
+                .expect("connect");
+            crate::store::backend::Backend::run_migrations(&b)
+                .await
+                .expect("migrate");
+            b
+        });
+        run(&rt, Arc::new(b));
     }
 }

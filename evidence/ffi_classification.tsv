@@ -22,8 +22,8 @@
 # CC asked for this file because 53 testimonial rows living only in a gated TSV
 # is itself a testimonial-class state: the class should not exemplify its own wrong.
 #
-# Counts at this revision: empirical=198 deontic=181 procedural=46 structural=40 testimonial=40 epistemic=30 ontological=29 axiotic=20 nomological=19 pragmatic=6 axiomatic=3
-# Counts at this revision: empirical=198 deontic=181 procedural=46 structural=40 testimonial=40 epistemic=30 ontological=29 axiotic=20 nomological=19 pragmatic=6 axiomatic=3
+# Counts at this revision: empirical=198 deontic=181 procedural=46 structural=40 testimonial=40 epistemic=30 ontological=28 axiotic=20 nomological=20 pragmatic=6 axiomatic=3
+# Counts at this revision: empirical=198 deontic=181 procedural=46 structural=40 testimonial=40 epistemic=30 ontological=28 axiotic=20 nomological=20 pragmatic=6 axiomatic=3
 #
 class	binding	class_count	owner	symbol	frame
 axiomatic	binding	3	MODULE	namespace_manifest_version	
@@ -90,7 +90,6 @@ deontic	binding	181	Engine	cohort_revoke_member
 deontic	binding	181	Engine	cohort_supersede_group	
 deontic	binding	181	Engine	cohort_supersede_group_with_quorum	
 deontic	binding	181	Engine	cohort_swap_member	
-deontic	binding	181	Engine	cohort_verify_membership_quorum	
 deontic	binding	181	Engine	community_dek_set_key_state	
 deontic	binding	181	Engine	community_dek_set_retain_past_epochs	
 deontic	binding	181	Engine	community_trust_consent_json	
@@ -218,6 +217,7 @@ deontic	binding	181	Engine	update_peer_trust
 deontic	binding	181	Engine	verify_accord_manifest_v2	
 deontic	binding	181	Engine	verify_coord_check_observed_region	
 deontic	binding	181	Engine	verify_corpus_want_v1	
+deontic	binding	181	Engine	verify_identity_template_v1	
 deontic	binding	181	Engine	verify_skill_import_manifest_b64	
 deontic	binding	181	Engine	verify_storage_budget_v1	
 deontic	binding	181	Engine	voice_held_row	
@@ -458,54 +458,54 @@ epistemic	descriptive	30	Engine	verify_composite_via_directory
 epistemic	descriptive	30	Engine	verify_trace	
 epistemic	descriptive	30	Engine	voice_status	
 epistemic	descriptive	30	ScoringFactorStream	summary	
-nomological	descriptive	19	Engine	accord_manifest_v2_message	
-nomological	descriptive	19	Engine	audit_canonicalize_for_hash	
-nomological	descriptive	19	Engine	audit_signing_preimage	
-nomological	descriptive	19	Engine	canonicalize_envelope	
-nomological	descriptive	19	Engine	canonicalize_envelope_for_signing	
-nomological	descriptive	19	Engine	cohort_scope_crypto_tier	
-nomological	descriptive	19	Engine	debug_canonicalize	
-nomological	descriptive	19	Engine	envelope_vocabulary	
-nomological	descriptive	19	Engine	is_canonical	
-nomological	descriptive	19	Engine	ledger_conservation_fold	
-nomological	descriptive	19	Engine	ledger_derive_id	
-nomological	descriptive	19	Engine	ledger_detect_double_head	
-nomological	descriptive	19	Engine	ledger_verify_chain	
-nomological	descriptive	19	Engine	maintenance_tighten_vocabulary	
-nomological	descriptive	19	Engine	purge_notice_signing_payload_json	
-nomological	descriptive	19	Engine	trace_summary_extraction	
-nomological	descriptive	19	Engine	validate_envelope_canonical_form	
-nomological	descriptive	19	Engine	verify_coord_constants_json	
-nomological	descriptive	19	MODULE	attestation_wire_hash	
-ontological	descriptive	29	Engine	canonical_bootstrap_hints	
-ontological	descriptive	29	Engine	deregister_occurrence	
-ontological	descriptive	29	Engine	heartbeat_occurrence	
-ontological	descriptive	29	Engine	initiate_classical_kex_b64	
-ontological	descriptive	29	Engine	initiate_hybrid_kex_b64	
-ontological	descriptive	29	Engine	keyring_path	
-ontological	descriptive	29	Engine	keyring_storage_kind	
-ontological	descriptive	29	Engine	list_identity_occurrences_for_json	
-ontological	descriptive	29	Engine	list_live_occurrences	
-ontological	descriptive	29	Engine	local_derived_key_id	
-ontological	descriptive	29	Engine	local_identity_aggregate	
-ontological	descriptive	29	Engine	local_key_id	
-ontological	descriptive	29	Engine	local_pqc_key_id	
-ontological	descriptive	29	Engine	local_pqc_public_key_b64	
-ontological	descriptive	29	Engine	local_public_key_b64	
-ontological	descriptive	29	Engine	lookup_identity_for_occurrence_json	
-ontological	descriptive	29	Engine	lookup_keys_for_identity	
-ontological	descriptive	29	Engine	lookup_public_key	
-ontological	descriptive	29	Engine	public_key_b64	
-ontological	descriptive	29	Engine	register_occurrence	
-ontological	descriptive	29	Engine	register_self_federation_key	
-ontological	descriptive	29	Engine	respond_classical_kex_b64	
-ontological	descriptive	29	Engine	respond_hybrid_kex_b64	
-ontological	descriptive	29	Engine	root_binding	
-ontological	descriptive	29	Engine	seal_trace_statement	
-ontological	descriptive	29	Engine	self_enc_pubkeys	
-ontological	descriptive	29	Engine	self_key_id	
-ontological	descriptive	29	Engine	set_self_key_id	
-ontological	descriptive	29	Engine	sign_composite	
+nomological	descriptive	20	Engine	accord_manifest_v2_message	
+nomological	descriptive	20	Engine	audit_canonicalize_for_hash	
+nomological	descriptive	20	Engine	audit_signing_preimage	
+nomological	descriptive	20	Engine	canonicalize_envelope	
+nomological	descriptive	20	Engine	canonicalize_envelope_for_signing	
+nomological	descriptive	20	Engine	cohort_scope_crypto_tier	
+nomological	descriptive	20	Engine	debug_canonicalize	
+nomological	descriptive	20	Engine	envelope_vocabulary	
+nomological	descriptive	20	Engine	identity_template_v1_message	
+nomological	descriptive	20	Engine	is_canonical	
+nomological	descriptive	20	Engine	ledger_conservation_fold	
+nomological	descriptive	20	Engine	ledger_derive_id	
+nomological	descriptive	20	Engine	ledger_detect_double_head	
+nomological	descriptive	20	Engine	ledger_verify_chain	
+nomological	descriptive	20	Engine	maintenance_tighten_vocabulary	
+nomological	descriptive	20	Engine	purge_notice_signing_payload_json	
+nomological	descriptive	20	Engine	trace_summary_extraction	
+nomological	descriptive	20	Engine	validate_envelope_canonical_form	
+nomological	descriptive	20	Engine	verify_coord_constants_json	
+nomological	descriptive	20	MODULE	attestation_wire_hash	
+ontological	descriptive	28	Engine	canonical_bootstrap_hints	
+ontological	descriptive	28	Engine	deregister_occurrence	
+ontological	descriptive	28	Engine	heartbeat_occurrence	
+ontological	descriptive	28	Engine	initiate_classical_kex_b64	
+ontological	descriptive	28	Engine	initiate_hybrid_kex_b64	
+ontological	descriptive	28	Engine	keyring_path	
+ontological	descriptive	28	Engine	keyring_storage_kind	
+ontological	descriptive	28	Engine	list_identity_occurrences_for_json	
+ontological	descriptive	28	Engine	list_live_occurrences	
+ontological	descriptive	28	Engine	local_derived_key_id	
+ontological	descriptive	28	Engine	local_identity_aggregate	
+ontological	descriptive	28	Engine	local_key_id	
+ontological	descriptive	28	Engine	local_pqc_key_id	
+ontological	descriptive	28	Engine	local_pqc_public_key_b64	
+ontological	descriptive	28	Engine	local_public_key_b64	
+ontological	descriptive	28	Engine	lookup_identity_for_occurrence_json	
+ontological	descriptive	28	Engine	lookup_keys_for_identity	
+ontological	descriptive	28	Engine	lookup_public_key	
+ontological	descriptive	28	Engine	public_key_b64	
+ontological	descriptive	28	Engine	register_occurrence	
+ontological	descriptive	28	Engine	register_self_federation_key	
+ontological	descriptive	28	Engine	respond_classical_kex_b64	
+ontological	descriptive	28	Engine	respond_hybrid_kex_b64	
+ontological	descriptive	28	Engine	seal_trace_statement	
+ontological	descriptive	28	Engine	self_enc_pubkeys	
+ontological	descriptive	28	Engine	self_key_id	
+ontological	descriptive	28	Engine	set_self_key_id	
+ontological	descriptive	28	Engine	sign_composite	
 pragmatic	descriptive	6	Engine	body_sha256	
 pragmatic	descriptive	6	Engine	get_blob_range	
 pragmatic	descriptive	6	Engine	locale_leaf_hash_hex	

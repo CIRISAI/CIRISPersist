@@ -1359,6 +1359,66 @@ where
     }
 }
 
+/// v62.0.0 (LF-fix2, P5; CC 2.4.1.1 "Never withdrawn") — **is `target_id` a
+/// statement held on a plane no `withdraws` retracts?** For a target
+/// [`resolve_withdraws_target`] does not find (no attestation row, no alias),
+/// the edition-2 statement store is read under the same id, on every plane.
+/// Answers the held statement's family when it is one of:
+///
+/// - an entity revocation (`revocation:{entity_type}:{reason}`; a peer
+///   DE-ADMISSION, which rides the attestation plane, is not one);
+/// - an occurrence revocation (`identity:occurrence_revocation`);
+/// - a cosignature (`cosign:{state}`);
+/// - a key grant (`key_grant:{axis}`).
+///
+/// CC 2.4.1.1: "An entity revocation, an occurrence revocation, a key grant
+/// and a cosignature already sent are never withdrawn". Such a target is
+/// held and simply not retractable, so the withdrawal SETTLES (not admitted)
+/// instead of waiting for an attestation row that never comes. `None` when
+/// no statement is held under the id (the withdrawal still waits), or the
+/// held one is on a retractable plane (it behaves as before). An id that is
+/// not an edition-2 row id (64 hex) names no statement.
+///
+/// # Errors
+///
+/// The read's.
+pub async fn held_unretractable_target<D>(dir: &D, target_id: &str) -> Result<Option<String>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use super::edition2::typed::{typed_plane_of, TypedPlane};
+    let Some(row_id) = hex::decode(target_id)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        .map(super::edition2::names::RowId)
+    else {
+        return Ok(None);
+    };
+    for statement in dir.edition2_voices(&row_id).await? {
+        let Some((family, row_type)) = super::edition2::emit::family_of_statement(&statement)
+        else {
+            continue;
+        };
+        let never_withdrawn = match typed_plane_of(&row_type, &family) {
+            Some(TypedPlane::Revocation) => !super::edition2::liveness::statement_parts(&statement)
+                .and_then(|(_, payload)| {
+                    payload
+                        .get_text("dimension")
+                        .and_then(ciris_verify_core::cde::Value::as_text)
+                        .map(super::admission::is_peer_deadmission_dimension)
+                })
+                .unwrap_or(false),
+            Some(TypedPlane::OccurrenceRevocation | TypedPlane::Cosign | TypedPlane::KeyGrant) => {
+                true
+            }
+            Some(TypedPlane::Takedown | TypedPlane::Custody | TypedPlane::DeliveryReceipt)
+            | None => false,
+        };
+        return Ok(never_withdrawn.then_some(family));
+    }
+    Ok(None)
+}
+
 /// v61.3.0 (CIRISPersist#1252, CC 2.4.1.1 rule 0) — **is the act `signed`
 /// names retracted on this node?** A held `withdraws` names ANY row of the
 /// act this node knows of: a held row of the same act (any subset of its

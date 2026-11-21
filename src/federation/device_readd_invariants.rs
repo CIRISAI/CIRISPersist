@@ -356,11 +356,33 @@ pub(crate) mod bodies {
             (0, 1, 0),
             "precondition: E1..E3 as minted"
         );
-        assert_eq!(
-            grants_on(b, &comm, &epochs, &bob_1).await,
-            3,
-            "precondition: bob-1 holds a grant on E1..E3"
-        );
+        // v62.0.0 (LF-fix1) — diagnosable: on a miss the message names WHICH
+        // epochs bob-1 lacks and what the fan-out resolved as bob's devices
+        // (pass 4d read 3 on sqlite and fewer on postgres; pass 4d.1 read 3
+        // on both; the count alone cannot say which epoch, or why).
+        if grants_on(b, &comm, &epochs, &bob_1).await != 3 {
+            let mut held = Vec::new();
+            for (m, e) in &epochs {
+                held.push((
+                    m.clone(),
+                    *e,
+                    b.community_dek_has_member_grant(&comm, m, *e, &bob_1)
+                        .await
+                        .unwrap(),
+                ));
+            }
+            let devices: Vec<(String, bool)> =
+                crate::federation::replication_audience::devices_of(b, &bob)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|o| (o.occurrence_key_id, o.encryption_pubkeys.is_some()))
+                    .collect();
+            panic!(
+                "precondition: bob-1 holds a grant on E1..E3; (minter, epoch, held) = {held:?}; \
+                 bob's devices (key, has content-KEM keys) = {devices:?}"
+            );
+        }
         let pointers = (
             b.community_dek_current_epoch(&comm, &alice_1)
                 .await
@@ -1452,14 +1474,45 @@ pub(crate) mod two_node {
             3,
             "(T4) the capsule's op re-wrapped A's epochs to d6 on A's backend"
         );
+        // I2116 (v62.0.0, LF-fix2, T5) — the replicated door over the PROXY
+        // runs WHOLE as the `ApplyReplicatedStatement` op
+        // (`FederationDirectory::replicated_statement_door`), so the binding,
+        // served by B and delivered to A through the planes, concludes on A's
+        // backend and its #916 hook re-wraps A's epochs there. Composed over
+        // the proxy, the hook called the proxy's unrouted
+        // `rewrap_own_epochs_for_device` (the trait's no-op).
         let d7 = device(a, b, &format!("d7-{run}")).await;
         anchor_local(a, &bob, &d7).await;
         let binding = bind_on(b, &bob, &d7.key).await;
-        deliver(&*proxy, &served(b, &l.node_a, &[binding]).await).await;
+        let offered = served(b, &l.node_a, &[binding]).await;
+        let outs = deliver(&*proxy, &offered).await;
+        assert!(
+            outs.iter().any(|o| matches!(
+                o,
+                ReplicatedStatementOutcome::Admitted(
+                    crate::federation::edition2::ingest::StatementOutcome::Row { .. }
+                )
+            )),
+            "(T5, I2116) the proxy's routed door concludes bob's binding for d7: {outs:?}"
+        );
         assert_eq!(
             grants_of(d7.key.clone()).await,
             3,
-            "(T5) the door over the proxy re-wrapped A's epochs to d7 on A's backend"
+            "(T5, I2116) the door over the proxy re-wrapped A's epochs to d7 on A's backend"
+        );
+        // The same statements again through the proxy: held byte for byte, the
+        // outcome crosses back as the door's own (`Unchanged`), nothing more.
+        let again = deliver(&*proxy, &offered).await;
+        assert!(
+            again
+                .iter()
+                .all(|o| matches!(o, ReplicatedStatementOutcome::Unchanged(_))),
+            "(T5, I2116) a re-offer through the proxy is Unchanged: {again:?}"
+        );
+        assert_eq!(
+            grants_of(d7.key.clone()).await,
+            3,
+            "(T5, I2116) a re-offer re-wraps nothing new"
         );
 
         // The rows: A's pending loop (the one PyEngine runs) signs and emits
@@ -1468,7 +1521,13 @@ pub(crate) mod two_node {
         // holds on B (v55.0.0, #989: a row to a device crosses to that
         // device's node, never to bob's).
         let signer_a = ts::local_signer(&format!("em-a-{run}"));
-        assert_eq!(signer_a.derived_key_id(), l.node_a, "fixture: A's signer");
+        // v62 (LF-fix1; cut B): the node states its rows under its composite
+        // identity-ref (`federation_id`), not the earlier derived id.
+        assert_eq!(
+            signer_a.federation_id().await,
+            l.node_a,
+            "fixture: A's signer"
+        );
         assert!(
             dirty_emit(a, &signer_a, &l.node_a).await >= 3,
             "(T) the doors left A's three epochs dirty"
@@ -1737,25 +1796,51 @@ pub(crate) mod two_node {
             .await
             .unwrap_or_else(|e| panic!("I380 A seals at epoch 0: {e}"));
 
-        // Both shared constructors, each over its own fresh handle.
-        let plain =
-            crate::Engine::from_shared(reopen(dsn_a.to_owned()).await, l.engine_a.signer().clone());
-        let with_local = crate::Engine::from_shared_with_local(
+        // v62.0.0 (LF-fix1; cut B) — a node's id is its COMPOSITE key's
+        // identity-ref, and only an Engine that holds the composite signer
+        // can name it: `from_shared_with_local(.., Some(local))`, the
+        // constructor every producing host uses (the pyo3 singleton, a
+        // hardware-hybrid node's `from_hardware_parts` signer). The earlier
+        // arms built both shared Engines with NO local signer; such an Engine
+        // is classical-only (`Engine::local_derived_key_id`: "keeps the
+        // earlier derived id; it produces nothing on the mesh"), so it told
+        // the fresh handle the earlier id, which no edition-2 row names.
+        //
+        // `ladder` opens A under `ts::local_signer("em-a-{run}")`; the same
+        // seed is the same key. Its identity-ref is read once here, so the
+        // synchronous constructor's single poll answers.
+        let local = ts::local_signer(&format!("em-a-{run}"));
+        assert_eq!(
+            local.federation_id().await,
+            l.node_a,
+            "fixture: A's composite signer"
+        );
+        // The #966 property: a shared Engine over a FRESH handle (one no
+        // Engine has told its key) tells that backend its node key.
+        let with_local = crate::Engine::try_from_shared_with_local(
             reopen(dsn_a.to_owned()).await,
             l.engine_a.signer().clone(),
-            None,
+            Some(local),
+        )
+        .expect("a shared engine view: no node_key_conflict");
+        assert_eq!(
+            pick(&with_local).node_key_id().as_deref(),
+            Some(l.node_a.as_str()),
+            "I380 from_shared_with_local tells the shared backend its node key — the same id \
+             `register_self_federation_key` uses"
         );
-        for (name, e) in [
-            ("from_shared", &plain),
-            ("from_shared_with_local", &with_local),
-        ] {
-            assert_eq!(
-                pick(e).node_key_id().as_deref(),
-                Some(l.node_a.as_str()),
-                "I380 {name} tells the shared backend its node key — the same id \
-                 `register_self_federation_key` uses"
-            );
-        }
+        // `from_shared` carries no composite signer: over a handle that
+        // already knows its key (the shape a host hands it: the SAME handle
+        // its producing Engine holds) it keeps that key. Kills: a
+        // classical-only view overwriting the node's identity-ref with the
+        // earlier derived id.
+        let plain =
+            crate::Engine::from_shared(with_local.backend().clone(), l.engine_a.signer().clone());
+        assert_eq!(
+            pick(&plain).node_key_id().as_deref(),
+            Some(l.node_a.as_str()),
+            "I380 from_shared keeps the node key the shared backend was told"
+        );
 
         let shared = pick(&plain);
         let b = l.bb.as_ref();

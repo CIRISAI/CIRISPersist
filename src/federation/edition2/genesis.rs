@@ -1673,9 +1673,11 @@ where
     // one transaction. It answers whether each occurrence upsert applied.
     let applied = dir.put_edition2_genesis(&write).await?;
     // The routes the bindings project go through their own door after the
-    // commit (wave O1's `after_edition2_occurrence`: the route when the
-    // upsert applied; no re-wrap for a seat, whose pair is itself). A
-    // failure here leaves the genesis held and the route re-projectable.
+    // commit (wave O1's `after_edition2_occurrence`; no re-wrap for a seat,
+    // whose pair is itself). A failure here leaves the genesis held with a
+    // seat's route missing. Offering the same bundle again projects it
+    // (SR-fix1, I2111): the upsert does not apply then, and the route is
+    // projected because the held binding still projects exactly it.
     for (((identity, occurrence), route), applied) in after.iter().zip(applied) {
         crate::federation::occurrence_admit::after_edition2_occurrence(
             dir,

@@ -11,15 +11,22 @@
 //! The override is armed by mutating the process environment, which is why
 //! this is its own integration target (its own process under both runners,
 //! #738) and every test in it is serial.
+//!
+//! v62.0.0 (BH-fix3) — ported to edition 2: the self's keys are edition-2
+//! `key:record`s and each addition is an `identity:occurrence` bind through
+//! the statement door (`edition2::fixture_occurrence::put_bind`). At one key
+//! the bind lands (`Row`); at two it is a proposal (`Pending`), landed by the
+//! lone path (`self_roster::execute_for`) once the window has passed.
 
 #![cfg(all(feature = "test-anchor", feature = "sqlite"))]
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
+use ciris_persist::federation::edition2::fixture_occurrence::{put_bind, BindOptions};
+use ciris_persist::federation::edition2::fixture_switch as e2;
+use ciris_persist::federation::edition2::ingest::StatementOutcome;
 use ciris_persist::federation::self_roster as sr;
-use ciris_persist::federation::tier_ingest::test_support as ts;
-use ciris_persist::federation::types::identity_type;
-use ciris_persist::federation::{Error, FederationDirectory};
+use ciris_persist::federation::FederationDirectory;
 use ciris_persist::store::backend::Backend as _;
 
 /// The window this target asks for, in seconds.
@@ -71,26 +78,28 @@ async fn active(d: &dyn FederationDirectory, f: &str, device: &str) -> bool {
 async fn lone_add_after_the_short_window(d: &dyn FederationDirectory, tag: &str) -> bool {
     let (f, d1, d2) = (format!("f-{tag}"), format!("d1-{tag}"), format!("d2-{tag}"));
     for k in [&f, &d1, &d2] {
-        ts::register_hybrid_key_as(d, k, k, identity_type::USER).await;
+        e2::put_key(d, k, &["user"]).await;
     }
-    let now = chrono::Utc::now;
-    d.put_identity_occurrence(ts::signed_content_only_occurrence(&f, &f, &d1, now()).await)
-        .await
-        .expect("I1162: at one key the addition lands at once");
-    match d
-        .put_identity_occurrence(ts::signed_content_only_occurrence(&f, &f, &d2, now()).await)
-        .await
-    {
-        Err(Error::SelfRosterNotLanded {
-            decision: "pending",
-            ..
-        }) => {}
+    let fk = e2::kid(&f);
+    let opts = BindOptions {
+        asserted_at_ms: ciris_persist::federation::edition2::composite_verify::now_ms() - 60_000,
+        ..BindOptions::default()
+    };
+    match put_bind(d, &f, &f, &d1, "laptop", &opts).await {
+        Ok(StatementOutcome::Row { .. }) => {}
+        other => panic!("I1162: at one key the addition lands at once, got {other:?}"),
+    }
+    match put_bind(d, &f, &f, &d2, "laptop", &opts).await {
+        Ok(StatementOutcome::Pending { .. }) => {}
         other => panic!("I1162: at two keys the addition is a proposal, got {other:?}"),
     }
-    assert!(!active(d, &f, &d2).await, "I1162: not before the window");
+    assert!(
+        !active(d, &fk, &e2::kid(&d2)).await,
+        "I1162: not before the window"
+    );
     tokio::time::sleep(std::time::Duration::from_secs(SHORT + 1)).await;
-    sr::execute_for(d, &f).await.expect("execute");
-    active(d, &f, &d2).await
+    sr::execute_for(d, &fk).await.expect("execute");
+    active(d, &fk, &e2::kid(&d2)).await
 }
 
 fn tag(n: &str) -> String {

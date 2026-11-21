@@ -1,23 +1,21 @@
-//! Cold-start binding-rooting primitive (CIRISPersist#94, v1.12.0).
+//! The recursive-provenance READ (CIRISPersist#94, v1.12.0).
 //!
-//! # What this module is
+//! # What this module is (v62.0.0, BH-fix1)
 //!
-//! This is the **CIRIS 3.0 critical-path node**: it replaces
-//! trust-on-first-use on CIRISEdge's `PeerResolver` cold-start path.
-//! When a peer is seen for the first time, the resolver has a claimed
-//! `(key_id, pubkey)` binding off the wire. Rather than accepting it
-//! ("trust on first use"), the resolver calls [`root_binding`], which:
+//! This module assembles a `federation_keys` row's recursive-provenance chain
+//! ([`provenance_chain`]) and types why it cannot be assembled
+//! ([`RootingRejection`]). It verifies nothing.
 //!
-//!  1. Confirms the `key_id` resolves to a real `federation_keys`
-//!     directory row.
-//!  2. Confirms the claimed Ed25519 pubkey matches that row's
-//!     `pubkey_ed25519_base64`.
-//!  3. Walks that row's **recursive-provenance chain** to the steward
-//!     bootstrap, verifying each link's scrub-signature cryptographically.
-//!
-//! The result is a typed [`RootingVerdict`] — `Confirmed` or
-//! `Rejected` with a typed [`RootingRejection`]. There is no third
-//! state (MISSION.md §1.6 — fail-honest).
+//! Its verifying primitive, `root_binding` (with `root_binding_anchored` and
+//! the `RootingVerdict` it returned), is DELETED (RULINGS "composite
+//! signatures only"): it walked each link's earlier-form scrub signature, a
+//! separate Ed25519 + ML-DSA-65 pair over `original_content_hash`, through
+//! Verify's provenance walk under `HybridPolicy::RequireHybrid`. A v62 node
+//! holds no such link: every key is an edition-2 `key:record`, live by its
+//! own statements (`edition2::liveness`), and the mesh's trust roots are the
+//! holders of the genesis bundle in force (`edition2::genesis::genesis_in_force`).
+//! A peer's key is checked by ONE composite under that live key
+//! (`edition2::composite_verify`), never by a chain of component halves.
 //!
 //! # The recursive-provenance four-tuple
 //!
@@ -39,26 +37,6 @@
 //! verifying each link's signature against the parent row's pubkey,
 //! until a self-signed `identity_type == "steward"` row is reached.
 //!
-//! # Crypto goes through CIRISVerify
-//!
-//! Each link's scrub-signature is verified through
-//! `crate::verify::hybrid::verify_hybrid` (deleted v62.0.0) — the existing hybrid
-//! Ed25519 + ML-DSA-65 verify path, which delegates to
-//! `ciris_crypto`. This module never rolls its own crypto
-//! (MISSION.md §1.4 — the crypto-through-CIRISVerify invariant).
-//!
-//! # Not a trust oracle
-//!
-//! A `Confirmed` verdict states **"this `key_id`'s claimed binding is
-//! rooted in the directory's recursive-provenance chain, which
-//! terminates at a steward bootstrap"**. It authenticates
-//! *origin / provenance*. It does **not** state "this key is
-//! trusted" — trust is a policy decision the consumer composes by
-//! walking attestations / revocations / trust grants. Storing or
-//! returning a provenance fact never *confers* trust (MISSION.md
-//! §1.4 — the apophatic bound; the federation-wide
-//! authenticate-origin-never-confer-trust invariant).
-//!
 //! # Scope (Finding G — decided)
 //!
 //! This primitive roots **federation-key bindings (trust anchors)
@@ -77,14 +55,9 @@
 
 use std::collections::HashSet;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use super::{FederationDirectory, KeyRecord};
-// #465: the scrub-signature crypto now routes through verify's provenance walk
-// (verify_provenance_chain_with_policy_and_terminus), so rooting no longer uses
-// persist's verify_hybrid / HybridPolicy directly.
 
 /// Maximum provenance-chain depth before the walk gives up and
 /// rejects with [`RootingRejection::OverDepth`].
@@ -105,7 +78,7 @@ pub const MAX_PROVENANCE_DEPTH: usize = 64;
 /// the mesh roots to them directly.
 ///
 /// **This identity check is only a coarse sanity gate.** The load-bearing
-/// trust decision is [`root_binding`]'s **anchor-membership** check: the
+/// trust decision is `root_binding` (deleted v62.0.0)'s **anchor-membership** check: the
 /// terminus's Ed25519 pubkey MUST be one of the pinned accord-holder anchor
 /// keys ([`ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor`]).
 /// A self-signed `steward`/`accord_holder` row that a peer merely *asserts*
@@ -134,12 +107,12 @@ fn is_trusted_root_identity(identity_type: &str) -> bool {
 ///
 /// # Cross-repo contract
 ///
-/// **This type, [`ProvenanceChain`], [`RootingVerdict`], and
+/// **This type, [`ProvenanceChain`], `RootingVerdict` (deleted v62.0.0), and
 /// [`RootingRejection`] are the CIRISPersist#94 ratification
 /// surface.** CIRISVerify WS-4 verifies the chain verify-side off its
 /// registry-local `trusted_primitive_keys`; CIRISEdge #28 Phase 3
 /// builds its `PeerResolver` cold-start path against
-/// [`RootingVerdict`]. Field names + JSON shape are the contract —
+/// `RootingVerdict` (deleted v62.0.0). Field names + JSON shape are the contract —
 /// changing them is a cross-repo coordination event.
 ///
 /// One [`ProvenanceLink`] corresponds to exactly one
@@ -229,7 +202,7 @@ impl ProvenanceLink {
 /// link's signature against the next link's pubkey, then checks the
 /// bootstrap link against its registry-local `trusted_primitive_keys`
 /// anchor. Persist's own verification verdict is reported separately
-/// by [`root_binding`]; this read is the *raw material* for an
+/// by `root_binding` (deleted v62.0.0); this read is the *raw material* for an
 /// independent verify-side check.
 ///
 /// `chain[0].key_id == queried_key_id`. `chain` is ordered
@@ -239,7 +212,7 @@ impl ProvenanceLink {
 ///
 /// **This read does not itself verify signatures** — it returns the
 /// chain so the verifier can. (Persist's verifying counterpart is
-/// [`root_binding`].) If the chain cannot be assembled (unknown
+/// `root_binding` (deleted v62.0.0).) If the chain cannot be assembled (unknown
 /// `key_id`, a `scrub_key_id` pointing at a missing row, or a cycle),
 /// [`provenance_chain`] returns a [`RootingRejection`] instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,7 +230,7 @@ pub struct ProvenanceChain {
     pub terminates_at_steward_bootstrap: bool,
 }
 
-/// Typed reason a [`RootingVerdict`] is `Rejected`.
+/// Typed reason a `RootingVerdict` (deleted v62.0.0) is `Rejected`.
 ///
 /// # Cross-repo contract
 ///
@@ -370,72 +343,6 @@ impl RootingRejection {
     }
 }
 
-/// Typed verdict from [`root_binding`] — the cold-start binding-rooting
-/// result. **There are exactly two states** (MISSION.md §1.6 —
-/// fail-honest; no silent pass, no third state).
-///
-/// # Cross-repo contract
-///
-/// The CIRISPersist#94 ratification surface. CIRISEdge's
-/// `PeerResolver` matches on this to decide whether a cold-start peer
-/// binding is rooted; CIRISVerify WS-4 cross-checks it against the
-/// chain from [`provenance_chain`].
-///
-/// # Not a trust statement
-///
-/// `Confirmed` means **the claimed binding is rooted in the
-/// directory's recursive-provenance chain, terminating at a steward
-/// bootstrap** — it authenticates origin/provenance. It is NOT "this
-/// key is trusted" (MISSION.md §1.4). A consumer still composes trust
-/// policy (attestations, revocations, trust grants) on top.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "verdict", rename_all = "snake_case")]
-pub enum RootingVerdict {
-    /// The `key_id` resolves to a directory row, the claimed Ed25519
-    /// pubkey matches it, and the recursive-provenance chain verifies
-    /// — every link's scrub-signature checks out — all the way up to
-    /// a self-signed steward bootstrap.
-    Confirmed {
-        /// The full verified provenance chain, leaf → root. The last
-        /// element is the steward bootstrap. Carried so the caller
-        /// can hand it to CIRISVerify / cache it / audit it without
-        /// a second directory round-trip.
-        chain: ProvenanceChain,
-    },
-    /// The binding could not be rooted. See [`RootingRejection`] for
-    /// the typed cause. The caller MUST NOT treat a `Rejected`
-    /// binding as provisionally trusted — that would reintroduce the
-    /// trust-on-first-use behavior this primitive replaces.
-    Rejected {
-        /// The typed rejection reason.
-        #[serde(flatten)]
-        rejection: RootingRejection,
-    },
-}
-
-impl RootingVerdict {
-    /// `true` iff this verdict is [`RootingVerdict::Confirmed`].
-    pub fn is_confirmed(&self) -> bool {
-        matches!(self, RootingVerdict::Confirmed { .. })
-    }
-
-    /// Borrow the verified chain when `Confirmed`; `None` otherwise.
-    pub fn chain(&self) -> Option<&ProvenanceChain> {
-        match self {
-            RootingVerdict::Confirmed { chain } => Some(chain),
-            RootingVerdict::Rejected { .. } => None,
-        }
-    }
-
-    /// Borrow the rejection reason when `Rejected`; `None` otherwise.
-    pub fn rejection(&self) -> Option<&RootingRejection> {
-        match self {
-            RootingVerdict::Rejected { rejection } => Some(rejection),
-            RootingVerdict::Confirmed { .. } => None,
-        }
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────
 // Chain assembly — the verify-consumable read
 // ─────────────────────────────────────────────────────────────────────
@@ -450,7 +357,7 @@ impl RootingVerdict {
 /// registry-local `trusted_primitive_keys`.
 ///
 /// **This read does not verify signatures** — it returns the raw
-/// chain. The verifying counterpart is [`root_binding`].
+/// chain. The verifying counterpart is `root_binding` (deleted v62.0.0).
 ///
 /// # Errors
 ///
@@ -468,7 +375,7 @@ impl RootingVerdict {
 /// **not** a steward is NOT an error here — it is returned with
 /// [`ProvenanceChain::terminates_at_steward_bootstrap`] set to
 /// `false`. The structural walk succeeded; whether that terminus is
-/// an acceptable root is a verify-side judgment. [`root_binding`]
+/// an acceptable root is a verify-side judgment. `root_binding` (deleted v62.0.0)
 /// treats it as [`RootingRejection::NotRootedAtSteward`].
 pub async fn provenance_chain<F>(
     directory: &F,
@@ -539,318 +446,12 @@ where
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// root_binding — the cold-start binding-rooting primitive
-// ─────────────────────────────────────────────────────────────────────
-
-/// v47.4.0 (CIRISPersist#805) — the tracing target a rooting rejection is
-/// reported on where the verdict is produced.
-pub const ROOTING_LOG_TARGET: &str = "ciris_persist::rooting";
-
-/// Cold-start binding-rooting primitive (CIRISPersist#94).
-///
-/// On first contact with a federation peer, confirm the claimed
-/// `(key_id, pubkey)` binding against the `federation_keys` directory
-/// and verify the row's recursive-provenance chain up to a **pinned
-/// trust-root** bootstrap. **This replaces trust-on-first-use** —
-/// CIRISEdge's `PeerResolver` calls it on its cold-start path.
-///
-/// This wrapper pins the trusted terminus anchor to the accord holders of the
-/// INGESTED genesis (the Ed25519 halves of the composite keys
-/// `edition2::genesis::genesis_in_force` seats) — the accord holders ARE the
-/// mesh's trusted primitive keyset (CIRISPersist#344). v62.0.0 (C5-fix1;
-/// ceremony gap 1): Verify's baked A1/B1/C1 keyset
-/// (`accord_holder_bootstrap_anchor`) no longer anchors anything; a node that
-/// holds no genesis has an EMPTY anchor and every binding is `Rejected`. Use
-/// [`root_binding_anchored`] to supply a different anchor (tests).
-///
-/// Returns [`RootingVerdict::Confirmed`] iff ALL hold:
-///
-///  1. `key_id` resolves to a `federation_keys` directory row.
-///  2. `claimed_pubkey_ed25519_base64` equals that row's
-///     `pubkey_ed25519_base64` (exact string match — both are base64
-///     standard of the 32 raw bytes).
-///  3. The recursive-provenance chain assembles (no break, no cycle,
-///     within depth) and terminates at a **self-signed** row carrying a
-///     trust-root role (`steward` or `accord_holder`).
-///  4. **The terminus's Ed25519 pubkey is one of the pinned anchor keys**
-///     — the load-bearing anti-spoof gate (step 3 is only a coarse
-///     identity-shape check; this is what actually pins trust to the
-///     un-forgeable accord holders).
-///  5. Every link's scrub-signature verifies cryptographically: each
-///     row's `scrub_signature_*` over its `original_content_hash`,
-///     checked against the **parent** row's pubkey (the self-signed
-///     bootstrap is checked against its own pubkey).
-///
-/// Otherwise returns [`RootingVerdict::Rejected`] with the typed
-/// [`RootingRejection`]. No third state (MISSION.md §1.6).
-///
-/// # Crypto path
-///
-/// Each link's signature is verified by DELEGATING to CIRISVerify's
-/// provenance walk (CIRISPersist#465) — never persist-local crypto. The
-/// verify policy is
-/// [`ciris_verify_core::threshold::HybridPolicy::RequireHybrid`]: EVERY
-/// link must carry a valid bound ML-DSA-65 scrub-signature, and a
-/// classical-only link is REJECTED as
-/// [`RootingRejection::UnsignedProvenanceLink`].
-///
-/// **Doc correction (v37.0.0):** this paragraph claimed
-/// `HybridPolicy::Ed25519Fallback` — "a hybrid-pending link is verified
-/// on its Ed25519 signature alone" — which has been false since #465
-/// tightened the walk to `RequireHybrid` (see the inline comment at the
-/// delegation site). The stale text described a classical-only link as
-/// rootable when the gate refuses it, which is precisely backwards for a
-/// federation binding gate (F-AV-14 / AV-8). Corrected during the v37.0.0
-/// policy sweep; the code was already correct and did not change.
-///
-/// # Not a trust statement
-///
-/// See [`RootingVerdict`] — `Confirmed` authenticates provenance, it
-/// does not confer trust.
-pub async fn root_binding<F>(
-    directory: &F,
-    key_id: &str,
-    claimed_pubkey_ed25519_base64: &str,
-) -> RootingVerdict
-where
-    F: FederationDirectory + ?Sized,
-{
-    // Secure by default: the trusted anchor is the accord holders of the
-    // ingested genesis. Every existing caller (CIRISEdge's cold-start
-    // announce path) therefore gets anchor enforcement with no code change —
-    // the terminus MUST be one of the genesis's accord holders, not any
-    // self-signed steward a peer asserts. No genesis held (or a store that
-    // cannot answer) ⇒ the empty anchor ⇒ `Rejected`: fail closed. Tests
-    // inject their own anchor via [`root_binding_anchored`].
-    let anchor: Vec<[u8; 32]> = match super::edition2::genesis::genesis_in_force(directory).await {
-        Ok(in_force) => in_force
-            .holders()
-            .iter()
-            .filter_map(|h| super::edition2::composite::ed25519_public(&h.key))
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    root_binding_anchored(directory, key_id, claimed_pubkey_ed25519_base64, &anchor).await
-}
-
-/// v47.4.0 (CIRISPersist#805, FSD §3.3) — the one place a rooting rejection
-/// is REPORTED: every caller (announce-admit, the FFI, a consumer's
-/// regression pin) gets the failing link and verify's text on
-/// [`ROOTING_LOG_TARGET`] without touching their code. The verdict itself
-/// is unchanged — see `root_binding_anchored_inner` for the walk.
-pub async fn root_binding_anchored<F>(
-    directory: &F,
-    key_id: &str,
-    claimed_pubkey_ed25519_base64: &str,
-    trusted_anchor: &[[u8; 32]],
-) -> RootingVerdict
-where
-    F: FederationDirectory + ?Sized,
-{
-    let verdict = root_binding_anchored_inner(
-        directory,
-        key_id,
-        claimed_pubkey_ed25519_base64,
-        trusted_anchor,
-    )
-    .await;
-    if let RootingVerdict::Rejected { rejection } = &verdict {
-        tracing::warn!(
-            target: ROOTING_LOG_TARGET,
-            key_id = %key_id,
-            kind = rejection.kind(),
-            detail = ?rejection,
-            "root_binding rejected"
-        );
-    }
-    verdict
-}
-
-/// [`root_binding`] with an explicit trusted-terminus **anchor** — the core
-/// primitive. The terminus's Ed25519 pubkey must appear in `trusted_anchor`
-/// (a slice of raw 32-byte keys) or the binding is rejected with
-/// [`RootingRejection::TerminusNotInAnchor`]. Production callers use the
-/// [`root_binding`] wrapper (accord-holder anchor); this form exists so tests
-/// (and any alternative pinning) can supply their own anchor.
-///
-/// See [`root_binding`] for the full step-by-step contract; this adds **step
-/// 5**: terminus-pubkey ∈ `trusted_anchor`.
-async fn root_binding_anchored_inner<F>(
-    directory: &F,
-    key_id: &str,
-    claimed_pubkey_ed25519_base64: &str,
-    trusted_anchor: &[[u8; 32]],
-) -> RootingVerdict
-where
-    F: FederationDirectory + ?Sized,
-{
-    // Step 1+2: resolve the queried row and confirm the claimed
-    // pubkey. We look it up directly (rather than relying on the
-    // chain's leaf) so a pubkey mismatch is reported before any
-    // chain walk — the cheapest, most specific rejection first.
-    let leaf = match directory.lookup_public_key(key_id).await {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return RootingVerdict::Rejected {
-                rejection: RootingRejection::UnknownKeyId {
-                    key_id: key_id.to_owned(),
-                },
-            }
-        }
-        Err(e) => {
-            return RootingVerdict::Rejected {
-                rejection: RootingRejection::DirectoryError {
-                    detail: format!("{e}"),
-                },
-            }
-        }
-    };
-
-    if leaf.pubkey_ed25519_base64 != claimed_pubkey_ed25519_base64 {
-        return RootingVerdict::Rejected {
-            rejection: RootingRejection::PubkeyMismatch {
-                key_id: key_id.to_owned(),
-                claimed_pubkey_ed25519_base64: claimed_pubkey_ed25519_base64.to_owned(),
-                directory_pubkey_ed25519_base64: leaf.pubkey_ed25519_base64,
-            },
-        };
-    }
-
-    // Step 3: assemble the recursive-provenance chain.
-    let chain = match provenance_chain(directory, key_id).await {
-        Ok(c) => c,
-        Err(rejection) => return RootingVerdict::Rejected { rejection },
-    };
-
-    // The chain must terminate at a trust-root bootstrap (a self-signed
-    // `steward` or `accord_holder` row). A structurally valid chain that
-    // roots at, e.g., a self-signed `agent` row is NOT rooted — fail-honest.
-    if !chain.terminates_at_steward_bootstrap {
-        // `chain` is non-empty (provenance_chain always pushes the
-        // leaf) and its last element is self-signed.
-        let terminus = chain.chain.last().expect("chain is non-empty");
-        return RootingVerdict::Rejected {
-            rejection: RootingRejection::NotRootedAtSteward {
-                key_id: terminus.key_id.clone(),
-                identity_type: terminus.identity_type.clone(),
-            },
-        };
-    }
-
-    // Step 3b (CIRISPersist#344 — the load-bearing anti-spoof gate): the
-    // terminus's Ed25519 pubkey MUST be a pinned trusted-anchor key. The
-    // identity-type check above is only a coarse shape gate — WITHOUT this,
-    // a peer that gets a self-signed `steward`/`accord_holder` row admitted
-    // (self-signed registration is permitted) could root to it and spoof a
-    // rooted binding. Pinning the terminus to the un-forgeable accord-holder
-    // anchor (A1/B1/C1) means only the real holders are valid roots.
-    let terminus = chain.chain.last().expect("chain is non-empty");
-    match BASE64.decode(terminus.pubkey_ed25519_base64.as_bytes()) {
-        Ok(raw) if raw.len() == 32 => {
-            let mut ed = [0u8; 32];
-            ed.copy_from_slice(&raw);
-            if !trusted_anchor.contains(&ed) {
-                return RootingVerdict::Rejected {
-                    rejection: RootingRejection::TerminusNotInAnchor {
-                        key_id: terminus.key_id.clone(),
-                        terminus_pubkey_ed25519_base64: terminus.pubkey_ed25519_base64.clone(),
-                    },
-                };
-            }
-        }
-        // A terminus whose pubkey cannot be decoded to 32 bytes can never be
-        // in the anchor — reject fail-secure (same token; the decode fault
-        // and the not-in-anchor case both mean "not a pinned root").
-        _ => {
-            return RootingVerdict::Rejected {
-                rejection: RootingRejection::TerminusNotInAnchor {
-                    key_id: terminus.key_id.clone(),
-                    terminus_pubkey_ed25519_base64: terminus.pubkey_ed25519_base64.clone(),
-                },
-            };
-        }
-    }
-
-    // Step 4: verify every link's scrub-signature by DELEGATING to CIRISVerify's
-    // provenance walk (CIRISPersist#465 — deletes persist's forked crypto
-    // re-implementation, crypto-DRY assessment #1). v10.4.0 fixed the JCS-envelope
-    // preimage and v10.5.0 (CIRISVerify#208) parameterized the terminus role set,
-    // so persist finally roots THROUGH verify instead of re-implementing the walk.
-    // We pass persist's own accepted-terminus roles ({steward, accord_holder},
-    // matching `is_trusted_root_identity`) and `RequireHybrid` — TIGHTENING the
-    // former `Ed25519Fallback`: a federation binding gate MUST reject a
-    // classical-only link (F-AV-14 / AV-8), and the two trust-root verifiers now
-    // agree on PQC-mandatoriness. Production genesis is full-hybrid, so nothing
-    // real breaks. Steps 3 + 3b already pinned the terminus ROLE and ANCHOR with
-    // persist's exact rejection tokens (the #94 edge contract), so verify's
-    // redundant re-checks pass here and its only live failure mode is crypto →
-    // mapped to `UnsignedProvenanceLink` (same `.kind()` token as the old fork).
-    // The two `ProvenanceChain`/`ProvenanceLink` types are field-identical, so
-    // the map is a serde round-trip; the anchor is `[u8;32]` → `Vec<u8>`.
-    let verify_chain: ciris_verify_core::provenance::ProvenanceChain =
-        match serde_json::to_value(&chain).and_then(serde_json::from_value) {
-            Ok(vc) => vc,
-            Err(e) => {
-                return RootingVerdict::Rejected {
-                    rejection: RootingRejection::UnsignedProvenanceLink {
-                        key_id: chain.key_id.clone(),
-                        signed_by_key_id: chain.key_id.clone(),
-                        detail: format!("map provenance chain to verify type: {e}"),
-                    },
-                };
-            }
-        };
-    let verify_anchor: Vec<Vec<u8>> = trusted_anchor.iter().map(|k| k.to_vec()).collect();
-    if let Err(e) = ciris_verify_core::provenance::verify_provenance_chain_with_policy_and_terminus(
-        &verify_chain,
-        &verify_anchor,
-        ciris_verify_core::threshold::HybridPolicy::RequireHybrid,
-        &[STEWARD_IDENTITY_TYPE, ACCORD_HOLDER_IDENTITY_TYPE],
-    ) {
-        let failing = verify_provenance_error_key_id(&e).unwrap_or_else(|| chain.key_id.clone());
-        return RootingVerdict::Rejected {
-            rejection: RootingRejection::UnsignedProvenanceLink {
-                key_id: failing.clone(),
-                signed_by_key_id: failing,
-                detail: format!("verify provenance: {e}"),
-            },
-        };
-    }
-
-    RootingVerdict::Confirmed { chain }
-}
-
-/// Extract the failing link's `key_id` from a verify [`ProvenanceError`] for the
-/// [`RootingRejection::UnsignedProvenanceLink`] mapping (CIRISPersist#465).
-/// Variants that name no specific link (empty chain, queried-key mismatch,
-/// terminus shape/role, over-depth) return `None` → caller falls back to the
-/// queried `key_id`.
-fn verify_provenance_error_key_id(
-    e: &ciris_verify_core::provenance::ProvenanceError,
-) -> Option<String> {
-    use ciris_verify_core::provenance::ProvenanceError as E;
-    match e {
-        E::BrokenLink { key_id, .. }
-        | E::SelfSignedMidChain { key_id, .. }
-        | E::BadContentHash { key_id, .. }
-        | E::ContentHashMismatch { key_id, .. }
-        | E::BadSignatureEncoding { key_id, .. }
-        | E::BadKeyEncoding { key_id, .. }
-        | E::ParentMissingPqcKey { key_id, .. }
-        | E::ScrubSignatureInvalid { key_id, .. }
-        | E::UntrustedAnchor { key_id, .. }
-        | E::LinkNotHybrid { key_id, .. } => Some(key_id.clone()),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// v21.3.0 (CIRISPersist#508) — `root_binding` / `root_binding_anchored`
-    /// (and `provenance_chain`) are callable with `&dyn FederationDirectory`
+    /// v21.3.0 (CIRISPersist#508) — `provenance_chain` is callable with
+    /// `&dyn FederationDirectory`
     /// (`F: ?Sized`), the handle CIRISServer actually holds
     /// (`engine.federation_directory()` → `Arc<dyn FederationDirectory>`) —
     /// the server-side E6 prime-time re-anchoring depends on this. A
@@ -858,8 +459,6 @@ mod tests {
     /// build if the bounds regress to `Sized`.
     #[allow(dead_code)]
     async fn dyn_directory_callable_508(dir: &dyn crate::federation::FederationDirectory) {
-        let _ = root_binding(dir, "k", "pk").await;
-        let _ = root_binding_anchored(dir, "k", "pk", &[[0u8; 32]]).await;
         let _ = provenance_chain(dir, "k").await;
     }
 
@@ -877,52 +476,6 @@ mod tests {
             RootingRejection::OverDepth { max_depth: 64 }.kind(),
             "rooting_over_depth"
         );
-    }
-
-    #[test]
-    fn verdict_json_shape_is_tagged() {
-        let confirmed = RootingVerdict::Confirmed {
-            chain: ProvenanceChain {
-                key_id: "k".into(),
-                chain: vec![],
-                terminates_at_steward_bootstrap: true,
-            },
-        };
-        let json = serde_json::to_value(&confirmed).unwrap();
-        assert_eq!(json["verdict"], "confirmed");
-
-        let rejected = RootingVerdict::Rejected {
-            rejection: RootingRejection::UnknownKeyId {
-                key_id: "missing".into(),
-            },
-        };
-        let json = serde_json::to_value(&rejected).unwrap();
-        assert_eq!(json["verdict"], "rejected");
-        // RootingRejection is `#[serde(flatten)]`'d, so its own
-        // `reason` tag + payload sit at the top level.
-        assert_eq!(json["reason"], "unknown_key_id");
-        assert_eq!(json["key_id"], "missing");
-    }
-
-    #[test]
-    fn verdict_accessors() {
-        let confirmed = RootingVerdict::Confirmed {
-            chain: ProvenanceChain {
-                key_id: "k".into(),
-                chain: vec![],
-                terminates_at_steward_bootstrap: true,
-            },
-        };
-        assert!(confirmed.is_confirmed());
-        assert!(confirmed.chain().is_some());
-        assert!(confirmed.rejection().is_none());
-
-        let rejected = RootingVerdict::Rejected {
-            rejection: RootingRejection::OverDepth { max_depth: 64 },
-        };
-        assert!(!rejected.is_confirmed());
-        assert!(rejected.chain().is_none());
-        assert!(rejected.rejection().is_some());
     }
 
     /// The trust-root identity classifier (CIRISPersist#344): a pure

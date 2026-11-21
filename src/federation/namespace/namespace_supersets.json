@@ -15737,7 +15737,7 @@
     "decimal_id": "2.4.1.1",
     "claim_id": "CLM-purge-tombstone-not-withdraws",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/steward_purge.rs#verify_purge_authorisation",
+    "path#symbol": "src/federation/steward_purge.rs#verify_purge_authorisation_edition2",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc8-8c8f536-1052"
    },
@@ -16057,7 +16057,7 @@
     "path#symbol": "src/federation/steward_purge.rs#resolve_selection",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v55-c-1007",
-    "witness": "I654, I662, I820 (memory, sqlite, postgres)"
+    "witness": "I654 (memory, sqlite, postgres); I662 and I820 retired in v62.0.0 (CL-fix1): their fixture was a #598 off-signature asserted_at row that no v62 node can hold"
    },
    {
     "decimal_id": "2.4.1.1",
@@ -16066,7 +16066,7 @@
     "path#symbol": "src/federation/steward_purge.rs#withhold_orphaned_derivatives",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v55-c-1007",
-    "witness": "I820 (memory, sqlite, postgres)"
+    "witness": "NONE on v62.0.0: I820 retired (CL-fix1) with the #598 asserted_at seam its fixture used; a witness through ByActor or MockModelTraces is owed before this row is cited as tested"
    },
    {
     "decimal_id": "2.4.1.1",
@@ -16090,19 +16090,19 @@
     "decimal_id": "3.3.2",
     "claim_id": "CLM-steward-purge-authorisation",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/steward_purge.rs#verify_purge_authorisation",
+    "path#symbol": "src/federation/steward_purge.rs#verify_purge_authorisation_edition2",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc8-1059",
-    "witness": "I650, I833, I656 (memory, sqlite, postgres)"
+    "witness": "I3165-I3169 (edition2::typed_invariants, sqlite + postgres); the edition-2 legs of steward_purge_invariants (BH-fix1: the earlier cosigned-notice count is deleted)"
    },
    {
     "decimal_id": "3.3.2",
     "claim_id": "CLM-steward-purge-authorisation",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/canonical_community.rs#trust_root_cosigners_over",
+    "path#symbol": "src/federation/canonical_community.rs#trust_root_counts_voices",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc8-1059",
-    "witness": "I650, I833, I656 (memory, sqlite, postgres)"
+    "witness": "I3165-I3169 (edition2::typed_invariants, sqlite + postgres); the edition-2 legs of steward_purge_invariants (BH-fix1: the earlier cosigned-notice count is deleted)"
    },
    {
     "decimal_id": "4.5.3",
@@ -16530,7 +16530,7 @@
     "decimal_id": "3.3.6",
     "claim_id": "CLM-identity",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/admission.rs#verify_signed_identity_occurrence",
+    "path#symbol": "src/federation/edition2/occurrence.rs#put_occurrence_voice",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc8-1091"
    },
@@ -16822,7 +16822,7 @@
     "decimal_id": "3.3.6.2",
     "claim_id": "CLM-transit-kex-binding",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/admission.rs#verify_signed_transport_destination",
+    "path#symbol": "src/federation/edition2/occurrence.rs#check_xwing_in_row",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc8-1091"
    },

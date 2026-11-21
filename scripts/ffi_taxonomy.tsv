@@ -269,7 +269,6 @@ Engine	cohort_scope_crypto_tier	nomological
 Engine	cohort_supersede_group	deontic	
 Engine	cohort_supersede_group_with_quorum	deontic	
 Engine	cohort_swap_member	deontic	
-Engine	cohort_verify_membership_quorum	deontic	
 Engine	community_dek_set_key_state	deontic	
 Engine	community_dek_set_retain_past_epochs	deontic	
 Engine	compare_wholeness_witnesses_json	testimonial	equivocation_evidence
@@ -570,7 +569,6 @@ Engine	respond_classical_kex_b64	ontological
 Engine	respond_hybrid_kex_b64	ontological	
 Engine	revocations_for	empirical	
 Engine	revoke_delegation	deontic	
-Engine	root_binding	ontological	
 Engine	row_type_report_json	empirical	
 Engine	run_consent_expiry_sweep_json	procedural	
 Engine	run_deletion_window_watch_json	procedural	
@@ -622,6 +620,8 @@ Engine	sign_composite	ontological
 Engine	verify_accord_manifest_v2	deontic	
 Engine	signer_standing	deontic	
 Engine	accord_manifest_v2_message	nomological	
+Engine	verify_identity_template_v1	deontic	
+Engine	identity_template_v1_message	nomological	
 Engine	audit_seal_entry	procedural	
 Engine	signer_ops_capsule	structural	
 Engine	steward_bind	deontic	

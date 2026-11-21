@@ -491,7 +491,7 @@ pub struct SignedTransportDestination {
     /// over the bytes; ML-DSA-65 over `bytes ‖ ed25519_sig`). Same container
     /// type as the occurrence/revocation planes — the producer is the same
     /// envelope-generic `produce_signed_identity_occurrence`.
-    pub signature: ciris_verify_core::transport_binding::TransportBindingSignature,
+    pub signature: crate::federation::types::RetiredPairSignature,
 }
 
 // ─── transit KEX pair (CC 3.3.6.2 rc8, CIRISPersist#1077) ───────────
@@ -3199,7 +3199,7 @@ mod transit_kex_tests {
         transport_destination: V55TransportDestination,
         attesting_key_id: String,
         signed_envelope: serde_json::Value,
-        signature: ciris_verify_core::transport_binding::TransportBindingSignature,
+        signature: crate::federation::types::RetiredPairSignature,
     }
 
     /// The fixed pair-bearing row the KAT pins. The projection is PARSED from
@@ -3228,7 +3228,7 @@ mod transit_kex_tests {
             transport_destination: projection,
             attesting_key_id: "kat-relay".into(),
             signed_envelope: env,
-            signature: ciris_verify_core::transport_binding::TransportBindingSignature {
+            signature: crate::federation::types::RetiredPairSignature {
                 ed25519_signature_base64: "ZWQyNTUxOQ==".into(),
                 mldsa65_signature_base64: Some("bWxkc2E2NQ==".into()),
             },

@@ -40,18 +40,19 @@ pub(super) const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
 /// re-vendoring (the drift gate asserts the file's `_meta.cc_version` matches).
 pub const VENDORED_CC_VERSION: &str = "1.0-rc21";
 
-/// v62.0.0 (R1c) — the CIRISConstitution TAG the vendored files were copied
-/// from. Through rc20 the tag was `v<VENDORED_CC_VERSION>`; rc21's cut is
-/// tagged `v1.0-rc21-wire` (the manifest's `_meta.cc_version` still reads
-/// `1.0-rc21`), so the tag witnesses (I1302, I1499) and
-/// `scripts/check_vendored_cc.sh` name the tag by this const, never by
-/// formatting the version. A witness that formatted `v1.0-rc21` would find
-/// no such tag and SKIP: a check that could not fail.
-pub const VENDORED_CC_TAG: &str = "v1.0-rc21-wire";
+/// v62.0.0 (R1c; CC-pin) — the CIRISConstitution TAG the vendored files were
+/// copied from. Through rc20 the tag was `v<VENDORED_CC_VERSION>`; R1c
+/// vendored rc21's wire cut, tagged `v1.0-rc21-wire` (`e6fd7c60`), and CC-pin
+/// moves to the RELEASE tag `v1.0-rc21` (`b016df47`), which is
+/// `v<VENDORED_CC_VERSION>` again. The tag witnesses (I1302, I1499) and
+/// `scripts/check_vendored_cc.sh` still name the tag by this const, never by
+/// formatting the version, so a later cut tagged otherwise cannot make a
+/// witness find no tag and SKIP: a check that could not fail.
+pub const VENDORED_CC_TAG: &str = "v1.0-rc21";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "5ca71c32a4573063d9a904a14adc7ae0d5f05866bd7ec34b034b2e6fce884f60";
+    "ede8773f5d38b821b9b5cd240bc4be5a2db15145fdf46cffd30c997bbd9b647f";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
 pub const VENDORED_N_FAMILIES: usize = 187;
@@ -71,23 +72,25 @@ pub const VENDORED_REGISTRY_SHA256: &str =
     "1f81a1b1ab6f29b645d292f70d8d15810b475fbde5d6444ffe33b4ee68845bd2";
 
 /// The CIRISConstitution commit every vendored CC manifest was copied from: the
-/// commit the `v1.0-rc21-wire` tag names (`e6fd7c60`, [`VENDORED_CC_TAG`]),
-/// copied from the tag with `git show v1.0-rc21-wire:manifests/<file>`, never
-/// a branch tip (v62.0.0 R1c, from rc20 `d4bd2a6b`, so persist's matcher reads
-/// the registry CIRISVerify 23.3.1 vendors; CIRISPersist#753; v62.0.0, from
+/// commit the `v1.0-rc21` release tag names (`b016df47`, [`VENDORED_CC_TAG`]),
+/// copied from the tag with `git show v1.0-rc21:manifests/<file>`, never
+/// a branch tip (v62.0.0 CC-pin, from the rc21 wire cut `e6fd7c60`
+/// (`v1.0-rc21-wire`): the registry's bytes moved only in
+/// `_meta.source_sha256`; v62.0.0 R1c, from rc20 `d4bd2a6b`, so persist's
+/// matcher reads the registry CIRISVerify 23.3.1 vendors; CIRISPersist#753; v62.0.0, from
 /// rc18 `646df978`; v61.3.0, CIRISPersist#1252, from rc15 `ace6b74`). The
 /// files are also pinned by their own SHA-256
 /// ([`VENDORED_REGISTRY_FILE_SHA256`], [`VENDORED_VECTORS_FILE_SHA256`], and the
 /// files in [`super::cc_manifests`]), and
-/// `scripts/check_vendored_cc.sh v1.0-rc21-wire` byte-compares all of them
+/// `scripts/check_vendored_cc.sh v1.0-rc21` byte-compares all of them
 /// against the tag before a persist release that names rc21 is tagged.
-pub const VENDORED_CC_COMMIT: &str = "e6fd7c6071ced5d0dcdd7f578e7fa9625e5bf16c";
+pub const VENDORED_CC_COMMIT: &str = "b016df47a7697b6544e34177541be442ff6f24e9";
 
 /// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
 /// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).
 /// What `scripts/check_vendored_cc.sh` compares against the tag.
 pub const VENDORED_REGISTRY_FILE_SHA256: &str =
-    "c6a478d65b8d7040311f989941b7d747de756abf4718ce3bdf7f459bfce41f49";
+    "83fbc43124a076ce6878e6c0e775d4cabb8c22c7ab1c4c71438b6b425e1f8c32";
 
 /// SHA-256 of the vendored `namespace_match_vectors.json` FILE bytes.
 pub const VENDORED_VECTORS_FILE_SHA256: &str =

@@ -7901,7 +7901,7 @@ fn pg_row_to_signed_transport_destination(
     let signature_json: String = row.safe_get_with(12, FErr::Backend)?;
     let signed_envelope: serde_json::Value = serde_json::from_str(&signed_envelope_json)
         .map_err(|e| FErr::Backend(format!("transport_destinations.signed_envelope: {e}")))?;
-    let signature: ciris_verify_core::transport_binding::TransportBindingSignature =
+    let signature: crate::federation::types::RetiredPairSignature =
         serde_json::from_str(&signature_json)
             .map_err(|e| FErr::Backend(format!("transport_destinations.signature: {e}")))?;
     Ok(crate::federation::SignedTransportDestination {
@@ -7930,7 +7930,7 @@ fn pg_row_to_signed_touch_claim(
     let signature_json: String = row.safe_get_with("signature", FErr::Backend)?;
     let signed_envelope: serde_json::Value = serde_json::from_str(&signed_envelope_json)
         .map_err(|e| FErr::Backend(format!("freshness_floor.signed_envelope: {e}")))?;
-    let signature: ciris_verify_core::transport_binding::TransportBindingSignature =
+    let signature: crate::federation::types::RetiredPairSignature =
         serde_json::from_str(&signature_json)
             .map_err(|e| FErr::Backend(format!("freshness_floor.signature: {e}")))?;
     Ok(crate::federation::types::SignedTouchClaim {
@@ -8451,81 +8451,6 @@ impl PostgresBackend {
                 "DELETE FROM cirislens.purge_tombstones \
                  WHERE notice_id = $1 AND plane = $2 AND record_ref = $3",
                 &[&notice_id, &plane, &record_ref],
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))
-    }
-
-    /// v54.1.0 (CIRISPersist#1043) — TEST SEAM: reproduce a legacy row the
-    /// apply door refuses today (#598 "typed asserted_at diverges from the
-    /// signed envelope"): move the typed `asserted_at` column off the signed
-    /// instant. Nothing else moves.
-    #[cfg(any(test, feature = "test-anchor"))]
-    pub async fn test_seam_set_attestation_asserted_at(
-        &self,
-        attestation_id: &str,
-        asserted_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        client
-            .execute(
-                "UPDATE cirislens.federation_attestations SET asserted_at = $2 \
-                 WHERE attestation_id::text = $1",
-                &[&attestation_id, &asserted_at],
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))
-    }
-
-    /// v55.0.0 (CIRISPersist#989) — TEST SEAM: reproduce a row of a type no
-    /// door admits today (a retired `holds_bytes` carrier a node still holds):
-    /// rewrite the typed `attestation_type` column and, when given, the stored
-    /// envelope (the rc6 shape). Nothing else moves.
-    #[cfg(any(test, feature = "test-anchor"))]
-    pub async fn test_seam_set_attestation_type(
-        &self,
-        attestation_id: &str,
-        attestation_type: &str,
-        envelope: Option<&serde_json::Value>,
-    ) -> Result<(), crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        let env: Option<String> = envelope.map(serde_json::Value::to_string);
-        client
-            .execute(
-                "UPDATE cirislens.federation_attestations SET attestation_type = $2, \
-                 attestation_envelope = COALESCE($3::text, attestation_envelope) \
-                 WHERE attestation_id::text = $1",
-                &[&attestation_id, &attestation_type, &env],
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))
-    }
-
-    /// v54.0.0 (CIRISPersist#995 row 2) — TEST SEAM: reproduce what a
-    /// pre-v53.1.4 UPDATE door left behind: `additional_scrubs` emptied while
-    /// `persist_row_hash` still binds the full record. Nothing else moves.
-    #[cfg(any(test, feature = "test-anchor"))]
-    pub async fn test_seam_drop_key_additional_scrubs(
-        &self,
-        key_id: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        client
-            .execute(
-                "UPDATE cirislens.federation_keys SET additional_scrubs = '[]' WHERE key_id = $1",
-                &[&key_id],
             )
             .await
             .map(|_| ())
@@ -29495,7 +29420,10 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         let tag = uuid_like();
         let node = format!("cc-node-{tag}");
-        backend.set_node_key_id(node.clone());
+        // RT-fix1: the node's identity-ref (the conferral walk asks as the
+        // backend's node key, and the accepts edge is signed by that key),
+        // never the bare seed text.
+        backend.set_node_key_id(crate::federation::edition2::fixture_switch::kid(&node));
         crate::federation::content_class::parity_test_support::assert_content_class_flag_plane(
             &backend, &node, &tag,
         )
@@ -31003,53 +30931,9 @@ mod tests {
         .await;
     }
 
-    // ── freshness_floor (CIRISPersist#519 item 2a-iii) witnesses ────
-
-    /// The anti-rollback matrix on postgres. Shares the assertion body with
-    /// the memory + sqlite parity tests.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn touch_claim_monotonic_max_only_advances_postgres() {
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
-        backend.run_migrations().await.expect("migrations run");
-        let suffix = uuid_like();
-        crate::federation::freshness::test_support::run_monotonic_max_matrix(&backend, &suffix)
-            .await;
-    }
-
-    /// The future-skew rejection on postgres.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn touch_claim_rejects_future_beyond_skew_postgres() {
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
-        backend.run_migrations().await.expect("migrations run");
-        let suffix = uuid_like();
-        crate::federation::freshness::test_support::run_future_skew_rejection(&backend, &suffix)
-            .await;
-    }
-
-    /// The `cohort_scope` admission-gate validation on postgres.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn touch_claim_cohort_scope_validated_postgres() {
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
-        backend.run_migrations().await.expect("migrations run");
-        let suffix = uuid_like();
-        crate::federation::freshness::test_support::run_cohort_scope_validation(&backend, &suffix)
-            .await;
-    }
+    // v62.0.0 (BH-fix3) — the freshness-floor touch-claim witnesses are deleted:
+    // they asserted the earlier-form signed touch claim (a separate Ed25519 +
+    // ML-DSA-65 pair) lands; its door refuses the earlier form.
 
     /// #446 — the occurrence→route composite-projection matrix on postgres.
     /// Shares the assertion body with the memory + sqlite parity tests.
@@ -40533,60 +40417,38 @@ mod tests {
     /// delegation `infra:detect` from a root THIS node trusts, never by the
     /// signer's own `lenscore_detector` label. So the fixture stands up the
     /// chain I3081 witnesses, under `tag`-scoped seeds (the pg test DB is
-    /// shared): this backend's node key (`set_node_key_id`), a key root
-    /// chartering itself, the node accepting it, and the root conferring
-    /// `infra:detect` on the detector. Returns the detector's SEED (sign with
-    /// it; its kid is `e2::kid(seed)`).
+    /// shared): this backend's node key (`set_node_key_id`) and the ROOTED
+    /// trust root at `{tag}-root` conferring `infra:detect` on the detector.
+    /// Returns the detector's SEED (sign with it; its kid is
+    /// `e2::kid(seed)`).
+    ///
+    /// RT-fix1 — through the shared conferral fixture
+    /// (`r2_test_support::confer_scope_from_trusted_root`), as the sqlite twin
+    /// (`conferred_key`) does: the bundle in force, an `infrastructure`
+    /// community founded by its holders, the charter, this node's acceptance,
+    /// and the grant voiced by the detector and by the owner the fixture
+    /// binds to this `agent` key. The earlier body chartered a bare `node`
+    /// KEY root by hand and gave the grant no second voice, so the grant
+    /// conferred nothing. The fixture returns only once the grant reaches the
+    /// root through this node.
     async fn pg_confer_detector(backend: &PostgresBackend, tag: &str) -> String {
-        use crate::federation::trust_root::{
-            TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION, TRUST_CONFERS_DIMENSION,
-        };
-        use crate::federation::types::attestation_type;
         let (node, root, det) = (
             format!("{tag}-node"),
             format!("{tag}-root"),
             format!("{tag}-detector"),
         );
         e2::put_key(backend, &node, &["node"]).await;
-        e2::put_key(backend, &root, &["node"]).await;
         // The detector states only `agent`: the duty is the delegation's.
         e2::put_key(backend, &det, &["agent"]).await;
         backend.set_node_key_id(e2::kid(&node));
-        let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&[format!(
-            "{tag}-root-successor"
-        )])
-        .expect("a pre-rotation commitment");
-        for (from, to, envelope) in [
-            (
-                &root,
-                &root,
-                serde_json::json!({
-                    "dimension": TRUST_CHARTER_DIMENSION,
-                    "scope": ["infra:serve", "infra:attest"],
-                    "pre_rotation_commitment": commitment,
-                }),
-            ),
-            (
-                &node,
-                &root,
-                serde_json::json!({"dimension": TRUST_ACCEPTS_DIMENSION, "scope": ["infra:serve"]}),
-            ),
-            (
-                &root,
-                &det,
-                serde_json::json!({
-                    "dimension": TRUST_CONFERS_DIMENSION,
-                    "scope": [crate::federation::types::delegation_scope::INFRA_DETECT],
-                }),
-            ),
-        ] {
-            let mut edge = pg_scores_shape(&e2::kid(from), &e2::kid(to), &e2::kid(from), "-");
-            edge.attestation_type = attestation_type::DELEGATES_TO.into();
-            edge.attestation_envelope = envelope;
-            e2::try_put_row(backend, &edge, from)
-                .await
-                .unwrap_or_else(|e| panic!("the trust edge {from} -> {to} is admitted: {e:?}"));
-        }
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+            backend,
+            &node,
+            &root,
+            &det,
+            crate::federation::types::delegation_scope::INFRA_DETECT,
+        )
+        .await;
         det
     }
 

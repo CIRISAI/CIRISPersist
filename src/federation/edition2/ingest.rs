@@ -1379,6 +1379,12 @@ impl ReplicatedStatementOutcome {
 ///   held rows untouched, safe to re-offer;
 /// - every other gate refusal keeps its typed [`Error`].
 ///
+/// v62.0.0 (LF-fix2, T5) — runs as ONE directory call,
+/// [`FederationDirectory::replicated_statement_door`]: over a backend, this
+/// door at `WriteOrigin::Wire`; over the capsule proxy (`OpsDirectory`), the
+/// `ApplyReplicatedStatement` op, so the whole door runs on the host's store
+/// and nothing composes it over the proxy's reads.
+///
 /// # Errors
 /// As above.
 pub async fn apply_replicated_statement<F>(
@@ -1389,13 +1395,57 @@ pub async fn apply_replicated_statement<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    apply_replicated_statement_with_origin(
-        dir,
-        bytes,
-        offered_id,
-        crate::federation::replication::admission::WriteOrigin::Wire,
-    )
-    .await
+    dir.replicated_statement_door(bytes, offered_id).await
+}
+
+/// v62.0.0 (LF-fix1; CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **the
+/// receive door's re-wrap, on the edition-2 wire.** An owner-binding
+/// `delegates_to(owner → device)` arriving from a peer is the moment a minter
+/// learns a member has a device: this node re-wraps its OWN epochs to it
+/// ([`FederationDirectory::rewrap_own_epochs_for_device`], through
+/// [`rewrap_after_admission`](crate::federation::rewrap_after_admission)).
+///
+/// The hook ran in the typed replicated attestation door
+/// (`attestation_apply::apply_planned`, on an inserted row). An edition-2
+/// binding never reaches that plan: it is offered here as its statements and
+/// concludes when the bound node's voice completes it
+/// ([`StatementOutcome::Row`]: the typed row was written by THIS call; a
+/// further voice of a landed row is `Voice`, a row still short is `Pending`).
+/// So the receive door that is open asks, once the row has concluded and
+/// every voice is stored (the owner seat counts the bound node's voice). The
+/// plain statement door ([`put_statement`]) does not: as before, a host's
+/// local write re-wraps through its own door.
+///
+/// The row stands whatever happens here: a failed read or re-wrap is logged
+/// and left to the pending-`KeyGrant` sweep, as on the typed door. The row is
+/// read back only for a `delegates_to` statement, so no other row pays a read.
+async fn rewrap_for_a_received_owner_binding<F>(dir: &F, bytes: &[u8], out: &StatementOutcome)
+where
+    F: FederationDirectory + ?Sized,
+{
+    let StatementOutcome::Row { row_id, .. } = out else {
+        return;
+    };
+    let is_delegation = super::emit::family_of_statement(bytes).is_some_and(|(_, row_type)| {
+        row_type == crate::federation::types::attestation_type::DELEGATES_TO
+    });
+    if !is_delegation {
+        return;
+    }
+    match dir.get_attestation(&row_id.hex()).await {
+        Ok(Some(row)) => {
+            if let Some((owner, device)) = crate::federation::owner_binding_of(&row) {
+                crate::federation::rewrap_after_admission(dir, &owner, &device).await;
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            row_id = %row_id.hex(),
+            "a received delegation concluded; reading it back for the owner-binding re-wrap \
+             failed, and the re-wrap is left to the pending-KeyGrant sweep (#916)"
+        ),
+    }
 }
 
 /// v62.0.0 (E6-fix9; CIRISPersist#804) — [`apply_replicated_statement`]
@@ -1420,6 +1470,7 @@ where
     use crate::federation::attestation_apply::AttestationRefusalReason;
     match put_statement_with_origin(dir, bytes, Some(offered_id), INGEST_TIER, origin).await {
         Ok(out) => {
+            rewrap_for_a_received_owner_binding(dir, bytes, &out).await;
             let new = match &out {
                 StatementOutcome::KeyPlane { new, .. }
                 | StatementOutcome::Voice { new, .. }

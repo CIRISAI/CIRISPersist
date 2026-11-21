@@ -1,12 +1,17 @@
 //! **The CC manifests persist vendors beside the namespace registry, pinned
-//! at the CIRISConstitution `v1.0-rc21-wire` tag.**
+//! at the CIRISConstitution `v1.0-rc21` release tag.**
 //!
 //! [`registry`](super::registry) carries the namespace registry and its match
 //! vectors; this module carries the other five CC `manifests/` files persist
-//! reads, copied byte for byte with `git show v1.0-rc21-wire:manifests/<file>` at
-//! [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) (`e6fd7c60`; v62.0.0 R1c, from
-//! rc20 `d4bd2a6b`, which came from rc18 `646df978`). At rc21-wire only
-//! `csd4_chain.json` moved of these five (and `WIRE_VOCABULARY.md`'s pin):
+//! reads, copied byte for byte with `git show v1.0-rc21:manifests/<file>` at
+//! [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) (`b016df47`; v62.0.0 CC-pin,
+//! from the rc21 wire cut `e6fd7c60`, which came from rc20 `d4bd2a6b`, which
+//! came from rc18 `646df978`). At the release tag three of these five moved:
+//! `governance_policy.json` and its vectors (the `moderator_election` FLOOR
+//! became "2 voices, or the roster's size if smaller", `floor_rule.kind`
+//! `voices_or_roster`; a `ranked` row persist reads as not two-path) and
+//! `csd4_chain.json` (614 claims, 101 text tokens, the CIRISServer v0.5.245
+//! catalogue). `WIRE_VOCABULARY.md` did not move:
 //!
 //! | file | CC | read by |
 //! |---|---|---|
@@ -35,20 +40,20 @@ pub(crate) const GOVERNANCE_POLICY_JSON: &str = include_str!("governance_policy.
 
 /// SHA-256 of the vendored `governance_policy.json` FILE bytes.
 pub const VENDORED_GOVERNANCE_POLICY_FILE_SHA256: &str =
-    "14a7c208b8904c688be7a89b0678782fb2047d13eb96988233674fd829e82b42";
+    "72c1cc376461433e7abf78de9b921f7e43fabf5129a4c1c53c7fc46f2bcd5119";
 
 /// The table's own `_meta.policy_sha256` (CC's hash over the rows; the
 /// vectors carry the same value, so a vector set is tied to its table).
 pub const VENDORED_GOVERNANCE_POLICY_SHA256: &str =
-    "32cfcb6c9503fecf6f1827075342bc438ebe721360253f936c680f4d1944247a";
+    "96edc650156b080724037c9ac7b6cf42a8386a577fd935713b02b77bd8554eaf";
 
 /// SHA-256 of the vendored `governance_policy_vectors.json` FILE bytes.
 pub const VENDORED_GOVERNANCE_POLICY_VECTORS_FILE_SHA256: &str =
-    "6c00ebd2bc5fdfcbbb485e653d2c09d564ff94a04472228399adf1a6e767bc05";
+    "0ea7e2313becd3a7456d667738432eaea966028a3a4b5e82594deb018908c801";
 
 /// SHA-256 of the vendored `csd4_chain.json` FILE bytes.
 pub const VENDORED_CSD4_CHAIN_FILE_SHA256: &str =
-    "1251358980418a1f09d9c1c3b3f41c6f3de0d20ddc68852026b57809a7d90c44";
+    "27824c07a7480845b9ea0b865b3287d4a770111d8c2b4be1ffa2b1b7a854bd48";
 
 /// SHA-256 of the vendored `topology_vocabulary.json` FILE bytes. The chain's
 /// `_meta.pins.vocabulary_sha256` and CIRISServer's catalogue pin

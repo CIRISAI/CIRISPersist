@@ -117,72 +117,38 @@ pub(crate) mod bodies {
         format!("{role}-{tail}")
     }
 
-    /// v62.0.0 (JSON cut, E7; P8) — `det` may state `detection:*`: a key root
-    /// (`{tag}-root`) charters itself, THIS node (the runner set its key
-    /// first) accepts it, and it confers `infra:detect` on `det`. The twin of
-    /// P4's `edition2::standing_invariants::conferred_detector_body`, which
-    /// is private to `edition2`; standing is never a self-declared type.
+    /// v62.0.0 (JSON cut, E7; P8; RT-fix1) — `det` may state `detection:*`:
+    /// the ROOTED trust root at `tag`'s root seed (W1b's
+    /// `fixture_trust_root`, through the shared conferral fixture
+    /// `admission::r2_test_support::confer_scope_from_trusted_root`: the
+    /// bundle in force, an `infrastructure` community founded by its holders,
+    /// the charter, THIS node's acceptance) confers `infra:detect` on `det`,
+    /// with the detector's own voice and, for a machine detector, its bound
+    /// owner's. The twin of P4's
+    /// `edition2::standing_invariants::conferred_detector_body`; standing is
+    /// never a self-declared type.
+    ///
+    /// RT-fix1: the earlier body chartered a bare `node` KEY root by hand. A
+    /// key-arm root is as attested as its holder's custody evidence (CC
+    /// 4.2.2.1), which no fixture key carries, so its grant rooted nowhere and
+    /// every detection was held. The shared fixture returns only once
+    /// `capability_roots_to_trusted_root(node, det, infra:detect)` roots at
+    /// the root, so a conferral that confers nothing stops here.
     pub(crate) async fn confer_detect<B>(b: &B, tag: &str, det: &str)
     where
-        B: FederationDirectory + ?Sized,
+        B: FederationDirectory,
     {
-        use crate::federation::trust_root::{
-            TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION, TRUST_CONFERS_DIMENSION,
-        };
         let node_kid = b
             .node_key_id()
             .expect("the runner sets this node's key before a detection");
-        let node = e2::seed_of(&node_kid);
-        let root = role_seed("root", tag);
-        e2::put_key(b, &root, &[identity_type::NODE]).await;
-        let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&[format!(
-            "{tag}-root-successor"
-        )])
-        .expect("commitment");
-        for (from, to, envelope) in [
-            (
-                root.as_str(),
-                root.as_str(),
-                serde_json::json!({
-                    "dimension": TRUST_CHARTER_DIMENSION,
-                    "scope": ["infra:serve", "infra:attest"],
-                    "pre_rotation_commitment": commitment,
-                }),
-            ),
-            (
-                node.as_str(),
-                root.as_str(),
-                serde_json::json!({"dimension": TRUST_ACCEPTS_DIMENSION, "scope": ["infra:serve"]}),
-            ),
-            (
-                root.as_str(),
-                det,
-                serde_json::json!({
-                    "dimension": TRUST_CONFERS_DIMENSION,
-                    "scope": [crate::federation::types::delegation_scope::INFRA_DETECT],
-                }),
-            ),
-        ] {
-            let confers = envelope
-                .get("dimension")
-                .and_then(serde_json::Value::as_str)
-                == Some(TRUST_CONFERS_DIMENSION);
-            let mut edge = ts::bare_attestation("", &e2::kid(from), &e2::kid(to), &envelope);
-            edge.attestation_type = attestation_type::DELEGATES_TO.to_owned();
-            let edge = e2::try_put_row(b, &edge, from)
-                .await
-                .unwrap_or_else(|e| panic!("the trust edge {from} -> {to} is admitted: {e:?}"));
-            // v62.0.0 (P8-fix11, a foreign hunk) — a conferral waits for its
-            // delegate's own voice (CC 2.6.1.9, K2's `delegate` role; the
-            // G0-fix3 finding on P4's twin fixture). Without it the
-            // conferral is held, and so is every detection it should stand.
-            if confers {
-                let st = e2::carried_statement(&edge).expect("the conferral's statement");
-                e2::put_statement(b, &e2::voice_of(&st, to))
-                    .await
-                    .expect("the detector's own voice on its conferral");
-            }
-        }
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+            b,
+            &node_kid,
+            &role_seed("root", tag),
+            det,
+            crate::federation::types::delegation_scope::INFRA_DETECT,
+        )
+        .await;
     }
 
     /// v62.0.0 (JSON cut, E7; P8) — a conferred detector (`detector_seed`,

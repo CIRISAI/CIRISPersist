@@ -124,7 +124,10 @@ mod tests {
         // re-read at rc20; the Goal row's anchor moved with its text (a group,
         // not only a community, declares a Goal by its own vote). v62.0.0
         // (R1c): re-read at rc21-wire (e6fd7c60); every anchor is still in its
-        // part's text (read-checked with `git show v1.0-rc21-wire:`).
+        // part's text (read-checked with `git show v1.0-rc21-wire:`). v62.0.0
+        // (CC-pin): re-read at the release tag v1.0-rc21 (b016df47); each of
+        // the four anchors occurs once in part 3 (read-checked with `git show
+        // v1.0-rc21:`), and part 3 hashes to the new VENDORED_SOURCE_SHA256.
         assert_eq!(VENDORED_CC_VERSION, "1.0-rc21", "the table is read at rc21");
         let tsv = std::fs::read_to_string(root().join("evidence/cc_impl.tsv")).expect("cc_impl");
         let claims: Vec<&str> = tsv

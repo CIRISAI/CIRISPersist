@@ -35,7 +35,8 @@
 //!   dropped, a forged cosignature, or unsorted ids is refused.
 //! - **I657** — RETIRED, not reused: it witnessed a #1043 serve filter the
 //!   operator ruled out (2026-10-09: both classes are PURGED through this
-//!   door, never withheld in place). Its selection half is I662.
+//!   door, never withheld in place). Its selection half was I662 (also
+//!   retired, v62.0.0).
 //! - **I658** — RETIRED, not reused: it witnessed a purged key that could
 //!   not return. The operator ruled (2026-10-09) that a purge never deletes
 //!   or tombstones a key; see I665, I666.
@@ -52,10 +53,11 @@
 //!   the serve read and the promotion door carry the purge gates, no key door
 //!   consults the purge plane, and no
 //!   serve read classifies a row by `refused_today` (#1043's ruling).
-//! - **I662** — #1043 class 1 is a SELECTION: a row the apply door refuses
-//!   today is still served until it is purged; `RefusedToday` selects it and
-//!   every score derived from it (nothing else), the dry run counts per table
-//!   and writes nothing, and once executed the purged rows stop being served.
+//! - **I662** — RETIRED, not reused (v62.0.0, CL-fix1): it witnessed the
+//!   #1043 `RefusedToday` selection over a #598 legacy row (typed
+//!   `asserted_at` moved off the signed instant by a test seam). No v62 door
+//!   writes that row and the upgrade deletes the earlier store, so the seam
+//!   and this witness are deleted with it.
 //! - **I663** — RETIRED, not reused: it witnessed a #1043 class-2
 //!   harness-prefix builder the operator dropped (harness rows on production
 //!   stay; Server selects by actor or by ids when it needs a purge).
@@ -129,12 +131,12 @@
 //!   admitted; a LEGACY manifest row with no `run_kind` is admitted and
 //!   stored byte for byte as signed; a `run_kind` outside the vocabulary, in
 //!   either shape, is `federation_trace_dimension_invalid`.
-//! - **I820** (Codex round 2 on PR #1057) — derivatives leave with a
-//!   withheld parent: under `RefusedToday`, a refused-today
-//!   `moderation_track_record` row is withheld (inadmissible), and so are the
-//!   score citing it and the score citing THAT score; a refused-today plain
-//!   row and the score over it are selected; the dry run's digest is the
-//!   reduced set's, and execution under it succeeds.
+//! - **I820** — RETIRED, not reused (v62.0.0, CL-fix1): it witnessed
+//!   derivatives leaving with a withheld parent, driven through
+//!   `RefusedToday` over the same #598 seam row as I662 (deleted with it).
+//!   The derivative rule (`withhold_orphaned_derivatives`) is shared by every
+//!   deriving class; a v62 witness through `ByActor` / `MockModelTraces` is
+//!   owed.
 //! - **I821** (Codex round 2 on PR #1057) — a blob's subject is resolved
 //!   from what THIS node holds, never from a bundle's `derived_from`: a
 //!   quorum-cosigned bundle that points a person's blob at a harmless row is
@@ -224,12 +226,6 @@ pub(crate) mod bodies {
 
     /// What a witness needs from a backend beyond the two public traits.
     pub(crate) trait Seams: FederationDirectory + Backend + Sync {
-        /// The #1043 legacy-row seam.
-        fn shift_asserted_at<'a>(
-            &'a self,
-            id: &'a str,
-            at: chrono::DateTime<chrono::Utc>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
         /// This node's identity, as `Engine` injects it.
         fn set_node(&self, key_id: &str);
         /// The stored role seam (CIRISPersist#1040).
@@ -253,17 +249,6 @@ pub(crate) mod bodies {
     macro_rules! seams_for {
         ($t:ty) => {
             impl Seams for $t {
-                fn shift_asserted_at<'a>(
-                    &'a self,
-                    id: &'a str,
-                    at: chrono::DateTime<chrono::Utc>,
-                ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-                    Box::pin(async move {
-                        self.test_seam_set_attestation_asserted_at(id, at)
-                            .await
-                            .expect("seam");
-                    })
-                }
                 fn set_node(&self, key_id: &str) {
                     self.set_node_key_id(key_id);
                 }
@@ -1754,94 +1739,6 @@ pub(crate) mod bodies {
         );
         let again = apply_at(db, &bundle, "node-b", t).await.unwrap();
         assert_eq!((again.tombstoned, again.already_tombstoned), (0, 5));
-    }
-
-    // ── I662 ──────────────────────────────────────────────────────────────
-    pub(crate) async fn i662_refused_today_is_a_selection_not_a_filter<D: Seams>(d: &D) {
-        let r = root(d).await;
-        let dir = d.as_dyn_directory();
-        let t = now();
-        let mut legacy = Vec::new();
-        for _ in 0..4 {
-            let row = put_score(d, BYSTANDER, AGENT, &[]).await;
-            d.shift_asserted_at(
-                &row.attestation_id,
-                row.asserted_at + chrono::Duration::seconds(1),
-            )
-            .await;
-            legacy.push(row.attestation_id);
-        }
-        let good = put_score(d, SCORER, AGENT, &[]).await.attestation_id;
-        let derived = put_score(d, SCORER, AGENT, &[&legacy[0]])
-            .await
-            .attestation_id;
-        for id in &legacy {
-            let row = dir.get_attestation(id).await.unwrap().unwrap();
-            assert!(
-                sp::refused_today(&row).is_some(),
-                "the seam makes a #598 legacy row"
-            );
-        }
-        // A local-tier row the apply door would also refuse is this node's
-        // own business: never served, never in the class.
-        let local = seed_trace(d, "trace-local-i662", AGENT, "gpt-real").await;
-        let local_row = dir.get_attestation(&local).await.unwrap().unwrap();
-        d.shift_asserted_at(&local, local_row.asserted_at + chrono::Duration::seconds(1))
-            .await;
-        let local_row = dir.get_attestation(&local).await.unwrap().unwrap();
-        assert!(
-            sp::refused_today(&local_row).is_some(),
-            "precondition: the class's tier clause is what keeps it out"
-        );
-        // The class scan reads every row, every tier, to the end.
-        let mut by_one = Vec::new();
-        sp::scan_attestations_paged(dir, 1, |r| by_one.push(r.attestation_id))
-            .await
-            .unwrap();
-        let mut whole = Vec::new();
-        sp::scan_attestations(dir, |r| whole.push(r.attestation_id))
-            .await
-            .unwrap();
-        assert_eq!(by_one, whole, "I662: the scan pages to the end");
-        assert!(legacy.iter().chain([&local]).all(|id| whole.contains(id)));
-        // Ruled (#1043, 2026-10-09): not a serve filter. Until purged, the
-        // rows are served like any other.
-        let served_before = served_ids(d).await;
-        for id in legacy.iter().chain([&good, &derived]) {
-            assert!(
-                served_before.contains(id),
-                "I662: {id} is served until it is purged"
-            );
-        }
-        // The class selects them, and the score derived from one follows.
-        let sel = PurgeSelection::RefusedToday;
-        let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
-        let mut expect: Vec<String> = legacy.iter().map(|l| format!("attestation:{l}")).collect();
-        expect.push(format!("attestation:{derived}"));
-        expect.sort();
-        assert_eq!(dry.sample, expect, "I662: withheld {:?}", dry.withheld);
-        assert_eq!(dry.record_count, 5);
-        assert_eq!(dry.counts.get("federation_attestations"), Some(&5));
-        assert_eq!(dry.counts.len(), 1, "I662: {:?}", dry.counts);
-        assert!(dry.withheld.is_empty(), "{:?}", dry.withheld);
-        assert_eq!(dry.selection_digest, sp::selection_digest(&expect));
-        assert_eq!(
-            served_ids(d).await,
-            served_before,
-            "I662: the dry run writes nothing"
-        );
-        // Executed on the quorum's notice, they stop being served; the row
-        // the class did not select still is.
-        let notice = notice_for(d, &r, &dry.notice_template, &[1, 2], t).await;
-        let report = rows_at(dir, &sel, &notice, &k(NODE), t)
-            .await
-            .expect("executes");
-        assert_eq!(report.tombstoned.get("attestation"), Some(&5));
-        let served = served_ids(d).await;
-        for id in legacy.iter().chain([&derived]) {
-            assert!(!served.contains(id), "I662: purged {id} is not served");
-        }
-        assert!(served.contains(&good), "I662: an unselected row still is");
     }
 
     // ── I664 ──────────────────────────────────────────────────────────────
@@ -4111,68 +4008,6 @@ pub(crate) mod bodies {
         );
     }
 
-    // ── I820 ──────────────────────────────────────────────────────────────
-    pub(crate) async fn i820_derivatives_leave_with_a_withheld_parent<D: Seams>(d: &D) {
-        let r = root(d).await;
-        let dir = d.as_dyn_directory();
-        let t = now();
-        // A refused-today accountability row (inadmissible) and a refused-
-        // today plain row (admissible).
-        let (parent_st, parent) = fed_statement(HARNESS, BYSTANDER, &mtr_dimension());
-        e2::put_statement(dir, &parent_st)
-            .await
-            .expect("the accountability row admits");
-        let plain = put_score(d, BYSTANDER, AGENT, &[]).await.attestation_id;
-        for id in [&parent, &plain] {
-            let row = dir.get_attestation(id).await.unwrap().unwrap();
-            d.shift_asserted_at(id, row.asserted_at + chrono::Duration::seconds(1))
-                .await;
-            let row = dir.get_attestation(id).await.unwrap().unwrap();
-            assert!(sp::refused_today(&row).is_some(), "precondition: {id}");
-        }
-        // A chain off each: score over the row, score over that score.
-        let s1 = put_score(d, SCORER, AGENT, &[&parent]).await.attestation_id;
-        let s2 = put_score(d, SCORER, AGENT, &[&s1]).await.attestation_id;
-        let p1 = put_score(d, SCORER, AGENT, &[&plain]).await.attestation_id;
-        let p2 = put_score(d, SCORER, AGENT, &[&p1]).await.attestation_id;
-
-        let sel = PurgeSelection::RefusedToday;
-        let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
-        let mut expect: Vec<String> = [&plain, &p1, &p2]
-            .iter()
-            .map(|id| format!("attestation:{id}"))
-            .collect();
-        expect.sort();
-        assert_eq!(
-            dry.sample, expect,
-            "I820: the chain off the withheld row leaves with it; withheld {:?}",
-            dry.withheld
-        );
-        let mut withheld: Vec<String> = dry.withheld.iter().map(|w| w.record_id.clone()).collect();
-        withheld.sort();
-        let mut expect_withheld: Vec<String> = [&parent, &s1, &s2]
-            .iter()
-            .map(|id| format!("attestation:{id}"))
-            .collect();
-        expect_withheld.sort();
-        assert_eq!(withheld, expect_withheld, "I820: {:?}", dry.withheld);
-        assert_eq!(dry.record_count, 3);
-        assert_eq!(
-            dry.selection_digest,
-            sp::selection_digest(&expect),
-            "I820: the digest is the reduced set's"
-        );
-        let notice = notice_for(d, &r, &dry.notice_template, &[0, 1], t).await;
-        let rep = rows_at(dir, &sel, &notice, &k(NODE), t)
-            .await
-            .expect("I820: the reduced selection executes");
-        assert_eq!(rep.record_count, 3);
-        let served = served_ids(d).await;
-        for id in [&parent, &s1, &s2] {
-            assert!(served.contains(id), "I820: withheld {id} is still served");
-        }
-    }
-
     // ── I821 ──────────────────────────────────────────────────────────────
     /// A quorum-cosigned bundle over `ids` (sorted here), with `derived_from`
     /// as given per id.
@@ -5025,11 +4860,6 @@ mod run {
                     b::i660_the_delete_doors_re_ask_the_tombstone(&d).await
                 }
                 #[tokio::test]
-                async fn i662() {
-                    let Some(d) = $fresh.await else { return };
-                    b::i662_refused_today_is_a_selection_not_a_filter(&d).await
-                }
-                #[tokio::test]
                 async fn i695() {
                     let Some(d) = $fresh.await else { return };
                     b::i695_the_header_and_its_tombstones_are_one_write(&d).await
@@ -5050,11 +4880,6 @@ mod run {
                 async fn i698() {
                     let Some(d) = $fresh.await else { return };
                     b::i698_run_kind_survives_the_manifest_form(&d).await
-                }
-                #[tokio::test]
-                async fn i820() {
-                    let Some(d) = $fresh.await else { return };
-                    b::i820_derivatives_leave_with_a_withheld_parent(&d).await
                 }
                 #[tokio::test]
                 async fn i821() {

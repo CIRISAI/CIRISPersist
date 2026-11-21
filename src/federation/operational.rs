@@ -496,9 +496,9 @@ pub mod test_support {
         pub fn threshold_sig(
             &self,
             bytes: &[u8],
-        ) -> ciris_verify_core::threshold::ThresholdSignature {
+        ) -> crate::federation::types::RetiredMemberPairSignature {
             let (ed, mldsa) = self.sign_bytes(bytes);
-            ciris_verify_core::threshold::ThresholdSignature {
+            crate::federation::types::RetiredMemberPairSignature {
                 member_id: self.key_id.clone(),
                 ed25519_signature_base64: ed,
                 mldsa65_signature_base64: Some(mldsa),
@@ -2239,6 +2239,11 @@ pub mod test_support {
     /// SELF-ENFORCING postcondition, as #536 asked: it returns `Err` unless
     /// `capability_roots_to_trusted_root(node, subject, scope)` then roots
     /// at this root.
+    ///
+    /// The subject is a PERSON's key: the grant carries the subject's voice
+    /// only (`confer_e2`). A `node` / `agent` subject's grant also waits for
+    /// its bound owner's voice (CC 4.4.3.19), which this helper does not
+    /// give; its postcondition then fails, naming the held grant's reason.
     pub async fn establish_e2_trust_root(
         directory: &dyn crate::federation::FederationDirectory,
         root_seed: &str,
@@ -2253,7 +2258,7 @@ pub mod test_support {
         })?;
         let r = stand_up_e2_root(directory, root_seed).await?;
         accept_e2_root(directory, &node, &r.root).await?;
-        confer_e2(directory, root_seed, subject_seed, &[scope]).await?;
+        let grant_row = confer_e2(directory, root_seed, subject_seed, &[scope]).await?;
         let subject = e2::kid(subject_seed);
         let grant = crate::federation::trust_root::capability_roots_to_trusted_root(
             directory, &node, &subject, scope,
@@ -2261,12 +2266,29 @@ pub mod test_support {
         .await?;
         match grant {
             Some(g) if g.root_key_id == r.root => Ok(r),
-            other => Err(crate::federation::Error::Backend(format!(
-                "establish_e2_trust_root postcondition NOT met: \
-                 capability_roots_to_trusted_root(node={node}, subject={subject}, \
-                 scope={scope}) = {other:?}, not the root {}",
-                r.root
-            ))),
+            other => {
+                // RT-fix1 — name WHY: a grant the fold holds confers nothing.
+                // The round-6 cluster (grant_supersede, I546) was a NODE
+                // subject: a machine key's bound owner is a required voice
+                // on a delegation to it (CC 4.4.3.19), and this helper voices
+                // the subject only. Such a caller binds the owner and adds
+                // its voice (`grant_supersede_invariants::bodies::
+                // root_conferring_on_a_node`), or confers through
+                // `admission::r2_test_support::confer_scope_from_trusted_root`.
+                let why = crate::federation::edition2::fold::why_held(directory, &grant_row)
+                    .await
+                    .ok()
+                    .flatten();
+                Err(crate::federation::Error::Backend(format!(
+                    "establish_e2_trust_root postcondition NOT met: \
+                     capability_roots_to_trusted_root(node={node}, subject={subject}, \
+                     scope={scope}) = {other:?}, not the root {}; the grant {} is held: {why:?} \
+                     (a `node` / `agent` subject needs its bound owner's voice on the grant, \
+                     CC 4.4.3.19)",
+                    r.root,
+                    grant_row.hex()
+                )))
+            }
         }
     }
 

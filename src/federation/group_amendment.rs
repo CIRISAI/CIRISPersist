@@ -589,22 +589,14 @@ where
         // v52.0.0 (#956) — leaving needs no quorum: the leaver's signature.
         Some((leaver, held)) => {
             super::family_dissolution::verify_self_leave_signature(
-                dir,
                 held,
                 &proof.change_envelope,
-                &proof.quorum_signatures,
                 leaver,
-            )
-            .await?;
+            )?;
         }
         None => {
-            dir.verify_membership_quorum(
-                offer.cohort,
-                offer.group_key_id,
-                &proof.change_envelope,
-                &proof.quorum_signatures,
-            )
-            .await?;
+            dir.verify_membership_quorum(offer.cohort, offer.group_key_id, &proof.change_envelope)
+                .await?;
         }
     }
     Ok(true)

@@ -18,6 +18,23 @@
 //! - I3039 (a seat): a seat's own later bind carrying another transit key
 //!   is held but not resolved: the seat's keys are the genesis bundle's
 //!   (W1's rule), and the bind resolver gives nothing for a seat.
+//!
+//! **I2110–I2113** (SR-fix1; CC 3.3.6.2): a seat's dial address after a
+//! genesis import, on sqlite and postgres. CIRISEdge dials a seat from
+//! `list_transport_destinations_for(<the seat's identity reference>)`.
+//!
+//! - I2110 (reads back): after the import, every seat of the bundle in force
+//!   has exactly one live route, at its own identity reference, whose
+//!   destination is the lowercase hex of the `destination_hash` its named
+//!   binding states.
+//! - I2111 (re-offer restores): with a seat's route row gone (the projection
+//!   runs after the bundle's commit, so a failure or a crash there leaves the
+//!   bundle held and no route), offering the same bundle again projects it.
+//! - I2112 (no regress): a re-offer does not replace a newer route held at
+//!   the seat's key.
+//! - I2113 (the occurrence door): the same holds for a bind landed through
+//!   the statement door: its route row gone, the same statement put again
+//!   projects it.
 
 use ciris_crypto::composite::CompositeSigningKey;
 use ciris_verify_core::cde::Value;
@@ -433,6 +450,253 @@ async fn seat_body(d: &dyn FederationDirectory) {
         XWingPublicKey::from_bytes(&seat.onion_hop_xwing_pubkey),
         "I3039: a seat's hop key is its bundle binding's"
     );
+}
+
+/// The `destination_hash` a binding statement states in its
+/// `transport_destination`, read from the statement's own bytes.
+fn stated_destination_hash(statement: &[u8]) -> Vec<u8> {
+    let Value::Tag(18, inner) = ciris_verify_core::cde::decode(statement).unwrap() else {
+        panic!("a row statement is a COSE_Sign1");
+    };
+    let parts = inner.as_array().expect("a COSE_Sign1 is an array");
+    let payload =
+        ciris_verify_core::cde::decode(parts[2].as_bytes().expect("its payload is bytes")).unwrap();
+    payload
+        .get_text("transport_destination")
+        .and_then(|td| td.get_text("destination_hash"))
+        .and_then(Value::as_bytes)
+        .expect("the binding states a destination hash")
+        .to_vec()
+}
+
+/// I2110–I2112 on one backend: a seat's dial address after a genesis import
+/// (the fixture's dates are the bundle's own window).
+async fn seat_route_body(d: &dyn FederationDirectory) {
+    use super::fixture_genesis::{bundle_v2, install_v2};
+    use super::genesis::{genesis_in_force, put_genesis_bundle};
+    use crate::federation::self_at_login::TransportDestination;
+    use crate::federation::types::OccurrenceTransportBinding;
+    install_v2(d).await.unwrap();
+    let c = bundle_v2();
+    // Each seat of the bundle in force, with the destination its named
+    // binding states.
+    let in_force = genesis_in_force(d).await.unwrap();
+    let seats: Vec<(String, String)> = in_force
+        .seats()
+        .iter()
+        .map(|placed| {
+            let minted = c
+                .seats
+                .iter()
+                .find(|s| s.binding.row_id == placed.binding)
+                .expect("I2110: the placed seat's binding is the fixture's");
+            (
+                placed.identity_ref.clone(),
+                hex::encode(stated_destination_hash(&minted.binding.statement)),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seats.len(),
+        c.seats.len(),
+        "I2110: every minted seat is a seat of the bundle in force"
+    );
+    assert!(!seats.is_empty(), "I2110: the bundle seats a serve node");
+
+    // I2110: one live route per seat, at its identity reference, to the
+    // destination its binding states.
+    let mut projected: Vec<TransportDestination> = Vec::new();
+    for (seat, destination) in &seats {
+        let routes = d.list_transport_destinations_for(seat).await.unwrap();
+        assert_eq!(
+            routes.len(),
+            1,
+            "I2110: a seat has exactly one live route after the import: {routes:?}"
+        );
+        let r = &routes[0];
+        assert_eq!(&r.occurrence_key_id, seat, "I2110: at the seat's key");
+        assert_eq!(
+            r.transport_kind,
+            OccurrenceTransportBinding::TRANSPORT_KIND,
+            "I2110: a Reticulum route"
+        );
+        assert_eq!(
+            &r.destination, destination,
+            "I2110: the destination is the hex of the binding's destination_hash"
+        );
+        assert!(r.retired_at.is_none(), "I2110: the route is live");
+        projected.push(r.clone());
+    }
+
+    let mut statements: Vec<Vec<u8>> = c
+        .rows_in_put_order()
+        .into_iter()
+        .map(|r| r.statement.clone())
+        .collect();
+    statements.extend(c.voices.iter().cloned());
+    let anchor = c.anchor();
+
+    // I2111: every seat's route row gone (the missed projection), then the
+    // same bundle offered again.
+    for (seat, destination) in &seats {
+        assert!(
+            d.remove_transport_destination(
+                seat,
+                OccurrenceTransportBinding::TRANSPORT_KIND,
+                destination
+            )
+            .await
+            .unwrap(),
+            "I2111: the route row is removed"
+        );
+        assert!(
+            d.list_transport_destinations_for(seat)
+                .await
+                .unwrap()
+                .is_empty(),
+            "I2111: the control: no route is held"
+        );
+    }
+    Box::pin(put_genesis_bundle(d, &statements, Some(&anchor)))
+        .await
+        .expect("I2111: the held bundle offered again is not refused");
+    for ((seat, _), was) in seats.iter().zip(&projected) {
+        assert_eq!(
+            d.list_transport_destinations_for(seat).await.unwrap(),
+            vec![was.clone()],
+            "I2111: the re-offer projects the missing route again"
+        );
+    }
+
+    // I2112: a newer route at the first seat's key (one second after the
+    // binding's own instant) is not replaced by a further re-offer.
+    let (seat, _) = &seats[0];
+    let newer = TransportDestination {
+        destination: hex::encode([0xcd_u8; 16]),
+        asserted_at: projected[0].asserted_at + chrono::Duration::seconds(1),
+        ..projected[0].clone()
+    };
+    d.put_transport_destination(&newer).await.unwrap();
+    assert_eq!(
+        d.list_transport_destinations_for(seat).await.unwrap(),
+        vec![newer.clone()],
+        "I2112: the control: the newer route is the seat's route"
+    );
+    Box::pin(put_genesis_bundle(d, &statements, Some(&anchor)))
+        .await
+        .expect("I2112: the held bundle offered again is not refused");
+    assert_eq!(
+        d.list_transport_destinations_for(seat).await.unwrap(),
+        vec![newer],
+        "I2112: a re-offer does not replace a newer route"
+    );
+    for ((other, _), was) in seats.iter().zip(&projected).skip(1) {
+        assert_eq!(
+            d.list_transport_destinations_for(other).await.unwrap(),
+            vec![was.clone()],
+            "I2112: the other seats keep their routes"
+        );
+    }
+}
+
+/// I2113 on one backend: a node's own bind landed through the statement
+/// door; its route row gone, the same statement put again projects it. The
+/// dates are the standard ceremony's window (`t0`: the record's start; the
+/// bind half a day later, in the past).
+async fn reput_route_body(d: &dyn FederationDirectory) {
+    use super::fixture_genesis::{CeremonySpec, DAY_MS, YEAR_MS};
+    use crate::federation::types::OccurrenceTransportBinding;
+    let t0 = CeremonySpec::standard().t0_ms;
+    let node = key(116);
+    let n = iref(&node);
+    put(d, &key_record(&node, &["node"], t0, Some(t0 + YEAR_MS))).await;
+    let st = bind_with(
+        d,
+        &node,
+        &n,
+        &n,
+        &n,
+        "server",
+        t0 + DAY_MS / 2,
+        None,
+        vec![
+            ("transport_destination", transport(13, 14)),
+            ("transit_xwing_pubkey", Value::Bytes(vec![15u8; 1216])),
+            ("onion_hop_xwing_pubkey", Value::Bytes(vec![16u8; 1216])),
+        ],
+    )
+    .await;
+    assert!(
+        matches!(put(d, &st).await, StatementOutcome::Row { .. }),
+        "I2113: the node's own bind lands"
+    );
+    let before = d.list_transport_destinations_for(&n).await.unwrap();
+    assert_eq!(
+        before.len(),
+        1,
+        "I2113: the bind projects one route: {before:?}"
+    );
+    assert!(
+        d.remove_transport_destination(
+            &n,
+            OccurrenceTransportBinding::TRANSPORT_KIND,
+            &before[0].destination
+        )
+        .await
+        .unwrap(),
+        "I2113: the route row is removed"
+    );
+    assert!(
+        d.list_transport_destinations_for(&n)
+            .await
+            .unwrap()
+            .is_empty(),
+        "I2113: the control: no route is held"
+    );
+    assert!(
+        matches!(put(d, &st).await, StatementOutcome::Row { .. }),
+        "I2113: the same statement put again is the landed row"
+    );
+    assert_eq!(
+        d.list_transport_destinations_for(&n).await.unwrap(),
+        before,
+        "I2113: the re-put projects the missing route again"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2110_to_i2113_seat_route_sqlite() {
+    use crate::store::Backend as _;
+    for which in 0..2 {
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        match which {
+            0 => Box::pin(seat_route_body(&b)).await,
+            _ => Box::pin(reput_route_body(&b)).await,
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2110_to_i2113_seat_route_postgres() {
+    use crate::store::Backend as _;
+    for which in 0..2 {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        match which {
+            0 => Box::pin(seat_route_body(&b)).await,
+            _ => Box::pin(reput_route_body(&b)).await,
+        }
+    }
 }
 
 #[cfg(feature = "sqlite")]

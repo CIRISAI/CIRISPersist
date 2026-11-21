@@ -277,11 +277,12 @@ mod tests {
         let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
             crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
         );
-        let engine = crate::Engine::from_shared_with_local(
+        let engine = crate::Engine::try_from_shared_with_local(
             crate::engine::BackendDispatch::Sqlite(backend.clone()),
             signer,
             Some(local.clone()),
-        );
+        )
+        .expect("a shared engine view: no node_key_conflict");
 
         let node_key = local.federation_id().await;
 
@@ -878,11 +879,12 @@ mod tests {
         let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
             crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
         );
-        let engine = crate::Engine::from_shared_with_local(
+        let engine = crate::Engine::try_from_shared_with_local(
             crate::engine::BackendDispatch::Sqlite(backend.clone()),
             signer,
             Some(local.clone()),
-        );
+        )
+        .expect("a shared engine view: no node_key_conflict");
         // v62.0.0 — the node's key is an edition-2 `key:record`; its id is the
         // identity-ref.
         let node = engine

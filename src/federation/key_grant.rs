@@ -2452,67 +2452,26 @@ pub async fn publish_signed_content_only_occurrence<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    // v62.0.0 (v62 P8) — the `LocalSelfSigner` JCS envelope is the earlier
-    // form: it exists only while the earlier-form doors are open. The
-    // edition-2 producer is `edition2::occurrence::publish_bind`.
+    // v62.0.0 (v62 P8; BH-fix3) — the JCS envelope this produced was signed
+    // with a SEPARATE Ed25519 + ML-DSA-65 pair (Verify's
+    // `produce_signed_identity_occurrence` over a `SelfSigner`): the earlier
+    // form, refused at every door. Its producer is deleted with the
+    // `LocalSelfSigner` adapter; the edition-2 producer is
+    // `edition2::occurrence::publish_bind` (`publish_self_occurrence`).
     super::edition2::door::refuse_earlier_form("identity_occurrence")?;
-    let me = signer.federation_id().await;
-    // Millisecond-exact: the envelope carries the millisecond rendering and
-    // the gate requires the typed instant to carry nothing below it.
-    let asserted_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
-        crate::host::clock::now().timestamp_millis(),
-    )
-    .unwrap_or_else(chrono::Utc::now);
-    // v44.5.0 (#855, §21.2) — `valid_until` is one more bound member, carried
-    // exactly as `asserted_at` is: truncated to the millisecond BEFORE
-    // signing, because the gate compares the typed instant to the envelope's
-    // millisecond rendering and a caller-supplied instant with finer
-    // precision would sign one thing and store another.
-    let valid_until = valid_until.map(|t| {
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis()).unwrap_or(t)
-    });
-    let valid_until_json = valid_until.map_or(serde_json::Value::Null, |t| {
-        serde_json::Value::String(t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-    });
-    let envelope = serde_json::json!({
-        "attesting_key_id": me,
-        "identity_key_id": identity_key_id,
-        "occurrence_key_id": occurrence_key_id,
-        "device_class": device_class,
-        "encryption_pubkeys": {
-            "x25519_base64": enc.x25519_base64,
-            "ml_kem_768_base64": enc.ml_kem_768_base64,
-        },
-        "asserted_at": asserted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        "valid_until": valid_until_json,
-        "hardware_attestation": hardware_attestation
-            .map_or(serde_json::Value::Null, |h| serde_json::Value::String(h.to_owned())),
-    });
-    let (signed_envelope, signature) =
-        ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
-            &crate::signing::LocalSelfSigner::new(signer),
-            envelope,
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("publish_self_occurrence: sign: {e}")))?;
-    let signed = crate::federation::SignedIdentityOccurrence {
-        identity_occurrence: crate::federation::IdentityOccurrence {
-            identity_key_id: identity_key_id.to_owned(),
-            occurrence_key_id: occurrence_key_id.to_owned(),
-            device_class: device_class.to_owned(),
-            hardware_attestation: hardware_attestation.map(str::to_owned),
-            asserted_at,
-            valid_until,
-            encryption_pubkeys: Some(enc),
-            transport_binding: None,
-            persist_row_hash: String::new(),
-        },
-        attesting_key_id: me,
-        signed_envelope,
-        signature,
-    };
-    backend.put_identity_occurrence(signed.clone()).await?;
-    Ok(signed)
+    let _ = (
+        backend,
+        signer,
+        identity_key_id,
+        occurrence_key_id,
+        device_class,
+        hardware_attestation,
+        enc,
+        valid_until,
+    );
+    Err(super::edition2::door::earlier_form_signature(
+        "identity_occurrence",
+    ))
 }
 
 /// §14 (V146, PR #850 review) — **the emission ledger: stamp the axis as

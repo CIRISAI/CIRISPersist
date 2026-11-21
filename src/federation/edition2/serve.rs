@@ -194,11 +194,11 @@ where
     match (placement, requester) {
         (Some(cs::Placement::Commons), _) => Ok(true),
         (None, _) | (Some(_), None) => Ok(false),
-        (Some(_), Some(peer)) => {
+        (Some(placement), Some(peer)) => {
             let target =
                 crate::federation::admission::envelope_cohort_target(&row.attestation_envelope)
                     .unwrap_or(None);
-            crate::federation::replication::hold::is_audience(
+            if crate::federation::replication::hold::is_audience(
                 dir,
                 &row.cohort_scope,
                 target,
@@ -206,9 +206,68 @@ where
                 |author| author == peer,
                 peer,
             )
-            .await
+            .await?
+            {
+                return Ok(true);
+            }
+            // v62.0.0 (LF-fix1; CC 5.4.6 / 3.2, CIRISEdge#761,
+            // CIRISPersist#1063) — a PUBLIC group's rows fan out to everyone
+            // ([`public_group_serves`]). Asked last, so a requester already
+            // in the audience pays no further read.
+            public_group_serves(dir, &row, placement, target, peer).await
         }
     }
+}
+
+/// v62.0.0 (LF-fix1; CC 5.4.6 / 3.2, CIRISEdge#761, CIRISPersist#1063) —
+/// **a typed row targeted at a PUBLIC group, and a requester outside its
+/// roster.** A public group's rows fan out to everyone: an authorized
+/// `infrastructure` community, a held `public` room, the accord family, a
+/// conferring family
+/// ([`is_public_group`](crate::federation::replication_audience::is_public_group),
+/// the ONE predicate the tier decisions ask). The send-set rule has this arm
+/// (`replication_audience::audience_nodes`: `Targeted(_) if is_public_group`
+/// is `Everyone`); the filtered serve asked only `hold::is_audience`, which
+/// is the requester's own MEMBERSHIPS. So a public room's rows were served to
+/// its members alone, and the row a non-member needs in order to join — the
+/// founder's subjectless standing proposal (`open:self_admit`,
+/// CIRISPersist#1063) — never left the member's node: `may_receive` said yes
+/// and the serve feed said no.
+///
+/// Decided by the send-set rule itself
+/// ([`may_receive`](crate::federation::replication_audience::may_receive)),
+/// so its carve-outs hold here as they do there: a cosign row reaches the
+/// group's active members only, a key-grant row its one recipient, an
+/// owner's grant FOR a node that node. A self, commons or untargeted row, and
+/// a group that is not public, is `false` (the audience rule above was the
+/// whole answer).
+///
+/// # Errors
+/// Directory reads.
+async fn public_group_serves<F>(
+    dir: &F,
+    row: &crate::federation::types::Attestation,
+    placement: cs::Placement,
+    target: Option<&str>,
+    peer: &str,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let (cs::Placement::Targeted(_), Some(group)) = (placement, target.filter(|t| !t.is_empty()))
+    else {
+        return Ok(false);
+    };
+    if !crate::federation::replication_audience::is_public_group(dir, group).await? {
+        return Ok(false);
+    }
+    Ok(
+        Box::pin(crate::federation::replication_audience::may_receive(
+            dir, peer, row,
+        ))
+        .await?
+        .allowed(),
+    )
 }
 
 /// **The filtered serve listing**: the statements after `cursor`, in this

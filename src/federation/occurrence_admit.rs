@@ -265,13 +265,58 @@ pub(crate) fn plan_edition2_occurrence(
     Ok((planned, route))
 }
 
-/// v62.0.0 (wave O1) — **what follows an edition-2 bind's commit**, never
-/// inside a transaction: when the upsert `applied`, the route projection
-/// and the owner's epoch re-wrap (`identity != occurrence` only; a genesis
-/// seat's self pair has none).
+/// v62.0.0 (SR-fix1) — **does the held occurrence of the pair project
+/// exactly `route`?** The row held under `(identity, occurrence)` carries a
+/// transport binding whose projection at the row's own `asserted_at` equals
+/// `route` in every member, and the row is inside its half-open window now
+/// (the write-side rule of [`plan_occurrence`]). A held row that is newer or
+/// carries another binding projects another route and answers `false`: a
+/// stale offer re-projects nothing.
 ///
 /// # Errors
-/// The route projection's write.
+/// The directory read.
+async fn held_occurrence_projects<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    identity: &str,
+    occurrence: &str,
+    route: &ProjectedRoute,
+) -> Result<bool, Error> {
+    let now = crate::host::clock::now();
+    Ok(dir
+        .list_identity_occurrences_by_occurrence_key(occurrence)
+        .await?
+        .iter()
+        .filter(|o| o.identity_key_id == identity)
+        .any(|o| {
+            o.valid_until.is_none_or(|u| now < u)
+                && o.transport_binding.as_ref().is_some_and(|tb| {
+                    tb.project_route(&o.occurrence_key_id, o.asserted_at)
+                        .is_ok_and(|p| p == *route)
+                })
+        }))
+}
+
+/// v62.0.0 (wave O1) — **what follows an edition-2 bind's commit**, never
+/// inside a transaction: the route projection, and when the upsert
+/// `applied` the owner's epoch re-wrap (`identity != occurrence` only; a
+/// genesis seat's self pair has none).
+///
+/// v62.0.0 (SR-fix1; I2111, I2113) — the route is projected when the upsert
+/// `applied`, and also when it did not apply but the HELD occurrence of the
+/// pair projects exactly this route ([`held_occurrence_projects`]). The
+/// projection runs after the commit, so a failure or a crash between the two
+/// leaves the occurrence held with no route; the same statement offered
+/// again does not apply (the upsert takes a strictly newer record only), and
+/// before this fix nothing projected its route again. The projection is the
+/// route table's monotonic upsert (`put_transport_destination`: a write
+/// applies only at a strictly newer `(epoch, asserted_at)`), so repeating it
+/// over a held route changes nothing and it never replaces a newer route
+/// (I2112). The agent-key and ended-window skips are unchanged
+/// ([`super::transport_routes::project_occurrence_route`],
+/// [`plan_occurrence`]).
+///
+/// # Errors
+/// The held occurrence's read; the route projection's write.
 pub(crate) async fn after_edition2_occurrence<D: FederationDirectory + ?Sized>(
     dir: &D,
     applied: bool,
@@ -279,13 +324,12 @@ pub(crate) async fn after_edition2_occurrence<D: FederationDirectory + ?Sized>(
     occurrence: &str,
     route: Option<&ProjectedRoute>,
 ) -> Result<(), Error> {
-    if !applied {
-        return Ok(());
-    }
     if let Some(route) = route {
-        super::transport_routes::project_occurrence_route(dir, route).await?;
+        if applied || held_occurrence_projects(dir, identity, occurrence, route).await? {
+            super::transport_routes::project_occurrence_route(dir, route).await?;
+        }
     }
-    if identity != occurrence {
+    if applied && identity != occurrence {
         super::rewrap_after_admission(dir, identity, occurrence).await;
     }
     Ok(())

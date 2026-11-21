@@ -764,9 +764,8 @@ impl OccurrenceBind {
 /// authority is the `ceg_statement` its `signed_envelope` carries; a
 /// consumer verifies that statement, never this value.
 #[must_use]
-pub fn edition2_signature_placeholder(
-) -> ciris_verify_core::transport_binding::TransportBindingSignature {
-    ciris_verify_core::transport_binding::TransportBindingSignature {
+pub fn edition2_signature_placeholder() -> crate::federation::types::RetiredPairSignature {
+    crate::federation::types::RetiredPairSignature {
         ed25519_signature_base64: String::new(),
         mldsa65_signature_base64: None,
     }

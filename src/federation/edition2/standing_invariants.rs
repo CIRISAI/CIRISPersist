@@ -229,6 +229,21 @@ pub(crate) async fn conferred_detector_body(d: &dyn FederationDirectory) {
             .unwrap()
             .map(|h| (h.reason, h.detail))
     );
+    // RT-fix1 — and it reaches the root through THIS node (the K2-fix13
+    // pattern): a conferral that roots nowhere stops at the fixture.
+    let rooted = crate::federation::trust_root::capability_roots_to_trusted_root(
+        d,
+        &e2::kid(node),
+        &e2::kid(det),
+        crate::federation::types::delegation_scope::INFRA_DETECT,
+    )
+    .await
+    .expect("I3081: capability_roots_to_trusted_root");
+    assert!(
+        rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
+        "I3081: the detector's infra:detect roots at {} through this node: {rooted:?}",
+        r.root
+    );
     let instant = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
         i64::try_from(at + 60_000).expect("I3081: an instant"),
     )

@@ -2736,76 +2736,6 @@ impl SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(e.to_string()))
     }
 
-    /// v54.1.0 (CIRISPersist#1043) — TEST SEAM: reproduce a legacy row the
-    /// apply door refuses today (#598 "typed asserted_at diverges from the
-    /// signed envelope"): move the typed `asserted_at` column off the signed
-    /// instant. Nothing else moves.
-    #[cfg(any(test, feature = "test-anchor"))]
-    pub async fn test_seam_set_attestation_asserted_at(
-        &self,
-        attestation_id: &str,
-        asserted_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), crate::federation::Error> {
-        let id = attestation_id.to_owned();
-        let at = asserted_at.to_rfc3339();
-        self.write(move |conn| {
-            conn.execute(
-                "UPDATE federation_attestations SET asserted_at = ?2 WHERE attestation_id = ?1",
-                rusqlite::params![id, at],
-            )
-        })
-        .await
-        .map(|_| ())
-        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
-    }
-
-    /// v55.0.0 (CIRISPersist#989) — TEST SEAM: reproduce a row of a type no
-    /// door admits today (a retired `holds_bytes` carrier a node still holds):
-    /// rewrite the typed `attestation_type` column and, when given, the stored
-    /// envelope (the rc6 shape). Nothing else moves.
-    #[cfg(any(test, feature = "test-anchor"))]
-    pub async fn test_seam_set_attestation_type(
-        &self,
-        attestation_id: &str,
-        attestation_type: &str,
-        envelope: Option<&serde_json::Value>,
-    ) -> Result<(), crate::federation::Error> {
-        let id = attestation_id.to_owned();
-        let ty = attestation_type.to_owned();
-        let env = envelope.map(serde_json::Value::to_string);
-        self.write(move |conn| {
-            conn.execute(
-                "UPDATE federation_attestations SET attestation_type = ?2, \
-                 attestation_envelope = COALESCE(?3, attestation_envelope) \
-                 WHERE attestation_id = ?1",
-                rusqlite::params![id, ty, env],
-            )
-        })
-        .await
-        .map(|_| ())
-        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
-    }
-
-    /// v54.0.0 (CIRISPersist#995 row 2) — TEST SEAM: reproduce what a
-    /// pre-v53.1.4 UPDATE door left behind: `additional_scrubs` emptied while
-    /// `persist_row_hash` still binds the full record. Nothing else moves.
-    #[cfg(any(test, feature = "test-anchor"))]
-    pub async fn test_seam_drop_key_additional_scrubs(
-        &self,
-        key_id: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let k = key_id.to_owned();
-        self.write(move |conn| {
-            conn.execute(
-                "UPDATE federation_keys SET additional_scrubs = '[]' WHERE key_id = ?1",
-                rusqlite::params![k],
-            )
-        })
-        .await
-        .map(|_| ())
-        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
-    }
-
     /// v13.0.0 (CIRISPersist#372) — enumerate the **canonical / founding
     /// bootstrap servers**, stable-sorted by `key_id`.
     ///
@@ -17538,7 +17468,7 @@ fn sqlite_row_to_signed_transport_destination(
     };
     let signed_envelope: serde_json::Value =
         serde_json::from_str(&signed_envelope_json).map_err(json_err(11))?;
-    let signature: ciris_verify_core::transport_binding::TransportBindingSignature =
+    let signature: crate::federation::types::RetiredPairSignature =
         serde_json::from_str(&signature_json).map_err(json_err(12))?;
     Ok(crate::federation::SignedTransportDestination {
         transport_destination,
@@ -17592,7 +17522,7 @@ fn sqlite_row_to_signed_touch_claim(
     };
     let signed_envelope: serde_json::Value =
         serde_json::from_str(&signed_envelope_json).map_err(json_err(5))?;
-    let signature: ciris_verify_core::transport_binding::TransportBindingSignature =
+    let signature: crate::federation::types::RetiredPairSignature =
         serde_json::from_str(&signature_json).map_err(json_err(6))?;
     Ok(crate::federation::types::SignedTouchClaim {
         target_key_id: row.get(0)?,
@@ -17683,11 +17613,10 @@ fn sqlite_row_to_signed_identity_occurrence(
     };
     let signed_envelope: serde_json::Value =
         serde_json::from_str(&signed_envelope_json).map_err(json_err)?;
-    let signature: ciris_verify_core::transport_binding::TransportBindingSignature =
-        match signature_json {
-            Some(j) => serde_json::from_str(&j).map_err(json_err)?,
-            None => crate::federation::edition2::occurrence::edition2_signature_placeholder(),
-        };
+    let signature: crate::federation::types::RetiredPairSignature = match signature_json {
+        Some(j) => serde_json::from_str(&j).map_err(json_err)?,
+        None => crate::federation::edition2::occurrence::edition2_signature_placeholder(),
+    };
     Ok(crate::federation::SignedIdentityOccurrence {
         identity_occurrence,
         attesting_key_id,
@@ -46956,7 +46885,12 @@ mod tests {
     async fn content_class_flag_plane_sqlite() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        backend.set_node_key_id("cc-node-sq");
+        // RT-fix1: the node's identity-ref (the conferral walk asks as the
+        // backend's node key, and the accepts edge is signed by that key),
+        // never the bare seed text.
+        backend.set_node_key_id(crate::federation::edition2::fixture_switch::kid(
+            "cc-node-sq",
+        ));
         crate::federation::content_class::parity_test_support::assert_content_class_flag_plane(
             &backend,
             "cc-node-sq",
@@ -48588,47 +48522,9 @@ mod tests {
         .await;
     }
 
-    // ── freshness_floor (CIRISPersist#519 item 2a-iii) witnesses ────
-
-    /// The anti-rollback matrix: T1 inserts, T2>T1 advances, T0<T1 is a
-    /// no-op that does not clobber T2, and a byte-identical re-put of T2 is
-    /// also a no-op (strict `>` guard — equal never wins).
-    #[tokio::test]
-    async fn touch_claim_monotonic_max_only_advances() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        crate::federation::freshness::test_support::run_monotonic_max_matrix(
-            &backend,
-            "sqlite-touch-max",
-        )
-        .await;
-    }
-
-    /// A `fresh_as_of` more than [`crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW`]
-    /// ahead of `now()` is rejected — a lying clock cannot jump the floor
-    /// into the future.
-    #[tokio::test]
-    async fn touch_claim_rejects_future_beyond_skew() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        crate::federation::freshness::test_support::run_future_skew_rejection(
-            &backend,
-            "sqlite-touch-skew",
-        )
-        .await;
-    }
-
-    /// An invalid `cohort_scope` is rejected — the MANDATORY privacy row.
-    #[tokio::test]
-    async fn touch_claim_cohort_scope_validated() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        crate::federation::freshness::test_support::run_cohort_scope_validation(
-            &backend,
-            "sqlite-touch-cohort",
-        )
-        .await;
-    }
+    // v62.0.0 (BH-fix3) — the freshness-floor touch-claim witnesses are deleted:
+    // they asserted the earlier-form signed touch claim (a separate Ed25519 +
+    // ML-DSA-65 pair) lands; its door refuses the earlier form.
 
     /// #446 — the occurrence→route composite-projection matrix on sqlite.
     /// Shares the assertion body with the memory + pg parity tests.

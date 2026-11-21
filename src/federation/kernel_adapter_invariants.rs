@@ -135,23 +135,29 @@ pub(crate) mod bodies {
         s: &str,
     ) {
         use crate::federation::accord_test_support as ops;
-        use crate::federation::trust_root::{trust_root_valid, INFRA_SERVE_SCOPE};
-        let (user, root, subject) = (
-            format!("i1842-user-{s}"),
-            format!("i1842-root-{s}"),
-            format!("i1842-subject-{s}"),
-        );
-        for k in [&user, &subject] {
-            e2::put_key(d, k, &[identity_type::NODE]).await;
-        }
-        ops::establish_trust_root(d, &user, &root, &subject, INFRA_SERVE_SCOPE)
+        use crate::federation::trust_root::trust_root_valid;
+        let (user, root) = (format!("i1842-user-{s}"), format!("i1842-root-{s}"));
+        e2::put_key(d, &user, &[identity_type::NODE]).await;
+        // RT-fix1 — PORTED to an edition-2 trust root (E9's twins, as E5 ported
+        // `trust_root_walk_and_tombstone_481`). The earlier-form
+        // `establish_trust_root` puts JSON key records and a hand-chartered
+        // KEY root: its door is shut (`earlier_form_object`), and a key-arm
+        // root is never valid under edition 2 (its holder's custody evidence,
+        // CC 4.2.2.1). The root is founded by the bundle's holders and
+        // chartered (`stand_up_e2_root`); the user's own `trust:accepts` edge
+        // is the edge leg this witness reads. The subject and its conferral
+        // were never read here.
+        let r = ops::stand_up_e2_root(d, &root)
             .await
-            .expect("I1842: establish the root");
+            .expect("I1842: the root stands up and charters itself");
+        ops::accept_e2_root(d, &user, &r.root)
+            .await
+            .expect("I1842: the user's acceptance edge");
         // v62 (E4): the store names each key by its identity-ref.
-        let (user_s, user, root) = (user.clone(), e2::kid(&user), e2::kid(&root));
+        let (user_s, user, root) = (user.clone(), e2::kid(&user), r.root.clone());
         let v = trust_root_valid(d, &user, &root).await.expect("verdict");
         assert!(v.edge_exists, "I1842: the user's acceptance edge is live");
-        assert!(v.valid, "I1842: a valid key root");
+        assert!(v.valid, "I1842: a valid root: {v:?}");
         let edge = d
             .list_attestations_by(&user)
             .await

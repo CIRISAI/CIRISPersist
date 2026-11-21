@@ -54,6 +54,10 @@
 //!    load-bearing half: a replicated decision that is trusted rather than
 //!    re-derived is worse than no replication, because it looks like
 //!    evidence.*
+//!
+//!    v62.0.0 (BH-fix2): the re-tally is DELETED (it verified separate
+//!    Ed25519 + ML-DSA-65 pairs); every bundle is refused, since the
+//!    records it carried are retired (CC rc20).
 //! 3. The receiver then **re-derives its own** V104/V095 projection
 //!    ([`project_role_withdrawals_for_proposal`]) by recomputing candidate
 //!    payload digests over its OWN key directory and re-running the #377
@@ -74,7 +78,6 @@
 //! — never one the sender supplies.
 
 use ciris_verify_core::accord_live_quorum::{AccordParticipation, AccordProposal};
-use ciris_verify_core::threshold::ThresholdMember;
 
 use super::admission::{
     accord_holder_roster, canonical_withdrawal_payload_sha256, op_withdraw_role,
@@ -235,35 +238,6 @@ pub enum AccordAdmissionEffect {
     Duplicate,
 }
 
-/// The strict-majority destructive threshold for a roster of `n` holders —
-/// the SAME derivation
-/// [`verify_canonical_authority_over_roster`](super::admission::verify_canonical_withdraw_authority)
-/// uses (`QuorumPolicy::new(n / 2 + 1, n)`, CIRISPersist#383), so the receive
-/// gate and the local destructive ops cannot drift apart.
-fn strict_majority_policy(n: usize) -> ciris_verify_core::threshold::QuorumPolicy {
-    ciris_verify_core::threshold::QuorumPolicy::new(super::admission::accord_threshold(n), n)
-}
-
-/// Resolve `roster_key_ids` to their PINNED directory pubkeys — never
-/// caller-supplied key material. Mirrors step (3) of the #377 authority core.
-async fn roster_from_own_directory(
-    directory: &dyn FederationDirectory,
-    roster_key_ids: &[String],
-) -> Result<Vec<ThresholdMember>, Error> {
-    let mut roster: Vec<ThresholdMember> = Vec::with_capacity(roster_key_ids.len());
-    for kid in roster_key_ids {
-        if let Some(rec) = directory.lookup_public_key(kid).await? {
-            roster.push(ThresholdMember {
-                member_id: rec.key_id,
-                ed25519_public_key_base64: rec.pubkey_ed25519_base64,
-                mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64,
-                role: None,
-            });
-        }
-    }
-    Ok(roster)
-}
-
 /// v31.1.0 (CIRISPersist#662) — **admit a replicated accord evidence bundle
 /// by re-deriving its quorum, against the production accord-holder roster.**
 /// See [`admit_replicated_accord_evidence_over_roster`].
@@ -301,18 +275,13 @@ pub async fn admit_replicated_accord_evidence(
 ///    verified and before the roster is resolved. No legitimate serve side
 ///    can produce such a bundle, and the refusal names the carrier rather
 ///    than the evidence.
-/// 2. Roster resolution: `roster_key_ids` → PINNED pubkeys from OUR
-///    `federation_keys`. Sender-supplied key material is unrepresentable.
-/// 3. **The re-tally.** `tally_live_quorum(&proposal, &participations,
-///    &roster)` re-verifies every participation's hybrid signature, its
-///    binding to THIS proposal digest, and its seat in the pinned roster,
-///    then dedups by member. `tally.yes` must clear
-///    [`strict_majority_policy`]. The sender's `authority_signature` and any
-///    `AccordDecision.authorized` bool are NOT consulted — they are not
-///    inputs to this function at all.
-/// 4. v62.0.0 (JSON-cut slice F; CC rc20): nothing lands. The proposal,
+/// 2. v62.0.0 (BH-fix2; RULINGS "composite signatures only") — the roster
+///    resolution and the re-tally (`tally_live_quorum`, which verified each
+///    participation's separate Ed25519 + ML-DSA-65 pair) are DELETED. The
+///    records they counted are retired, and v62 verifies no separate pair.
+/// 3. v62.0.0 (JSON-cut slice F; CC rc20): nothing lands. The proposal,
 ///    participation and decision records have no write door in this edition,
-///    so a bundle that clears steps 0–3 is refused
+///    so a bundle that clears steps 0–1b is refused
 ///    ([`Error::AccordEvidenceUnverified`]) and projects nothing.
 ///
 /// # On step 4's nonce
@@ -328,8 +297,6 @@ pub async fn admit_replicated_accord_evidence_over_roster(
     evidence: &AccordQuorumEvidence,
     roster_key_ids: &[String],
 ) -> Result<AccordEvidenceAdmission, Error> {
-    use ciris_verify_core::accord_live_quorum::tally_live_quorum;
-
     let proposal_digest = evidence.proposal.digest();
     let refuse = |reason: String| Error::AccordEvidenceUnverified {
         proposal_digest: proposal_digest.clone(),
@@ -420,31 +387,11 @@ pub async fn admit_replicated_accord_evidence_over_roster(
         seats_seen.push(p.member_id.as_str());
     }
 
-    // (2) Roster from OUR directory.
-    let roster = roster_from_own_directory(directory, roster_key_ids).await?;
-
-    // (3) THE RE-TALLY. Not the sender's verdict — ours, over their signatures.
-    let tally = tally_live_quorum(&evidence.proposal, &evidence.participations, &roster)
-        .map_err(|e| refuse(format!("live-quorum tally failed (fail-closed): {e:?}")))?;
-    let policy = strict_majority_policy(roster.len());
-    policy.validate().map_err(|e| {
-        refuse(format!(
-            "accord roster quorum policy invalid ({n} holders): {e:?}",
-            n = roster.len()
-        ))
-    })?;
-    if tally.yes < policy.m {
-        return Err(refuse(format!(
-            "insufficient accord quorum on RE-TALLY: {yes} YES vote(s) among the live set \
-             {live:?}, but replicated accord evidence is admitted only at a strict majority \
-             of the accord family (>= {m} of {n}) — the sender's own verdict is not consulted",
-            yes = tally.yes,
-            live = tally.live_set,
-            m = policy.m,
-            n = policy.n,
-        )));
-    }
-
+    // (2)–(3) v62.0.0 (BH-fix2; RULINGS "composite signatures only") — the
+    // re-tally (`tally_live_quorum`: each participation's SEPARATE Ed25519 +
+    // ML-DSA-65 pair verified against the holder's component halves) is
+    // deleted: the records it counted are retired, and v62 verifies no
+    // separate pair.
     // (4) v62.0.0 (JSON-cut slice F; CC rc20) — nothing lands. The rc20
     // edition has no accord proposal, participation or decision record (a
     // roster change is a later genesis bundle), so their write doors are

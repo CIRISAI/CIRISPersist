@@ -70,14 +70,14 @@ DELEGATED_DEFAULTS = (
     # delegating one and not another would make that relationship differ
     # through the double from what it is against a bare backend.
     "lookup_signed_record_by_content_hash",
-    # v50.0.0 (#916) — defaulted no-op, overridden by sqlite/postgres (the
-    # receive doors' re-wrap); through the double it must reach the override.
-    "rewrap_own_epochs_for_device",
-    # v55.0.0 (CIRISPersist#989) — the key-grant hooks: leaf operations the
-    # sqlite / postgres backends override (the held content's author, the
-    # projection into the grant tables); neither composes a trait method.
+    # v50.0.0 (#916) `rewrap_own_epochs_for_device` and v55.0.0 (#989)
+    # `project_key_grant_row` were listed here while they defaulted to a
+    # silent no-op; v62.0.0 (PX-fix1) made each an `Unsupported` leaf, found
+    # automatically.
+    # v55.0.0 (CIRISPersist#989) — the key-grant held-owner hook: a leaf the
+    # sqlite / postgres backends override (the held content's author); it
+    # composes no trait method.
     "key_grant_held_owner",
-    "project_key_grant_row",
     # v50.0.0 (PR #921 review, F1) — defaulted `None`, overridden by every
     # backend. A SYNC accessor (emitted by name in `render`): the double hands
     # out the INNER backend's cache, so a verdict read through the double is
@@ -90,33 +90,28 @@ DELEGATED_DEFAULTS = (
     # through the double it must reach the backend's held set.
     "trust_direction_held_among",
     # v62.0.0 (wave P1c) — the edition-2 statement store's leaves: each
-    # defaulted "none held" / a `Backend` refusal, overridden by sqlite and
+    # defaulted a `Backend` refusal or "none held", overridden by sqlite and
     # postgres, composing no trait method. Before this, the double answered
     # every edition-2 read with the default, so a fault injected on the key
     # plane (`edition2_statements_about`) was never observed and a witness
     # counting the door's reads through the double could not fail.
     # `key_edition` stays out: its default is a composition over
     # `lookup_public_key`.
-    "edition2_statements_about",
-    "edition2_voices",
-    "edition2_rows_naming",
-    "edition2_objects",
+    # v62.0.0 (PX-fix1) — the store's READS (`edition2_statements_about`,
+    # `edition2_voices`, `edition2_rows_naming`, `edition2_objects`) and the
+    # fold store's reads below now default to `Unsupported`, so they are
+    # found as leaves and left this list (with `edition2_statement` and
+    # `edition2_statement_ids_since`, which the double did not delegate
+    # before).
     "put_edition2_object",
     "put_edition2_statement",
     "upsert_edition2_key_projection",
     "edition2_statements_since",
-    # v62.0.0 (wave G0) — the fold store's reads: defaulted "none held",
-    # overridden by sqlite and postgres, composing no trait method. Through
-    # the double the fold must read the held reasons and the dependency index
-    # it writes (`put_fold_record` is found: `Unsupported`-bodied).
-    "fold_held",
-    "fold_held_page",
-    "fold_dependents",
-    # v4 — the fold state, the slot read and the boot probe.
-    "fold_state",
-    "fold_slot_rows",
-    "fold_any_refolding",
-    "fold_slot_held",
+    # v62.0.0 (wave G0) — the fold store's reads (`fold_held`,
+    # `fold_held_page`, `fold_dependents`, `fold_state`, `fold_slot_rows`,
+    # `fold_any_refolding`, `fold_slot_held`) were listed here while they
+    # defaulted "none held"; v62.0.0 (PX-fix1) made each an `Unsupported`
+    # leaf, found automatically.
 )
 
 # NOT_DELEGATED — an `Unsupported`-bodied default the double must NOT delegate,

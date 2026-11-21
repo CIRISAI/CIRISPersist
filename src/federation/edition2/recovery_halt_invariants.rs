@@ -146,7 +146,7 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
                 "family_key_id": FAMILY_KEY_ID,
                 "old_holder_key_id": holder,
             }),
-            quorum_signatures: vec![ciris_verify_core::threshold::ThresholdSignature {
+            quorum_signatures: vec![crate::federation::types::RetiredMemberPairSignature {
                 member_id: "i2876-recovery-key".to_owned(),
                 ed25519_signature_base64: "c2ln".to_owned(),
                 mldsa65_signature_base64: Some("c2ln".to_owned()),

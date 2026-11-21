@@ -543,7 +543,11 @@ mod tests {
                 // built too. Without it this test would assert that persist
                 // REFUSES its own required identity — a manifest/rule divergence
                 // that is really just a missing fixture.
-                backend.set_node_key_id("wia-node");
+                // RT-fix1: the node's identity-ref (the accepts edge's `iss`,
+                // and the asking party of the conferral walk), never the
+                // bare seed text.
+                backend
+                    .set_node_key_id(crate::federation::edition2::fixture_switch::kid("wia-node"));
                 for scope in [
                     crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
                     crate::federation::types::delegation_scope::INFRA_DETECT,

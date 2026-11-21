@@ -11,7 +11,8 @@
 //!    the closed-set basis [`STEWARD_PURGE_BASIS`], `claimant_key_id` = the
 //!    trust root's `community_key_id`, cosigned by distinct SEATS of the held
 //!    root and counted under that root's own `consensus_protocol`
-//!    ([`trust_root_cosigners_over`](super::canonical_community::trust_root_cosigners_over)),
+//!    ([`trust_root_counts_voices`](super::canonical_community::trust_root_counts_voices):
+//!    in edition 2 each founder's cosign is its own statement, a voice),
 //!    with `content_sha256` = the **selection digest**: SHA-256 over the CDE
 //!    array of CDE-sorted, unique `"plane:id"` strings naming every purged
 //!    record, derived included — a record is named by its plane identifier
@@ -1748,7 +1749,7 @@ pub struct StewardPurgeNotice {
     /// The signed envelope.
     pub envelope: serde_json::Value,
     /// Every cosignature (Ed25519 + bound ML-DSA-65 per founder).
-    pub cosignatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
+    pub cosignatures: Vec<crate::federation::types::RetiredMemberPairSignature>,
 }
 
 /// The notice's signed members, parsed.
@@ -1902,27 +1903,15 @@ pub fn notice_terms(envelope: &serde_json::Value) -> Result<NoticeTerms, Error> 
     })
 }
 
-/// **The authorisation gate.** The notice's shape, its window at
-/// [`purge_clock`], and
-/// its cosigners under the claimant trust root's own `consensus_protocol`
-/// ([`trust_root_cosigners_over`](super::canonical_community::trust_root_cosigners_over)).
-/// Returns the terms and the counted cosigners.
-///
-/// # Errors
-///
-/// [`token::UNAUTHORISED`]; directory reads.
-pub async fn verify_purge_authorisation<F>(
-    directory: &F,
-    notice: &StewardPurgeNotice,
-) -> Result<(NoticeTerms, BTreeSet<String>), Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    authorise_at(directory, notice, purge_clock()).await
-}
-
-/// [`verify_purge_authorisation`] at the instant the calling door read from
-/// [`purge_clock`] (one reading per door call).
+/// v62.0.0 (BH-fix1; RULINGS "composite signatures only") — **the earlier
+/// notice's authorisation**: its cosignatures are separate Ed25519 +
+/// ML-DSA-65 pairs (Verify's `ThresholdSignature`) over `JCS(envelope)`, and
+/// their verify is DELETED (with `verify_purge_authorisation` and
+/// `canonical_community::trust_root_cosigners_over`). A notice reaching here
+/// is refused by name (`earlier_form_object`); every door that reaches it
+/// refuses the earlier form first. An edition-2 notice is a
+/// `takedown_notice:steward_purge` row whose founders' cosigns are its
+/// voices ([`verify_purge_authorisation_edition2`]).
 async fn authorise_at<F>(
     directory: &F,
     notice: &StewardPurgeNotice,
@@ -1931,22 +1920,8 @@ async fn authorise_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let terms = notice_terms(&notice.envelope)?;
-    let unauth =
-        |reason: &'static str, detail: String| unauthorised(Some(&terms.notice_id), reason, detail);
-    check_notice_window(&terms, now)?;
-    match super::canonical_community::trust_root_cosigners_over(
-        directory,
-        &terms.claimant_key_id,
-        &notice.envelope,
-        &notice.cosignatures,
-        now,
-    )
-    .await?
-    {
-        Ok(signers) => Ok((terms, signers)),
-        Err((reason, detail)) => Err(unauth(reason, detail)),
-    }
+    let _ = (directory, notice, now);
+    Err(super::edition2::door::earlier_form_signature("purge"))
 }
 
 /// The notice's window at `now`: not asserted in the future (beyond the
@@ -2286,7 +2261,7 @@ fn check_counts(terms: &NoticeTerms, live: &BTreeMap<String, u64>) -> Result<(),
 /// **`purge_rows(selection, notice)`** — the door, at [`purge_clock`].
 ///
 /// In order, each a typed refusal and none an override:
-/// 1. the notice authorises ([`verify_purge_authorisation`]) —
+/// 1. the notice authorises (the earlier form is refused by name, BH-fix1) —
 ///    [`token::UNAUTHORISED`];
 /// 2. the LIVE selection's per-table counts equal the notice's —
 ///    [`token::SELECTION_COUNT_MISMATCH`] `{table, expected, found}`;
@@ -3023,8 +2998,9 @@ pub struct ApplyPurgeOutcome {
 }
 
 /// **Apply** a peer's [`PurgeBundle`]. The receiver trusts nothing the sender
-/// says: it re-verifies the notice against its OWN trust root at `now`
-/// ([`verify_purge_authorisation`]), requires the ids to be well-formed,
+/// says: it re-verifies the notice against its OWN trust root at `now` (an
+/// edition-2 notice by [`verify_purge_authorisation_edition2`]; the earlier
+/// form is refused by name, BH-fix1), requires the ids to be well-formed,
 /// sorted and unique, re-derives the digest and the per-table counts from
 /// them, and only then records the header ([`origin::REPLICATED`]) and the
 /// tombstones. Nothing is deleted: this node's own [`purge_finalize`] does

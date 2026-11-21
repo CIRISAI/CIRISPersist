@@ -163,21 +163,29 @@ pub fn self_leave_member<'a>(stored: &'a Family, offered: &Family) -> Option<&'a
         .then_some(leaver.key_id.as_str())
 }
 
-/// The leaver's own signature over the change envelope, and nothing else, is
+/// The leaver's own voice over the change envelope, and nothing else, is
 /// the authority for a self-leave. The envelope must name the held roster in
 /// `supersedes.prior_member_key_ids` (anti-replay, as the quorum path) and
 /// must not carry a dissolution.
-pub async fn verify_self_leave_signature<F>(
-    dir: &F,
+///
+/// v62.0.0 (BH-fix1; RULINGS "composite signatures only") — the leaver signs
+/// with ONE composite statement, verified at the edition-2 door; the door
+/// vouches for exactly this change envelope
+/// (`edition2::group::vouched_quorum_signers`),
+/// and the leaver must be among the vouched voices. The earlier form (a
+/// separate Ed25519 + ML-DSA-65 pair in the proof's `quorum_signatures`,
+/// verified against the leaver's component halves) is deleted: outside a
+/// vouch nobody has signed.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] for each refusal (a dissolution, a missing
+/// `supersedes`, an unvouched leaver); the prior-roster mismatch holds under
+/// a fold attempt.
+pub fn verify_self_leave_signature(
     stored: &Family,
     change_envelope: &serde_json::Value,
-    signatures: &[ciris_verify_core::threshold::ThresholdSignature],
     leaver: &str,
-) -> Result<(), Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    use ciris_verify_core::threshold::ThresholdMember;
+) -> Result<(), Error> {
     let refuse = |detail: &str| {
         Error::InvalidArgument(format!(
             "self-leave from family {}: {detail} (CIRISPersist#956)",
@@ -197,10 +205,9 @@ where
         .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
         .ok_or_else(|| refuse("the change envelope is missing `supersedes`"))?;
     // v62.0.0 (wave GC7; CC 2.7.3) — the claimed prior roster is compared
-    // with the HELD head (another row) and the leaver's key record is looked
-    // up (a link that waits): both hold under a fold attempt and re-fold when
-    // the family or the leaver's key changes. The envelope's own shape and
-    // the signature stay refusals.
+    // with the HELD head (another row): it holds under a fold attempt and
+    // re-folds when the family or the leaver's key changes. The envelope's
+    // own shape and the voice stay refusals.
     fold::reads(Dep::key(&stored.family_key_id));
     fold::reads(Dep::key(leaver));
     let held: Vec<&str> = stored.members.iter().map(|m| m.key_id.as_str()).collect();
@@ -210,29 +217,10 @@ where
             refuse("supersedes.prior_member_key_ids does not match the held roster"),
         ));
     }
-    let Some(sig) = signatures.iter().find(|s| s.member_id == leaver) else {
+    let voiced = super::edition2::group::vouched_quorum_signers(change_envelope)
+        .is_some_and(|signers| signers.contains(leaver));
+    if !voiced {
         return Err(refuse("the leaver did not sign"));
-    };
-    let Some(rec) = dir.lookup_public_key(leaver).await? else {
-        return Err(fold::hold(
-            reason::LINK_UNHELD,
-            refuse("the leaver's key is not registered here"),
-        ));
-    };
-    let member = ThresholdMember {
-        member_id: rec.key_id,
-        ed25519_public_key_base64: rec.pubkey_ed25519_base64,
-        mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64,
-        role: None,
-    };
-    let bytes = ciris_verify_core::accord_genesis::accord_family_signing_bytes(change_envelope)
-        .map_err(|e| refuse(&format!("canonicalize: {e}")))?;
-    ciris_verify_core::threshold::verify_threshold_signatures(
-        &bytes,
-        std::slice::from_ref(&member),
-        std::slice::from_ref(sig),
-        1,
-    )
-    .map_err(|e| refuse(&format!("the leaver's signature does not verify: {e}")))?;
+    }
     Ok(())
 }

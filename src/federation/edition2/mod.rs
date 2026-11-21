@@ -141,6 +141,10 @@ mod group_serve_invariants;
 mod halt_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod halt_lifecycle_invariants;
+// v62.0.0 (BH-fix3) — I2125: an identity template is signed by an accord
+// holder, in its own domain.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod identity_template_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod ingest_invariants;
 #[cfg(test)]
@@ -161,6 +165,10 @@ mod occurrence_roster_invariants;
 mod occurrence_route_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod occurrence_tx_invariants;
+// v62.0.0 (BH-fix1) — I2120–I2121: the separate-pair verifies removed; the
+// quorum counts are the edition-2 door's vouched voices only.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod pair_verify_removed_invariants;
 #[cfg(test)]
 mod payloads_invariants;
 #[cfg(test)]

@@ -196,7 +196,10 @@ pub(crate) mod bodies {
         let node_key = format!("i1592-nodekey-{tag}");
         let agent = format!("i1592-agent-{tag}");
         let victim = format!("i1592-victim-{tag}");
-        b.declare_node_key_for_test(&node);
+        // RT-fix1: the node's identity-ref (the accepts edge's `iss`, and the
+        // asking party of the conferral walk), never the bare seed text: a
+        // backend asked as the seed text reaches no conferral.
+        b.declare_node_key_for_test(&e2::kid(&node));
         let author_kid = register(d, &author, &[it::SUBSTRATE_PERSIST]).await;
         register(d, &node_key, &[it::NODE]).await;
         register(d, &agent, &[it::AGENT]).await;

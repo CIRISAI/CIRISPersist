@@ -48,6 +48,10 @@ pub const ROOT_SUCCESSOR_SEED: &str = "w1-rooted-trust-root-successor";
 pub struct RootedTrustRoot {
     /// The root's identity-ref (the community_key_id, `e2::kid(ROOT_SEED)`).
     pub root: String,
+    /// The root's E0 seed ([`ROOT_SEED`], or the seed
+    /// [`try_rooted_trust_root_at_seed`] was given): the key that signs the
+    /// root's charter and its grants ([`confers_statement`]).
+    pub root_seed: String,
     /// The founders' identity-refs, in the order given.
     pub founders: Vec<String>,
     /// The founders' holder seeds, same order ([`Self::founder_key`]).
@@ -126,7 +130,7 @@ pub fn confers_statement(
     asserted_at_ms: u64,
 ) -> Vec<u8> {
     trust_edge(
-        &e2::signing_key(ROOT_SEED),
+        &e2::signing_key(&r.root_seed),
         &r.root,
         subject,
         vec![
@@ -158,6 +162,50 @@ pub async fn try_rooted_trust_root<D>(
 where
     D: FederationDirectory + ?Sized,
 {
+    try_rooted_trust_root_at_seed(dir, ROOT_SEED, founders, protocol).await
+}
+
+/// The seed of the successor key the charter of the root at `root_seed`
+/// commits to: `s-` and the first 30 characters of the root's own key
+/// thumbprint (32 bytes, unique per root). Never the root seed with a suffix:
+/// a test signer seeds from the first 32 bytes of its seed name, so a
+/// suffixed long seed would be the root's own key. [`ROOT_SEED`] keeps
+/// [`ROOT_SUCCESSOR_SEED`] (its statements' bytes are unchanged).
+fn successor_seed_of(root_seed: &str) -> String {
+    if root_seed == ROOT_SEED {
+        return ROOT_SUCCESSOR_SEED.to_owned();
+    }
+    let root = e2::kid(root_seed);
+    let thumb = root.rsplit(':').next().unwrap_or(root.as_str());
+    format!("s-{}", &thumb[..thumb.len().min(30)])
+}
+
+/// v62.0.0 (RT-fix1) — **[`try_rooted_trust_root`] with the root at
+/// `root_seed`'s key** instead of [`ROOT_SEED`]: the same five steps, the
+/// same instants (derived from the bundle in force), the same idempotence
+/// per directory and per seed. For a fixture that names its own root (the
+/// shared conferral helper `admission::r2_test_support::
+/// confer_scope_from_trusted_root`), so a root is ROOTED whichever seed names
+/// it: a bare key chartering itself is no trust root a v62 reader trusts.
+///
+/// `root_seed` is a seed, or a kid E0 minted from one. THIS node's acceptance
+/// is stated no earlier than one second after the node's own `key:record`
+/// starts (a node key registered after the bundle's tip signs inside its own
+/// window).
+///
+/// # Errors
+/// As [`try_rooted_trust_root`].
+pub async fn try_rooted_trust_root_at_seed<D>(
+    dir: &D,
+    root_seed: &str,
+    founders: &[u8],
+    protocol: &str,
+) -> Result<RootedTrustRoot, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let root_seed = e2::seed_of(root_seed);
+    let root_seed = root_seed.as_str();
     // 1. The genesis bundle in force.
     if !genesis_in_force(dir).await?.is_held() {
         fixture_genesis::install_v2(dir).await?;
@@ -190,7 +238,11 @@ where
     ensure_live_key(dir, &node, &["node"]).await?;
 
     // 2. The root's key.
-    let root = e2::put_key(dir, ROOT_SEED, &["user"]).await;
+    // (RT-fix1: a root key the caller already registered is kept as held.)
+    let root = e2::kid(root_seed);
+    if root_seed == ROOT_SEED || dir.lookup_public_key(&root).await?.is_none() {
+        e2::put_key(dir, root_seed, &["user"]).await;
+    }
 
     // 3. The founding. IDEMPOTENT per directory: every instant derives from
     // the bundle in force (one minute after its newest tip), so a second call
@@ -206,7 +258,11 @@ where
     let founded_at = instant(at - 30_000);
     let community = Community {
         community_key_id: root.clone(),
-        community_name: "w1b rooted trust root".into(),
+        community_name: if root_seed == ROOT_SEED {
+            "w1b rooted trust root".to_owned()
+        } else {
+            format!("w1b rooted trust root {root}")
+        },
         members: founder_refs
             .iter()
             .map(|f| CommunityMember {
@@ -238,7 +294,12 @@ where
     let key_refs: Vec<&CompositeSigningKey> = keys.iter().collect();
     let voices = roster_voices(&GroupRecord::Community(community), 1, None, at, &key_refs);
     let birth = row_id_of(&voices[0]);
-    let charter = charter_statement(&root, at)?;
+    let charter = charter_statement(root_seed, &root, at)?;
+    // RT-fix1 — the node's acceptance, inside the node's own key window.
+    let accept_at = match dir.lookup_public_key(&node).await? {
+        Some(rec) => at.max(e2::ms(rec.valid_from).saturating_add(1_000)),
+        None => at,
+    };
 
     // A second call: the root this directory already holds is RETURNED, never
     // re-founded. A root held at ROOT_SEED that another call founded with
@@ -248,10 +309,10 @@ where
             return Err(refused(
                 "founding",
                 "a root founded with other founders or another protocol is already held at \
-                 ROOT_SEED",
+                 this root seed",
             ));
         }
-        let acceptance = acceptance_statement(&node, &root, &held.persist_row_hash, at)?;
+        let acceptance = acceptance_statement(&node, &root, &held.persist_row_hash, accept_at)?;
         if dir
             .get_attestation(&row_id_of(&charter).hex())
             .await?
@@ -263,6 +324,7 @@ where
         {
             return Ok(RootedTrustRoot {
                 root,
+                root_seed: root_seed.to_owned(),
                 founders: founder_refs,
                 founder_seeds: founders.to_vec(),
                 protocol: protocol.to_owned(),
@@ -287,12 +349,13 @@ where
         .await?
         .ok_or_else(|| refused("acceptance", "the root is not held"))?
         .persist_row_hash;
-    let acceptance = acceptance_statement(&node, &root, &head, at)?;
+    let acceptance = acceptance_statement(&node, &root, &head, accept_at)?;
     e2::put_statement(dir, &acceptance).await?;
     require_concluded(dir, "acceptance", &row_id_of(&acceptance)).await?;
 
     Ok(RootedTrustRoot {
         root,
+        root_seed: root_seed.to_owned(),
         founders: founder_refs,
         founder_seeds: founders.to_vec(),
         protocol: protocol.to_owned(),
@@ -302,12 +365,12 @@ where
     })
 }
 
-/// The root's `trust:charter:v1` self-edge at `at`.
-fn charter_statement(root: &str, at: u64) -> Result<Vec<u8>, Error> {
-    let successor = e2::signing_key(ROOT_SUCCESSOR_SEED);
+/// The `trust:charter:v1` self-edge of the root at `root_seed`, at `at`.
+fn charter_statement(root_seed: &str, root: &str, at: u64) -> Result<Vec<u8>, Error> {
+    let successor = e2::signing_key(&successor_seed_of(root_seed));
     let commitment = recovery_commitment(&[successor.public_key().clone()]);
     trust_edge(
-        &e2::signing_key(ROOT_SEED),
+        &e2::signing_key(root_seed),
         root,
         root,
         vec![

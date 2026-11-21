@@ -79,7 +79,7 @@ pub struct FramedOccurrenceRevocation {
     /// `revoked_at`, `effective_at`, …).
     pub signed_envelope: serde_json::Value,
     /// The hybrid signature over `JCS(signed_envelope)`.
-    pub signature: ciris_verify_core::transport_binding::TransportBindingSignature,
+    pub signature: crate::federation::types::RetiredPairSignature,
 }
 
 fn malformed(reason: &'static str, message: String) -> Error {
@@ -178,65 +178,19 @@ pub fn carrier_of_row(row: &Attestation) -> Option<FramedOccurrenceRevocation> {
     serde_json::from_value(row.attestation_envelope.get(CARRIER_MEMBER)?.clone()).ok()
 }
 
-/// The framed object's hybrid signature verifies, 1-of-1 and RequireHybrid,
-/// over `JCS(signed_envelope)` against the revoker's HELD keys; the revoker
-/// acts for the identity now (`signer_acts_for`).
+/// v62.0.0 (BH-fix1; RULINGS "composite signatures only") — the framed
+/// object's signature is the separate Ed25519 + ML-DSA-65 pair (Verify's
+/// `ThresholdSignature`) over `JCS(signed_envelope)`. Its verify is DELETED:
+/// a carrier reaching here is refused by name (`earlier_form_object`). An
+/// occurrence revocation is an edition-2 statement through the door.
 async fn verify_framed<D>(dir: &D, framed: &FramedOccurrenceRevocation) -> Result<(), Error>
 where
     D: FederationDirectory + ?Sized,
 {
-    use ciris_verify_core::threshold::{
-        verify_threshold_signatures, ThresholdMember, ThresholdSignature,
-    };
-    let revocation = framed.revocation()?;
-    if framed.field("attesting_key_id")? != framed.attesting_key_id {
-        return Err(malformed(
-            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
-            "framed occurrence revocation: the signer diverges from the signed envelope's \
-             attesting_key_id"
-                .to_owned(),
-        ));
-    }
-    let Some(signer) = dir.lookup_public_key(&framed.attesting_key_id).await? else {
-        return Err(Error::unknown_signer(
-            &framed.attesting_key_id,
-            "occurrence_revocation_carrier",
-        ));
-    };
-    let bytes = crate::verify::canonical::ceg_produce_canonicalize(&framed.signed_envelope)
-        .map_err(|e| {
-            malformed(
-                super::malformed_row::ENVELOPE_NOT_CANONICAL,
-                format!("framed occurrence revocation canonicalize: {e}"),
-            )
-        })?;
-    let members = [ThresholdMember {
-        member_id: signer.key_id.clone(),
-        ed25519_public_key_base64: signer.pubkey_ed25519_base64.clone(),
-        mldsa65_public_key_base64: signer.pubkey_ml_dsa_65_base64.clone(),
-        role: None,
-    }];
-    let sigs = [ThresholdSignature {
-        member_id: framed.attesting_key_id.clone(),
-        ed25519_signature_base64: framed.signature.ed25519_signature_base64.clone(),
-        mldsa65_signature_base64: framed.signature.mldsa65_signature_base64.clone(),
-    }];
-    if framed.signature.mldsa65_signature_base64.is_none()
-        || verify_threshold_signatures(&bytes, &members, &sigs, 1).is_err()
-    {
-        return Err(Error::SignatureInvalid(format!(
-            "occurrence revocation carrier for {}: the framed object's hybrid signature does not \
-             verify against {}'s held key (CC 3.1.5)",
-            revocation.occurrence_key_id, framed.attesting_key_id
-        )));
-    }
-    super::admission::check_signer_acts_for(
-        dir,
-        &framed.attesting_key_id,
-        &revocation.identity_key_id,
+    let _ = (dir, framed);
+    Err(super::edition2::door::earlier_form_signature(
         "occurrence_revocation_carrier",
-    )
-    .await
+    ))
 }
 
 /// **The structural admission rule** (CC 3.1.5, CIRISPersist#1104): (A) a

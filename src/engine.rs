@@ -1020,7 +1020,7 @@ impl Engine {
             // v2.12.0 (#112) — `from_shared` only takes the hybrid
             // `HardwareSigner` (the cohabitation singleton path);
             // `sign_hybrid` is unavailable on Engines built this way.
-            // Use [`Engine::from_shared_with_local`] to propagate a
+            // Use [`Engine::try_from_shared_with_local`] to propagate a
             // `LocalSigner` through.
             local_signer: None,
             // v3.4.0 (#123) — cohabitation views do NOT spawn a
@@ -1030,7 +1030,10 @@ impl Engine {
             disk_pressure_state: None,
             trace_signers: Arc::from(Vec::new()),
         };
-        engine.tell_shared_backend_its_node_key();
+        // v62.0.0 (LF-fix2, P4) — an engine with no composite local signer
+        // tells the shared backend NOTHING: on v62 a node's key id is its
+        // edition-2 identity-ref, which only a composite signer names, and an
+        // earlier derived id names no row. The handle keeps what it knows.
         engine
     }
 
@@ -1043,11 +1046,23 @@ impl Engine {
     /// software-rooted deployment); for hardware-rooted deployments
     /// with no LocalSigner present, `from_shared` (no propagation) is
     /// the right constructor.
-    pub fn from_shared_with_local(
+    ///
+    /// v62.0.0 (LF-fix2, P4) — **fallible**, and the only form: the
+    /// infallible `from_shared_with_local` is gone (clean break). A shared
+    /// backend that already knows a DIFFERENT identity-ref as its node key
+    /// is `node_key_conflict`, a typed error on every host path (PyO3 maps
+    /// it to `RuntimeError`, as it maps the engine-open errors).
+    ///
+    /// # Errors
+    /// [`EngineError::NodeKeyConflict`] when the shared backend already
+    /// knows an identity-ref as its node key and this engine's composite
+    /// signer names a different one. Nothing is told; the handle is
+    /// unchanged.
+    pub fn try_from_shared_with_local(
         backend: BackendDispatch,
         signer: Arc<dyn HardwareSigner>,
         local_signer: Option<Arc<LocalSigner>>,
-    ) -> Engine {
+    ) -> Result<Engine, EngineError> {
         let engine = Engine {
             backend,
             signer,
@@ -1057,8 +1072,8 @@ impl Engine {
             disk_pressure_state: None,
             trace_signers: Arc::from(Vec::new()),
         };
-        engine.tell_shared_backend_its_node_key();
-        engine
+        engine.tell_shared_backend_its_node_key()?;
+        Ok(engine)
     }
 
     /// v53.0.0 (CIRISPersist#966) — a shared constructor tells the backend
@@ -1068,42 +1083,57 @@ impl Engine {
     /// known node key, and a host that hands persist a backend it opened
     /// itself never calls a door that would tell it.
     ///
+    /// v62.0.0 (LF-fix2, P4) — the rule is [`node_key_to_tell`]: only a
+    /// composite local signer names a node key (its identity-ref); with none,
+    /// nothing is told. An identity-ref REPLACES an earlier-form value the
+    /// handle holds, and is never replaced by a different identity-ref
+    /// (`node_key_conflict`).
+    ///
     /// The constructors stay synchronous (Edge and the pyo3 singleton call
-    /// them outside a runtime), so the key id is derived by polling
-    /// [`local_derived_key_id`](Self::local_derived_key_id) ONCE: a software
-    /// signer answers on the first poll. A signer that does not (a hardware
-    /// round-trip) leaves the key to the lazy path the #916 doors already
-    /// run (`ensure_backend_node_key`) — never a guessed id. A key the
-    /// backend already knows is kept: it was told by the Engine that opened
-    /// it, which is the same id.
-    fn tell_shared_backend_its_node_key(&self) {
+    /// them outside a runtime), so the identity-ref is read by polling
+    /// [`LocalSigner::federation_id`](crate::signing::LocalSigner::federation_id)
+    /// ONCE: a software signer answers on the first poll. A signer that does
+    /// not leaves the key to the lazy path the #916 doors already run
+    /// ([`Self::ensure_backend_node_key`]) — never a guessed id.
+    fn tell_shared_backend_its_node_key(&self) -> Result<(), EngineError> {
         #[cfg(any(feature = "postgres", feature = "sqlite"))]
         {
-            let known = match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(b) => {
-                    crate::federation::FederationDirectory::node_key_id(b.as_ref()).is_some()
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(b) => {
-                    crate::federation::FederationDirectory::node_key_id(b.as_ref()).is_some()
-                }
+            let Some(local) = self.composite_local_signer() else {
+                return Ok(());
             };
-            if known {
-                return;
-            }
-            let fut = std::pin::pin!(self.local_derived_key_id());
+            let fut = std::pin::pin!(local.federation_id());
             // One poll that never wakes (`Waker::noop`, stable since 1.85).
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
             match std::future::Future::poll(fut, &mut cx) {
-                std::task::Poll::Ready(Ok(k)) => self.set_backend_node_key_id(&k),
-                std::task::Poll::Ready(Err(e)) => tracing::warn!(
-                    error = %e,
-                    "from_shared: no node key for the shared backend; the #916 doors derive it lazily"
-                ),
+                std::task::Poll::Ready(identity_ref) => {
+                    let held = self.backend_node_key_id();
+                    match node_key_to_tell(held.as_deref(), &identity_ref) {
+                        Ok(Some(k)) => self.set_backend_node_key_id(&k),
+                        Ok(None) => {}
+                        Err((held, local)) => {
+                            return Err(EngineError::NodeKeyConflict { held, local })
+                        }
+                    }
+                }
                 std::task::Poll::Pending => tracing::debug!(
                     "from_shared: the signer answers asynchronously; the #916 doors derive the node key lazily"
                 ),
+            }
+        }
+        Ok(())
+    }
+
+    /// The node key the composed backend already knows, if any.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    fn backend_node_key_id(&self) -> Option<String> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::federation::FederationDirectory::node_key_id(b.as_ref())
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::federation::FederationDirectory::node_key_id(b.as_ref())
             }
         }
     }
@@ -7063,7 +7093,7 @@ impl Engine {
                 "hybrid-only: this engine has no PQC LocalSigner and cannot announce a \
                  holding claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1); \
                  construct with `with_signer` / `with_hardware_signer_hybrid` / \
-                 `from_shared_with_local` to announce"
+                 `try_from_shared_with_local` to announce"
                     .into(),
             )
         })?;
@@ -7297,7 +7327,7 @@ impl Engine {
     /// #848 (I66) — **resolve V145's minter sentinel before the first door
     /// that reads or writes the community-DEK plane.** The DSN constructors
     /// resolve at boot; an `Engine` over a shared backend
-    /// ([`from_shared`](Self::from_shared) / [`from_shared_with_local`]) is
+    /// ([`from_shared`](Self::from_shared) / [`try_from_shared_with_local`](Self::try_from_shared_with_local)) is
     /// synchronous and cannot, so every DEK-plane door calls this first: an
     /// atomic load once the backend reports resolved, the same resolver
     /// otherwise — and a survivor fails THIS call (fail-secure) rather than
@@ -8579,22 +8609,29 @@ impl Engine {
     /// v50.0.0 (CIRISPersist#916 review, N1) — an `Engine` over a shared
     /// backend (`from_shared*`) is built synchronously and never told the
     /// backend its key; the #916 doors tell it before they need it.
+    ///
+    /// v62.0.0 (LF-fix2, P4) — the same rule as the constructors
+    /// ([`node_key_to_tell`]): no composite local signer tells nothing; an
+    /// identity-ref replaces an earlier-form value and never a different
+    /// identity-ref. A conflict is not overwritten: it is logged at `error`
+    /// and the held key stands, so a door that compares this signer with the
+    /// store's node (`publish_self_occurrence`) refuses on it.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     async fn ensure_backend_node_key(&self) {
-        let known = match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => {
-                crate::federation::FederationDirectory::node_key_id(b.as_ref()).is_some()
-            }
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => {
-                crate::federation::FederationDirectory::node_key_id(b.as_ref()).is_some()
-            }
+        let Some(local) = self.composite_local_signer() else {
+            return;
         };
-        if !known {
-            if let Ok(k) = self.local_derived_key_id().await {
-                self.set_backend_node_key_id(&k);
-            }
+        let identity_ref = local.federation_id().await;
+        let held = self.backend_node_key_id();
+        match node_key_to_tell(held.as_deref(), &identity_ref) {
+            Ok(Some(k)) => self.set_backend_node_key_id(&k),
+            Ok(None) => {}
+            Err((held, local)) => tracing::error!(
+                held = %held,
+                local = %local,
+                "{}: the shared backend's node key is a different identity-ref; not replaced",
+                NODE_KEY_CONFLICT
+            ),
         }
     }
 
@@ -12481,6 +12518,57 @@ pub enum EngineError {
     /// seed's failure, CIRISPersist#347; that seed is gone.)
     #[error("genesis install: {0}")]
     GenesisSeed(String),
+
+    /// v62.0.0 (LF-fix2, P4) — `node_key_conflict`: a shared constructor
+    /// (`Engine::try_from_shared_with_local`) met a backend that already
+    /// knows an identity-ref as its node key, and this engine's composite
+    /// signer names a different one. An identity-ref is never replaced
+    /// silently; nothing was told.
+    #[error(
+        "node_key_conflict: the shared backend's node key is {held}; this engine's composite key is {local}"
+    )]
+    NodeKeyConflict {
+        /// The identity-ref the backend already knows.
+        held: String,
+        /// This engine's composite signer's identity-ref.
+        local: String,
+    },
+}
+
+/// v62.0.0 (LF-fix2, P4) — the refusal token of [`EngineError::NodeKeyConflict`].
+pub const NODE_KEY_CONFLICT: &str = "node_key_conflict";
+
+/// v62.0.0 (LF-fix2, P4) — **what a shared engine tells its backend** as the
+/// node key, given the key the handle `held` and this engine's composite
+/// `identity_ref`:
+///
+/// - nothing held → the identity-ref;
+/// - the same identity-ref held → nothing (kept);
+/// - a value that is not an identity-ref held (an earlier derived id names no
+///   v62 row) → the identity-ref REPLACES it;
+/// - a different identity-ref held → `Err((held, identity_ref))`, the
+///   conflict. Never a silent keep, never a silent replace.
+///
+/// An engine with no composite signer has no identity-ref and never asks; a
+/// composite signer whose identity-ref could not be read
+/// ([`LocalSigner::federation_id`](crate::signing::LocalSigner::federation_id)
+/// falls back to the earlier derived id) tells nothing either.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn node_key_to_tell(
+    held: Option<&str>,
+    identity_ref: &str,
+) -> Result<Option<String>, (String, String)> {
+    if !ciris_verify_core::edition2::is_identity_ref(identity_ref) {
+        return Ok(None);
+    }
+    match held {
+        None => Ok(Some(identity_ref.to_owned())),
+        Some(h) if h == identity_ref => Ok(None),
+        Some(h) if ciris_verify_core::edition2::is_identity_ref(h) => {
+            Err((h.to_owned(), identity_ref.to_owned()))
+        }
+        Some(_) => Ok(Some(identity_ref.to_owned())),
+    }
 }
 
 /// The body of [`Engine::evict_blob`], generic over the backend.
@@ -14083,7 +14171,8 @@ mod tests {
         let hw_signer = engine_full.signer().clone();
 
         let engine_shared =
-            Engine::from_shared_with_local(backend, hw_signer, Some(signer.clone()));
+            Engine::try_from_shared_with_local(backend, hw_signer, Some(signer.clone()))
+                .expect("a shared engine view: no node_key_conflict");
 
         let message = b"any message";
         let sig = engine_shared
@@ -19652,21 +19741,24 @@ mod tests {
         )
         .await;
 
-        // The subject self-declares MINOR (self rung; attested defaults to
-        // the emitter — subject-signed by design).
-        let self_minor = crate::federation::EmitAttestationInput::with_envelope(
-            "age_self_declared:band:minor:v1",
+        // The subject self-declares ADULT (self rung; attested defaults to
+        // the emitter — subject-signed by design): it graduates nobody.
+        // v62.0.0 (K2-fix14): this was a self-declared MINOR, but under CC
+        // 3.4.11 a subject's own minor band lowers any witness reading, so
+        // it would hide the cross-subject graduation this witnesses.
+        let self_adult = crate::federation::EmitAttestationInput::with_envelope(
+            "age_self_declared:band:adult:v1",
             crate::federation::envelope::EnvelopeCore::from_value(
-                serde_json::json!({ "id": "wtse-self-minor" }),
+                serde_json::json!({ "id": "wtse-self-adult" }),
             )
             .unwrap(),
             crate::federation::types::cohort_scope::FEDERATION,
         );
         engine
-            .emit_attestation(&t_signer, self_minor)
+            .emit_attestation(&t_signer, self_adult)
             .await
-            .expect("self-declared minor admits");
-        assert_eq!(engine.age_band(&t).await.unwrap(), AgeBand::Minor);
+            .expect("self-declared adult admits");
+        assert_eq!(engine.age_band(&t).await.unwrap(), AgeBand::Unknown);
 
         // WITNESS-TARGETS-SUBJECT: the witness emits `age_assurance:*` ABOUT
         // the subject by carrying it in `attested_key_id` — the #368 surface.
@@ -19688,7 +19780,7 @@ mod tests {
         let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
         assert_eq!(row.attesting_key_id, w, "attester = the witness");
         assert_eq!(row.attested_key_id, t, "subject rides attested_key_id");
-        // The SUBJECT's band graduates (witness outranks its self-minor).
+        // The SUBJECT's band graduates (a witness, not the self rung).
         assert_eq!(
             engine.age_band(&t).await.unwrap(),
             AgeBand::Adult,
@@ -19787,12 +19879,12 @@ mod tests {
         )
         .await;
 
-        // Subject self-declares minor.
+        // Subject self-declares adult (K2-fix14: see the sqlite twin).
         engine
             .emit_attestation(
                 &t_signer,
                 crate::federation::EmitAttestationInput::with_envelope(
-                    "age_self_declared:band:minor:v1",
+                    "age_self_declared:band:adult:v1",
                     crate::federation::envelope::EnvelopeCore::from_value(
                         serde_json::json!({ "id": format!("pgw-self-{run}") }),
                     )
@@ -19801,8 +19893,8 @@ mod tests {
                 ),
             )
             .await
-            .expect("self-declared minor admits");
-        assert_eq!(engine.age_band(&t).await.unwrap(), AgeBand::Minor);
+            .expect("self-declared adult admits");
+        assert_eq!(engine.age_band(&t).await.unwrap(), AgeBand::Unknown);
 
         // Witness graduates the SUBJECT cross-subject.
         let mut cross = crate::federation::EmitAttestationInput::with_envelope(
@@ -23461,5 +23553,196 @@ mod engine_607_tests {
             "refused, but not for the #607 reason — an is_err() check alone would have passed \
          on an unregistered key or a bad signature. Got: {msg}"
         );
+    }
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod shared_node_key_tests {
+    //! v62.0.0 (LF-fix2, P4) — the node key a shared engine tells its
+    //! backend ([`super::node_key_to_tell`]), over a real backend handle.
+    use super::*;
+
+    /// A fresh handle onto `dsn`: no Engine has told it a node key.
+    async fn fresh(dsn: &str) -> BackendDispatch {
+        build_backend(dsn, crate::store::HostStoreProfile::Native)
+            .await
+            .expect("a fresh backend handle")
+    }
+
+    fn adapter(local: &Arc<LocalSigner>) -> Arc<dyn HardwareSigner> {
+        Arc::new(LocalSignerHardwareAdapter::new(local.clone()))
+    }
+
+    /// **I2114 (LF-fix2, P4)** — on v62 a node's key id IS its edition-2
+    /// identity-ref:
+    ///
+    /// 1. `from_shared` (no composite signer) over a fresh handle tells it
+    ///    NOTHING — the node key stays unset (was: the earlier derived id);
+    /// 2. `from_shared_with_local(Some)` over that SAME handle tells it the
+    ///    identity-ref, and the classical-only view sees it too;
+    /// 3. a handle already holding the identity-ref keeps it (a second
+    ///    constructor, and `from_shared` over it, change nothing);
+    /// 4. a handle holding an earlier-form id has it REPLACED by the
+    ///    identity-ref;
+    /// 5. a handle holding a DIFFERENT identity-ref refuses the constructor
+    ///    with `node_key_conflict` and is left unchanged, and the lazy path
+    ///    (`ensure_backend_node_key`) does not overwrite it either;
+    /// 6. the lazy path of an engine with no composite signer tells nothing.
+    async fn i2114_body(dsn: &str) {
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let local = crate::federation::tier_ingest::test_support::local_signer(&format!(
+            "i2114-node-{run}"
+        ));
+        let iref = local.federation_id().await;
+        assert!(
+            ciris_verify_core::edition2::is_identity_ref(&iref),
+            "fixture: a PQC-configured local signer names an identity-ref, got {iref}"
+        );
+        let hw = adapter(&local);
+
+        // (1) fresh handle + from_shared → unset.
+        let plain = Engine::from_shared(fresh(dsn).await, hw.clone());
+        assert_eq!(
+            plain.backend_node_key_id(),
+            None,
+            "I2114(1) from_shared tells a fresh handle nothing"
+        );
+
+        // (2) then from_shared_with_local over the same handle → the identity-ref.
+        let with_local = Engine::try_from_shared_with_local(
+            plain.backend().clone(),
+            hw.clone(),
+            Some(local.clone()),
+        )
+        .expect("I2114(2) no conflict on an unset handle");
+        assert_eq!(
+            with_local.backend_node_key_id().as_deref(),
+            Some(iref.as_str()),
+            "I2114(2) from_shared_with_local tells the handle its identity-ref"
+        );
+        assert_eq!(
+            plain.backend_node_key_id().as_deref(),
+            Some(iref.as_str()),
+            "I2114(2) the same handle: the classical-only view sees the identity-ref"
+        );
+
+        // (3) a handle already holding the identity-ref keeps it.
+        let again = Engine::try_from_shared_with_local(
+            plain.backend().clone(),
+            hw.clone(),
+            Some(local.clone()),
+        )
+        .expect("I2114(3) the same identity-ref is not a conflict");
+        let plain_again = Engine::from_shared(again.backend().clone(), hw.clone());
+        assert_eq!(
+            plain_again.backend_node_key_id().as_deref(),
+            Some(iref.as_str()),
+            "I2114(3) a handle holding the identity-ref keeps it"
+        );
+
+        // (4) an earlier-form id is replaced.
+        let earlier = local.derived_key_id();
+        assert!(
+            !ciris_verify_core::edition2::is_identity_ref(&earlier),
+            "fixture: the derived id is the earlier form, got {earlier}"
+        );
+        assert_ne!(earlier, iref, "fixture: two different ids");
+        let held_earlier = Engine::from_shared(fresh(dsn).await, hw.clone());
+        held_earlier.set_backend_node_key_id(&earlier);
+        assert_eq!(
+            held_earlier.backend_node_key_id().as_deref(),
+            Some(earlier.as_str()),
+            "fixture: the handle holds the earlier id"
+        );
+        let replaced = Engine::try_from_shared_with_local(
+            held_earlier.backend().clone(),
+            hw.clone(),
+            Some(local.clone()),
+        )
+        .expect("I2114(4) an earlier-form id is not a conflict");
+        assert_eq!(
+            replaced.backend_node_key_id().as_deref(),
+            Some(iref.as_str()),
+            "I2114(4) the identity-ref replaces the earlier-form id"
+        );
+
+        // (5) a different identity-ref is a conflict, never a keep or a replace.
+        let other = crate::federation::tier_ingest::test_support::local_signer(&format!(
+            "i2114-other-{run}"
+        ));
+        let other_iref = other.federation_id().await;
+        assert!(ciris_verify_core::edition2::is_identity_ref(&other_iref));
+        assert_ne!(other_iref, iref, "fixture: two different composite keys");
+        let held_other = Engine::from_shared(fresh(dsn).await, hw.clone());
+        held_other.set_backend_node_key_id(&other_iref);
+        let err = Engine::try_from_shared_with_local(
+            held_other.backend().clone(),
+            hw.clone(),
+            Some(local.clone()),
+        )
+        .err()
+        .expect("I2114(5) a different identity-ref on the handle is a conflict");
+        match &err {
+            EngineError::NodeKeyConflict { held, local: mine } => {
+                assert_eq!(
+                    held, &other_iref,
+                    "I2114(5) the conflict names the held key"
+                );
+                assert_eq!(mine, &iref, "I2114(5) the conflict names this engine's key");
+            }
+            e => panic!("I2114(5) expected node_key_conflict, got {e:?}"),
+        }
+        assert!(
+            err.to_string().starts_with(NODE_KEY_CONFLICT),
+            "I2114(5) the refusal is named: {err}"
+        );
+        assert_eq!(
+            held_other.backend_node_key_id().as_deref(),
+            Some(other_iref.as_str()),
+            "I2114(5) the refused constructor told the handle nothing"
+        );
+        // The lazy path over the same handle, from an engine that names the
+        // other identity-ref, does not overwrite it either.
+        let lazy = Engine {
+            backend: held_other.backend().clone(),
+            signer: hw.clone(),
+            local_signer: Some(local.clone()),
+            replication_config: None,
+            disk_pressure_config: None,
+            disk_pressure_state: None,
+            trace_signers: Arc::from(Vec::new()),
+        };
+        lazy.ensure_backend_node_key().await;
+        assert_eq!(
+            held_other.backend_node_key_id().as_deref(),
+            Some(other_iref.as_str()),
+            "I2114(5) the lazy path never replaces an identity-ref with a different one"
+        );
+
+        // (6) the lazy path of an engine with no composite signer tells nothing.
+        let lazy_plain = Engine::from_shared(fresh(dsn).await, hw.clone());
+        lazy_plain.ensure_backend_node_key().await;
+        assert_eq!(
+            lazy_plain.backend_node_key_id(),
+            None,
+            "I2114(6) no composite signer, no node key — even lazily"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i2114_shared_node_key_rule_sqlite() {
+        i2114_body("sqlite::memory:").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn i2114_shared_node_key_rule_postgres() {
+        let Some(dsn) = crate::test_pg::dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        i2114_body(&dsn).await;
     }
 }
