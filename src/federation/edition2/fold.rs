@@ -2166,12 +2166,15 @@ where
         if super::ingest::is_key_record(&st) {
             keys.insert_record(st.clone());
         }
-        let Ok(a) = super::door::admit_row(
-            &st,
-            &keys,
-            Some(&row_id.0),
-            ciris_verify_core::edition2::family::SelectContext::default(),
-        ) else {
+        // v62.0.0 (PIN-fix2; CIRISVerify 23.4.1) — a composer is re-admitted
+        // with its held target (`SelectContext.target`), as the put door
+        // admits it; without it Verify waits on the target and the row could
+        // never re-fold.
+        let ctx = ciris_verify_core::edition2::family::SelectContext {
+            target: super::typed::held_target_row(dir, &st).await?,
+            ..Default::default()
+        };
+        let Ok(a) = super::door::admit_row(&st, &keys, Some(&row_id.0), ctx) else {
             continue;
         };
         if a.author.as_deref() == Some(a.iss.as_str()) {

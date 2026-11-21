@@ -288,6 +288,59 @@ pub fn fill_context_from_bytes(
     }
 }
 
+/// v62.0.0 (PIN-fix2; CIRISVerify 23.4.1) — **the row a composer names, as
+/// this node holds it**: for a statement whose row type is one of Verify's
+/// composers (`edition2::is_composer`: `withdraws` / `recants`, the rows that
+/// carry no dimension; a `supersedes` keeps its own leaf and is `None` here
+/// once Verify's list is narrowed), the held statement whose row id is its
+/// `refs.target`, as Verify's `TargetRow` (row id, family -70002, payload).
+/// `None` for any other row, a composer naming no target, or a target this
+/// node does not hold.
+///
+/// # Errors
+/// Directory reads.
+pub async fn held_target_row<F>(
+    dir: &F,
+    bytes: &[u8],
+) -> Result<Option<ciris_verify_core::edition2::family::TargetRow>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some((protected, payload)) = super::liveness::statement_parts(bytes) else {
+        return Ok(None);
+    };
+    if !protected
+        .get_int(-70001)
+        .and_then(Value::as_text)
+        .is_some_and(ciris_verify_core::edition2::is_composer)
+    {
+        return Ok(None);
+    }
+    let Some(target) = super::names::names_of(&payload)
+        .ok()
+        .and_then(|n| single(&n, "target"))
+    else {
+        return Ok(None);
+    };
+    for st in dir.edition2_voices(&target).await? {
+        if RowId::of_statement(&st) != Some(target) {
+            continue;
+        }
+        let Some((tp, tpayload)) = super::liveness::statement_parts(&st) else {
+            continue;
+        };
+        let Some(family_id) = tp.get_int(-70002).and_then(Value::as_text) else {
+            continue;
+        };
+        return Ok(Some(ciris_verify_core::edition2::family::TargetRow {
+            row_id: target.0,
+            family_id: family_id.to_owned(),
+            payload: tpayload,
+        }));
+    }
+    Ok(None)
+}
+
 /// v62.0.0 (T2-fix1; CC 3.1.3) — **the selector context a typed family's
 /// authorship cell reads**, which Verify's door cannot know from the bytes
 /// alone (`SelectContext` keys left `None` read unknown, and an undecided
@@ -325,7 +378,14 @@ where
     F: FederationDirectory + ?Sized,
 {
     use ciris_verify_core::edition2::family::{select::Group, SelectContext};
-    let mut ctx = SelectContext::default();
+    // v62.0.0 (PIN-fix2; CIRISVerify 23.4.1) — a `withdraws` / `recants`
+    // carries no dimension: its leaf, and so its authorship, are its TARGET's,
+    // which Verify reads from `SelectContext.target`. A target not held is
+    // left `None`, and Verify waits on it (`MissingKey::Row`).
+    let mut ctx = SelectContext {
+        target: held_target_row(dir, bytes).await?,
+        ..Default::default()
+    };
     let Some((protected, payload)) = super::liveness::statement_parts(bytes) else {
         return Ok(ctx);
     };

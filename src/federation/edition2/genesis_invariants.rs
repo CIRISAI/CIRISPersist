@@ -5,7 +5,7 @@
 //! moved bundles v3 to v4 and reseat v2 to v3, Verify 23.3.3 `dial_hints`).
 //!
 //! - I2300: the vendored files are Verify 23.3.1's, byte for byte.
-//! - I2301: every case of `genesis_bundles_v5.json` read through
+//! - I2301: every case of `genesis_bundles_v6.json` read through
 //!   [`read_lineage`] gives Verify's verdict for each offered object, with a
 //!   case's predecessor chain HELD (each held first bundle rooted by its own
 //!   object id, as the store re-reads it) and its anchor rooting only what
@@ -111,7 +111,11 @@ pub(crate) mod vectors {
         };
     }
 
-    /// `genesis_bundles_v5.json` (the case list; VB-vectors: v4 → v5, every
+    /// `genesis_bundles_v6.json` (the case list; PIN-fix2, CIRISVerify 23.4.1:
+    /// v5 → v6, the charter names of CC v1.0-rc22-pre2: `transparency_services`
+    /// / `receipt_quorum` / `receipt_cadence_secs`, and the cases
+    /// `transparency_members_partial` / `receipt_quorum_mismatch` replace the
+    /// two witness cases; VB-vectors: v4 → v5, every
     /// bundle voice states CWT `sub`; CE-fix3: v3 → v4, every seat
     /// binding gains `dial_hints`, plus the 12 `binding_dial_hint*` cases).
     /// Before that, v62.0.0 (R1): Verify
@@ -119,23 +123,26 @@ pub(crate) mod vectors {
     /// seat's own `identity:occurrence`); v2's valid bundles no longer verify,
     /// so v2 is no longer vendored. The const keeps its name (`V2`, the
     /// bundle/2 case list) for the store witnesses that read it.
-    pub(crate) const V2: &str = vendored!("genesis_bundles_v5.json");
-    /// The statements of `genesis_bundles_v5.json`, split as Verify splits them.
+    pub(crate) const V2: &str = vendored!("genesis_bundles_v6.json");
+    /// The statements of `genesis_bundles_v6.json`, split as Verify splits them.
     pub(crate) const POOL: [&str; 8] = [
-        vendored!("pool_v5_0.json"),
-        vendored!("pool_v5_1.json"),
-        vendored!("pool_v5_2.json"),
-        vendored!("pool_v5_3.json"),
-        vendored!("pool_v5_4.json"),
-        vendored!("pool_v5_5.json"),
-        vendored!("pool_v5_6.json"),
-        vendored!("pool_v5_7.json"),
+        vendored!("pool_v6_0.json"),
+        vendored!("pool_v6_1.json"),
+        vendored!("pool_v6_2.json"),
+        vendored!("pool_v6_3.json"),
+        vendored!("pool_v6_4.json"),
+        vendored!("pool_v6_5.json"),
+        vendored!("pool_v6_6.json"),
+        vendored!("pool_v6_7.json"),
     ];
     /// `genesis_reseat_v4.json` (its own pool inside; VB-vectors: v3 → v4, the
     /// voices carry `sub`; CE-fix3: v2 → v3, the bindings carry `dial_hints`).
     pub(crate) const RESEAT: &str = vendored!("genesis_reseat_v4.json");
 
-    /// Each vendored file and its SHA-256 at CIRISVerify 23.4.0, the TESTED
+    /// Each vendored file and its SHA-256. PIN-fix2 (CIRISVerify 23.4.1, PR #354
+    /// head a6eba8ae, PROVISIONAL until the tag): the v6 bundles and pools,
+    /// hashed from the vendored bytes (bundles 82778bc1…, Verify's stated
+    /// value); the re-seat v4 is unchanged. Before: at CIRISVerify 23.4.0, the TESTED
     /// rev 320d41f (VB-vectors2: the same files re-minted with i2p / kiss / ble
     /// known and up to 8 hints; read the 4n-regen pins). Earlier (VB-vectors:
     /// the v5 bundles and the v4 re-seat, every bundle voice carrying CWT
@@ -145,9 +152,9 @@ pub(crate) mod vectors {
     pub(crate) fn pinned() -> [(&'static str, &'static str, &'static str); 10] {
         [
             (
-                "genesis_bundles_v5.json",
+                "genesis_bundles_v6.json",
                 V2,
-                "e5f3a01f71a83986ed5ba44c08b7f6fcfcd6dc01ca1594673daf99fd849c11a2",
+                "82778bc136e33af7c3c6eaf9fde763b74096868a5186f931f69c3e969bb97be9",
             ),
             (
                 "genesis_reseat_v4.json",
@@ -155,49 +162,49 @@ pub(crate) mod vectors {
                 "f95e69d1dc79530266f953344c53d62274b885e3610d22a9033ac98f36e44f90",
             ),
             (
-                "pool_v5_0.json",
+                "pool_v6_0.json",
                 POOL[0],
-                "3c795d94ef1c59921fc9e64b8d9b9af45a8154218fca4c5730f12ee3d2438314",
+                "6806274ed0cb7d7a9cbdc66eceae508b4f5f1b1d92bd4eb63b3fe6aa87b5910d",
             ),
             (
-                "pool_v5_1.json",
+                "pool_v6_1.json",
                 POOL[1],
-                "c2171836494c637958a0f8dcbd81fbf0bd52281712e33184b7ddb319bbf26eec",
+                "346f6a3014620df1d9d893c752a5bc69e9ce88a1ae1457b8d2e9e4acc741f8e9",
             ),
             (
-                "pool_v5_2.json",
+                "pool_v6_2.json",
                 POOL[2],
-                "17f1aa8574adb5b501cafed46ebc18869d2cfd2609b9553cb5784369f4d200c8",
+                "40bdbd08308b198c58fc574b936172bf55a6f55be0c4d9dc6fbcb38a70c04f3e",
             ),
             (
-                "pool_v5_3.json",
+                "pool_v6_3.json",
                 POOL[3],
-                "a3274ae99baac2dd64ba4520a0af91c576d7c721002147ca6c62e92542f5567a",
+                "7ddf9f90594212d6880155fb9cd33900d4136e9c01ecbea8c94a4366aaf3a6ff",
             ),
             (
-                "pool_v5_4.json",
+                "pool_v6_4.json",
                 POOL[4],
-                "3960f61ebd84affccbb73513e35b8f5125fccdd0dc2e76c31bd8b260e878b7c8",
+                "5d2b5742a9bd817ca77469637f35867481044361fa5dbcd92e7651a2478be43e",
             ),
             (
-                "pool_v5_5.json",
+                "pool_v6_5.json",
                 POOL[5],
-                "9f0667a4858eecf220e90fb0db6bd86322aa4b2b50d1d2b6b895ca995c5d8331",
+                "e39132315ef43e46e8c10a2fa504421e5de1ca5823e3ff7d8413e45e43145720",
             ),
             (
-                "pool_v5_6.json",
+                "pool_v6_6.json",
                 POOL[6],
-                "3d769d4c903331add758942301596d43a9bf0ac372fcf294a40f0a1409dbeb4c",
+                "9d2596b8e5c88ae2f9c75fd020b6d705d902c7bc6819b7ed45a0ab409692c467",
             ),
             (
-                "pool_v5_7.json",
+                "pool_v6_7.json",
                 POOL[7],
-                "b4fb0d084a7d3bf8e296de7a8572e956167bc3d8c9d57ede06af3283827aa012",
+                "919a6bbb8382b65704b8f084ac7a764748184adeb02c8ac02da3b3d18318c7a8",
             ),
         ]
     }
 
-    /// `genesis_bundles_v5.json` with its pool merged in under `pool`.
+    /// `genesis_bundles_v6.json` with its pool merged in under `pool`.
     pub(crate) fn v2() -> &'static J {
         static F: OnceLock<J> = OnceLock::new();
         F.get_or_init(|| {

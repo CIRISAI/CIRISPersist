@@ -632,11 +632,12 @@ where
     D: FederationDirectory + Sync + ?Sized,
 {
     let keys = super::edition2::ingest::held_keys_for(dir, statement).await?;
-    let admitted = super::edition2::door::admit_row(
-        statement,
-        &keys,
-        None,
-        ciris_verify_core::edition2::family::SelectContext::default(),
-    )?;
+    // v62.0.0 (PIN-fix2) — a composer is admitted with its held target, as
+    // the put door admits it (`typed::family_context`).
+    let ctx = ciris_verify_core::edition2::family::SelectContext {
+        target: super::edition2::typed::held_target_row(dir, statement).await?,
+        ..Default::default()
+    };
+    let admitted = super::edition2::door::admit_row(statement, &keys, None, ctx)?;
     super::edition2::ingest::attestation_of(&admitted, super::types::attestation_tier::FEDERATION)
 }

@@ -81,7 +81,8 @@ async fn record_and_read_head<A: AuditService, D: crate::federation::FederationD
         .unwrap_or_else(|| panic!("{backend}: the Merkle hook stored no head"));
     assert_eq!(head.tree_size, 1, "{backend}: the head covers the one leaf");
     assert_eq!(
-        head.timestamp, at,
+        crate::verify::utc::from_verify(head.timestamp).unwrap(),
+        at,
         "{backend}: the signed head must carry the installed clock's instant"
     );
 }
@@ -181,7 +182,7 @@ mod postgres {
         let root = store.root().await.unwrap();
         let signer = merkle_signer(0x95);
         let log_id = crate::audit::merkle_store::log_id_for_tenant(&tenant);
-        let at = fixed_instant();
+        let at = crate::verify::utc::to_verify(fixed_instant()).unwrap();
         let bytes = SignedTreeHead::signing_bytes(&log_id, 3, &root, at);
         let sth = SignedTreeHead {
             log_id,

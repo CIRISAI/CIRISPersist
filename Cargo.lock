@@ -805,8 +805,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-crypto"
-version = "23.4.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v23.4.0#03f19b771cd67d147975c2ba87a85e0d8d5aef75"
+version = "23.4.1"
+source = "git+https://github.com/CIRISAI/CIRISVerify?rev=a6eba8ae7e0abcae06a30a4f9927cdc43f498fd6#a6eba8ae7e0abcae06a30a4f9927cdc43f498fd6"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -832,8 +832,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-host-abi"
-version = "23.4.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v23.4.0#03f19b771cd67d147975c2ba87a85e0d8d5aef75"
+version = "23.4.1"
+source = "git+https://github.com/CIRISAI/CIRISVerify?rev=a6eba8ae7e0abcae06a30a4f9927cdc43f498fd6#a6eba8ae7e0abcae06a30a4f9927cdc43f498fd6"
 dependencies = [
  "proc-macro2",
  "wasmparser",
@@ -849,8 +849,8 @@ source = "git+https://github.com/CIRISAI/CIRISKernel?tag=kernel-v0.2.0#78b2f677d
 
 [[package]]
 name = "ciris-keyring"
-version = "23.4.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v23.4.0#03f19b771cd67d147975c2ba87a85e0d8d5aef75"
+version = "23.4.1"
+source = "git+https://github.com/CIRISAI/CIRISVerify?rev=a6eba8ae7e0abcae06a30a4f9927cdc43f498fd6#a6eba8ae7e0abcae06a30a4f9927cdc43f498fd6"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -956,14 +956,13 @@ dependencies = [
 
 [[package]]
 name = "ciris-verify-core"
-version = "23.4.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v23.4.0#03f19b771cd67d147975c2ba87a85e0d8d5aef75"
+version = "23.4.1"
+source = "git+https://github.com/CIRISAI/CIRISVerify?rev=a6eba8ae7e0abcae06a30a4f9927cdc43f498fd6#a6eba8ae7e0abcae06a30a4f9927cdc43f498fd6"
 dependencies = [
  "android_system_properties",
  "async-trait",
  "base64 0.21.7",
  "chacha20poly1305",
- "chrono",
  "ciborium",
  "ciris-crypto",
  "ciris-keyring",

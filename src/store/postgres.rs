@@ -1592,6 +1592,9 @@ impl crate::federation::blob_admit::BlobFloorStore for PostgresBackend {
             .map_err(|e| BlobError::Backend(format!("put_stream_sth witness json: {e}")))?;
         let epoch_i64 = 0i64;
         let root = sth.sth.root_hash.to_vec();
+        // v62.0.0 (PIN-fix2) — Verify's instant, back as the column's.
+        let signed_at = crate::verify::utc::from_verify(sth.sth.timestamp)
+            .map_err(|e| BlobError::Backend(format!("put_stream_sth: {e}")))?;
         let client = self
             .get_client()
             .await
@@ -1608,7 +1611,7 @@ impl crate::federation::blob_admit::BlobFloorStore for PostgresBackend {
                     &sth.tree_size_i64,
                     &epoch_i64,
                     &root,
-                    &sth.sth.timestamp,
+                    &signed_at,
                     &sth.producer_key_id,
                     &sth.signature_blob,
                     &witness_value,
@@ -18818,7 +18821,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
             log_id: crate::federation::stream_sth::log_id_for_stream(stream_id),
             tree_size,
             root_hash,
-            timestamp: signed_at,
+            // v62.0.0 (PIN-fix2) — the stored instant, into Verify's.
+            timestamp: crate::verify::utc::to_verify(signed_at).map_err(|e| {
+                crate::federation::BlobError::Backend(format!("latest_stream_sth: {e}"))
+            })?,
             signature,
             witness_signatures,
         }))
@@ -43712,7 +43718,7 @@ mod tests {
         }
         let root_hash = store.root().unwrap();
         let log_id = crate::federation::stream_sth::log_id_for_stream(stream_id);
-        let timestamp = chrono::Utc::now();
+        let timestamp = crate::verify::utc::to_verify(chrono::Utc::now()).unwrap();
         let signing_bytes = ciris_verify_core::transparency::SignedTreeHead::signing_bytes(
             &log_id, tree_size, &root_hash, timestamp,
         );

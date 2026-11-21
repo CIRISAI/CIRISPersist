@@ -18,7 +18,7 @@ path = "src/lib.rs"
 
 [dependencies]
 ciris-persist = { path = "../..", default-features = false, features = ["sqlite", "host-abi"] }
-ciris-host-abi = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23.4.0", version = "23", features = ["getrandom-backend"] }
+ciris-host-abi = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "a6eba8ae7e0abcae06a30a4f9927cdc43f498fd6", version = "23", features = ["getrandom-backend"] }
 
 [profile.release]
 opt-level = "s"

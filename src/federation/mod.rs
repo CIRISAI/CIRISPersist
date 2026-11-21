@@ -357,6 +357,10 @@ mod affiliation_licence_invariants;
 /// the instant it is given (I950).
 #[cfg(test)]
 pub(crate) mod attestation_admit_invariants;
+/// v62.0.0 (PIN-fix2) — the dimension gate asks a `withdraws` / `recants`
+/// its held target's dimension (I2433).
+#[cfg(test)]
+mod composer_gate_invariants;
 /// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
 /// is refused at admission (I590).
 #[cfg(test)]

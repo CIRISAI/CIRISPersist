@@ -66,7 +66,12 @@ fn head(
     root: [u8; 32],
     operator: &CompositeSigningKey,
 ) -> SignedTreeHead {
-    let timestamp: chrono::DateTime<chrono::Utc> = "2026-11-15T12:00:00.123456Z".parse().unwrap();
+    let timestamp = crate::verify::utc::to_verify(
+        "2026-11-15T12:00:00.123456Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap(),
+    )
+    .unwrap();
     let bytes = SignedTreeHead::signing_bytes(log_id, tree_size, &root, timestamp);
     SignedTreeHead {
         log_id: log_id.to_owned(),

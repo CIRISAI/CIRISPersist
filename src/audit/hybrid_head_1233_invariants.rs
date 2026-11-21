@@ -51,7 +51,10 @@ pub(crate) mod bodies {
         tree_size: u64,
     ) -> (SignedTreeHead, String, String) {
         let signer = crate::federation::tier_ingest::test_support::local_signer(SIGNER);
-        let timestamp = crate::audit::verify::truncate_to_micros(chrono::Utc::now());
+        let timestamp = crate::verify::utc::to_verify(crate::audit::verify::truncate_to_micros(
+            chrono::Utc::now(),
+        ))
+        .unwrap();
         let root_hash = [0x5Au8; 32];
         let bytes = SignedTreeHead::signing_bytes(log_id, tree_size, &root_hash, timestamp);
         let signature = crate::federation::sth_form::sign_sth(&signer, &bytes)

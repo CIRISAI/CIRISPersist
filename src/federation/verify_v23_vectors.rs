@@ -29,7 +29,7 @@
 //! the JSON lineage) are dropped with their orphaned v2 sibling and the
 //! `tests/vectors/accord_lineage/` files they built on: nothing replays them,
 //! and an edition-2 recovery is one recovery voice over bundle/2, which the
-//! genesis vectors' `recovery_*` cases cover (`genesis_bundles_v5.json`,
+//! genesis vectors' `recovery_*` cases cover (`genesis_bundles_v6.json`,
 //! I2301).
 //!
 //! - **I2360** (slice C3) the three Verify 23.3.0 files carry the case

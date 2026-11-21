@@ -595,6 +595,63 @@ pub(crate) fn trust_graph_deps(signer: &str) -> [super::edition2::fold::Dep; 2] 
 }
 
 /// Store a planned row; an occupied id is decided by the #771 verdict.
+/// v62.0.0 (PIN-fix2) — **the dimension the dimension gate asks of a
+/// `withdraws` / `recants`**: its held target's (the composer carries none,
+/// CIRISVerify 23.4.1). `None` for every other row (the gate reads the row's
+/// own dimension), for a row that carries no edition-2 statement, and for a
+/// target whose family scores no dimension.
+///
+/// # Errors
+/// The held `link_unheld` wait (`WithdrawsTargetUnheld`) when the composer
+/// names a target this node does not hold; directory reads.
+pub(crate) async fn composer_gate_dimension(
+    dir: &dyn crate::federation::FederationDirectory,
+    row: &crate::federation::Attestation,
+) -> Result<Option<String>, crate::federation::Error> {
+    if !crate::federation::edition2::emit::carries_no_dimension(&row.attestation_type) {
+        return Ok(None);
+    }
+    let Some(statement) = crate::federation::edition2::emit::carried_statement(row) else {
+        return Ok(None);
+    };
+    match crate::federation::edition2::typed::held_target_row(dir, &statement).await? {
+        Some(t) => Ok(t
+            .payload
+            .get_text("dimension")
+            .and_then(ciris_verify_core::cde::Value::as_text)
+            .map(str::to_owned)),
+        None => {
+            let named = row
+                .attestation_envelope
+                .get(crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let Some(target) = named else {
+                // A composer naming no target: Verify's reader refuses it.
+                return Ok(None);
+            };
+            // A target held as a mapped row only (no edition-2 statement of
+            // it, e.g. one stored before edition 2): its own dimension.
+            if let Some(t) = dir.get_attestation(&target).await? {
+                return Ok(crate::federation::admission::envelope_dimension(
+                    &t.attestation_envelope,
+                )
+                .map(str::to_owned));
+            }
+            if let Some(dep) = crate::federation::edition2::fold::Dep::row_hex(&target) {
+                crate::federation::edition2::fold::reads(dep);
+            }
+            Err(crate::federation::edition2::fold::hold(
+                crate::federation::edition2::fold::reason::LINK_UNHELD,
+                crate::federation::Error::WithdrawsTargetUnheld {
+                    attestation_id: row.attestation_id.clone(),
+                    target_attestation_id: target,
+                },
+            ))
+        }
+    }
+}
+
 async fn execute_planned<D>(
     dir: &D,
     planned: PlannedAttestation,
@@ -1022,7 +1079,18 @@ where
     // primitives are exempt. See `src/federation/admission.rs`.
     {
         let policy = crate::federation::admission::DimensionAdmissionPolicy::default();
-        let dim = crate::federation::admission::envelope_dimension(&row.attestation_envelope);
+        // v62.0.0 (PIN-fix2; CIRISVerify 23.4.1, CC part 3 l.2543 "a reserved
+        // family that rides a structural composer is checked at the same
+        // point") — a `withdraws` / `recants` carries no dimension, so the gate
+        // asks its TARGET's, read from the held target through the one
+        // resolver the put doors pass Verify (`typed::held_target_row`). A
+        // target not held is waited for (as `check_composer_target` does),
+        // never skipped.
+        let target_dimension = composer_gate_dimension(dir.as_dyn_directory(), &row).await?;
+        let dim = match &target_dimension {
+            Some(d) => Some(d.as_str()),
+            None => crate::federation::admission::envelope_dimension(&row.attestation_envelope),
+        };
         match standing {
             crate::federation::admission::EmitterStanding::Conferred => {
                 policy.check_conferred(&row.attestation_type, dim, &attesting_identity_type)?;

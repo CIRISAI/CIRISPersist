@@ -16,6 +16,9 @@ pub mod ed25519;
 pub mod hybrid;
 pub mod named_key;
 pub mod sig19;
+// v62.0.0 (PIN-fix2; CIRISVerify 23.4.1 removed chrono) — the ONE boundary
+// between persist's `chrono::DateTime<Utc>` and Verify's `UtcDateTime`.
+pub mod utc;
 
 pub use canonical::{
     body_sha256, canonicalize_envelope_for_signing, canonicalize_envelope_for_signing_v1_pinned,

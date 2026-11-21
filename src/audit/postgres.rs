@@ -80,7 +80,9 @@ async fn merkle_hook_pg(
 
     // 2. Sign the STH: the composite (v62.0.0, CC 2.6.1.7), the only form
     //    a v62 node writes.
-    let timestamp = crate::host::clock::now();
+    // v62.0.0 (PIN-fix2) — the head's instant crosses into Verify here.
+    let timestamp = crate::verify::utc::to_verify(crate::host::clock::now())
+        .map_err(|e| Error::Merkle(format!("sth timestamp: {e}")))?;
     let signing_bytes = SignedTreeHead::signing_bytes(&log_id, tree_size, &root_hash, timestamp);
     let signature = super::sth_form::sign_sth(&signer, &signing_bytes)
         .await

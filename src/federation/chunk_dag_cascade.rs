@@ -6325,7 +6325,7 @@ pub mod invariants {
         }
         let root_hash = store.root().unwrap();
         let log_id = crate::federation::stream_sth::log_id_for_stream(stream_id);
-        let timestamp = crate::host::clock::now();
+        let timestamp = crate::verify::utc::to_verify(crate::host::clock::now()).unwrap();
         let signing_bytes = ciris_verify_core::transparency::SignedTreeHead::signing_bytes(
             &log_id, tree_size, &root_hash, timestamp,
         );

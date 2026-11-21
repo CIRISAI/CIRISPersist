@@ -226,6 +226,9 @@ pub async fn produce_stream_sth(
         .root()
         .map_err(|e| BlobError::Backend(format!("stream-sth root: {e}")))?;
     let log_id = log_id_for_stream(stream_id);
+    // v62.0.0 (PIN-fix2) — the head's instant crosses into Verify here.
+    let timestamp = crate::verify::utc::to_verify(timestamp)
+        .map_err(|e| BlobError::InvalidArgument(format!("produce_stream_sth: {e}")))?;
     let signing_bytes = SignedTreeHead::signing_bytes(&log_id, tree_size, &root_hash, timestamp);
     // v62.0.0 (slice D) — the composite (CC 2.6.1.7), the only form a v62
     // node writes.
@@ -455,7 +458,7 @@ mod tests {
             log_id: log_id_for_stream("s1"),
             tree_size: 3,
             root_hash: root,
-            timestamp: chrono::Utc::now(),
+            timestamp: crate::verify::utc::to_verify(chrono::Utc::now()).unwrap(),
             signature: dummy_sig_bytes(),
             witness_signatures: Vec::new(),
         };
@@ -469,7 +472,7 @@ mod tests {
             log_id: log_id_for_stream("s1"),
             tree_size: 3,
             root_hash: [0xFF; 32], // wrong root
-            timestamp: chrono::Utc::now(),
+            timestamp: crate::verify::utc::to_verify(chrono::Utc::now()).unwrap(),
             signature: dummy_sig_bytes(),
             witness_signatures: Vec::new(),
         };
@@ -484,7 +487,7 @@ mod tests {
             log_id: log_id_for_stream("s1"),
             tree_size: 5, // more than the 2 chunks held
             root_hash: store.root().unwrap(),
-            timestamp: chrono::Utc::now(),
+            timestamp: crate::verify::utc::to_verify(chrono::Utc::now()).unwrap(),
             signature: dummy_sig_bytes(),
             witness_signatures: Vec::new(),
         };

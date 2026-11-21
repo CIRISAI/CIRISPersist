@@ -91,16 +91,18 @@ impl CcTag {
 /// (`v1.0-rc21`, `b016df47`). v62.0.0 (4r) vendored rc22 at commit `8c436b8b`,
 /// untagged, so PENDING; v62.0.0 (CC-tag) moves the pin to the commit CC
 /// tagged `v1.0-rc22-pre1` (tag object `74029fc3`, commit `0774639b`) and
-/// RECORDS it. A later manifest-changing CC commit lands untagged again (a
-/// `pre2`): set this back to `CcTag::Pending` until CC tags it.
+/// RECORDS it. v62.0.0 (PIN-fix1): the pin moves to `v1.0-rc22-pre2` (tag
+/// object `6f56ae85`, commit `bab36531`), the SCITT charter rename. A later
+/// manifest-changing CC commit lands untagged again: set this back to
+/// `CcTag::Pending` until CC tags it.
 /// `scripts/check_vendored_cc.sh` and `scripts/release_ship.sh` read this
 /// line's text (`pub const VENDORED_CC_TAG: CcTag = CcTag::Pending;` or
 /// `... CcTag::Recorded("<tag>");`): keep it on one line.
-pub const VENDORED_CC_TAG: CcTag = CcTag::Recorded("v1.0-rc22-pre1");
+pub const VENDORED_CC_TAG: CcTag = CcTag::Recorded("v1.0-rc22-pre2");
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "a221ca4ea3d6b02d7ac2354a0b68272d5f6283a396a12b8a40fd0e7b910f6eeb";
+    "0d91fa0eacc968739cc0eb0d8ac776d3ee7020de39701c549c4691e95f50d21d";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
 pub const VENDORED_N_FAMILIES: usize = 189;
@@ -120,7 +122,12 @@ pub const VENDORED_REGISTRY_SHA256: &str =
     "23a4e129f09532b3b896f39522da88995e8453c4b15ba9d9012da1f75e9795c4";
 
 /// The CIRISConstitution commit every vendored CC manifest was copied from.
-/// v62.0.0 (CC-tag): `0774639b`, the commit the `v1.0-rc22-pre1` tag names
+/// v62.0.0 (PIN-fix1): `bab36531`, the commit the `v1.0-rc22-pre2` tag names.
+/// From pre1 the registry moves in `_meta.source_sha256` only (part 3 carries
+/// the SCITT charter rename; the grammar hash `VENDORED_REGISTRY_SHA256` does
+/// not move) and the CSD/4 chain in `_meta.pins.claims_sha256` only; the
+/// other vendored files are byte-identical. v62.0.0 (CC-tag): `0774639b`,
+/// the commit the `v1.0-rc22-pre1` tag names
 /// ([`VENDORED_CC_TAG`]). From 4r's untagged `8c436b8b` (the commit
 /// CIRISVerify v23.4.0 vendors) no vendored file's bytes move: under
 /// `manifests/` only `family_payloads_v2.cddl` (not vendored) changed, so
@@ -141,13 +148,13 @@ pub const VENDORED_REGISTRY_SHA256: &str =
 /// `scripts/check_vendored_cc.sh` byte-compares all of them against the
 /// commit (pending) or the tag (recorded) before a persist release is tagged,
 /// and refuses the release while the tag is pending.
-pub const VENDORED_CC_COMMIT: &str = "0774639b9a76f7746569446c3eb56439a74e7a09";
+pub const VENDORED_CC_COMMIT: &str = "bab36531a36473d8c29f9c4023cbe821ae16311d";
 
 /// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
 /// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).
 /// What `scripts/check_vendored_cc.sh` compares against the tag.
 pub const VENDORED_REGISTRY_FILE_SHA256: &str =
-    "01f6c39b14de1ca068a26b18ee5ddddb4a5989e4394829ab4d5e5a20bfee3645";
+    "054ed9efc3c3f88dbe89f53453bdd43905b95592273d0e30742cf157389927bb";
 
 /// SHA-256 of the vendored `namespace_match_vectors.json` FILE bytes.
 pub const VENDORED_VECTORS_FILE_SHA256: &str =

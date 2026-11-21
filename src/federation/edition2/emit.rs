@@ -248,6 +248,18 @@ pub const COMPOSER_EARLIER_MEMBERS: &[&str] = &[
     "references_attestation_type",
 ];
 
+/// v62.0.0 (PIN-fix2 rev 2; CIRISVerify 23.4.1, the Constitution's ruling of
+/// 2026-11-21) — **the composers that carry no `dimension`**: a
+/// `withdraws` / `recants` scores nothing; its leaf and authorship are its
+/// target's (Verify refuses one that states a dimension,
+/// `Malformed { member: "dimension" }`). Read from Verify's own list
+/// (`edition2::is_composer`), the one source. A `supersedes` is a
+/// REPLACEMENT statement (CC 2.4.1): it keeps its own `dimension` and leaf.
+#[must_use]
+pub fn carries_no_dimension(row_type: &str) -> bool {
+    ciris_verify_core::edition2::is_composer(row_type)
+}
+
 /// **The JSON members of a row as its edition-2 payload.**
 ///
 /// v62.0.0 (wave P1e) — `family` is the family id the row is stated under
@@ -435,6 +447,23 @@ pub fn family_for(
     use crate::federation::types::attestation_type as t;
     if let Some(f) = explicit {
         return Ok(f.to_owned());
+    }
+    // v62.0.0 (PIN-fix2 rev 2; CIRISVerify 23.4.1) — a `withdraws` /
+    // `recants` takes its family from its target and nothing else: a
+    // dimension the host envelope still names is not read for it (the payload
+    // drops it, [`carries_no_dimension`]). A `supersedes` keeps its own
+    // dimension and resolves below like any row.
+    if carries_no_dimension(row_type) {
+        return target_statement
+            .and_then(family_of_statement)
+            .map(|(f, _)| f)
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "edition2_payload_invalid: a {row_type} carries its target's family \
+                     (CC-READING(next-edition)), and its target is not an edition-2 row this \
+                     node holds"
+                ))
+            });
     }
     if let Some(d) = envelope
         .get("dimension")
@@ -912,7 +941,16 @@ pub fn row_payload(
     target: Option<&Digest32>,
 ) -> Result<Value, Error> {
     let composer = super::payloads::COMPOSER_ROW_TYPES.contains(&row_type);
-    let drop: &[&str] = if composer {
+    // v62.0.0 (PIN-fix2 rev 2) — a `withdraws` / `recants` states no
+    // `dimension` ([`carries_no_dimension`]); a `supersedes` keeps its own.
+    let retraction_drop: Vec<&str> = COMPOSER_EARLIER_MEMBERS
+        .iter()
+        .copied()
+        .chain(std::iter::once("dimension"))
+        .collect();
+    let drop: &[&str] = if carries_no_dimension(row_type) {
+        &retraction_drop
+    } else if composer {
         COMPOSER_EARLIER_MEMBERS
     } else {
         &["references_attestation_id"]

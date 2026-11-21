@@ -1519,12 +1519,18 @@ where
 {
     let mut voices = std::collections::BTreeSet::new();
     for st in dir.edition2_voices(event_row_id).await? {
+        // BF27: resolved before `keys` (a `&dyn KeyDirectory` is not `Send` across an await).
+        let target = super::edition2::typed::held_target_row(dir, &st).await?;
         let keys = super::edition2::ingest::held_keys_for(dir, &st).await?;
         if let Ok(row) = super::edition2::door::admit_row(
             &st,
             &keys,
             Some(&event_row_id.0),
-            ciris_verify_core::edition2::family::SelectContext::default(),
+            // v62.0.0 (PIN-fix2) — a composer event's held target.
+            ciris_verify_core::edition2::family::SelectContext {
+                target,
+                ..Default::default()
+            },
         ) {
             voices.insert(row.iss);
         }

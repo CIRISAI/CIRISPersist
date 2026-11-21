@@ -863,6 +863,15 @@ fn payload_of(row: &Attestation, family: &str, signer_iref: &str) -> Value {
     // `null` is no ceg-value, CC 2.6.1.3; `emit::payload_from_envelope` skips
     // it the same way).
     o.retain(|_, v| !v.is_null());
+    // v62.0.0 (PIN-fix2 rev 2; CIRISVerify 23.4.1) — a `withdraws` /
+    // `recants` carries no `dimension` (Verify refuses one; its leaf is its
+    // target's), as the producers state it (`emit::carries_no_dimension`): a
+    // fixture retraction built from a clone of its target, or with the
+    // target's dimension copied in, is stated without it. A `supersedes`
+    // keeps its own.
+    if super::emit::carries_no_dimension(&row.attestation_type) {
+        o.remove("dimension");
+    }
     // v62.0.0 (E0 fix 9; P1's `REF_MEMBERS`, CC 2.6.1.3 "a member that names
     // a row stands in `refs` and nowhere else") — the earlier members this
     // family states under a `refs` role (a deferral response's
@@ -1450,6 +1459,10 @@ pub fn voices_of(row: &Attestation, seeds_: &[&str]) -> Vec<Vec<u8>> {
 /// **A composer** (`withdraws` / `recants` / `supersedes`) of `target`,
 /// signed by `seed`: `refs.target` names the target's row id and the row
 /// carries the target's family (CC 2.4.1.1), about the target's subject.
+/// v62.0.0 (PIN-fix2 rev 2; CIRISVerify 23.4.1) — a `withdraws` /
+/// `recants` carries NO `dimension` (Verify refuses one; its leaf is its
+/// target's, read from the held target, `typed::held_target_row`); a
+/// `supersedes` restates the target's dimension (a replacement keeps its own).
 ///
 /// # Panics
 /// `kind` is not a composer; the door refuses it.
@@ -1473,8 +1486,10 @@ pub fn composer_of(kind: &str, target: &Attestation, seed: &str) -> Attestation 
     row.expires_at = None;
     row.subject_key_ids = Vec::new();
     let mut envelope = serde_json::Map::new();
-    if let Some(d) = target.attestation_envelope.get("dimension") {
-        envelope.insert("dimension".to_owned(), d.clone());
+    if !super::emit::carries_no_dimension(kind) {
+        if let Some(d) = target.attestation_envelope.get("dimension") {
+            envelope.insert("dimension".to_owned(), d.clone());
+        }
     }
     envelope.insert(
         REFERENCES_MEMBER.to_owned(),

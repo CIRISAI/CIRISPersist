@@ -1,5 +1,5 @@
 //! **The CC manifests persist vendors beside the namespace registry, pinned
-//! at the CIRISConstitution tag `v1.0-rc22-pre1` (commit `0774639b`;
+//! at the CIRISConstitution tag `v1.0-rc22-pre2` (commit `bab36531`;
 //! [`VENDORED_CC_TAG`](super::registry::VENDORED_CC_TAG)).**
 //!
 //! v62.0.0 (4r): re-copied at rc22 commit `8c436b8b` (then untagged). Of these
@@ -9,7 +9,10 @@
 //! only (`1.0-rc21` → `1.0-rc22`), so its file pin moves and
 //! [`crate::wire_vocabulary::WIRE_VOCABULARY_HASH`] does not. v62.0.0
 //! (CC-tag): the tag's commit `0774639b` carries every one of these files
-//! byte-identical to `8c436b8b`. The rc21 history follows.
+//! byte-identical to `8c436b8b`. v62.0.0 (PIN-fix1): at `v1.0-rc22-pre2`
+//! (`bab36531`) only `csd4_chain.json` moves, in `_meta.pins.claims_sha256`
+//! (the claims table carries the SCITT charter rename). The rc21 history
+//! follows.
 //!
 //! [`registry`](super::registry) carries the namespace registry and its match
 //! vectors; this module carries the other five CC `manifests/` files persist
@@ -63,7 +66,7 @@ pub const VENDORED_GOVERNANCE_POLICY_VECTORS_FILE_SHA256: &str =
 
 /// SHA-256 of the vendored `csd4_chain.json` FILE bytes.
 pub const VENDORED_CSD4_CHAIN_FILE_SHA256: &str =
-    "c23bcbc63484097b23a4653a608fd58f9a9af9d2150dca0e00eed56d83135b45";
+    "a83070c81779945b878650f5460490519c4f627c45de4bed0859d92e53b4f592";
 
 /// SHA-256 of the vendored `topology_vocabulary.json` FILE bytes. The chain's
 /// `_meta.pins.vocabulary_sha256` and CIRISServer's catalogue pin

@@ -55,7 +55,7 @@ use ciris_verify_core::edition2::genesis::{
 };
 pub use ciris_verify_core::edition2::genesis::{
     Anchor, BundleReading, Fork, GenesisCharter, GenesisPlacement, GenesisVerdict, PlacedHolder,
-    PlacedSeat, PlacedWitness, TipsInCommon,
+    PlacedSeat, PlacedTransparencyService, TipsInCommon,
 };
 use ciris_verify_core::edition2::keys::{check_key_record, KEY_RECORD_FAMILY};
 use ciris_verify_core::edition2::{
@@ -1137,7 +1137,9 @@ impl BundleKeys {
         for s in &p.seats {
             m.insert(s.kid, s.key.clone());
         }
-        for w in &p.witnesses {
+        // v62.0.0 (PIN-fix2; CIRISVerify 23.4.1, CC v1.0-rc22-pre2) — the
+        // charter's transparency services (were `witnesses`).
+        for w in &p.transparency_services {
             m.insert(w.kid, w.key.clone());
         }
         for id in named {
@@ -1895,7 +1897,11 @@ where
         .iter()
         .map(|h| (h.identity_ref.clone(), h.kid))
         .chain(p.seats.iter().map(|s| (s.identity_ref.clone(), s.kid)))
-        .chain(p.witnesses.iter().map(|w| (w.identity_ref.clone(), w.kid)))
+        .chain(
+            p.transparency_services
+                .iter()
+                .map(|w| (w.identity_ref.clone(), w.kid)),
+        )
         .collect();
     let seats = BundleSeats::held(placed.iter().cloned());
     for (_, kid) in &placed {

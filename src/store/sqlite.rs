@@ -12701,7 +12701,10 @@ impl crate::federation::BlobStorage for SqliteBackend {
             log_id: crate::federation::stream_sth::log_id_for_stream(stream_id),
             tree_size,
             root_hash,
-            timestamp,
+            // v62.0.0 (PIN-fix2) — the stored instant, into Verify's.
+            timestamp: crate::verify::utc::to_verify(timestamp).map_err(|e| {
+                crate::federation::BlobError::Backend(format!("latest_stream_sth: {e}"))
+            })?,
             signature,
             witness_signatures,
         }))
@@ -24721,7 +24724,10 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
         let stream_id = sth.stream_id.to_owned();
         let tree_size = sth.tree_size_i64;
         let root = sth.sth.root_hash.to_vec();
-        let signed_at = sth.sth.timestamp.to_rfc3339();
+        // v62.0.0 (PIN-fix2) — Verify's instant, back as the column's.
+        let signed_at = crate::verify::utc::from_verify(sth.sth.timestamp)
+            .map_err(|e| BlobError::Backend(format!("put_stream_sth: {e}")))?
+            .to_rfc3339();
         let producer = sth.producer_key_id.to_owned();
         let (signature_blob, witness_json) = (sth.signature_blob, sth.witness_json);
         self.write(move |conn| -> Result<Option<Vec<u8>>, BlobError> {
@@ -46589,7 +46595,7 @@ mod tests {
         }
         let root_hash = store.root().unwrap();
         let log_id = crate::federation::stream_sth::log_id_for_stream(stream_id);
-        let timestamp = chrono::Utc::now();
+        let timestamp = crate::verify::utc::to_verify(chrono::Utc::now()).unwrap();
         let signing_bytes = ciris_verify_core::transparency::SignedTreeHead::signing_bytes(
             &log_id, tree_size, &root_hash, timestamp,
         );

@@ -163,15 +163,9 @@ pub fn invalid_label(i: &Invalid) -> String {
 /// Verify's family fault as a stable label for the refusal's message.
 #[must_use]
 pub fn fault_label(f: &FamilyFault) -> &'static str {
-    match f {
-        FamilyFault::UnregisteredFamily => "unregistered_family",
-        FamilyFault::AuthorColumn => "author_column",
-        FamilyFault::IssNotInRole => "iss_not_in_role",
-        FamilyFault::DimensionMissing => "dimension_missing",
-        FamilyFault::AuthorshipUndetermined => "authorship_undetermined",
-        FamilyFault::NoArmHolds => "no_arm_holds",
-        _ => "other",
-    }
+    // v62.0.0 (PIN-fix2; CIRISVerify 23.4.1) — Verify's own stable token
+    // (`FamilyFault::token`, incl. `target_mismatch`): one name per fault.
+    f.token()
 }
 
 /// The waiting refusal: the retryable unknown-signer error naming the
@@ -195,6 +189,9 @@ fn waiting(missing: &[MissingKey]) -> Error {
                 ciris_verify_core::edition2::genesis::GENESIS_BUNDLE_TYP,
                 hex::encode(b)
             ),
+            // v62.0.0 (PIN-fix2; CIRISVerify 23.4.1) — a composer whose target
+            // row is not held: the row it waits on, by id.
+            MissingKey::Row(r) => format!("row:{}", hex::encode(r)),
             other => format!("{other:?}"),
         })
         .unwrap_or_else(|| "<unnamed key>".to_owned());
@@ -697,6 +694,19 @@ pub const RETRACTION_ROW_TYPES: &[&str] = &["withdraws", "recants"];
 ///   vendored entries, so its role is the model's.)
 #[must_use]
 pub fn second_signer_roles(bytes: &[u8]) -> Vec<SecondSignerRole> {
+    second_signer_roles_with(bytes, None)
+}
+
+/// v62.0.0 (PIN-fix2; CIRISVerify 23.4.1, CC rc22) — [`second_signer_roles`]
+/// with a composer's TARGET: a composer (Verify's `is_composer`: `withdraws`
+/// / `recants`) carries no `dimension`, so its leaf is its target's (`ciris_verify_core::edition2::family::dimension_leaf`
+/// over the held target's family and payload). `None` for a composer leaves
+/// the leaf unknown (a leaf-conditioned cell then names no role).
+#[must_use]
+pub fn second_signer_roles_with(
+    bytes: &[u8],
+    target: Option<&ciris_verify_core::edition2::family::TargetRow>,
+) -> Vec<SecondSignerRole> {
     use ciris_verify_core::edition2::family::{
         select::{second_signers, Signers},
         vendored_family, FamilyModel as _, RoleParty, RuleAnswer, AUTHOR_IS_SUBJECT,
@@ -712,15 +722,27 @@ pub fn second_signer_roles(bytes: &[u8]) -> Vec<SecondSignerRole> {
         .and_then(|c| c.get_int(2))
         .and_then(Value::as_text)
         .map(str::to_owned);
-    let leaf = payload
-        .get_text("dimension")
+    // v62.0.0 (PIN-fix2) — a composer's leaf is its target's, never a
+    // dimension of its own (CIRISVerify 23.4.1 refuses one).
+    let composer = protected
+        .get_int(-70001)
         .and_then(Value::as_text)
-        .and_then(|d| {
-            let prefix = ciris_verify_core::namespace_match::prefix_of_family_id(family)?;
-            ciris_verify_core::namespace_match::bind_leaf(prefix, d)
-                .ok()
-                .map(|b| b.leaf)
-        });
+        .is_some_and(ciris_verify_core::edition2::is_composer);
+    let leaf = if composer {
+        target.and_then(|t| {
+            ciris_verify_core::edition2::family::dimension_leaf(&t.family_id, &t.payload)
+        })
+    } else {
+        payload
+            .get_text("dimension")
+            .and_then(Value::as_text)
+            .and_then(|d| {
+                let prefix = ciris_verify_core::namespace_match::prefix_of_family_id(family)?;
+                ciris_verify_core::namespace_match::bind_leaf(prefix, d)
+                    .ok()
+                    .map(|b| b.leaf)
+            })
+    };
     // v62.0.0 (WD-fix1; CC 2.4.1.1 / CC 3.2.3 rules 1–4) — a RETRACTION
     // composer (`withdraws`, `recants`) carries its TARGET's family and sub
     // but is its own author's act: it takes NO second-signer role from the
@@ -859,7 +881,9 @@ where
         .and_then(|(_, p)| p.get_text("asserted_at").and_then(Value::as_u64))
         .unwrap_or(u64::MAX);
     let mut out = Vec::new();
-    for r in second_signer_roles(bytes) {
+    // v62.0.0 (PIN-fix2) — a composer's roles read its held target's leaf.
+    let target = super::typed::held_target_row(dir, bytes).await?;
+    for r in second_signer_roles_with(bytes, target.as_ref()) {
         let mut parties = Vec::new();
         let mut applies = r.parties.is_empty();
         for p in r.parties {

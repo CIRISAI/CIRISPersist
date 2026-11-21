@@ -619,7 +619,9 @@ mod pg_impl {
                     log_id: log_id_for_tenant(&tenant),
                     tree_size: u64::try_from(tree_size_i).unwrap_or(u64::MAX),
                     root_hash: root_hash_from_bytes(&root_bytes)?,
-                    timestamp,
+                    // v62.0.0 (PIN-fix2) — the stored instant, into Verify's.
+                    timestamp: crate::verify::utc::to_verify(timestamp)
+                        .map_err(|e| TransparencyError::Storage(e.to_string()))?,
                     signature,
                     witness_signatures,
                 };
@@ -641,7 +643,9 @@ mod pg_impl {
             let tree_size = i64::try_from(sth.tree_size)
                 .map_err(|_| TransparencyError::Storage("tree_size exceeds i64 range".into()))?;
             let root_hash = sth.root_hash.to_vec();
-            let timestamp = sth.timestamp;
+            // v62.0.0 (PIN-fix2) — Verify's instant, back as the column's.
+            let timestamp = crate::verify::utc::from_verify(sth.timestamp)
+                .map_err(|e| TransparencyError::Storage(e.to_string()))?;
             let signature_blob = serialize_signature(&sth.signature)?;
             let witnesses_str = serialize_witness_signatures(&sth.witness_signatures)?;
             let signer_key_id = crate::federation::sth_form::signer_column(&sth.signature);
@@ -926,7 +930,9 @@ mod sqlite_impl {
                     log_id: log_id_for_tenant(&tenant),
                     tree_size: u64::try_from(tree_size_i).unwrap_or(u64::MAX),
                     root_hash: root_hash_from_bytes(&root_bytes)?,
-                    timestamp,
+                    // v62.0.0 (PIN-fix2) — the stored instant, into Verify's.
+                    timestamp: crate::verify::utc::to_verify(timestamp)
+                        .map_err(|e| TransparencyError::Storage(e.to_string()))?,
                     signature,
                     witness_signatures,
                 };
@@ -946,7 +952,11 @@ mod sqlite_impl {
             let tree_size = i64::try_from(sth.tree_size)
                 .map_err(|_| TransparencyError::Storage("tree_size exceeds i64 range".into()))?;
             let root_hash = sth.root_hash.to_vec();
-            let signed_at = fmt_signed_at(sth.timestamp);
+            // v62.0.0 (PIN-fix2) — Verify's instant, back as the column's.
+            let signed_at = fmt_signed_at(
+                crate::verify::utc::from_verify(sth.timestamp)
+                    .map_err(|e| TransparencyError::Storage(e.to_string()))?,
+            );
             let signature_blob = serialize_signature(&sth.signature)?;
             let witnesses_str = serialize_witness_signatures(&sth.witness_signatures)?;
             let signer_key_id = crate::federation::sth_form::signer_column(&sth.signature);
@@ -1397,7 +1407,7 @@ mod tests {
         async fn sign_head(store: &PgMerkleStore, log_id: &str) -> SignedTreeHead {
             let tree_size = store.tree_size().await.unwrap();
             let root_hash = store.root().await.unwrap();
-            let timestamp = Utc::now();
+            let timestamp = crate::verify::utc::to_verify(Utc::now()).unwrap();
             let signing_bytes =
                 SignedTreeHead::signing_bytes(log_id, tree_size, &root_hash, timestamp);
             let signer =

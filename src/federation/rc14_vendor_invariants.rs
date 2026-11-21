@@ -135,6 +135,9 @@ mod tests {
         // v1.0-rc22-pre1 (0774639b): part 3 is byte-identical (the same
         // VENDORED_SOURCE_SHA256), each anchor occurs once; part 2 moved again
         // (CC 5.3.3.8's file- stream sentence) and still holds no row.
+        // v62.0.0 (PIN-fix1): re-read at v1.0-rc22-pre2 (bab36531): part 3
+        // moved (the SCITT charter rename; the new VENDORED_SOURCE_SHA256) and
+        // each of the four anchors still occurs once in it.
         assert_eq!(VENDORED_CC_VERSION, "1.0-rc22", "the table is read at rc22");
         let tsv = std::fs::read_to_string(root().join("evidence/cc_impl.tsv")).expect("cc_impl");
         let claims: Vec<&str> = tsv

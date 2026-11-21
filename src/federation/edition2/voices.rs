@@ -350,12 +350,18 @@ where
                 if v.iss != actor {
                     continue;
                 }
+                // BF27: resolved before `keys` (a `&dyn KeyDirectory` is not `Send` across an await).
+                let target = super::typed::held_target_row(dir, &st).await?;
                 let keys = super::ingest::held_keys_for(dir, &st).await?;
                 if let Ok(p) = super::door::admit_row(
                     &st,
                     &keys,
                     Some(&admitted.row_id.0),
-                    ciris_verify_core::edition2::family::SelectContext::default(),
+                    // v62.0.0 (PIN-fix2) — a composer's held target.
+                    ciris_verify_core::edition2::family::SelectContext {
+                        target,
+                        ..Default::default()
+                    },
                 ) {
                     return Ok(p);
                 }
@@ -373,12 +379,18 @@ where
         if !wanted {
             continue;
         }
+        // BF27: resolved before `keys` (a `&dyn KeyDirectory` is not `Send` across an await).
+        let target = super::typed::held_target_row(dir, &st).await?;
         let keys = super::ingest::held_keys_for(dir, &st).await?;
         if let Ok(p) = super::door::admit_row(
             &st,
             &keys,
             Some(&admitted.row_id.0),
-            ciris_verify_core::edition2::family::SelectContext::default(),
+            // v62.0.0 (PIN-fix2) — a composer's held target.
+            ciris_verify_core::edition2::family::SelectContext {
+                target,
+                ..Default::default()
+            },
         ) {
             return Ok(p);
         }
