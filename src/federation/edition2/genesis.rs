@@ -1736,15 +1736,22 @@ pub fn check_baked_bundle(
 /// the genesis in force with its signed dial hints, `(identity_ref, hint)`,
 /// most preferred first per seat. Replaces the earlier-form
 /// `KeyRecord::transport_hints()` read over `list_canonical_servers`.
+///
+/// v62.0.0 (HT-fix1; CC rc22 2.6.8: "a dialler skips" a hint of an unknown
+/// type) — an `Unknown` hint (carried, as signed, by Verify's reader) is
+/// SKIPPED here: it is no dialable bootstrap entry, and it does not drop the
+/// seat's known hints around it.
 #[must_use]
 pub fn bootstrap_hints(
     g: &GenesisInForce,
 ) -> Vec<(String, ciris_verify_core::edition2::fedcode::Hint)> {
+    use ciris_verify_core::edition2::fedcode::Hint;
     g.seats()
         .iter()
         .flat_map(|s| {
             s.dial_hints
                 .iter()
+                .filter(|h| !matches!(h, Hint::Unknown { .. }))
                 .map(move |h| (s.identity_ref.clone(), h.clone()))
         })
         .collect()
@@ -1752,9 +1759,12 @@ pub fn bootstrap_hints(
 
 /// v62.0.0 (CE-fix3) — one bootstrap hint as the host surface's JSON:
 /// `{identity_ref, type, body_hex}` (the FedCode hint, byte for byte, via
-/// Verify's `fedcode::hint_parts`; an `Unknown` hint as signed), plus the readable members of a known kind: `kind`
-/// (`tcp` | `udp` | `auto` | `rnode` | `http` | `unknown`), and `host` /
-/// `port` (tcp, udp) or `url` (http).
+/// Verify's `fedcode::hint_parts`; an `Unknown` hint as signed), plus the
+/// readable members of a known kind: `kind` (`tcp` | `udp` | `auto` |
+/// `rnode` | `http` | `i2p` | `kiss` | `ble` | `unknown`), and `host` /
+/// `port` (tcp, udp), `url` (http), `destination_hex` (i2p), or
+/// `frequency_hz` / `bitrate` / `callsign` (kiss; `callsign` null when not
+/// named). v62.0.0 (HT-fix2): i2p / kiss / ble.
 #[must_use]
 pub fn dial_hint_json(
     identity_ref: &str,
@@ -1789,6 +1799,23 @@ pub fn dial_hint_json(
             o["kind"] = "http".into();
             o["url"] = url.clone().into();
         }
+        // v62.0.0 (HT-fix2; CC rc22 2.6.8, Verify 23.4.0 320d41f) — types 6,
+        // 7 and 8.
+        Hint::I2p { destination } => {
+            o["kind"] = "i2p".into();
+            o["destination_hex"] = hex::encode(destination).into();
+        }
+        Hint::Kiss {
+            frequency_hz,
+            bitrate,
+            callsign,
+        } => {
+            o["kind"] = "kiss".into();
+            o["frequency_hz"] = (*frequency_hz).into();
+            o["bitrate"] = (*bitrate).into();
+            o["callsign"] = callsign.clone().into();
+        }
+        Hint::Ble => o["kind"] = "ble".into(),
         _ => o["kind"] = "unknown".into(),
     }
     o

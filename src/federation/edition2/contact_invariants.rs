@@ -27,6 +27,18 @@
 //! - **I2252** the owner rows: admitted after the seal, the node's one live
 //!   owner is the code's identity; removing the contact removes the hint and
 //!   leaves the signed route.
+//! - **I2296** (HT-fix1; CC rc22 2.6.8, 3004759) the store's cap IS
+//!   Verify's (`FEDCODE_E2_MAX_HINTS` = `edition2::DIAL_HINTS_MAX`), eight: a
+//!   code with eight entries (types 1, 2, 4–8 and one unknown) is recorded
+//!   and read back in order, byte for byte; a ninth is refused
+//!   `dial_hint_out_of_bounds`, nothing written.
+//! - **I2298** an unknown type (200) is carried, not refused ("a decoder
+//!   carries a hint of any other type as unknown and a dialler skips it"):
+//!   stored and returned in its place, counted toward the eight, and never
+//!   offered as dialable (no route, no transit pair).
+//! - **I2309** (ruling: the tag is the wire's u8) tags 255 and 0 are stored
+//!   and returned (sqlite + pg); the host parser refuses a tag above 255 by
+//!   name, `dial_hint_out_of_bounds`, never truncating (pure).
 
 use ciris_verify_core::cde::Value;
 
@@ -71,7 +83,7 @@ fn self_bind(seed: &str, head: RowId, route: (u8, u8), transit: &[u8]) -> Vec<u8
 
 /// The code A decodes for `node` (owned by `owner`): the node kid, the
 /// transport identity X25519 ‖ Ed25519, and `hints` in order.
-fn code(node: &str, owner: &str, x: u8, ed: &[u8], hints: &[(u16, &[u8])]) -> DialHints {
+fn code(node: &str, owner: &str, x: u8, ed: &[u8], hints: &[(u8, &[u8])]) -> DialHints {
     let mut transport_identity = vec![x; 32];
     transport_identity.extend_from_slice(ed);
     DialHints {
@@ -121,7 +133,7 @@ pub(crate) async fn body(a: &dyn FederationDirectory, b: &dyn FederationDirector
         &owner,
         7,
         &[8; 32],
-        &[(1, &b"10.0.0.2:4242"[..]), (0x7f00, &b"\x01\x02"[..])],
+        &[(1, &b"10.0.0.2:4242"[..]), (0x7f, &b"\x01\x02"[..])],
     );
     record_dial_hints(a, hint.clone())
         .await
@@ -308,4 +320,166 @@ async fn i2247_to_i2252_first_contact_by_node_code_postgres() {
         nodes.push(b);
     }
     Box::pin(body(&nodes[0], &nodes[1], "postgres")).await;
+}
+
+/// **I2296 / I2298** — the cap is Verify's; an unknown type is carried,
+/// counted toward it, and never offered as dialable.
+pub(crate) async fn cap_body(a: &dyn FederationDirectory, tag: &str) {
+    use super::contact::MAX_DIAL_HINTS;
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let node = format!("ht1-node-{tag}-{run}");
+    let owner = format!("ht1-owner-{tag}-{run}");
+    let n = e2::kid(&node);
+    assert_eq!(
+        MAX_DIAL_HINTS,
+        ciris_verify_core::edition2::DIAL_HINTS_MAX,
+        "I2296: the store reads Verify's cap"
+    );
+    assert_eq!(
+        MAX_DIAL_HINTS, 8,
+        "I2296: eight (CC rc22, Verify 23.4.0 final)"
+    );
+    let i2p = [0x5au8; 32];
+    let kiss: &[u8] = b"\x19\xc8\x2f\x40\x00\x00\x04\xb0N0CALL-7";
+    // Seven assigned types and one unknown (tag 200): eight entries.
+    let eight: Vec<(u8, &[u8])> = vec![
+        (1, &b"\x10\x92seat.example"[..]),
+        (2, &b"\x10\x92seat.example"[..]),
+        (200, &b"\x01\x02\x03"[..]),
+        (
+            4,
+            &[0x36, 0x7a, 0x74, 0x40, 0x00, 0x01, 0xe8, 0x48, 0x09, 0x05][..],
+        ),
+        (5, &b"https://seat.example/"[..]),
+        (6, &i2p[..]),
+        (7, kiss),
+        (8, &b""[..]),
+    ];
+    let code8 = code(&node, &owner, 7, &[8; 32], &eight);
+    record_dial_hints(a, code8.clone())
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] I2296: eight hints are admitted: {e}"));
+    let held = dial_hints_for(a, &n).await.unwrap().expect("I2296: held");
+    // I2298: the unknown hint is stored and returned in its place.
+    assert_eq!(
+        held.hints, code8.hints,
+        "[{tag}] I2296/I2298: every hint, the unknown one included, in order, byte for byte"
+    );
+    // ... and never offered as dialable: a hint is no route and no transit.
+    assert!(
+        a.list_transport_destinations_for(&n)
+            .await
+            .unwrap()
+            .is_empty()
+            && transit_kex_pair_for(a, &n).await.unwrap().is_none(),
+        "[{tag}] I2298: no route is derived from a hint"
+    );
+    // A ninth (the unknown counted toward the eight): refused by name.
+    let mut nine = eight.clone();
+    nine.push((3, &b"\x02ciris"[..]));
+    let e = record_dial_hints(a, code(&node, &owner, 7, &[8; 32], &nine))
+        .await
+        .expect_err("I2296: nine hints exceed the cap");
+    assert_eq!(
+        reason(&e),
+        crate::federation::malformed_row::DIAL_HINT_OUT_OF_BOUNDS,
+        "[{tag}] I2296: {e:?}"
+    );
+    assert_eq!(
+        dial_hints_for(a, &n).await.unwrap().expect("held").hints,
+        code8.hints,
+        "[{tag}] I2296: the refused record wrote nothing"
+    );
+    // I2309 (ruling: the tag is the wire's one byte): the widest tag, 255,
+    // and tag 0 (an unknown type, carried) are stored and returned.
+    let edges = code(
+        &node,
+        &owner,
+        7,
+        &[8; 32],
+        &[
+            (255, &b"\xff"[..]),
+            (0, &b""[..]),
+            (1, &b"\x10\x92seat.example"[..]),
+        ],
+    );
+    record_dial_hints(a, edges.clone())
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] I2309: tags 255 and 0 are stored: {e}"));
+    assert_eq!(
+        dial_hints_for(a, &n).await.unwrap().expect("held").hints,
+        edges.hints,
+        "[{tag}] I2309: returned as stored"
+    );
+}
+
+/// **I2309 (pure)** — the host surfaces' hint parser validates the tag as the
+/// wire's one byte: 255 and 0 read; 256 is refused by name
+/// (`dial_hint_out_of_bounds`), never truncated; a non-integer tag or a body
+/// that is not hex is `InvalidArgument`.
+#[test]
+fn i2309_a_hint_tag_is_one_byte_at_the_door() {
+    use super::contact::dial_hint_from_json;
+    let ok = |t: u64| dial_hint_from_json(0, &serde_json::json!({"tag": t, "body_hex": "0102"}));
+    assert_eq!(
+        ok(255).unwrap(),
+        DialHint {
+            tag: 255,
+            body: vec![1, 2]
+        }
+    );
+    assert_eq!(
+        ok(0).unwrap().tag,
+        0,
+        "I2309: tag 0 is an unknown type, carried"
+    );
+    for t in [256u64, 0x7f00, u64::from(u32::MAX)] {
+        let e = ok(t).expect_err("I2309: above 255 is refused");
+        assert_eq!(
+            reason(&e),
+            crate::federation::malformed_row::DIAL_HINT_OUT_OF_BOUNDS,
+            "I2309 {t}: {e:?}"
+        );
+        assert!(
+            e.to_string().contains(&t.to_string()),
+            "I2309 {t}: names the tag: {e}"
+        );
+    }
+    for bad in [
+        serde_json::json!({"tag": "1", "body_hex": "00"}),
+        serde_json::json!({"tag": -1, "body_hex": "00"}),
+        serde_json::json!({"body_hex": "00"}),
+        serde_json::json!({"tag": 1, "body_hex": "zz"}),
+    ] {
+        assert!(
+            matches!(dial_hint_from_json(3, &bad), Err(Error::InvalidArgument(_))),
+            "I2309: {bad}"
+        );
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2296_i2298_dial_hint_cap_sqlite() {
+    use crate::store::Backend as _;
+    let a = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    a.run_migrations().await.unwrap();
+    Box::pin(cap_body(&a, "sqlite")).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2296_i2298_dial_hint_cap_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::empty_dsn() else {
+        eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+        return;
+    };
+    let a = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    a.run_migrations().await.unwrap();
+    Box::pin(cap_body(&a, "postgres")).await;
 }

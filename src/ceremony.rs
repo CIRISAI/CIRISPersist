@@ -329,7 +329,7 @@ pub fn seat_binding_terms(
 /// `destination_hash` is derived), and BOTH X-Wing keys
 /// (`transit_xwing_pubkey`, `onion_hop_xwing_pubkey`, 1216 bytes each),
 /// stated at the payload's top level. `dial_hints` (CE-fix3; CC 2.6.1.11)
-/// are the seat's signed dial hints, MOST PREFERRED FIRST, at most four,
+/// are the seat's signed dial hints, MOST PREFERRED FIRST, at most eight,
 /// written byte for byte as Verify's FedCode hint bodies; a genesis serve
 /// seat needs at least one `tcp` hint. Persist does not judge them: Verify's
 /// bundle reader does ([`check_genesis_offer`] surfaces its

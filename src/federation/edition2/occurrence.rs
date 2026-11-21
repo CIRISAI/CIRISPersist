@@ -1727,7 +1727,7 @@ pub struct BindTerms {
     /// otherwise). Empty: no `also`.
     pub cites: Vec<RowId>,
     /// v62.0.0 (CE-fix3; CC 2.6.1.11, Verify 23.3.3) — `dial_hints`, a
-    /// top-level member beside `transport_destination`: at most four
+    /// top-level member beside `transport_destination`: at most eight (CC rc22)
     /// FedCode hints, MOST PREFERRED FIRST (an ordered sequence, not a
     /// set), each written as `[type, body]` by Verify's own encoder
     /// (Verify's, through [`dial_hints_value`]). Hints only: the transport identity is
@@ -1738,7 +1738,7 @@ pub struct BindTerms {
 }
 
 /// v62.0.0 (CE-fix3) — the `dial_hints` member's value, built by Verify
-/// (`edition2::dial_hints_value`, 23.3.3: `[1*4 [type, body]]`, each from
+/// (`edition2::dial_hints_value`, 23.4.0: `[1*8 [type, body]]`, each from
 /// `fedcode::hint_parts`, in the order given). Persist assembles and judges
 /// nothing here.
 ///

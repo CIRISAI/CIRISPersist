@@ -135,62 +135,64 @@ pub(crate) mod vectors {
     /// voices carry `sub`; CE-fix3: v2 → v3, the bindings carry `dial_hints`).
     pub(crate) const RESEAT: &str = vendored!("genesis_reseat_v4.json");
 
-    /// Each vendored file and its SHA-256 at CIRISVerify 23.4.0 (VB-vectors:
+    /// Each vendored file and its SHA-256 at CIRISVerify 23.4.0, the TESTED
+    /// rev 320d41f (VB-vectors2: the same files re-minted with i2p / kiss / ble
+    /// known and up to 8 hints; read the 4n-regen pins). Earlier (VB-vectors:
     /// the v5 bundles and the v4 re-seat, every bundle voice carrying CWT
     /// `sub` = `family_key_id`; vendored byte for byte from `release/23.4.0`
     /// 7943a2af, `src/ciris-verify-core/tests/vectors/edition2/genesis/`).
-    /// The hashes are set by the pass-4l regen from the vendored files' bytes.
+    /// The hashes are set by the pass-4n regen from the vendored files' bytes.
     pub(crate) fn pinned() -> [(&'static str, &'static str, &'static str); 10] {
         [
             (
                 "genesis_bundles_v5.json",
                 V2,
-                "2741477601eee9e1a698f68b0957012a301965c2d61cd3002a2a092535017f1b",
+                "e5f3a01f71a83986ed5ba44c08b7f6fcfcd6dc01ca1594673daf99fd849c11a2",
             ),
             (
                 "genesis_reseat_v4.json",
                 RESEAT,
-                "8ba7aeb170da90572f1054b736b54c4a242521f96bef15042a53fb9213d2b505",
+                "f95e69d1dc79530266f953344c53d62274b885e3610d22a9033ac98f36e44f90",
             ),
             (
                 "pool_v5_0.json",
                 POOL[0],
-                "80dcc700c9e4f9f14fcc8ee06d2923d6035d200d946dfe587e5f93b4263aee3e",
+                "3c795d94ef1c59921fc9e64b8d9b9af45a8154218fca4c5730f12ee3d2438314",
             ),
             (
                 "pool_v5_1.json",
                 POOL[1],
-                "669630e250b2a0c36ca35ac4a7f1cc324a766bfba59e3b1f5944c0e8cc6bf57b",
+                "c2171836494c637958a0f8dcbd81fbf0bd52281712e33184b7ddb319bbf26eec",
             ),
             (
                 "pool_v5_2.json",
                 POOL[2],
-                "72d1856d04085e130bfdaab81f0eba7645fe8c5986139be5c44947c6a6182821",
+                "17f1aa8574adb5b501cafed46ebc18869d2cfd2609b9553cb5784369f4d200c8",
             ),
             (
                 "pool_v5_3.json",
                 POOL[3],
-                "64d221c2559e68da106f41ab2a13c971ce8367ff43a8b2828b77b30eb91714ae",
+                "a3274ae99baac2dd64ba4520a0af91c576d7c721002147ca6c62e92542f5567a",
             ),
             (
                 "pool_v5_4.json",
                 POOL[4],
-                "746eb80d06d2e4cff879ee07f8424ce5a00d559523fc29d016f6a2bd3956d320",
+                "3960f61ebd84affccbb73513e35b8f5125fccdd0dc2e76c31bd8b260e878b7c8",
             ),
             (
                 "pool_v5_5.json",
                 POOL[5],
-                "23ed4c148086a18ae1c760bda1c11202b8abbc4dd11ae8a4cbb30a7c1b139d3a",
+                "9f0667a4858eecf220e90fb0db6bd86322aa4b2b50d1d2b6b895ca995c5d8331",
             ),
             (
                 "pool_v5_6.json",
                 POOL[6],
-                "7615043c7c61a8a79b390ba9c4bb30463a5c0567ef79ef84ddd25f7c08ef556b",
+                "3d769d4c903331add758942301596d43a9bf0ac372fcf294a40f0a1409dbeb4c",
             ),
             (
                 "pool_v5_7.json",
                 POOL[7],
-                "2bad347e1a4556633391b98d77f77fde714a07607897fc0c5a300fb86aff8ee6",
+                "b4fb0d084a7d3bf8e296de7a8572e956167bc3d8c9d57ede06af3283827aa012",
             ),
         ]
     }

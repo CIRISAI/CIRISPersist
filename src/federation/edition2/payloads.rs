@@ -365,7 +365,7 @@ pub const FAMILIES: &[FamilyPayload] = &[
             m("transport_destination", Ty::Map, O, "transport_destination: exactly reticulum_x25519_pubkey (bstr 32), reticulum_ed25519_pubkey (bstr 32), app_name (tstr), aspects ([* tstr]), destination_hash (bstr 16, derived per CC 3.3.6.3)"),
             m("transit_xwing_pubkey", Ty::Bstr, O, "transport_destination's transit_xwing_pubkey: 1216 bytes, at the top level (CC 3.3.6.2)"),
             m("onion_hop_xwing_pubkey", Ty::Bstr, O, "transport_destination's onion_hop_xwing_pubkey: 1216 bytes, at the top level (CC 3.3.6.2)"),
-            m("dial_hints", Ty::Any, O, "dial hints, most preferred first: [1*4 [type (uint, at most 255), body (bstr, 0..255 bytes, the FedCode hint body)]]; hints only, no transport identity; a genesis serve seat needs one tcp hint (shape and rule judged by Verify's reader, 23.3.3)"),
+            m("dial_hints", Ty::Any, O, "dial hints, most preferred first: [1*8 [type (uint, at most 255), body (bstr, 0..255 bytes, the FedCode hint body)]]; hints only, no transport identity; a genesis serve seat needs one tcp hint (shape and rule judged by Verify's reader, 23.4.0)"),
             m("onion_relay", Ty::Map, O, "exactly {\"opt_out\": true}, on a node that opts out of relaying (CC 3.3.6.2)"),
             m("encryption_pubkeys", Ty::Map, O, "encryption_pubkeys: exactly x25519 (bstr 32) and ml_kem_768 (bstr 1184)"),
             m("build_manifest_hash", Ty::Digest, O, "build_manifest_hash"),

@@ -51,7 +51,7 @@
 //!   by its exact names (under `genesis_bundle_row_invalid`): a serve seat
 //!   with no hint, only udp, only http or only unknown types is
 //!   `seat_dial_hints_missing`; a known type with a bad body is
-//!   `dial_hint_malformed`; an empty or five-entry list is `Malformed {
+//!   `dial_hint_malformed`; an empty or nine-entry list is `Malformed {
 //!   member: "dial_hints" }`, which a genesis reads as `row_invalid`. The builder refuses an `Unknown` hint up
 //!   front with `hint_parts`' token. Persist re-implements none of these.
 //! - I2292 (pure): the bake gate. [`genesis::check_seats_dialable`] passes a
@@ -81,6 +81,17 @@
 //!   `charter.scope` is in CDE set order (`assure:age`, `infra:serve`,
 //!   `infra:attest`, `infra:detect`, `assure:capacity`,
 //!   `infra:attest_assurance`), and the bundle is placed.
+//! - I2299 (sqlite + postgres; HT-fix1): a seat binding signed with an
+//!   UNKNOWN hint before its tcp hint (`[[200, h'010203'], tcp]`) is placed
+//!   (Verify carries the unknown entry); the seat's route is still projected
+//!   from `transport_destination`; `bootstrap_hints` offers the tcp hint and
+//!   SKIPS the unknown one, without dropping the known one.
+//! - I2276 (pure; HT-fix2, Verify 23.4.0): `dial_hint_json` labels the three
+//!   new types: `i2p` (`destination_hex`), `kiss` (`frequency_hz`, `bitrate`,
+//!   `callsign`, null when not named), `ble`; each with its `type` 6 / 7 / 8
+//!   and `body_hex` from Verify's encoder. A seat binding carrying eight hints
+//!   (tcp, then i2p, kiss, ble, …) is placed, and its placement carries all
+//!   eight in order.
 //! - I2289 (pure; CE-fix2): CEREMONY step 3 before step 4.
 //!   [`c::check_offer_with_halts`] passes with exactly one sealed halt per
 //!   listed holder, and the coverage names each holder's halt.
@@ -1135,10 +1146,14 @@ fn unknown_only(_seed: u8) -> Vec<c::Hint> {
 /// `dial_hints` = `raw` verbatim (past every encoder).
 fn with_raw_dial_hints(off: &Offline, raw: Value) -> Vec<Vec<u8>> {
     let s = &off.seats[0];
+    // The ceremony's own t0 (the bundle is asserted at t0 + DAY_MS / 2), so
+    // the binding is asserted with its record (HT-fix1: also for a ceremony
+    // minted at `CeremonySpec::standard()`).
+    let t0 = off.terms.asserted_at_ms - DAY_MS / 2;
     let terms = c::seat_binding_terms(
         s.key.public_key(),
         &s.record_id,
-        T0,
+        t0,
         s.transport.clone(),
         s.dial_hints.clone(),
     );
@@ -1281,7 +1296,7 @@ fn i2291_verify_refuses_an_undialable_seat_by_its_name() {
         e.to_string().contains("dial_hint_malformed"),
         "I2291 bad body: Verify's detail dial_hint_malformed: {e}"
     );
-    // A shape off the CDDL (empty; five entries): Malformed{dial_hints},
+    // A shape off the CDDL (empty; nine entries): Malformed{dial_hints},
     // row_invalid in a genesis.
     let tcp = Value::Array(vec![
         Value::Uint(1),
@@ -1295,7 +1310,9 @@ fn i2291_verify_refuses_an_undialable_seat_by_its_name() {
     ]);
     for (what, raw) in [
         ("empty", Value::Array(Vec::new())),
-        ("five", Value::Array(vec![tcp; 5])),
+        // HT-fix2 (Verify 23.4.0): up to EIGHT hints, so nine is the shape
+        // off the CDDL.
+        ("nine", Value::Array(vec![tcp; 9])),
     ] {
         let st = with_raw_dial_hints(&off, raw);
         let e = c::check_genesis_offer(&st, &off.anchor(), CHECK_AT).expect_err(what);
@@ -1597,4 +1614,163 @@ fn i2270_the_charter_scope_is_written_in_set_order() {
         placed[0].charter.scope, cde_order,
         "I2270: the reader reads the six"
     );
+}
+
+/// **I2299** — an unknown signed hint is carried, skipped as dialable, and
+/// fails nothing around it.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+async fn body_unknown_hint(d: &dyn crate::federation::FederationDirectory) {
+    use super::genesis::{bootstrap_hints, genesis_in_force, put_genesis_bundle};
+    add_test_attestation_root(mock_attestation_root_der());
+    let off = offline(&ceremony_v2(&CeremonySpec::standard()));
+    let tcp = super::occurrence::dial_hints_value(&off.seats[0].dial_hints)
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .clone();
+    let raw = Value::Array(vec![
+        Value::Array(vec![Value::Uint(200), Value::Bytes(vec![1, 2, 3])]),
+        tcp,
+    ]);
+    let st = with_raw_dial_hints(&off, raw);
+    put_genesis_bundle(d, &st, Some(&off.anchor()))
+        .await
+        .expect("I2299: an unknown hint beside a tcp hint is placed");
+    let g = genesis_in_force(d).await.unwrap();
+    let seat0 = c::identity_ref_of(off.seats[0].key.public_key());
+    let placed = g.seat(&seat0).expect("I2299: the seat is placed");
+    assert_eq!(
+        placed.dial_hints.len(),
+        2,
+        "I2299: Verify carries both, in order"
+    );
+    assert!(
+        matches!(placed.dial_hints[0], c::Hint::Unknown { tag: 200, .. }),
+        "I2299: {:?}",
+        placed.dial_hints
+    );
+    let hints: Vec<c::Hint> = bootstrap_hints(&g)
+        .into_iter()
+        .filter(|(i, _)| *i == seat0)
+        .map(|(_, h)| h)
+        .collect();
+    assert_eq!(
+        hints, off.seats[0].dial_hints,
+        "I2299: the unknown hint is skipped, the tcp one kept"
+    );
+    assert!(
+        !d.list_transport_destinations_for(&seat0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "I2299: the seat's route is projected all the same"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2299_unknown_hint_skipped_sqlite() {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(body_unknown_hint(&b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2299_unknown_hint_skipped_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::isolated_dsn() else {
+        return;
+    };
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(body_unknown_hint(&b)).await;
+}
+
+/// **I2276** — the three new hint types (HT-fix2, Verify 23.4.0).
+#[test]
+fn i2276_the_new_hint_types_are_labelled_and_eight_are_placed() {
+    add_test_attestation_root(mock_attestation_root_der());
+    let i2p = c::Hint::I2p {
+        destination: [0x5a; 32],
+    };
+    let kiss = c::Hint::Kiss {
+        frequency_hz: 144_390_000,
+        bitrate: 1200,
+        callsign: Some("N0CALL-7".to_owned()),
+    };
+    let bare_kiss = c::Hint::Kiss {
+        frequency_hz: 144_390_000,
+        bitrate: 1200,
+        callsign: None,
+    };
+    let j = super::genesis::dial_hint_json("seat", &i2p);
+    assert_eq!(j["kind"], "i2p", "I2276: {j}");
+    assert_eq!(j["type"], 6, "I2276: {j}");
+    assert_eq!(j["destination_hex"], "5a".repeat(32), "I2276: {j}");
+    let j = super::genesis::dial_hint_json("seat", &kiss);
+    assert_eq!(j["kind"], "kiss", "I2276: {j}");
+    assert_eq!(j["type"], 7, "I2276: {j}");
+    assert_eq!(j["frequency_hz"], 144_390_000, "I2276: {j}");
+    assert_eq!(j["bitrate"], 1200, "I2276: {j}");
+    assert_eq!(j["callsign"], "N0CALL-7", "I2276: {j}");
+    assert!(
+        super::genesis::dial_hint_json("seat", &bare_kiss)["callsign"].is_null(),
+        "I2276: an unnamed callsign is null"
+    );
+    let j = super::genesis::dial_hint_json("seat", &c::Hint::Ble);
+    assert_eq!(j["kind"], "ble", "I2276: {j}");
+    assert_eq!(j["type"], 8, "I2276: {j}");
+    assert_eq!(j["body_hex"], "", "I2276: a ble hint's body is empty");
+
+    // Eight hints on a seat binding (the cap), tcp first: placed, in order.
+    let fx = ceremony_v2(&CeremonySpec::at(T0));
+    let eight = |seed: u8| -> Vec<c::Hint> {
+        let mut h = seat_dial_hints(seed);
+        h.extend([
+            c::Hint::I2p {
+                destination: [seed; 32],
+            },
+            c::Hint::Kiss {
+                frequency_hz: 144_390_000,
+                bitrate: 1200,
+                callsign: None,
+            },
+            c::Hint::Ble,
+            c::Hint::Udp {
+                host: format!("seat-{seed}.genesis.test"),
+                port: 4242,
+            },
+            c::Hint::Http {
+                url: "https://seat.genesis.test/".to_owned(),
+            },
+            c::Hint::Tcp {
+                host: format!("relay-{seed}.genesis.test"),
+                port: 4242,
+            },
+            c::Hint::Udp {
+                host: format!("relay-{seed}.genesis.test"),
+                port: 4242,
+            },
+        ]);
+        h
+    };
+    let off = offline_with(&fx, &eight);
+    let placed = c::check_genesis_offer(&off.statements(), &off.anchor(), CHECK_AT)
+        .unwrap_or_else(|e| panic!("I2276: eight hints are placed: {e:?}"));
+    for s in &off.seats {
+        assert_eq!(s.dial_hints.len(), 8, "I2276: eight");
+        let iref = c::identity_ref_of(s.key.public_key());
+        let ps = placed[0]
+            .seats
+            .iter()
+            .find(|x| x.identity_ref == iref)
+            .unwrap();
+        assert_eq!(ps.dial_hints, s.dial_hints, "I2276: all eight, in order");
+    }
 }

@@ -6592,7 +6592,7 @@ impl PyEngine {
     /// v62.0.0 (RL-fix2) — **record a contact's dial hint** from a decoded
     /// node code: `node` (identity-ref), `transport_identity_hex` (64 bytes,
     /// X25519 ‖ Ed25519), `hints_json` (a JSON list, most preferred first,
-    /// possibly empty: `[{"tag": int, "body_hex": hex}, ...]`, each hint as
+    /// possibly empty: `[{"tag": 0..=255, "body_hex": hex}, ...]`, each hint as
     /// Verify's edition-2 FedCode `Hint` encodes it, unknown tags included),
     /// the code's `identity` / `kind` (`"user"` | `"node"`) if it named them.
     /// Local, unsigned, never a transit pair, never served; replaces the
@@ -6608,7 +6608,7 @@ impl PyEngine {
         identity: Option<String>,
         kind: Option<String>,
     ) -> PyResult<()> {
-        use crate::federation::edition2::contact::{ContactKind, DialHint, DialHints};
+        use crate::federation::edition2::contact::{ContactKind, DialHints};
         self.ensure_usable()?;
         catch_panic(|| {
             let transport_identity = hex::decode(transport_identity_hex).map_err(|e| {
@@ -6617,21 +6617,14 @@ impl PyEngine {
             let raw: Vec<serde_json::Value> = serde_json::from_str(hints_json)
                 .map_err(|e| PyValueError::new_err(format!("hints_json: {e}")))?;
             let mut hints = Vec::with_capacity(raw.len());
+            // v62.0.0 (HT-fix1) — the tag is the wire's one byte: a tag above
+            // 255 is refused by name (`dial_hint_out_of_bounds`), never
+            // truncated (`contact::dial_hint_from_json`).
             for (i, h) in raw.iter().enumerate() {
-                let tag = h
-                    .get("tag")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|t| u16::try_from(t).ok());
-                let body = h.get("body_hex").and_then(serde_json::Value::as_str);
-                let (Some(tag), Some(body)) = (tag, body) else {
-                    return Err(PyValueError::new_err(format!(
-                        "hints_json[{i}]: needs `tag` (0..=65535) and `body_hex`"
-                    )));
-                };
-                let body = hex::decode(body).map_err(|e| {
-                    PyValueError::new_err(format!("hints_json[{i}].body_hex: not hex: {e}"))
-                })?;
-                hints.push(DialHint { tag, body });
+                hints.push(
+                    crate::federation::edition2::contact::dial_hint_from_json(i, h)
+                        .map_err(federation_err_to_py)?,
+                );
             }
             let kind = match kind.as_deref() {
                 None => None,

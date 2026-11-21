@@ -52,26 +52,35 @@ pub const PLANE: &str = "contact";
 /// The owner-binding family a bound key's binding is filed under.
 const OWNERSHIP_FAMILY: &str = "ownership:{relation}:{target_kind}:{version}";
 
-/// The most hints one node's endpoint carries (Verify's edition-2 FedCode:
-/// 4 hints per node).
-pub const MAX_DIAL_HINTS: usize = 4;
-/// The most bytes of the code's whole payload (Verify's FedCode cap): one
-/// node's hint bodies together never exceed it.
-pub const MAX_DIAL_HINT_PAYLOAD_BYTES: usize = 1024;
+/// The most hints one node's endpoint carries: VERIFY's own cap, read, never
+/// copied (CC rc22 2.6.8, 3004759: `hint_count(1) = 0..=8`), so the unsigned
+/// store and the signed hints (`edition2::DIAL_HINTS_MAX`, the same const)
+/// can never disagree. v62.0.0 (HT-fix1): was a local `4`. An unknown type
+/// counts toward it.
+pub const MAX_DIAL_HINTS: usize = ciris_verify_core::edition2::fedcode::FEDCODE_E2_MAX_HINTS;
+/// The most bytes of the code's whole payload (Verify's FedCode cap, read):
+/// one node's hint bodies together never exceed it.
+pub const MAX_DIAL_HINT_PAYLOAD_BYTES: usize =
+    ciris_verify_core::edition2::fedcode::FEDCODE_E2_MAX_PAYLOAD;
 /// The most bytes one hint body carries (inside the payload cap).
 pub const MAX_DIAL_HINT_BODY_BYTES: usize = 255;
 /// A Reticulum transport public identity: X25519 (32) ‖ Ed25519 (32).
 pub const TRANSPORT_IDENTITY_LEN: usize = 64;
 
 /// One transport hint, OPAQUE to persist and 1:1 with Verify's FedCode
-/// `Hint` (`Tcp` / `Udp` / `Auto` / `RNode` / `Http` / `Unknown { tag, body
-/// }`): its wire tag and its body bytes, in the code's order. The dialler
-/// interprets the tag and skips one it does not know; an unknown hint
-/// round-trips unchanged.
+/// `Hint`: its wire tag and its body bytes, in the code's order. The eight
+/// assigned types (CC rc22 2.6.8) are 1 `tcp`, 2 `udp`, 3 `auto`, 4
+/// `rnode`, 5 `http`, 6 `i2p`, 7 `kiss`, 8 `ble`; "a decoder carries a hint
+/// of any other type as unknown and a dialler skips it", so an unknown hint
+/// round-trips unchanged here, and persist judges no body.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DialHint {
-    /// The hint's wire tag (Verify pins the vocabulary).
-    pub tag: u16,
+    /// The hint's wire tag: ONE byte, as the code and a signed `dial_hints`
+    /// entry carry it (`type(1)`, CC rc22 2.6.8). v62.0.0 (HT-fix1, ruling:
+    /// the wire is the authority): was `u16`. Tag 0 and 9..=255 are unknown
+    /// types, carried. A stored body naming a tag above 255 does not decode
+    /// (it is refused on read, never wrapped).
+    pub tag: u8,
     /// The hint's body, as the code carries it.
     pub body: Vec<u8>,
 }
@@ -166,6 +175,43 @@ where
             .decode(k.pubkey_ed25519_base64)
             .ok()
     }))
+}
+
+/// v62.0.0 (HT-fix1) — **one hint from a host's JSON** (`{"tag": int,
+/// "body_hex": hex}`, hint `index` of the list): the host surfaces' one
+/// parser (PyO3 `record_dial_hints`). The tag is VALIDATED as the wire's
+/// one byte, never truncated.
+///
+/// # Errors
+/// [`malformed_row::DIAL_HINT_OUT_OF_BOUNDS`] for an integer tag above 255;
+/// `InvalidArgument` for a missing or non-integer tag, or a body that is not
+/// hex.
+pub fn dial_hint_from_json(index: usize, h: &serde_json::Value) -> Result<DialHint, Error> {
+    let tag = h
+        .get("tag")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "hints_json[{index}]: needs an integer `tag` (0..=255) and `body_hex`"
+            ))
+        })?;
+    let tag = u8::try_from(tag).map_err(|_| {
+        refuse(
+            malformed_row::DIAL_HINT_OUT_OF_BOUNDS,
+            format!(
+                "hints_json[{index}]: tag {tag} is out of range: a hint's type is one byte \
+                 (0..=255, CC 2.6.8)"
+            ),
+        )
+    })?;
+    let body = h
+        .get("body_hex")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::InvalidArgument(format!("hints_json[{index}]: needs `body_hex`")))?;
+    let body = hex::decode(body).map_err(|e| {
+        Error::InvalidArgument(format!("hints_json[{index}].body_hex: not hex: {e}"))
+    })?;
+    Ok(DialHint { tag, body })
 }
 
 /// **Record a node's dial hint** from a decoded code. Re-recording the same

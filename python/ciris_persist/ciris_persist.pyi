@@ -735,16 +735,16 @@ class Engine:
     ) -> None:
         """v62.0.0 (RL-fix2) — record a contact's dial hint from a decoded node
         code: ``node`` (identity-ref), ``transport_identity_hex`` (64 bytes,
-        X25519 ‖ Ed25519), ``hints_json`` (``[{"tag": int, "body_hex": hex},
+        X25519 ‖ Ed25519), ``hints_json`` (``[{"tag": 0..=255, "body_hex": hex},
         ...]``, Verify's edition-2 FedCode hints in order, unknown tags
-        included; at most 4 hints of at most 255 bytes within the 1024-byte
+        included; at most 8 hints of at most 255 bytes within the 1024-byte
         payload), and the code's ``identity`` / ``kind`` (``"user"``
         | ``"node"``). Local, unsigned, never a transit pair, never served;
         replaces the node's list.
 
         Raises:
             ValueError: ``federation_malformed_row: contact:
-                dial_hint_out_of_bounds`` or
+                dial_hint_out_of_bounds`` (also a ``tag`` above 255) or
                 ``fedcode_transport_is_federation_key``.
         """
 
