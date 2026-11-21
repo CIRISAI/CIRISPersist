@@ -8,7 +8,7 @@ CIRISPersist#873, CIRISPersist#888.
 
 Since v62.0.0 (P5c; CC 3.3.6) a machine key (`node` or `agent`) is never a
 device of a person. The occurrence doors refuse such a binding
-(`occurrence_binds_machine_to_person`), and
+(`occurrence_mixes_person_and_machine`), and
 `active_identities_for_occurrence` skips a held one from an upgraded store.
 So for a node key, `active_identity_for_occurrence` answers **the node
 itself**. A node's human is its OWNER (the owner binding, `owner_of`).

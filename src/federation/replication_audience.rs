@@ -174,7 +174,7 @@ where
 
 // ── v62.0.0 (v62 P5c): a node's human is its OWNER ───────────────────
 //
-// CC rc21 3.3.6 (way (d) and the door, `occurrence_binds_machine_to_person`):
+// CC rc21 3.3.6 (way (d) and the door, `occurrence_mixes_person_and_machine`):
 // a machine key (`node` / `agent`) is never bound under a person's identity.
 // So a person's NODE is never an occurrence of the person; its human is known
 // only through its owner binding ([`owner_of`](super::admission::owner_of),
@@ -205,7 +205,7 @@ where
 /// v62.0.0 (v62 P5c; CC rc21 3.3.6) — **does the pair (`identity`, `key`)
 /// bind a machine key under a person?** `key`'s record is `node` / `agent`
 /// and `identity`'s is `user` / `accord_holder`. Such a pair is the
-/// forbidden occurrence (`occurrence_binds_machine_to_person`). The self pair
+/// forbidden occurrence (`occurrence_mixes_person_and_machine`). The self pair
 /// never is.
 ///
 /// # Errors

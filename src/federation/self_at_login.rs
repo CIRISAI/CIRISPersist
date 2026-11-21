@@ -248,22 +248,108 @@ pub fn check_owner_binding_statement(
     node_key_id: &str,
     required_scopes: &[&str],
 ) -> Result<(), super::Error> {
+    owner_binding_shape(statement, owner_iss, node_key_id, required_scopes)
+        .map_err(|f| super::Error::InvalidArgument(format!("owner binding: {f}")))
+}
+
+/// v62.0.0 (KR-fix12) — **what is wrong with a signed owner binding**, by
+/// name, so a ceremony tool can print which check failed
+/// ([`OwnerBindingFault::token`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OwnerBindingFault {
+    /// The bytes are not a row statement.
+    NotAStatement,
+    /// Not a `delegates_to` of the ownership family on the owner-binding
+    /// dimension.
+    NotAnOwnerBinding(String),
+    /// The signature does not verify under the owner's key (Verify's label:
+    /// `bad_signature`, `kid_mismatch`, `malformed:…`, ...). A wrong key or a
+    /// truncated signature from the signing step lands here.
+    SignatureInvalid(String),
+    /// The owner's key is not held, or not live at the statement's instant
+    /// (the Engine form only).
+    OwnerKeyNotLive(String),
+    /// `iss` / `author` is not the expected owner.
+    OwnerMismatch,
+    /// The owner's key is not a person's (`user`): a `node` or `agent` key
+    /// owns nothing, and the owner folds would ignore the row for ever.
+    OwnerNotAPerson(String),
+    /// `sub` is not the node.
+    NodeMismatch,
+    /// Not placed at `cohort_scope: federation`.
+    NotAtFederation,
+    /// A scope token outside `infra:*`, or no scope.
+    ScopeNotInfra(String),
+    /// A required scope is missing.
+    ScopeMissing(String),
+}
+
+impl OwnerBindingFault {
+    /// The fault's stable name.
+    #[must_use]
+    pub fn token(&self) -> &'static str {
+        match self {
+            Self::NotAStatement => "owner_binding_not_a_statement",
+            Self::NotAnOwnerBinding(_) => "owner_binding_wrong_row",
+            Self::SignatureInvalid(_) => "owner_binding_signature_invalid",
+            Self::OwnerKeyNotLive(_) => "owner_binding_owner_key_not_live",
+            Self::OwnerMismatch => "owner_binding_owner_mismatch",
+            Self::OwnerNotAPerson(_) => super::admission::OWNER_BINDING_OWNER_NOT_A_PERSON,
+            Self::NodeMismatch => "owner_binding_node_mismatch",
+            Self::NotAtFederation => "owner_binding_not_at_federation",
+            Self::ScopeNotInfra(_) => "owner_binding_scope_not_infra",
+            Self::ScopeMissing(_) => "owner_binding_scope_missing",
+        }
+    }
+}
+
+impl std::fmt::Display for OwnerBindingFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let detail = match self {
+            Self::NotAStatement
+            | Self::OwnerMismatch
+            | Self::NodeMismatch
+            | Self::NotAtFederation => "",
+            Self::NotAnOwnerBinding(d)
+            | Self::SignatureInvalid(d)
+            | Self::OwnerKeyNotLive(d)
+            | Self::OwnerNotAPerson(d)
+            | Self::ScopeNotInfra(d)
+            | Self::ScopeMissing(d) => d.as_str(),
+        };
+        if detail.is_empty() {
+            f.write_str(self.token())
+        } else {
+            write!(f, "{}: {detail}", self.token())
+        }
+    }
+}
+
+/// The shape checks of an owner binding (no key, no store).
+fn owner_binding_shape(
+    statement: &[u8],
+    owner_iss: &str,
+    node_key_id: &str,
+    required_scopes: &[&str],
+) -> Result<(), OwnerBindingFault> {
     use ciris_verify_core::cde::Value;
-    let bad = |what: String| super::Error::InvalidArgument(format!("owner binding: {what}"));
-    let (family, row_type) = super::edition2::emit::family_of_statement(statement)
-        .ok_or_else(|| bad("not a row statement".into()))?;
+    use OwnerBindingFault as F;
+    let (family, row_type) =
+        super::edition2::emit::family_of_statement(statement).ok_or(F::NotAStatement)?;
     if row_type != super::types::attestation_type::DELEGATES_TO {
-        return Err(bad(format!("row type {row_type:?}, not delegates_to")));
+        return Err(F::NotAnOwnerBinding(format!(
+            "row type {row_type:?}, not delegates_to"
+        )));
     }
     if super::edition2::emit::family_of_dimension(super::types::owner_binding::DIMENSION).as_deref()
         != Some(family.as_str())
     {
-        return Err(bad(format!(
+        return Err(F::NotAnOwnerBinding(format!(
             "family {family:?} is not the ownership family"
         )));
     }
-    let (protected, payload) = super::edition2::liveness::statement_parts(statement)
-        .ok_or_else(|| bad("undecodable".into()))?;
+    let (protected, payload) =
+        super::edition2::liveness::statement_parts(statement).ok_or(F::NotAStatement)?;
     let claim = |n: i64| {
         protected
             .get_int(15)
@@ -271,23 +357,19 @@ pub fn check_owner_binding_statement(
             .and_then(Value::as_text)
     };
     let text = |k: &str| payload.get_text(k).and_then(Value::as_text);
+    if text("dimension") != Some(super::types::owner_binding::DIMENSION) {
+        return Err(F::NotAnOwnerBinding(
+            "its dimension is not the owner binding's".into(),
+        ));
+    }
     if claim(1) != Some(owner_iss) || text("author") != Some(owner_iss) {
-        return Err(bad(format!(
-            "it is not authored and signed by the owner {owner_iss}"
-        )));
+        return Err(F::OwnerMismatch);
     }
     if claim(2) != Some(node_key_id) {
-        return Err(bad(format!("its sub is not the node {node_key_id}")));
-    }
-    if text("dimension") != Some(super::types::owner_binding::DIMENSION) {
-        return Err(bad("its dimension is not the owner binding's".into()));
+        return Err(F::NodeMismatch);
     }
     if text("cohort_scope") != Some(super::types::cohort_scope::FEDERATION) {
-        return Err(bad(
-            "it is not placed at cohort_scope federation (a serve seat's binding is announced \
-             there, CC 3.1.3.2)"
-                .into(),
-        ));
+        return Err(F::NotAtFederation);
     }
     let scope: Vec<&str> = payload
         .get_text("scope")
@@ -295,12 +377,125 @@ pub fn check_owner_binding_statement(
         .map(|a| a.iter().filter_map(Value::as_text).collect())
         .unwrap_or_default();
     if scope.is_empty() || scope.iter().any(|t| !t.starts_with("infra:")) {
-        return Err(bad(format!("its scope is not infra:* only: {scope:?}")));
+        return Err(F::ScopeNotInfra(format!("{scope:?}")));
     }
     if let Some(missing) = required_scopes.iter().find(|t| !scope.contains(t)) {
-        return Err(bad(format!("its scope lacks {missing}: {scope:?}")));
+        return Err(F::ScopeMissing((*missing).to_owned()));
     }
     Ok(())
+}
+
+/// v62.0.0 (KR-fix12) — **THE self-check a ceremony tool runs on a signed
+/// owner binding before it submits it, signature included.** Pure: no store,
+/// no clock (the instant is the statement's own).
+///
+/// 1. the statement VERIFIES under `owner_key`, the owner's public key the
+///    caller supplies (Verify's `verify_row_statement` over a directory
+///    holding that one key): a signature made with another key, or cut short
+///    by the signing step, is [`OwnerBindingFault::SignatureInvalid`];
+/// 2. `owner_identity_type` (the owner's key record's `identity_type`, as the
+///    caller knows it) names `user`: an owner binding signed by a `node` or
+///    `agent` key is [`OwnerBindingFault::OwnerNotAPerson`]. The folds ignore
+///    such a row silently (`owner_of` stays `None`, nothing ever lands);
+/// 3. the shape: a `delegates_to` of the ownership family on the owner-binding
+///    dimension, authored by the owner (the identity-ref of `owner_key`),
+///    `sub` = `node_key_id`, at `cohort_scope: federation`, `scope` `infra:*`
+///    only and carrying every token of `required_scopes`.
+///
+/// It does not know whether the key is LIVE on a given node (its window, a
+/// revocation): `Engine::check_owner_binding` asks that node's key plane.
+///
+/// # Errors
+/// The first [`OwnerBindingFault`].
+pub fn verify_owner_binding_statement(
+    statement: &[u8],
+    owner_key: &ciris_crypto::composite::CompositePublicKey,
+    owner_identity_type: &str,
+    node_key_id: &str,
+    required_scopes: &[&str],
+) -> Result<(), OwnerBindingFault> {
+    use super::edition2::self_check::{verify_statement_signature, SignerKey, StatementFault};
+    use OwnerBindingFault as F;
+    let kid = ciris_verify_core::edition2::thumbprint(owner_key);
+    let owner_iss = ciris_verify_core::edition2::identity_ref(&kid);
+    // KR-fix14 — the ONE signature self-check, shared with the root
+    // acceptance's and the generic one.
+    match verify_statement_signature(statement, SignerKey::PublicKey(owner_key)) {
+        Ok(()) => {}
+        Err(StatementFault::NotAStatement) => return Err(F::NotAStatement),
+        Err(f) => return Err(F::SignatureInvalid(f.to_string())),
+    }
+    owner_is_a_person(owner_identity_type)?;
+    owner_binding_shape(statement, &owner_iss, node_key_id, required_scopes)
+}
+
+/// An owner is a PERSON: its key record names `user`.
+fn owner_is_a_person(identity_type: &str) -> Result<(), OwnerBindingFault> {
+    use super::types::identity_type as it;
+    if it::set_contains(identity_type, it::USER) {
+        Ok(())
+    } else {
+        Err(OwnerBindingFault::OwnerNotAPerson(format!(
+            "the owner's key is typed {identity_type:?}, not user"
+        )))
+    }
+}
+
+/// v62.0.0 (KR-fix12) — [`verify_owner_binding_statement`] against a NODE's
+/// own key plane (`Engine::check_owner_binding`): the owner's key is the one
+/// this directory holds for the statement's `iss`, LIVE at the statement's
+/// instant (the door's own verification, `edition2::door::admit_row` over
+/// `held_keys_for`), and its held record names `user`. `Ok(None)`: nothing is
+/// wrong.
+///
+/// # Errors
+/// Directory reads.
+pub async fn check_owner_binding_held<F>(
+    directory: &F,
+    statement: &[u8],
+    node_key_id: &str,
+    required_scopes: &[&str],
+) -> Result<Option<OwnerBindingFault>, super::Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    use ciris_verify_core::cde::Value;
+    use ciris_verify_core::edition2::{verify_row_statement, Verdict};
+    use OwnerBindingFault as Fault;
+    let Some((protected, _)) = super::edition2::liveness::statement_parts(statement) else {
+        return Ok(Some(Fault::NotAStatement));
+    };
+    let Some(owner_iss) = protected
+        .get_int(15)
+        .and_then(|c| c.get_int(1))
+        .and_then(Value::as_text)
+        .map(str::to_owned)
+    else {
+        return Ok(Some(Fault::NotAStatement));
+    };
+    let keys = super::edition2::ingest::held_keys_for(directory, statement).await?;
+    match verify_row_statement(statement, &keys) {
+        Verdict::Valid(_) => {}
+        Verdict::Invalid(i) => {
+            return Ok(Some(Fault::SignatureInvalid(
+                super::edition2::door::invalid_label(&i),
+            )))
+        }
+        Verdict::Waiting { .. } => {
+            return Ok(Some(Fault::OwnerKeyNotLive(format!(
+                "this node holds no live key record for {owner_iss} at the statement's instant"
+            ))))
+        }
+    }
+    let Some(record) = directory.lookup_public_key(&owner_iss).await? else {
+        return Ok(Some(Fault::OwnerKeyNotLive(format!(
+            "this node holds no key record for {owner_iss}"
+        ))));
+    };
+    if let Err(f) = owner_is_a_person(&record.identity_type) {
+        return Ok(Some(f));
+    }
+    Ok(owner_binding_shape(statement, &owner_iss, node_key_id, required_scopes).err())
 }
 
 /// v61 (CIRISPersist#1126; CC 4.4.3.4.3.1, CC 3.3.5) — a partnership
@@ -2711,7 +2906,7 @@ pub(crate) mod test_support {
     ///   authored by its owner, with the agent key's own voice: it lands and
     ///   projects NO route (an agent is reached through its node, CC 3.4.7.3
     ///   Clause A). The same agent key under the owner's (a person's)
-    ///   identity is refused `occurrence_binds_machine_to_person`, as
+    ///   identity is refused `occurrence_mixes_person_and_machine`, as
     ///   `agent` and as `laptop`.
     /// - **I3327** the window is half-open: a bind whose `valid_until` is
     ///   ahead projects its route; a bind whose `valid_until` has passed
@@ -2850,7 +3045,7 @@ pub(crate) mod test_support {
                 .expect_err("I3326: an agent key under a person");
             assert_eq!(
                 reason(&e),
-                mr::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
+                mr::OCCURRENCE_MIXES_PERSON_AND_MACHINE,
                 "I3326 ({class}): {e}"
             );
         }

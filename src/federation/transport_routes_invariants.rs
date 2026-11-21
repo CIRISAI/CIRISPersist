@@ -365,7 +365,7 @@ pub(crate) mod bodies {
         use crate::federation::edition2::fixture_switch as e2;
         let identity_seed = format!("{tag}-occid");
         // v62.0.0 (wave O1) — a NODE identity: a node or agent key is never
-        // an occurrence of a person (`occurrence_binds_machine_to_person`,
+        // an occurrence of a person (`occurrence_mixes_person_and_machine`,
         // every occurrence door), so the two machine occurrences bind under a
         // machine identity. Each key is an edition-2 `key:record`: the local
         // rows name it by its kid (the `federation_keys` id they reference).

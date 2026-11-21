@@ -463,6 +463,41 @@ where
     acceptance_statement_by(key, iss, &root, head_hex, at)
 }
 
+/// v62.0.0 (RL-fix15) — `iss`'s `trust:accepts:v1` edge to `root` (a bundle
+/// lineage's `family_key_id`, literal), signed by `key`, stated at `at`,
+/// naming `head_hex` (a bundle object id) for audit, or none. Not put.
+///
+/// # Errors
+/// A `head_hex` that is not hex; a signing failure.
+pub fn root_acceptance_statement(
+    key: &CompositeSigningKey,
+    iss: &str,
+    root: &str,
+    head_hex: Option<&str>,
+    at: u64,
+) -> Result<Vec<u8>, Error> {
+    let mut members = vec![
+        ("author", text(iss)),
+        ("asserted_at", Value::Uint(at)),
+        (
+            "dimension",
+            text(crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION),
+        ),
+        (
+            "scope",
+            Value::Array(vec![text(crate::federation::trust_root::INFRA_SERVE_SCOPE)]),
+        ),
+    ];
+    if let Some(h) = head_hex {
+        let head = hex::decode(h).map_err(|e| refused("acceptance", e))?;
+        members.push((
+            crate::federation::envelope::paths::ATTACHED_HEAD_DIGEST,
+            Value::Bytes(head),
+        ));
+    }
+    trust_edge(key, iss, root, members)
+}
+
 /// **Another party accepts the root**: `iss`'s `trust:accepts:v1` edge to
 /// `r.root`, signed by `key` (e.g. a bundle seat's
 /// `fixture_genesis::test_key(seed)` signing as its identity-ref), naming the

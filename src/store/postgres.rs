@@ -34219,7 +34219,7 @@ mod tests {
         // Community members (alice/bob) are user-role humans; the rest agents,
         // the minter a node. v62.0.0 (round 3, E8) — the members' occurrence
         // keys are their own devices, so user-typed: an occurrence never binds
-        // a node or agent key to a person (`occurrence_binds_machine_to_person`,
+        // a node or agent key to a person (`occurrence_mixes_person_and_machine`,
         // CC 3.3.6).
         let _ = pg_put_key(
             &backend,

@@ -256,7 +256,7 @@ pub(crate) mod bodies {
         let alice = e2::put_key(d, "i3120-alice", &[identity_type::USER]).await;
         let node = e2::put_key(d, "i3120-node", &[identity_type::NODE]).await;
         // The forbidden pair, through the trusted-local door. Since v62 the
-        // door refuses it (`occurrence_binds_machine_to_person`); an upgraded
+        // door refuses it (`occurrence_mixes_person_and_machine`); an upgraded
         // store may still hold one. Either way the reads below must not
         // derive the node's human from it.
         let at = now_ms();

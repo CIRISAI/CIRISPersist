@@ -1505,6 +1505,139 @@ pub(crate) async fn i3245_i3247_infrastructure_rooted_here(d: &dyn FederationDir
     );
 }
 
+/// **I4290** (KR-fix13; CC 3.1.3.2 "A node gives no acceptance", CC 4.4.3.19;
+/// the ceremony's step 10) — **a canonical install is seated in the
+/// infrastructure room by the founders' count alone.** An infrastructure room
+/// under the rooted root's charter is founded by the holders' voices ONLY;
+/// its roster lists a serve SEAT of the genesis bundle in force as a member
+/// with no role. It lands: no voice of the node, no acceptance row from the
+/// node or from an owner (the seat has none), and the node is on the roster,
+/// not a founder (it holds no vote). KR-fix10's consent rule is not asked.
+/// Control: the same room listing a `node` key that is NO seat of the bundle
+/// does not land on the holders' voices alone.
+pub(crate) async fn i4290_a_bundle_seat_is_seated_without_acceptance(d: &dyn FederationDirectory) {
+    use crate::federation::edition2::fixture_trust_root::rooted_trust_root;
+    use crate::federation::membership_acceptance::node_seated_without_acceptance;
+    let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
+    let seat = fixture_genesis::bundle_v2().seats[0].identity_ref.clone();
+    let stray = e2::put_key(d, "i4290-stray-node", &["node"]).await;
+    assert!(
+        crate::federation::edition2::genesis::is_canonical_by_bundle(d, &seat)
+            .await
+            .unwrap(),
+        "I4290 premise: the seat is a serve seat of the bundle in force"
+    );
+    // A room under the root's charter, founded by the three holders, listing
+    // `member` (no role) besides them. Only the holders voice it.
+    let found = |seed: &'static str, member: String| async move {
+        let mut rec = infrastructure_room(seed, &[], "quorum:2/3");
+        let t = now_ms();
+        if let GroupRecord::Community(c) = &mut rec {
+            let founded = at(i64::try_from(t).unwrap() - 60_000);
+            c.founded_at = founded;
+            c.members = fixture_genesis::HOLDER_SEEDS
+                .iter()
+                .map(|h| CommunityMember {
+                    key_id: fixture_genesis::identity_ref_of(*h),
+                    joined_at: founded,
+                    role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
+                })
+                .chain(std::iter::once(CommunityMember {
+                    key_id: member,
+                    joined_at: founded,
+                    role: None,
+                }))
+                .collect();
+            c.charter_digest = r.charter.hex();
+        }
+        let keys: Vec<_> = fixture_genesis::HOLDER_SEEDS
+            .iter()
+            .map(|h| fixture_genesis::test_key(*h))
+            .collect();
+        let refs: Vec<_> = keys.iter().collect();
+        let voices = roster_voices(&rec, 1, None, t, &refs);
+        let row = row_id_of(&voices[0]);
+        (put_voices(d, &voices).await, row)
+    };
+
+    // The seat: lands on the founders' voices alone.
+    let (out, rec) = found("i4290-canonical-room", seat.clone()).await;
+    assert!(
+        matches!(out, Ok(StatementOutcome::Row { .. })),
+        "I4290: the room listing a bundle seat lands on the holders' voices alone: {out:?}"
+    );
+    let cid = e2::kid("i4290-canonical-room");
+    let room = d
+        .lookup_community(&cid)
+        .await
+        .unwrap()
+        .expect("I4290: the room is held");
+    let listed = room
+        .members
+        .iter()
+        .find(|m| m.key_id == seat)
+        .expect("I4290: the seat is on the roster");
+    assert_eq!(listed.role, None, "I4290: a member, not a founder: no vote");
+    assert!(
+        d.active_community_members(&cid)
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.key_id == seat),
+        "I4290: the seat is an active member"
+    );
+    assert!(
+        node_seated_without_acceptance(d, &room, &seat, room.founded_at)
+            .await
+            .unwrap(),
+        "I4290: the one predicate: a bundle seat needs no acceptance in an infrastructure room"
+    );
+    // Nothing the seat or an owner signed: the seat authored no row at all,
+    // and no membership reply is about it.
+    assert!(
+        d.list_attestations_by(&seat)
+            .await
+            .unwrap()
+            .iter()
+            .all(|a| crate::federation::membership_acceptance::membership_row(a).is_none()),
+        "I4290: the seat signed no acceptance"
+    );
+    assert_eq!(
+        d.edition2_voices(&rec).await.unwrap().len(),
+        fixture_genesis::HOLDER_SEEDS.len(),
+        "I4290: only the holders voiced the founding (the seat's voice is not among them)"
+    );
+    assert!(
+        d.list_attestations_for(&seat)
+            .await
+            .unwrap()
+            .iter()
+            .all(|a| crate::federation::membership_acceptance::membership_row(a).is_none()),
+        "I4290: no proposal, acceptance or decline is about the seat"
+    );
+    assert_eq!(
+        crate::federation::admission::owner_of(d, &seat)
+            .await
+            .unwrap(),
+        None,
+        "I4290: and it has no owner yet (the founding seats it before any owner binding)"
+    );
+
+    // Control: a node that is no seat of the bundle is not seated that way.
+    let (out, _) = found("i4290-stray-room", stray.clone()).await;
+    assert!(
+        !matches!(out, Ok(StatementOutcome::Row { .. })),
+        "I4290: a node that is no bundle seat is not seated by others' voices alone: {out:?}"
+    );
+    assert!(
+        d.lookup_community(&e2::kid("i4290-stray-room"))
+            .await
+            .unwrap()
+            .is_none(),
+        "I4290: that room did not land"
+    );
+}
+
 /// **I3248 / I3249** — `trust_root_valid` reads the edition-2 root at its own
 /// id (its charter self-edge, this node's acceptance edge), and a capability
 /// the root confers reaches it in the walk; the fixture is idempotent; the
@@ -2313,6 +2446,24 @@ async fn i3245_i3247_postgres() {
         return;
     };
     Box::pin(i3245_i3247_infrastructure_rooted_here(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i4290_sqlite() {
+    Box::pin(i4290_a_bundle_seat_is_seated_without_acceptance(
+        &sqlite_with_node().await,
+    ))
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i4290_postgres() {
+    let Some(b) = postgres_with_node().await else {
+        return;
+    };
+    Box::pin(i4290_a_bundle_seat_is_seated_without_acceptance(&b)).await;
 }
 
 #[cfg(feature = "sqlite")]

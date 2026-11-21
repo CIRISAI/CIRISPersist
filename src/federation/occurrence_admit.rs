@@ -148,7 +148,7 @@ pub(crate) async fn put_identity_occurrence_planned<D: OccurrenceStore>(
     super::edition2::door::refuse_earlier_form("identity_occurrence")?;
     // v62.0.0 (wave O1) — the identity-set exclusion on every occurrence
     // door: no machine key under a person, no person key under a machine
-    // (`occurrence_binds_machine_to_person`), as the edition-2 door.
+    // (`occurrence_mixes_person_and_machine`), as the edition-2 door.
     super::edition2::occurrence::check_identity_set_exclusion(
         dir,
         &occurrence.identity_occurrence.identity_key_id,
@@ -207,7 +207,7 @@ pub(crate) async fn put_identity_occurrence_local_planned<D: OccurrenceStore>(
 ) -> Result<(), Error> {
     // v62.0.0 (wave O1) — the trusted-local door keeps the identity-set
     // exclusion too: a local write binds no machine key under a person and
-    // no person key under a machine (`occurrence_binds_machine_to_person`).
+    // no person key under a machine (`occurrence_mixes_person_and_machine`).
     super::edition2::occurrence::check_identity_set_exclusion(
         dir,
         &occurrence.identity_key_id,

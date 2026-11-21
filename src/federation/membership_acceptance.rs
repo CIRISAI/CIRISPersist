@@ -1095,6 +1095,20 @@ where
     if !super::is_node_bearing_key_at(dir, member, at).await? {
         return Ok(false);
     }
+    // v62.0.0 (KR-fix13; CC 3.1.3.2, CC 4.4.3.19: in an infrastructure room
+    // a node "gives NO acceptance: seated by the founders' count alone, for
+    // the canonical room with the bundle's conferral") — THE CONFERRAL ON
+    // v62 IS THE BUNDLE'S SEAT. A canonical install is a serve seat of the
+    // genesis bundle in force (`is_canonical_by_bundle`). The earlier
+    // conferral (the accord's co-scrub on the node's own key record) can
+    // never pass on v62 (`verify_accord_family_coscrub` answers
+    // `accord_conferral_awaits_trust_blessing_card`, TR-fix1), so before this
+    // line NO node was ever seated without its own voice, and after KR-fix10
+    // a node's acceptance of a named invitation is refused: a canonical
+    // install could not be added to the room at all.
+    if super::edition2::genesis::is_canonical_by_bundle(dir, member).await? {
+        return Ok(true);
+    }
     super::admission::key_record_carries_accord_scrub(dir, member).await
 }
 

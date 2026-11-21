@@ -2610,7 +2610,16 @@ where
             .and_then(|v| v.as_str());
         let labeled = super::admission::envelope_dimension(envelope)
             == Some(super::trust_root::TRUST_ACCEPTS_DIMENSION);
-        if door == AttachDoor::Replicated && (presented.is_some() || !labeled) {
+        // v62.0.0 (RL-fix15, PRODUCTION; CC 2.7.3 "a row waits for what it
+        // names") — the bundle an acceptance edge NAMES is judged at every
+        // door, the replicated one included: a peer's edge naming a bundle
+        // this node does not hold is HELD (`trust_root_head_stale`), judged
+        // only from the bundles this node holds (no clock: T4a), and lands
+        // when that bundle is imported (the hold reads the bundle-in-force
+        // key, RL-fix6), so nodes converge whatever the arrival order. The
+        // shape-only reading of another node's attach stays for an unlabeled
+        // row here, and for a room's lineage head below.
+        if door == AttachDoor::Replicated && !labeled {
             return Ok(());
         }
         if edge_already_admitted(directory, attestation_id, attesting_key_id, root, envelope)
@@ -2618,15 +2627,20 @@ where
         {
             return Ok(());
         }
+        // The rule, per row (RL-fix15's table; witnessed at both doors):
+        // (a) names no bundle, none of the lineage held: not on this branch
+        //     (no bundle in force): the edge waits on the subject rule and
+        //     lands at the import;
+        // (b) names no bundle, the lineage held: lands (the id is audit-only,
+        //     Verify 23.4.0; `Engine::accept_root` always names the held tip,
+        //     so only a peer's or an earlier edge reaches this row, and it
+        //     binds the LINEAGE, which is what an acceptance accepts);
+        // (c) names a held Valid bundle of the lineage: lands;
+        // (d) names a bundle not held: HELD `trust_root_head_stale`;
+        // (e) names a held bundle of another lineage: unreachable in v62 (a
+        //     node reads every held bundle as one lineage; a second
+        //     `family_key_id` is a fork), so it reads as (d).
         return match presented {
-            None if labeled => Err(Error::TrustRootHeadUnnamed {
-                root_key_id: root.to_owned(),
-                detail: format!(
-                    "a new acceptance edge of the bundle root {root} names the bundle it attaches \
-                     on (`{}`): the object id of a bundle of that lineage (CC 3.2 T4a)",
-                    paths::ATTACHED_HEAD_DIGEST
-                ),
-            }),
             None => Ok(()),
             Some(p) if in_force.valid.iter().any(|b| hex::encode(b.object_id) == p) => Ok(()),
             Some(p) => refuse(format!(

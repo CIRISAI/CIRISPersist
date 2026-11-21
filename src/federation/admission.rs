@@ -2275,6 +2275,37 @@ pub fn is_owner_binding_envelope(envelope: &serde_json::Value) -> bool {
             == Some(super::types::owner_binding::CC_DELEGATION_PURPOSE)
 }
 
+/// v62.0.0 (KR-fix14) — the prefix of the refusal of an owner binding whose
+/// signer is not a person. ONE token for the door and the ceremony
+/// self-check (`self_at_login::OwnerBindingFault::OwnerNotAPerson`).
+pub const OWNER_BINDING_OWNER_NOT_A_PERSON: &str = "owner_binding_owner_not_a_person";
+
+/// v62.0.0 (KR-fix14; CC 3.2: an owner is a person) — **the signer-kind rule
+/// of an owner binding**: a `delegates_to` on the owner-binding dimension
+/// ([`is_owner_binding_envelope`]) is signed by a key whose identity set
+/// names `user`. A no-op for every other row. Refused by name, never held:
+/// a key's kind is its key record's and does not change by waiting.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] prefixed [`OWNER_BINDING_OWNER_NOT_A_PERSON`].
+pub fn check_owner_binding_signer_kind(
+    row: &super::Attestation,
+    attesting_identity_type: &str,
+) -> Result<(), Error> {
+    if row.attestation_type != attestation_type::DELEGATES_TO
+        || !is_owner_binding_envelope(&row.attestation_envelope)
+        || identity_type::set_contains(attesting_identity_type, identity_type::USER)
+    {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "{OWNER_BINDING_OWNER_NOT_A_PERSON}: the owner binding of {} is signed by {}, whose key \
+         is typed {attesting_identity_type:?}, not user: an owner is a person, and a node or \
+         agent key owns nothing (CC 3.2)",
+        row.attested_key_id, row.attesting_key_id
+    )))
+}
+
 /// v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10) — does an
 /// attestation `envelope` bind `content_sha256`? True iff the envelope's
 /// `evidence_refs` array contains the hex string. This is the exact
@@ -14289,6 +14320,96 @@ pub async fn nodes_stewarded_by(
 /// refusal a serve seat in an infrastructure community carries when its node
 /// has no live announced owner binding.
 pub const SERVE_SEAT_OWNER_UNANNOUNCED: &str = "serve_seat_owner_unannounced";
+
+/// v62.0.0 (KR-fix12; CC 3.2, CC 5.4.6, CC 3.1.3.2) — what a host reads
+/// about a node's owner binding ([`node_owner_binding`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeOwnerBinding {
+    /// The node's owner ([`owner_of`]: the counted owner, the node's own
+    /// voice included).
+    pub owner: String,
+    /// The owner's binding row about the node (its row id, hex): the newest
+    /// held one, a `federation`-scope row before any other. `None` when the
+    /// owner is known only through rows this read does not list.
+    pub row_id: Option<String>,
+    /// The `scope` tokens that row carries (`infra:*`).
+    pub scopes: Vec<String>,
+    /// The `cohort_scope` that row is placed at.
+    pub cohort_scope: Option<String>,
+    /// Is the owner ANNOUNCED: a live owner binding carried at
+    /// `cohort_scope: federation` ([`serve_seat_owner_announced`])? What a
+    /// serve seat needs before it serves.
+    pub announced_at_federation: bool,
+}
+
+/// v62.0.0 (KR-fix12) — **who owns `node_key_id`, by which row, with which
+/// scopes, and is it announced at federation scope?** `None`: the node has no
+/// counted owner (no binding, or the owner's half is held and the node has not
+/// voiced it).
+///
+/// The two VERDICTS are the existing folds, unchanged: `owner` is
+/// [`owner_of`] and `announced_at_federation` is
+/// [`serve_seat_owner_announced`]. `row_id`, `scopes` and `cohort_scope`
+/// describe the owner's newest held binding row about the node (a
+/// `federation`-scope row preferred): what a ceremony tool reads to confirm
+/// the scopes it asked for (`infra:attest`) are the ones that landed. They
+/// are a description of a held row, not a third liveness fold: after a
+/// withdrawal and a re-binding, read the two verdicts.
+///
+/// # Errors
+/// [`owner_of`]'s (two counted owners: [`Error::AmbiguousNodeOwner`]);
+/// directory reads.
+pub async fn node_owner_binding<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    node_key_id: &str,
+) -> Result<Option<NodeOwnerBinding>, Error> {
+    let Some(owner) = owner_of(directory, node_key_id).await? else {
+        return Ok(None);
+    };
+    let mut rows: Vec<super::Attestation> = Vec::new();
+    let mut pages = super::attestation_query::AttestationQuery::to(
+        node_key_id,
+        super::attestation_query::FOLD_PAGE,
+    )
+    .pages();
+    while let Some(page) = pages.next(directory).await? {
+        for r in page {
+            if r.attestation_type == attestation_type::DELEGATES_TO
+                && is_owner_binding_envelope(&r.attestation_envelope)
+                && (r.attesting_key_id == owner
+                    || directory
+                        .active_identity_for_occurrence(&r.attesting_key_id)
+                        .await?
+                        == owner)
+            {
+                rows.push(r);
+            }
+        }
+    }
+    let federation =
+        |r: &super::Attestation| r.cohort_scope == super::types::cohort_scope::FEDERATION;
+    rows.sort_by(|a, b| {
+        federation(b)
+            .cmp(&federation(a))
+            .then(b.asserted_at.cmp(&a.asserted_at))
+            .then(a.attestation_id.cmp(&b.attestation_id))
+    });
+    let row = rows.first();
+    Ok(Some(NodeOwnerBinding {
+        owner,
+        row_id: row.map(|r| r.attestation_id.clone()),
+        scopes: row
+            .map(|r| {
+                envelope_scope_tokens(&r.attestation_envelope)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        cohort_scope: row.map(|r| r.cohort_scope.clone()),
+        announced_at_federation: serve_seat_owner_announced(directory, node_key_id).await?,
+    }))
+}
 
 /// v61 (CIRISPersist#1101; CC 5.4.6, steward ruling 2026-10-21) — **is
 /// `node_key_id`'s owner announced?** True while a live owner binding

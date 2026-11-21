@@ -30,7 +30,7 @@
 //! everywhere, the roster as `group:roster` voices, a removal as
 //! `membership:removal` voices, and the minter node alice's by the OWNER
 //! RELATION (her owner binding + the node's own self-occurrence), never an
-//! occurrence of her (`occurrence_binds_machine_to_person`). Device seeds
+//! occurrence of her (`occurrence_mixes_person_and_machine`). Device seeds
 //! lead with their distinguishing part (a signer seeds from a key id's first
 //! 32 bytes).
 

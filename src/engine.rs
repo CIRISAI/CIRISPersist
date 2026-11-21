@@ -501,6 +501,51 @@ pub(crate) fn local_or_family_predicate(
     move |k: &str| k == our_key || family.as_ref().is_some_and(|f| f(k))
 }
 
+/// v62.0.0 (KB-fix4) — what [`Engine::accept_root`] stated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootAcceptance {
+    /// The root accepted: the lineage's `family_key_id`.
+    pub root: String,
+    /// The bundle the edge names for audit (object id, hex); `None` when no
+    /// bundle of the lineage was held when it was stated.
+    pub bundle: Option<String>,
+    /// The acceptance edge's row id (hex).
+    pub row_id: String,
+    /// `true`: the edge landed. `false`: it WAITS (held, kept) for the
+    /// lineage's bundle, and lands when the bundle is imported.
+    pub landed: bool,
+}
+
+/// v62.0.0 (KB-fix4) — what [`Engine::root_standing`] reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootStanding {
+    /// The root this node's own chain reaches (`family_key_id`); `None`:
+    /// rootless.
+    pub root: Option<String>,
+    /// v62.0.0 (KB-fix5; CC 3.2 T8) — whose acceptance edge roots it: the
+    /// node's own, or its owner's (once the owner has signed any acceptance
+    /// edge, the node's own is never read again). `None` while rootless.
+    pub through: Option<RootedThrough>,
+    /// While rootless, the plane that waits ([`Self::WAITING_PLANE`]).
+    pub waiting: Option<&'static str>,
+}
+
+/// v62.0.0 (KB-fix5) — whose acceptance edge a rooted node's chain reads
+/// (CC 3.2 T8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootedThrough {
+    /// The node's own edge (its owner has signed no acceptance edge).
+    Own,
+    /// Its owner's edge (the owner's identity-ref).
+    Owner(String),
+}
+
+impl RootStanding {
+    /// The plane a rootless node withholds: the federation tier, from third
+    /// parties (CC 5.3.4). The mesh planes run.
+    pub const WAITING_PLANE: &'static str = "federation_tier";
+}
+
 impl Engine {
     /// Construct an Engine with a pre-loaded
     /// [`LocalSigner`](crate::signing::LocalSigner) `Arc` plus a
@@ -4758,6 +4803,148 @@ impl Engine {
         .await
     }
 
+    /// v62.0.0 (KR-fix12; CC 3.2, CC 5.4.6) — **who owns `node_key_id`, by
+    /// which row, with which scopes, and is it announced at federation
+    /// scope?** One read for a ceremony tool
+    /// ([`node_owner_binding`](crate::federation::admission::node_owner_binding)).
+    /// `None`: no counted owner yet.
+    ///
+    /// # Errors
+    /// Two counted owners; directory reads.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn node_owner_binding(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Option<crate::federation::admission::NodeOwnerBinding>, crate::federation::Error>
+    {
+        crate::federation::admission::node_owner_binding(
+            self.federation_directory().as_ref(),
+            node_key_id,
+        )
+        .await
+    }
+
+    /// v62.0.0 (KR-fix12) — **the self-check of a signed owner binding
+    /// against THIS node's key plane**, before it is submitted: the statement
+    /// verifies under the key this node holds for its signer, live at the
+    /// statement's instant; that key is a person's (`user`); and the shape
+    /// (the node, `cohort_scope: federation`, `infra:*` scopes carrying
+    /// `required_scopes`). `None`: nothing is wrong. `Some(fault)`: do not
+    /// submit; `fault.token()` names it
+    /// ([`check_owner_binding_held`](crate::federation::self_at_login::check_owner_binding_held)).
+    /// The pure form, for a tool holding only the owner's public key, is
+    /// [`verify_owner_binding_statement`](crate::federation::self_at_login::verify_owner_binding_statement).
+    ///
+    /// # Errors
+    /// Directory reads.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn check_owner_binding(
+        &self,
+        statement: &[u8],
+        node_key_id: &str,
+        required_scopes: &[&str],
+    ) -> Result<Option<crate::federation::self_at_login::OwnerBindingFault>, crate::federation::Error>
+    {
+        crate::federation::self_at_login::check_owner_binding_held(
+            self.federation_directory().as_ref(),
+            statement,
+            node_key_id,
+            required_scopes,
+        )
+        .await
+    }
+
+    /// v62.0.0 (KR-fix12; CC 3.2 "the first binding", CC 2.6.1.9) — **the
+    /// node's host takes an owner binding signed elsewhere**: `statement` is
+    /// the OWNER's half (an assembled [`Self::owner_binding_draft`]). It is
+    /// put through the statement door, and when the node it binds is THIS
+    /// Engine's own key the Engine adds the node's own voice, as
+    /// [`Self::steward_bind`] does for a software owner. One behaviour for
+    /// both producers: on the node's own host, an owner-binding verb carries
+    /// the node's voice.
+    ///
+    /// On any OTHER host (the node is not this Engine's key) it only keeps
+    /// the owner's half: `Waiting` (`count_short`).
+    ///
+    /// This is a deliberate act of the node's host: it makes the node agree
+    /// to the owner the statement names. A host does not expose it to callers
+    /// it would not let name the node's owner. [`Self::submit_voice`] never
+    /// adds a voice of its own.
+    ///
+    /// **What it checks before anything is kept or voiced** (rev 3;
+    /// [`Self::check_owner_binding`] with the statement's own `sub` as the
+    /// node), each refused by its own name
+    /// ([`OwnerBindingFault::token`](crate::federation::self_at_login::OwnerBindingFault::token)):
+    /// the bytes are an owner binding (`owner_binding_wrong_row`); the
+    /// signature verifies under the key this node holds for the signer, live
+    /// at the statement's instant (`owner_binding_signature_invalid`,
+    /// `owner_binding_owner_key_not_live`); the signer is a person
+    /// (`owner_binding_owner_not_a_person`); it is placed at federation scope
+    /// (`owner_binding_not_at_federation`); its scope is `infra:*` only
+    /// (`owner_binding_scope_not_infra`). The node's own voice is added only
+    /// when the statement's `sub` is THIS Engine's key.
+    ///
+    /// # Errors
+    /// `InvalidArgument` naming the fault above; the door's refusals;
+    /// `composite_signing_unavailable` when the node's voice is due and this
+    /// Engine has no composite signer.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn submit_owner_binding(
+        &self,
+        statement: &[u8],
+    ) -> Result<
+        crate::federation::edition2::second_signer_voice::VoiceOutcome,
+        crate::federation::Error,
+    > {
+        use crate::federation::edition2::emit::{family_of_dimension, family_of_statement};
+        let bad = |what: &str| {
+            crate::federation::Error::InvalidArgument(format!("submit_owner_binding: {what}"))
+        };
+        let (family, row_type) =
+            family_of_statement(statement).ok_or_else(|| bad("not a row statement"))?;
+        if row_type != crate::federation::types::attestation_type::DELEGATES_TO
+            || family_of_dimension(crate::federation::types::owner_binding::DIMENSION).as_deref()
+                != Some(family.as_str())
+        {
+            return Err(bad(
+                "not an owner binding (a delegates_to of the ownership family)",
+            ));
+        }
+        let sub = crate::federation::edition2::liveness::statement_parts(statement)
+            .and_then(|(protected, _)| {
+                protected
+                    .get_int(15)?
+                    .get_int(2)?
+                    .as_text()
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| bad("the statement names no sub"))?;
+        let row_id = crate::federation::edition2::names::RowId::of_statement(statement)
+            .ok_or_else(|| bad("the statement has no row id"))?;
+        // Rev 3 — nothing is kept and the node voices nothing until the
+        // owner's half passes the self-check against THIS node's key plane:
+        // the signature verifies under the signer's live key, the signer is a
+        // person (`user`), the row is at `cohort_scope: federation` and its
+        // scope is `infra:*` only. Refused by the fault's own name.
+        if let Some(fault) = crate::federation::self_at_login::check_owner_binding_held(
+            self.federation_directory().as_ref(),
+            statement,
+            &sub,
+            &[],
+        )
+        .await?
+        {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "{fault} (submit_owner_binding: nothing kept, the node voiced nothing)"
+            )));
+        }
+        let out = self.submit_voice(statement).await?;
+        if out.is_seated() || self.local_derived_key_id().await.ok().as_deref() != Some(&sub) {
+            return Ok(out);
+        }
+        self.voice_held_row(&row_id.hex(), None).await
+    }
+
     /// v62.0.0 (v62 P8-fix4/fix5; CC 2.6.1.9, CC 2.7.3) —
     /// [`Self::grant_delegation`] with the row's STATE: `Seated` when it
     /// landed, `Waiting` (HTTP 424 on a host surface; reason `count_short`)
@@ -8822,7 +9009,7 @@ impl Engine {
         // - The AGENT binds under its OWN identity (`agent.identity_key_id`,
         //   else the agent key itself), authored by its owner, the login
         //   identity (an agent key is no person's occurrence:
-        //   `occurrence_binds_machine_to_person`). Its owner binding is stated
+        //   `occurrence_mixes_person_and_machine`). Its owner binding is stated
         //   first when both pens are in hand and none is held.
         //
         // A bind that did not land (a voice still drafted, or no
@@ -10879,6 +11066,182 @@ impl Engine {
             from_position,
         )
         .await
+    }
+
+    /// v62.0.0 (KB-fix4; CC 3.2 at rc22 `87abd2d`, T3) — **this node accepts
+    /// the root `family_key_id`**: its OWN `trust:accepts:v1` edge to the
+    /// lineage of a genesis bundle (`sub` = `family_key_id`), signed by THIS
+    /// engine's composite key and admitted through the statement door like
+    /// every host producer (`attestation_emit::emit_statement`). When a
+    /// bundle of that lineage is held, the edge names its newest tip for
+    /// audit (`attached_head_digest`); when none is, it names none (optional
+    /// to Verify) and WAITS: held, kept, and landing with no further act when
+    /// the bundle is imported (`put_genesis_bundle`). A later bundle of the
+    /// lineage (an amend, a re-seat, a recovery) needs no new edge.
+    ///
+    /// A node's own act: no person's consent is asked (KR-fix10's consent
+    /// reader, `admission::consenting_identity`, is not on this door). When
+    /// the node is owned and its owner accepts a root, the owner's edges
+    /// govern its chain instead (CC 3.2 T3, `trust_root::accepted_roots_of`).
+    ///
+    /// # Errors
+    /// `composite_signing_unavailable`; the door's refusals.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn accept_root(
+        &self,
+        family_key_id: &str,
+    ) -> Result<RootAcceptance, crate::federation::Error> {
+        let signer = self.composite_signer("accept_root")?;
+        let dir = self.federation_directory();
+        let (mut env, bundle) = self.root_acceptance_envelope(family_key_id).await?;
+        let asserted_at = crate::federation::hard_case::statement_instant(
+            dir.as_ref(),
+            signer,
+            crate::host::clock::now(),
+        )
+        .await?;
+        if let Some(o) = env.as_object_mut() {
+            // The emit stamps `cohort_scope` from its input, not the envelope.
+            o.remove("cohort_scope");
+            o.insert(
+                "asserted_at".into(),
+                serde_json::Value::String(crate::federation::admission::render_signed_instant(
+                    asserted_at,
+                )),
+            );
+        }
+        let mut input = crate::federation::EmitAttestationInput::with_envelope(
+            crate::federation::types::attestation_type::DELEGATES_TO,
+            crate::federation::envelope::EnvelopeCore::from_value(env)?,
+            crate::federation::types::cohort_scope::FEDERATION,
+        );
+        input.attested_key_id = Some(family_key_id.to_owned());
+        let emitted =
+            crate::federation::attestation_emit::emit_statement(dir.as_ref(), signer, input, None)
+                .await?;
+        let landed = dir
+            .get_attestation(&emitted.attestation_id)
+            .await?
+            .is_some();
+        Ok(RootAcceptance {
+            root: family_key_id.to_owned(),
+            bundle,
+            row_id: emitted.attestation_id,
+            landed,
+        })
+    }
+
+    /// v62.0.0 (KB-fix5) — **the ONE builder of an acceptance of the root
+    /// `family_key_id`**, shared by [`Self::accept_root`] (the node's own key)
+    /// and [`Self::accept_root_draft`] (the owner's key, offline), so the two
+    /// cannot state different rows: `dimension` `trust:accepts:v1`, `scope`
+    /// `infra:serve`, and, when a bundle of that lineage is held, its newest
+    /// tip as `attached_head_digest` (audit; returned beside the envelope).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn root_acceptance_envelope(
+        &self,
+        family_key_id: &str,
+    ) -> Result<(serde_json::Value, Option<String>), crate::federation::Error> {
+        let dir = self.federation_directory();
+        // v62.0.0 (KB-fix6; one_standing `bundle`) — the held tip through
+        // the ONE bundle reader (`genesis::bundles_in_force`), never a copy.
+        let bundle = crate::federation::edition2::genesis::bundles_in_force(dir.as_ref())
+            .await?
+            .into_iter()
+            .filter(|t| t.family_key_id == family_key_id)
+            .max_by_key(|t| t.asserted_at)
+            .map(|t| hex::encode(t.object_id));
+        let mut env = serde_json::json!({
+            "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
+            "scope": [crate::federation::trust_root::INFRA_SERVE_SCOPE],
+            "cohort_scope": crate::federation::types::cohort_scope::FEDERATION,
+        });
+        if let (Some(b), Some(o)) = (&bundle, env.as_object_mut()) {
+            o.insert(
+                crate::federation::envelope::paths::ATTACHED_HEAD_DIGEST.into(),
+                serde_json::Value::String(b.clone()),
+            );
+        }
+        Ok((env, bundle))
+    }
+
+    /// v62.0.0 (KB-fix5; CC 3.2 T3/T8, ceremony step 8) — **an acceptance of
+    /// the root `family_key_id`, drafted for an OWNER whose key is not in
+    /// this process** (the operator's person key, on hardware): the row
+    /// [`Self::accept_root`] states (the same builder), under a protected
+    /// header naming `owner_iss` / `owner_kid_hex`, through
+    /// [`Self::statement_draft`]. The host has the owner's key sign
+    /// `sig_structure`, assembles it (`Draft::assemble`), may run
+    /// [`check_root_acceptance_statement`](crate::federation::trust_root::check_root_acceptance_statement),
+    /// and submits it on the SEAT's host with
+    /// [`Self::put_edition2_statement`] (it is carried as bytes: a rootless
+    /// host's feed withholds a federation-tier acceptance from third
+    /// parties). Once the owner has signed it, the seat's chain is the
+    /// owner's (CC 3.2 T8); [`Self::root_standing`] reads `through: Owner`.
+    ///
+    /// # Errors
+    /// As [`Self::statement_draft`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn accept_root_draft(
+        &self,
+        family_key_id: &str,
+        owner_iss: &str,
+        owner_kid_hex: &str,
+        asserted_at_ms: u64,
+    ) -> Result<crate::federation::edition2::emit::Draft, crate::federation::Error> {
+        let (env, _) = self.root_acceptance_envelope(family_key_id).await?;
+        self.statement_draft(
+            crate::federation::types::attestation_type::DELEGATES_TO,
+            &env,
+            owner_iss,
+            owner_kid_hex,
+            family_key_id,
+            asserted_at_ms,
+            None,
+        )
+        .await
+    }
+
+    /// v62.0.0 (KB-fix4) — **is this node rooted, and under which root?**
+    /// `root`: the `family_key_id` this node's own chain (its governing
+    /// acceptor's live edge, CC 3.2 T3) reaches (`serve::rooted_under`, the
+    /// body the serve wait reads). While `None`, the plane that waits is
+    /// named: the federation tier is withheld from third parties
+    /// (`federation_tier`); the mesh planes (bootstrap kinds, allegiance,
+    /// a row's own parties) still cross (CC 5.3.4). No node key: `None`.
+    ///
+    /// # Errors
+    /// Directory reads.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn root_standing(&self) -> Result<RootStanding, crate::federation::Error> {
+        let dir = self.federation_directory();
+        let Some(node) = crate::federation::FederationDirectory::node_key_id(dir.as_ref()) else {
+            return Ok(RootStanding {
+                root: None,
+                through: None,
+                waiting: Some(RootStanding::WAITING_PLANE),
+            });
+        };
+        let now = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0);
+        let root =
+            crate::federation::edition2::serve::rooted_under(dir.as_ref(), &node, now).await?;
+        // v62.0.0 (KB-fix5; CC 3.2 T8) — through whom: the owner's edges once
+        // the owner has signed any acceptance, for good; else the node's own.
+        let acceptor =
+            crate::federation::trust_root::governing_acceptor(dir.as_ref(), &node).await?;
+        let through = root.as_ref().map(|_| {
+            if acceptor == node {
+                RootedThrough::Own
+            } else {
+                RootedThrough::Owner(acceptor.clone())
+            }
+        });
+        let waiting = root.is_none().then_some(RootStanding::WAITING_PLANE);
+        Ok(RootStanding {
+            root,
+            through,
+            waiting,
+        })
     }
 
     /// v62.0.0 (RL-fix2c) — **what this node will serve a third party**
@@ -23327,7 +23690,7 @@ mod tests {
             async move {
                 // v62.0.0 (P1-fix4; CC rc21 3.3.6) — a person's LAPTOP occurrence
                 // is a person's key: a `node` / `agent` key is never an
-                // occurrence of a person (`occurrence_binds_machine_to_person`).
+                // occurrence of a person (`occurrence_mixes_person_and_machine`).
                 let occ = e3_login_seed_key(engine, &occ, identity_type::USER).await;
                 engine
                     .federation_directory()

@@ -7,7 +7,7 @@
 //! ("An occurrence that places a `node` or `agent` key under a `user` or
 //! `accord_holder` identity, or the reverse, concludes nothing"; CC 3.4.7.1:
 //! a key is a person's or a machine's, never both), and the door refuses it
-//! (`occurrence_binds_machine_to_person`). A node's human is its OWNER
+//! (`occurrence_mixes_person_and_machine`). A node's human is its OWNER
 //! binding (`admission::owner_of` / `nodes_owned_by`; v62 P5c's
 //! `replication_audience`), witnessed there. I124 (one node shared by two
 //! humans) has no rc21 counterpart: an owner binding is single-valued

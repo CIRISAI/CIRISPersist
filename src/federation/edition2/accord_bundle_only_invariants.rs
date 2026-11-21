@@ -102,12 +102,52 @@ pub(crate) async fn accord_rows_are_refused(d: &dyn FederationDirectory, rooted:
         malformed_row::ACCORD_CHARTER_IS_THE_BUNDLE,
         &format!("[{tag}] I2350: the charter gate"),
     );
-    // … and through the statement door, nothing kept.
-    let row = e2::row_of(&by_gate, seed);
-    let id = super::voices::carried_row_id(&row)
-        .unwrap_or_else(|| panic!("[{tag}] I2350: the row carries its statement"));
+    // … and through the statement door, nothing kept. RL-fix16 — the row is
+    // signed with the LITERAL accord id as its `sub`: the fixture codec
+    // (`e2::row_of` → `kid_or_keep`) read "humanity-accord" as a seed and
+    // stated the row about a KEY of that name, so the 4u run's door leg was
+    // never about the accord at all (held `Pending` on an unknown subject).
+    let st = {
+        use ciris_verify_core::cde::Value;
+        let text = |t: &str| Value::Text(t.to_owned());
+        let at = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0);
+        ciris_verify_core::edition2::sign_row_statement(
+            &e2::signing_key(seed),
+            &signer,
+            ACCORD,
+            attestation_type::DELEGATES_TO,
+            &ciris_verify_core::namespace_match::family_id("trust:{job}:{version}"),
+            &{
+                let mut m: Vec<(Value, Value)> = vec![
+                    (text("author"), text(&signer)),
+                    (text("asserted_at"), Value::Uint(at)),
+                    (
+                        text("dimension"),
+                        text(crate::federation::trust_root::TRUST_CHARTER_DIMENSION),
+                    ),
+                    (
+                        text("scope"),
+                        Value::Array(vec![
+                            text(crate::federation::trust_root::INFRA_SERVE_SCOPE),
+                            text(crate::federation::trust_root::INFRA_ATTEST_SCOPE),
+                        ]),
+                    ),
+                    (
+                        text(crate::federation::trust_root::CHARTER_PRE_ROTATION_FIELD),
+                        Value::Bytes(vec![0xab; 32]),
+                    ),
+                ];
+                m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
+                Value::Map(m)
+            },
+            vec![],
+        )
+        .unwrap_or_else(|e| panic!("[{tag}] I2350: the charter row signs: {e}"))
+    };
+    let id = super::names::RowId::of_statement(&st)
+        .unwrap_or_else(|| panic!("[{tag}] I2350: the statement carries a row id"));
     refused_by(
-        e2::put_signed(d, &row).await,
+        e2::put_statement(d, &st).await,
         malformed_row::ACCORD_CHARTER_IS_THE_BUNDLE,
         &format!("[{tag}] I2350: the statement door"),
     );

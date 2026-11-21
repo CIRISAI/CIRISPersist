@@ -271,7 +271,7 @@ pub mod two_node {
     /// SELF-occurrence (identity = occurrence = the node, which CC rc21
     /// allows). This replaces binding a `node` / `agent` key as an occurrence
     /// of a person, which the door refuses
-    /// (`occurrence_binds_machine_to_person`). The node then receives its
+    /// (`occurrence_mixes_person_and_machine`). The node then receives its
     /// owner's content by its class (`replication_audience::owned_device`)
     /// and is a wrap target through `nodes_owned_by`
     /// (`at_rest_cascade::member_holders`).
@@ -2473,7 +2473,7 @@ pub mod two_node {
     /// statement plus the node's own voice, delivered through the replicated
     /// statement door; the rosters and the removal are T1 voices. Leg (7)'s
     /// attack (carol binding A's key under herself) is now refused at the
-    /// signed door (`occurrence_binds_machine_to_person`: a node key is never
+    /// signed door (`occurrence_mixes_person_and_machine`: a node key is never
     /// a person's occurrence, O1), so its row exists only as a trusted-local
     /// write, which is where the revocation rule is still asked.
     pub async fn exercise_i77_owned_node_minter_admitted_by_principal<B>(
@@ -2669,7 +2669,7 @@ pub mod two_node {
                 .expect_err("{tag} I77 (4): a node key is never a person's occurrence");
             assert_eq!(
                 token_of(&err),
-                crate::federation::malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
+                crate::federation::malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE,
                 "{tag} I77 (4): {err}"
             );
             bind_member_device(&c, &bob, &b.key, &b.kem).await;
@@ -2717,7 +2717,7 @@ pub mod two_node {
             .expect_err("{tag} I77 (7): a person cannot bind a node's key as her occurrence");
             assert_eq!(
                 token_of(&err),
-                crate::federation::malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
+                crate::federation::malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE,
                 "{tag} I77 (7): {err}"
             );
             let err = e
@@ -2731,7 +2731,7 @@ pub mod two_node {
                 .expect_err("{tag} I77 (7): nor as a trusted-local row");
             assert_eq!(
                 token_of(&err),
-                crate::federation::malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
+                crate::federation::malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE,
                 "{tag} I77 (7): {err}"
             );
             deliver_statements(&e, &owner_binding_voices(&alice, &a.key, bound_at))
@@ -2781,7 +2781,7 @@ pub mod two_node {
     /// the occurrence key's own statement, then the identity's (the author).
     /// A node no longer vouches for itself through its owner binding: the
     /// identity authors, and a node's key is never a person's occurrence
-    /// (`occurrence_binds_machine_to_person`, whatever binding is live). The
+    /// (`occurrence_mixes_person_and_machine`, whatever binding is live). The
     /// legs map:
     /// - (1) unbound → P8's producer with no author pen states the device's
     ///   own voice, drafts the author's, and lands nothing;
@@ -2967,7 +2967,7 @@ pub mod two_node {
         };
         assert_eq!(
             token_of(&err),
-            malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
+            malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE,
             "{tag} I76 (9): {err}"
         );
         // …and an AGENT's occurrence binds the agent's own identity, authored
@@ -2987,7 +2987,7 @@ pub mod two_node {
         .expect_err("{tag} I76 (9): an agent key under a person is refused");
         assert_eq!(
             token_of(&err),
-            malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
+            malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE,
             "{tag} I76 (9): {err}"
         );
         e2::put_agent_owner_binding(n.backend, &alice, &agent, ms(chrono::Utc::now()) - 60_000)
@@ -4241,7 +4241,7 @@ mod tests {
                 .expect("I92: self_at_login with the identity's signer");
             // v62.0.0 (E11, O1) — the person's DEVICE (the app) is an
             // `identity:occurrence` bind the identity authors; an AGENT key is
-            // never a person's occurrence (`occurrence_binds_machine_to_person`:
+            // never a person's occurrence (`occurrence_mixes_person_and_machine`:
             // an agent's occurrence binds the agent's own identity), so it is
             // not on the person's plane. DEPENDS ON P8's edition-2
             // `self_at_login` (its producer and its outcome's agent leg).

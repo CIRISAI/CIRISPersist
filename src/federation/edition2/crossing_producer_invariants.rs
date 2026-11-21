@@ -456,7 +456,7 @@ pub(crate) mod bodies {
                     &e,
                     crate::federation::Error::MalformedRow { reason, .. }
                         if *reason
-                            == crate::federation::malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON
+                            == crate::federation::malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE
                 ),
                 "I3532: {e:?}"
             ),

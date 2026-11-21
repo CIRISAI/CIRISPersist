@@ -8048,7 +8048,7 @@ pub trait FederationDirectory: Send + Sync {
     /// v62.0.0 (v62 P5c, KR-fix10; CC 3.3.6) — **what this answers for a
     /// NODE or AGENT key: the key itself.** A machine key is never a device
     /// of a person: the doors refuse such an occurrence
-    /// (`occurrence_binds_machine_to_person`) and
+    /// (`occurrence_mixes_person_and_machine`) and
     /// [`Self::active_identities_for_occurrence`] skips a held one
     /// (`replication_audience::occurrence_counts`). A node's human is its
     /// OWNER, read by `admission::owner_of` and followed only by
@@ -8123,7 +8123,7 @@ pub trait FederationDirectory: Send + Sync {
             if principals.iter().any(|(id, _)| *id == io.identity_key_id) {
                 continue;
             }
-            // v62.0.0 (v62 P5c; CC rc21 3.3.6, `occurrence_binds_machine_to_person`)
+            // v62.0.0 (v62 P5c; CC rc21 3.3.6, `occurrence_mixes_person_and_machine`)
             // — a machine key (`node` / `agent`) is never a device of a
             // person. Once the earlier form is shut, a held row binding one
             // under a person's identity (an upgraded store's) resolves
@@ -14542,7 +14542,7 @@ pub mod malformed_row {
     /// `accord_holder`) whose occurrence key is a `node` / `agent` key, or
     /// whose `device_class` is `agent`: an occurrence never binds a machine
     /// to a person; an agent's occurrence binds the agent's own identity.
-    pub const OCCURRENCE_BINDS_MACHINE_TO_PERSON: &str = "occurrence_binds_machine_to_person";
+    pub const OCCURRENCE_MIXES_PERSON_AND_MACHINE: &str = "occurrence_mixes_person_and_machine";
     /// v62.0.0 (wave O1; CC 3.3.6, CC 3.2) — an `identity:occurrence` of an
     /// agent identity with no live owner binding
     /// (`ownership:{relation}:agent:{version}`,
@@ -14682,7 +14682,7 @@ pub mod malformed_row {
         BODY_NUMBER_UNREPRESENTABLE,
         OCCURRENCE_VOICE_NOT_OWN_KEY,
         RECOVERY_KEY_IS_NOT_A_SIGNER,
-        OCCURRENCE_BINDS_MACHINE_TO_PERSON,
+        OCCURRENCE_MIXES_PERSON_AND_MACHINE,
         AGENT_OCCURRENCE_UNOWNED,
         AGENT_OCCURRENCE_NOT_OWNER_AUTHORED,
         OCCURRENCE_WITHDRAWS_NOT_PROPOSER,

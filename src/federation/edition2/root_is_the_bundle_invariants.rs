@@ -149,6 +149,182 @@ pub(crate) async fn root_is_the_bundle(d: &dyn FederationDirectory, tag: &str) {
     );
 }
 
+/// The two doors an acceptance edge arrives at.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Door {
+    /// THIS node's own act (`Engine::accept_root`).
+    Authored,
+    /// A peer's edge, from the feed.
+    Wire,
+}
+
+async fn put_at(d: &dyn FederationDirectory, st: &[u8], door: Door) {
+    use crate::federation::replication::admission::WriteOrigin;
+    let origin = match door {
+        Door::Authored => WriteOrigin::Authored,
+        Door::Wire => WriteOrigin::Wire,
+    };
+    let _ =
+        super::ingest::put_statement_with_origin(d, st, None, super::ingest::INGEST_TIER, origin)
+            .await;
+}
+
+async fn edge_of(d: &dyn FederationDirectory, seed: &str, head: Option<&str>) -> Vec<u8> {
+    let node = e2::put_key(d, seed, &["node"]).await;
+    let at = e2::ms(crate::host::clock::now()) + 1_000;
+    super::fixture_trust_root::root_acceptance_statement(
+        &e2::signing_key(seed),
+        &node,
+        fg::FAMILY_KEY_ID,
+        head,
+        at,
+    )
+    .expect("the acceptance edge signs")
+}
+
+async fn landed(d: &dyn FederationDirectory, st: &[u8]) -> bool {
+    let id = super::group_fixtures::row_id_of(st);
+    d.get_attestation(&id.hex())
+        .await
+        .expect("get_attestation reads")
+        .is_some()
+}
+
+async fn held_reason(d: &dyn FederationDirectory, st: &[u8]) -> Option<String> {
+    let id = super::group_fixtures::row_id_of(st);
+    super::fold::why_held(d, &id)
+        .await
+        .expect("why_held reads")
+        .map(|h| h.reason)
+}
+
+/// **I2460–I2463 (RL-fix15)** — the bundle-root acceptance table at `door`:
+/// `none` a fresh directory, `held` another (the bundle installed there).
+///
+/// - **I2460 (a)** names no bundle, none held: held, then lands at import;
+/// - **I2461 (b)** names no bundle, the lineage held: lands (audit-only id);
+/// - **I2462 (c)** names the held tip: lands;
+/// - **I2463 (d)** names a bundle not held: HELD `trust_root_head_stale`,
+///   never landed, at the wire door as at the authored one.
+/// - **I2466 (d) then import** an edge naming a LATER bundle of the lineage
+///   this node does not hold yet is held, and lands when that bundle is
+///   imported: arrival order does not matter.
+pub(crate) async fn attach_table(
+    none: &dyn FederationDirectory,
+    held: &dyn FederationDirectory,
+    door: Door,
+    tag: &str,
+) {
+    // (a)
+    let a = edge_of(none, &format!("rl15a-{tag}"), None).await;
+    put_at(none, &a, door).await;
+    assert!(
+        !landed(none, &a).await && held_reason(none, &a).await.is_some(),
+        "[{tag} {door:?}] I2460: no bundle held: the edge waits"
+    );
+    fg::install_v2(none).await.expect("the ceremony installs");
+    assert!(
+        landed(none, &a).await,
+        "[{tag} {door:?}] I2460: the import lands it"
+    );
+    // (b), (c), (d)
+    fg::install_v2(held).await.expect("the ceremony installs");
+    let tip = hex::encode(
+        super::genesis::genesis_in_force(held)
+            .await
+            .expect("genesis")
+            .tips()
+            .first()
+            .expect("a tip")
+            .object_id,
+    );
+    let b = edge_of(held, &format!("rl15b-{tag}"), None).await;
+    put_at(held, &b, door).await;
+    assert!(
+        landed(held, &b).await,
+        "[{tag} {door:?}] I2461: no bundle named, the lineage held: lands"
+    );
+    let c = edge_of(held, &format!("rl15c-{tag}"), Some(&tip)).await;
+    put_at(held, &c, door).await;
+    assert!(
+        landed(held, &c).await,
+        "[{tag} {door:?}] I2462: the held tip: lands"
+    );
+    let dd = edge_of(held, &format!("rl15d-{tag}"), Some(&"00".repeat(32))).await;
+    put_at(held, &dd, door).await;
+    assert!(
+        !landed(held, &dd).await,
+        "[{tag} {door:?}] I2463: a bundle not held: never landed"
+    );
+    assert_eq!(
+        held_reason(held, &dd).await,
+        Some(super::fold::reason::gc8::TRUST_ROOT_HEAD_STALE.to_owned()),
+        "[{tag} {door:?}] I2463: held trust_root_head_stale"
+    );
+    // (d) then import
+    let first = fg::bundle_v2();
+    let later = fg::later_v2(first, &[1, 2, 4], &[11, 12], &[1, 2, 4]);
+    let ee = edge_of(
+        held,
+        &format!("rl15e-{tag}"),
+        Some(&hex::encode(later.object_id)),
+    )
+    .await;
+    put_at(held, &ee, door).await;
+    assert_eq!(
+        held_reason(held, &ee).await,
+        Some(super::fold::reason::gc8::TRUST_ROOT_HEAD_STALE.to_owned()),
+        "[{tag} {door:?}] I2466: a later bundle not held yet: held"
+    );
+    fg::install_ceremony_v2(held, &later)
+        .await
+        .expect("the later bundle installs");
+    assert!(
+        landed(held, &ee).await,
+        "[{tag} {door:?}] I2466: the import of that bundle lands it"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+async fn sqlite_fresh() -> crate::store::sqlite::SqliteBackend {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    b
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2460_i2466_the_attach_table_sqlite() {
+    for door in [Door::Authored, Door::Wire] {
+        let (none, held) = (sqlite_fresh().await, sqlite_fresh().await);
+        Box::pin(attach_table(&none, &held, door, "sqlite")).await;
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2460_i2466_the_attach_table_postgres() {
+    use crate::store::Backend as _;
+    for door in [Door::Authored, Door::Wire] {
+        let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let none = crate::store::postgres::PostgresBackend::connect(&a)
+            .await
+            .unwrap();
+        none.run_migrations().await.unwrap();
+        let held = crate::store::postgres::PostgresBackend::connect(&b)
+            .await
+            .unwrap();
+        held.run_migrations().await.unwrap();
+        Box::pin(attach_table(&none, &held, door, "postgres")).await;
+    }
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn i2400_the_root_is_the_bundle_sqlite() {

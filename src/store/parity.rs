@@ -142,6 +142,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // attestation plan: a `trace:*` / `trace_summary:*` row from a signer
     // that is not an agent's key is refused `trace_signer_not_agent`.
     ("check_trace_signer_kind", Class::Gate),
+    // v62.0.0 (KR-fix14) — refuses an owner binding signed by a key that is
+    // not a person's. A statement about the caller's row and its signer's
+    // identity type (already resolved by the plan).
+    ("check_owner_binding_signer_kind", Class::Gate),
     // v62.0.0 (slice E2a) — the edition-2 attestation path: the carried
     // statement's re-verify and signer identity set refuses a row that is
     // not its statement's projection (Gate); `put_row` writes an admitted

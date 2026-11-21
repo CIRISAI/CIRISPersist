@@ -22,7 +22,7 @@
 //! `identity:occurrence` door. **I382 is deleted** (round 3): its premise is a
 //! node's ENGINE key provisioned as an occurrence of its owner (a person) and
 //! named as `self_at_login`'s `app`. CC rc21 3.3.6 (way (d)) refuses a machine
-//! key under a person (`occurrence_binds_machine_to_person`): a node's human
+//! key under a person (`occurrence_mixes_person_and_machine`): a node's human
 //! is its owner binding, which I381 witnesses.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -99,7 +99,7 @@ pub(crate) mod bodies {
 
     /// **I381** — re-asserting the occurrence does not demote the binding:
     /// the node's principal stands. v62.0.0 (CC rc21 3.3.6, way (d); the
-    /// door refuses `occurrence_binds_machine_to_person`): a NODE key is never
+    /// door refuses `occurrence_mixes_person_and_machine`): a NODE key is never
     /// an occurrence of a person. The user OWNS the node through an owner
     /// binding (the owner's statement plus the node's voice), and the node
     /// carries its OWN self-occurrence `(node, node)` (O1 `put_bind`, naming

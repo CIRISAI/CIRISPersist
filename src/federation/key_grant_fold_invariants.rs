@@ -33,7 +33,7 @@
 //! is ONE `group:roster` version (T1 voices), the removal is
 //! `membership:removal` voices, and the MINTER node is alice's by the OWNER
 //! RELATION (CC rc21 way (d): a node key is never bound under a person,
-//! `occurrence_binds_machine_to_person`): her owner binding (her statement
+//! `occurrence_mixes_person_and_machine`): her owner binding (her statement
 //! plus the node's voice) and the node's OWN self-occurrence `(node, node)`
 //! carrying its class and content-KEM keys (O1 `put_bind`; P5c: the owner
 //! gives WHO, the self-occurrence WHAT KIND). The person devices stay on the

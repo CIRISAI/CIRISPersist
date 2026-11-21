@@ -229,7 +229,7 @@ pub(crate) mod bodies {
         assert_granted_basis_is_live(d, &b, "I623").await;
 
         // occurrence_of: device G, an active occurrence of human U. v62.0.0
-        // (CC rc21 3.3.6, `occurrence_binds_machine_to_person`): a machine key
+        // (CC rc21 3.3.6, `occurrence_mixes_person_and_machine`): a machine key
         // is never an occurrence of a person (an agent's human is its owner,
         // the delegates_to path above), so the occurrence is a PERSON's
         // device, bound through O1's door (its own voice, then U's).
@@ -277,7 +277,7 @@ pub(crate) mod bodies {
         let x = e2::put_key(d, &format!("i624-x-{s}"), &[NODE]).await;
         // v62.0.0 — G and H are a person's DEVICES (`user` keys bound by
         // O1's door), not agents: a machine key is never an occurrence of a
-        // person (CC rc21 3.3.6, `occurrence_binds_machine_to_person`).
+        // person (CC rc21 3.3.6, `occurrence_mixes_person_and_machine`).
 
         let (g_s, u_s) = (format!("i624-g-{s}"), format!("i624-u-{s}"));
         let g = e2::put_key(d, &g_s, &[USER]).await;

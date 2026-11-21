@@ -33,7 +33,7 @@
 //!   signed by a key that is not the agent's; an unowned agent has no seated
 //!   WA. Ill-shaped `amendment_digest` / `authorized_by` are malformed rows.
 //! - **I1368** (deleted in v62, E3: the split home binds an AGENT key as a
-//!   person's occurrence, which O1 refuses `occurrence_binds_machine_to_person`
+//!   person's occurrence, which O1 refuses `occurrence_mixes_person_and_machine`
 //!   by the CC rc21 ruling, witnessed by O1 I3030; an agent's occurrence binds
 //!   the agent's own identity, O1 I3023.)
 

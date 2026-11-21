@@ -1648,6 +1648,119 @@ where
     Ok(owner.filter(|o| o != node))
 }
 
+/// v62.0.0 (KB-fix5; CC 3.2 T3/T8) — **whose acceptance edges `node`'s
+/// chain reads**: its owner once the owner has signed ANY labelled
+/// `trust:accepts:v1` row (live or withdrawn: the owner's first edge ends the
+/// node's own reading for good), else the node itself. The one rule
+/// [`accepted_roots_of`] and `Engine::root_standing` share.
+///
+/// # Errors
+/// Directory read failures.
+pub(crate) async fn governing_acceptor<F>(directory: &F, node: &str) -> Result<String, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if let Some(o) = governing_owner(directory, node).await? {
+        if acceptance_slice(directory, &o).await?.1 {
+            return Ok(o);
+        }
+    }
+    Ok(node.to_owned())
+}
+
+/// v62.0.0 (KB-fix5) — why a signed acceptance of a bundle root is not the
+/// row a ceremony tool meant to submit
+/// ([`check_root_acceptance_statement`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootAcceptanceFault {
+    /// Not a row statement.
+    NotARowStatement,
+    /// Its row type is not `delegates_to`.
+    NotADelegatesTo,
+    /// Its family is not `trust:{job}:{version}`.
+    NotTheTrustFamily,
+    /// Its dimension is not `trust:accepts:v1`.
+    NotAnAcceptance,
+    /// Its `sub` is not the root's `family_key_id`.
+    NotTheRoot,
+    /// It is not authored (`author` and `iss`) by the signer named.
+    NotAuthoredByTheSigner,
+    /// Its signature does not verify under the signer's key record.
+    SignatureDoesNotVerify,
+}
+
+impl RootAcceptanceFault {
+    /// The fault's token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotARowStatement => "root_acceptance_not_a_row_statement",
+            Self::NotADelegatesTo => "root_acceptance_not_a_delegates_to",
+            Self::NotTheTrustFamily => "root_acceptance_not_the_trust_family",
+            Self::NotAnAcceptance => "root_acceptance_not_an_acceptance",
+            Self::NotTheRoot => "root_acceptance_not_the_root",
+            Self::NotAuthoredByTheSigner => "root_acceptance_not_authored_by_the_signer",
+            Self::SignatureDoesNotVerify => "root_acceptance_signature_does_not_verify",
+        }
+    }
+}
+
+/// v62.0.0 (KB-fix5; CC 3.2 T3) — **the self-check a ceremony tool runs on
+/// a signed acceptance of a bundle root before it submits it** (pure: no
+/// store): a `delegates_to` of the trust family, on `trust:accepts:v1`,
+/// `sub` = `family_key_id`, authored and signed by `signer_iss`, whose
+/// signature verifies under `signer_key_record` (the signer's own
+/// `key:record` statement). It does not know whether the node holds the
+/// bundle (the door decides: RL-fix15's table).
+///
+/// # Errors
+/// The first [`RootAcceptanceFault`].
+pub fn check_root_acceptance_statement(
+    statement: &[u8],
+    family_key_id: &str,
+    signer_iss: &str,
+    signer_key_record: &[u8],
+) -> Result<(), RootAcceptanceFault> {
+    use ciris_verify_core::cde::Value;
+    use RootAcceptanceFault as F;
+    let (family, row_type) =
+        super::edition2::emit::family_of_statement(statement).ok_or(F::NotARowStatement)?;
+    if row_type != attestation_type::DELEGATES_TO {
+        return Err(F::NotADelegatesTo);
+    }
+    if !super::edition2::typed::is_trust_family(&family) {
+        return Err(F::NotTheTrustFamily);
+    }
+    let (protected, payload) =
+        super::edition2::liveness::statement_parts(statement).ok_or(F::NotARowStatement)?;
+    let claim = |n: i64| {
+        protected
+            .get_int(15)
+            .and_then(|c| c.get_int(n))
+            .and_then(Value::as_text)
+    };
+    let text = |k: &str| payload.get_text(k).and_then(Value::as_text);
+    if text("dimension") != Some(TRUST_ACCEPTS_DIMENSION) {
+        return Err(F::NotAnAcceptance);
+    }
+    if claim(2) != Some(family_key_id) {
+        return Err(F::NotTheRoot);
+    }
+    if claim(1) != Some(signer_iss) || text("author") != Some(signer_iss) {
+        return Err(F::NotAuthoredByTheSigner);
+    }
+    // KR-fix14 — the ONE signature self-check
+    // (`edition2::self_check::verify_statement_signature`), the core this
+    // check shares with the owner binding's and the generic one: the same
+    // judgement as before (the door's, against the signer's one key record).
+    super::edition2::self_check::verify_statement_signature(
+        statement,
+        super::edition2::self_check::SignerKey::KeyRecord(signer_key_record),
+    )
+    .map_err(|_| F::SignatureDoesNotVerify)?;
+    Ok(())
+}
+
 /// v62.0.0 (PR-fix1; CC 3.2 T3) — the roots `node`'s governing acceptor
 /// (its owner once the owner has signed any acceptance edge, else the node)
 /// names by a `trust:accepts:v1` row, live or not, in the order held. A
@@ -1662,6 +1775,7 @@ where
     F: FederationDirectory + ?Sized,
 {
     let mut slice = None;
+    // (The same acceptor rule as [`governing_acceptor`].)
     if let Some(o) = governing_owner(directory, node).await? {
         let (rows, any) = acceptance_slice(directory, &o).await?;
         if any {
@@ -2999,6 +3113,14 @@ where
             // (R → subject); a row here labeled charter or trust-edge is
             // pointing the other way and does not confer.
             && job_dimension_admits(&a.attestation_envelope, TRUST_CONFERS_DIMENSION)
+            // v62.0.0 (RL-fix14; CC 3.3.6, CC 3.2 T2) — an OWNER BINDING
+            // (`delegates_to(owner → node)`, scope `infra:serve` +
+            // `infra:network_presence`) is an allegiance fact, never a
+            // conferral: its owner is no root. Read as one, it gave every
+            // owned node a delegation seat "under" its owner, so peer
+            // rooting answered `NoAcceptanceEdge { root: <the owner> }` for
+            // an owned CI worker (the 4u run's I2409, I2221).
+            && !super::admission::is_owner_binding_envelope(&a.attestation_envelope)
             // v62.0.0 (KR-fix3a) — exact for every scope, plus the attest
             // families' parent-covers-child rule (`scope_confers`).
             && scope_confers(&a.attestation_envelope, scope)
@@ -6096,6 +6218,8 @@ pub(crate) mod v53_1_6_reference {
                 // (R → subject); a row here labeled charter or trust-edge is
                 // pointing the other way and does not confer.
                 && job_dimension_admits(&a.attestation_envelope, TRUST_CONFERS_DIMENSION)
+                // RL-fix14 — an owner binding is no conferral (as above).
+                && !crate::federation::admission::is_owner_binding_envelope(&a.attestation_envelope)
                 && scope_contains(&a.attestation_envelope, scope)
         };
 

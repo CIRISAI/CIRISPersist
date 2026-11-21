@@ -250,7 +250,7 @@ fn is_machine(types: &[String]) -> bool {
 /// RULINGS identity-set rule): an occurrence never binds a machine to a
 /// person. Under a `user` / `accord_holder` identity, a `node` / `agent`
 /// key, or `device_class: agent` (even when the key's type is not held),
-/// is refused [`malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON`]. An
+/// is refused [`malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE`]. An
 /// agent's occurrence binds the agent's own identity.
 pub(crate) async fn check_identity_set_exclusion<F>(
     dir: &F,
@@ -271,7 +271,7 @@ where
     // person's vote.
     if is_machine(&identity_types) && is_person(&key_types(dir, occurrence).await?) {
         return Err(refuse(
-            malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
+            malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE,
             format!(
                 "{OCCURRENCE_FAMILY}: {identity} is a machine's identity and {occurrence} is a \
                  person's key: an occurrence never binds a person's key to a node or agent \
@@ -285,7 +285,7 @@ where
     let agent_class = device_class == crate::federation::types::device_class::AGENT;
     if agent_class || is_machine(&key_types(dir, occurrence).await?) {
         return Err(refuse(
-            malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
+            malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE,
             format!(
                 "{OCCURRENCE_FAMILY}: {identity} is a person's identity and {occurrence} is \
                  a machine's key (device_class {device_class}): an occurrence never binds a \

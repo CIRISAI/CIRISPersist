@@ -23,7 +23,7 @@
 //! signed transport destination, the touch claim; each
 //! `refuse_earlier_form(..)` once shut), and I630's revocation leg stands an
 //! agent key as an occurrence of a person, which v62 refuses
-//! (`occurrence_binds_machine_to_person`). The edition-2 occurrence wait (an
+//! (`occurrence_mixes_person_and_machine`). The edition-2 occurrence wait (an
 //! author's voice offered alone is the retryable `federation_attester_key_unknown`)
 //! is O1's. I615 remains: the statement door names its own plane
 //! (`edition2::door::PLANE`).

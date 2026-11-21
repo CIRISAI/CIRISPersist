@@ -218,7 +218,9 @@ mod build_version_tests {
 pub use engine::AuditDispatch;
 #[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
 pub use engine::NodeCoreDispatch;
-pub use engine::{BackendDispatch, Engine, EngineError};
+pub use engine::{
+    BackendDispatch, Engine, EngineError, RootAcceptance, RootStanding, RootedThrough,
+};
 // v11.9.0 (CIRISPersist#337) — CC 0.7 wire-vocabulary range-steward surface
 // at the crate root so consumers `use ciris_persist::{TRACE_BATCH_KIND,
 // WIRE_VOCABULARY_HASH}` alongside `Engine`. CIRISServer/lens-core repins its

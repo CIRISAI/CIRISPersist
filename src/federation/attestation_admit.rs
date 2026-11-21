@@ -1052,6 +1052,16 @@ where
             &attesting_identity_type,
         )?;
     }
+    // v62.0.0 (KR-fix14; CC 3.2, CC 3.1.3.2; lead's ruling) — an OWNER
+    // BINDING is authored by a PERSON. The owner folds already count nothing
+    // from a granter that is not a `user` (`live_delegation_granter_instants`,
+    // `kernel_owner_selves`), so an owner's half signed by a `node` or
+    // `agent` key could never count: it sat in the store looking pending for
+    // ever. Refused by name, here beside the sibling signer-kind checks, so
+    // every door that admits a row answers alike (local, replicated, tier
+    // ingest, the re-fold). The OWNER's half only: the bound node's own
+    // second voice is never an attesting row of its own (it joins this one).
+    crate::federation::admission::check_owner_binding_signer_kind(&row, &attesting_identity_type)?;
 
     // v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — a `revoked`
     // consent_record at local tier MAY *transit* the local write path

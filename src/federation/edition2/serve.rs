@@ -165,13 +165,28 @@ pub async fn node_is_rooted<F>(dir: &F, node: &str, at_ms: u64) -> Result<bool, 
 where
     F: FederationDirectory + ?Sized,
 {
+    Ok(Box::pin(rooted_under(dir, node, at_ms)).await?.is_some())
+}
+
+/// v62.0.0 (KB-fix4) — [`node_is_rooted`], naming the root: the first root
+/// `node`'s governing acceptor names that roots it (the bundle lineage's
+/// `family_key_id`, or a keyed root's id while that arm stands). `None`:
+/// not rooted. The ONE body `node_is_rooted` and the host's read
+/// (`Engine::root_standing`) share.
+///
+/// # Errors
+/// Directory reads.
+pub async fn rooted_under<F>(dir: &F, node: &str, at_ms: u64) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     use crate::federation::canonical_community::{reader_standing, StoredStanding};
     let Some(now) = chrono::TimeZone::timestamp_millis_opt(
         &chrono::Utc,
         i64::try_from(at_ms).unwrap_or(i64::MAX),
     )
     .single() else {
-        return Ok(false);
+        return Ok(None);
     };
     for root in crate::federation::trust_root::accepted_roots_of(dir, node).await? {
         // v62.0.0 (KB-fix1; CC 3.2 at rc22 `87abd2d`) — the root a node
@@ -183,17 +198,17 @@ where
         ))
         .await?
         {
-            return Ok(true);
+            return Ok(Some(root));
         }
         let (standing, _) = Box::pin(reader_standing(dir, Some(node), &root, now)).await?;
         if matches!(
             standing,
             StoredStanding::Rooted(_) | StoredStanding::Stalled { .. }
         ) {
-            return Ok(true);
+            return Ok(Some(root));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// This directory's node, rooted now ([`node_is_rooted`]). Every serve path

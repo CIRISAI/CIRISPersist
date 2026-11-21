@@ -45,7 +45,7 @@ pub(crate) mod bodies {
     /// carrying the ownership marker, landed with the agent's own voice (the
     /// family's second signer) through K2's `ts::put_sealed_owner_binding`. An occurrence row cannot carry
     /// it: an occurrence never binds a machine key to a person
-    /// (`occurrence_binds_machine_to_person`).
+    /// (`occurrence_mixes_person_and_machine`).
     async fn steward_binds(d: &dyn FederationDirectory, steward: &str, agent: &str) {
         use crate::federation::types::{attestation_type, delegation_scope as ds, owner_binding};
         let mut row = ts::bare_attestation(

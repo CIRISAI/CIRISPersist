@@ -32,12 +32,12 @@
 //! - I3030: no occurrence binds a machine to a person (CC 3.3.6, rc21): an
 //!   agent key under a user identity (as `agent` or as `laptop`), and
 //!   `device_class: agent` under a user identity, are refused
-//!   `occurrence_binds_machine_to_person`; and an agent key is never a key
+//!   `occurrence_mixes_person_and_machine`; and an agent key is never a key
 //!   of its owner's identity (`kid_not_of_iss`).
 //! - I3044: the trusted-LOCAL occurrence door keeps the same exclusion: an
 //!   agent key under a user, a user key under an agent identity, and
 //!   `device_class: agent` under a user are refused
-//!   `occurrence_binds_machine_to_person`; a user's device under the user is
+//!   `occurrence_mixes_person_and_machine`; a user's device under the user is
 //!   stored.
 
 use ciris_crypto::composite::CompositeSigningKey;
@@ -442,7 +442,7 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
         let e = put(d, &st).await.unwrap_err();
         assert_eq!(
             reason(&e),
-            malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
+            malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE,
             "{what}: {e}"
         );
         assert_eq!(bound(d, &u, occ).await, None, "{what}: nothing bound");
@@ -475,7 +475,7 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
             .unwrap_err();
         assert_eq!(
             reason(&e),
-            malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON,
+            malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE,
             "{what}: {e}"
         );
         assert_eq!(

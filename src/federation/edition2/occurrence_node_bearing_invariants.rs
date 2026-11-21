@@ -8,7 +8,7 @@
 //!   node-bearing through that occurrence, its own voice the agreement.
 //! - I3041: a user key is not node-bearing, and a node cannot make it so: a
 //!   bind of a person's key under a node identity is refused
-//!   `occurrence_binds_machine_to_person`.
+//!   `occurrence_mixes_person_and_machine`.
 
 use ciris_crypto::composite::CompositeSigningKey;
 use ciris_verify_core::cde::Value;
@@ -126,7 +126,7 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
         .unwrap_err();
     assert!(
         matches!(&e, Error::MalformedRow { reason, .. }
-            if *reason == malformed_row::OCCURRENCE_BINDS_MACHINE_TO_PERSON),
+            if *reason == malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE),
         "I3041: {e}"
     );
     assert!(

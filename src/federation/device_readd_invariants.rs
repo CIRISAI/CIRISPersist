@@ -194,7 +194,7 @@ pub(crate) mod bodies {
     /// `owner = None` is an unbound device (its singleton row only).
     /// v62.0.0 (E13): `node` and `owner` are identity-refs E0 minted. P5c
     /// (lead's ruling): a node is never an occurrence of a person
-    /// (`occurrence_binds_machine_to_person`); WHO it belongs to is the owner
+    /// (`occurrence_mixes_person_and_machine`); WHO it belongs to is the owner
     /// binding, WHAT KIND it is its own self-occurrence `(node, node)`.
     async fn device<B>(
         b: &B,
@@ -1138,7 +1138,7 @@ pub(crate) mod two_node {
     /// `identity:occurrence` bind of the self pair (author = identity =
     /// occurrence = the node key; one statement), carrying the device's
     /// class and content-KEM keys. A node key is never bound under a person
-    /// (`occurrence_binds_machine_to_person`): bob's claim on it is the owner
+    /// (`occurrence_mixes_person_and_machine`): bob's claim on it is the owner
     /// binding. Returns its row id.
     async fn anchor_self_on<B: FederationDirectory + Sync>(n: &B, d: &Device) -> RowId {
         use ciris_verify_core::cde::Value;

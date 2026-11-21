@@ -78,6 +78,9 @@ mod fold_gc8_invariants;
 // v62.0.0 (RL-fix1; CC 5.3.4) — a rootless node runs the P2P mesh (I2240–I2243).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod rootless_mesh_invariants;
+// v62.0.0 (KB-fix4) — the host's acceptance of the bundle root (I2416–I2418).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod bundle_root_acceptance_invariants;
 // v62.0.0 (RL-fix11) — the parties to a row under the rootless serve rule:
 // every voice's signer (I2412–I2414).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -139,6 +142,9 @@ mod admission_unit_invariants;
 pub mod second_signer_voice;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod second_signer_voice_invariants;
+/// v62.0.0 (KR-fix14) — the one signature self-check of an assembled
+/// statement, shared by the per-row ceremony self-checks.
+pub mod self_check;
 pub mod serve;
 // v62.0.0 (F0-cp8) — the closed registry of signing domains (CC 2.6.1.7).
 pub mod signing_domain;

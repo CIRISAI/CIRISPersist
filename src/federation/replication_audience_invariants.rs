@@ -1010,7 +1010,7 @@ pub(crate) mod bodies {
     /// (`owner_of` counts it only then, `owner_binding_counted_short`). The
     /// earlier `unagreed_row` — an identity-signed `(k, node)` occurrence row —
     /// is gone: a node is never a person's occurrence in v62
-    /// (`occurrence_binds_machine_to_person`), and a bind offered on the
+    /// (`occurrence_mixes_person_and_machine`), and a bind offered on the
     /// author's voice alone is never held.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn invitee_seen_from_the_creator(d: &dyn FederationDirectory, k: &str, node: &str) {
@@ -1540,7 +1540,7 @@ pub(crate) mod key_bodies {
     /// node holds real content-KEM keys.
     ///
     /// v62 (E3b; P5c, O1): a node is never bound under a person
-    /// (`occurrence_binds_machine_to_person`), so there is no `(owner, node)`
+    /// (`occurrence_mixes_person_and_machine`), so there is no `(owner, node)`
     /// occurrence. WHO: the owner binding plus the node's voice
     /// (`bodies::claim_with`). WHAT KIND, and the keys a wrap is sealed to:
     /// the node's OWN self-occurrence (identity = occurrence = the node key),

@@ -11,7 +11,7 @@
 //! the "sign" split, `admit_produced` the "put"), and the minter node
 //! member 0's by the OWNER RELATION (his owner binding + the node's own
 //! self-occurrence, [`own_node`]), never an occurrence of a person
-//! (`occurrence_binds_machine_to_person`). Member 0 is the SAME identity in
+//! (`occurrence_mixes_person_and_machine`). Member 0 is the SAME identity in
 //! both rooms, so the node has one owner. Device seeds lead with their
 //! distinguishing part (a signer seeds from a key id's first 32 bytes).
 
