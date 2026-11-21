@@ -328,6 +328,9 @@ rs_fixture() {  # <name>: a clone whose HEAD carries CHANGELOG [9.9.0] and the l
         git init -q --bare -b main "$t/rs/$1.git"
         git init -q -b main "$t/rs/$1"; cd "$t/rs/$1"
         mkdir scripts; cp "$OLDPWD/scripts/release_lib.sh" scripts/; cp "$t/CHANGELOG.md" .
+        mkdir -p src/federation/namespace
+        printf '%s\n' "${RS_CC_TAG_LINE:-pub const VENDORED_CC_TAG: CcTag = CcTag::Recorded(\"v9.9\");}" \
+            > src/federation/namespace/registry.rs
         git add -A; git commit -q -m one
         git remote add origin "$t/rs/$1.git"; git push -q origin HEAD:refs/heads/main
         git rev-parse HEAD > "$t/rs/$1.head"
@@ -349,6 +352,12 @@ case "$out" in *"git tag -d v9.9.0"*) ok "ship: the refusal says how to clear it
 if git -C "$t/rs/stale" ls-remote --exit-code origin refs/tags/v9.9.0 >/dev/null; then bad "ship: the stale tag was pushed"; else ok "ship: the stale tag was not pushed"; fi
 rs_fixture light; git -C "$t/rs/light" tag v9.9.0 HEAD; rs light
 expect_eq "ship: a lightweight local tag is refused (exit 11)" "$rc" "11"
+# v62.0.0 (4r) — a head whose CC tag is pending (or unreadable) never merges.
+RS_CC_TAG_LINE='pub const VENDORED_CC_TAG: CcTag = CcTag::Pending;' rs_fixture pending; rs pending
+expect_eq "ship: a pending CC tag is refused before the merge (exit 17)" "$rc" "17"
+if git -C "$t/rs/pending" ls-remote --exit-code origin refs/tags/v9.9.0 >/dev/null; then bad "ship: a pending-CC head was tagged"; else ok "ship: a pending-CC head was not tagged"; fi
+RS_CC_TAG_LINE='pub const VENDORED_CC_TAG: CcTag = CcTag::Recorded("");' rs_fixture emptytag; rs emptytag
+expect_eq "ship: an empty recorded CC tag is refused (exit 17)" "$rc" "17"
 
 echo "release.sh resume binding"
 # .release/<ver> is bound to the branch it was started on and to the release

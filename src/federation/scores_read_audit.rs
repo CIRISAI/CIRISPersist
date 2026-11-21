@@ -1770,10 +1770,14 @@ mod tests {
         // `accord:lifecycle:{kind}`), drops `credits:…:substrate_building` and
         // adds `location_proof:{version}` and `trust:blessing`: the retained
         // side loses seven, and the two `+1.0 only` lifecycle leaves become
-        // one withheld row.
+        // one withheld row. v62.0.0 (4r, CC rc22 8c436b8): 159 / 16 of 189.
+        // Of its two new families the `signed` `contribution:{subject_kind}`
+        // joins the retained side (a pin is a function of the polarity alone,
+        // and every `signed` row is retained) and the `positive-only`
+        // `stream:head` pins on neither.
         assert_eq!(
             (retained, withheld),
-            (158, 16),
+            (159, 16),
             "the contradiction-count contrast moved (retained={retained}, \
              withheld={withheld})"
         );

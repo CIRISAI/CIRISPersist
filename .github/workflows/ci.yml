@@ -2822,8 +2822,13 @@ jobs:
           sha = const("VENDORED_REGISTRY_SHA256")
           if not re.fullmatch(r"[0-9a-f]{64}", sha):
               sys.exit("VENDORED_REGISTRY_SHA256 is not 64 hex: %r" % sha)
+          # v62.0.0 (4r): the tag is the RECORDED one; a pending tag fails here
+          # too (release_ship.sh refuses it first, exit 17).
+          m = re.search(r'^pub const VENDORED_CC_TAG: CcTag = CcTag::Recorded\("([^"]+)"\);$', src, re.M)
+          if not m:
+              sys.exit("registry.rs: VENDORED_CC_TAG records no CIRISConstitution tag (CcTag::Pending?)")
           print(json.dumps({
-              "cc_tag": "v" + const("VENDORED_CC_VERSION"),
+              "cc_tag": m.group(1),
               "registry_sha256": sha,
               "crate_version": sys.argv[1],
               "merge_sha": sys.argv[2],

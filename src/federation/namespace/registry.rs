@@ -38,24 +38,72 @@ pub(super) const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
 
 /// The CC version [`REGISTRY_JSON`] was generated from. Bump in lockstep when
 /// re-vendoring (the drift gate asserts the file's `_meta.cc_version` matches).
-pub const VENDORED_CC_VERSION: &str = "1.0-rc21";
+pub const VENDORED_CC_VERSION: &str = "1.0-rc22";
 
-/// v62.0.0 (R1c; CC-pin) — the CIRISConstitution TAG the vendored files were
-/// copied from. Through rc20 the tag was `v<VENDORED_CC_VERSION>`; R1c
-/// vendored rc21's wire cut, tagged `v1.0-rc21-wire` (`e6fd7c60`), and CC-pin
-/// moves to the RELEASE tag `v1.0-rc21` (`b016df47`), which is
-/// `v<VENDORED_CC_VERSION>` again. The tag witnesses (I1302, I1499) and
-/// `scripts/check_vendored_cc.sh` still name the tag by this const, never by
-/// formatting the version, so a later cut tagged otherwise cannot make a
-/// witness find no tag and SKIP: a check that could not fail.
-pub const VENDORED_CC_TAG: &str = "v1.0-rc21";
+/// v62.0.0 (4r) — whether CIRISConstitution has tagged
+/// [`VENDORED_CC_COMMIT`], and with which tag.
+///
+/// A vendor is taken BY COMMIT; the tag can follow it. While it has not,
+/// the tag is [`CcTag::Pending`], and every tag check is still a real check
+/// of the commit pin (none skips for want of a tag), and the release fails
+/// closed:
+///
+/// - **I1302 / I1499** (with a CC checkout) read every file at the COMMIT
+///   (a checkout that lacks the commit is a failure, not a skip), and red the
+///   moment any tag names the commit, so a tag CC cuts is recorded here.
+/// - **I2430** (always runs, no checkout) holds the pending state's own
+///   shape: a full commit id and the registry's `_meta.cc_version`.
+/// - **`scripts/check_vendored_cc.sh`** byte-compares at the commit, then
+///   exits 3 (`CC tag pending`) unless `--commit-only` is given; and
+///   **`scripts/release_ship.sh`** refuses (exit 17) while this reads
+///   `CcTag::Pending`, so no persist release ships an unrecorded tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CcTag {
+    /// The tag CC cut at [`VENDORED_CC_COMMIT`] (an annotated tag names a tag
+    /// object; the checks resolve it to its commit).
+    Recorded(&'static str),
+    /// CC has not tagged [`VENDORED_CC_COMMIT`] yet.
+    Pending,
+}
+
+impl CcTag {
+    /// The recorded tag, or `None` while pending.
+    #[must_use]
+    pub const fn tag(self) -> Option<&'static str> {
+        match self {
+            Self::Recorded(t) => Some(t),
+            Self::Pending => None,
+        }
+    }
+
+    /// The git revision the tag checks read: the tag once recorded, else the
+    /// commit.
+    #[must_use]
+    pub const fn rev(self) -> &'static str {
+        match self {
+            Self::Recorded(t) => t,
+            Self::Pending => VENDORED_CC_COMMIT,
+        }
+    }
+}
+
+/// The CIRISConstitution tag of the vendored cut. Through rc21 a tag
+/// (`v1.0-rc21`, `b016df47`). v62.0.0 (4r) vendored rc22 at commit `8c436b8b`,
+/// untagged, so PENDING; v62.0.0 (CC-tag) moves the pin to the commit CC
+/// tagged `v1.0-rc22-pre1` (tag object `74029fc3`, commit `0774639b`) and
+/// RECORDS it. A later manifest-changing CC commit lands untagged again (a
+/// `pre2`): set this back to `CcTag::Pending` until CC tags it.
+/// `scripts/check_vendored_cc.sh` and `scripts/release_ship.sh` read this
+/// line's text (`pub const VENDORED_CC_TAG: CcTag = CcTag::Pending;` or
+/// `... CcTag::Recorded("<tag>");`): keep it on one line.
+pub const VENDORED_CC_TAG: CcTag = CcTag::Recorded("v1.0-rc22-pre1");
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "ede8773f5d38b821b9b5cd240bc4be5a2db15145fdf46cffd30c997bbd9b647f";
+    "a221ca4ea3d6b02d7ac2354a0b68272d5f6283a396a12b8a40fd0e7b910f6eeb";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 187;
+pub const VENDORED_N_FAMILIES: usize = 189;
 
 /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the manifest's
 /// `_meta.registry_sha256`: the hash of the GRAMMAR (families + `_meta` minus
@@ -65,16 +113,24 @@ pub const VENDORED_N_FAMILIES: usize = 187;
 /// vendored bytes the way `tools/build_cc_namespace.py` does.
 ///
 /// Vendored byte-for-byte from CIRISConstitution commit [`VENDORED_CC_COMMIT`]
-/// (CC 1.0-rc21; see [`VENDORED_CC_COMMIT`] for the tag), together with
+/// (CC 1.0-rc22; see [`VENDORED_CC_TAG`] for the tag, pending), together with
 /// `namespace_match_vectors.json` from the same commit. JSON carries no
 /// comments, so this doc is the vendored files' header.
 pub const VENDORED_REGISTRY_SHA256: &str =
-    "1f81a1b1ab6f29b645d292f70d8d15810b475fbde5d6444ffe33b4ee68845bd2";
+    "23a4e129f09532b3b896f39522da88995e8453c4b15ba9d9012da1f75e9795c4";
 
-/// The CIRISConstitution commit every vendored CC manifest was copied from: the
-/// commit the `v1.0-rc21` release tag names (`b016df47`, [`VENDORED_CC_TAG`]),
-/// copied from the tag with `git show v1.0-rc21:manifests/<file>`, never
-/// a branch tip (v62.0.0 CC-pin, from the rc21 wire cut `e6fd7c60`
+/// The CIRISConstitution commit every vendored CC manifest was copied from.
+/// v62.0.0 (CC-tag): `0774639b`, the commit the `v1.0-rc22-pre1` tag names
+/// ([`VENDORED_CC_TAG`]). From 4r's untagged `8c436b8b` (the commit
+/// CIRISVerify v23.4.0 vendors) no vendored file's bytes move: under
+/// `manifests/` only `family_payloads_v2.cddl` (not vendored) changed, so
+/// persist and Verify still read the same registry bytes. v62.0.0 (4r): rc22
+/// `8c436b8b`, copied BY COMMIT while the tag was pending. From rc21 `b016df47`, the commit the
+/// `v1.0-rc21` release tag names: the registry gains `stream:head` and
+/// `contribution:{subject_kind}` (189 families) and four rows their own
+/// reserved rule; the match vectors gain 13 (1336); the CSD/4 chain gains
+/// seven refusal tokens (the fedcode six and `code_node_key_mismatch`); parts
+/// 2 and 3 move. Earlier: v62.0.0 CC-pin, from the rc21 wire cut `e6fd7c60`
 /// (`v1.0-rc21-wire`): the registry's bytes moved only in
 /// `_meta.source_sha256`; v62.0.0 R1c, from rc20 `d4bd2a6b`, so persist's
 /// matcher reads the registry CIRISVerify 23.3.1 vendors; CIRISPersist#753; v62.0.0, from
@@ -82,19 +138,20 @@ pub const VENDORED_REGISTRY_SHA256: &str =
 /// files are also pinned by their own SHA-256
 /// ([`VENDORED_REGISTRY_FILE_SHA256`], [`VENDORED_VECTORS_FILE_SHA256`], and the
 /// files in [`super::cc_manifests`]), and
-/// `scripts/check_vendored_cc.sh v1.0-rc21` byte-compares all of them
-/// against the tag before a persist release that names rc21 is tagged.
-pub const VENDORED_CC_COMMIT: &str = "b016df47a7697b6544e34177541be442ff6f24e9";
+/// `scripts/check_vendored_cc.sh` byte-compares all of them against the
+/// commit (pending) or the tag (recorded) before a persist release is tagged,
+/// and refuses the release while the tag is pending.
+pub const VENDORED_CC_COMMIT: &str = "0774639b9a76f7746569446c3eb56439a74e7a09";
 
 /// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
 /// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).
 /// What `scripts/check_vendored_cc.sh` compares against the tag.
 pub const VENDORED_REGISTRY_FILE_SHA256: &str =
-    "83fbc43124a076ce6878e6c0e775d4cabb8c22c7ab1c4c71438b6b425e1f8c32";
+    "01f6c39b14de1ca068a26b18ee5ddddb4a5989e4394829ab4d5e5a20bfee3645";
 
 /// SHA-256 of the vendored `namespace_match_vectors.json` FILE bytes.
 pub const VENDORED_VECTORS_FILE_SHA256: &str =
-    "46a274d010a37c16c81ef02718b21cbd31d67ba823fbade85317fabad127f7ca";
+    "6bed6efa3b4d95d63cfc07844cc4c2eacd68511097fcf72c970962895646f198";
 
 /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the case class of one dimension
 /// SEGMENT, read from the manifest rather than inferred from `{...}` in prose.
@@ -1159,6 +1216,17 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     // `pattern` (a key's bare thumbprint: `licensure:{authority_id}`,
     // `moderation_track_record:{community_key_id}`); two descriptions move.
     "admission:unit",
+    // rc22 (CIRISConstitution 8c436b8; v62.0.0 4r) — two families added, none
+    // retired: the stream head (CC 3.1.3; reserved, CC 5.3.3.8: the signer is
+    // the row's author and the stream's producer, a member's key and never a
+    // node's) and the node contribution (`contribution:{subject_kind}`, CC
+    // 3.1.9.3, open). The
+    // same cut gives four rows their own reserved rule in place of the CC 3.4.3
+    // `substrate-self-report` default: `admission:unit` (CC 2.7.11),
+    // `ballot:moderator` and `ballot:moderator_acceptance` (CC 4.5.13),
+    // `transport:canonical_rebind` (CC 3.3.6.2).
+    "contribution:{subject_kind}",
+    "stream:head",
 ];
 
 /// Families CC has **deliberately retired** — present in an earlier vendored cut,

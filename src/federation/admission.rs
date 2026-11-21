@@ -25209,9 +25209,11 @@ mod tests {
         // `location_proof:{version}`), refused before any persist gate.
         // (E12-fix3.)
         "location_proof:",
-        // rc21 re-vendor (v62.0.0 R1c, CC 3.1.3 / CC 2.7.11) — reserved
-        // `substrate-self-report` (CC 3.4.3), and the rule CC 2.7.11 states is
-        // "every signer is a person": no program's key admits a unit, which no
+        // rc21 re-vendor (v62.0.0 R1c, CC 3.1.3 / CC 2.7.11) — reserved, and
+        // since rc22 (8c436b8; v62.0.0 4r) the row states CC 2.7.11's own rule
+        // ("a person's key, alone or as a voice of the group whose head the
+        // row names; never a substrate self-report") in place of the CC 3.4.3
+        // `substrate-self-report` default: no program's key admits a unit, which no
         // prefix → identity-type rule expresses (a person may be `user` or
         // `accord_holder`, and the row may be counted). It is an edition-2
         // family (wire `admission:unit:v1`); the gates are the door's pure
@@ -25275,11 +25277,23 @@ mod tests {
         // period's fresh rendezvous key. Persist has no emitter and no gate.
         ("rendezvous:route", "CIRISPersist#1149"),
         // rc18 re-vendor (CIRISPersist#1252 vendored the registry pair at the
-        // v1.0-rc18 tag) — the moderator ballot and its acceptance, CC 3.1.3,
-        // substrate self-reports. Persist has no door for either yet.
+        // v1.0-rc18 tag) — the moderator ballot and its acceptance, CC 3.1.3.
+        // Since rc22 (8c436b8; v62.0.0 4r) each row states CC 4.5.13's rule (a
+        // ballot: a member of the roster the election names, one a person; the
+        // acceptance: the count's winner over the bound ballot set), no longer
+        // the `substrate-self-report` default. Persist has no door for either yet.
         (
             "ballot:moderator",
             "CIRISPersist#1252 (rc18 re-vendor; door not built)",
+        ),
+        // rc22 re-vendor (CC 8c436b8; v62.0.0 4r) — the stream head, CC 3.1.3
+        // / CC 5.3.3.8: the signer is the row's author and the stream's
+        // producer, a member's key and never a node's. An edition-2 family
+        // (wire `stream:head:v1`); its door is the receipts stack's RC3
+        // (`stream_head::require_stream_head_signer`), which deletes this line.
+        (
+            "stream:head",
+            "CIRISPersist#953 (v62 receipts RC3; door not in this cut)",
         ),
     ];
 

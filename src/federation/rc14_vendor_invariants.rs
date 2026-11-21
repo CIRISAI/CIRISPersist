@@ -128,7 +128,14 @@ mod tests {
         // (CC-pin): re-read at the release tag v1.0-rc21 (b016df47); each of
         // the four anchors occurs once in part 3 (read-checked with `git show
         // v1.0-rc21:`), and part 3 hashes to the new VENDORED_SOURCE_SHA256.
-        assert_eq!(VENDORED_CC_VERSION, "1.0-rc21", "the table is read at rc21");
+        // v62.0.0 (4r): re-read at rc22 commit 8c436b8b (no rc22 tag yet); each
+        // of the four anchors still occurs once in part 3 (read-checked with
+        // `git show 8c436b8b:`). No row is in part 2, so part 2's move at rc22
+        // reaches none of them. v62.0.0 (CC-tag): re-read at the tag
+        // v1.0-rc22-pre1 (0774639b): part 3 is byte-identical (the same
+        // VENDORED_SOURCE_SHA256), each anchor occurs once; part 2 moved again
+        // (CC 5.3.3.8's file- stream sentence) and still holds no row.
+        assert_eq!(VENDORED_CC_VERSION, "1.0-rc22", "the table is read at rc22");
         let tsv = std::fs::read_to_string(root().join("evidence/cc_impl.tsv")).expect("cc_impl");
         let claims: Vec<&str> = tsv
             .lines()
@@ -190,13 +197,15 @@ mod tests {
         candidate.join(".git").exists().then_some(candidate)
     }
 
-    /// **I1499 (CC side)** — every anchor is the tag's text: with a
-    /// CIRISConstitution checkout carrying [`VENDORED_CC_TAG`], its part 3
-    /// hashes to [`VENDORED_SOURCE_SHA256`] and every anchor is in its
-    /// section's part. Skips, saying so, without the checkout or the tag.
+    /// **I1499 (CC side)** — every anchor is the vendored cut's text: with a
+    /// CIRISConstitution checkout, part 3 at [`VENDORED_CC_TAG`]'s revision
+    /// (the tag once recorded, the commit while pending) hashes to
+    /// [`VENDORED_SOURCE_SHA256`] and every anchor is in its section's part.
+    /// Skips, saying so, without a checkout; a checkout that lacks the
+    /// revision FAILS (v62.0.0 4r: a pending tag is not a reason to skip).
     #[test]
     fn i1499_every_anchor_is_the_tags_text_when_cc_is_present() {
-        let tag = VENDORED_CC_TAG;
+        let tag = VENDORED_CC_TAG.rev();
         let Some(repo) = cc_repo() else {
             eprintln!(
                 "I1499: no CIRISConstitution checkout (CIRIS_CC_REPO or a sibling) — SKIPPED"
@@ -212,10 +221,12 @@ mod tests {
                 .expect("git runs");
             out.status.success().then_some(out.stdout)
         };
-        let Some(part3) = show("part_3_the_namespace.md") else {
-            eprintln!("I1499: {repo:?} carries no {tag} part 3 — SKIPPED (fetch the tags)");
-            return;
-        };
+        let part3 = show("part_3_the_namespace.md").unwrap_or_else(|| {
+            panic!(
+                "I1499: {repo:?} carries no {tag} part 3 ({VENDORED_CC_TAG:?}): fetch it; a \
+                 checkout that cannot show the vendored cut fails, it does not skip"
+            )
+        });
         assert_eq!(
             hex::encode(Sha256::digest(&part3)),
             VENDORED_SOURCE_SHA256,

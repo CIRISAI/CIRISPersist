@@ -30,10 +30,13 @@
 # 5 main CI red · 6 main CI timeout · 7 no CHANGELOG section · 8 tag cut failed ·
 # 9 tag sha mismatch · 10 tag push failed · 11 the local tag's annotation is
 # not the CHANGELOG section byte for byte (or it is lightweight) · 16 tag run
-# never appeared.
+# never appeared · 17 the PR head records no CIRISConstitution tag
+# (`registry.rs#VENDORED_CC_TAG` is `CcTag::Pending`, or unreadable).
 #
-# BEFORE running this for a release that names a CC version: run
-# `scripts/check_vendored_cc.sh <cc-tag>` — the vendored CC files must be the tag's bytes.
+# BEFORE running this: run `scripts/check_vendored_cc.sh` (no `--commit-only`)
+# — the vendored CC files must be the recorded tag's bytes. v62.0.0 (4r): a
+# vendor can be taken by commit before CC tags it; this script refuses to merge
+# such a head (exit 17), so a release never ships a CC tag it has not recorded.
 set -uo pipefail
 pr="${1:?pr number}"; ver="${2:?version}"; want="${3:?expected head sha (7)}"; subject="${4:?merge subject}"; bodyf="${5:?merge body file}"
 cd "$(git rev-parse --show-toplevel)" || exit 2
@@ -43,6 +46,12 @@ repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner) || { echo "cannot 
 [ -z "$(git status --porcelain)" ] || { echo "DIRTY TREE"; exit 2; }
 head=$(gh api "repos/$repo/pulls/$pr" --jq .head.sha); [ "${head:0:7}" = "$want" ] || { echo "HEAD MOVED: $head"; exit 3; }
 head_tree=$(git rev-parse "${head}^{tree}" 2>/dev/null || { git fetch -q origin "$head" && git rev-parse "${head}^{tree}"; })
+# v62.0.0 (4r) — fail closed on a pending CC tag, read from the PR head itself.
+cc_tag_line=$(git show "$head:src/federation/namespace/registry.rs" 2>/dev/null | grep '^pub const VENDORED_CC_TAG: CcTag = ')
+case "$cc_tag_line" in
+  'pub const VENDORED_CC_TAG: CcTag = CcTag::Recorded("'?*'");') ;;
+  *) echo "CC TAG NOT RECORDED on $head (${cc_tag_line:-no VENDORED_CC_TAG line}): record the CIRISConstitution tag before a release — refusing to merge"; exit 17;;
+esac
 # The PR run must be GREEN before the merge (#756): the main-CI wait below
 # is skipped when the trees match, and that skip leans on this run.
 prst=$(gh run list --commit "$head" --workflow ci.yml --event pull_request --json status,conclusion --jq '.[0] | "\(.status)/\(.conclusion)"' 2>/dev/null || echo none)

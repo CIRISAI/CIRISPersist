@@ -1,5 +1,15 @@
 //! **The CC manifests persist vendors beside the namespace registry, pinned
-//! at the CIRISConstitution `v1.0-rc21` release tag.**
+//! at the CIRISConstitution tag `v1.0-rc22-pre1` (commit `0774639b`;
+//! [`VENDORED_CC_TAG`](super::registry::VENDORED_CC_TAG)).**
+//!
+//! v62.0.0 (4r): re-copied at rc22 commit `8c436b8b` (then untagged). Of these
+//! five only `csd4_chain.json` moved from rc21 (108 refusal tokens: the six
+//! `fedcode_*` and `code_node_key_mismatch` added); the rest and the six
+//! traces are byte-identical. `WIRE_VOCABULARY.md` moved in its header line
+//! only (`1.0-rc21` → `1.0-rc22`), so its file pin moves and
+//! [`crate::wire_vocabulary::WIRE_VOCABULARY_HASH`] does not. v62.0.0
+//! (CC-tag): the tag's commit `0774639b` carries every one of these files
+//! byte-identical to `8c436b8b`. The rc21 history follows.
 //!
 //! [`registry`](super::registry) carries the namespace registry and its match
 //! vectors; this module carries the other five CC `manifests/` files persist
@@ -26,9 +36,9 @@
 //! by the report script and the witnesses.
 //!
 //! JSON carries no comments, so this doc is the five files' header. Do not
-//! hand-edit them: re-copy from the tag CC names, move each pin below and
-//! [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) in the same
-//! commit, and run `scripts/check_vendored_cc.sh <tag>`.
+//! hand-edit them: re-copy from the commit (or tag) CC names, move each pin
+//! below and [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) in
+//! the same commit, and run `scripts/check_vendored_cc.sh`.
 //!
 //! The six `formal/self_roster` traces the two-path replay runs stay test
 //! fixtures (`tests/fixtures/self_roster/`): they are model output, not
@@ -53,7 +63,7 @@ pub const VENDORED_GOVERNANCE_POLICY_VECTORS_FILE_SHA256: &str =
 
 /// SHA-256 of the vendored `csd4_chain.json` FILE bytes.
 pub const VENDORED_CSD4_CHAIN_FILE_SHA256: &str =
-    "27824c07a7480845b9ea0b865b3287d4a770111d8c2b4be1ffa2b1b7a854bd48";
+    "c23bcbc63484097b23a4653a608fd58f9a9af9d2150dca0e00eed56d83135b45";
 
 /// SHA-256 of the vendored `topology_vocabulary.json` FILE bytes. The chain's
 /// `_meta.pins.vocabulary_sha256` and CIRISServer's catalogue pin
@@ -74,7 +84,7 @@ pub const VENDORED_SIGNED_OBJECT_VECTORS_FILE_SHA256: &str =
 /// stays where it is. This is the tag's file hash, so a re-vendor sees the
 /// document move; I1302 checks it against the CC checkout.
 pub const VENDORED_WIRE_VOCABULARY_FILE_SHA256: &str =
-    "06a64d70bde9edb97b533cbea3e2ba04834175befac43541e8ef22d7d4564361";
+    "279b282e5d565d3d4378820770f71179dddbe1c8d397ab8f7fbe0e8f51299e77";
 
 /// The five files, `(file under src/federation/namespace/, pinned sha256)`,
 /// in the order `scripts/check_vendored_cc.sh` compares them.
@@ -132,8 +142,8 @@ mod tests {
     //! **I1300–I1302, I1308** — every vendored CC byte is the pinned byte,
     //! the pin is the tag's, and the refusal tokens at the pin.
     use super::super::registry::{
-        VENDORED_CC_COMMIT, VENDORED_CC_TAG, VENDORED_REGISTRY_FILE_SHA256,
-        VENDORED_VECTORS_FILE_SHA256,
+        CcTag, VENDORED_CC_COMMIT, VENDORED_CC_TAG, VENDORED_CC_VERSION,
+        VENDORED_REGISTRY_FILE_SHA256, VENDORED_VECTORS_FILE_SHA256,
     };
     use super::*;
     use sha2::{Digest, Sha256};
@@ -347,12 +357,19 @@ mod tests {
         out.status.success().then_some(out.stdout)
     }
 
-    /// **I1302** — the pins are the tag's bytes: when a CIRISConstitution
-    /// checkout carrying [`VENDORED_CC_TAG`] is present, the tag names
-    /// [`VENDORED_CC_COMMIT`] and every pinned file equals `git show
-    /// <tag>:<path>` byte for byte. Without the checkout (or the tag) it skips,
-    /// saying so: CI has no CC checkout, and `scripts/check_vendored_cc.sh`
-    /// is the networked ship gate for the same property.
+    /// **I1302** — the pins are the vendored cut's bytes: when a
+    /// CIRISConstitution checkout is present, every pinned file equals `git
+    /// show <rev>:<path>` byte for byte, where `<rev>` is
+    /// [`VENDORED_CC_TAG`]'s tag once recorded (which must name
+    /// [`VENDORED_CC_COMMIT`]) and the commit while the tag is pending.
+    ///
+    /// v62.0.0 (4r) — the pending form is a real check, not a skip: a checkout
+    /// that lacks the commit FAILS ("fetch it"), and **I2431** reds the moment
+    /// any tag names the commit, so the tag CC cuts is recorded in
+    /// [`VENDORED_CC_TAG`] rather than silently ignored. Without a checkout at
+    /// all it skips, saying so (CI has none); I2430 is the check that always
+    /// runs, and `scripts/check_vendored_cc.sh` + `scripts/release_ship.sh`
+    /// fail the release closed while the tag is pending.
     #[test]
     fn i1302_the_pins_are_the_tags_bytes_when_cc_is_present() {
         let Some(repo) = cc_repo() else {
@@ -361,43 +378,100 @@ mod tests {
             );
             return;
         };
-        let tag = VENDORED_CC_TAG;
-        let Some(commit) = git(&repo, &["rev-parse", &format!("{tag}^{{commit}}")]) else {
-            eprintln!("I1302: {repo:?} carries no tag {tag} — SKIPPED (fetch the tags to run it)");
-            return;
-        };
+        let rev = VENDORED_CC_TAG.rev();
+        let commit =
+            git(&repo, &["rev-parse", &format!("{rev}^{{commit}}")]).unwrap_or_else(|| {
+                panic!(
+                    "I1302: {repo:?} carries no {rev} ({VENDORED_CC_TAG:?}): fetch it; a \
+                     checkout that cannot show the vendored cut fails, it does not skip"
+                )
+            });
         assert_eq!(
             String::from_utf8_lossy(&commit).trim(),
             VENDORED_CC_COMMIT,
-            "{tag} is not the commit VENDORED_CC_COMMIT names"
+            "{rev} is not the commit VENDORED_CC_COMMIT names"
         );
+        // I2431 — the pending latch: a tag CC cut at the commit is recorded.
+        if VENDORED_CC_TAG == CcTag::Pending {
+            let tags = git(&repo, &["tag", "--points-at", VENDORED_CC_COMMIT])
+                .expect("git tag --points-at runs");
+            let tags = String::from_utf8_lossy(&tags);
+            assert!(
+                tags.trim().is_empty(),
+                "I2431: CC tag(s) {:?} now name the vendored commit {VENDORED_CC_COMMIT}: \
+                 record it (`VENDORED_CC_TAG = CcTag::Recorded(\"<tag>\")`), so the tag \
+                 checks and the release read the tag",
+                tags.split_whitespace().collect::<Vec<_>>()
+            );
+        }
         for (cc_path, local, pin) in every_pinned_file() {
-            let upstream = git(&repo, &["show", &format!("{tag}:{cc_path}")])
-                .unwrap_or_else(|| panic!("{tag} carries no {cc_path}"));
+            let upstream = git(&repo, &["show", &format!("{rev}:{cc_path}")])
+                .unwrap_or_else(|| panic!("{rev} carries no {cc_path}"));
             assert_eq!(
                 hex_sha256(&upstream),
                 pin,
-                "{cc_path} at {tag} is not the pinned byte string"
+                "{cc_path} at {rev} is not the pinned byte string"
             );
             assert_eq!(
                 upstream,
                 std::fs::read(&local).unwrap(),
-                "{local:?} is not {tag}:{cc_path}"
+                "{local:?} is not {rev}:{cc_path}"
             );
         }
         let wire = git(
             &repo,
-            &["show", &format!("{tag}:manifests/WIRE_VOCABULARY.md")],
+            &["show", &format!("{rev}:manifests/WIRE_VOCABULARY.md")],
         )
-        .unwrap_or_else(|| panic!("{tag} carries no manifests/WIRE_VOCABULARY.md"));
+        .unwrap_or_else(|| panic!("{rev} carries no manifests/WIRE_VOCABULARY.md"));
         assert_eq!(
             hex_sha256(&wire),
             VENDORED_WIRE_VOCABULARY_FILE_SHA256,
-            "manifests/WIRE_VOCABULARY.md at {tag} is not the pinned byte string"
+            "manifests/WIRE_VOCABULARY.md at {rev} is not the pinned byte string"
         );
         eprintln!(
-            "I1302: 13 files equal {tag} ({VENDORED_CC_COMMIT}), and WIRE_VOCABULARY.md \
-             hashes to its pin: RAN"
+            "I1302: 13 files equal {rev} ({VENDORED_CC_COMMIT}, {VENDORED_CC_TAG:?}), and \
+             WIRE_VOCABULARY.md hashes to its pin: RAN"
+        );
+    }
+
+    /// **I2430** (v62.0.0 4r) — the pending state's own shape, checked with no
+    /// CC checkout, so it runs in CI: the vendored cut is named by a full
+    /// lowercase commit id, the registry's `_meta.cc_version` is
+    /// [`VENDORED_CC_VERSION`], and a recorded tag is a non-empty spelling.
+    /// The release half (`scripts/release_ship.sh` exit 17 while pending) is
+    /// the script's, witnessed by its self-test.
+    #[test]
+    fn i2430_the_cc_pin_is_a_full_commit_and_the_tag_state_is_well_formed() {
+        assert_eq!(VENDORED_CC_COMMIT.len(), 40, "a full commit id");
+        assert!(
+            VENDORED_CC_COMMIT
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "VENDORED_CC_COMMIT is lowercase hex"
+        );
+        let registry: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(namespace_dir().join("namespace_registry.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(registry["_meta"]["cc_version"], VENDORED_CC_VERSION);
+        match VENDORED_CC_TAG {
+            CcTag::Pending => assert_eq!(VENDORED_CC_TAG.rev(), VENDORED_CC_COMMIT),
+            CcTag::Recorded(tag) => {
+                assert!(!tag.trim().is_empty(), "a recorded tag has a spelling");
+                assert_eq!(VENDORED_CC_TAG.rev(), tag);
+            }
+        }
+        // The two scripts read the const's line by its text; hold its shape.
+        let text = std::fs::read_to_string(namespace_dir().join("registry.rs")).unwrap();
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("pub const VENDORED_CC_TAG: CcTag = "))
+            .expect("VENDORED_CC_TAG is one line the scripts can read");
+        assert!(
+            line == "pub const VENDORED_CC_TAG: CcTag = CcTag::Pending;"
+                || (line.starts_with("pub const VENDORED_CC_TAG: CcTag = CcTag::Recorded(\"")
+                    && line.ends_with("\");")),
+            "the scripts cannot read {line:?}"
         );
     }
 }

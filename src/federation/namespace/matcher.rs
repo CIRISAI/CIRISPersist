@@ -1026,11 +1026,12 @@ mod tests {
         let vs = vectors();
         assert_eq!(
             vs.len(),
-            1323,
-            "the rc21 vectors file (v1.0-rc21) carries 1323 dimension vectors (rc20: 1311, rc18: \
-             1264, rc15: 1244, rc14: 1244, rc12: 1236; the evidence family adds eight; rc18's \
-             three families add twenty; rc20's folds and two new kinds add forty-seven; rc21 \
-             adds twelve)"
+            1336,
+            "the rc22 vectors file (CC 8c436b8) carries 1336 dimension vectors (rc21: 1323, rc20: \
+             1311, rc18: 1264, rc15: 1244, rc14: 1244, rc12: 1236; the evidence family adds \
+             eight; rc18's three families add twenty; rc20's folds and two new kinds add \
+             forty-seven; rc21 adds twelve; rc22's stream:head and contribution:{{subject_kind}} \
+             add thirteen)"
         );
         let oracle: serde_json::Value = serde_json::from_str(BINDS_JSON).unwrap();
         let oracle = oracle["binds"].as_array().unwrap();
