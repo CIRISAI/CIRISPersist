@@ -26,9 +26,9 @@
 //!   `valid_until_not_after_asserted_at`.
 //! - I3025 (pure): the occurrence window is half-open, and a revocation
 //!   after an assertion ends it until a later assertion.
-//! - I3026 (pure; R1b): the door's family model, `WithVendored(&PersistCells)`,
-//!   names the occurrence key's role (`occurrence`, member `occurrence_key_id`,
-//!   CC rc21 90d537b) on `identity:occurrence` and changes no other family.
+//! - I3026 (pure; VA-cc-cut): the door's family model, `VendoredFamilyModel`
+//!   (CIRISVerify 23.3.3, CC b016df4), names the occurrence key's role
+//!   (`occurrence`, member `occurrence_key_id`) on `identity:occurrence`.
 //! - I3030: no occurrence binds a machine to a person (CC 3.3.6, rc21): an
 //!   agent key under a user identity (as `agent` or as `laptop`), and
 //!   `device_class: agent` under a user identity, are refused
@@ -42,16 +42,14 @@
 
 use ciris_crypto::composite::CompositeSigningKey;
 use ciris_verify_core::cde::Value;
-use ciris_verify_core::edition2::family::{
-    FamilyModel as _, RoleParty, VendoredFamilyModel, WithVendored,
-};
+use ciris_verify_core::edition2::family::{FamilyModel as _, RoleParty, VendoredFamilyModel};
 use ciris_verify_core::edition2::sign_row_statement;
 
 use super::door_invariants::fixture::{iref, key, key_record, kid, map};
 use super::ingest::{held_keys_for, put_statement, StatementOutcome, INGEST_TIER};
 use super::liveness::KeyOf;
 use super::occurrence::{
-    occurrence_live_at, PersistCells, OCCURRENCE_FAMILY, OCCURRENCE_KEY_MEMBER, OCCURRENCE_KEY_ROLE,
+    occurrence_live_at, OCCURRENCE_FAMILY, OCCURRENCE_KEY_MEMBER, OCCURRENCE_KEY_ROLE,
 };
 use crate::federation::types::IdentityOccurrenceRevocation;
 use crate::federation::{malformed_row, Error, FederationDirectory};
@@ -568,32 +566,23 @@ fn i3025_the_occurrence_window_is_half_open() {
     );
 }
 
+/// v62.0.0 (VA-cc-cut; CIRISVerify 23.3.3, CC v1.0-rc21 b016df4) — I3026
+/// re-anchored: the door reads `VendoredFamilyModel` directly, and CC's own
+/// cell names the occurrence key's role (`occurrence`, member
+/// `occurrence_key_id`) on `identity:occurrence`, authored. (Green only on
+/// 23.3.3's model: at e6fd7c6 the cell named no second signer, which the
+/// deleted `PersistCells` overlay supplied.)
 #[test]
-fn i3026_the_door_model_adds_the_occurrence_key_role_to_its_family_only() {
-    let model = WithVendored(&PersistCells);
-    let rule = model.rule(OCCURRENCE_FAMILY).expect("I3026: registered");
+fn i3026_the_vendored_model_names_the_occurrence_key_role() {
+    let rule = VendoredFamilyModel
+        .rule(OCCURRENCE_FAMILY)
+        .expect("I3026: registered");
     assert!(rule.authored, "I3026: authored");
     assert!(
         rule.roles.iter().any(|(r, p)| r == OCCURRENCE_KEY_ROLE
             && *p == RoleParty::Member(OCCURRENCE_KEY_MEMBER.to_owned())),
-        "I3026: the occurrence key's own voice"
+        "I3026: the occurrence key's own voice is CC's cell"
     );
-    // R1b (CIRISVerify 23.3.1): `self:delegates_to`'s rc21 cell reads `act`,
-    // so it has no row-free rule; the owner binding stands in (its count
-    // voice is the door's, not this model's).
-    for other in [
-        "key:revocation",
-        "identity_amendment",
-        "ownership:.relation:.target_kind:.version",
-    ] {
-        let r = model.rule(other);
-        assert!(r.is_some(), "I3026: {other} registered");
-        assert_eq!(
-            r,
-            VendoredFamilyModel.rule(other),
-            "I3026: {other} unchanged"
-        );
-    }
 }
 
 #[cfg(feature = "sqlite")]

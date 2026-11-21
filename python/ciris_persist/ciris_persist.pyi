@@ -2242,7 +2242,7 @@ class Engine:
     # ==============================================================
 
     def canonical_bootstrap_hints(self) -> str:
-        """(derived) ontological — v13.6.0 (CIRISPersist#402, CIRISEdge#296) — the accord-attested bootstrap dial set as a compact JSON list edge consumes directly:"""
+        """(derived) ontological — v62.0.0 (CE-fix3) — the trust-root bootstrap dial set (the genesis in force's seats' signed dial hints) as a compact JSON list edge consumes directly:"""
 
     def deregister_occurrence(self, occurrence_id: str) -> bool:
         """v1.7.3 (CIRISPersist#81) — Clean shutdown: remove the

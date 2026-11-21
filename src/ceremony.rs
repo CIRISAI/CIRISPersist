@@ -26,7 +26,9 @@
 //!    `identity:occurrence` binding** (the self pair, `device_class`
 //!    `server`, `transport_destination`'s five members, the two X-Wing keys
 //!    at the payload's top level, `refs.head` and `refs.also.cites` naming
-//!    the seat's record): [`seat_binding_draft`] over a [`BindTransport`]
+//!    the seat's record, and its signed `dial_hints`, CE-fix3, at least one
+//!    `tcp` hint): [`seat_binding_draft`] over a [`BindTransport`] and the
+//!    seat's [`Hint`]s
 //!    and the record's row id ([`row_id_of`]); check with
 //!    [`check_seat_binding`].
 //! 3. **Each holder's pre-signed halt** (`accord:invoke:constitutional`, one
@@ -86,6 +88,9 @@ pub use crate::federation::edition2::signing_domain::{
     accord_manifest_v2_message, domain_preimage, verify_domain_composite, SigningDomain,
 };
 pub use ciris_crypto::composite::CompositePublicKey;
+/// v62.0.0 (CE-fix3) — a FedCode dial hint (Verify 23.3.3,
+/// `edition2::fedcode::Hint`; BELIEVED until the pin).
+pub use ciris_verify_core::edition2::fedcode::Hint;
 pub use ciris_verify_core::edition2::Digest32;
 
 /// The `identity_type` of an accord holder's record.
@@ -288,13 +293,16 @@ fn identity_ref_of_payload(payload: &Value) -> String {
 /// (`author` = `identity_key_id` = `occurrence_key_id` = the seat's
 /// identity-ref), `device_class` `server`, no end, `transport`, and
 /// `refs.head` and `refs.also.cites` naming the seat's own `key:record`
-/// (`seat_record`, its row id).
+/// (`seat_record`, its row id), and `dial_hints` (CE-fix3: most preferred
+/// first; a genesis serve seat needs one `tcp` hint, judged by Verify's
+/// reader).
 #[must_use]
 pub fn seat_binding_terms(
     seat: &CompositePublicKey,
     seat_record: &Digest32,
     asserted_at_ms: u64,
     transport: BindTransport,
+    dial_hints: Vec<Hint>,
 ) -> occurrence::BindTerms {
     let iref = identity_ref_of(seat);
     occurrence::BindTerms {
@@ -310,6 +318,7 @@ pub fn seat_binding_terms(
         head: Some(RowId(*seat_record)),
         further_heads: Vec::new(),
         cites: vec![RowId(*seat_record)],
+        dial_hints,
     }
 }
 
@@ -319,16 +328,24 @@ pub fn seat_binding_terms(
 /// the app name and aspects (the `transport_destination` map, whose
 /// `destination_hash` is derived), and BOTH X-Wing keys
 /// (`transit_xwing_pubkey`, `onion_hop_xwing_pubkey`, 1216 bytes each),
-/// stated at the payload's top level.
+/// stated at the payload's top level. `dial_hints` (CE-fix3; CC 2.6.1.11)
+/// are the seat's signed dial hints, MOST PREFERRED FIRST, at most four,
+/// written byte for byte as Verify's FedCode hint bodies; a genesis serve
+/// seat needs at least one `tcp` hint. Persist does not judge them: Verify's
+/// bundle reader does ([`check_genesis_offer`] surfaces its
+/// `seat_dial_hints_missing` / `dial_hint_malformed` by name).
 ///
 /// # Errors
 /// `edition2_payload_invalid`: a destination hash that does not derive, an
-/// X-Wing key missing, or a payload the door would refuse.
+/// X-Wing key missing, a hint Verify's encoder refuses (`hint_parts`: an
+/// `Unknown` hint, a bad body; its `FedCodeE2Error` token in the message),
+/// or a payload the door would refuse.
 pub fn seat_binding_draft(
     seat: &CompositePublicKey,
     seat_record: &Digest32,
     asserted_at_ms: u64,
     transport: BindTransport,
+    dial_hints: Vec<Hint>,
 ) -> Result<Draft, Error> {
     let both = transport
         .transit_xwing_pubkey
@@ -345,7 +362,18 @@ pub fn seat_binding_draft(
              bytes each (CC 2.6.1.11)"
         )));
     }
-    let terms = seat_binding_terms(seat, seat_record, asserted_at_ms, transport);
+    // CE-fix3 — every hint must be one Verify's minter encodes
+    // (`fedcode::hint_parts`: it refuses `Unknown`, a minter emits only
+    // assigned types), refused up front with Verify's own token.
+    for (i, h) in dial_hints.iter().enumerate() {
+        if let Err(e) = ciris_verify_core::edition2::fedcode::hint_parts(h) {
+            return Err(Error::InvalidArgument(format!(
+                "edition2_payload_invalid: ceremony_seat_binding: dial hint {i}: {}",
+                e.token()
+            )));
+        }
+    }
+    let terms = seat_binding_terms(seat, seat_record, asserted_at_ms, transport, dial_hints);
     occurrence::bind_draft(&terms, &terms.occurrence_key_id)
 }
 
@@ -749,6 +777,10 @@ pub struct ImportedSeat {
     pub transit_xwing_pubkey: [u8; XWING_PUBKEY_LEN],
     /// `onion_hop_xwing_pubkey`, as the genesis in force places it.
     pub onion_hop_xwing_pubkey: [u8; XWING_PUBKEY_LEN],
+    /// v62.0.0 (CE-fix3) — the seat's signed `dial_hints`, as the genesis in
+    /// force places them (Verify's `PlacedSeat::dial_hints`, BELIEVED),
+    /// most preferred first.
+    pub dial_hints: Vec<Hint>,
     /// The seat's projected routes (`list_transport_destinations_for`).
     pub routes: Vec<crate::federation::self_at_login::TransportDestination>,
 }
@@ -888,6 +920,7 @@ pub async fn import_offer_into_throwaway(
             identity_ref: s.identity_ref.clone(),
             transit_xwing_pubkey: s.transit_xwing_pubkey,
             onion_hop_xwing_pubkey: s.onion_hop_xwing_pubkey,
+            dial_hints: s.dial_hints.clone(),
             routes: store
                 .list_transport_destinations_for(&s.identity_ref)
                 .await?,

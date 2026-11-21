@@ -8051,60 +8051,50 @@ impl PyEngine {
         })
     }
 
-    /// v13.6.0 (CIRISPersist#402, CIRISEdge#296) — the **accord-attested
-    /// bootstrap dial set** as a compact JSON list edge consumes directly:
+    /// v62.0.0 (CE-fix3) — the trust-root bootstrap dial set (the genesis in force's seats' signed dial hints) as a compact JSON list edge consumes directly:
     ///
     /// ```json
-    /// [{"key_id": "ciris-canonical-1", "kind": "ip", "destination": "108.61.242.236:4242"},
-    ///  {"key_id": "ciris-canonical-1", "kind": "reticulum", "destination": "…"}]
+    /// [{"identity_ref": "urn:ietf:params:oauth:ckt:sha-256:…", "kind": "tcp",
+    ///   "host": "seat-1.example", "port": 4242, "type": 1, "body_hex": "…"}]
     /// ```
     ///
-    /// Every [`TransportHint`](crate::federation::types::TransportHint) carried
-    /// inside the signed `registration_envelope` of each `canonical` server,
-    /// paired with the server `key_id` it reaches — the zero-config reachability
-    /// plane a cold node (the agent-embedded edge) uses to JOIN the mesh
-    /// (`init_edge_runtime` auto-seeds the canonical TCP dial from this).
-    ///
-    /// This is the thin Python surface over
-    /// [`Engine::canonical_bootstrap_hints`](crate::Engine::canonical_bootstrap_hints):
-    /// the `registration_envelope`→hint extraction stays inside persist (single
-    /// source of truth, #381) so edge never parses persist's signed-envelope
-    /// internals. No new query — a projection of `list_canonical_servers`.
-    /// Consumers filter by `kind` (e.g. `ip` for the TCP entry).
+    /// One object per (seat, hint), most preferred first per seat
+    /// ([`edition2::genesis::dial_hint_json`](crate::federation::edition2::genesis::dial_hint_json)):
+    /// `type` and `body_hex` are the FedCode hint byte for byte; `kind` is
+    /// `tcp` | `udp` | `auto` | `rnode` | `http` | `unknown`, with `host` /
+    /// `port` (tcp, udp) or `url` (http). Empty before a genesis is held.
+    /// CLEAN BREAK (v62.0): the earlier `{key_id, kind, destination}` objects
+    /// from the canonical records' `registration_envelope` are gone. FFI
+    /// mirror of [`Engine::canonical_bootstrap_hints`](crate::Engine::canonical_bootstrap_hints).
     fn canonical_bootstrap_hints(&self, py: Python<'_>) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
-            let rows = py
+            let g = py
                 .detach(move || match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
-                        runtime.block_on(async move { backend.list_canonical_servers().await })
+                        runtime.block_on(async move {
+                            crate::federation::edition2::genesis::genesis_in_force(backend.as_ref())
+                                .await
+                        })
                     }
                     #[cfg(feature = "sqlite")]
                     BackendDispatch::Sqlite(sq) => {
                         let backend = sq.clone();
-                        runtime.block_on(async move { backend.list_canonical_servers().await })
+                        runtime.block_on(async move {
+                            crate::federation::edition2::genesis::genesis_in_force(backend.as_ref())
+                                .await
+                        })
                     }
                 })
                 .map_err(federation_err_to_py)?;
-            // Extract every envelope TransportHint, paired with its server
-            // key_id, as a flat {key_id, kind, destination} object (mirrors
-            // Engine::canonical_bootstrap_hints). A canonical row with no
-            // envelope hint contributes nothing (the field is optional).
-            let hints: Vec<serde_json::Value> = rows
-                .into_iter()
-                .flat_map(|r| {
-                    r.transport_hints().into_iter().map(move |h| {
-                        serde_json::json!({
-                            "key_id": r.key_id.clone(),
-                            "kind": h.kind,
-                            "destination": h.destination,
-                        })
-                    })
-                })
-                .collect();
+            let hints: Vec<serde_json::Value> =
+                crate::federation::edition2::genesis::bootstrap_hints(&g)
+                    .iter()
+                    .map(|(iref, h)| crate::federation::edition2::genesis::dial_hint_json(iref, h))
+                    .collect();
             serde_json::to_string(&hints).map_err(|e| {
                 PyRuntimeError::new_err(format!("canonical bootstrap hints JSON encode: {e}"))
             })

@@ -51,7 +51,8 @@
 
 use ciris_verify_core::cde::Value;
 use ciris_verify_core::edition2::family::{
-    select::Act, verify_row_in_family_with, FamilyFault, FamilyVerdict, SelectContext, WithVendored,
+    select::Act, verify_row_in_family_with, FamilyFault, FamilyVerdict, SelectContext,
+    VendoredFamilyModel,
 };
 use ciris_verify_core::edition2::keys::{check_key_record, KeyRecordError, KEY_RECORD_FAMILY};
 use ciris_verify_core::edition2::{
@@ -152,6 +153,9 @@ pub fn invalid_label(i: &Invalid) -> String {
         // v62.0.0 (R1-v2332; CIRISVerify 23.3.2, CC rc21 cddl 87–91) — a
         // body number outside CBOR's integer range.
         Invalid::BodyNumberUnrepresentable => "body_number_unrepresentable".into(),
+        // v62.0.0 (CE-fix3; CIRISVerify 23.3.3) — a known dial-hint type with a
+        // bad body: Verify's token.
+        Invalid::DialHintMalformed => "dial_hint_malformed".into(),
         other => format!("{other:?}"),
     }
 }
@@ -389,11 +393,11 @@ pub fn admit_row(
     };
 
     let ctx = door_context(bytes, ctx);
-    // v62.0.0 (wave O1; R1b, CIRISVerify 23.3.1) — persist's own cells first
-    // (`occurrence::PersistCells`: the occurrence key's own voice on
-    // `identity:occurrence`, CC rc21 90d537b; drop at 23.3.2), then CC's
-    // vendored model (`WithVendored`).
-    let model = WithVendored(&super::occurrence::PersistCells);
+    // v62.0.0 (VA-cc-cut; CIRISVerify 23.3.3, CC v1.0-rc21 b016df4) — CC's
+    // vendored model, read directly: it now names the occurrence key's own
+    // voice on `identity:occurrence` (the cell persist's `PersistCells`
+    // overlay stated until 23.3.3).
+    let model = VendoredFamilyModel;
     let (row, role) = match verify_row_in_family_with(bytes, keys, &model, &ctx) {
         FamilyVerdict::Valid { row, role } => (row, role),
         // Verify's own key-of-issuer check (23.3.0), through `keys.key_of`
@@ -643,8 +647,11 @@ pub struct SecondSignerRole {
 ///   `membership:acceptance` row.
 /// - a `subject` family, a family the model leaves undecided, a cell whose
 ///   `when` is unknown: no role. A `gap` / `target` member is not resolved.
-/// - A family only persist's own cells register (`occurrence::PersistCells`)
-///   reads those cells' roles.
+/// - A family the vendored model registers with no `second_signers` entry
+///   reads its rule's roles. (v62.0.0 VA-cc-cut: persist's own cells,
+///   `occurrence::PersistCells`, are deleted; at CC b016df4
+///   `identity:occurrence` lists `occurrence` / `occurrence_key_id` in the
+///   vendored entries, so its role is the model's.)
 #[must_use]
 pub fn second_signer_roles(bytes: &[u8]) -> Vec<SecondSignerRole> {
     use ciris_verify_core::edition2::family::{
@@ -676,7 +683,7 @@ pub fn second_signer_roles(bytes: &[u8]) -> Vec<SecondSignerRole> {
     if ctx.act != Some(Act::Own) {
         return Vec::new();
     }
-    let model = WithVendored(&super::occurrence::PersistCells);
+    let model = VendoredFamilyModel;
     let RuleAnswer::Rule(rule) = model.rule_for(family, leaf.as_deref(), &ctx) else {
         return Vec::new();
     };
@@ -688,8 +695,8 @@ pub fn second_signer_roles(bytes: &[u8]) -> Vec<SecondSignerRole> {
     {
         return Vec::new();
     }
-    // (role, member): the vendored entries under the selector, else (a
-    // family only persist's cells register) the cells' roles.
+    // (role, member): the vendored entries under the selector, else the
+    // rule's own roles.
     let entries: Vec<(String, String)> = match vendored_family(family) {
         Some(f) => match second_signers(&f.second_signers, leaf.as_deref(), &ctx) {
             Signers::Roles(rs) => rs

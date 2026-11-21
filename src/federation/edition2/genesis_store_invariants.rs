@@ -1563,10 +1563,9 @@ mod real_custody {
     /// extension is no DER INTEGER is refused by the judge, not read as "no
     /// serial": Verify's `CustodyError::SerialMalformed` ("the 9c serial
     /// extension is not a DER INTEGER fitting u32"). Compared by the error's
-    /// text, so it COMPILES on 23.3.2 too, where the leaf verifies (serial
-    /// `None`): ignored until VA-repin, which deletes the `#[ignore]`.
+    /// text (it compiled on 23.3.2 too, where the leaf verified with serial
+    /// `None`; it ran only from VA-repin, the 23.3.3 re-pin).
     #[test]
-    #[ignore = "VA-repin: green on CIRISVerify 23.3.3 only (custody_serial_malformed); the re-pin deletes this ignore"]
     fn i2172_a_malformed_serial_extension_is_refused_by_the_judge() {
         let chain: Vec<Vec<u8>> = MALFORMED_SERIAL_CHAIN_HEX.iter().map(|h| der(h)).collect();
         // Holder 1's Ed25519 half: seed [101; 32] (the generator's `ed_pub(1)`).
@@ -1591,8 +1590,8 @@ mod real_custody {
     /// **I2173** (VA-custody; sqlite, postgres; CIRISVerify 23.3.3) —
     /// through `put_genesis_bundle`, a first bundle whose holder 1 carries the
     /// malformed-serial chain is refused `genesis_holder_custody` /
-    /// `custody_serial_malformed` and nothing is stored. Ignored until
-    /// VA-repin (on 23.3.2 the bundle is placed).
+    /// `custody_serial_malformed` and nothing is stored. Runs from VA-repin
+    /// (on 23.3.2 the bundle was placed).
     pub(super) async fn body_malformed_serial(d: &dyn FederationDirectory) {
         add_test_attestation_root(mock_attestation_root_der());
         let spec = CeremonySpec::standard();
@@ -1680,7 +1679,6 @@ async fn i2395_sqlite() {
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-#[ignore = "VA-repin: green on CIRISVerify 23.3.3 only (custody_serial_malformed); the re-pin deletes this ignore"]
 async fn i2173_sqlite() {
     let d = sqlite().await;
     Box::pin(real_custody::body_malformed_serial(&d)).await;
@@ -1688,7 +1686,6 @@ async fn i2173_sqlite() {
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
-#[ignore = "VA-repin: green on CIRISVerify 23.3.3 only (custody_serial_malformed); the re-pin deletes this ignore"]
 async fn i2173_postgres() {
     let Some(d) = postgres().await else {
         return;

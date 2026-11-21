@@ -8785,6 +8785,8 @@ impl Engine {
                         head,
                         further_heads,
                         cites: Vec::new(),
+                        // CE-fix3: a non-genesis bind carries no dial hints.
+                        dial_hints: Vec::new(),
                     };
                     let author_signer =
                         (signer.federation_id().await == terms.author).then_some(signer.as_ref());
@@ -11315,30 +11317,26 @@ impl Engine {
         }
     }
 
-    /// v13.1.0 (CIRISPersist#381) — the **accord-attested bootstrap dial set**:
-    /// every [`TransportHint`](crate::federation::types::TransportHint) carried
-    /// inside the signed `registration_envelope` of each `canonical` server,
-    /// paired with the server `key_id` it reaches. This is the reachability
-    /// plane a cold node uses to JOIN the mesh with zero config — sourced from
-    /// the baked/replicated canonical records, not a hardcoded bootstrap-peers
-    /// const (which ciris-server 0.5.81 retires). Hints are the genesis/default
-    /// address; the mutable `TransportDestination` overlay wins at runtime.
-    /// A canonical server with no envelope hint contributes nothing (the field
-    /// is optional); consumers filter by `kind` (e.g. `ip` for the TCP entry).
+    /// v62.0.0 (CE-fix3; Eric's ruling: trust-root dial hints go SIGNED in
+    /// the bundle) — **the trust-root bootstrap dial set**: every seat of the
+    /// genesis in force paired with each of its signed `dial_hints`
+    /// (`(identity_ref, Hint)`, most preferred first per seat), read from
+    /// [`genesis_in_force`](Self::genesis_in_force)`.seats()`
+    /// ([`edition2::genesis::bootstrap_hints`](crate::federation::edition2::genesis::bootstrap_hints)).
+    /// A pre-genesis node answers empty. CLEAN BREAK (v62.0): this was
+    /// `Vec<(key_id, TransportHint)>` from the earlier-form canonical
+    /// records' `registration_envelope`; there is no alias. The mutable
+    /// `TransportDestination` overlay still wins at runtime.
+    ///
+    /// # Errors
+    /// Directory read failures.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn canonical_bootstrap_hints(
         &self,
-    ) -> Result<Vec<(String, crate::federation::types::TransportHint)>, crate::federation::Error>
+    ) -> Result<Vec<(String, ciris_verify_core::edition2::fedcode::Hint)>, crate::federation::Error>
     {
-        let servers = self.list_canonical_servers().await?;
-        Ok(servers
-            .into_iter()
-            .flat_map(|r| {
-                r.transport_hints()
-                    .into_iter()
-                    .map(move |h| (r.key_id.clone(), h))
-            })
-            .collect())
+        let g = self.genesis_in_force().await?;
+        Ok(crate::federation::edition2::genesis::bootstrap_hints(&g))
     }
 
     /// v13.1.0 (CIRISPersist#377) — enumerate the canonical-role withdrawal

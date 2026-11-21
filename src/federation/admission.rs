@@ -14361,7 +14361,7 @@ pub async fn check_owner_binding_counted(
 /// the family model's, read from the row's own statement
 /// ([`door::second_signer_roles`](super::edition2::door::second_signer_roles):
 /// Verify's vendored `family_authorship.json` through
-/// `WithVendored(&PersistCells)`, with the row's leaf), never a per-family
+/// `VendoredFamilyModel`, with the row's leaf), never a per-family
 /// list here. A role is filled when one of its parties is among the row's
 /// voices ([`row_voice_issuers`](super::edition2::voices::row_voice_issuers):
 /// the held ones, the carried one, the one the door is offering now).
@@ -16574,21 +16574,20 @@ pub const fn accord_threshold(roster_size: usize) -> usize {
 /// `⌊n/2⌋ + 1` (3→2, 4→3, 5→3), with no minimum roster: the ONE arithmetic
 /// every majority count in persist routes to (the accord's
 /// [`accord_threshold`], a room's `majority` protocol, a reverse-quorum
-/// floor, a two-path threshold). The body is a one-line seam: VA-repin
-/// swaps it to `ciris_verify_core::edition2::strict_majority` (23.3.3) and
-/// nothing else changes.
+/// floor, a two-path threshold). The body is a one-line seam: since VA-repin
+/// it is Verify's `ciris_verify_core::edition2::strict_majority` (23.3.3).
 #[must_use]
 pub const fn strict_majority(n: usize) -> usize {
-    n / 2 + 1
+    ciris_verify_core::edition2::strict_majority(n)
 }
 
 /// v62.0.0 (VA-genesis-fns) — **is `yes` a strict majority of `n`**
 /// (`2·yes > n`, i.e. `yes ≥ ⌊n/2⌋ + 1`)? The predicate twin of
-/// [`strict_majority`]; seam to `ciris_verify_core::edition2::is_strict_majority`
-/// at VA-repin.
+/// [`strict_majority`]; a seam to `ciris_verify_core::edition2::is_strict_majority`
+/// (since VA-repin, 23.3.3).
 #[must_use]
 pub const fn is_strict_majority(yes: usize, n: usize) -> bool {
-    yes > n / 2
+    ciris_verify_core::edition2::is_strict_majority(yes, n)
 }
 
 /// v60.1.0 (CIRISPersist#1117; TR-fix1) — the accord threshold over THIS

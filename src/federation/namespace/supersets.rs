@@ -1878,11 +1878,22 @@ mod tests {
         let cargo = include_str!("../../../Cargo.toml");
         let pyproject = include_str!("../../../pyproject.toml");
 
+        // v62.0.0 (4j-regen): a Verify pin is a `tag = "vM.m.p"` OR a
+        // `rev = "<sha>"` carrying `version = "M"` (the dry-run pin, VA-repin);
+        // the major is read from whichever the CIRISVerify line carries.
         let tag_majors: std::collections::BTreeSet<&str> = cargo
             .lines()
-            .filter_map(|l| l.split_once("tag = \"v"))
-            .filter_map(|(_, rest)| rest.split_once('.'))
-            .map(|(major, _)| major)
+            .filter(|l| l.contains("github.com/CIRISAI/CIRISVerify"))
+            .filter_map(|l| {
+                l.split_once("tag = \"v")
+                    .and_then(|(_, rest)| rest.split_once('.'))
+                    .map(|(major, _)| major)
+                    .or_else(|| {
+                        l.split_once("version = \"")
+                            .and_then(|(_, rest)| rest.split_once('"'))
+                            .map(|(v, _)| v.split('.').next().unwrap_or(v))
+                    })
+            })
             .collect();
         assert_eq!(
             tag_majors.len(),

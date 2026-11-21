@@ -195,8 +195,9 @@ pub mod field {
 ///   (`affiliation_member_action@subject_group`) only in an affiliation's
 ///   one-voice seat. Verify 23.3.1 ALREADY vendors this cell
 ///   (`family_authorship.json`), so persist's family model reads it from
-///   Verify; [`crate::federation::edition2::occurrence::PersistCells`] pins
-///   it with the empty second-signer list below.
+///   Verify. Its second-signer list is empty in CC's cell (e6fd7c6 and
+///   b016df4 alike); persist's former pin of it (`PersistCells`) is deleted
+///   (v62.0.0 VA-cc-cut).
 /// - **second_signers** — none ([`SECOND_SIGNERS`]).
 /// - **signer_rule** — `seat_role(slash)` via `delegates_to(slash)` (CC
 ///   3.1.9.2, CC 4.5.5) ([`SIGNER_RULE`]): applied by

@@ -2426,6 +2426,8 @@ where
         head,
         further_heads,
         cites: Vec::new(),
+        // CE-fix3: a self-occurrence bind carries no dial hints.
+        dial_hints: Vec::new(),
     };
     publish_bind(backend, Some(signer), author_signer, &terms).await
 }

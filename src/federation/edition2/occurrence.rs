@@ -10,7 +10,7 @@
 //!
 //! - **the occurrence key's own statement** (`iss` = `sub` =
 //!   `occurrence_key_id`, signed by that very key, role
-//!   [`OCCURRENCE_KEY_ROLE`], stated by [`PersistCells`]): proof of
+//!   [`OCCURRENCE_KEY_ROLE`], CC's vendored cell at b016df4): proof of
 //!   possession, REQUIRED, as a rotation record carries its new key's voice. It is held when it arrives and
 //!   lands nothing by itself.
 //! - **the author's statement** (`iss` = `author` = `identity_key_id`): a
@@ -47,9 +47,6 @@ use std::collections::BTreeSet;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use ciris_verify_core::cde::Value;
-use ciris_verify_core::edition2::family::{
-    FamilyModel, FamilyRule, RoleParty, RuleAnswer, SelectContext, VendoredFamilyModel,
-};
 use ciris_verify_core::edition2::{identity_ref, Digest32};
 
 use super::door::AdmittedRow;
@@ -69,8 +66,8 @@ pub const OCCURRENCE_FAMILY: &str = "identity:occurrence";
 /// The role the occurrence key's own statement fills (CC 3.3.6, CC 3.3.6.4,
 /// the rc21 second voice): CC names it `occurrence`, its party the member
 /// [`OCCURRENCE_KEY_MEMBER`] (CIRISConstitution rc21 90d537b, after the
-/// `v1.0-rc21-wire` tag). Stated by [`PersistCells`] until CIRISVerify
-/// vendors it.
+/// `v1.0-rc21-wire` tag). CIRISVerify 23.3.3 vendors it (CC b016df4); the
+/// door reads it from `VendoredFamilyModel` (VA-cc-cut).
 pub const OCCURRENCE_KEY_ROLE: &str = "occurrence";
 
 /// The payload member naming the occurrence key, the party of
@@ -100,101 +97,12 @@ fn payload_invalid(message: impl Into<String>) -> Error {
     )
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-//  The family model: the occurrence key's own voice
-// ─────────────────────────────────────────────────────────────────────────
-
-/// v62.0.0 (R1b; CIRISVerify 23.3.1) — **persist's own family cells**, read
-/// BEFORE CC's vendored model: the door reads every row statement through
-/// `WithVendored(&PersistCells)` (Verify's `edition2::family::WithVendored`:
-/// a family this model does not register falls through to
-/// `VendoredFamilyModel`).
-///
-/// v62.0.0 (K2-fix9) — and the `quarantine:{state}` rule, pinned (see
-/// `quarantine_rule`; DROP AT 23.3.3).
-///
-/// One cell, `identity:occurrence`'s `second_signers`:
-/// `[{role: occurrence, member: occurrence_key_id}]` (CC 3.3.6, CC 3.3.6.4;
-/// CIRISConstitution rc21 90d537b, "An occurrence's proof of possession has a
-/// role in the family model"). The occurrence key's own statement over its
-/// occurrence row (`iss` = the payload's `occurrence_key_id`) is its proof of
-/// possession; the vendored model at `v1.0-rc21-wire` (e6fd7c6) names no second
-/// signer, so without this cell that statement is `iss_not_in_role`. The
-/// authorship and every other member of the rule are CC's vendored answer for
-/// the row, unchanged.
-///
-/// **DROP AT 23.3.2** (the CIRISVerify release that vendors CC past
-/// 90d537b): delete this model and read `VendoredFamilyModel` at the door. It
-/// replaces the earlier `WithOccurrenceRole` overlay (role `occurrence_key`,
-/// party the CWT `sub`).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PersistCells;
-
-/// CC's vendored rule for `identity:occurrence`, with the occurrence key's
-/// own voice ([`PersistCells`]).
-fn with_occurrence_voice(mut rule: FamilyRule) -> FamilyRule {
-    if !rule.roles.iter().any(|(r, _)| r == OCCURRENCE_KEY_ROLE) {
-        rule.roles.push((
-            OCCURRENCE_KEY_ROLE.to_owned(),
-            RoleParty::Member(OCCURRENCE_KEY_MEMBER.to_owned()),
-        ));
-    }
-    rule
-}
-
-/// v62.0.0 (K2-fix9) — the `quarantine:{state}` family id
-/// (`namespace_match::family_id("quarantine:{state}")`).
-fn is_quarantine_family(family_id: &str) -> bool {
-    family_id == ciris_verify_core::namespace_match::family_id("quarantine:{state}")
-}
-
-/// v62.0.0 (K2-fix9; CC rc21 family model, `quarantine:{state}`; **DROP AT
-/// 23.3.3**, when CIRISVerify vendors these cells) — the quarantine family's
-/// rule, pinned: its authorship is CC's vendored cell ("group=affiliations &
-/// seats=one => counted ; authored", CC 4.4.3.12: authored by the slash-duty
-/// holder, counted as `affiliation_member_action@subject_group` only in an
-/// affiliation's one-voice seat), and its second signers are NONE
-/// ([`crate::federation::quarantine::cells::SECOND_SIGNERS`]). The signer
-/// rule (`seat_role(slash)`, CC 3.1.9.2 / CC 4.5.5), the signer kind
-/// (agent / person, never a node key, CC 3.4.7.3 C and E) and the marker
-/// plane's precedence (CC 3.1.9.2) are not family-rule fields; persist
-/// applies them in `quarantine` (`quarantine::cells`).
-fn quarantine_rule(mut rule: FamilyRule) -> FamilyRule {
-    rule.roles.retain(|(r, _)| {
-        crate::federation::quarantine::cells::SECOND_SIGNERS.contains(&r.as_str())
-    });
-    rule
-}
-
-impl FamilyModel for PersistCells {
-    fn rule(&self, family_id: &str) -> Option<FamilyRule> {
-        if is_quarantine_family(family_id) {
-            return VendoredFamilyModel.rule(family_id).map(quarantine_rule);
-        }
-        if family_id != OCCURRENCE_FAMILY {
-            return None;
-        }
-        VendoredFamilyModel
-            .rule(family_id)
-            .map(with_occurrence_voice)
-    }
-
-    fn rule_for(&self, family_id: &str, leaf: Option<&str>, ctx: &SelectContext) -> RuleAnswer {
-        if is_quarantine_family(family_id) {
-            return match VendoredFamilyModel.rule_for(family_id, leaf, ctx) {
-                RuleAnswer::Rule(r) => RuleAnswer::Rule(quarantine_rule(r)),
-                other => other,
-            };
-        }
-        if family_id != OCCURRENCE_FAMILY {
-            return RuleAnswer::Unregistered;
-        }
-        match VendoredFamilyModel.rule_for(family_id, leaf, ctx) {
-            RuleAnswer::Rule(r) => RuleAnswer::Rule(with_occurrence_voice(r)),
-            other => other,
-        }
-    }
-}
+// v62.0.0 (VA-cc-cut; CIRISVerify 23.3.3 vendors CC v1.0-rc21 b016df4) — the
+// door reads CC's vendored family model directly. b016df4's one verdict change
+// is `identity:occurrence`'s second signer (`occurrence`, member
+// `occurrence_key_id`), which persist's `PersistCells` overlay stated until
+// now; its `quarantine:{state}` pin was a no-op (CC's cell names no second
+// signer at e6fd7c6 and at b016df4 alike). Both are deleted with the overlay.
 
 // ─────────────────────────────────────────────────────────────────────────
 //  The occurrence arm of the key-of-issuer check (way (d))
@@ -1818,6 +1726,31 @@ pub struct BindTerms {
     /// `key:record` here (Verify's bundle reader: `binding_names_no_record`
     /// otherwise). Empty: no `also`.
     pub cites: Vec<RowId>,
+    /// v62.0.0 (CE-fix3; CC 2.6.1.11, Verify 23.3.3) — `dial_hints`, a
+    /// top-level member beside `transport_destination`: at most four
+    /// FedCode hints, MOST PREFERRED FIRST (an ordered sequence, not a
+    /// set), each written as `[type, body]` by Verify's own encoder
+    /// (Verify's, through [`dial_hints_value`]). Hints only: the transport identity is
+    /// `transport_destination`'s. A genesis serve seat's binding needs at
+    /// least one `tcp` hint (Verify's bundle reader:
+    /// `seat_dial_hints_missing`). Empty: no member.
+    pub dial_hints: Vec<ciris_verify_core::edition2::fedcode::Hint>,
+}
+
+/// v62.0.0 (CE-fix3) — the `dial_hints` member's value, built by Verify
+/// (`edition2::dial_hints_value`, 23.3.3: `[1*4 [type, body]]`, each from
+/// `fedcode::hint_parts`, in the order given). Persist assembles and judges
+/// nothing here.
+///
+/// # Errors
+/// `edition2_payload_invalid` carrying Verify's label (`dial_hint_malformed`,
+/// `malformed:dial_hints`, …) for hints Verify will not write: an `Unknown`
+/// hint, more than four, a body out of range.
+pub fn dial_hints_value(
+    hints: &[ciris_verify_core::edition2::fedcode::Hint],
+) -> Result<Value, Error> {
+    ciris_verify_core::edition2::dial_hints_value(hints)
+        .map_err(|e| payload_invalid(format!("`dial_hints`: {}", super::door::invalid_label(&e))))
 }
 
 /// v62.0.0 (v62 P8) — **a bind's transport members** (CC 3.3.6.2): the
@@ -1907,6 +1840,10 @@ pub fn bind_payload(t: &BindTerms) -> Result<Value, Error> {
         if let Some(x) = &tr.onion_hop_xwing_pubkey {
             m.push((text(ONION_HOP_XWING_PUBKEY_MEMBER), Value::Bytes(x.clone())));
         }
+    }
+    // v62.0.0 (CE-fix3) — `dial_hints`, in the order given.
+    if !t.dial_hints.is_empty() {
+        m.push((text("dial_hints"), dial_hints_value(&t.dial_hints)?));
     }
     let mut refs: Vec<(Value, Value)> = Vec::new();
     if let Some(h) = &t.head {

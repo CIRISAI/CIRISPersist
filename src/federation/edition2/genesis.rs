@@ -1638,6 +1638,150 @@ pub fn check_genesis_offer(
     }
 }
 
+// ------------------------------------------------------------------ dial hints (CE-fix3)
+
+/// v62.0.0 (CE-fix3) — the refusal of a BAKED bundle one of whose serve
+/// seats has no `tcp` dial hint (a node cold-booting from the bake could
+/// not dial it). The bake gate's own token: Verify's reader refuses a
+/// genesis serve seat with no `tcp` hint first (`seat_dial_hints_missing`),
+/// so on a Verify-placed bundle this is the second line, run on the
+/// placement a bake ships.
+pub const BAKED_SEAT_NOT_DIALABLE: &str = "baked_seat_not_dialable";
+
+/// v62.0.0 (CE-fix3; Eric's ruling: trust-root dial hints go SIGNED in the
+/// bundle) — **every serve seat of `p` is dialable**: it carries at least
+/// one `tcp` dial hint: Verify's `edition2::has_tcp_hint` over
+/// `PlacedSeat::dial_hints` (23.3.3, BELIEVED until the pin). Pure.
+///
+/// # Errors
+/// `InvalidArgument` leading with [`BAKED_SEAT_NOT_DIALABLE`], naming the
+/// first such seat.
+pub fn check_seats_dialable(p: &GenesisPlacement) -> Result<(), Error> {
+    // Verify's own seat check (23.3.3), never a re-derivation of it.
+    for s in &p.seats {
+        if !ciris_verify_core::edition2::has_tcp_hint(&s.dial_hints) {
+            return Err(Error::InvalidArgument(format!(
+                "{BAKED_SEAT_NOT_DIALABLE}: serve seat {} of bundle {} carries no tcp dial \
+                 hint; a baked genesis must be dialable from a cold boot",
+                s.identity_ref,
+                hex::encode(p.object_id)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// v62.0.0 (CE-fix3) — **every genesis bundle this build BAKES**: `(name,
+/// bytes)`, the bytes a CDE array of the bundle's statements (its voices and
+/// every row it names, as bstr). **v62.0 bakes no edition-2 bundle** (a
+/// fresh v62.0 node is pre-genesis, C1-fix3), so this is empty and the bake
+/// gate runs only on fixtures until v62.1 adds the ceremony's bundle here.
+/// A bake anywhere else is refused by the from-disk witness (I2297).
+pub const BAKED_BUNDLES: &[(&str, &[u8])] = &[];
+
+/// v62.0.0 (CE-fix3) — **the bake gate**: a baked bundle (`bytes`, a CDE
+/// array of statements) reads Valid under its OWN object id
+/// ([`check_genesis_offer`], with every refusal of Verify's reader by its
+/// name: `seat_dial_hints_missing`, `dial_hint_malformed`,
+/// `Malformed { member: "dial_hints" }`), and every seat of every placed
+/// bundle is dialable ([`check_seats_dialable`]). Pure.
+///
+/// # Errors
+/// `genesis_bundle_malformed` for bytes that are not an array of statements
+/// or carry no bundle voice; as [`check_genesis_offer`];
+/// [`BAKED_SEAT_NOT_DIALABLE`].
+pub fn check_baked_bundle(
+    bytes: &[u8],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<GenesisPlacement>, Error> {
+    let statements: Vec<Vec<u8>> = cde::decode(bytes)
+        .ok()
+        .and_then(|v| {
+            v.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_bytes().map(<[u8]>::to_vec))
+                    .collect()
+            })
+        })
+        .ok_or_else(|| {
+            refuse(
+                token::MALFORMED,
+                "baked bundle: not a CDE array of statements",
+            )
+        })?;
+    let oid = statements
+        .iter()
+        .find_map(|s| cose_parts(s).as_ref().and_then(voice_of).map(|(o, _)| o))
+        .ok_or_else(|| refuse(token::MALFORMED, "baked bundle: no bundle voice"))?;
+    let placed = check_genesis_offer(&statements, Some(&Anchor::ObjectId(oid)), now)?;
+    for p in &placed {
+        check_seats_dialable(p)?;
+    }
+    Ok(placed)
+}
+
+/// v62.0.0 (CE-fix3) — **the trust-root bootstrap dial set**: every seat of
+/// the genesis in force with its signed dial hints, `(identity_ref, hint)`,
+/// most preferred first per seat. Replaces the earlier-form
+/// `KeyRecord::transport_hints()` read over `list_canonical_servers`.
+#[must_use]
+pub fn bootstrap_hints(
+    g: &GenesisInForce,
+) -> Vec<(String, ciris_verify_core::edition2::fedcode::Hint)> {
+    g.seats()
+        .iter()
+        .flat_map(|s| {
+            s.dial_hints
+                .iter()
+                .map(move |h| (s.identity_ref.clone(), h.clone()))
+        })
+        .collect()
+}
+
+/// v62.0.0 (CE-fix3) — one bootstrap hint as the host surface's JSON:
+/// `{identity_ref, type, body_hex}` (the FedCode hint, byte for byte, via
+/// Verify's `fedcode::hint_parts`; an `Unknown` hint as signed), plus the readable members of a known kind: `kind`
+/// (`tcp` | `udp` | `auto` | `rnode` | `http` | `unknown`), and `host` /
+/// `port` (tcp, udp) or `url` (http).
+#[must_use]
+pub fn dial_hint_json(
+    identity_ref: &str,
+    h: &ciris_verify_core::edition2::fedcode::Hint,
+) -> serde_json::Value {
+    use ciris_verify_core::edition2::fedcode::{hint_parts, Hint};
+    let mut o = serde_json::json!({ "identity_ref": identity_ref });
+    // `hint_parts` refuses `Unknown` (a minter emits only assigned types);
+    // a placed `Unknown` hint carries its own type and body as signed.
+    let parts = match h {
+        Hint::Unknown { tag, body } => Some((*tag, body.clone())),
+        other => hint_parts(other).ok(),
+    };
+    if let Some((tag, body)) = parts {
+        o["type"] = serde_json::json!(tag);
+        o["body_hex"] = serde_json::json!(hex::encode(body));
+    }
+    match h {
+        Hint::Tcp { host, port } => {
+            o["kind"] = "tcp".into();
+            o["host"] = host.clone().into();
+            o["port"] = (*port).into();
+        }
+        Hint::Udp { host, port } => {
+            o["kind"] = "udp".into();
+            o["host"] = host.clone().into();
+            o["port"] = (*port).into();
+        }
+        Hint::Auto { .. } => o["kind"] = "auto".into(),
+        Hint::RNode { .. } => o["kind"] = "rnode".into(),
+        Hint::Http { url } => {
+            o["kind"] = "http".into();
+            o["url"] = url.clone().into();
+        }
+        _ => o["kind"] = "unknown".into(),
+    }
+    o
+}
+
 /// A test seam on [`GenesisWrite`]: a backend fails the transaction after
 /// every write and before the commit. Always [`WriteFault::None`] outside
 /// the witnesses.

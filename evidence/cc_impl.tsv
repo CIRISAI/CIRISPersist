@@ -453,7 +453,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 # genesis bundle/2 and canonical standing (CC 5.3.4), key liveness (CC 3.1.3).
 2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/ingest.rs#put_statement	ciris-persist@61.4.2	a138f5bb93953b04783e0264169ea915ce4f5c3c4cb23d161aedf59c995bcbae
 2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/ingest.rs#apply_replicated_statement	ciris-persist@61.4.2	14f1867d3134997fa2999f76950b895dd7053fb7e3357cccd28a63ba6999fd91
-2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/door.rs#admit_row	ciris-persist@61.4.2	bf3b9e6cfccaf52afc8e5bd82df83428dbac842adea6a3a3436410907991b125
+2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/door.rs#admit_row	ciris-persist@61.4.2	842f09b2a2829b603434210688a513b389c169f57340ab1901720ab889c47988
 2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/door.rs#require_statement_form	ciris-persist@61.4.2	b34305537779c912398120e5f502e1c822cbb5ec5270fae7b41c918057ae109e
 2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/door.rs#refuse_edition_one	ciris-persist@61.4.2	4a0b8b96d042831e6d4dd9cc78862c5d9d585d3c59d25c6ee877080c4bcebd04
 2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/door.rs#refuse_earlier_form	ciris-persist@61.4.2	664f52340225294dcc3ec81e455fc1b40a86d3cd82d4078fe55543bf8046c71b

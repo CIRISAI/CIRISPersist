@@ -43,6 +43,32 @@
 //!   the test seam `edition2::genesis::add_test_attestation_root` (cfg(test)
 //!   / test-anchor only; a production build judges against Verify's baked
 //!   roots). One voice short, the gate refuses (`genesis_bundle_count_unmet`).
+//! - I2290 (pure; CE-fix3): the seat binding states its `dial_hints` as
+//!   `[[type, body]]` from Verify's encoder, in the order given; the
+//!   placement carries them (`PlacedSeat::dial_hints`); and the bootstrap
+//!   dial set / its JSON read them.
+//! - I2291 (pure): Verify's reader refuses at [`c::check_genesis_offer`],
+//!   by its exact names (under `genesis_bundle_row_invalid`): a serve seat
+//!   with no hint, only udp, only http or only unknown types is
+//!   `seat_dial_hints_missing`; a known type with a bad body is
+//!   `dial_hint_malformed`; an empty or five-entry list is `Malformed {
+//!   member: "dial_hints" }`, which a genesis reads as `row_invalid`. The builder refuses an `Unknown` hint up
+//!   front with `hint_parts`' token. Persist re-implements none of these.
+//! - I2292 (pure): the bake gate. [`genesis::check_seats_dialable`] passes a
+//!   placement whose seats carry a tcp hint and refuses one without
+//!   (`baked_seat_not_dialable`, naming the seat; witnessed by a placed
+//!   seat with no hint, only udp, only http and only unknown types; the
+//!   check is Verify's `has_tcp_hint`); [`genesis::check_baked_bundle`]
+//!   passes the fixture bundle encoded as a bake and refuses a bake whose
+//!   seat has no hint by Verify's name.
+//! - I2293 (pure, from disk): every bundle this build bakes
+//!   (`genesis::BAKED_BUNDLES`, empty in v62.0) passes the bake gate, and no
+//!   `include_bytes!` / `include_str!` in `src/` names a genesis file outside
+//!   `tests/vectors/`: a bake added anywhere but `BAKED_BUNDLES` fails the
+//!   build's test lane.
+//! - I2294 (sqlite + postgres): `genesis::bootstrap_hints` over the genesis in
+//!   force is empty pre-genesis and, after the import, every seat paired with
+//!   each of its signed hints (what `Engine::canonical_bootstrap_hints` returns).
 //! - I2289 (pure; CE-fix2): CEREMONY step 3 before step 4.
 //!   [`c::check_offer_with_halts`] passes with exactly one sealed halt per
 //!   listed holder, and the coverage names each holder's halt.
@@ -65,8 +91,8 @@ use ciris_verify_core::edition2::Digest32;
 
 use super::emit::key_record_end;
 use super::fixture_genesis::{
-    ceremony_v2, mock_attestation_root_der, recovery_key, test_key, CeremonySpec, TestCeremonyV2,
-    DAY_MS, FAMILY_KEY_ID, YEAR_MS,
+    ceremony_v2, mock_attestation_root_der, recovery_key, seat_dial_hints, test_key, CeremonySpec,
+    TestCeremonyV2, DAY_MS, FAMILY_KEY_ID, YEAR_MS,
 };
 use super::fixture_genesis_custody::HOLDER_CHAINS_HEX;
 use super::genesis::add_test_attestation_root;
@@ -140,6 +166,7 @@ struct Seat {
     record_id: Digest32,
     binding: Vec<u8>,
     transport: BindTransport,
+    dial_hints: Vec<c::Hint>,
 }
 
 /// The ceremony, built offline by the production builders over the
@@ -171,6 +198,11 @@ impl Offline {
 }
 
 fn offline(fx: &TestCeremonyV2) -> Offline {
+    offline_with(fx, &seat_dial_hints)
+}
+
+/// [`offline`] with each seat's dial hints from `hints` (by seat seed).
+fn offline_with(fx: &TestCeremonyV2, hints: &dyn Fn(u8) -> Vec<c::Hint>) -> Offline {
     let t0 = fx.spec.t0_ms;
     // Step 1: each holder's record.
     let holders: Vec<(CompositeSigningKey, Vec<u8>)> = fx
@@ -197,8 +229,15 @@ fn offline(fx: &TestCeremonyV2) -> Offline {
             let record_id = c::row_id_of(&d).expect("a record draft has a row id");
             let record = sign(&key, &d);
             let transport = transport_of(&fs.binding.statement);
-            let b = c::seat_binding_draft(key.public_key(), &record_id, t0, transport.clone())
-                .expect("a seat binding");
+            let dial_hints = hints(*s);
+            let b = c::seat_binding_draft(
+                key.public_key(),
+                &record_id,
+                t0,
+                transport.clone(),
+                dial_hints.clone(),
+            )
+            .expect("a seat binding");
             let binding = sign(&key, &b);
             Seat {
                 key,
@@ -206,6 +245,7 @@ fn offline(fx: &TestCeremonyV2) -> Offline {
                 record_id,
                 binding,
                 transport,
+                dial_hints,
             }
         })
         .collect();
@@ -417,16 +457,27 @@ fn i2282_the_offer_check_refuses_what_the_door_refuses() {
     let s = &off.seats[0];
     let mut no_onion = s.transport.clone();
     no_onion.onion_hop_xwing_pubkey = None;
-    let e = c::seat_binding_draft(s.key.public_key(), &s.record_id, T0, no_onion)
-        .expect_err("I2282: no onion-hop key");
+    let e = c::seat_binding_draft(
+        s.key.public_key(),
+        &s.record_id,
+        T0,
+        no_onion,
+        s.dial_hints.clone(),
+    )
+    .expect_err("I2282: no onion-hop key");
     assert!(
         e.to_string().contains("edition2_payload_invalid"),
         "I2282: a seat binding carries both X-Wing keys: {e}"
     );
 
     // A binding that cites no record, in a bundle that names it: refused.
-    let mut terms =
-        c::seat_binding_terms(s.key.public_key(), &s.record_id, T0, s.transport.clone());
+    let mut terms = c::seat_binding_terms(
+        s.key.public_key(),
+        &s.record_id,
+        T0,
+        s.transport.clone(),
+        s.dial_hints.clone(),
+    );
     terms.cites.clear();
     let uncited = sign(
         &s.key,
@@ -1022,4 +1073,388 @@ async fn i2307_the_final_gate_reports_halt_coverage() {
         off.halts.len(),
         "I2307: not offered"
     );
+}
+
+// ------------------------------------------------------------------ CE-fix3: dial hints
+
+/// The statements of `off` with seat `i`'s binding replaced by `binding`:
+/// the bundle re-cut to cite it, every holder voicing it again.
+fn with_binding(off: &Offline, i: usize, binding: Vec<u8>) -> Vec<Vec<u8>> {
+    let id = |st: &[u8]| super::names::RowId::of_statement(st).unwrap().0;
+    let old = id(&off.seats[i].binding);
+    let new = id(&binding);
+    let mut terms = off.terms.clone();
+    for x in &mut terms.cites {
+        if *x == old {
+            *x = new;
+        }
+    }
+    let mut st: Vec<Vec<u8>> = off.holders.iter().map(|(_, r)| r.clone()).collect();
+    st.extend(off.seats.iter().map(|s| s.record.clone()));
+    for (j, s) in off.seats.iter().enumerate() {
+        st.push(if j == i {
+            binding.clone()
+        } else {
+            s.binding.clone()
+        });
+    }
+    st.extend(
+        off.holders
+            .iter()
+            .map(|(k, _)| sign(k, &c::bundle_voice_draft(k.public_key(), &terms))),
+    );
+    st
+}
+
+fn http_only(_seed: u8) -> Vec<c::Hint> {
+    vec![c::Hint::Http {
+        url: "https://seat.genesis.test/".to_owned(),
+    }]
+}
+
+fn unknown_only(_seed: u8) -> Vec<c::Hint> {
+    vec![c::Hint::Unknown {
+        tag: 200,
+        body: vec![1, 2, 3],
+    }]
+}
+
+/// The statements of `off` with seat 0's binding re-signed carrying
+/// `dial_hints` = `raw` verbatim (past every encoder).
+fn with_raw_dial_hints(off: &Offline, raw: Value) -> Vec<Vec<u8>> {
+    let s = &off.seats[0];
+    let terms = c::seat_binding_terms(
+        s.key.public_key(),
+        &s.record_id,
+        T0,
+        s.transport.clone(),
+        s.dial_hints.clone(),
+    );
+    let payload = super::emit::with_member(
+        super::occurrence::bind_payload(&terms).unwrap(),
+        "dial_hints",
+        raw,
+    )
+    .unwrap();
+    let iref = c::identity_ref_of(s.key.public_key());
+    let d = super::emit::draft_row(
+        &c::kid_of(s.key.public_key()),
+        &iref,
+        &iref,
+        "scores",
+        super::occurrence::OCCURRENCE_FAMILY,
+        &payload,
+    )
+    .unwrap();
+    with_binding(off, 0, sign(&s.key, &d))
+}
+
+fn udp_only(seed: u8) -> Vec<c::Hint> {
+    vec![c::Hint::Udp {
+        host: format!("seat-{seed}.genesis.test"),
+        port: 4242,
+    }]
+}
+
+fn baked(statements: &[Vec<u8>]) -> Vec<u8> {
+    ciris_verify_core::cde::encode(&Value::Array(
+        statements.iter().cloned().map(Value::Bytes).collect(),
+    ))
+}
+
+fn instant(ms: u64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp_millis(i64::try_from(ms).unwrap()).unwrap()
+}
+
+/// **I2290** — the binding states its dial hints; the placement carries
+/// them; the JSON reads them.
+#[test]
+fn i2290_the_binding_states_and_the_placement_carries_dial_hints() {
+    add_test_attestation_root(mock_attestation_root_der());
+    let (_, off) = fixed();
+    for s in &off.seats {
+        assert!(
+            !s.dial_hints.is_empty(),
+            "I2290: the fixture seat has hints"
+        );
+        let (_, p) = statement_parts(&s.binding).unwrap();
+        assert_eq!(
+            p.get_text("dial_hints"),
+            Some(&super::occurrence::dial_hints_value(&s.dial_hints).unwrap()),
+            "I2290: `dial_hints` as Verify's encoder writes them, in order"
+        );
+    }
+    let placed = c::check_genesis_offer(&off.statements(), &off.anchor(), CHECK_AT).unwrap();
+    for s in &off.seats {
+        let iref = c::identity_ref_of(s.key.public_key());
+        let ps = placed[0]
+            .seats
+            .iter()
+            .find(|x| x.identity_ref == iref)
+            .unwrap();
+        assert_eq!(
+            ps.dial_hints, s.dial_hints,
+            "I2290: the placement carries them"
+        );
+        let j = super::genesis::dial_hint_json(&iref, &ps.dial_hints[0]);
+        assert_eq!(j["kind"], "tcp", "I2290: {j}");
+        assert_eq!(j["port"], 4242, "I2290: {j}");
+        assert_eq!(j["identity_ref"], iref.as_str(), "I2290: {j}");
+        assert!(
+            j["body_hex"].is_string(),
+            "I2290: the hint byte for byte: {j}"
+        );
+    }
+}
+
+/// **I2291** — Verify's refusals surface by Verify's exact names; persist
+/// re-implements none.
+/// A seat's dial-hint builder, by seed.
+type HintsFor<'a> = &'a dyn Fn(u8) -> Vec<c::Hint>;
+
+#[test]
+fn i2291_verify_refuses_an_undialable_seat_by_its_name() {
+    add_test_attestation_root(mock_attestation_root_der());
+    let fx = ceremony_v2(&CeremonySpec::at(T0));
+    // A serve seat with no tcp hint: RowFault::SeatDialHintsMissing.
+    let none = |_: u8| -> Vec<c::Hint> { Vec::new() };
+    let cases: [(&str, HintsFor<'_>); 3] = [
+        ("no hint", &none),
+        ("udp only", &udp_only),
+        ("http only", &http_only),
+    ];
+    for (what, hints) in cases {
+        let off = offline_with(&fx, hints);
+        let e = c::check_genesis_offer(&off.statements(), &off.anchor(), CHECK_AT)
+            .expect_err("I2291: a serve seat with no tcp hint is not placed");
+        assert_eq!(
+            reason(&e),
+            malformed_row::GENESIS_BUNDLE_ROW_INVALID,
+            "I2291 {what}: {e:?}"
+        );
+        assert!(
+            e.to_string().contains("seat_dial_hints_missing"),
+            "I2291 {what}: Verify's detail seat_dial_hints_missing: {e}"
+        );
+    }
+    let off = offline(&fx);
+    // Unknown types only (written raw: the builder refuses them).
+    let st = with_raw_dial_hints(
+        &off,
+        Value::Array(vec![Value::Array(vec![
+            Value::Uint(200),
+            Value::Bytes(vec![1, 2, 3]),
+        ])]),
+    );
+    let e = c::check_genesis_offer(&st, &off.anchor(), CHECK_AT).expect_err("unknown only");
+    assert!(
+        e.to_string().contains("seat_dial_hints_missing"),
+        "I2291 unknown only: {e}"
+    );
+    // A known type with a bad body: RowFault::DialHintMalformed.
+    let st = with_raw_dial_hints(
+        &off,
+        Value::Array(vec![Value::Array(vec![
+            Value::Uint(1),
+            Value::Bytes(vec![0x00]),
+        ])]),
+    );
+    let e = c::check_genesis_offer(&st, &off.anchor(), CHECK_AT).expect_err("bad body");
+    assert_eq!(
+        reason(&e),
+        malformed_row::GENESIS_BUNDLE_ROW_INVALID,
+        "{e:?}"
+    );
+    assert!(
+        e.to_string().contains("dial_hint_malformed"),
+        "I2291 bad body: Verify's detail dial_hint_malformed: {e}"
+    );
+    // A shape off the CDDL (empty; five entries): Malformed{dial_hints},
+    // row_invalid in a genesis.
+    let tcp = Value::Array(vec![
+        Value::Uint(1),
+        super::occurrence::dial_hints_value(&seat_dial_hints(11))
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .as_array()
+            .unwrap()[1]
+            .clone(),
+    ]);
+    for (what, raw) in [
+        ("empty", Value::Array(Vec::new())),
+        ("five", Value::Array(vec![tcp; 5])),
+    ] {
+        let st = with_raw_dial_hints(&off, raw);
+        let e = c::check_genesis_offer(&st, &off.anchor(), CHECK_AT).expect_err(what);
+        assert_eq!(
+            reason(&e),
+            malformed_row::GENESIS_BUNDLE_ROW_INVALID,
+            "I2291 {what}: {e:?}"
+        );
+        assert!(
+            e.to_string().contains("row_invalid"),
+            "I2291 {what}: Malformed {{ member: dial_hints }} reads row_invalid in a genesis: {e}"
+        );
+    }
+    // The builder refuses an Unknown hint up front, by Verify's token.
+    let s = &off.seats[0];
+    let e = c::seat_binding_draft(
+        s.key.public_key(),
+        &s.record_id,
+        T0,
+        s.transport.clone(),
+        unknown_only(11),
+    )
+    .expect_err("I2291: the minter writes only assigned types");
+    let msg = e.to_string();
+    assert!(
+        msg.contains("edition2_payload_invalid") && msg.contains("dial hint 0"),
+        "I2291: refused up front, with hint_parts' token: {msg}"
+    );
+}
+
+/// **I2292** — the bake gate, both ways.
+#[test]
+fn i2292_the_bake_gate_fails_an_undialable_seat_by_name() {
+    add_test_attestation_root(mock_attestation_root_der());
+    let fx = ceremony_v2(&CeremonySpec::at(T0));
+    let off = offline(&fx);
+    let placed = c::check_genesis_offer(&off.statements(), &off.anchor(), CHECK_AT).unwrap();
+    super::genesis::check_seats_dialable(&placed[0]).expect("I2292: dialable seats pass");
+    // A placement whose seat carries no tcp hint fails, naming the seat.
+    for (what, hints) in [
+        ("no hint", Vec::new()),
+        ("udp only", udp_only(11)),
+        ("http only", http_only(11)),
+        ("unknown only", unknown_only(11)),
+    ] {
+        let mut p = placed[0].clone();
+        p.seats[0].dial_hints = hints;
+        let e = super::genesis::check_seats_dialable(&p).expect_err("I2292: not dialable");
+        let msg = e.to_string();
+        assert!(
+            msg.contains(super::genesis::BAKED_SEAT_NOT_DIALABLE)
+                && msg.contains(&p.seats[0].identity_ref),
+            "I2292 {what}: by name, naming the seat: {msg}"
+        );
+    }
+    // The bake: the fixture bundle passes; a bake with an undialable seat
+    // fails by Verify's name before the gate's own.
+    let now = instant(CHECK_AT);
+    let ok = super::genesis::check_baked_bundle(&baked(&off.statements()), now)
+        .expect("I2292: the fixture bake passes");
+    assert_eq!(ok[0].object_id, c::bundle_object_id(&off.terms));
+    let bare = offline_with(&fx, &|_: u8| -> Vec<c::Hint> { Vec::new() });
+    let e = super::genesis::check_baked_bundle(&baked(&bare.statements()), now)
+        .expect_err("I2292: an undialable bake fails");
+    assert!(
+        format!("{e:?}").contains("seat_dial_hints_missing"),
+        "I2292: {e:?}"
+    );
+    // Not an array of statements.
+    assert!(super::genesis::check_baked_bundle(b"\x01", now).is_err());
+}
+
+/// **I2293** — every bake passes the gate, and there is no bake elsewhere.
+#[test]
+fn i2293_every_bake_runs_the_gate() {
+    for (name, bytes) in super::genesis::BAKED_BUNDLES {
+        super::genesis::check_baked_bundle(bytes, chrono::Utc::now())
+            .unwrap_or_else(|e| panic!("I2293: baked bundle {name}: {e:?}"));
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let me = std::path::Path::new(file!())
+        .file_name()
+        .unwrap()
+        .to_owned();
+    let needles = [concat!("include", "_bytes!"), concat!("include", "_str!")];
+    let mut stack = vec![root];
+    let mut found = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|x| x != "rs") || path.file_name() == Some(&me) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                let lower = code.to_ascii_lowercase();
+                if needles.iter().any(|x| code.contains(x))
+                    && lower.contains("genesis")
+                    && !code.contains("tests/vectors/")
+                {
+                    found.push(format!("{}:{}", path.display(), n + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "I2293: a genesis file is included outside tests/vectors/ and outside \
+         genesis::BAKED_BUNDLES (bake it there, where the gate runs): {found:?}"
+    );
+}
+
+/// **I2294** — the bootstrap dial set reads the seats' signed hints from the
+/// genesis in force.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+async fn body_bootstrap_hints(d: &dyn crate::federation::FederationDirectory) {
+    use super::genesis::{bootstrap_hints, genesis_in_force, put_genesis_bundle};
+    add_test_attestation_root(mock_attestation_root_der());
+    assert!(
+        bootstrap_hints(&genesis_in_force(d).await.unwrap()).is_empty(),
+        "I2294: pre-genesis, no bootstrap hint"
+    );
+    let off = offline(&ceremony_v2(&CeremonySpec::standard()));
+    put_genesis_bundle(d, &off.statements(), Some(&off.anchor()))
+        .await
+        .expect("I2294: the genesis imports");
+    let got = bootstrap_hints(&genesis_in_force(d).await.unwrap());
+    let mut want: Vec<(String, c::Hint)> = off
+        .seats
+        .iter()
+        .flat_map(|s| {
+            let iref = c::identity_ref_of(s.key.public_key());
+            s.dial_hints.iter().map(move |h| (iref.clone(), h.clone()))
+        })
+        .collect();
+    let mut got_sorted = got.clone();
+    let key = |x: &(String, c::Hint)| x.0.clone();
+    got_sorted.sort_by_key(key);
+    want.sort_by_key(key);
+    assert_eq!(got_sorted, want, "I2294: every seat's signed hints");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2294_bootstrap_hints_sqlite() {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(body_bootstrap_hints(&b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2294_bootstrap_hints_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::isolated_dsn() else {
+        return;
+    };
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(body_bootstrap_hints(&b)).await;
 }

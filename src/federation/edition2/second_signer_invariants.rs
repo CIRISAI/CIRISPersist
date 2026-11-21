@@ -2,7 +2,7 @@
 //! consents", CC 2.6.1.9) — **I2845–I2846: an authored row whose family names
 //! a second signer is held until every named role has voiced.** The roles
 //! are the family model's (Verify's vendored `family_authorship.json`
-//! through `WithVendored(&PersistCells)`), read from the row's own
+//! through `VendoredFamilyModel`), read from the row's own
 //! statement by `door::second_signer_roles`; the gate is
 //! `admission::check_second_signers_voiced`.
 //!

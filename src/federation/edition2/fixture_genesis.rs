@@ -220,6 +220,22 @@ pub struct SeatV2 {
     pub transit_xwing_pubkey: [u8; XWING_PUBKEY_LEN],
     /// The binding's onion-hop X-Wing key.
     pub onion_hop_xwing_pubkey: [u8; XWING_PUBKEY_LEN],
+    /// v62.0.0 (CE-fix3) — the binding's `dial_hints` ([`seat_dial_hints`]).
+    pub dial_hints: Vec<ciris_verify_core::edition2::fedcode::Hint>,
+}
+
+/// v62.0.0 (CE-fix3; CC 2.6.1.11, Verify 23.3.3) — **THE fixture seats' dial
+/// hints**, the one place every fixture seat binding takes them from: one
+/// `tcp` hint (a genesis serve seat needs one, Verify's
+/// `seat_dial_hints_missing`) at a test-only name. Changing the fixture
+/// seats' hints is a change here, and moves the genesis vectors and every
+/// pinned fixture byte with it.
+#[must_use]
+pub fn seat_dial_hints(seed: u8) -> Vec<ciris_verify_core::edition2::fedcode::Hint> {
+    vec![ciris_verify_core::edition2::fedcode::Hint::Tcp {
+        host: format!("seat-{seed}.genesis.test"),
+        port: 4242,
+    }]
 }
 
 /// A minted bundle and every row it names.
@@ -547,6 +563,12 @@ fn mint_seat(seed: u8, t0_ms: u64) -> SeatV2 {
         ("transport_destination", td),
         ("transit_xwing_pubkey", Value::Bytes(transit.to_vec())),
         ("onion_hop_xwing_pubkey", Value::Bytes(onion.to_vec())),
+        // CE-fix3 — the seat's dial hints, through the production encoder.
+        (
+            "dial_hints",
+            super::occurrence::dial_hints_value(&seat_dial_hints(seed))
+                .expect("the fixture hints encode"),
+        ),
         // X2 build fix (P1e / CC rc21): `refs.head` is REQUIRED on
         // identity:occurrence; a new identity's first bind names the genesis
         // key's own key:record row, here the seat's record.
@@ -570,6 +592,7 @@ fn mint_seat(seed: u8, t0_ms: u64) -> SeatV2 {
         binding,
         transit_xwing_pubkey: transit,
         onion_hop_xwing_pubkey: onion,
+        dial_hints: seat_dial_hints(seed),
     }
 }
 

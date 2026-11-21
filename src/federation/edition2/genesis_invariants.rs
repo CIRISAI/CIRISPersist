@@ -1,10 +1,11 @@
 //! **I2300–I2304**: the genesis bundle/2 reader in persist, pure (no store),
 //! against CIRISVerify 23.3.1's own known answers (vendored at
 //! `tests/vectors/verify_v23/genesis/`, SHA-256 pinned; v62.0.0 R1 moved
-//! bundles v2 to v3 and reseat v1 to v2, CC v1.0-rc21-wire e6fd7c6).
+//! bundles v2 to v3 and reseat v1 to v2, CC v1.0-rc21-wire e6fd7c6; CE-fix3
+//! moved bundles v3 to v4 and reseat v2 to v3, Verify 23.3.3 `dial_hints`).
 //!
 //! - I2300: the vendored files are Verify 23.3.1's, byte for byte.
-//! - I2301: every case of `genesis_bundles_v3.json` read through
+//! - I2301: every case of `genesis_bundles_v4.json` read through
 //!   [`read_lineage`] gives Verify's verdict for each offered object, with a
 //!   case's predecessor chain HELD (each held first bundle rooted by its own
 //!   object id, as the store re-reads it) and its anchor rooting only what
@@ -21,7 +22,7 @@
 //! - I2302: on the fork cases, the genesis in force ([`GenesisInForce`])
 //!   reports Verify's forks, head, and the tips' common holders and seats.
 //! - I2303: persist's tokens are Verify's.
-//! - I2304: `genesis_reseat_v2.json` read the same way: a seat re-seated at a
+//! - I2304: `genesis_reseat_v3.json` read the same way: a seat re-seated at a
 //!   new key keeps its identity-ref and canonical standing, at the new key and
 //!   its X-Wing keys; a binding not signed by the key the bundle places for
 //!   the seat is `genesis_bundle_row_invalid` (`row_signer`); a binding whose
@@ -106,86 +107,90 @@ pub(crate) mod vectors {
         };
     }
 
-    /// `genesis_bundles_v3.json` (the case list). v62.0.0 (R1): Verify
+    /// `genesis_bundles_v4.json` (the case list; CE-fix3: v3 → v4, every seat
+    /// binding gains `dial_hints`, plus the 12 `binding_dial_hint*` cases).
+    /// Before that, v62.0.0 (R1): Verify
     /// 23.3.1 replays v3 (CC v1.0-rc21-wire e6fd7c6: a seat's binding is the
     /// seat's own `identity:occurrence`); v2's valid bundles no longer verify,
     /// so v2 is no longer vendored. The const keeps its name (`V2`, the
     /// bundle/2 case list) for the store witnesses that read it.
-    pub(crate) const V2: &str = vendored!("genesis_bundles_v3.json");
-    /// The statements of `genesis_bundles_v3.json`, split as Verify splits them.
+    pub(crate) const V2: &str = vendored!("genesis_bundles_v4.json");
+    /// The statements of `genesis_bundles_v4.json`, split as Verify splits them.
     pub(crate) const POOL: [&str; 8] = [
-        vendored!("pool_v3_0.json"),
-        vendored!("pool_v3_1.json"),
-        vendored!("pool_v3_2.json"),
-        vendored!("pool_v3_3.json"),
-        vendored!("pool_v3_4.json"),
-        vendored!("pool_v3_5.json"),
-        vendored!("pool_v3_6.json"),
-        vendored!("pool_v3_7.json"),
+        vendored!("pool_v4_0.json"),
+        vendored!("pool_v4_1.json"),
+        vendored!("pool_v4_2.json"),
+        vendored!("pool_v4_3.json"),
+        vendored!("pool_v4_4.json"),
+        vendored!("pool_v4_5.json"),
+        vendored!("pool_v4_6.json"),
+        vendored!("pool_v4_7.json"),
     ];
-    /// `genesis_reseat_v2.json` (its own pool inside; v1 retired with
-    /// bundles v2).
-    pub(crate) const RESEAT: &str = vendored!("genesis_reseat_v2.json");
+    /// `genesis_reseat_v3.json` (its own pool inside; CE-fix3: v2 → v3, the
+    /// bindings carry `dial_hints`).
+    pub(crate) const RESEAT: &str = vendored!("genesis_reseat_v3.json");
 
-    /// Each vendored file and its SHA-256 at CIRISVerify 23.3.1
-    /// (Verify tag 23.3.1, b0933ba; byte-identical to CIRISVerify#350 head fad948e,
-    /// `src/ciris-verify-core/tests/vectors/edition2/genesis/`).
+    /// Each vendored file and its SHA-256 at CIRISVerify 23.3.3 (CE-fix3: the
+    /// v4 bundles and the v3 re-seat, every seat binding carrying
+    /// `dial_hints`; vendored from `feat/23.3.3` 20f0216 + its staged
+    /// vectors, `src/ciris-verify-core/tests/vectors/edition2/genesis/`).
+    /// The hashes are set by 4j-regen from the vendored files' bytes.
     pub(crate) fn pinned() -> [(&'static str, &'static str, &'static str); 10] {
         [
             (
-                "genesis_bundles_v3.json",
+                "genesis_bundles_v4.json",
                 V2,
-                "187dcf6005eae5e4f6fdd8b82e644538d256c122076acf8e2f22267001c5abc1",
+                "567899d79c3e4ceb6bda3bd3f617ed845eb29a48cf9ba3edfe8e3dd1372151c6",
             ),
             (
-                "genesis_reseat_v2.json",
+                "genesis_reseat_v3.json",
                 RESEAT,
-                "a3c93adfde2dd98710530f2377cbc30bb6f4092c06eb652f0c4c3035ca4ada3a",
+                "b68583252a60ee91b1394adef5b9b4b06c763c2a0330ef52bb1cd8757841c710",
             ),
             (
-                "pool_v3_0.json",
+                "pool_v4_0.json",
                 POOL[0],
-                "113226738b72eb60e8d745738775ff2c8ffea54189466916d84756fda467bbe5",
+                "b43b01f74842ac45b164052036a4949c4812e66b177a702d6208760d343cb347",
             ),
             (
-                "pool_v3_1.json",
+                "pool_v4_1.json",
                 POOL[1],
-                "8fd3e83382610546dce426061b475abc17ea904c56ccd998c3eb65d8bcedaf9f",
+                "9fc8706c81a31b12d98bae98410245a9a5ae912ced98ba8843590252b91b8967",
             ),
             (
-                "pool_v3_2.json",
+                "pool_v4_2.json",
                 POOL[2],
-                "e12bc129ebd1c69600e1ca3268a458eb7a0a36e4c4ff3703369d16f52a344a58",
+                "bc87346c3ded0070d9964fed6a5a3b1f6ad5dabc9337e31912895ae6511e990f",
             ),
             (
-                "pool_v3_3.json",
+                "pool_v4_3.json",
                 POOL[3],
-                "c3984f4c2e34e89bbf64e71222a15c754227ca4aa45ecd1a77bcb6ca1b1e2a31",
+                "d28912dc601967fb5a2c0bcee31e5ef8f0b90212e75d7a6e30b5411d5a0fec82",
             ),
             (
-                "pool_v3_4.json",
+                "pool_v4_4.json",
                 POOL[4],
-                "641f9326bae29b47d93e8381a17cb6b890386792dd88fc6f6e0f56e2c40d1564",
+                "cc158dcc9b0b22bc5b9eee287c54851ac0bedc869c2e2d802d68b907236b30a8",
             ),
             (
-                "pool_v3_5.json",
+                "pool_v4_5.json",
                 POOL[5],
-                "7f1dcac2cdd6d280caaf5a0cd29b3769f78f04883871582f3d5c618bec913c7e",
+                "7827e0a5468ccdfea6eca00a40d7ceeff17402553c990560482f0ced3e7c6068",
             ),
             (
-                "pool_v3_6.json",
+                "pool_v4_6.json",
                 POOL[6],
-                "45fc4810efee67ec79dd3213d470a4529a9079f6711a4a0c583205da53755ba6",
+                "76dff88a510c9dbd2efe78ef768eb0ff6a911a6fb32cbec91925d438084134ad",
             ),
             (
-                "pool_v3_7.json",
+                "pool_v4_7.json",
                 POOL[7],
-                "fa80688ad634523e5c0b98f82449a3d59ed834dcb0b24114ec0cdbf46123208a",
+                "5b88f35ad05cbaf3d8dae269f6d7d518eb1eb10e286f0c656eecb745ec7de8d5",
             ),
         ]
     }
 
-    /// `genesis_bundles_v3.json` with its pool merged in under `pool`.
+    /// `genesis_bundles_v4.json` with its pool merged in under `pool`.
     pub(crate) fn v2() -> &'static J {
         static F: OnceLock<J> = OnceLock::new();
         F.get_or_init(|| {
@@ -202,7 +207,7 @@ pub(crate) mod vectors {
         })
     }
 
-    /// `genesis_reseat_v2.json`.
+    /// `genesis_reseat_v3.json`.
     pub(crate) fn reseat() -> &'static J {
         static F: OnceLock<J> = OnceLock::new();
         F.get_or_init(|| serde_json::from_str(RESEAT).unwrap())
@@ -457,7 +462,7 @@ fn i2300_the_genesis_vectors_are_verify_23_3_1s() {
         assert_eq!(sha_hex(body.as_bytes()), sha, "I2300: {name}");
     }
     assert!(
-        vectors::v2()["cases"].as_array().unwrap().len() >= 116,
+        vectors::v2()["cases"].as_array().unwrap().len() >= 128,
         "I2300: the case list"
     );
 }

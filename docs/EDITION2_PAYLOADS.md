@@ -141,6 +141,7 @@ Rules beyond the list (refused `edition2_payload_invalid`):
 | `transport_destination` | `map` | optional | transport_destination: exactly reticulum_x25519_pubkey (bstr 32), reticulum_ed25519_pubkey (bstr 32), app_name (tstr), aspects ([* tstr]), destination_hash (bstr 16, derived per CC 3.3.6.3) |
 | `transit_xwing_pubkey` | `bstr` | optional | transport_destination's transit_xwing_pubkey: 1216 bytes, at the top level (CC 3.3.6.2) |
 | `onion_hop_xwing_pubkey` | `bstr` | optional | transport_destination's onion_hop_xwing_pubkey: 1216 bytes, at the top level (CC 3.3.6.2) |
+| `dial_hints` | `ceg-value` | optional | dial hints, most preferred first: [1*4 [type (uint, at most 255), body (bstr, 0..255 bytes, the FedCode hint body)]]; hints only, no transport identity; a genesis serve seat needs one tcp hint (shape and rule judged by Verify's reader, 23.3.3) |
 | `onion_relay` | `map` | optional | exactly {"opt_out": true}, on a node that opts out of relaying (CC 3.3.6.2) |
 | `encryption_pubkeys` | `map` | optional | encryption_pubkeys: exactly x25519 (bstr 32) and ml_kem_768 (bstr 1184) |
 | `build_manifest_hash` | `hash-digest [-16, bstr .size 32]` | optional | build_manifest_hash |

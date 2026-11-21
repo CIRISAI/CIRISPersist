@@ -14,7 +14,7 @@ of helpers in `admission.rs`: `strict_majority(n) = n / 2 + 1` (its count)
 and `is_strict_majority(yes, n) = yes > n / 2` (its predicate). This covers
 the accord's `accord_threshold`, a room's `majority` protocol, a
 reverse-quorum floor and a two-path threshold. Each body is a one-line seam:
-VA-repin swaps it to Verify's `edition2::strict_majority` /
+since VA-repin (Verify 23.3.3) it calls Verify's `edition2::strict_majority` /
 `is_strict_majority`.
 
 Red in production code (stripped by earlier_form_doors.py: comments,
@@ -59,9 +59,9 @@ VERIFY_CALL = re.compile(
 # (file, enclosing fn): why
 ALLOWED = {
     ("src/federation/admission.rs", "strict_majority"):
-        "THE count (seam to Verify's edition2::strict_majority at VA-repin)",
+        "THE count (the seam to Verify's edition2::strict_majority)",
     ("src/federation/admission.rs", "is_strict_majority"):
-        "THE predicate (seam to Verify's edition2::is_strict_majority at VA-repin)",
+        "THE predicate (the seam to Verify's edition2::is_strict_majority)",
 }
 
 
