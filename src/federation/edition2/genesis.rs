@@ -843,6 +843,12 @@ pub struct NotPlaced {
     pub detail: Option<String>,
     /// It waits on a named row or its predecessor: retryable.
     pub waiting: bool,
+    /// v62.0.0 (CE-fix4) — the object's statements Verify's reader refused
+    /// on their own, each `statement {index}: {token}` with Verify's token
+    /// (`statement_sub_not_family`, …), in reading order. A bundle whose
+    /// voices were all refused reads `genesis_bundle_count_unmet`; this names
+    /// why.
+    pub refused: Vec<String>,
 }
 
 /// What [`put_genesis_bundle`] did.
@@ -860,7 +866,11 @@ pub struct GenesisAdmission {
     pub in_force: GenesisInForce,
 }
 
-fn not_placed(object_id: Digest32, v: &GenesisVerdict) -> Option<NotPlaced> {
+fn not_placed(
+    object_id: Digest32,
+    v: &GenesisVerdict,
+    refused_statements: &[ciris_verify_core::edition2::genesis::RefusedStatement],
+) -> Option<NotPlaced> {
     let (token, detail, waiting) = match v {
         GenesisVerdict::Valid(_) => return None,
         GenesisVerdict::Invalid(m) => (token::MALFORMED, Some(m.reason().to_owned()), false),
@@ -881,6 +891,10 @@ fn not_placed(object_id: Digest32, v: &GenesisVerdict) -> Option<NotPlaced> {
         token,
         detail,
         waiting,
+        refused: refused_statements
+            .iter()
+            .map(|r| format!("statement {}: {}", r.index, r.fault.token()))
+            .collect(),
     })
 }
 
@@ -985,10 +999,16 @@ fn error_of(n: &NotPlaced) -> Error {
             .unwrap_or_default();
         return Error::unknown_signer(&format!("{GENESIS_BUNDLE_TYP}:{first}"), PLANE);
     }
+    // v62.0.0 (CE-fix4) — Verify's per-statement refusals, by name.
+    let refused = if n.refused.is_empty() {
+        String::new()
+    } else {
+        format!("; refused statements: {}", n.refused.join(", "))
+    };
     refuse(
         n.token,
         format!(
-            "{}: bundle {oid} is not placed (CC 2.6.1.11); nothing of it is stored",
+            "{}: bundle {oid} is not placed (CC 2.6.1.11); nothing of it is stored{refused}",
             n.detail.as_deref().unwrap_or(n.token)
         ),
     )
@@ -1511,8 +1531,9 @@ pub fn bundle_object_id(payload: &Value) -> Digest32 {
 }
 
 /// v62.0.0 (CE-fix1; CC 5.3.4) — **one signer's voice over a bundle,
-/// drafted**: the object header (`kid`, `iss`, `typ` `ceg-genesis-bundle/2`,
-/// `iat` the bundle's `asserted_at` in seconds), the payload as encoded.
+/// drafted**: the object header (`kid`, `iss`, `sub` the payload's
+/// `family_key_id` (CE-fix4), `typ` `ceg-genesis-bundle/2`, `iat` the
+/// bundle's `asserted_at` in seconds), the payload as encoded.
 /// The signer (a holder; a recovery key speaking as its holder's `iss`)
 /// signs `Draft::sig_structure` with its composite key.
 #[must_use]
@@ -1522,8 +1543,16 @@ pub fn bundle_voice_draft(
     payload: &Value,
     asserted_at_ms: u64,
 ) -> super::emit::Draft {
-    let protected =
-        super::produce::object_protected(kid, iss, GENESIS_BUNDLE_TYP, Some(asserted_at_ms / 1000));
+    // v62.0.0 (CE-fix4) — `sub` = the payload's `family_key_id` (the
+    // lineage), as every bundle voice states it.
+    let sub = payload.get_text("family_key_id").and_then(Value::as_text);
+    let protected = super::produce::object_protected(
+        kid,
+        iss,
+        sub,
+        GENESIS_BUNDLE_TYP,
+        Some(asserted_at_ms / 1000),
+    );
     let payload = cde::encode(payload);
     let sig_structure = ciris_verify_core::edition2::sig_structure(&protected, &payload);
     super::emit::Draft {
@@ -1608,7 +1637,7 @@ pub fn check_genesis_offer(
     let mut placed = Vec::new();
     let mut refused = Vec::new();
     for o in &reading.objects {
-        if let Some(n) = not_placed(o.reading.object_id, &o.reading.verdict) {
+        if let Some(n) = not_placed(o.reading.object_id, &o.reading.verdict, &o.reading.refused) {
             refused.push(n);
             continue;
         }
@@ -1982,7 +2011,7 @@ where
         if !o.offered {
             continue;
         }
-        if let Some(n) = not_placed(o.reading.object_id, &o.reading.verdict) {
+        if let Some(n) = not_placed(o.reading.object_id, &o.reading.verdict, &o.reading.refused) {
             if let GenesisVerdict::Nothing(i) = &o.reading.verdict {
                 // Held only on a lineage this node roots: a later bundle
                 // whose predecessor it stores, or a first bundle whose

@@ -716,8 +716,9 @@ pub fn check_offer_with_halts(
 // ------------------------------------------------------------------ steps 4, 5: the genesis and its anchor
 
 /// **Step 4 — one holder's voice over the bundle, drafted**: `iss` the
-/// holder's identity-ref, `kid` its key's thumbprint, `iat` the bundle's
-/// `asserted_at`. Every holder signs (CC 5.3.4).
+/// holder's identity-ref, `sub` the bundle's `family_key_id` (CE-fix4, RFC
+/// 9943), `kid` its key's thumbprint, `iat` the bundle's `asserted_at`.
+/// Every holder signs (CC 5.3.4).
 #[must_use]
 pub fn bundle_voice_draft(holder_key: &CompositePublicKey, terms: &BundleTerms) -> Draft {
     genesis::bundle_voice_draft(
@@ -881,9 +882,15 @@ pub async fn import_offer_into_throwaway(
                     PLANE,
                     n.token,
                     format!(
-                        "ceremony: bundle {} is not placed: {}",
+                        "ceremony: bundle {} is not placed: {}{}",
                         hex::encode(n.object_id),
-                        n.detail.as_deref().unwrap_or(n.token)
+                        n.detail.as_deref().unwrap_or(n.token),
+                        // CE-fix4 — Verify's per-statement refusals, by name.
+                        if n.refused.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; refused statements: {}", n.refused.join(", "))
+                        }
                     ),
                 )
             },

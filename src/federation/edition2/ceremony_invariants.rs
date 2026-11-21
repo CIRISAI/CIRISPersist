@@ -69,6 +69,11 @@
 //! - I2294 (sqlite + postgres): `genesis::bootstrap_hints` over the genesis in
 //!   force is empty pre-genesis and, after the import, every seat paired with
 //!   each of its signed hints (what `Engine::canonical_bootstrap_hints` returns).
+//! - I2295 (pure; CE-fix4, Verify 23.4.0): every bundle voice states CWT
+//!   `sub` = the payload's `family_key_id`; a holder's voice re-signed with
+//!   `sub` naming another accord is refused by Verify's reader, and the
+//!   offer check names Verify's `statement_sub_not_family`; the object id
+//!   does not move with the header.
 //! - I2289 (pure; CE-fix2): CEREMONY step 3 before step 4.
 //!   [`c::check_offer_with_halts`] passes with exactly one sealed halt per
 //!   listed holder, and the coverage names each holder's halt.
@@ -1457,4 +1462,53 @@ async fn i2294_bootstrap_hints_postgres() {
         .unwrap();
     b.run_migrations().await.unwrap();
     Box::pin(body_bootstrap_hints(&b)).await;
+}
+
+/// **I2295** — the bundle voice's CWT `sub` (CE-fix4).
+#[test]
+fn i2295_a_bundle_voice_states_its_lineage_as_sub() {
+    add_test_attestation_root(mock_attestation_root_der());
+    let (_, off) = fixed();
+    for v in &off.voices {
+        let (h, _) = statement_parts(v).unwrap();
+        assert_eq!(
+            h.get_int(15)
+                .and_then(|c| c.get_int(2))
+                .and_then(Value::as_text),
+            Some(FAMILY_KEY_ID),
+            "I2295: sub = family_key_id"
+        );
+    }
+    // Holder 0's voice with `sub` naming another accord.
+    let (k0, _) = &off.holders[0];
+    let payload = c::bundle_payload(&off.terms);
+    let protected = super::produce::object_protected(
+        &c::kid_of(k0.public_key()),
+        &c::identity_ref_of(k0.public_key()),
+        Some("another-accord"),
+        super::genesis::GENESIS_BUNDLE_TYP,
+        Some(off.terms.asserted_at_ms / 1000),
+    );
+    let bytes = ciris_verify_core::cde::encode(&payload);
+    let sig = k0
+        .sign(&ciris_verify_core::edition2::sig_structure(
+            &protected, &bytes,
+        ))
+        .unwrap();
+    let wrong = super::produce::assemble(protected, bytes, sig);
+    let mut st = off.statements();
+    let n = st.len() - off.voices.len();
+    st[n] = wrong;
+    let e = c::check_genesis_offer(&st, &off.anchor(), CHECK_AT)
+        .expect_err("I2295: a voice whose sub is not the lineage does not count");
+    assert!(
+        e.to_string().contains("statement_sub_not_family"),
+        "I2295: Verify's token, by name: {e}"
+    );
+    // The object id is the payload's: unmoved by the header.
+    assert_eq!(
+        super::genesis::bundle_object_id(&payload),
+        c::bundle_object_id(&off.terms),
+        "I2295"
+    );
 }

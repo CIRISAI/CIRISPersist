@@ -641,14 +641,23 @@ getrandom = { version = "0.2", optional = true }
 # judge's `custody_serial_malformed`, and vendors CC v1.0-rc21 (b016df4).
 # The three pair-surface removals (66069c7) are already in this rev and
 # persist names none of them; any later groupb removals change APIs only.
+# v62.0.0 (VB-repin) — CIRISVerify 23.4.0 as a REV pin on `release/23.4.0`
+# (7943a2af, PR #353; the same URL, all four crates on one rev). It becomes
+# the `v23.4.0` tag when Verify tags; there is no `v23.3.3` tag. 23.4.0 is ONE
+# release: feat/23.3.3 (e56c8313: a tcp/udp hint host is a DNS name or a bare
+# IP literal), the receipts work (`edition2::receipt`, `edition2::stream_head`,
+# the genesis-bundle statement's CWT `sub` = `family_key_id`,
+# `statement_sub_not_family`; StreamKeyBinding profile 1's `head_interval_s`)
+# and the groupb pair-surface removals. The audit (VB-repin.md): persist's
+# tree names no removed or renamed item.
 # The NODE profile: verify-core `std` + `pqc` (the pure verifiers, plus the
 # std-tier accord custody verifiers persist's admission calls), keyring slim
 # (no `fs`: in-memory software signers from caller seeds). `host` (above)
 # turns on verify-core `host` and the keyring's file-backed defaults.
-ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "97de4c9a465c322605aa3ce5ce9a42208deea179", version = "23", default-features = false, features = ["software", "pqc-ml-dsa"] }
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "97de4c9a465c322605aa3ce5ce9a42208deea179", version = "23", default-features = false, features = ["std", "pqc"] }
+ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "7943a2af01014367b14780dd0be56be60bf9694d", version = "23", default-features = false, features = ["software", "pqc-ml-dsa"] }
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "7943a2af01014367b14780dd0be56be60bf9694d", version = "23", default-features = false, features = ["std", "pqc"] }
 # The `ciris:node` host ABI (`host-abi` feature). No `getrandom-backend` here.
-ciris-host-abi    = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "97de4c9a465c322605aa3ce5ce9a42208deea179", version = "23", optional = true }
+ciris-host-abi    = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "7943a2af01014367b14780dd0be56be60bf9694d", version = "23", optional = true }
 # v62.0.0 (slice C, the kernel adapter) — persist's decisions answer through
 # `ciris-kernel`: no_std, zero dependencies, its rules the Constitution's
 # (CC 2.7). `src/kernel/` is the adapter (persist's verified rows as the
@@ -659,7 +668,7 @@ ciris-kernel = { git = "https://github.com/CIRISAI/CIRISKernel", tag = "kernel-v
 # ciris-verify-core so versions are workspace-coherent. Features
 # `ed25519` + `pqc-ml-dsa` light up the concrete Ed25519Verifier +
 # MlDsa65Verifier impls used by HybridVerifier::verify.
-ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "97de4c9a465c322605aa3ce5ce9a42208deea179", version = "23", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant", "kdf"] }
+ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "7943a2af01014367b14780dd0be56be60bf9694d", version = "23", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant", "kdf"] }
 async-trait   = "0.1"
 # v0.1.14 — filesystem advisory locks for the cohabitation
 # bootstrap (docs/COHABITATION.md). POSIX flock cross-process,
@@ -963,7 +972,7 @@ tokio-stream = "0.1"
 # targets only (no node module is built for them), and they never match
 # `wasm32-unknown-unknown` (I1852 vets them by name).
 [target.'cfg(target_os = "ios")'.dependencies]
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "97de4c9a465c322605aa3ce5ce9a42208deea179", version = "23", default-features = false, features = ["software", "pqc-ml-dsa", "ios"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "7943a2af01014367b14780dd0be56be60bf9694d", version = "23", default-features = false, features = ["software", "pqc-ml-dsa", "ios"] }
 # v12.3.0 (CIRISPersist#355) — vendored openssl removed here too (dead leaf;
 # see the base-deps note). No iOS openssl in any configuration now.
 
@@ -971,7 +980,7 @@ ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "97de4c9
 # v3.5.2 (#132) — rusqlite `bundled` for Android. See comment block
 # before the iOS entry (~line 628) for the rationale.
 rusqlite = { version = "0.41", features = ["backup", "bundled", "serde_json", "functions"], optional = true }
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "97de4c9a465c322605aa3ce5ce9a42208deea179", version = "23", default-features = false, features = ["software", "pqc-ml-dsa", "android"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "7943a2af01014367b14780dd0be56be60bf9694d", version = "23", default-features = false, features = ["software", "pqc-ml-dsa", "android"] }
 # v12.3.0 (CIRISPersist#355) — vendored openssl removed here too (dead leaf;
 # see the base-deps note). No Android openssl in any configuration now,
 # retiring the flakiest part of the mobile wheel matrix.
@@ -983,7 +992,7 @@ ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "97de4c9
 # own root (structurally inert against the pinned real Yubico root). Same
 # git tag as the [workspace] pins — one graph version, feature-unified in
 # test builds, absent from `--edges normal`.
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "97de4c9a465c322605aa3ce5ce9a42208deea179", version = "23", default-features = false, features = [
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", rev = "7943a2af01014367b14780dd0be56be60bf9694d", version = "23", default-features = false, features = [
     "test-support",
 ] }
 # v62.0.0 (slice D) — the lib's tokio is the node's (`rt, sync, macros, time`);

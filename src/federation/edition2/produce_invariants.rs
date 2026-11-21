@@ -249,6 +249,8 @@ async fn i2012_sign_object_is_the_voice_the_genesis_reader_reads() {
     let payload = map(vec![
         ("version", Value::Uint(1)),
         ("asserted_at", Value::Uint(4_000)),
+        // CE-fix4 — the voice's CWT `sub`.
+        ("family_key_id", Value::Text("humanity-accord".into())),
     ]);
     let ours = sign_object(&signer, GENESIS_BUNDLE_TYP, &payload, Some(4))
         .await
@@ -269,6 +271,13 @@ async fn i2012_sign_object_is_the_voice_the_genesis_reader_reads() {
     );
     assert!(matches!(
         sign_object(&signer, GENESIS_BUNDLE_TYP, &Value::Uint(1), None).await,
+        Err(ProduceError::Payload(_))
+    ));
+    // CE-fix4 — a bundle voice names its lineage: no `family_key_id`, no
+    // `sub`, nothing signed.
+    let unnamed = map(vec![("version", Value::Uint(1))]);
+    assert!(matches!(
+        sign_object(&signer, GENESIS_BUNDLE_TYP, &unnamed, None).await,
         Err(ProduceError::Payload(_))
     ));
 }

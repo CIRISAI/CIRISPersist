@@ -225,10 +225,26 @@ pub fn row_protected(
 }
 
 /// The protected header of an object voice (`typ` one of Verify's
-/// `OBJECT_TYPS`): `iss`, an optional `iat` (seconds), the edition.
+/// `OBJECT_TYPS`): `iss`, an optional `sub`, an optional `iat` (seconds),
+/// the edition.
+///
+/// v62.0.0 (CE-fix4; Eric's ruling, RFC 9943: every Signed Statement has
+/// `iss` and `sub`) — a `ceg-genesis-bundle/2` voice states `sub` = the
+/// lineage's `family_key_id` (the payload's; Verify's reader refuses a
+/// mismatch). Verify mints no object statement, so this is the one encoder
+/// of an object header.
 #[must_use]
-pub fn object_protected(kid: &Digest32, iss: &str, typ: &str, iat: Option<u64>) -> Vec<u8> {
+pub fn object_protected(
+    kid: &Digest32,
+    iss: &str,
+    sub: Option<&str>,
+    typ: &str,
+    iat: Option<u64>,
+) -> Vec<u8> {
     let mut claims = vec![(Value::int(C_ISS), Value::Text(iss.into()))];
+    if let Some(s) = sub {
+        claims.push((Value::int(C_SUB), Value::Text(s.into())));
+    }
     if let Some(i) = iat {
         claims.push((Value::int(C_IAT), Value::Uint(i)));
     }
@@ -277,6 +293,26 @@ pub async fn sign_row(
     Ok(assemble(protected, payload, sig))
 }
 
+/// v62.0.0 (CE-fix4) — the CWT `sub` an object voice of `typ` states: for
+/// a `ceg-genesis-bundle/2` voice, the payload's `family_key_id` (the
+/// lineage); for any other object `typ`, none.
+///
+/// # Errors
+/// [`ProduceError::Payload`] for a genesis bundle payload that names no
+/// `family_key_id` (the producer never signs what the reader refuses).
+pub fn object_sub<'a>(typ: &str, payload: &'a Value) -> Result<Option<&'a str>, ProduceError> {
+    if typ != super::genesis::GENESIS_BUNDLE_TYP {
+        return Ok(None);
+    }
+    payload
+        .get_text("family_key_id")
+        .and_then(Value::as_text)
+        .map(Some)
+        .ok_or(ProduceError::Payload(
+            "a genesis bundle payload names its family_key_id (the voice's CWT sub)",
+        ))
+}
+
 /// **Sign an object voice** (`ceg-genesis-bundle/2` and the other object
 /// `typ`s) with persist's own composite signer.
 ///
@@ -292,7 +328,8 @@ pub async fn sign_object(
         return Err(ProduceError::Payload("the payload is not a map"));
     }
     let (kid, iss) = signer_identity(signer).await?;
-    let protected = object_protected(&kid, &iss, typ, iat);
+    let sub = object_sub(typ, payload)?;
+    let protected = object_protected(&kid, &iss, sub, typ, iat);
     let payload = cde::encode(payload);
     let sig = signer
         .sign_composite(&sig_structure(&protected, &payload))
