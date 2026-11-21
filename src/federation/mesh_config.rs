@@ -1813,7 +1813,7 @@ where
     // simply has not seeded yet: `humanity-accord` holds no key, so
     // "did a key literally named humanity-accord sign this" is a question no
     // legitimate signer can answer and a squatted key id can. On a pre-genesis
-    // node that turned a 2-of-3 into a string comparison. Absence of the family
+    // node that turned a strict-majority count into a string comparison. Absence of the family
     // row is not permission to use a weaker rule about it.
     match super::trust_root::resolve_family_root(directory, root_ref).await? {
         Some(family) => Ok(

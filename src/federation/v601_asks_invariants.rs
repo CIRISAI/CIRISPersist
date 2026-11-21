@@ -69,7 +69,29 @@ pub(crate) mod bodies {
         // deleted: they ride the earlier-form key record's roles and scrubs,
         // and an edition-2 `key:record` carries neither (standing is the
         // bundle in force, RULINGS "Canonical standing"). The rule stays.
-        let _ = (d, tag);
+        //
+        // v62.0.0 (TR-fix2; Eric's rule, CC 4.2.6) — the store leg, re-stated:
+        // `accord_threshold_now` counts over the STANDING roster, the holders
+        // of the genesis bundle in force. Pre-genesis it is the empty roster's
+        // fail-closed 1-of-0; with the three-holder bundle, 2 of 3.
+        let _ = tag;
+        let t = crate::federation::admission::accord_threshold_now(d)
+            .await
+            .expect("I1360: read");
+        if t.n == 0 {
+            assert_eq!(t.m, 1, "I1360: an empty roster is never met");
+            crate::federation::edition2::fixture_genesis::install_v2(d)
+                .await
+                .expect("I1360: the bundle installs");
+        }
+        let t = crate::federation::admission::accord_threshold_now(d)
+            .await
+            .expect("I1360: read");
+        assert_eq!(
+            (t.m, t.n),
+            (2, 3),
+            "I1360: two of the three holders of the bundle in force"
+        );
     }
 
     /// **I1362** — see the module doc.

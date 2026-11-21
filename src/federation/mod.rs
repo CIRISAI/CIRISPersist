@@ -1015,22 +1015,20 @@ pub(crate) mod serde_bytes_b64 {
 }
 
 pub use admission::{
-    accord_threshold, accord_threshold_now, accord_threshold_over_roster,
-    canonical_withdrawal_payload_sha256, check_accord_role_admission_over_roster,
-    check_canonical_role_admission, check_canonical_role_admission_over_roster,
-    check_co_steward_role_admission, check_co_steward_role_admission_over_roster,
-    check_cohort_scope, check_consensus_protocol_form, check_device_class,
-    check_encryption_pubkeys, check_infra_attest_role_admission,
+    accord_threshold, accord_threshold_now, canonical_withdrawal_payload_sha256,
+    check_accord_role_admission_over_roster, check_canonical_role_admission,
+    check_canonical_role_admission_over_roster, check_co_steward_role_admission,
+    check_co_steward_role_admission_over_roster, check_cohort_scope, check_consensus_protocol_form,
+    check_device_class, check_encryption_pubkeys, check_infra_attest_role_admission,
     check_infra_attest_role_admission_over_roster, check_observed_region, check_row_column_binding,
     has_accord_conferred_role, has_accord_conferred_role_over_roster, is_canonical,
     is_canonical_effective, is_infra_attest, is_infra_attest_effective, op_withdraw_role,
-    supersede_canonical, verify_canonical_supersede_authority, verify_canonical_withdraw_authority,
     verify_signed_touch_claim, verify_signed_transport_destination, verify_touch_claim_admission,
-    withdraw_accord_role, withdraw_accord_role_over_roster, withdraw_canonical_role,
-    withdraw_infra_attest_role, AccordThreshold, CanonicalWithdrawal, DimensionAdmissionPolicy,
-    DimensionRejectionReason, NamespaceConformanceReason, ReachabilityVerdict, ReservedPrefixRule,
-    RoleWithdrawal, ATTESTATION_LADDER_MECHANISMS, DEFAULT_MAX_TOUCH_SKEW,
-    MINTED_NAMESPACE_FAMILIES, UNREGISTERED_GATED_FAMILIES,
+    withdraw_accord_role, withdraw_accord_role_over_roster, withdraw_infra_attest_role,
+    AccordThreshold, CanonicalWithdrawal, DimensionAdmissionPolicy, DimensionRejectionReason,
+    NamespaceConformanceReason, ReachabilityVerdict, ReservedPrefixRule, RoleWithdrawal,
+    ATTESTATION_LADDER_MECHANISMS, DEFAULT_MAX_TOUCH_SKEW, MINTED_NAMESPACE_FAMILIES,
+    UNREGISTERED_GATED_FAMILIES,
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
@@ -4610,8 +4608,8 @@ pub trait FederationDirectory: Send + Sync {
     /// [`types::identity_type::STEWARD`]).
     ///
     /// Used by CIRISEdge for class-based directory queries:
-    /// - `identity_type::ACCORD_HOLDER` → 2-of-3 constitutional
-    ///   verification set (CIRISEdge#19).
+    /// - `identity_type::ACCORD_HOLDER` → the constitutional verification set
+    ///   (CIRISEdge#19), counted at a strict majority of the holders of the bundle in force (2·yes > N).
     /// - `identity_type::STEWARD` → high-priority recipient class for
     ///   gossip topology (CIRISEdge#20).
     ///
@@ -4670,6 +4668,11 @@ pub trait FederationDirectory: Send + Sync {
     /// which verifies the accord authority BEFORE this write. The default body
     /// errors (mock/test backends without the V095 table); the real
     /// sqlite/postgres/memory backends override it.
+    ///
+    /// v62.0.0 (TR-fix2; CC rc21 4.2.1) — NO backend overrides it any more:
+    /// a canonical is withdrawn only by a later genesis bundle, so every
+    /// backend answers the named refusal below (PX-fix2's, I1893), and
+    /// [`Self::lookup_canonical_withdrawal`] answers `None`.
     async fn record_canonical_withdrawal(
         &self,
         key_id: &str,
@@ -9470,13 +9473,22 @@ pub trait FederationDirectory: Send + Sync {
         // then binds the envelope to the ONE version it authorizes
         // ([`canonical_community::bind_next_version`]: every recorded role, the
         // next content hash, the link's instant) before the founders sign.
-        Ok(group_membership_change::build_membership_change(
+        // v62.0.0 (SM-fix1) — a prior envelope missing a member is refused
+        // by name (`envelope_member_missing`), never defaulted.
+        group_membership_change::build_membership_change(
             &prior_envelope,
             new_member_key_ids,
             role,
             entrenched,
             consensus_protocol,
-        ))
+        )
+        .map_err(|e| {
+            Error::malformed_row(
+                edition2::fold::plane::GROUP,
+                malformed_row::ENVELOPE_MEMBER_MISSING,
+                e.to_string(),
+            )
+        })
     }
 
     /// #249 Cut G3 (§3/§4/§5) — quorum-gated family supersede: verify the
@@ -13556,8 +13568,8 @@ pub enum Error {
     /// persist-computed canonical payload for THIS operation + target (a replay
     /// of a decision authorizing some other payload). Fail-closed
     /// (verify-before-mutation, AV-9 — no tombstone / successor is written).
-    /// Symmetric m-of-n by design (v13.2.0 / CIRISPersist#383): ADD requires a
-    /// 2-of-3 accord co-scrub and WITHDRAW/SUPERSEDE the 2-of-3 quorum. Stable `kind()` token
+    /// Symmetric m-of-n by design (v13.2.0 / CIRISPersist#383): ADD and
+    /// WITHDRAW/SUPERSEDE each require a strict majority of the holders of the bundle in force (2·yes > N). Stable `kind()` token
     /// `canonical_withdrawal_authority_invalid`. See
     /// [`admission::verify_canonical_withdraw_authority`].
     #[error(

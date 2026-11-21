@@ -430,6 +430,18 @@ fn read_one(
 
 // ------------------------------------------------------------------ in force
 
+/// v62.0.0 (HL-fix1) — what [`GenesisInForce::head_standing`] answers.
+#[derive(Clone, Copy, Debug)]
+pub enum HeadStanding<'a> {
+    /// A tip in force: count over its holders.
+    InForce(&'a GenesisPlacement),
+    /// A held Valid bundle a later held bundle superseded: never counted
+    /// over (its holders are not the bundle in force's).
+    Superseded,
+    /// No held Valid bundle: wait on it.
+    NotHeld,
+}
+
 /// **The genesis in force**, as the held voices and rows give it.
 #[derive(Clone, Debug, Default)]
 pub struct GenesisInForce {
@@ -467,6 +479,25 @@ impl GenesisInForce {
             .as_ref()
             .or_else(|| self.valid.first())
             .map(|p| p.family_key_id.as_str())
+    }
+
+    /// v62.0.0 (HL-fix1; CC 4.2.1.3, CC 3.4.7) — **the standing of a bundle
+    /// a row names in `refs.head`**: one of the tips in force
+    /// ([`HeadStanding::InForce`]), a held Valid bundle a later one
+    /// superseded ([`HeadStanding::Superseded`]), or none held
+    /// ([`HeadStanding::NotHeld`]). The one reading every door counting over
+    /// "the bundle in force" uses (the seat re-bind, the halt lifecycle), so
+    /// none counts voices against a predecessor's holders.
+    #[must_use]
+    pub fn head_standing(&self, head: &Digest32) -> HeadStanding<'_> {
+        if let Some(p) = self.tips().into_iter().find(|t| t.object_id == *head) {
+            return HeadStanding::InForce(p);
+        }
+        if self.valid.iter().any(|p| p.object_id == *head) {
+            HeadStanding::Superseded
+        } else {
+            HeadStanding::NotHeld
+        }
     }
 
     /// The tips: the head, or each tip of a fork of successors.

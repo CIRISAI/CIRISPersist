@@ -84,6 +84,12 @@ mod accord_rescan_invariants;
 // v62.0.0 (RL-fix2) — I2247–I2252: first contact by node code.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod contact_invariants;
+// v62.0.0 (RL-fix2b) — I2253: the JSON attestation serve plane waits in the SQL.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod serve_wait_invariants;
+// v62.0.0 (RL-fix4) — I2255–I2259: relay eligibility by consent.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod relay_eligibility_invariants;
 // v62.0.0 (wave W1b) — a ROOTED edition-2 trust root, for any test.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod fixture_trust_root;

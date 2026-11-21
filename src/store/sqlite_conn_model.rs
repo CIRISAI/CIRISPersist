@@ -749,7 +749,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v50.0.0 (#920) — the row load/init moved out of
     // `load_or_init_content_master`, which now only resolves it.
     ("load_or_init_content_master_row", ConnClass::Write),
-    ("lookup_canonical_withdrawal", ConnClass::Read),
     ("lookup_community", ConnClass::Read),
     ("lookup_family", ConnClass::Read),
     ("lookup_freshness_floor", ConnClass::Read),
@@ -886,7 +885,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("read_pool_handle", ConnClass::Door),
     ("rebuild_signed_wire_index", ConnClass::Write),
     ("record_announced_peer", ConnClass::Write),
-    ("record_canonical_withdrawal", ConnClass::Write),
     ("record_role_withdrawal", ConnClass::Write),
     ("refresh_factor_rollup", ConnClass::Write),
     ("register_accord_public_key", ConnClass::Write),

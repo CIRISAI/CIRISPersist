@@ -872,7 +872,7 @@ impl ObjectionOutcome {
 
 /// The m-of-n evidence behind a dismissal decision — carried on BOTH arms, so
 /// a refusal names its shortfall and an admission names what it cleared.
-/// Structural twin of `CharterQuorum` on the trust-root plane.
+/// Structural twin of `SignerCount` on the trust-root plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DismissalQuorum {
     /// DISTINCT roster members whose signature over this dismissal's canonical

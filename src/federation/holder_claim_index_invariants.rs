@@ -89,9 +89,19 @@ pub(crate) mod bodies {
     /// `Engine::put_blob_scoped`) indexes the holder claim it writes.**
     pub async fn i113_the_put_door_indexes_its_holder_claim<B>(b: &B, s: &str)
     where
-        B: BlobStorage + FederationDirectory + Sync,
+        B: BlobStorage
+            + FederationDirectory
+            + Sync
+            + crate::federation::edition2::serve_wait_invariants::test_support::SetsNodeKey,
     {
         let n = node_as(b, &format!("i113-holder-{s}"), NODE).await;
+        // v62.0.0 (RL-fix2c) — THIS node (the holder) rooted: its FEDERATION
+        // claim is advertised and served (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+            b,
+            &format!("i113-holder-{s}"),
+        )
+        .await;
         let bytes = format!("i113 public bytes {s}").into_bytes();
         let sha = sha256_of(&bytes);
         b.put_blob_signing_scoped(

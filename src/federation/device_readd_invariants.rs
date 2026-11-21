@@ -1032,19 +1032,21 @@ pub(crate) mod two_node {
         minter: &str,
         epoch: u64,
     ) -> Vec<(Attestation, KeyGrantRow)> {
-        backend
-            .list_attestations_since(None, 10_000)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|s| s.attestation)
-            .filter(is_key_grant_row)
-            .filter_map(|a| KeyGrantRow::from_attestation(&a).ok().map(|r| (a, r)))
-            .filter(|(_, r)| {
-                matches!(&r.axis, KeyGrantAxis::Epoch { community_key_id, minter_key_id, epoch: e }
+        // v62.0.0 (RL-fix2c) — the fixture inspects its own store, not a serve.
+        crate::federation::edition2::serve::as_internal_read(
+            backend.list_attestations_since(None, 10_000),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.attestation)
+        .filter(is_key_grant_row)
+        .filter_map(|a| KeyGrantRow::from_attestation(&a).ok().map(|r| (a, r)))
+        .filter(|(_, r)| {
+            matches!(&r.axis, KeyGrantAxis::Epoch { community_key_id, minter_key_id, epoch: e }
                     if community_key_id == comm && minter_key_id == minter && *e == epoch)
-            })
-            .collect()
+        })
+        .collect()
     }
 
     /// The row on `backend` for `(comm, minter, epoch)` whose recipient is

@@ -3,7 +3,7 @@
 # #1089, #1120, #1113).
 #
 # - #1117: `accord_threshold` and the roster read over it
-#   (`accord_threshold_over_roster`, `accord_threshold_now`). Witness I1360
+#   (`accord_threshold_now`; TR-fix1 removed `accord_threshold_over_roster`). Witness I1360
 #   (sqlite, postgres); the rule by value and the co-scrub gate agreeing.
 # - #1064: `KeyGrantRefusalReason::is_retryable` / `from_token` and
 #   `dimension_rejected_reason::is_retryable`. Witnesses
@@ -27,7 +27,7 @@
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
 tests: test(/v601_asks_invariants|takedown_reversal_invariants|retryability_is_classified_once_per_reason|key_grant_rows_invariants::directory::.*::i742|i1364|i655|i790|i773|i972|i1218/)
 
-src/federation/admission.rs accord_threshold accord_threshold_over_roster accord_threshold_now is_retryable check_takedown_reconsideration_admission check_reconsideration_admission
+src/federation/admission.rs accord_threshold accord_threshold_now is_retryable check_takedown_reconsideration_admission check_reconsideration_admission
 src/federation/key_grant.rs is_retryable from_token
 src/federation/identity_amendment.rs
 src/federation/takedown_tombstone.rs notice_row_of_header is_reversal_of review_holders_of_content takedown_reversal

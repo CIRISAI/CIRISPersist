@@ -118,7 +118,6 @@ pyo3	scheduled_task_upsert	exempt	-	agent-local store of an unsigned record; no 
 pyo3	secrets_store_detected_secret	exempt	-	agent-local store of an unsigned record; no signed object is admitted
 pyo3	service_token_revocation_record	exempt	-	agent-local store of an unsigned record; no signed object is admitted
 pyo3	store_blob_local_json	exempt	-	node-local blob bytes under this node's own signer; no signed object is admitted
-pyo3	supersede_canonical	refuses	federation/admission.rs::supersede_canonical > federation/admission.rs::supersede_canonical_over_roster > trait:*	-
 pyo3	task_upsert	exempt	-	agent-local store of an unsigned record; no signed object is admitted
 pyo3	telemetry_record_metric	exempt	-	agent-local store of an unsigned record; no signed object is admitted
 pyo3	telemetry_record_metrics_batch	exempt	-	agent-local store of an unsigned record; no signed object is admitted

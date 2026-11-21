@@ -11156,6 +11156,23 @@ impl Engine {
         .await
     }
 
+    /// v62.0.0 (RL-fix2c) — **what this node will serve a third party**
+    /// ([`serve_standing`](crate::federation::edition2::serve::serve_standing)):
+    /// its node key (`None` when the signer could not derive one), whether its
+    /// own standing chain is rooted, and whether it therefore withholds
+    /// federation-tier rows. A host warns at startup when `node_key_id` is
+    /// `None`.
+    ///
+    /// # Errors
+    /// Directory reads.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn serve_standing(
+        &self,
+    ) -> Result<crate::federation::edition2::serve::ServeStanding, crate::federation::Error> {
+        crate::federation::edition2::serve::serve_standing(self.federation_directory().as_ref())
+            .await
+    }
+
     /// v62.0.0 (RL-fix2) — **record a contact's dial hint** from a decoded
     /// node code ([`record_dial_hints`](crate::federation::edition2::contact::record_dial_hints)):
     /// local, unsigned, never a transit pair, never served. Replaces the
@@ -11742,64 +11759,6 @@ impl Engine {
                     .map(move |h| (r.key_id.clone(), h))
             })
             .collect())
-    }
-
-    /// v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — **withdraw**
-    /// the `canonical` founding-server role from `key_id`. The DESTRUCTIVE
-    /// counterpart of the monotonic add-canonical (#372): a durable,
-    /// quorum-verified TOMBSTONE (V095) that
-    /// [`check_canonical_role_admission`](crate::federation::check_canonical_role_admission)
-    /// consults — so withdrawal defeats a re-add over anti-entropy
-    /// ([`apply_replicated_key_record`](Self::apply_replicated_key_record))
-    /// rather than being silently re-conferred.
-    ///
-    /// `proposal_digest` names a STORED accord live-quorum proposal (#302 /
-    /// V091) whose payload commits to `(withdraw, key_id)`. Persist re-tallies
-    /// ITS OWN cryptographically-verified `accord_participation` rows against the
-    /// accord-holder roster (A1/B1/C1) at the **2-of-3 destructive threshold** —
-    /// never a caller-supplied `AccordDecision.authorized` bool (which is
-    /// unauthenticated and forgeable) — before recording the tombstone
-    /// (verify-before-mutation, AV-9). Symmetric m-of-n by design (v13.2.0 /
-    /// CIRISPersist#383): ADD now also requires ≥2-of-3 accord co-scrubs (the
-    /// 1-of-N add path was retired as a first-strike weakness), and WITHDRAW
-    /// keeps the 2-of-3 family quorum. Idempotent. After this,
-    /// [`is_canonical`](Self::is_canonical) reads `false`.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn withdraw_canonical_role(
-        &self,
-        key_id: &str,
-        proposal_digest: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let directory = self.federation_directory();
-        crate::federation::withdraw_canonical_role(directory.as_ref(), key_id, proposal_digest)
-            .await
-    }
-
-    /// v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — **supersede**
-    /// (rotate) a canonical server: admit `new_record`'s successor key (the
-    /// normal anchor-scrub add-gate runs) AND record `old_key_id`'s withdrawal
-    /// with `superseded_by = new_key_id` (the old→new audit link).
-    /// `proposal_digest` names a STORED accord proposal whose payload commits to
-    /// the supersede `old_key_id → new_record.key_id`; persist re-tallies its own
-    /// verified participations at the 2-of-3 destructive threshold
-    /// (verify-before-mutation). The authority is verified first; the successor
-    /// is admitted before the predecessor is tombstoned so the canonical set is
-    /// never momentarily empty.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn supersede_canonical(
-        &self,
-        old_key_id: &str,
-        new_record: crate::federation::SignedKeyRecord,
-        proposal_digest: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let directory = self.federation_directory();
-        crate::federation::supersede_canonical(
-            directory.as_ref(),
-            old_key_id,
-            new_record,
-            proposal_digest,
-        )
-        .await
     }
 
     /// v13.1.0 (CIRISPersist#377) — enumerate the canonical-role withdrawal
@@ -18580,6 +18539,9 @@ mod tests {
         // own statement); the earlier unsigned `attestation_insert_local` row
         // has no in-place crossing.
         let (engine, sq, node) = engine_with_registered_agent("node-509v").await;
+        // v62.0.0 (RL-fix2c) — the engine's node, rooted (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_this_node(&*sq)
+            .await;
         let signer = engine
             .composite_signer("e3b visibility witness")
             .expect("a composite signer");

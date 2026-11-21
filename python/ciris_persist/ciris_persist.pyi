@@ -715,6 +715,16 @@ class Engine:
         ``from_position``: clear that watermark. ``False`` when none matches.
         """
 
+    def serve_standing_json(self) -> str:
+        """v62.0.0 (RL-fix2c) — what this node will serve a third party:
+        ``{"node_key_id": str | null, "rooted": bool,
+        "withholds_federation_tier": bool}``. ``node_key_id`` is ``null`` when
+        the signer could not derive one (a classical-only signer, a P-256
+        keystore fallback, a failed hardware public-key read); such a node
+        withholds every federation-tier row from third parties, so warn loudly
+        at startup.
+        """
+
     def record_dial_hints(
         self,
         node: str,
@@ -1691,7 +1701,14 @@ class Engine:
     def resolve_transit_eligibility_json(self, user_key_id: str, peer_key_id: str) -> str:
         """v24.1.0 (CIRISPersist#561) — **may ``peer_key_id`` carry our relay
         traffic?** Returns the verdict as JSON
-        ``{"eligible": bool, "valid_until": ..., "via_root": ...}``.
+        ``{"eligible": bool, "valid_until": ..., "via_root": ..., "arm": ...,
+        "refusal": ...}``. v62.0.0 (RL-fix4): carriage by consent, no root
+        needed for ``arm == "own_node"``; ``arm`` is ``"own_node"`` |
+        ``"seat"`` | ``"onion_root"`` (``"contact"`` reserved); ``refusal`` is
+        ``"self_hop"`` | ``"not_in_directory"`` | ``"not_a_node_key"`` |
+        ``"no_relay_offer"`` | ``"opted_out"`` | ``"no_consent_from_owner"`` |
+        ``"relay_contact_grant_not_representable"`` | ``"expired"`` |
+        ``"unreadable"``. It says nothing about federation-tier serving.
 
         **The refusal arm is a TRUTHY string.** ``'{"eligible": false}'`` is a
         non-empty ``str``, so ``if engine.resolve_transit_eligibility_json(...)``
@@ -1880,16 +1897,13 @@ class Engine:
     def store_plaintext_local(self, sha256_hex: str, bytes: bytes, media_type: str | None = None) -> None:
         """(derived) deontic — v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §4; #863 ask 1) — the LocalOnly plaintext door. Store commons bytes this node verified itself (size..."""
 
-    def supersede_canonical(self, old_key_id: str, signed_key_record_json: str, proposal_digest: str) -> None:
-        """(derived) deontic — v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — supersede (rotate) a canonical server. signed_key_record_json is the successor's SignedKe..."""
-
     def trust_root_verdict_json(self, user_key_id: str, root_key_id: str) -> str:
         """CIRISServer#356 — **does this node still have a live trust root at
         all, and when was it last drilled?**
 
         The full verdict as JSON: ``{edge_exists, root_self_declares,
         charter_has_recovery, last_drill_at, drill_freshness, halt_latched,
-        valid, root_kind, charter_quorum?, bounded_until?, not_rooted?}``.
+        valid, root_kind, signer_count?, bounded_until?, not_rooted?}``.
         ``not_rooted`` (v62.0.0) is present only when the id holds a
         trust-root community record whose chain does not root: the reason
         it is not valid (it never reads as a key root). One call for two
@@ -1995,9 +2009,6 @@ class Engine:
 
     def widen_audience(self, prior_attestation_id: str, contextual_integrity: str, strip: list[str]) -> dict[str, Any]:
         """(derived) deontic — v39.0.0 — widen the audience of a row in the mesh by a supersedes this node signs as the row's author (CC 4.4.3.3.1 / 8.1.5). The prior row is unto..."""
-
-    def withdraw_canonical_role(self, key_id: str, proposal_digest: str) -> None:
-        """(derived) deontic — v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — withdraw the canonical role from key_id (the DESTRUCTIVE Trust Root op). proposal_digest..."""
 
     def would_hold_json(self, payload_json: str) -> str:
         """(derived) deontic — #846 (BLOB_REPLICATION.md §6.3) — the WILL decision as a door, asked before a fetch: would this node hold content with this provenance, now? Writes..."""

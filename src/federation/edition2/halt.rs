@@ -80,6 +80,10 @@ use crate::federation::{malformed_row, Error, FederationDirectory};
 
 /// The plane name the halt door's refusals carry.
 pub const PLANE: &str = "accord_halt";
+/// v62.0.0 (HL-fix1; CC 4.2.1.3) — the detail token of a lifecycle voice
+/// whose `refs.head` names a superseded bundle: refused under
+/// `accord_invocation_invalid`, nothing kept.
+pub const LIFECYCLE_HEAD_NOT_IN_FORCE: &str = "accord_lifecycle_head_not_in_force";
 /// The `typ` a waiting halt names when it waits on the accord's bundle.
 const GENESIS_BUNDLE_TYP: &str = "ceg-genesis-bundle/2";
 /// The three invocation families.
@@ -789,7 +793,11 @@ where
 ///
 /// - the bundle `refs.head` names must be a held Valid bundle, else the
 ///   statement WAITS on it (retryable `federation_attester_key_unknown`
-///   naming `ceg-genesis-bundle/2:<id>`); the halt `refs.target` names must
+///   naming `ceg-genesis-bundle/2:<id>`). v62.0.0 (HL-fix1) — it must be a
+///   bundle IN FORCE (a tip, `GenesisInForce::head_standing`): a held bundle
+///   a later one superseded is refused by name
+///   ([`LIFECYCLE_HEAD_NOT_IN_FORCE`], under `accord_invocation_invalid`),
+///   nothing kept, and its voices count nothing. The halt `refs.target` names must
 ///   be held and verify under a held bundle, else it waits on that row;
 /// - the statement alone is read by [`verify_lifecycle_row`] under that
 ///   bundle's roster: a key the roster does not hold WAITS; `iss_not_holder`
@@ -820,11 +828,34 @@ where
         .and_then(|n| super::names::single(&n, "target"))
         .ok_or_else(|| malformed_lifecycle("target"))?;
     let state = super::genesis::genesis_in_force(dir).await?;
-    let Some(roster) = HaltRoster::from_placements_by_head(&state.valid, &head) else {
-        return Err(Error::unknown_signer(
-            &format!("{GENESIS_BUNDLE_TYP}:{}", hex::encode(head)),
-            PLANE,
-        ));
+    // v62.0.0 (HL-fix1, SECURITY; CC 4.2.1.3 "against the bundle in force")
+    // — the roster is the bundle IN FORCE that `refs.head` names, never any
+    // held Valid bundle: `state.valid` holds the predecessors too, so a voice
+    // naming a superseded head would count a removed holder against the old
+    // roster. The one head reading, shared with the seat re-bind door.
+    let roster = match state.head_standing(&head) {
+        super::genesis::HeadStanding::InForce(p) => HaltRoster::from_placement(p),
+        // A refusal, nothing kept: no later row brings a superseded bundle
+        // back into force (a bundle is never un-superseded), so there is
+        // nothing a hold could wait for.
+        super::genesis::HeadStanding::Superseded => {
+            return Err(Error::malformed_row(
+                PLANE,
+                malformed_row::ACCORD_INVOCATION_INVALID,
+                format!(
+                    "{LIFECYCLE_HEAD_NOT_IN_FORCE}: `refs.head` names bundle {}, which a later \
+                     held bundle superseded; a lifecycle row is counted against the bundle in \
+                     force (CC 4.2.1.3)",
+                    hex::encode(head)
+                ),
+            ));
+        }
+        super::genesis::HeadStanding::NotHeld => {
+            return Err(Error::unknown_signer(
+                &format!("{GENESIS_BUNDLE_TYP}:{}", hex::encode(head)),
+                PLANE,
+            ));
+        }
     };
     let wait_on_halt = || Error::unknown_signer(&format!("row:{}", target.hex()), PLANE);
     let Some(halt_bytes) = dir.edition2_voices(&target).await?.into_iter().next() else {

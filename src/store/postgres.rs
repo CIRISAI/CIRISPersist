@@ -940,7 +940,9 @@ impl crate::federation::read_plan::ReadPlanStore for PostgresBackend {
         cursor: Option<&crate::read::AttestationCursor>,
         fetch: i64,
     ) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error> {
-        let (sql, params) = pg_naming_page_sql(subject_key_id, dimension, cursor, fetch);
+        // v62.0.0 (RL-fix2b) — this node's standing, asked once.
+        let rooted = crate::federation::edition2::serve::rooted_for_serve(self).await?;
+        let (sql, params) = pg_naming_page_sql(subject_key_id, dimension, cursor, fetch, rooted);
         let (rows, bytes) = self
             .query_attestations("list_attestations_naming_by_dimension", &sql, &params)
             .await?;
@@ -967,11 +969,14 @@ impl crate::federation::read_plan::ReadPlanStore for PostgresBackend {
         );
         let head_stmt =
             crate::federation::read_plan::serve_stream_head_statement(Dialect::Postgres);
+        // v62.0.0 (RL-fix2b) — this node's standing, asked once.
+        let rooted = crate::federation::edition2::serve::rooted_for_serve(self).await?;
         let page_stmt = crate::federation::read_plan::serve_stream_statement(
             Dialect::Postgres,
             narrowing,
             since,
             fetch,
+            rooted,
         );
         let client = self
             .get_client()
@@ -9723,145 +9728,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
-    /// v13.1.0 (CIRISPersist#377) — record a canonical-role WITHDRAW/SUPERSEDE
-    /// tombstone (V095). Idempotent on `key_id`: an existing row with the same
-    /// `superseded_by` + `authority_decision_digest` is a no-op; a differing one
-    /// is a [`Conflict`](crate::federation::Error::Conflict). Backend-symmetric
-    /// with SQLite + memory.
-    async fn record_canonical_withdrawal(
-        &self,
-        key_id: &str,
-        superseded_by: Option<&str>,
-        authority_decision_digest: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let mut record = crate::federation::CanonicalWithdrawal {
-            key_id: key_id.to_owned(),
-            withdrawn_at: crate::host::clock::now(),
-            authority_decision_digest: authority_decision_digest.to_owned(),
-            superseded_by: superseded_by.map(str::to_owned),
-            persist_row_hash: String::new(),
-        };
-        record.persist_row_hash = crate::federation::types::compute_persist_row_hash(&record)?;
-        let be = |what: &'static str| {
-            move |e: tokio_postgres::Error| {
-                crate::federation::Error::Backend(format!(
-                    "record_canonical_withdrawal {what}: {}",
-                    pg_error_detail(&e)
-                ))
-            }
-        };
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        // v62.0.0 (wave GC4; CC 2.7.2 "one set, one answer") — the twin of
-        // sqlite's fold choice: rival tombstones under one key are never a
-        // `Conflict`. The one whose `(authority_decision_digest,
-        // superseded_by)` sorts lowest stands (`pg_withdrawal_rival_wins`);
-        // a loser is absorbed; a winner takes the row, keeping the stored
-        // `withdrawn_at`. Under one transaction, the row locked FOR UPDATE,
-        // so two writers cannot both decide against the same held row.
-        let tx = client.transaction().await.map_err(be("begin"))?;
-        let select = "SELECT superseded_by, authority_decision_digest, withdrawn_at \
-                      FROM cirislens.canonical_role_withdrawal WHERE key_id = $1 FOR UPDATE";
-        let mut existing = tx
-            .query_opt(select, &[&record.key_id])
-            .await
-            .map_err(be("read"))?;
-        if existing.is_none() {
-            let inserted = tx
-                .execute(
-                    "INSERT INTO cirislens.canonical_role_withdrawal (\
-                        key_id, withdrawn_at, authority_decision_digest, superseded_by, \
-                        persist_row_hash\
-                     ) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-                    &[
-                        &record.key_id,
-                        &record.withdrawn_at,
-                        &record.authority_decision_digest,
-                        &record.superseded_by,
-                        &record.persist_row_hash,
-                    ],
-                )
-                .await
-                .map_err(be("insert"))?;
-            if inserted == 1 {
-                return tx.commit().await.map_err(be("commit"));
-            }
-            // A concurrent writer inserted first: decide against its row.
-            existing = tx
-                .query_opt(select, &[&record.key_id])
-                .await
-                .map_err(be("race re-read"))?;
-        }
-        let Some(row) = existing else {
-            return Err(crate::federation::Error::Backend(
-                "record_canonical_withdrawal: insert conflicted but no row is present".to_owned(),
-            ));
-        };
-        let held_superseded: Option<String> =
-            row.safe_get_with("superseded_by", crate::federation::Error::Backend)?;
-        let held_auth: String = row.safe_get_with(
-            "authority_decision_digest",
-            crate::federation::Error::Backend,
-        )?;
-        let held_at: chrono::DateTime<chrono::Utc> =
-            row.safe_get_with("withdrawn_at", crate::federation::Error::Backend)?;
-        if !pg_withdrawal_rival_wins(
-            (
-                &record.authority_decision_digest,
-                record.superseded_by.as_deref(),
-            ),
-            (&held_auth, held_superseded.as_deref()),
-        ) {
-            // The same tombstone (idempotent), or a rival that sorts higher:
-            // absorbed.
-            return tx.commit().await.map_err(be("commit"));
-        }
-        record.withdrawn_at = held_at;
-        record.persist_row_hash = String::new();
-        record.persist_row_hash = crate::federation::types::compute_persist_row_hash(&record)?;
-        tx.execute(
-            "UPDATE cirislens.canonical_role_withdrawal SET withdrawn_at = $2, \
-                authority_decision_digest = $3, superseded_by = $4, persist_row_hash = $5 \
-             WHERE key_id = $1",
-            &[
-                &record.key_id,
-                &record.withdrawn_at,
-                &record.authority_decision_digest,
-                &record.superseded_by,
-                &record.persist_row_hash,
-            ],
-        )
-        .await
-        .map_err(be("update"))?;
-        tx.commit().await.map_err(be("commit"))
-    }
-
-    /// v13.1.0 (CIRISPersist#377) — consult the V095 withdrawal tombstone for
-    /// `key_id` (the load-bearing gate consult). Backend-symmetric.
-    async fn lookup_canonical_withdrawal(
-        &self,
-        key_id: &str,
-    ) -> Result<Option<crate::federation::CanonicalWithdrawal>, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(crate::store::Error::into_federation)?;
-        let row = client
-            .query_opt(
-                "SELECT key_id, withdrawn_at, authority_decision_digest, superseded_by, \
-                    persist_row_hash \
-                 FROM cirislens.canonical_role_withdrawal WHERE key_id = $1",
-                &[&key_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("lookup_canonical_withdrawal: {e}"))
-            })?;
-        row.map(pg_row_to_canonical_withdrawal).transpose()
-    }
-
     /// v13.1.0 (CIRISPersist#377) — all V095 withdrawal tombstones, stable-sorted
     /// by `key_id`. Backend-symmetric.
     async fn list_canonical_withdrawals(
@@ -10657,6 +10523,27 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await;
         }
+        // v62.0.0 (RL-fix2b; CC 5.3.4) — the advertisement is a serve path:
+        // on a node that is not rooted, an Attestation hash whose row waits is
+        // not advertised (the same predicate as the serve rule).
+        let wait = if kind == "Attestation" {
+            !crate::federation::edition2::serve::rooted_for_serve(self).await?
+        } else {
+            false
+        };
+        let filter = if wait {
+            format!(
+                " AND NOT EXISTS (SELECT 1 FROM cirislens.federation_attestations fa \
+                   WHERE fa.attestation_id = (swi.record_key::jsonb ->> 'attestation_id') \
+                   AND NOT COALESCE({}, 0 = 1))",
+                crate::federation::read_plan::served_while_unrooted_sql(
+                    crate::federation::attestation_query::Dialect::Postgres,
+                    "fa",
+                )
+            )
+        } else {
+            String::new()
+        };
         let after = after_content_hash.unwrap_or("");
         let lim = i64::from(limit);
         let client = self
@@ -10665,9 +10552,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(crate::store::Error::into_federation)?;
         let rows = client
             .query(
-                "SELECT content_hash FROM cirislens.signed_wire_index \
-                 WHERE kind = $1 AND content_hash > $2 \
-                 ORDER BY content_hash LIMIT $3",
+                &format!(
+                    "SELECT swi.content_hash FROM cirislens.signed_wire_index swi \
+                 WHERE swi.kind = $1 AND swi.content_hash > $2{filter} \
+                 ORDER BY swi.content_hash LIMIT $3"
+                ),
                 &[&kind, &after, &lim],
             )
             .await
@@ -13965,10 +13854,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // unless the tombstone is void for it (the accountability record, a
         // person-subject row: Codex rounds 1 and 4 on PR #1057). Excluded in
         // the SQL, before the page is cut.
+        // v62.0.0 (RL-fix2b; CC 5.3.4) — this node's standing, asked once:
+        // a node that is not rooted excludes the federation-tier rows that
+        // wait, in the SQL, before the page is cut.
+        let rooted = crate::federation::edition2::serve::rooted_for_serve(self).await?;
         let serve_rule = crate::federation::read_plan::serve_rule_parts(
             crate::federation::attestation_query::Dialect::Postgres,
             "fa",
             "cirislens.",
+            rooted,
         )
         .join(" AND ");
         let rows = client
@@ -14065,6 +13959,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 recomputed = %recomputed,
                 "signed_wire_index content-hash mismatch; self-healing (returning None)"
             );
+            return Ok(None);
+        }
+        // v62.0.0 (RL-fix2b; CC 5.3.4) — the point read is a serve path: a
+        // row that waits on a node that is not rooted is not handed out.
+        if crate::federation::edition2::serve::point_read_waits(self, kind, &bytes).await? {
             return Ok(None);
         }
         Ok(Some(bytes))
@@ -20735,7 +20634,7 @@ fn pg_row_to_key_record(
     // v13.2.0 (CIRISPersist#383): additional_scrubs is the V096
     // `TEXT NOT NULL DEFAULT '[]'` column holding the 2nd..Nth anchor scrub
     // signatures as a JSON array. MUST decode the column (never Vec::new()) —
-    // else a stored 2-of-3 canonical record reads back as 0 additional scrubs
+    // else a stored strict-majority canonical record reads back as 0 additional scrubs
     // and loses its quorum. Tolerant read (matching roles/consent_role above):
     // a SELECT that didn't pull the column, a NULL, or an empty/malformed
     // string all map to an empty set. SELECTs that need it MUST include it.
@@ -22060,6 +21959,7 @@ pub(crate) fn pg_naming_page_sql(
     dimension: &str,
     cursor: Option<&crate::read::AttestationCursor>,
     fetch: i64,
+    rooted: bool,
 ) -> (
     String,
     Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
@@ -22077,6 +21977,7 @@ pub(crate) fn pg_naming_page_sql(
         crate::federation::attestation_query::Dialect::Postgres,
         "fa",
         "cirislens.",
+        rooted,
     ));
     if let Some(c) = cursor {
         params.push(Box::new(c.last_asserted_at));
@@ -29601,6 +29502,12 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
+        // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+            &backend,
+            "rl2c-backend",
+        )
+        .await;
         crate::federation::operational::test_support::exercise_known_hashes_never_reach_holdings_785(
             &backend,
             &format!("pg785a{}", uuid::Uuid::new_v4().simple()),
@@ -29736,6 +29643,12 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
+        // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+            &backend,
+            "rl2c-backend",
+        )
+        .await;
         crate::federation::admission::ungated_doors_test_support::exercise_cohort_scope_survives_the_read_path(
             &backend,
             &format!("pg{}", uuid_like()),
@@ -29754,6 +29667,12 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
+        // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+            &backend,
+            "rl2c-backend",
+        )
+        .await;
         crate::federation::admission::ungated_doors_test_support::exercise_late_admitted_attestation_is_served(
             &backend,
             &format!("pg{}", uuid_like()),
@@ -31170,6 +31089,12 @@ mod tests {
         )
         .await;
         let suffix = uuid_like();
+        // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+            &backend,
+            "rl2c-backend",
+        )
+        .await;
         crate::federation::quarantine::test_support::exercise_admin_ops(&backend, &suffix).await;
     }
 

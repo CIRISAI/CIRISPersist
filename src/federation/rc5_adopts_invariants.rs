@@ -400,6 +400,9 @@ pub mod bodies {
             // review M1 — a single founder must not admit unilaterally.
             "quorum:1/2",
             "quorum:1/3",
+            // v62.0.0 (TR-fix2; CC rc21 3.2 T7) — `quorum:1/N` is
+            // non-conformant, 1/1 included.
+            "quorum:1/1",
             "founder_only",
             "majority",
             "unanimous",
@@ -443,17 +446,8 @@ pub mod bodies {
                 put.unwrap_or_else(|e| panic!("{tag}: {p} outside infrastructure: {e}"));
             }
         }
-        let room = format!("root-ok-{tag}");
-        authorized_room_key(d, &room).await;
-        found(
-            d,
-            ts::sign_community(
-                &human,
-                infra_room(&room, "quorum:1/1", vec![seat(&human, "founder")]),
-            ),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{tag}: quorum:1/1 is conformant: {e}"));
+        // v62.0.0 (TR-fix2) — the conformant shape is `quorum:2/3` over three
+        // founders (`root-23` below); `quorum:1/1` is refused above.
         // Review (M1 loophole) — N is the founder count: M is read absolutely,
         // so `quorum:1/1` over three founders would let one of them admit
         // alone, and `quorum:2/3` over two would demand a founder who is not
@@ -468,7 +462,7 @@ pub mod bodies {
             seat(&format!("f3-{tag}"), "founder"),
         ];
         for (i, (p, founders)) in [
-            ("quorum:1/1", three.clone()),
+            ("quorum:2/2", three.clone()),
             ("quorum:2/3", three[..2].to_vec()),
         ]
         .into_iter()
@@ -503,7 +497,7 @@ pub mod bodies {
             d,
             ts::sign_community(
                 &human,
-                infra_room(&none, "quorum:1/1", vec![seat(&human, "member")]),
+                infra_room(&none, "quorum:2/3", vec![seat(&human, "member")]),
             ),
         )
         .await
@@ -514,7 +508,9 @@ pub mod bodies {
             "{err}"
         );
         // T1 §6: the supersede is version v+1 naming the held head.
-        let (head, version) = e2::held_head(d, &e2::kid(&room))
+        // v62.0.0 (BF17) — the conformant room is `room3` (TR-fix2 removed
+        // the `quorum:1/1` room this supersede used to name).
+        let (head, version) = e2::held_head(d, &e2::kid(&room3))
             .await
             .expect("the conformant room is held");
         let err = e2::put_voices(
@@ -522,7 +518,7 @@ pub mod bodies {
             &e2::community_voices(
                 &ts::sign_community(
                     &human,
-                    infra_room(&room, "majority", vec![seat(&human, "founder")]),
+                    infra_room(&room3, "majority", vec![seat(&human, "founder")]),
                 ),
                 version + 1,
                 Some(&head),

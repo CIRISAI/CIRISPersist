@@ -247,7 +247,7 @@ pub struct TrustRootSignal {
     pub roots_considered: usize,
     /// The full per-leg verdict for [`Self::root_ref`] — `edge_exists`,
     /// `root_self_declares`, `charter_has_recovery`, `halt_latched`,
-    /// `charter_quorum`, `bounded_until`. Present whenever a candidate was
+    /// `signer_count`, `bounded_until`. Present whenever a candidate was
     /// walked, on the failing arm as well as the passing one, so an operator
     /// sees WHICH leg failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]

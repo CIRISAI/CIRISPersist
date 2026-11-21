@@ -305,6 +305,11 @@ pub(crate) mod bodies {
         // v62.0.0 — edition-2 keys: each is the kid of its seed.
         let room = e2::put_key(d, &format!("i1883-room-{tag}"), &[it::SUBSTRATE_PERSIST]).await;
         let founder = e2::put_key(d, &format!("i1883-founder-{tag}"), &[it::USER]).await;
+        // v62.0.0 (TR-fix2; CC rc21 3.2 T7) — a CONFORMANT record (three person
+        // founders at `quorum:2/3`; `quorum:1/1` is refused), so the witness
+        // reads the ROOTING leg, not a protocol refusal.
+        let founder2 = e2::put_key(d, &format!("i1883-founder2-{tag}"), &[it::USER]).await;
+        let founder3 = e2::put_key(d, &format!("i1883-founder3-{tag}"), &[it::USER]).await;
         let node = e2::put_key(d, &format!("i1883-node-{tag}"), &[it::NODE]).await;
         let at: chrono::DateTime<chrono::Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
         crate::federation::types::Community {
@@ -319,13 +324,23 @@ pub(crate) mod bodies {
                     role: Some("founder".to_owned()),
                 },
                 crate::federation::types::CommunityMember {
+                    key_id: founder2,
+                    joined_at: at,
+                    role: Some("founder".to_owned()),
+                },
+                crate::federation::types::CommunityMember {
+                    key_id: founder3,
+                    joined_at: at,
+                    role: Some("founder".to_owned()),
+                },
+                crate::federation::types::CommunityMember {
                     key_id: node,
                     joined_at: at,
                     role: Some("member".to_owned()),
                 },
             ],
             founded_at: at,
-            consensus_protocol: "quorum:1/1".to_owned(),
+            consensus_protocol: "quorum:2/3".to_owned(),
             policy_blob: Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
             persist_row_hash: String::new(),
         }
@@ -383,6 +398,9 @@ pub(crate) mod bodies {
             "quorum:0/1",
             "quorum:2/1",
             "quorum:x",
+            // v62.0.0 (TR-fix2; CC rc21 3.2 T7): `quorum:1/N`, 1/1 included.
+            "quorum:1/1",
+            "quorum:1/3",
         ] {
             let mut c = base.clone();
             c.consensus_protocol = p.to_owned();
@@ -398,7 +416,9 @@ pub(crate) mod bodies {
             );
         }
         let mut c = base.clone();
-        c.members[0].role = Some("member".to_owned());
+        for m in &mut c.members {
+            m.role = Some("member".to_owned());
+        }
         assert!(!conformant(c).await, "I1884: no founder");
         let mut c = base;
         c.policy_blob = Some(serde_json::json!({ "cohort_subkind": "community" }));

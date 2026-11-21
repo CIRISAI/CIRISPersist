@@ -561,10 +561,12 @@ where
     let mut cursor: Option<(DateTime<Utc>, String)> = None;
     let scan_complete = true;
     loop {
-        let page = dir
-            .list_attestations_since(cursor.clone(), SCAN_PAGE)
-            .await
-            .map_err(|e| super::Error::Backend(format!("vocabulary tightening scan: {e}")))?;
+        // v62.0.0 (RL-fix2c) — persist's own scan: no serve wait.
+        let page = crate::federation::edition2::serve::as_internal_read(
+            dir.list_attestations_since(cursor.clone(), SCAN_PAGE),
+        )
+        .await
+        .map_err(|e| super::Error::Backend(format!("vocabulary tightening scan: {e}")))?;
         if page.is_empty() {
             break;
         }
@@ -1078,12 +1080,15 @@ mod sweep_tests {
     where
         D: FederationDirectory + Sync + ?Sized,
     {
-        dir.list_attestations_since(None, 10_000)
-            .await
-            .expect("scan")
-            .into_iter()
-            .map(|a| a.attestation)
-            .collect()
+        // v62.0.0 (RL-fix2c) — the fixture inspects its own store, not a serve.
+        crate::federation::edition2::serve::as_internal_read(
+            dir.list_attestations_since(None, 10_000),
+        )
+        .await
+        .expect("scan")
+        .into_iter()
+        .map(|a| a.attestation)
+        .collect()
     }
 
     /// RED-FIRST, then green, then green-again:

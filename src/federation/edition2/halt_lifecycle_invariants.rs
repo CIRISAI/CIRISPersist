@@ -28,6 +28,16 @@
 //!   while no bundle is held (nothing kept) and latches once the genesis is
 //!   installed. Either half of the composite signature alone is refused
 //!   `accord_invocation_invalid` (`statement_invalid`).
+//! - **I2308** (HL-fix1, SECURITY; CC 4.2.1.3 "against the bundle in
+//!   force") — after a later bundle removes holder H, a `confirmed` voice
+//!   naming the OLD (superseded) head is refused by name
+//!   (`accord_lifecycle_head_not_in_force`, under `accord_invocation_invalid`)
+//!   and kept nowhere, at the lifecycle door and at the statement door;
+//!   H's voice plus a remaining holder's over the old head
+//!   count nothing (the halt stays unconfirmed). The same `confirmed` row
+//!   over the head IN FORCE, voiced by two of its holders, counts and
+//!   confirms. (Before HL-fix1 the old head's roster counted H: the first
+//!   assertion below would read `Ok(Pending)`.)
 
 use chrono::{DateTime, Duration, Utc};
 use ciris_crypto::composite::{CompositeSigningKey, MLDSA65_SIG_LEN};
@@ -510,6 +520,127 @@ pub(crate) async fn the_pre_signed_halt(d: &dyn FederationDirectory) {
     assert_eq!(f.halt_row, Some(row_of(&sealed)), "I2346");
 }
 
+/// I2308.
+pub(crate) async fn superseded_head_counts_nothing(d: &dyn FederationDirectory) {
+    use super::fixture_genesis::{install_ceremony_v2, later_v2};
+    let first = bundle_v2();
+    install_v2(d).await.unwrap();
+    let at = now_ms();
+    let now = crate::host::clock::now();
+    // Holder 0 fires under the first bundle.
+    let h = holder_halt(0, "hl-fix1-halt", 0xa1, at, at + HOUR_MS);
+    let hid = row_of(&h);
+    put_statement(d, &h, None, INGEST_TIER).await.unwrap();
+    // A later bundle removes holder seed 3 (index 2) and seats seed 4.
+    let later = later_v2(first, &[1, 2, 4], &[11, 12], &[1, 2, 4]);
+    install_ceremony_v2(d, &later)
+        .await
+        .expect("I2308: the later bundle is in force");
+    assert_eq!(
+        genesis_in_force(d).await.unwrap().head.map(|p| p.object_id),
+        Some(later.object_id),
+        "I2308: the later bundle is the head"
+    );
+    let removed = first.holder_identity_ref(2).to_owned();
+    assert!(
+        !later.holder_identity_refs().contains(&removed),
+        "I2308: H is no holder of the bundle in force"
+    );
+    // H's and holder 0's `confirmed` voices over the OLD head.
+    let old_h = lifecycle(
+        &first.holder_key(2),
+        &removed,
+        "confirmed",
+        &hid.0,
+        &first.object_id,
+        "hl-fix1-confirm-old",
+        0xa2,
+        at + 1,
+    );
+    let old_0 = voice(0, "confirmed", &hid.0, "hl-fix1-confirm-old", 0xa2, at + 1);
+    for (who, st) in [("H", &old_h), ("holder 0", &old_0)] {
+        let e = put_lifecycle_at(d, st, now)
+            .await
+            .expect_err("I2308: a voice over a superseded head is not counted");
+        assert_eq!(
+            reason(&e),
+            malformed_row::ACCORD_INVOCATION_INVALID,
+            "I2308 {who}: {e:?}"
+        );
+        assert!(
+            format!("{e:?}").contains("accord_lifecycle_head_not_in_force"),
+            "I2308 {who}: refused by name: {e:?}"
+        );
+        assert!(
+            d.edition2_voices(&row_of(st)).await.unwrap().is_empty(),
+            "I2308 {who}: nothing kept"
+        );
+    }
+    // Through the statement door too: refused, nothing kept (no hold).
+    let e = put_statement(d, &old_h, None, INGEST_TIER)
+        .await
+        .expect_err("I2308: the statement door refuses it too");
+    assert!(
+        format!("{e:?}").contains("accord_lifecycle_head_not_in_force"),
+        "I2308: {e:?}"
+    );
+    assert!(
+        d.edition2_voices(&row_of(&old_h)).await.unwrap().is_empty(),
+        "I2308: the statement door kept nothing"
+    );
+    assert!(
+        !halt_in_force(d, ACCORD, now)
+            .await
+            .unwrap()
+            .expect("I2308: the halt is in force")
+            .confirmed,
+        "I2308: the old head confirmed nothing"
+    );
+    // The same row over the head IN FORCE, by two of its holders, counts.
+    let new_0 = lifecycle(
+        &later.holder_key(0),
+        later.holder_identity_ref(0),
+        "confirmed",
+        &hid.0,
+        &later.object_id,
+        "hl-fix1-confirm-new",
+        0xa3,
+        at + 2,
+    );
+    let new_1 = lifecycle(
+        &later.holder_key(1),
+        later.holder_identity_ref(1),
+        "confirmed",
+        &hid.0,
+        &later.object_id,
+        "hl-fix1-confirm-new",
+        0xa3,
+        at + 2,
+    );
+    assert!(matches!(
+        put_lifecycle_at(d, &new_0, now).await.unwrap(),
+        LifecycleOutcome::Pending { .. }
+    ));
+    assert!(
+        matches!(
+            put_lifecycle_at(d, &new_1, now).await.unwrap(),
+            LifecycleOutcome::Applied {
+                kind: LifecycleKind::Confirmed,
+                ..
+            }
+        ),
+        "I2308: counted over the head in force"
+    );
+    assert!(
+        halt_in_force(d, ACCORD, now)
+            .await
+            .unwrap()
+            .unwrap()
+            .confirmed,
+        "I2308: confirmed"
+    );
+}
+
 #[cfg(feature = "sqlite")]
 mod sqlite {
     use crate::store::Backend as _;
@@ -545,6 +676,11 @@ mod sqlite {
     #[tokio::test]
     async fn i2346_pre_signed_halt_sqlite() {
         Box::pin(super::the_pre_signed_halt(&store().await)).await;
+    }
+
+    #[tokio::test]
+    async fn i2308_superseded_head_counts_nothing_sqlite() {
+        Box::pin(super::superseded_head_counts_nothing(&store().await)).await;
     }
 }
 
@@ -589,5 +725,11 @@ mod postgres {
     async fn i2346_pre_signed_halt_postgres() {
         let Some(b) = store().await else { return };
         Box::pin(super::the_pre_signed_halt(&b)).await;
+    }
+
+    #[tokio::test]
+    async fn i2308_superseded_head_counts_nothing_postgres() {
+        let Some(b) = store().await else { return };
+        Box::pin(super::superseded_head_counts_nothing(&b)).await;
     }
 }

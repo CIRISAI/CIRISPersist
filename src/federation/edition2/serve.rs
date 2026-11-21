@@ -150,9 +150,14 @@ pub fn is_bootstrap_kind(statement: &[u8]) -> bool {
 /// T3). `node` is this directory's own node key (`node_key_id`), which
 /// `stored_standing_at` reads its own chain from.
 ///
-/// **PR-fix1 / TR-fix1: re-point this body at the aligned standing
-/// primitive** (the "own standing reaches a root" verdict); every serve path
-/// asks only this.
+/// v62.0.0 (TR-fix2) — **re-pointed at the peer verdict's own pieces**, for
+/// the reader's own node: the roots `node`'s governing acceptor names
+/// (`trust_root::accepted_roots_of`) judged FOR `node` by the trust root's
+/// read verdict (`canonical_community::reader_standing`: the chain from an
+/// accord birth, the charter, `node`'s own T3 legs, T7's margin), the same
+/// call `edition2::peer_rooting` makes. Rooted or Stalled crosses (CC 3.2
+/// T7 l.1240). No wall clock: `at_ms` is the caller's instant. It now reads
+/// `node`'s chain, not this directory's node key's.
 ///
 /// # Errors
 /// Directory reads.
@@ -160,8 +165,7 @@ pub async fn node_is_rooted<F>(dir: &F, node: &str, at_ms: u64) -> Result<bool, 
 where
     F: FederationDirectory + ?Sized,
 {
-    use crate::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
-    use crate::federation::canonical_community::{stored_standing_at, StoredStanding};
+    use crate::federation::canonical_community::{reader_standing, StoredStanding};
     let Some(now) = chrono::TimeZone::timestamp_millis_opt(
         &chrono::Utc,
         i64::try_from(at_ms).unwrap_or(i64::MAX),
@@ -169,33 +173,34 @@ where
     .single() else {
         return Ok(false);
     };
-    let mut users = vec![node.to_owned()];
-    match crate::federation::admission::owner_of_unmarked(dir, node).await {
-        Ok(Some(o)) if o != node => users.push(o),
-        Ok(_) | Err(Error::AmbiguousNodeOwner { .. }) => {}
-        Err(e) => return Err(e),
-    }
-    for user in &users {
-        let mut rows = Vec::new();
-        let mut pages = AttestationQuery::by(user, FOLD_PAGE).pages();
-        while let Some(page) = pages.next(dir).await? {
-            rows.extend(page);
-        }
-        for c in crate::federation::trust_root::transit_candidate_roots(&rows, user, now) {
-            if matches!(
-                Box::pin(stored_standing_at(dir, &c.root_ref, now)).await?,
-                StoredStanding::Rooted(_) | StoredStanding::Stalled { .. }
-            ) {
-                return Ok(true);
-            }
+    for root in crate::federation::trust_root::accepted_roots_of(dir, node).await? {
+        let (standing, _) = Box::pin(reader_standing(dir, Some(node), &root, now)).await?;
+        if matches!(
+            standing,
+            StoredStanding::Rooted(_) | StoredStanding::Stalled { .. }
+        ) {
+            return Ok(true);
         }
     }
     Ok(false)
 }
 
-/// This directory's node, rooted now ([`node_is_rooted`]); no node key is
-/// no root.
-async fn this_node_is_rooted<F>(dir: &F) -> Result<bool, Error>
+/// This directory's node, rooted now ([`node_is_rooted`]). Every serve path
+/// computes it ONCE per call and passes it on (the SQL serve rule takes it
+/// as a parameter, `read_plan::serve_rule_parts`).
+///
+/// v62.0.0 (RL-fix2b/2c, lead ruling) — **no node identity: not rooted, the
+/// wait APPLIES, in every build** (fail closed). No host-reachable path can
+/// be proved to always set a node key: the `Engine` constructors set it only
+/// when the signer derives an id (`if let Ok(id) =
+/// engine.local_derived_key_id()`), `Engine::from_shared` only through
+/// `node_key_to_tell`, and the wheel only when `federation_key_id_of`
+/// answers. A store with no node key withholds federation-tier rows from
+/// third parties (I2254).
+///
+/// # Errors
+/// Directory reads.
+pub(crate) async fn this_node_is_rooted<F>(dir: &F) -> Result<bool, Error>
 where
     F: FederationDirectory + ?Sized,
 {
@@ -223,31 +228,137 @@ pub async fn withhold_waiting_rows<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let waits = |a: &crate::federation::Attestation| {
-        let commons = cs::Scope::parse(&a.cohort_scope).map(cs::Scope::placement)
-            == Some(cs::Placement::Commons);
-        if !commons
-            || crate::federation::admission::is_owner_binding_envelope(&a.attestation_envelope)
-        {
-            return false;
-        }
-        let dim =
-            crate::federation::admission::envelope_dimension(&a.attestation_envelope).unwrap_or("");
-        !(dim.starts_with("identity:occurrence")
-            || dim.starts_with("revocation:")
-            || dim.starts_with("ownership:"))
-    };
-    if !rows.iter().any(waits) || Box::pin(this_node_is_rooted(dir)).await? {
+    if !rows.iter().any(row_waits_unrooted) || Box::pin(rooted_for_serve(dir)).await? {
         return Ok(rows);
     }
     let before = rows.len();
-    let kept: Vec<_> = rows.into_iter().filter(|a| !waits(a)).collect();
+    let kept: Vec<_> = rows
+        .into_iter()
+        .filter(|a| !row_waits_unrooted(a))
+        .collect();
     tracing::debug!(
         reason = SERVE_WAITS_FOR_ROOTED,
         withheld = before - kept.len(),
         "federation-tier rows wait: this node's own standing chain reaches no root"
     );
     Ok(kept)
+}
+
+tokio::task_local! {
+    /// v62.0.0 (RL-fix2b) — set while persist reads its OWN store through a
+    /// listing that is also a serve surface (a sweep, the key plane's own
+    /// walk, the replication apply's held check): no peer is served, so no
+    /// row waits.
+    static INTERNAL_READ: ();
+}
+
+/// v62.0.0 (RL-fix2b) — run `fut` as one of persist's own reads of its
+/// store ([`rooted_for_serve`] then reads `true`): the serve wait applies to
+/// what a node hands a peer, never to what it reads for itself.
+pub(crate) async fn as_internal_read<T>(fut: impl std::future::Future<Output = T>) -> T {
+    INTERNAL_READ.scope((), fut).await
+}
+
+/// v62.0.0 (RL-fix2b) — **what the SQL serve rule takes as `rooted`**: `true`
+/// for persist's own reads ([`as_internal_read`]), else this node's standing
+/// ([`this_node_is_rooted`]), asked once per call.
+///
+/// # Errors
+/// Directory reads.
+pub(crate) async fn rooted_for_serve<F>(dir: &F) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if INTERNAL_READ.try_with(|()| ()).is_ok() {
+        return Ok(true);
+    }
+    Box::pin(this_node_is_rooted(dir)).await
+}
+
+/// v62.0.0 (RL-fix2c) — **what this store will serve a third party**: the
+/// read a host calls at startup instead of inferring it from side effects.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ServeStanding {
+    /// The store's node key (`FederationDirectory::node_key_id`). `None`
+    /// when no constructor could derive one (a classical-only signer, a P-256
+    /// keystore fallback, a hardware public-key read that failed at boot).
+    pub node_key_id: Option<String>,
+    /// Does this node's own standing chain reach a root
+    /// ([`node_is_rooted`]; always `false` with no node key)?
+    pub rooted: bool,
+    /// `!rooted`: federation-tier rows are WITHHELD from third parties
+    /// ([`SERVE_WAITS_FOR_ROOTED`]). A host warns loudly when this is true
+    /// AND `node_key_id` is `None` (a misconfiguration, not a pre-genesis
+    /// state).
+    pub withholds_federation_tier: bool,
+}
+
+/// v62.0.0 (RL-fix2c) — **[`ServeStanding`] of this store, now** (read only).
+///
+/// # Errors
+/// Directory reads.
+pub async fn serve_standing<F>(dir: &F) -> Result<ServeStanding, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let rooted = Box::pin(this_node_is_rooted(dir)).await?;
+    Ok(ServeStanding {
+        node_key_id: dir.node_key_id(),
+        rooted,
+        withholds_federation_tier: !rooted,
+    })
+}
+
+/// v62.0.0 (RL-fix2b) — the dimension prefixes of the attestation-plane
+/// bootstrap kinds (CC part_5 l.1129: occurrences, revocations, a sender's
+/// own allegiance rows): ONE list, read by the Rust row test
+/// ([`row_waits_unrooted`]) and by the SQL serve rule
+/// (`read_plan::served_while_unrooted_sql`).
+pub(crate) const BOOTSTRAP_DIMENSION_PREFIXES: [&str; 3] =
+    ["identity:occurrence", "revocation:", "ownership:"];
+
+/// v62.0.0 (RL-fix2b) — **does an attestation row WAIT on a node that is not
+/// rooted?** A commons-scope row that is neither an owner binding
+/// (`admission::is_owner_binding_envelope`) nor a bootstrap kind by its
+/// dimension ([`BOOTSTRAP_DIMENSION_PREFIXES`]). The SQL form is
+/// `read_plan::served_while_unrooted_sql`; the two are the same decision.
+#[must_use]
+pub(crate) fn row_waits_unrooted(a: &crate::federation::Attestation) -> bool {
+    let commons =
+        cs::Scope::parse(&a.cohort_scope).map(cs::Scope::placement) == Some(cs::Placement::Commons);
+    if !commons || crate::federation::admission::is_owner_binding_envelope(&a.attestation_envelope)
+    {
+        return false;
+    }
+    let dim =
+        crate::federation::admission::envelope_dimension(&a.attestation_envelope).unwrap_or("");
+    !BOOTSTRAP_DIMENSION_PREFIXES
+        .iter()
+        .any(|p| dim.starts_with(p))
+}
+
+/// v62.0.0 (RL-fix2b) — **the wire-index point read's wait**: `bytes`, read
+/// for an `"Attestation"` entry, is a row that waits
+/// ([`row_waits_unrooted`]) on a node that is not rooted
+/// ([`this_node_is_rooted`]). Any other kind, or bytes that do not parse as
+/// a row, never wait here (their own serve rules decide them).
+///
+/// # Errors
+/// Directory reads.
+pub(crate) async fn point_read_waits<F>(dir: &F, kind: &str, bytes: &[u8]) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if kind != "Attestation" {
+        return Ok(false);
+    }
+    let Ok(row) = serde_json::from_slice::<crate::federation::Attestation>(bytes) else {
+        return Ok(false);
+    };
+    if !row_waits_unrooted(&row) {
+        return Ok(false);
+    }
+    Ok(!Box::pin(rooted_for_serve(dir)).await?)
 }
 
 /// v62.0.0 (RL-fix1; CC 5.3.4) — **may a federation-tier (commons) row be

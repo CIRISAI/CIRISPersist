@@ -21,16 +21,27 @@
 //! [`AccordGenesisError`] values (their `Display` text is unchanged, so every
 //! refusal persist renders reads as it did).
 
-use ciris_verify_core::accord_genesis::{
-    accord_consensus_protocol, AccordGenesisError, HUMANITY_ACCORD_FAMILY_KEY_ID,
-};
+use ciris_verify_core::accord_genesis::{accord_consensus_protocol, AccordGenesisError};
 use ciris_verify_core::threshold::{Role, ThresholdMember};
 use serde_json::{json, Value};
 
 use super::edition2::fold as e2fold;
 
-/// The v22 default `consensus_protocol` of a prior envelope that names none.
-const ACCORD_CONSENSUS_PROTOCOL: &str = "quorum:2/3";
+/// v62.0.0 (SM-fix1) — a string member a prior envelope must carry. Absent
+/// or ill-typed is a REFUSAL (malformed is a refusal, not absence): v22
+/// defaulted a missing `family_key_id` to the humanity accord's and a missing
+/// `consensus_protocol` to a literal `quorum:2/3`, which named a group and a
+/// rule nobody signed. On v62 every prior envelope comes from
+/// `FederationDirectory::group_prior_envelope`, which reads both from a
+/// stored record whose fields are non-optional `String`s, so no stored row
+/// reaches this refusal; it holds the public builder to the same shape.
+fn required_str<'a>(envelope: &'a Value, member: &str) -> Result<&'a str, AccordGenesisError> {
+    envelope.get(member).and_then(Value::as_str).ok_or_else(|| {
+        AccordGenesisError::MalformedEnvelope {
+            detail: format!("prior envelope: missing or non-string `{member}`"),
+        }
+    })
+}
 
 fn parse_quorum_protocol(s: &str) -> Option<(usize, usize)> {
     let (m, n) = s.strip_prefix("quorum:")?.split_once('/')?;
@@ -141,27 +152,22 @@ fn resolve_members(
 /// strict-majority `quorum:M/N` for the new count), the entrenchment flag, and
 /// a `supersedes` block binding the change to the exact prior roster and
 /// protocol. The prior roster co-signs it.
-#[must_use]
+///
+/// # Errors
+/// v62.0.0 (SM-fix1) — [`AccordGenesisError::MalformedEnvelope`] when the
+/// prior envelope lacks a string `family_key_id`, `family_name` or
+/// `consensus_protocol`, or its `members` do not parse: never a default.
 pub fn build_membership_change(
     prior_envelope: &Value,
     new_member_key_ids: &[String],
     role: Role,
     entrenched: bool,
     consensus_protocol: Option<&str>,
-) -> Value {
-    let group_key_id = prior_envelope
-        .get("family_key_id")
-        .and_then(Value::as_str)
-        .unwrap_or(HUMANITY_ACCORD_FAMILY_KEY_ID);
-    let group_name = prior_envelope
-        .get("family_name")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let prior_members = envelope_member_key_ids(prior_envelope).unwrap_or_default();
-    let prior_cp = prior_envelope
-        .get("consensus_protocol")
-        .and_then(Value::as_str)
-        .unwrap_or(ACCORD_CONSENSUS_PROTOCOL);
+) -> Result<Value, AccordGenesisError> {
+    let group_key_id = required_str(prior_envelope, "family_key_id")?;
+    let group_name = required_str(prior_envelope, "family_name")?;
+    let prior_members = envelope_member_key_ids(prior_envelope)?;
+    let prior_cp = required_str(prior_envelope, "consensus_protocol")?;
     let role_str = match role {
         Role::Founder => "founder",
         Role::Member => "member",
@@ -173,7 +179,7 @@ pub fn build_membership_change(
     let cp = consensus_protocol
         .map(str::to_string)
         .unwrap_or_else(|| accord_consensus_protocol(new_member_key_ids.len()));
-    json!({
+    Ok(json!({
         "family_key_id": group_key_id,
         "family_name": group_name,
         "members": members,
@@ -183,7 +189,7 @@ pub fn build_membership_change(
             "prior_member_key_ids": prior_members,
             "prior_consensus_protocol": prior_cp,
         },
-    })
+    }))
 }
 
 /// The structural invariants of a membership change (everything but who
@@ -294,7 +300,8 @@ mod tests {
             Role::Member,
             false,
             Some("quorum:2/2"),
-        );
+        )
+        .expect("a well-formed prior");
         assert_eq!(change["supersedes"]["prior_member_key_ids"], json!(["a"]));
         validate_membership_change_structure(&prior(), &change, &dir).unwrap();
 
@@ -307,6 +314,37 @@ mod tests {
         ));
     }
 
+    /// **I2192 (v62.0.0, SM-fix1)** — a prior envelope missing its
+    /// `family_key_id`, `family_name` or `consensus_protocol` (or with
+    /// unparseable `members`) is REFUSED by name, never defaulted (v22 read a
+    /// missing protocol as `quorum:2/3` and a missing id as the humanity
+    /// accord's).
+    #[test]
+    fn i2192_a_prior_envelope_missing_a_member_is_refused_not_defaulted() {
+        for (member, missing) in [
+            ("family_key_id", "`family_key_id`"),
+            ("family_name", "`family_name`"),
+            ("consensus_protocol", "`consensus_protocol`"),
+            ("members", "`members`"),
+        ] {
+            let mut p = prior();
+            p.as_object_mut().expect("an object").remove(member);
+            match build_membership_change(&p, &["a".to_string()], Role::Member, false, None) {
+                Err(AccordGenesisError::MalformedEnvelope { detail }) => assert!(
+                    detail.contains(missing) || detail.contains("members"),
+                    "I2192 {member}: {detail}"
+                ),
+                other => panic!("I2192 {member}: refused, not defaulted: {other:?}"),
+            }
+        }
+        let mut p = prior();
+        p["consensus_protocol"] = json!(3);
+        assert!(
+            build_membership_change(&p, &["a".to_string()], Role::Member, false, None).is_err(),
+            "I2192 a non-string protocol is refused"
+        );
+    }
+
     #[test]
     fn one_key_two_seats_and_a_weak_quorum_are_refused() {
         let dir = [member("a", "SAME"), member("b", "SAME")];
@@ -316,7 +354,8 @@ mod tests {
             Role::Member,
             false,
             Some("quorum:2/2"),
-        );
+        )
+        .expect("a well-formed prior");
         assert!(matches!(
             validate_membership_change_structure(&prior(), &change, &dir),
             Err(AccordGenesisError::DuplicateFounderKey { .. })
@@ -328,7 +367,8 @@ mod tests {
             Role::Member,
             false,
             Some("quorum:1/2"),
-        );
+        )
+        .expect("a well-formed prior");
         assert!(matches!(
             validate_membership_change_structure(&prior(), &weak, &dir),
             Err(AccordGenesisError::WeakQuorum { m: 1, n: 2 })

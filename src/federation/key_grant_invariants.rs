@@ -817,7 +817,13 @@ pub mod two_node {
         D: FederationDirectory + ?Sized,
     {
         let mut out = Vec::new();
-        for served in dir.list_attestations_since(None, 100_000).await.unwrap() {
+        // v62.0.0 (RL-fix2c) — the fixture inspects its own store, not a serve.
+        for served in crate::federation::edition2::serve::as_internal_read(
+            dir.list_attestations_since(None, 100_000),
+        )
+        .await
+        .unwrap()
+        {
             let row = served.attestation;
             if row.attesting_key_id != signer
                 || !crate::federation::key_grant::is_key_grant_row(&row)

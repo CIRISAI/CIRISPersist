@@ -25,6 +25,7 @@ job, because a broken instrument produces a report that looks like evidence.
 | diff mutants | `scripts/mutants_diff.sh` | reports.yml `mutants-diff` (every `release-*` PR, PR label `run-mutants`, dispatch) | **report**; `scripts/mutants.sh`'s scoped matrix is the gate ([MUTATION_TESTING.md](MUTATION_TESTING.md)) |
 | evidence pointers | `scripts/evidence_pointers.py check` (+ `_test.py`) | certify fast stage (`evidenceptr`); ci.yml `lint`; ci-hygiene `evidence-pointers` (daily) | **GATE** |
 | earlier-form doors | `scripts/earlier_form_doors.py check` (+ `--self-test`) | certify fast stage (`earlierform`); ci.yml `lint` | **GATE** |
+| one strict-majority spelling, no fixed count | `scripts/one_threshold.py check` (+ `--self-test`) | certify fast stage (`onethreshold`); ci.yml `lint` | **GATE** |
 | Constitution pointers | `scripts/evidence_pointers.py register <claims.tsv>` | certify fast stage (`evidenceptrcc`, when a Constitution checkout is found) | **report** |
 
 Installing the cargo tools locally:

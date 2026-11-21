@@ -2970,7 +2970,9 @@ impl PyEngine {
 
     /// v24.1.0 (CIRISPersist#561) — **may `peer_key_id` carry our
     /// relay traffic?** Returns the verdict as JSON
-    /// (`{eligible, valid_until, via_root}`).
+    /// (`{eligible, valid_until, via_root, arm, refusal}`; v62.0.0 RL-fix4: `arm`
+    /// is `contact` | `own_node` | `seat` | `onion_root`, `refusal` the failed
+    /// conjunct's snake_case token).
     ///
     /// CIRISEdge#430 gates A/V relay HOP SELECTION on this, and
     /// selection is a hot path (reparent on peer churn, per-substream
@@ -3156,7 +3158,7 @@ impl PyEngine {
     /// [`TrustRootVerdict`](crate::federation::trust_root::TrustRootVerdict)
     /// as JSON: `{edge_exists, root_self_declares, charter_has_recovery,
     /// last_drill_at, drill_freshness, halt_latched, valid, root_kind,
-    /// charter_quorum?, bounded_until?, not_rooted?}`. `not_rooted` (v62.0.0)
+    /// signer_count?, bounded_until?, not_rooted?}`. `not_rooted` (v62.0.0)
     /// is present only when the id holds a trust-root community record whose
     /// chain does not root: the reason it is not valid.
     ///
@@ -6594,6 +6596,28 @@ impl PyEngine {
         })
     }
 
+    /// v62.0.0 (RL-fix2c) — **what this node will serve a third party**, as
+    /// JSON `{"node_key_id": str|null, "rooted": bool,
+    /// "withholds_federation_tier": bool}`. `node_key_id` is `null` when the
+    /// signer could not derive one (a classical-only signer, a P-256 keystore
+    /// fallback, a failed hardware public-key read): warn loudly at startup.
+    fn serve_standing_json(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let v = py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::edition2::serve::serve_standing(dir.as_ref())
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })?;
+            serde_json::to_string(&v)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
     /// v62.0.0 (RL-fix2) — **record a contact's dial hint** from a decoded
     /// node code: `node` (identity-ref), `transport_identity_hex` (64 bytes,
     /// X25519 ‖ Ed25519), `hints_json` (a JSON list, most preferred first,
@@ -8118,111 +8142,6 @@ impl PyEngine {
             serde_json::to_string(&hints).map_err(|e| {
                 PyRuntimeError::new_err(format!("canonical bootstrap hints JSON encode: {e}"))
             })
-        })
-    }
-
-    /// v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — **withdraw**
-    /// the `canonical` role from `key_id` (the DESTRUCTIVE Trust Root op).
-    /// `proposal_digest` names a STORED accord live-quorum proposal (#302) whose
-    /// payload commits to `(withdraw, key_id)`. Persist re-tallies ITS OWN
-    /// cryptographically-verified `accord_participation` rows against the
-    /// accord-holder roster (A1/B1/C1) at the 2-of-3 destructive threshold — a
-    /// caller cannot fabricate a quorum. Records a durable tombstone the
-    /// admission gate consults, so a re-add over anti-entropy is refused.
-    fn withdraw_canonical_role(
-        &self,
-        py: Python<'_>,
-        key_id: &str,
-        proposal_digest: &str,
-    ) -> PyResult<()> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let key_id = key_id.to_owned();
-            let proposal_digest = proposal_digest.to_owned();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        crate::federation::withdraw_canonical_role(
-                            backend.as_ref(),
-                            &key_id,
-                            &proposal_digest,
-                        )
-                        .await
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        crate::federation::withdraw_canonical_role(
-                            backend.as_ref(),
-                            &key_id,
-                            &proposal_digest,
-                        )
-                        .await
-                    })
-                }
-            })
-            .map_err(federation_err_to_py)
-        })
-    }
-
-    /// v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — **supersede**
-    /// (rotate) a canonical server. `signed_key_record_json` is the successor's
-    /// `SignedKeyRecord` (admitted via the normal anchor-scrub add-gate);
-    /// `proposal_digest` names a STORED accord proposal committing to the
-    /// supersede `old_key_id → successor` payload (persist re-tallies its own
-    /// verified participations at the 2-of-3 destructive threshold). Admits the
-    /// successor AND records `old_key_id`'s withdrawal (`superseded_by =
-    /// successor`).
-    fn supersede_canonical(
-        &self,
-        py: Python<'_>,
-        old_key_id: &str,
-        signed_key_record_json: &str,
-        proposal_digest: &str,
-    ) -> PyResult<()> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let old_key_id = old_key_id.to_owned();
-            let proposal_digest = proposal_digest.to_owned();
-            let new_record: crate::federation::SignedKeyRecord =
-                serde_json::from_str(signed_key_record_json).map_err(|e| {
-                    PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}"))
-                })?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        crate::federation::supersede_canonical(
-                            backend.as_ref(),
-                            &old_key_id,
-                            new_record,
-                            &proposal_digest,
-                        )
-                        .await
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        crate::federation::supersede_canonical(
-                            backend.as_ref(),
-                            &old_key_id,
-                            new_record,
-                            &proposal_digest,
-                        )
-                        .await
-                    })
-                }
-            })
-            .map_err(federation_err_to_py)
         })
     }
 

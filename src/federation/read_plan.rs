@@ -422,8 +422,20 @@ pub(crate) struct ServedRows {
 /// subject read and [`serve_stream_statement`] AND these in; none spells its
 /// own. The row-type filter reads the enforcement in force on the calling
 /// task, so build on the task, before a closure moves to a pool.
+///
+/// v62.0.0 (RL-fix2b; CC 5.3.4, lead ruling (A)) — `rooted` is THIS node's
+/// standing ([`edition2::serve::this_node_is_rooted`](super::edition2::serve),
+/// asked ONCE per call by the caller): `false` adds the serve wait
+/// ([`served_while_unrooted_sql`]), so a federation-tier row a node that is
+/// not rooted must not serve is excluded in the SQL, before the page is cut,
+/// and paging neither stalls nor truncates.
 #[must_use]
-pub(crate) fn serve_rule_parts(dialect: Dialect, alias: &str, prefix: &str) -> Vec<String> {
+pub(crate) fn serve_rule_parts(
+    dialect: Dialect,
+    alias: &str,
+    prefix: &str,
+    rooted: bool,
+) -> Vec<String> {
     let mut parts = vec![format!(
         "{alias}.tier = '{}'",
         super::types::attestation_tier::FEDERATION
@@ -433,7 +445,32 @@ pub(crate) fn serve_rule_parts(dialect: Dialect, alias: &str, prefix: &str) -> V
         dialect.row_type(),
     ));
     parts.push(super::steward_purge::served_under_purge_sql(alias, prefix));
+    if !rooted {
+        parts.push(served_while_unrooted_sql(dialect, alias));
+    }
     parts
+}
+
+/// v62.0.0 (RL-fix2b) — **the SQL form of the serve wait**: the rows a node
+/// that is not rooted still serves. A row at no commons scope, an owner
+/// binding ([`owner_binding_marker_sql`]), or a bootstrap kind by its
+/// dimension (`edition2::serve::BOOTSTRAP_DIMENSION_PREFIXES`). The same
+/// decision as `edition2::serve::row_waits_unrooted`, negated.
+pub(crate) fn served_while_unrooted_sql(dialect: Dialect, alias: &str) -> String {
+    let commons = super::types::cohort_scope::commons()
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let bootstrap = super::edition2::serve::BOOTSTRAP_DIMENSION_PREFIXES
+        .iter()
+        .map(|p| format!("{alias}.dimension LIKE '{p}%'"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    format!(
+        "({alias}.cohort_scope NOT IN ({commons}) OR {owner} OR {bootstrap})",
+        owner = owner_binding_marker_sql(dialect, alias)
+    )
 }
 
 /// The dialect-specific spellings the serve-stream statements read. The
@@ -543,6 +580,7 @@ pub(crate) fn serve_stream_statement(
     narrowing: ServeNarrowing<'_>,
     since: Option<&ServePosition>,
     fetch: i64,
+    rooted: bool,
 ) -> Statement {
     use super::types::attestation_type as at;
     let sp = serve_spelling(dialect);
@@ -580,7 +618,7 @@ pub(crate) fn serve_stream_statement(
             ));
         }
     }
-    parts.extend(serve_rule_parts(dialect, "fa", prefix));
+    parts.extend(serve_rule_parts(dialect, "fa", prefix, rooted));
     if let Some((at_, id)) = ServePosition::resume_after(since) {
         binds.push(Bind::Time(at_));
         let a = placeholder(dialect, &binds);

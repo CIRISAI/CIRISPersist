@@ -513,9 +513,9 @@ pub mod test_support {
     /// [`check_canonical_role_admission`](crate::federation::admission::check_canonical_role_admission)
     /// verifies). Scrub #1 fills the base `scrub_key_id`/`scrub_signature_*`
     /// fields; scrubs #2..N ride `additional_scrubs`. Each scrub is a REAL
-    /// hybrid signature by the scrubber's keypair, so the 2-of-3 add gate
+    /// hybrid signature by the scrubber's keypair, so the strict-majority add gate
     /// (`verify_quorum_policy`) counts it. Pass the accord-holder `Identity`s as
-    /// `scrubbers` (2 distinct for a 2-of-3 admit). `envelope` lets a test embed
+    /// `scrubbers` (2 distinct: a strict majority of a three-holder fixture). `envelope` lets a test embed
     /// e.g. a `transport_hints` array (the bootstrap-dial-set surface).
     ///
     /// # v31.0.0 (CIRISPersist#659) — BREAKING: the subject is now BOUND
@@ -638,7 +638,7 @@ pub mod test_support {
     /// column is not part of the signed bytes — matching the production
     /// admission model: role CLAIM is the column, role CONFERRAL is the
     /// re-verified co-scrub against the accord roster). Pass 2 distinct
-    /// accord-holder `Identity`s (a 2-of-3 admit) as `scrubbers`, register
+    /// accord-holder `Identity`s (a strict majority of a three-holder fixture) as `scrubbers`, register
     /// them with [`register_accord_holder`], then read back with
     /// [`crate::federation::admission::has_accord_conferred_role_over_roster`] over
     /// their key_ids.
@@ -786,7 +786,7 @@ pub mod test_support {
     }
 
     /// v21.14.0 (CIRISPersist#534) — the ONE backend-agnostic conferral
-    /// primitive: stand up a fresh 2-of-3 accord family, register its pinned
+    /// primitive: stand up a fresh three-holder accord family (strict majority: two), register its pinned
     /// pubkeys, and write a `key_id` canonical record whose `roles` are
     /// genuinely co-scrubbed by two distinct holders — so
     /// [`crate::federation::admission::has_accord_conferred_role_over_roster`] (over
@@ -894,7 +894,7 @@ pub mod test_support {
     /// testing what it always tested and only the CONFERRAL changes: the key
     /// stops asserting its own privileged type and starts being granted it.
     /// Pass 2 distinct [`register_genesis_accord_roster`] holders for a
-    /// 2-of-3 admit.
+    /// strict-majority admit (two of a three-holder fixture).
     pub fn accord_conferred(
         mut record: crate::federation::types::KeyRecord,
         scrubbers: &[&Identity],
@@ -968,7 +968,7 @@ pub mod test_support {
         let holders = register_genesis_accord_roster(directory).await?;
         assert!(
             holders.len() >= 2,
-            "the genesis accord roster must have at least 2 holders to reach a 2-of-3 quorum"
+            "the genesis accord roster must have at least 2 holders to reach a strict-majority quorum"
         );
         let record = accord_conferred(record, &[&holders[0], &holders[1]]);
         directory
@@ -2596,7 +2596,7 @@ pub mod test_support {
     /// Deleted with the earlier form (no edition-2 meaning): the charter's
     /// `additional_scrubs` storage round-trip and `distinct_scrub_count`
     /// (#556's column; an edition-2 voice is its own statement), and the
-    /// family `CharterQuorum` accounting (`charter_quorum` is `None` on the
+    /// family `SignerCount` accounting (`signer_count` is `None` on the
     /// community arm; the count is the chain verdict's, read here through
     /// `chain_standing_at`).
     ///

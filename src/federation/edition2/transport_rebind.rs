@@ -39,7 +39,7 @@
 //!   A seat signing its own re-bind is refused by this rule.
 //! - A transit key that is not 1216 bytes: `xwing_pubkey_wrong_length`.
 //! - Otherwise the voice is kept. The row is `Row` once its distinct holder
-//!   voices reach the count ([`required_count`]), `Pending` before.
+//!   voices reach the count ([`accord_threshold`](crate::federation::admission::accord_threshold), the one spelling), `Pending` before.
 //!
 //! # The read ([`seat_transit_key`], [`rebind_held_for`])
 //!
@@ -79,13 +79,6 @@ pub const TRANSIT_MEMBER: &str = "transit_xwing_pubkey";
 
 /// The `refs` role naming the bundle a re-bind is counted over.
 pub const HEAD_ROLE: &str = "head";
-
-/// The count a re-bind needs over `holders` holders: a strict majority (CC
-/// ruling).
-#[must_use]
-pub const fn required_count(holders: usize) -> usize {
-    holders / 2 + 1
-}
 
 fn unseated(detail: impl Into<String>) -> Error {
     Error::malformed_row(PLANE, malformed_row::RESERVED_FAMILY_UNSEATED, detail)
@@ -165,8 +158,11 @@ where
     // re-bind plane is FINAL: it reads the row's NAMED past only).
     super::fold::reads(super::fold::Dep::Row(head));
     let in_force = genesis_in_force(dir).await?;
-    if !in_force.tips().iter().any(|t| t.object_id == head.0) {
-        if in_force.valid.iter().any(|p| p.object_id == head.0) {
+    // v62.0.0 (HL-fix1) — the one head reading (`head_standing`), shared
+    // with the halt lifecycle door.
+    let standing = in_force.head_standing(&head.0);
+    if !matches!(standing, super::genesis::HeadStanding::InForce(_)) {
+        if matches!(standing, super::genesis::HeadStanding::Superseded) {
             // v62.0.0 (wave GC5; CC 2.7.3) — whether a LATER bundle
             // superseded the named one is another statement's word: the
             // voice is HELD (`rebind_head_not_in_force`), concluding
@@ -206,7 +202,8 @@ where
     let voices = dir.edition2_voices(&row.row_id).await?;
     let counted = counted_holders(in_force.holders(), &voices);
     Ok(
-        if counted.len() >= required_count(in_force.holders().len()) {
+        if counted.len() >= crate::federation::admission::accord_threshold(in_force.holders().len())
+        {
             StatementOutcome::Row {
                 row_id: row.row_id,
                 new,
@@ -278,7 +275,9 @@ where
         let Some(over) = run.iter().find(|p| p.object_id == head.0) else {
             continue;
         };
-        if counted_holders(&over.holders, &voices).len() < required_count(over.holders.len()) {
+        if counted_holders(&over.holders, &voices).len()
+            < crate::federation::admission::accord_threshold(over.holders.len())
+        {
             continue;
         }
         let Some(at) = payload.get_text("asserted_at").and_then(Value::as_u64) else {

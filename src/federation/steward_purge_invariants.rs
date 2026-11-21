@@ -4956,6 +4956,8 @@ mod run {
         let node =
             crate::federation::edition2::fixture_switch::put_key(&b, "inv-node", &["node"]).await;
         b.set_node_key_id(node);
+        // v62.0.0 (RL-fix2c) — THIS node, rooted (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_this_node(&b).await;
         Some(b)
     });
 
@@ -4972,6 +4974,8 @@ mod run {
         let node =
             crate::federation::edition2::fixture_switch::put_key(&b, "inv-node", &["node"]).await;
         b.set_node_key_id(node);
+        // v62.0.0 (RL-fix2c) — THIS node, rooted (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_this_node(&b).await;
         Some(b)
     });
 
@@ -4987,6 +4991,8 @@ mod run {
         let node =
             crate::federation::edition2::fixture_switch::put_key(&b, "inv-node", &["node"]).await;
         b.set_node_key_id(node);
+        // v62.0.0 (RL-fix2c) — THIS node, rooted (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_this_node(&b).await;
         Some(b)
     });
 
@@ -5003,6 +5009,8 @@ mod run {
         let node =
             crate::federation::edition2::fixture_switch::put_key(&b, "inv-node", &["node"]).await;
         b.set_node_key_id(node);
+        // v62.0.0 (RL-fix2c) — THIS node, rooted (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_this_node(&b).await;
         Some(b)
     });
 
@@ -5201,6 +5209,12 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
+        // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+            &b,
+            "rl2c-steward-purge",
+        )
+        .await;
         drop(b);
         let conn = rusqlite::Connection::open(&path).unwrap();
         let mut columns: Vec<(String, String)> = conn

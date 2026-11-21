@@ -36,7 +36,7 @@ use super::group::{
 };
 use super::liveness::statement_parts;
 use super::names::RowId;
-use crate::federation::trust_root::CharterQuorum;
+use crate::federation::trust_root::SignerCount;
 use crate::federation::types::Community;
 use crate::federation::{Error, FederationDirectory};
 
@@ -56,6 +56,73 @@ where
         .any(|h| h.identity_ref == key_id))
 }
 
+/// v62.0.0 (TR-fix2; CC rc21 3.2 T7 "The active founder set", conditions
+/// three and four) — **does the holder `key_id` count as an active founder at
+/// `when_ms`** beyond being a holder of the bundle in force? Read from
+/// signer-stamped rows only, no clock:
+///
+/// - **`revoked_after`**: no honoured revocation of the holder's placed key is
+///   in effect at `when_ms` (a bound at or before it, or a revocation with no
+///   bound). "t < the effective revoked_after of f's key".
+/// - **not `node`-bearing**: no valid record of that key whose
+///   `identity_type` includes `node` is asserted at or before `when_ms`. That
+///   covers "a later key record that adds `node` is a resignation at that
+///   record's `asserted_at`". At seating the record cannot be node-bearing:
+///   Verify's bundle reader requires `accord_holder` on a holder record
+///   (`holder_not_accord_holder`), and a set holding `accord_holder` with
+///   `node` is refused at the key door (CC 2.4.1.1; I1870). This check is
+///   kept for every record of the key anyway (no reliance on door order).
+///
+/// Returns `(counts, next)`, where `next` is the earliest such instant after
+/// `when_ms` (a bound for a cached verdict). A key that is not a holder of
+/// the bundle in force answers `(false, None)`.
+///
+/// # Errors
+/// Directory read failures.
+pub async fn holder_founder_counts_at<F>(
+    dir: &F,
+    key_id: &str,
+    when_ms: u64,
+) -> Result<(bool, Option<u64>), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let in_force = genesis_in_force(dir).await?;
+    let Some(kid) = in_force
+        .holders()
+        .iter()
+        .find(|h| h.identity_ref == key_id)
+        .map(|h| h.kid)
+    else {
+        return Ok((false, None));
+    };
+    let held = super::ingest::held_keys_for_kid(dir, &kid).await?;
+    let mut next: Option<u64> = None;
+    let mut later = |t: u64| {
+        if t > when_ms {
+            next = Some(next.map_or(t, |n: u64| n.min(t)));
+        }
+    };
+    for r in held.honoured_revocations(&kid) {
+        match r.revoked_after {
+            None => return Ok((false, None)),
+            Some(b) if b <= when_ms => return Ok((false, None)),
+            Some(b) => later(b),
+        }
+    }
+    if let Ok(records) = held.valid_records(&kid) {
+        for v in records {
+            if v.record.identity_type.iter().any(|t| t == "node") {
+                if v.record.asserted_at <= when_ms {
+                    return Ok((false, None));
+                }
+                later(v.record.asserted_at);
+            }
+        }
+    }
+    Ok((true, next))
+}
+
 /// The identity-refs of the holders of the bundle in force (empty: none
 /// held). An input of the standing cache's key.
 ///
@@ -73,14 +140,8 @@ where
         .collect())
 }
 
-/// The count a holders' act needs over `holders` holders: a strict majority.
-#[must_use]
-pub const fn holders_required(holders: usize) -> usize {
-    holders / 2 + 1
-}
-
 /// **The birth's accord count**: the distinct holders of the bundle in force
-/// among `signers`, against [`holders_required`]. With no bundle held the
+/// among `signers`, against [`accord_threshold`](crate::federation::admission::accord_threshold). With no bundle held the
 /// roster is empty and the count is never met.
 ///
 /// # Errors
@@ -88,15 +149,16 @@ pub const fn holders_required(holders: usize) -> usize {
 pub async fn bundle_quorum_over<F>(
     dir: &F,
     signers: &BTreeSet<String>,
-) -> Result<CharterQuorum, Error>
+) -> Result<SignerCount, Error>
 where
     F: FederationDirectory + ?Sized,
 {
     let holders = bundle_holder_refs(dir).await?;
     let distinct_holders = holders.iter().filter(|h| signers.contains(*h)).count();
-    Ok(CharterQuorum {
+    Ok(SignerCount {
         distinct_holders,
-        required: holders_required(holders.len()),
+        // TR-fix1 — the ONE spelling of the holders' strict majority.
+        required: crate::federation::admission::accord_threshold(holders.len()),
         roster_size: holders.len(),
     })
 }

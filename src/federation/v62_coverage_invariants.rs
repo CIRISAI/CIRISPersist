@@ -2552,3 +2552,230 @@ async fn i2230_i2231_postgres() {
     };
     Box::pin(i2230_i2231_canonical_is_the_bundle_seat(&b)).await;
 }
+
+/// **I2232** (TR-fix1; CC rc21 4.2.1, CC 2.6.1.11: a canonical changes only by
+/// a later genesis bundle) — with the bundle in force, no store write can
+/// un-seat a canonical (the withdraw and supersede doors and, TR-fix2, the
+/// backend writer are deleted; `record_canonical_withdrawal` refuses by name): the seat stays canonical (`is_canonical_effective`,
+/// `canonical_servers_among`, `serves_under_seat`'s seat leg). A later bundle
+/// (an amend by a strict majority of the holders) that lists only the second
+/// seat un-seats the first, and only it does.
+pub(crate) async fn i2232_only_a_later_bundle_reseats(d: &dyn FederationDirectory) {
+    use crate::federation::admission::{canonical_servers_among, is_canonical_effective};
+    let c = fixture_genesis::bundle_v2();
+    fixture_genesis::install_v2(d)
+        .await
+        .expect("I2232: the bundle installs");
+    let (s0, s1) = (
+        c.serve_node_identity_ref(0).to_owned(),
+        c.serve_node_identity_ref(1).to_owned(),
+    );
+    assert!(
+        is_canonical_effective(d, &s0).await.unwrap(),
+        "I2232: seated"
+    );
+    // TR-fix2: the backend writer is retired; it refuses by name.
+    assert!(
+        matches!(
+            d.record_canonical_withdrawal(&s0, None, &"11".repeat(32))
+                .await,
+            Err(crate::federation::Error::Unsupported { .. })
+        ),
+        "I2232: no store write un-seats a canonical"
+    );
+    assert!(
+        is_canonical_effective(d, &s0).await.unwrap(),
+        "I2232: a tombstone does not un-seat a bundle seat"
+    );
+    assert_eq!(
+        canonical_servers_among(d, vec![s0.clone(), s1.clone()])
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "I2232: both seats are canonical servers"
+    );
+    let later = fixture_genesis::later_v2(
+        c,
+        &fixture_genesis::HOLDER_SEEDS,
+        &fixture_genesis::SERVE_NODE_SEEDS[1..],
+        &fixture_genesis::HOLDER_SEEDS[..2],
+    );
+    fixture_genesis::install_ceremony_v2(d, &later)
+        .await
+        .expect("I2232: the later bundle installs at two of three holders");
+    assert!(
+        !is_canonical_effective(d, &s0).await.unwrap(),
+        "I2232: the later bundle un-seats the first seat"
+    );
+    assert!(
+        is_canonical_effective(d, &s1).await.unwrap(),
+        "I2232: and keeps the second"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2232_sqlite() {
+    Box::pin(i2232_only_a_later_bundle_reseats(&sqlite_with_node().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2232_postgres() {
+    let Some(b) = postgres_with_node().await else {
+        return;
+    };
+    Box::pin(i2232_only_a_later_bundle_reseats(&b)).await;
+}
+
+/// A statement by holder seed `seed`'s own key under its identity: a
+/// `key:revocation` (`revoked_after`) or a later `key:record` of the same key
+/// carrying `identity_type`.
+fn holder_self_statement(seed: u8, family: &str, members: Vec<(&str, Value)>) -> Vec<u8> {
+    let k = fixture_genesis::test_key(seed);
+    let iref = fixture_genesis::identity_ref_of(seed);
+    let mut m: Vec<(Value, Value)> = members
+        .into_iter()
+        .map(|(n, v)| (Value::Text(n.to_owned()), v))
+        .collect();
+    m.push((Value::Text("author".into()), Value::Text(iref.clone())));
+    m.sort_by_key(|(n, _)| ciris_verify_core::cde::encode(n));
+    ciris_verify_core::edition2::sign_row_statement(
+        &k,
+        &iref,
+        &iref,
+        "scores",
+        family,
+        &Value::Map(m),
+        vec![],
+    )
+    .expect("a holder signs")
+}
+
+async fn w1b_standing(
+    d: &dyn FederationDirectory,
+    root: &str,
+) -> crate::federation::canonical_community::StoredStanding {
+    crate::federation::canonical_community::chain_standing_at(d, root, crate::host::clock::now())
+        .await
+        .unwrap()
+}
+
+/// **I2233** (TR-fix2; CC rc21 3.2 T7, the active founder set, condition
+/// three: "t < the effective revoked_after of f's key") — W1b's root (holders
+/// 1, 2, 3 founding at `quorum:2/3`) is Rooted; holder 3's own revocation of
+/// its key with `revoked_after` in the past takes it out of the active set:
+/// 2 = M, Stalled. Being a holder of the bundle in force does not stand in.
+pub(crate) async fn i2233_a_revoked_holder_is_not_an_active_founder(d: &dyn FederationDirectory) {
+    use crate::federation::canonical_community::StoredStanding;
+    use crate::federation::edition2::fixture_trust_root::rooted_trust_root;
+    let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
+    assert!(
+        matches!(w1b_standing(d, &r.root).await, StoredStanding::Rooted(_)),
+        "I2233: three holder founders, Rooted"
+    );
+    let now = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap();
+    let rev = holder_self_statement(
+        3,
+        crate::federation::edition2::liveness::KEY_REVOCATION_FAMILY,
+        vec![
+            ("asserted_at", Value::Uint(now - 60_000)),
+            ("revoked_after", Value::Uint(now - 60_000)),
+        ],
+    );
+    e2::put_statement(d, &rev)
+        .await
+        .expect("I2233: holder 3 revokes its key");
+    assert!(
+        matches!(
+            w1b_standing(d, &r.root).await,
+            StoredStanding::Stalled { .. }
+        ),
+        "I2233: a founder past its key's revoked_after is not active: 2 = M, Stalled"
+    );
+}
+
+/// **I2234** (TR-fix2; CC rc21 3.2 T7, condition four, and "a later key
+/// record that adds `node` is a resignation at that record's `asserted_at`")
+/// — holder 2's later record of the same key, `identity_type` {node}, takes
+/// it out of the active set from its `asserted_at`: 2 = M, Stalled. (A MIXED
+/// set {accord_holder, node} is refused at the key door, CC 2.4.1.1, I1870,
+/// so a holder's seating record is never node-bearing.)
+pub(crate) async fn i2234_a_node_bearing_holder_is_not_a_founder(d: &dyn FederationDirectory) {
+    use crate::federation::canonical_community::StoredStanding;
+    use crate::federation::edition2::fixture_trust_root::rooted_trust_root;
+    let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
+    assert!(
+        matches!(w1b_standing(d, &r.root).await, StoredStanding::Rooted(_)),
+        "I2234: Rooted"
+    );
+    let now = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap();
+    let k = fixture_genesis::test_key(2);
+    let types = Value::Array(
+        ["node"]
+            .iter()
+            .map(|t| Value::Text((*t).to_owned()))
+            .collect(),
+    );
+    let rec = holder_self_statement(
+        2,
+        ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY,
+        vec![
+            ("key", ciris_verify_core::edition2::cose_key(k.public_key())),
+            ("asserted_at", Value::Uint(now - 60_000)),
+            // a `node` record ends (CC 2.4.1.1's node-key window)
+            (
+                "valid_until",
+                Value::Uint(now + 30 * fixture_genesis::DAY_MS),
+            ),
+            ("identity_type", types),
+        ],
+    );
+    e2::put_statement(d, &rec)
+        .await
+        .expect("I2234: holder 2's node-bearing record lands");
+    assert!(
+        matches!(
+            w1b_standing(d, &r.root).await,
+            StoredStanding::Stalled { .. }
+        ),
+        "I2234: a node-bearing founder does not count: 2 = M, Stalled"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2233_sqlite() {
+    Box::pin(i2233_a_revoked_holder_is_not_an_active_founder(
+        &sqlite_with_node().await,
+    ))
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2233_postgres() {
+    let Some(b) = postgres_with_node().await else {
+        return;
+    };
+    Box::pin(i2233_a_revoked_holder_is_not_an_active_founder(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2234_sqlite() {
+    Box::pin(i2234_a_node_bearing_holder_is_not_a_founder(
+        &sqlite_with_node().await,
+    ))
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2234_postgres() {
+    let Some(b) = postgres_with_node().await else {
+        return;
+    };
+    Box::pin(i2234_a_node_bearing_holder_is_not_a_founder(&b)).await;
+}

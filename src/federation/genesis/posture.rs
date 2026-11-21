@@ -785,10 +785,20 @@ pub(crate) async fn exercise_seedless_gate_refusals(dir: &dyn FederationDirector
 
     // 4. canonical_withdraw_authority — a DESTRUCTIVE constitutional op.
     record(
-        admission::verify_canonical_withdraw_authority(dir, "some-canonical", "digest")
-            .await
-            .expect_err("a canonical withdraw on a rootless node must REFUSE"),
-        "verify_canonical_withdraw_authority",
+        // v62.0.0 (TR-fix1) — the withdraw door is deleted; the authority core
+        // it ran is still reached by the accord-carriage projection.
+        admission::verify_withdrawal_authority_over_roster(
+            dir,
+            "digest",
+            admission::OP_WITHDRAW_CANONICAL,
+            "some-canonical",
+            &admission::accord_holder_roster(dir)
+                .await
+                .unwrap_or_default(),
+        )
+        .await
+        .expect_err("a canonical withdraw on a rootless node must REFUSE"),
+        "verify_withdrawal_authority_over_roster",
     );
 
     // 5. family_charter_admission — the #632 inversion in miniature. With no

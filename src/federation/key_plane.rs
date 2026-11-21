@@ -2124,7 +2124,11 @@ pub async fn key_records_on_the_plane(
     let mut out = Vec::new();
     let mut since = None;
     loop {
-        let page = dir.list_attestations_since(since.clone(), PAGE).await?;
+        // v62.0.0 (RL-fix2b) — persist's own walk: no serve wait.
+        let page = super::edition2::serve::as_internal_read(
+            dir.list_attestations_since(since.clone(), PAGE),
+        )
+        .await?;
         let Some(last) = page.last() else { break };
         since = Some(last.resume_pair());
         let full = page.len() as u32 == PAGE;

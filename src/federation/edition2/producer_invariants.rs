@@ -48,6 +48,18 @@ pub(crate) mod bodies {
         to: &Engine,
         cursor: &mut Option<StatementCursor>,
     ) -> Vec<Vec<u8>> {
+        // v62.0.0 (RL-fix2c) — the serving node, rooted (the serve wait, CC
+        // 5.3.4): idempotent per directory, so each delivery re-puts nothing.
+        crate::federation::edition2::serve_wait_invariants::test_support::root_this_node(
+            from.federation_directory().as_ref(),
+        )
+        .await;
+        // ... and the receiving node too, so the root's own rows A serves
+        // (founded over the bundle's holders) are rows B already holds.
+        crate::federation::edition2::serve_wait_invariants::test_support::root_this_node(
+            to.federation_directory().as_ref(),
+        )
+        .await;
         // Served to B as B (the filtered listing: the serve rule plus B's
         // audience), never read out of A's store.
         let requester = to.local_derived_key_id().await.ok();
@@ -62,6 +74,13 @@ pub(crate) mod bodies {
             }
             *cursor = page.next;
             for served in page.statements {
+                // v62.0.0 (RL-fix2c) — a signed object (the serving node's
+                // genesis bundle voices, served since its root was stood up)
+                // crosses at the import door, never the statement door.
+                if crate::federation::edition2::names::RowId::of_statement(&served.bytes).is_none()
+                {
+                    continue;
+                }
                 to.put_edition2_statement(&served.bytes, None)
                     .await
                     .unwrap_or_else(|e| panic!("B admits A's statement: {e}"));

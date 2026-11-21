@@ -164,34 +164,11 @@ pub(crate) async fn self_roster_unheld_body(d: &dyn FederationDirectory) {
 /// I3753: rival tombstones fold to one, in either order.
 pub(crate) async fn withdrawal_fold_choice_body(d: &dyn FederationDirectory) {
     let tag = run_tag();
-    let (lo, hi) = ("aa".repeat(32), "bb".repeat(32));
-    // Canonical (V095): low first, then high; and high first, then low.
-    for (n, order) in [[&lo, &hi], [&hi, &lo]].into_iter().enumerate() {
-        let key = format!("gc3-cw-{n}-{tag}");
-        for digest in order {
-            d.record_canonical_withdrawal(&key, None, digest)
-                .await
-                .expect("I3753: a rival tombstone is never refused");
-        }
-        let held = d
-            .lookup_canonical_withdrawal(&key)
-            .await
-            .expect("read")
-            .expect("I3753: one tombstone is held");
-        assert_eq!(
-            held.authority_decision_digest, lo,
-            "I3753: the lower digest is the tombstone, arrival order {n}"
-        );
-        // A repeat of the loser changes nothing.
-        d.record_canonical_withdrawal(&key, None, &hi)
-            .await
-            .expect("I3753: the loser is absorbed");
-        let again = d.lookup_canonical_withdrawal(&key).await.unwrap().unwrap();
-        assert_eq!(
-            again.authority_decision_digest, lo,
-            "I3753: still the lower"
-        );
-    }
+    let lo = "aa".repeat(32);
+    // v62.0.0 (TR-fix2): the canonical half (V095) is DELETED with the
+    // backend writer: a canonical is withdrawn only by a later genesis
+    // bundle (CC rc21 4.2.1), and `record_canonical_withdrawal` refuses by
+    // name on every backend.
     // Role (V104): the same choice, and `None` sorts below a successor.
     for (n, order) in [[Some("gc3-succ"), None], [None, Some("gc3-succ")]]
         .into_iter()

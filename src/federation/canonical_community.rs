@@ -37,7 +37,7 @@
 //!
 //! # Birth by the accord, amendment by the founders (#926 review ruling)
 //!
-//! The accord holders' 2-of-3 is the BIRTH of the row (and, on the ceremony
+//! The accord holders' strict majority (2·yes > N) is the BIRTH of the row (and, on the ceremony
 //! plane, the conferral of each founder). After birth the row changes only by
 //! its FOUNDERS' quorum — its own entrenched `quorum:M/N` over the `founder`
 //! seats — on every door: the local `supersede_community_with_quorum`, the
@@ -433,7 +433,7 @@ pub fn accord_family_key_id() -> &'static str {
 pub async fn accord_quorum_over_community<F>(
     directory: &F,
     signed: &SignedCommunity,
-) -> Result<super::trust_root::CharterQuorum, Error>
+) -> Result<super::trust_root::SignerCount, Error>
 where
     F: FederationDirectory + ?Sized,
 {
@@ -448,7 +448,7 @@ async fn accord_quorum_at<F>(
     directory: &F,
     signed: &SignedCommunity,
     memo: &mut Memo,
-) -> Result<super::trust_root::CharterQuorum, Error>
+) -> Result<super::trust_root::SignerCount, Error>
 where
     F: FederationDirectory + ?Sized,
 {
@@ -880,8 +880,27 @@ impl Memo {
         // The `steward` role withdrawal is the steward arm's alone: a seated
         // holder was never conferred `steward`, and leaves by leaving the
         // accord roster.
+        // v62.0.0 (TR-fix2; CC rc21 3.2 T7 "The active founder set") — and
+        // T7's two remaining conditions hold for a holder too: its key not
+        // past `revoked_after` at `when`, and no `node`-bearing record of it
+        // at or before `when` (at seating, or a later record adding `node`,
+        // a resignation at its `asserted_at`). "Holder of the bundle in
+        // force" does not stand in for them.
         if arm == FounderArm::Holder {
-            return Ok(true);
+            let when_ms = u64::try_from(when.timestamp_millis()).unwrap_or(0);
+            let (counts, next) = super::edition2::trust_root_group::holder_founder_counts_at(
+                directory, key_id, when_ms,
+            )
+            .await?;
+            if at.is_none() {
+                if let Some(t) = next
+                    .and_then(|t| i64::try_from(t).ok())
+                    .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                {
+                    self.bound(t);
+                }
+            }
+            return Ok(counts);
         }
         Ok(
             match directory

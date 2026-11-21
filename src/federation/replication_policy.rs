@@ -665,9 +665,11 @@ where
         crate::federation::Error::Backend(format!("settle_if_held serialize {kind:?}: {e}"))
     })?;
     let hash = crate::federation::wire_index::content_hash_of_bytes(&bytes);
-    let held = match dir
-        .lookup_signed_record_by_content_hash(kind.as_str(), &hash)
-        .await
+    // v62.0.0 (RL-fix2b) — persist's own held check: no serve wait.
+    let held = match crate::federation::edition2::serve::as_internal_read(
+        dir.lookup_signed_record_by_content_hash(kind.as_str(), &hash),
+    )
+    .await
     {
         Ok(held) => held,
         Err(e) => {

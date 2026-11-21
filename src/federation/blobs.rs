@@ -5605,6 +5605,12 @@ mod put_blob_binding_tests {
 
         let sq = SqliteBackend::open_in_memory().await.expect("open");
         sq.run_migrations().await.expect("migrations");
+        // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+            &sq,
+            "rl2c-blob-652",
+        )
+        .await;
         let holder = e2::put_key(&sq, "h652", &["user"]).await;
 
         let payload = b"652-witness".to_vec();

@@ -3795,122 +3795,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(())
     }
 
-    /// v13.1.0 (CIRISPersist#377) — record a canonical-role WITHDRAW/SUPERSEDE
-    /// tombstone (V095). Idempotent on `key_id`: an existing row with the same
-    /// `superseded_by` + `authority_decision_digest` is a no-op; a differing one
-    /// is a [`Conflict`](crate::federation::Error::Conflict). Backend-symmetric
-    /// with Postgres + memory.
-    async fn record_canonical_withdrawal(
-        &self,
-        key_id: &str,
-        superseded_by: Option<&str>,
-        authority_decision_digest: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let mut record = crate::federation::CanonicalWithdrawal {
-            key_id: key_id.to_owned(),
-            withdrawn_at: crate::host::clock::now(),
-            authority_decision_digest: authority_decision_digest.to_owned(),
-            superseded_by: superseded_by.map(str::to_owned),
-            persist_row_hash: String::new(),
-        };
-        record.persist_row_hash = crate::federation::types::compute_persist_row_hash(&record)?;
-        let outcome = self.write(move |conn| -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
-            let existing: Option<(Option<String>, String, String)> = conn
-                .query_row(
-                    "SELECT superseded_by, authority_decision_digest, withdrawn_at \
-                     FROM canonical_role_withdrawal WHERE key_id = ?1",
-                    [&record.key_id],
-                    |r| {
-                        Ok((
-                            r.get::<_, Option<String>>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            if let Some((existing_superseded, existing_auth, existing_at)) = existing {
-                if existing_superseded == record.superseded_by
-                    && existing_auth == record.authority_decision_digest
-                {
-                    return Ok(Ok(())); // idempotent no-op
-                }
-                // v62.0.0 (wave GC3; CC 2.7.3) — rival content under one key
-                // is a FOLD CHOICE, never a refusal: the lower
-                // (authority_decision_digest, superseded_by) is the tombstone,
-                // whichever arrived first. A losing rival is absorbed; a
-                // winning one replaces the content and keeps the instant this
-                // node first recorded the withdrawal.
-                if !withdrawal_rival_wins(
-                    (&record.authority_decision_digest, record.superseded_by.as_deref()),
-                    (&existing_auth, existing_superseded.as_deref()),
-                ) {
-                    return Ok(Ok(()));
-                }
-                record.withdrawn_at = parse_withdrawn_at(&existing_at, record.withdrawn_at);
-                record.persist_row_hash = String::new();
-                record.persist_row_hash =
-                    match crate::federation::types::compute_persist_row_hash(&record) {
-                        Ok(h) => h,
-                        Err(e) => return Ok(Err(e)),
-                    };
-                conn.execute(
-                    "UPDATE canonical_role_withdrawal SET withdrawn_at = ?2, \
-                        authority_decision_digest = ?3, superseded_by = ?4, persist_row_hash = ?5 \
-                     WHERE key_id = ?1",
-                    rusqlite::params![
-                        record.key_id,
-                        record.withdrawn_at.to_rfc3339(),
-                        record.authority_decision_digest,
-                        record.superseded_by,
-                        record.persist_row_hash,
-                    ],
-                )?;
-                return Ok(Ok(()));
-            }
-            conn.execute(
-                "INSERT INTO canonical_role_withdrawal (\
-                    key_id, withdrawn_at, authority_decision_digest, superseded_by, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    record.key_id,
-                    record.withdrawn_at.to_rfc3339(),
-                    record.authority_decision_digest,
-                    record.superseded_by,
-                    record.persist_row_hash,
-                ],
-            )?;
-            Ok(Ok(()))
-        }).await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("record_canonical_withdrawal: {e}"))
-        })?;
-        outcome
-    }
-
-    /// v13.1.0 (CIRISPersist#377) — consult the V095 withdrawal tombstone for
-    /// `key_id` (the load-bearing gate consult). Backend-symmetric.
-    async fn lookup_canonical_withdrawal(
-        &self,
-        key_id: &str,
-    ) -> Result<Option<crate::federation::CanonicalWithdrawal>, crate::federation::Error> {
-        let key_id = key_id.to_owned();
-        self.read(
-            move |conn| -> Result<Option<crate::federation::CanonicalWithdrawal>, rusqlite::Error> {
-                conn.query_row(
-                    "SELECT key_id, withdrawn_at, authority_decision_digest, superseded_by, \
-                        persist_row_hash \
-                     FROM canonical_role_withdrawal WHERE key_id = ?1",
-                    [&key_id],
-                    sqlite_row_to_canonical_withdrawal,
-                )
-                .optional()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("lookup_canonical_withdrawal: {e}")))
-    }
-
     /// v13.1.0 (CIRISPersist#377) — all V095 withdrawal tombstones, stable-sorted
     /// by `key_id`. Backend-symmetric.
     async fn list_canonical_withdrawals(
@@ -4704,18 +4588,42 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             )
             .await;
         }
+        // v62.0.0 (RL-fix2b; CC 5.3.4) — the advertisement is a serve path:
+        // on a node that is not rooted, an Attestation hash whose row waits is
+        // not advertised (the same predicate as the serve rule), so a peer
+        // is never told of a row the point read then refuses.
+        let wait = if kind == "Attestation" {
+            !crate::federation::edition2::serve::rooted_for_serve(self).await?
+        } else {
+            false
+        };
+        let filter = if wait {
+            format!(
+                " AND NOT EXISTS (SELECT 1 FROM federation_attestations fa \
+                   WHERE fa.attestation_id = json_extract(signed_wire_index.record_key, \
+                   '$.attestation_id') AND NOT COALESCE({}, 0 = 1))",
+                crate::federation::read_plan::served_while_unrooted_sql(
+                    crate::federation::attestation_query::Dialect::Sqlite,
+                    "fa",
+                )
+            )
+        } else {
+            String::new()
+        };
         let kind = kind.to_owned();
         let after = after_content_hash.unwrap_or("").to_owned();
         let lim = i64::from(limit);
         let out = self
             .read(move |guard| -> Result<Vec<String>, rusqlite::Error> {
                 // Covered by `PRIMARY KEY (kind, content_hash)`: SQLite serves
-                // this from index pages and never visits a row.
-                let mut stmt = guard.prepare(
+                // this from index pages and never visits a row (the RL-fix2b
+                // filter, on a node that is not rooted, visits each
+                // Attestation entry's row).
+                let mut stmt = guard.prepare(&format!(
                     "SELECT content_hash FROM signed_wire_index \
-                 WHERE kind = ?1 AND content_hash > ?2 \
-                 ORDER BY content_hash LIMIT ?3",
-                )?;
+                 WHERE kind = ?1 AND content_hash > ?2{filter} \
+                 ORDER BY content_hash LIMIT ?3"
+                ))?;
                 let rows = stmt.query_map(rusqlite::params![kind, after, lim], |r| {
                     r.get::<_, String>(0)
                 })?;
@@ -7906,10 +7814,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // a person-subject row: Codex rounds 1 and 4 on PR #1057). Built on
         // the calling task (the row-type filter reads its enforcement),
         // before the closure moves to the pool.
+        // v62.0.0 (RL-fix2b; CC 5.3.4) — this node's standing, asked once:
+        // a node that is not rooted excludes the federation-tier rows that
+        // wait, in the SQL, before the page is cut.
+        let rooted = crate::federation::edition2::serve::rooted_for_serve(self).await?;
         let serve_rule = crate::federation::read_plan::serve_rule_parts(
             crate::federation::attestation_query::Dialect::Sqlite,
             "federation_attestations",
             "",
+            rooted,
         )
         .join(" AND ");
         let (read, bytes) = self
@@ -7996,6 +7909,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 recomputed = %recomputed,
                 "signed_wire_index content-hash mismatch; self-healing (returning None)"
             );
+            return Ok(None);
+        }
+        // v62.0.0 (RL-fix2b; CC 5.3.4) — the point read is a serve path: a
+        // row that waits on a node that is not rooted is not handed out.
+        if crate::federation::edition2::serve::point_read_waits(self, kind, &bytes).await? {
             return Ok(None);
         }
         Ok(Some(bytes))
@@ -15583,7 +15501,7 @@ fn sqlite_row_to_key_record(
     // v13.2.0 (CIRISPersist#383): additional_scrubs is the V096
     // `TEXT NOT NULL DEFAULT '[]'` column holding the 2nd..Nth anchor scrub
     // signatures as a JSON array. MUST decode the column (never Vec::new()) —
-    // else a stored 2-of-3 canonical record reads back as 0 additional scrubs
+    // else a stored strict-majority canonical record reads back as 0 additional scrubs
     // and loses its quorum. NULL / absent column / empty string → empty set.
     let additional_scrubs_text: Option<String> = row.get("additional_scrubs").ok();
     let additional_scrubs: Vec<crate::federation::types::ScrubSig> = additional_scrubs_text
@@ -17245,6 +17163,7 @@ fn sqlite_naming_page_sql(
     dimension: &str,
     cursor: Option<&crate::read::AttestationCursor>,
     fetch: i64,
+    rooted: bool,
 ) -> (String, Vec<SqlValue>) {
     let mut binds: Vec<SqlValue> = vec![
         SqlValue::Text(subject_key_id.to_owned()),
@@ -17259,6 +17178,7 @@ fn sqlite_naming_page_sql(
         crate::federation::attestation_query::Dialect::Sqlite,
         "fa",
         "",
+        rooted,
     ));
     if let Some(c) = cursor {
         binds.push(SqlValue::Text(c.last_asserted_at.to_rfc3339()));
@@ -24166,7 +24086,9 @@ impl crate::federation::read_plan::ReadPlanStore for SqliteBackend {
         fetch: i64,
     ) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error> {
         use crate::federation::Error;
-        let (sql, binds) = sqlite_naming_page_sql(subject_key_id, dimension, cursor, fetch);
+        // v62.0.0 (RL-fix2b) — this node's standing, asked once.
+        let rooted = crate::federation::edition2::serve::rooted_for_serve(self).await?;
+        let (sql, binds) = sqlite_naming_page_sql(subject_key_id, dimension, cursor, fetch, rooted);
         let (rows, bytes) = self
             .read_measured(
                 move |conn| -> Result<Vec<crate::federation::Attestation>, Error> {
@@ -24215,11 +24137,14 @@ impl crate::federation::read_plan::ReadPlanStore for SqliteBackend {
             crate::host::clock::now(),
         );
         let head_stmt = crate::federation::read_plan::serve_stream_head_statement(Dialect::Sqlite);
+        // v62.0.0 (RL-fix2b) — this node's standing, asked once.
+        let rooted = crate::federation::edition2::serve::rooted_for_serve(self).await?;
         let page_stmt = crate::federation::read_plan::serve_stream_statement(
             Dialect::Sqlite,
             narrowing,
             since,
             fetch,
+            rooted,
         );
         let head_sql = head_stmt.sql;
         let page_sql = page_stmt.sql;
@@ -27705,6 +27630,12 @@ mod accord_tests {
     async fn known_hashes_never_reach_holdings_sqlite_785() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+            &backend,
+            "rl2c-backend",
+        )
+        .await;
         crate::federation::operational::test_support::exercise_known_hashes_never_reach_holdings_785(
             &backend, "sq785",
         )
@@ -27731,6 +27662,12 @@ mod accord_tests {
     async fn cohort_scope_survives_the_read_path_sqlite_713() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+            &backend,
+            "rl2c-backend",
+        )
+        .await;
         crate::federation::admission::ungated_doors_test_support::exercise_cohort_scope_survives_the_read_path(
             &backend, "sq",
         )
@@ -27743,6 +27680,12 @@ mod accord_tests {
     async fn late_admitted_attestation_is_served_sqlite_668() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+            &backend,
+            "rl2c-backend",
+        )
+        .await;
         crate::federation::admission::ungated_doors_test_support::exercise_late_admitted_attestation_is_served(
             &backend, "sq",
         )
@@ -27798,6 +27741,12 @@ mod accord_tests {
                 .unwrap();
             assert!(n >= ids.len(), "the tie plant must touch every seeded row");
         }
+        // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+            &backend,
+            "rl2c-backend",
+        )
+        .await;
         ts::assert_attestation_tie_pages_exactly_once(&backend, "sq", &ids, 3).await;
     }
 
@@ -29035,6 +28984,12 @@ mod tests {
         // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
         crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
             .await;
+        // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+            &backend,
+            "rl2c-backend",
+        )
+        .await;
         crate::federation::quarantine::test_support::exercise_admin_ops(&backend, "sqlite-qa")
             .await;
     }
@@ -40912,7 +40867,7 @@ mod tests {
             uuid::Uuid::new_v4().to_string(),
         );
         for (tag, c) in [("head", None), ("cursor", Some(&cursor))] {
-            let (sql, binds) = sqlite_naming_page_sql("k", "membership:proposal:v1", c, 51);
+            let (sql, binds) = sqlite_naming_page_sql("k", "membership:proposal:v1", c, 51, true);
             let plan = sqlite_plan(&backend, &sql, binds).await;
             eprintln!("#1225 subject read ({tag}) plan: {plan:?}");
             assert!(
@@ -40967,7 +40922,7 @@ mod tests {
             ("owner bindings", ServeNarrowing::OwnerBindingChanges),
         ] {
             for (at, c) in [("head", None), ("cursor", Some(&since))] {
-                let stmt = serve_stream_statement(Dialect::Sqlite, narrowing, c, 51);
+                let stmt = serve_stream_statement(Dialect::Sqlite, narrowing, c, 51, true);
                 let plan = sqlite_plan(&backend, &stmt.sql, sqlite_binds(stmt.binds)).await;
                 eprintln!("#1190/#1163 {tag} ({at}) plan: {plan:?}");
                 let walk = plan

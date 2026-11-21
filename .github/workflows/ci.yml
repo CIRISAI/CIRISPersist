@@ -1737,6 +1737,16 @@ jobs:
           set -euo pipefail
           python3 scripts/earlier_form_doors.py --self-test
           python3 scripts/earlier_form_doors.py check
+      # v62.0.0 (TR-fix1; CC 4.2.6) — the holders' strict majority has ONE
+      # spelling (admission::accord_threshold); a second `x / 2 + 1` in
+      # production code is red. v62.0.0 (SM-fix1) — and no fixed count stands
+      # in for it: a `"quorum:M/N"` literal or a threshold over a fixed roster
+      # size is red too. From disk, no cargo; its witnesses first.
+      - name: one spelling of the holders' strict majority, no fixed count (from disk)
+        run: |
+          set -euo pipefail
+          python3 scripts/one_threshold.py --self-test
+          python3 scripts/one_threshold.py check
       # #934 — the size counter behind evidence/size.tsv (fixtures, no
       # cargo). The size DELTA itself is a report (ci-hygiene.yml, reports.yml);
       # this step only proves the instrument counts what it claims to.

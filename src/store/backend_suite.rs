@@ -697,6 +697,12 @@ mod tests {
     async fn wire_index_hashes_are_what_the_serve_path_advertises_780() {
         use crate::federation::FederationDirectory as _;
         let backend = test_backend();
+        // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+        crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+            &backend,
+            "rl2c-backend-suite",
+        )
+        .await;
         for k in ["adv-a", "adv-b"] {
             put_e2_key(
                 &backend,
@@ -2893,6 +2899,14 @@ mod tests {
             )
             .await;
             put_e2_key(backend, founder, founder_it).await;
+            if infra {
+                for f in
+                    &crate::federation::tier_ingest::test_support::FIXTURE_INFRASTRUCTURE_FOUNDERS
+                        [1..]
+                {
+                    put_e2_key(backend, f, identity_type::USER).await;
+                }
+            }
             let policy_blob =
                 infra.then(|| serde_json::json!({ "cohort_subkind": "infrastructure" }));
             let community = crate::federation::types::Community {
@@ -2900,11 +2914,25 @@ mod tests {
                 charter_digest: String::new(),
                 community_key_id: cid.into(),
                 community_name: "dt".into(),
-                members: vec![crate::federation::types::CommunityMember {
-                    key_id: founder.into(),
-                    joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                    role: Some(MEMBER_ROLE_FOUNDER.into()),
-                }],
+                members: {
+                    let mut m = vec![crate::federation::types::CommunityMember {
+                        key_id: founder.into(),
+                        joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                        role: Some(MEMBER_ROLE_FOUNDER.into()),
+                    }];
+                    // v62.0.0 (TR-fix2; CC rc21 3.2 T7) — an infrastructure
+                    // fixture counts at `quorum:2/3`: two more founders.
+                    if infra {
+                        for f in &crate::federation::tier_ingest::test_support::FIXTURE_INFRASTRUCTURE_FOUNDERS[1..] {
+                            m.push(crate::federation::types::CommunityMember {
+                                key_id: (*f).into(),
+                                joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                                role: Some(MEMBER_ROLE_FOUNDER.into()),
+                            });
+                        }
+                    }
+                    m
+                },
                 founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
                 consensus_protocol: crate::federation::tier_ingest::test_support::fixture_protocol(
                     policy_blob.as_ref(),

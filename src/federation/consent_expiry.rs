@@ -158,9 +158,11 @@ where
     let mut truncated = true;
 
     for _page in 0..MAX_SCAN_PAGES {
-        let page = dir
-            .list_attestations_since(cursor.clone(), CONSENT_EXPIRY_SCAN_CAP)
-            .await?;
+        // v62.0.0 (RL-fix2b) — persist's own sweep: no serve wait.
+        let page = crate::federation::edition2::serve::as_internal_read(
+            dir.list_attestations_since(cursor.clone(), CONSENT_EXPIRY_SCAN_CAP),
+        )
+        .await?;
         let Some(last) = page.last() else {
             truncated = false;
             break;

@@ -988,6 +988,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("envelope_dimension", Class::Plumbing),
     ("execute", Class::Plumbing),
     ("filter_withheld_rows", Class::Gate),
+    // v62.0.0 (RL-fix2b; CC 5.3.4) — the serve wait: the point read's row
+    // test is a policy decision (a Gate); this node's standing, asked once
+    // per serve call and passed into the SQL serve rule, is a derivation.
+    ("point_read_waits", Class::Gate),
+    ("rooted_for_serve", Class::Plumbing),
     ("fountain_manifest_row", Class::Delegates),
     ("from_manifest_bytes", Class::Plumbing),
     ("from_run", Class::Plumbing),

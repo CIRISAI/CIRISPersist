@@ -1247,6 +1247,9 @@ mod tests {
                         .await
                         .unwrap();
                     backend.run_migrations().await.unwrap();
+                    // v62.0.0 (RL-fix2c) — a rooted serving node (the serve
+                    // wait, CC 5.3.4): the witnesses assert what they did.
+                    crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(&backend, "rl2c-serve-feeds").await;
                     let $b = &backend;
                     let $t = &tag("s");
                     $call.await;
@@ -1266,6 +1269,9 @@ mod tests {
                         .await
                         .unwrap();
                     backend.run_migrations().await.unwrap();
+                    // v62.0.0 (RL-fix2c) — a rooted serving node (the serve
+                    // wait, CC 5.3.4): the witnesses assert what they did.
+                    crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(&backend, "rl2c-serve-feeds").await;
                     let $b = &backend;
                     let $t = &tag("p");
                     $call.await;
@@ -1311,6 +1317,12 @@ mod tests {
             .await
             .unwrap();
         backend.run_migrations().await.unwrap();
+        // v62.0.0 (RL-fix2c) — a rooted serving node.
+        crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+            &backend,
+            "rl2c-serve-feeds",
+        )
+        .await;
         let pause = backend
             .test_hooks()
             .arm_pause("delegation_cycle_before_insert");

@@ -3969,44 +3969,31 @@ mod holdings_authority_tests {
         );
     }
 
-    /// Withdrawal wins, inherited from `is_trust_root`'s `_effective` reads
-    /// (#685). A quorum-withdrawn canonical publisher demotes on the very next
-    /// resolution — its corpus stops gossiping globally with no cache to
-    /// invalidate.
+    /// v62.0.0 (TR-fix1; CC rc21 4.2.1, 2.6.1.11: a canonical changes only by
+    /// a later genesis bundle) — the earlier "withdrawal wins" read (#685) is
+    /// gone with its doors: a canonical tombstone written straight into the
+    /// store (no verifying door can write one on v62) does not un-seat the
+    /// bundle's seat, so its corpus stays a trust-root corpus. Was
+    /// `a_withdrawn_canonical_publisher_stops_being_a_trust_root_corpus`.
     #[tokio::test]
-    async fn a_withdrawn_canonical_publisher_stops_being_a_trust_root_corpus() {
+    async fn a_raw_canonical_tombstone_does_not_unseat_a_bundle_seat() {
         let (backend, canonical) = seeded_canonical().await;
         assert_eq!(
             holdings_authority(&backend, &canonical)
                 .await
                 .expect("seam"),
             AuthorityClass::AccordCoScrub,
-            "the trap must be reachable — if it were already ProducerSteward, the \
-             demotion below would prove nothing"
+            "the seat is a trust-root corpus"
         );
-
-        backend
-            .record_canonical_withdrawal(&canonical, None, &"11".repeat(32))
-            .await
-            .expect("record the quorum withdrawal");
-
-        // THE DISJUNCTION IS REAL, and this leg records it rather than
-        // discovering it later. `is_trust_root` is `canonical OR infra:attest`,
-        // and the baked canonical carries BOTH (`roles` includes `infra:attest`
-        // — it is a build-signing pipeline as well as a bootstrap server). So a
-        // canonical withdrawal alone does NOT demote the corpus, and a
-        // consumer-side gate that consulted only the canonical tombstone would
-        // be the #441 one-surface shape a plane over.
-        assert_eq!(
-            holdings_authority(&backend, &canonical)
-                .await
-                .expect("seam"),
-            AuthorityClass::AccordCoScrub,
-            "the canonical role is withdrawn, but this publisher is ALSO an \
-             accord-blessed `infra:attest` pipeline — one tombstone does not \
-             retire a two-role trust root"
+        assert!(
+            matches!(
+                backend
+                    .record_canonical_withdrawal(&canonical, None, &"11".repeat(32))
+                    .await,
+                Err(crate::federation::Error::Unsupported { .. })
+            ),
+            "TR-fix2: the store writes no canonical tombstone"
         );
-
         backend
             .record_role_withdrawal(
                 crate::federation::types::roles::INFRA_ATTEST,
@@ -4015,26 +4002,13 @@ mod holdings_authority_tests {
                 &"22".repeat(32),
             )
             .await
-            .expect("record the infra:attest withdrawal");
-
+            .expect("a raw store write");
         assert_eq!(
             holdings_authority(&backend, &canonical)
                 .await
                 .expect("seam"),
-            AuthorityClass::ProducerSteward,
-            "a withdrawn trust root does not keep gossiping its corpus globally"
-        );
-        assert_eq!(
-            projection_for(
-                Plane::FountainContent,
-                "federation",
-                holdings_authority(&backend, &canonical)
-                    .await
-                    .expect("seam"),
-                false
-            ),
-            Projection::Cohort,
-            "and the projection narrows with it"
+            AuthorityClass::AccordCoScrub,
+            "only a later bundle changes which canonical is seated"
         );
     }
 

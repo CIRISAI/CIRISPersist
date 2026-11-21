@@ -1877,28 +1877,31 @@ pub mod test_support {
     >(
         dir: &D,
     ) {
-        if dir
-            .lookup_public_key(FIXTURE_INFRASTRUCTURE_FOUNDER)
-            .await
-            .expect("lookup")
-            .is_some()
-        {
-            return;
+        // v62.0.0 (TR-fix2) — the three placeholder founders (CC rc21 3.2 T7:
+        // the smallest conformant infrastructure shape is `quorum:2/3`).
+        for f in FIXTURE_INFRASTRUCTURE_FOUNDERS {
+            if dir.lookup_public_key(f).await.expect("lookup").is_some() {
+                continue;
+            }
+            register_hybrid_key_as(dir, f, f, crate::federation::types::identity_type::USER).await;
         }
-        register_hybrid_key_as(
-            dir,
-            FIXTURE_INFRASTRUCTURE_FOUNDER,
-            FIXTURE_INFRASTRUCTURE_FOUNDER,
-            crate::federation::types::identity_type::USER,
-        )
-        .await;
     }
 
-    /// The placeholder founder [`fixture_members`] seats.
+    /// The first placeholder founder [`fixture_members`] seats.
     pub const FIXTURE_INFRASTRUCTURE_FOUNDER: &str = "fixture-infrastructure-founder";
 
+    /// v62.0.0 (TR-fix2; CC rc21 3.2 T7) — every placeholder founder an
+    /// `infrastructure` fixture seats: three, at `quorum:2/3` (`M ≥ 2` and
+    /// `N ≥ M + 1`; `quorum:1/1` is refused).
+    pub const FIXTURE_INFRASTRUCTURE_FOUNDERS: [&str; 3] = [
+        FIXTURE_INFRASTRUCTURE_FOUNDER,
+        "fixture-infrastructure-founder-2",
+        "fixture-infrastructure-founder-3",
+    ];
+
     /// v50.0.0 (review) — `members` plus, when `policy_blob` labels the
-    /// fixture `infrastructure`, one founder (a registered human seat): an
+    /// fixture `infrastructure`, three founders (registered human seats; v62.0.0
+    /// TR-fix2): an
     /// infrastructure record with no founder is refused
     /// (`INFRA_RULE_NO_FOUNDER`), and these fixtures test other things.
     pub fn fixture_members(
@@ -1913,26 +1916,30 @@ pub mod test_support {
             .iter()
             .any(|m| m.role.as_deref() == Some(crate::federation::admission::MEMBER_ROLE_FOUNDER));
         if infra && !has_founder {
-            members.push(crate::federation::types::CommunityMember {
-                key_id: FIXTURE_INFRASTRUCTURE_FOUNDER.into(),
-                joined_at: "2026-01-01T00:00:00Z".parse().expect("rfc3339"),
-                role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
-            });
+            for f in FIXTURE_INFRASTRUCTURE_FOUNDERS {
+                members.push(crate::federation::types::CommunityMember {
+                    key_id: f.into(),
+                    joined_at: "2026-01-01T00:00:00Z".parse().expect("rfc3339"),
+                    role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
+                });
+            }
         }
         members
     }
 
     /// v50.0.0 (CIRISPersist#927, CC 3.2) — the `consensus_protocol` a
     /// community fixture declares: `otherwise`, unless `policy_blob` labels it
-    /// `infrastructure`, which admits only a `quorum:M/N` form (a one-founder
-    /// fixture's is `quorum:1/1`).
+    /// `infrastructure`, which admits only a `quorum:M/N` form with `M ≥ 2`
+    /// (v62.0.0 TR-fix2: `quorum:2/3` over [`FIXTURE_INFRASTRUCTURE_FOUNDERS`]).
     pub fn fixture_protocol(policy_blob: Option<&serde_json::Value>, otherwise: &str) -> String {
         let infra = policy_blob
             .and_then(|b| b.get("cohort_subkind"))
             .and_then(|v| v.as_str())
             == Some(crate::federation::admission::COHORT_SUBKIND_INFRASTRUCTURE);
         if infra {
-            "quorum:1/1".to_owned()
+            // v62.0.0 (TR-fix2; CC rc21 3.2 T7): `quorum:1/1` is refused; the
+            // three founders `fixture_members` seats count at 2 of 3.
+            "quorum:2/3".to_owned()
         } else {
             otherwise.to_owned()
         }

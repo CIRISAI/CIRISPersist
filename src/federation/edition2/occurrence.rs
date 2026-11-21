@@ -1049,6 +1049,78 @@ where
     Ok(found)
 }
 
+/// v62.0.0 (RL-fix4; CC 3.3.6.2 "The opt-out marker", part_3 l.1907; CC
+/// 5.4.6 "Relay is offered by default on every owned node") — what the node's
+/// OWN live edition-2 binds say about relaying for others.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BindRelayOffer {
+    /// A live bind carries `"onion_relay": {"opt_out": true}`: the node
+    /// carries nobody (the marker is absent by default, so a live bind
+    /// without it OFFERS relay).
+    pub opted_out: bool,
+    /// The earliest signed `valid_until` of the live binds read (the
+    /// signer's own stamp), if any is bounded.
+    pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// **The relay offer of `occurrence_key_id`'s live edition-2 binds**
+/// ([`BindRelayOffer`]): `None` when no live bind of it is held. Read from
+/// the held statements the typed rows carry, as [`bind_xwing_keys_for`] reads
+/// them; the marker's shape (exactly `{"opt_out": true}`) was checked at
+/// admission ([`read_payload`]).
+///
+/// # Errors
+/// Directory read failures.
+pub async fn bind_relay_offer_for<F>(
+    dir: &F,
+    occurrence_key_id: &str,
+) -> Result<Option<BindRelayOffer>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let now = ms_of(crate::host::clock::now());
+    let mut found: Option<BindRelayOffer> = None;
+    let mut identities: Vec<String> = dir
+        .list_identity_occurrences_by_occurrence_key(occurrence_key_id)
+        .await?
+        .into_iter()
+        .map(|o| o.identity_key_id)
+        .collect();
+    identities.sort();
+    identities.dedup();
+    for identity in identities {
+        if !occurrence_live(dir, &identity, occurrence_key_id, now).await? {
+            continue;
+        }
+        let signed = dir.list_signed_identity_occurrences_for(&identity).await?;
+        let Some(statement) = signed
+            .iter()
+            .find(|s| s.identity_occurrence.occurrence_key_id == occurrence_key_id)
+            .and_then(|s| s.signed_envelope.get(super::ingest::STATEMENT_MEMBER))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|h| hex::decode(h).ok())
+        else {
+            continue;
+        };
+        let Some((_, payload)) = statement_parts(&statement) else {
+            continue;
+        };
+        let opted_out = payload.get_text("onion_relay").is_some();
+        let until = payload
+            .get_text("valid_until")
+            .and_then(Value::as_u64)
+            .and_then(|ms| i64::try_from(ms).ok())
+            .and_then(|ms| chrono::TimeZone::timestamp_millis_opt(&chrono::Utc, ms).single());
+        let entry = found.get_or_insert_with(BindRelayOffer::default);
+        entry.opted_out |= opted_out;
+        entry.valid_until = match (entry.valid_until, until) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
+    Ok(found)
+}
+
 /// **A non-seat node's transit X-Wing key from its edition-2 bind**
 /// ([`bind_xwing_keys_for`]), passing the cross-row rule at use (a half
 /// equal to any key on the node's current occurrence ⇒ `None`, CC 3.3.6.2).

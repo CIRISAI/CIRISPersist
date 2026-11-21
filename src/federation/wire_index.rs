@@ -538,7 +538,11 @@ pub async fn all_kind_hash_keys(
     // `ServedAttestation` wrapper: `admitted_at` is node-local and must stay
     // out of every content hash (the ServedKeyRecord wire-hash lesson). The
     // same rule applies to every Served* plane below.
-    for a in dir.list_attestations_since(None, u32::MAX).await? {
+    // v62.0.0 (RL-fix2c) — the index rebuild is persist's own read: every
+    // row is indexed; the serve wait applies when a hash is ADVERTISED.
+    for a in super::edition2::serve::as_internal_read(dir.list_attestations_since(None, u32::MAX))
+        .await?
+    {
         let rk = record_key(&[("attestation_id", &a.attestation.attestation_id)]);
         out.push(("Attestation", attestation_wire_hash_hex(&a.attestation), rk));
     }

@@ -82,6 +82,10 @@ mod tests {
         assert_eq!(r.tier, CryptoTier::CommunityDek);
 
         // The stored claim carries BOTH halves: it is a federation-tier row.
+        // v62.0.0 (RL-fix2c) — A SERVES these claims to B below: A's node is
+        // rooted (the serve wait, CC 5.3.4), so the read is A's serve path.
+        crate::federation::edition2::serve_wait_invariants::test_support::root_this_node(&*sa)
+            .await;
         let claims: Vec<_> = sa
             .list_attestations_since(None, 1_000)
             .await

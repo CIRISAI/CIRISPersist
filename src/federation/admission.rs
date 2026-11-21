@@ -13509,15 +13509,9 @@ pub async fn serves_under_seat<F: super::FederationDirectory + ?Sized>(
     if !super::edition2::genesis::is_canonical_by_bundle(directory, key_id).await? {
         return Ok(false);
     }
-    // The seat as [`is_canonical_effective`] reads it: a quorum-withdrawn
-    // seat (the V095/V104 tombstone) serves nothing, owner or not.
-    if directory
-        .lookup_canonical_withdrawal(key_id)
-        .await?
-        .is_some()
-    {
-        return Ok(false);
-    }
+    // v62.0.0 (TR-fix1; CC rc21 4.2.1, 2.6.1.11) — a canonical seat changes
+    // only by a later genesis bundle. The earlier withdraw/supersede
+    // tombstone (V095) has no verifying write door on v62 and is not read.
     serve_seat_owner_announced(directory, key_id).await
 }
 
@@ -14731,14 +14725,14 @@ pub async fn check_canonical_role_admission(
 /// keyset — the core primitive. Production callers use the
 /// [`check_canonical_role_admission`] wrapper (genesis A1/B1/C1 roster); this
 /// form exists so tests can supply their own signable holders, mirroring
-/// [`super::withdraw_canonical_role_over_roster`].
+/// the deleted v13 withdraw door (TR-fix1).
 ///
-/// # v13.2.0 (CIRISPersist#383) — 2-of-3 multi-scrub add (the security crux)
+/// # v13.2.0 (CIRISPersist#383) — the m-of-n multi-scrub add (the security crux)
 ///
 /// The `canonical` role is conferred ONLY if the record carries **≥ a strict
 /// majority of the live accord family, each a cryptographically VERIFIED
 /// hybrid scrub signature** over the record's canonical `registration_envelope`
-/// — the m-of-n add gate (2-of-3 today; 3-of-4 if the family grows). This
+/// — the m-of-n add gate: a strict majority of the holders (2·yes > N). This
 /// retires the v13.0.0 (#372) **1-of-N** add path, where a single anchor-scrub
 /// (`scrub_key_id ∈ anchor`, membership only, no sig verified) conferred the
 /// role — the ASI first-strike hole (one captured accord key mints a rogue
@@ -14757,7 +14751,7 @@ pub async fn check_canonical_role_admission(
 /// 1. Fast path — the row's `identity_type` set lacks `canonical` → `Ok(())`.
 /// 2. **Withdrawal consult (revocation-wins, #377).** A `key_id` the accord
 ///    quorum WITHDREW (V095 tombstone) cannot be re-conferred `canonical`, EVEN
-///    with a valid 2-of-3 scrub set — the add-gate is monotonic and the
+///    with a valid strict-majority scrub set — the add-gate is monotonic and the
 ///    anti-entropy path ([`apply_replicated_key_record`](super::register),
 ///    #375) re-runs it, so without this a peer still holding the old scrubbed
 ///    record would silently RE-ADD the role on the next round. A SUPERSEDE
@@ -14783,7 +14777,7 @@ pub async fn check_canonical_role_admission(
 /// (`put_public_key` on all three backends + the `adopt_scrub_upgrade`
 /// self→anchored path), so `canonical` can never be added by a later
 /// self-registration or by replication of an under-quorum record. The only way
-/// `canonical` enters the directory is a fully-assembled ≥2-of-3 accord co-scrub
+/// `canonical` enters the directory is a fully-assembled strict-majority accord co-scrub
 /// (the Trust Root add-canonical op). `root_binding` is unchanged (still roots
 /// via ANY one scrub — rooting is recognition, not conferral). Verify-before-
 /// mutation (AV-9); backend-agnostic.
@@ -14814,39 +14808,9 @@ pub async fn check_canonical_role_admission_over_roster(
     )
     .await?;
 
-    // (1c) v31.1.0 (CIRISPersist#662) — MATERIALIZE BEFORE CONSULTING, the
-    // twin of the `infra:attest` gate's step (1c). The tombstone is a local
-    // projection of replicated accord evidence, and the evidence plane and the
-    // key plane replicate independently: evidence authorizing this key's
-    // withdrawal can arrive first, and then step (2) would consult an empty
-    // table and re-confer `canonical`. Derived here from a proposal already in
-    // our own state, re-tallied by us. See
-    // [`accord_carriage::project_role_withdrawal_for_key`](super::accord_carriage::project_role_withdrawal_for_key).
-    super::accord_carriage::project_role_withdrawal_for_key(
-        directory,
-        identity_type::CANONICAL,
-        &row.key_id,
-        roster_key_ids,
-    )
-    .await?;
-
-    // (2) Revocation-wins (#377): a quorum-withdrawn key stays refused, even
-    // with a valid 2-of-3 scrub set. Runs BEFORE the quorum verify. A SUPERSEDE
-    // successor whose tombstone names THIS key_id is exempt (rotate-in).
-    fold_reads_key(&row.key_id);
-    if let Some(w) = directory.lookup_canonical_withdrawal(&row.key_id).await? {
-        if w.superseded_by.as_deref() != Some(row.key_id.as_str()) {
-            // v62.0.0 (wave GC1; CC 2.7.3) — a role withdrawal is another row: HELD
-            // `role_withdrawn` (re-folded when it is superseded or withdrawn).
-            return Err(fold::hold(
-                fold::reason::gc1::ROLE_WITHDRAWN,
-                Error::CanonicalRoleWithdrawn {
-                    key_id: row.key_id.clone(),
-                    superseded_by: w.superseded_by.clone(),
-                },
-            ));
-        }
-    }
+    // v62.0.0 (TR-fix1; CC rc21 4.2.1) — the earlier withdraw/supersede
+    // tombstone (steps 1c, 2) is not read: a canonical changes only by a later
+    // genesis bundle, and no verifying door can write the tombstone on v62.
 
     // (3)-(7) the shared accord-family m-of-n co-scrub quorum core.
     //
@@ -14901,30 +14865,8 @@ pub async fn check_canonical_role_admission_over_roster_with_custody_root(
     if !names_canonical_conferral(row) {
         return Ok(());
     }
-    // v31.1.0 (CIRISPersist#662) — materialize before consulting, like the
-    // production gate. A simulation twin that skipped it would model a mesh
-    // whose ordering behaviour differs from the one we ship.
-    super::accord_carriage::project_role_withdrawal_for_key(
-        directory,
-        identity_type::CANONICAL,
-        &row.key_id,
-        roster_key_ids,
-    )
-    .await?;
-    fold_reads_key(&row.key_id);
-    if let Some(w) = directory.lookup_canonical_withdrawal(&row.key_id).await? {
-        if w.superseded_by.as_deref() != Some(row.key_id.as_str()) {
-            // v62.0.0 (wave GC1; CC 2.7.3) — a role withdrawal is another row: HELD
-            // `role_withdrawn` (re-folded when it is superseded or withdrawn).
-            return Err(fold::hold(
-                fold::reason::gc1::ROLE_WITHDRAWN,
-                Error::CanonicalRoleWithdrawn {
-                    key_id: row.key_id.clone(),
-                    superseded_by: w.superseded_by.clone(),
-                },
-            ));
-        }
-    }
+    // v62.0.0 (TR-fix1) — no withdrawal tombstone is read (see the production
+    // gate).
     // v62.0.0 (TR-fix1) — custody is gated where the genesis bundle seats
     // each holder (CC 4.2.2.1), against the bundle reader's own store; the
     // canonical conferral is the bundle's serve seats. `custody_root` is
@@ -16102,7 +16044,7 @@ pub async fn has_accord_conferred_role(
 /// the AV-75 property: registering the string buys nothing.
 ///
 /// v22.1.0 (CIRISPersist#548): the walk it delegates to also accepts the
-/// CEREMONY plane — a 2-of-3 accord co-scrub conferring the role inside the
+/// CEREMONY plane — a strict-majority accord co-scrub conferring the role inside the
 /// subject's own registration_envelope (the baked-seed encoding), still
 /// subject to the user's full trust chain to the subject-as-root. Strictly
 /// stronger evidence than one root's `delegates_to`; the AV-75 property is
@@ -16306,7 +16248,7 @@ pub async fn is_infra_attest_effective(
 /// with `roles` including `infra:serve` (CC 8.11.27: "the accord's co-scrub
 /// over that envelope is the conferral … Its `canonical` member names that
 /// conferral"), and its stored scrub set (base `scrub_key_id` plus
-/// `additional_scrubs`) is the accord's 2-of-3 co-scrub over that envelope. It
+/// `additional_scrubs`) is the accord's strict-majority co-scrub over that envelope. It
 /// presents the conferral by its earlier-form name and the co-scrub verifies
 /// against the genesis roster at the baked lineage's bar, so it is canonical
 /// with no migration, re-sign or re-seed. A record of the forward form
@@ -16479,7 +16421,7 @@ pub async fn canonical_conferral_coscrub(
 // un-set — because the add-gate above is monotonic and anti-entropy re-runs
 // it, so a hard drop would be silently re-added on the next replication round.
 // The gate ([`check_canonical_role_admission_over_roster`]) consults the
-// tombstone so the effective rule is "2-of-3-scrubbed AND not
+// tombstone so the effective rule is "strict-majority-scrubbed AND not
 // withdrawn-by-quorum".
 // ─────────────────────────────────────────────────────────────────────
 
@@ -16628,42 +16570,15 @@ pub const fn accord_threshold(roster_size: usize) -> usize {
     roster_size / 2 + 1
 }
 
-/// v60.1.0 (CIRISPersist#1117) — the accord threshold over THIS node's
-/// standing roster: `n` is the holders of `roster_key_ids` whose keys resolve
-/// in this node's directory (the same resolution the co-scrub core and the
-/// destructive re-tally make, so an unregistered holder counts toward neither
-/// side), and `m` is [`accord_threshold`]`(n)`.
+/// v60.1.0 (CIRISPersist#1117; TR-fix1) — the accord threshold over THIS
+/// node's standing roster: `n` is the holders of the genesis bundle in force,
+/// and `m` is [`accord_threshold`]`(n)`, the strict majority (2·m > n).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccordThreshold {
     /// Signatures required: the strict majority of `n`.
     pub m: usize,
     /// Holders on the standing roster whose keys this node holds.
     pub n: usize,
-}
-
-/// v60.1.0 (CIRISPersist#1117) — [`AccordThreshold`] over `roster_key_ids`.
-///
-/// # Errors
-///
-/// A directory read.
-pub async fn accord_threshold_over_roster<F>(
-    directory: &F,
-    roster_key_ids: &[String],
-) -> Result<AccordThreshold, Error>
-where
-    F: super::FederationDirectory + ?Sized,
-{
-    let mut seen = std::collections::HashSet::new();
-    for kid in roster_key_ids {
-        if let Some(rec) = directory.lookup_public_key(kid).await? {
-            seen.insert(rec.key_id);
-        }
-    }
-    let n = seen.len();
-    Ok(AccordThreshold {
-        m: accord_threshold(n),
-        n,
-    })
 }
 
 /// v60.1.0 (CIRISPersist#1117) — [`AccordThreshold`] over the accord-holder
@@ -16676,7 +16591,15 @@ pub async fn accord_threshold_now<F>(directory: &F) -> Result<AccordThreshold, E
 where
     F: super::FederationDirectory + ?Sized,
 {
-    accord_threshold_over_roster(directory, &accord_holder_roster(directory).await?).await
+    // v62.0.0 (TR-fix1; Eric's rule, CC 4.2.6) — the STANDING roster is the
+    // holders of the genesis bundle in force (every tip alike), never the
+    // holders whose key records this node happens to hold: `m` is the strict
+    // majority of that `n` (2·m > n), never a fixed count.
+    let n = accord_holder_roster(directory).await?.len();
+    Ok(AccordThreshold {
+        m: accord_threshold(n),
+        n,
+    })
 }
 
 /// v13.1.0 (CIRISPersist#377) — verify a withdraw/supersede authority by
@@ -16701,7 +16624,7 @@ where
 ///    (each participation's hybrid signature + proposal-digest + seat binding is
 ///    re-checked; signers resolve ONLY in the pinned roster; deduped by member).
 /// 5. Require `tally.yes` ≥ a **strict majority of the live accord roster**
-///    (`QuorumPolicy::new(n/2+1, n)` — 2-of-3 today, tracks the family). A caller
+///    (`QuorumPolicy::new(n/2+1, n)`: 2·yes > N over the standing roster). A caller
 ///    cannot forge YES votes: only real, signed participations the roster holders
 ///    produced (and persist already verified at store time) count.
 ///
@@ -16779,26 +16702,6 @@ async fn verify_canonical_authority_over_roster(
     )))
 }
 
-/// v13.1.0 (CIRISPersist#377) — verify a PLAIN-WITHDRAW authority binds a
-/// withdraw of `key_id`, against the production accord-holder roster (A1/B1/C1).
-/// Returns the authorizing proposal digest. See
-/// [`verify_canonical_authority_over_roster`].
-pub async fn verify_canonical_withdraw_authority(
-    directory: &dyn super::FederationDirectory,
-    key_id: &str,
-    proposal_digest: &str,
-) -> Result<String, Error> {
-    verify_canonical_authority_over_roster(
-        directory,
-        proposal_digest,
-        OP_WITHDRAW_CANONICAL,
-        key_id,
-        None,
-        &accord_holder_roster(directory).await?,
-    )
-    .await
-}
-
 /// v31.1.0 (CIRISPersist#662) — the **op-generic plain-WITHDRAW** form of the
 /// #377 authority core, exported for
 /// [`accord_carriage`](super::accord_carriage)'s local withdrawal projection.
@@ -16830,74 +16733,6 @@ pub async fn verify_withdrawal_authority_over_roster(
         roster_key_ids,
     )
     .await
-}
-
-/// v13.1.0 (CIRISPersist#377) — verify a SUPERSEDE authority binds
-/// `old_key_id → new_key_id`, against the production accord-holder roster.
-/// Returns the authorizing proposal digest. See
-/// [`verify_canonical_authority_over_roster`].
-pub async fn verify_canonical_supersede_authority(
-    directory: &dyn super::FederationDirectory,
-    old_key_id: &str,
-    new_key_id: &str,
-    proposal_digest: &str,
-) -> Result<String, Error> {
-    verify_canonical_authority_over_roster(
-        directory,
-        proposal_digest,
-        OP_SUPERSEDE_CANONICAL,
-        old_key_id,
-        Some(new_key_id),
-        &accord_holder_roster(directory).await?,
-    )
-    .await
-}
-
-/// v13.1.0 (CIRISPersist#377) — **withdraw** the `canonical` role from `key_id`.
-/// `proposal_digest` names a STORED accord proposal (#302) whose payload commits
-/// to `(withdraw, key_id)`; persist re-tallies its own cryptographically-verified
-/// participations against the accord-holder roster at the 2-of-3 destructive
-/// threshold (verify-before-mutation, AV-9 — never a caller-supplied
-/// `AccordDecision.authorized` bool), then records the durable tombstone (V095).
-/// Because [`check_canonical_role_admission`] consults it, a replicated re-offer
-/// of the old anchor-scrubbed `canonical` record for `key_id` is Refused, and
-/// [`is_canonical_effective`] reads `false`. Idempotent.
-pub async fn withdraw_canonical_role(
-    directory: &dyn super::FederationDirectory,
-    key_id: &str,
-    proposal_digest: &str,
-) -> Result<(), Error> {
-    withdraw_canonical_role_over_roster(
-        directory,
-        key_id,
-        proposal_digest,
-        &accord_holder_roster(directory).await?,
-    )
-    .await
-}
-
-/// [`withdraw_canonical_role`] with an explicit accord-holder roster keyset — the
-/// core primitive. Production callers use the [`withdraw_canonical_role`] wrapper
-/// (genesis A1/B1/C1 roster); this form exists so tests can supply their own
-/// signable holders, mirroring [`check_canonical_role_admission_over_roster`].
-pub async fn withdraw_canonical_role_over_roster(
-    directory: &dyn super::FederationDirectory,
-    key_id: &str,
-    proposal_digest: &str,
-    roster_key_ids: &[String],
-) -> Result<(), Error> {
-    let authority_digest = verify_canonical_authority_over_roster(
-        directory,
-        proposal_digest,
-        OP_WITHDRAW_CANONICAL,
-        key_id,
-        None,
-        roster_key_ids,
-    )
-    .await?;
-    directory
-        .record_canonical_withdrawal(key_id, None, &authority_digest)
-        .await
 }
 
 /// v16.0.0 (CIRISPersist#424) — **withdraw** the `infra:attest` role from
@@ -17028,61 +16863,6 @@ pub async fn withdraw_accord_role_over_roster(
         .await
 }
 
-/// v13.1.0 (CIRISPersist#377) — **supersede** (rotate) a canonical server:
-/// re-tally the stored quorum for `proposal_digest` (payload committing to
-/// `old_key_id → new_record`'s key_id) at the 2-of-3 destructive threshold
-/// (AV-9), then admit the successor (the normal anchor-scrub add-gate runs inside
-/// [`put_public_key`](super::FederationDirectory::put_public_key)) AND record
-/// `old_key_id`'s withdrawal with `superseded_by = new_key_id` (the old→new audit
-/// link). The authority is verified FIRST, so if the successor is refused no
-/// tombstone is written; the successor is admitted before the predecessor is
-/// tombstoned so the canonical set is never momentarily empty. Backend-agnostic
-/// (all three backends run identical steps — the ordering IS the atomicity
-/// guarantee and a re-record is idempotent).
-pub async fn supersede_canonical(
-    directory: &dyn super::FederationDirectory,
-    old_key_id: &str,
-    new_record: super::SignedKeyRecord,
-    proposal_digest: &str,
-) -> Result<(), Error> {
-    supersede_canonical_over_roster(
-        directory,
-        old_key_id,
-        new_record,
-        proposal_digest,
-        &accord_holder_roster(directory).await?,
-    )
-    .await
-}
-
-/// [`supersede_canonical`] with an explicit accord-holder roster keyset (tests).
-/// See [`withdraw_canonical_role_over_roster`].
-pub async fn supersede_canonical_over_roster(
-    directory: &dyn super::FederationDirectory,
-    old_key_id: &str,
-    new_record: super::SignedKeyRecord,
-    proposal_digest: &str,
-    roster_key_ids: &[String],
-) -> Result<(), Error> {
-    let new_key_id = new_record.record.key_id.clone();
-    let authority_digest = verify_canonical_authority_over_roster(
-        directory,
-        proposal_digest,
-        OP_SUPERSEDE_CANONICAL,
-        old_key_id,
-        Some(&new_key_id),
-        roster_key_ids,
-    )
-    .await?;
-    // Admit the successor first — the anchor-scrub add-gate + (for a key-id-
-    // preserving rotation) the `superseded_by == key_id` withdrawal exemption
-    // are enforced inside `put_public_key`.
-    directory.put_public_key(new_record).await?;
-    directory
-        .record_canonical_withdrawal(old_key_id, Some(&new_key_id), &authority_digest)
-        .await
-}
-
 /// v13.1.0 (CIRISPersist#377) — the **tombstone-aware** `canonical`-membership
 /// read: `true` iff `key_id` carries the `canonical` role AND has NO withdrawal
 /// tombstone (a superseded successor whose tombstone names itself is treated as
@@ -17094,13 +16874,9 @@ pub async fn is_canonical_effective(
     directory: &dyn super::FederationDirectory,
     key_id: &str,
 ) -> Result<bool, Error> {
-    if !is_canonical(directory, key_id).await? {
-        return Ok(false);
-    }
-    Ok(directory
-        .lookup_canonical_withdrawal(key_id)
-        .await?
-        .is_none())
+    // v62.0.0 (TR-fix1; CC rc21 4.2.1) — the seat of the bundle in force:
+    // a canonical changes only by a later bundle, so no tombstone subtracts.
+    is_canonical(directory, key_id).await
 }
 
 /// #249 Cut B — the steward-binding **PATH** for audit: the actual delegation
@@ -17422,7 +17198,7 @@ pub const TRUST_ROOT_RULE_RESIGNATION_BACKDATED: &str = "resignation_backdated";
 /// v50.0.0 (CIRISPersist#927, review M1) — THE `infrastructure` quorum parser:
 /// `quorum:M/N` with `1 ≤ M ≤ N`, `N ≥ 1`, and `M ≥ 2` whenever `N ≥ 2` (CC
 /// 3.2: "a single founder must not be able to admit unilaterally";
-/// `quorum:1/1` is the degenerate single-founder case and stays conformant).
+/// v62.0.0 (TR-fix2): `quorum:1/1` is refused too, CC rc21 3.2 T7).
 /// `Some((M, N))` when conformant. One parser, shared with #926.
 #[must_use]
 pub fn infrastructure_quorum(protocol: &str) -> Option<(u32, u32)> {
@@ -17430,7 +17206,10 @@ pub fn infrastructure_quorum(protocol: &str) -> Option<(u32, u32)> {
         .strip_prefix(super::types::consensus_protocol::QUORUM_PREFIX)?
         .split_once('/')?;
     let (m, n) = (m.parse::<u32>().ok()?, n.parse::<u32>().ok()?);
-    (n >= 1 && m >= 1 && m <= n && (n < 2 || m >= 2)).then_some((m, n))
+    // v62.0.0 (TR-fix2; CC rc21 3.2 T7 "`quorum:1/N` is non-conformant for the
+    // same reason `founder_only` is") — `M ≥ 2`, 1/1 included: one founder
+    // never admits alone.
+    (m >= 2 && m <= n).then_some((m, n))
 }
 
 /// v61 (CIRISPersist#1123; CC 4.5.13, 4.4.3.4.2) — rule: a community
@@ -25936,7 +25715,7 @@ mod tests {
 /// v13.2.0 (CIRISPersist#383) — run `body` against an **isolated, freshly-created
 /// postgres database** derived from `base_dsn`, then drop it. The v13.2.0
 /// canonical tests seed the accord family (A1/B1/C1) under their real key_ids
-/// with TEST hybrid keys to satisfy the 2-of-3 ADD gate; on the SHARED test db
+/// with TEST hybrid keys to satisfy the strict-majority ADD gate; on the SHARED test db
 /// that squats the real anchor and breaks concurrent Engine-constructing pg
 /// tests. A throwaway db (`ciris_isol_<uuid>`) gives full pg coverage with zero
 /// shared-anchor pollution. `CREATE`/`DROP DATABASE` run over a bare admin
@@ -25994,7 +25773,7 @@ where
 /// #528/#573/#659 and the infra:attest / co-steward / set-path / announced-
 /// peer parity tables, sqlite + postgres) and `canonical_withdrawal_tests`
 /// (#377 and the infra:attest withdrawal matrix, sqlite + postgres) are
-/// DELETED: they drive the earlier form's canonical conferral — a 2-of-3
+/// DELETED: they drive the earlier form's canonical conferral — a strict-majority
 /// hybrid CO-SCRUB over a `registration_envelope` through `put_public_key` /
 /// `adopt_scrub_upgrade` (`check_canonical_role_admission*`, the baked
 /// bundle/1 A1/B1/C1 roster) and its withdrawal by stored

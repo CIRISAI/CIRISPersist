@@ -293,7 +293,8 @@ async fn i3954_membership_change_structure_marks_fold_reasons() {
         Role::Member,
         false,
         Some("quorum:2/2"),
-    );
+    )
+    .expect("I3954: a well-formed prior");
     // "b" has no held record.
     let dir = [member("a", "KA")];
     let (out, att) = fold::attempt(rid(0x56), None, async {

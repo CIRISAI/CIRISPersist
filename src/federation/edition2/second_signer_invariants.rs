@@ -631,6 +631,12 @@ async fn i2846_held_until_the_second_signer_votes_sqlite() {
         .await
         .unwrap();
     b.run_migrations().await.unwrap();
+    // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+    crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+        &b,
+        "rl2c-second-signer",
+    )
+    .await;
     Box::pin(i2846_body(&b, &suffix())).await;
 }
 
@@ -646,6 +652,12 @@ async fn i2846_held_until_the_second_signer_votes_postgres() {
         .await
         .unwrap();
     b.run_migrations().await.unwrap();
+    // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+    crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+        &b,
+        "rl2c-second-signer",
+    )
+    .await;
     Box::pin(i2846_body(&b, &suffix())).await;
 }
 
@@ -657,6 +669,12 @@ async fn i2848_a_machine_delegation_and_its_read_surfaces_sqlite() {
         .await
         .unwrap();
     b.run_migrations().await.unwrap();
+    // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+    crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+        &b,
+        "rl2c-second-signer",
+    )
+    .await;
     Box::pin(i2848_body(&b, &suffix())).await;
 }
 
@@ -672,6 +690,12 @@ async fn i2848_a_machine_delegation_and_its_read_surfaces_postgres() {
         .await
         .unwrap();
     b.run_migrations().await.unwrap();
+    // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+    crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+        &b,
+        "rl2c-second-signer",
+    )
+    .await;
     Box::pin(i2848_body(&b, &suffix())).await;
 }
 
@@ -683,6 +707,12 @@ async fn i2849_wire_index_carry_and_stewards_sqlite() {
         .await
         .unwrap();
     b.run_migrations().await.unwrap();
+    // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+    crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+        &b,
+        "rl2c-second-signer",
+    )
+    .await;
     Box::pin(i2849_body(&b, &suffix())).await;
 }
 
@@ -698,5 +728,11 @@ async fn i2849_wire_index_carry_and_stewards_postgres() {
         .await
         .unwrap();
     b.run_migrations().await.unwrap();
+    // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+    crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
+        &b,
+        "rl2c-second-signer",
+    )
+    .await;
     Box::pin(i2849_body(&b, &suffix())).await;
 }

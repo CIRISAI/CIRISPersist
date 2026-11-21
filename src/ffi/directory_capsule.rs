@@ -420,7 +420,8 @@ pub enum DirectoryOp {
     },
     /// [`FederationDirectory::list_keys_by_identity_type`] with
     /// [`crate::federation::types::identity_type::ACCORD_HOLDER`] — the
-    /// 2-of-3 constitutional verification set (CIRISEdge#19).
+    /// constitutional verification set (CIRISEdge#19), counted at a strict
+    /// majority of the holders of the bundle in force (2·yes > N).
     ListAccordHolders {},
     /// [`FederationDirectory::put_revocation`].
     PutRevocation {
@@ -2047,6 +2048,11 @@ pub enum DirectoryOp {
         /// The person, a key acting for them, or their node.
         key_id: String,
     },
+    /// v62.0.0 (RL-fix2c) —
+    /// [`crate::federation::edition2::serve::serve_standing`]: what this store
+    /// will serve a third party (node key, rooted, withholds the federation
+    /// tier). Result rides `ServeStanding`. APPEND-ONLY (Growth).
+    ServeStanding {},
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -2431,6 +2437,8 @@ pub enum DirectoryOpResult {
     ContactOwner(Edition2ContactOwner),
     /// v62.0.0 (PX-fix3) — `list_group_tips`. APPEND-ONLY (Growth).
     GroupTips(Vec<cohort::GroupTip>),
+    /// v62.0.0 (RL-fix2c) — `ServeStanding`. APPEND-ONLY (Growth).
+    ServeStanding(crate::federation::edition2::serve::ServeStanding),
 }
 
 /// v62.0.0 (AU-fix2; CC 2.7.11) — the host's answer for one
@@ -3339,7 +3347,9 @@ pub fn earlier_form_op_plane(op: &DirectoryOp) -> Option<&'static str> {
         | DirectoryOp::ListDialHints { .. }
         | DirectoryOp::RemoveDialHints { .. }
         | DirectoryOp::AdmitPreSealAnswer { .. }
-        | DirectoryOp::AdmitContactOwnerRows { .. } => None,
+        | DirectoryOp::AdmitContactOwnerRows { .. }
+        // v62.0.0 (RL-fix2c) — a read of this store's serve standing.
+        | DirectoryOp::ServeStanding { .. } => None,
         // TODO(json-cut): detection events are MESH (RULINGS "Planes"), but
         // no edition-2 detection door exists yet and the Rust door
         // (`derived::put_edge_detection_event`) is not wired to the
@@ -5091,6 +5101,12 @@ pub async fn dispatch_directory_op(
             Ok(o) => DirectoryOpResult::ContactOwner(o.into()),
             Err(e) => op_err_typed(&e),
         },
+        DirectoryOp::ServeStanding {} => {
+            match Box::pin(crate::federation::edition2::serve::serve_standing(dir)).await {
+                Ok(v) => DirectoryOpResult::ServeStanding(v),
+                Err(e) => op_err_typed(&e),
+            }
+        }
         DirectoryOp::ListGroupTips {
             cohort,
             group_key_id,
@@ -9442,9 +9458,11 @@ mod tests {
         // v62.0.0 (4g-regen) — re-pinned over the MERGED 4g order (PR-fix1,
         // AU-fix2, PX-fix2, RL-fix2, RL-fix3, PX-fix3, K2-fix20 after 4f's
         // PX-fix1). GROWTH; ABI stays 14.
+        // v62.0.0 (4h-regen) — re-pinned over 4h: RL-fix2c's `ServeStanding`
+        // appended (and TR-fix2's changes). ABI stays 14 (ruled).
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "6582bd9de3c7639ae42507f4a29c2caae82b1d52cfb7298009115b000d25f385",
+            "08a938e242cd0fe75515a939ea8a5d5a75a208f78d1e87b04776585d07a4b05f",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -9533,7 +9551,7 @@ mod tests {
             // v62.0.0 (PX-fix3) — GROWTH: `GroupTips` APPENDED.
             // v62.0.0 (4g-regen) — re-pinned over the merged 4g order.
             structural_digest("DirectoryOpResult"),
-            "87b3f03e2055a1af8c997bbc7a2f086bcd07aa007842fa6389090bc85e6ba0b0",
+            "96480819e93fca49e71e71a041d8a87f012ef8f1cea199ecd85c421ce7b10ec6",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
@@ -11812,21 +11830,28 @@ mod tests {
             .is_none());
     }
 
-    /// **I1765 — a withdrawn canonical is SEEN through the proxy**, by key and
-    /// in the list. The trait defaults answered `Ok(None)` / empty, so
-    /// `is_canonical_effective` read a withdrawn canonical as live.
+    /// **I1765** — v62.0.0 (TR-fix2; CC rc21 4.2.1): a canonical is withdrawn
+    /// only by a later genesis bundle. The backend writer is gone: the
+    /// concrete store refuses `record_canonical_withdrawal` by name (naming
+    /// `PutGenesisBundle`), and the lookup / list answer none, alike direct,
+    /// through the vtable and through the proxy.
     fn exercise_i1765(
         rt: &Arc<tokio::runtime::Runtime>,
         dir: Arc<dyn FederationDirectory>,
         tag: &str,
     ) {
         let key = format!("{tag}-canonical");
-        rt.block_on(dir.record_canonical_withdrawal(&key, None, "digest-1765"))
-            .expect("record canonical withdrawal");
+        match rt.block_on(dir.record_canonical_withdrawal(&key, None, "digest-1765")) {
+            Err(Error::Unsupported { method }) => assert!(
+                method.contains("PutGenesisBundle"),
+                "I1765: the refusal names the replacement: {method}"
+            ),
+            other => panic!("I1765: the backend writer is retired, got {other:?}"),
+        }
         let direct = rt
             .block_on(dir.lookup_canonical_withdrawal(&key))
             .expect("direct");
-        assert!(direct.is_some(), "I1765 seed");
+        assert!(direct.is_none(), "I1765: nothing is held");
         let directory = build_persist_directory(dir.clone());
         match run_op(
             rt,
@@ -11846,10 +11871,6 @@ mod tests {
             listed,
             rt.block_on(dir.list_canonical_withdrawals()).unwrap(),
             "I1765 list"
-        );
-        assert!(
-            listed.contains(direct.as_ref().unwrap()),
-            "I1765 list holds it"
         );
         // SAFETY: single-drop, matched vtable.
         unsafe { (directory.vtable.drop)(directory.data) };
@@ -14085,10 +14106,8 @@ mod tests {
                 .record_role_withdrawal("steward", &q.subject_f, None, "eq-digest")
                 .await
                 .unwrap();
-            concrete
-                .record_canonical_withdrawal(&q.subject_f, None, "eq-digest")
-                .await
-                .unwrap();
+            // v62.0.0 (TR-fix2): no canonical tombstone can be written (a
+            // later genesis bundle withdraws a canonical, CC 4.2.1).
         });
         let (r, _) = diff_1774(rt, &concrete, &proxy, &q, "halted+withdrawn");
         red.extend(r);
@@ -15044,6 +15063,11 @@ mod proxy_gate {
             "AdmitContactOwnerRows",
             "`edition2::contact::admit_contact_owner_rows` is a free door persist runs over \
              its own directory",
+        ),
+        (
+            "ServeStanding",
+            "`edition2::serve::serve_standing` is a free read over this store's node key and \
+             its own standing chain, not a trait method to proxy",
         ),
         (
             "PutIdentityOccurrenceRevocation",

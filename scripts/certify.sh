@@ -202,7 +202,7 @@ done
 # The leg is skippable ONLY by CERTIFY_SKIP_PYTHON=1, and never silently — the
 # verdict table carries a SKIPPED line and the run stops claiming full
 # certification.
-ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix mutscopes cachetrim cacheunits evidencetsv evidenceptr evidenceptrcc earlierform sizetest sizereport floortoken$AXIS_KEYS"
+ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix mutscopes cachetrim cacheunits evidencetsv evidenceptr evidenceptrcc earlierform onethreshold sizetest sizereport floortoken$AXIS_KEYS"
 
 FOCUS_LEG=""; FOCUS_FILTER=""
 if [ "$MODE" = "focus" ]; then
@@ -616,6 +616,8 @@ run_bg evidenceptrcc bash -c 'r="${CIRIS_CONSTITUTION_DIR:-../CIRISConstitution}
 # retired, or carry a written exemption (scripts/earlier_form_doors.tsv). The
 # gate's own witnesses run first: a check nobody has seen fail is a report.
 run_bg earlierform bash -c 'python3 scripts/earlier_form_doors.py --self-test && python3 scripts/earlier_form_doors.py check'
+# v62.0.0 (TR-fix1) — one spelling of the holders' strict majority.
+run_bg onethreshold bash -c 'python3 scripts/one_threshold.py --self-test && python3 scripts/one_threshold.py check'
 # v56.0.0 (CIRISPersist#934, #1076 slice T) — size tracking. `sizetest` is the
 # counter's and the table's witnesses (fixture trees, no cargo) and gates like
 # the other tool self-tests. `sizereport` is a REPORT: the per-file delta of

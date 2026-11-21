@@ -377,7 +377,7 @@ pub mod identity_type {
         ///
         /// This is the plane the portable trust root already uses for
         /// operational capability. A minted root is five objects: three accord
-        /// holders, a `canonical` blessed by their 2-of-3 co-scrub, a
+        /// holders, a `canonical` blessed by their strict-majority co-scrub, a
         /// self-referential charter `delegates_to(root → root, [infra:*])`, a
         /// grant `delegates_to(root → canonical, [infra:serve])`, and the user's
         /// own `delegates_to(user → root)` trust edge. Note the split: **root
@@ -416,14 +416,14 @@ pub mod identity_type {
             // The gate was briefly `AccordCoScrubbed`. That was wrong: the
             // co-scrub roster resolves to the accord holders, whose private
             // halves live in the #268 hardware ceremony, so registering a
-            // routine detector would have required 2-of-3 named humans with
+            // routine detector would have required a strict majority of named humans with
             // hardware tokens. A gate that fails closed on every legitimate
             // operator is not a gate, it is an outage — and it would have made
             // the root LESS portable, since every minted root would owe the
             // ceremony for each operational role it wants to stand up.
             //
             // The portable trust root already shows the right split: root
-            // IDENTITY (`canonical`) is conferred by the accord's 2-of-3
+            // IDENTITY (`canonical`) is conferred by the accord's strict-majority
             // co-scrub, while operational CAPABILITY (`infra:serve`,
             // `infra:attest`, `infra:store`, `infra:transport`) flows by
             // `delegates_to` from the root. These two roles are capabilities.
@@ -493,7 +493,7 @@ pub mod identity_type {
             // caught exactly that.
             //
             // Unlike `trusted_publisher` / `lenscore_detector` — which were
-            // moved OFF AccordCoScrubbed because requiring 2-of-3 hardware
+            // moved OFF AccordCoScrubbed because requiring a strict majority of hardware
             // humans to stand up a routine detector is an outage, not a gate —
             // the co-stewards are two named services, not a routine operational
             // role, and a self-asserted one gains standing over THIRD PARTIES:
@@ -1577,7 +1577,7 @@ pub struct KeyRecord {
     /// pre-#383 shape and cannot perturb `compute_persist_row_hash` (which
     /// excludes it — see there). The `canonical` role is conferred only on a
     /// record whose scrub set has **≥2 distinct anchor holders with valid
-    /// signatures** (`check_canonical_role_admission`), the 2-of-3 add gate.
+    /// signatures** (`check_canonical_role_admission`), the strict-majority add gate (2·yes > N).
     /// `root_binding` still roots via **any one** scrub. Wire-identical to
     /// `ciris_verify_core::federation_self_record::KeyRecord::additional_scrubs`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1837,7 +1837,7 @@ pub struct Attestation {
     /// outcomes: the serve-node KEY RECORD carried `scrub A1 +
     /// additional_scrubs [B1]` and proved 2-of-n, while the `genesis-charter`
     /// ATTESTATION that makes A1 a trust root carried one `scrub_key_id` and
-    /// proved 1-of-n. The 2-of-3 that authorized it was real, checked at
+    /// proved 1-of-n. The strict majority that authorized it was real, checked at
     /// `verify_bundle`, and then unrecoverable — a peer receiving the charter by
     /// replication could only ever answer *"A1 asserted it"*. With this field a
     /// replicated row proves its own m-of-n, which is what the family trust root

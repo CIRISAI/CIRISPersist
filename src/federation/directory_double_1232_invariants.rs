@@ -178,6 +178,8 @@ mod tests {
                         .await
                         .unwrap();
                     b.run_migrations().await.unwrap();
+                    // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+                    crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(&b, "rl2c-double-1232").await;
                     let d: Arc<dyn FederationDirectory> = Arc::new(b);
                     $body(d, &tag("s")).await;
                 }
@@ -194,6 +196,8 @@ mod tests {
                         .await
                         .unwrap();
                     b.run_migrations().await.unwrap();
+                    // v62.0.0 (RL-fix2c) — a rooted serving node (the serve wait, CC 5.3.4).
+                    crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(&b, "rl2c-double-1232").await;
                     let d: Arc<dyn FederationDirectory> = Arc::new(b);
                     $body(d, &tag("p")).await;
                     eprintln!("{}: RAN", stringify!($name));
