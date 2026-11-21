@@ -264,6 +264,9 @@ pub(crate) struct Counters {
     /// [`MAX_CALLER_LABELS`]. Locked only when a [`Caller`] is made and at
     /// [`snapshot`], never on the read path.
     caller_labels: std::sync::Mutex<Vec<String>>,
+    /// v61.4.3 (OB-fix1) — refusals of a slot at intern time (see
+    /// [`TelemetrySnapshot::caller_label_refusals`]).
+    caller_label_refusals: AtomicU64,
 }
 
 impl Counters {
@@ -275,6 +278,7 @@ impl Counters {
             callers: [const { [const { [const { Tally::new() }; CALLER_SLOTS] }; Door::COUNT] };
                 StoreBackend::COUNT],
             caller_labels: std::sync::Mutex::new(Vec::new()),
+            caller_label_refusals: AtomicU64::new(0),
         }
     }
 
@@ -298,6 +302,8 @@ impl Counters {
             labels.push(label.to_owned());
             return (labels.len() - 1) as u8;
         }
+        // Counted under the label lock, off the read path.
+        self.caller_label_refusals.fetch_add(1, Relaxed);
         OTHER_SLOT
     }
 
@@ -384,6 +390,7 @@ impl Counters {
             reads,
             folds,
             callers,
+            caller_label_refusals: self.caller_label_refusals.load(Relaxed),
         }
     }
 }
@@ -416,7 +423,21 @@ tokio::task_local! {
 
 /// The most distinct caller labels one counter set interns. Every label
 /// past them is counted under [`CALLER_OTHER`].
-pub const MAX_CALLER_LABELS: usize = 32;
+///
+/// v61.4.3 (CIRISServer workload attribution, rule A1) — 128, was 32. Edge
+/// alone names 26 labels, which left the server about 5; the server's own
+/// budget is 24 (route groups and loops). Every label in the process,
+/// whoever names it, shares this one set, and an interned label holds its slot
+/// for the life of the counter set.
+///
+/// What it costs: the `callers` table is `[backend][door][slot]` of
+/// [`Tally`] (3 × `AtomicU64` = 24 bytes), with 2 [`StoreBackend`]s × 19
+/// [`Door`]s × [`CALLER_SLOTS`] slots. At 129 slots that is 117,648 bytes
+/// (was 30,096 at 33), in the zero-initialised `GLOBAL` static. A snapshot
+/// lists at most 2 × 19 × (129 + 1 `unattributed`) = 4,940 caller rows (was
+/// 1,292), and only the rows that counted a read. The slot is a `u8`, so the
+/// cap stays at or below 254 (the assert below).
+pub const MAX_CALLER_LABELS: usize = 128;
 
 /// The longest caller label, in bytes.
 pub const MAX_CALLER_LABEL_LEN: usize = 48;
@@ -781,6 +802,18 @@ pub struct TelemetrySnapshot {
     /// listed only when it counts a read). A door's entries sum to its
     /// `reads` entry. Additive: `reads` and `folds` keep their shape.
     pub callers: Vec<CallerReads>,
+    /// v61.4.3 (OB-fix1; CIRISServer workload attribution) — **refusals of a
+    /// caller slot at intern time**: one per [`Caller::new`] call whose label
+    /// was not interned and found all [`MAX_CALLER_LABELS`] slots taken. That
+    /// caller's reads are counted under [`CALLER_OTHER`]. It is NOT a count of
+    /// distinct labels: persist keeps no names past the cap (remembering them
+    /// is the unbounded set the cap exists to prevent), so a label made
+    /// again after it was refused is refused, and counted, again. A host that
+    /// makes each [`Caller`] once and reuses it (the documented use) sees one
+    /// refusal per label. Never counted: a label already interned, a host's
+    /// own `other`, or a label [`validate_caller_label`] refuses. Monotone for
+    /// the life of the counter set. Additive.
+    pub caller_label_refusals: u64,
 }
 
 /// v61.1.0 (CIRISPersist#1235) — the counters of one `(backend, door,

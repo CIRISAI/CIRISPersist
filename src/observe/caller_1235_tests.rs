@@ -11,7 +11,10 @@
 //! - **I1583**: the label set is capped. The first `MAX_CALLER_LABELS`
 //!   distinct labels each get their own row; every label past them is counted
 //!   under `other`, as is a host's own `other`; re-making a known label is
-//!   its own caller, not a new one.
+//!   its own caller, not a new one. v61.4.3 (OB-fix1): the snapshot's
+//!   `caller_label_refusals` counts each refusal of a slot at intern time
+//!   (three new labels and one re-made overflow label past a full cap are
+//!   four), never the host's `other` or a known label.
 //! - **I1584** (sqlite, postgres): nested scopes, innermost wins: a read in
 //!   the inner scope is the inner caller's, and the outer caller is credited
 //!   again once the inner scope ends; a task scope wins over a thread scope,
@@ -154,8 +157,11 @@ fn i1583_the_label_set_is_capped_and_overflow_is_other() {
         (2, 2, 4),
         "I1583 both overflow reads land in other"
     );
+    // The last capped-in label, named from the cap (it was a literal
+    // `caller31` while the cap was 32).
+    let last = format!("caller{}", MAX_CALLER_LABELS - 1);
     assert_eq!(
-        snap.caller(StoreBackend::Sqlite, Door::GetAttestation, "caller31"),
+        snap.caller(StoreBackend::Sqlite, Door::GetAttestation, &last),
         (1, 1, 2),
         "I1583 the last capped-in label keeps its own row"
     );
@@ -163,6 +169,30 @@ fn i1583_the_label_set_is_capped_and_overflow_is_other() {
         snap.caller(StoreBackend::Sqlite, Door::GetAttestation, "one.too.many"),
         (0, 0, 0),
         "I1583 an overflow label gets no row of its own"
+    );
+    // OB-fix1 — refusals of a slot at intern time. The two over-cap labels
+    // above are two refusals; the host's own `other` and the re-made
+    // `caller3` are none. Three more distinct labels and one re-make of an
+    // overflowed one: four more, because a refused label is not remembered.
+    assert_eq!(snap.caller_label_refusals, 2, "I1583 two refusals so far");
+    for label in [
+        "three.too.many",
+        "four.too.many",
+        "five.too.many",
+        "one.too.many",
+    ] {
+        assert_eq!(
+            Caller::new(label).expect("legal").label(),
+            CALLER_OTHER,
+            "I1583 {label} is past the cap"
+        );
+    }
+    let _ = Caller::new(CALLER_OTHER).expect("legal");
+    let _ = Caller::new("caller3").expect("legal");
+    assert_eq!(
+        local.snapshot().caller_label_refusals,
+        6,
+        "I1583 refusals, not distinct labels: three new plus one re-made overflow label"
     );
 }
 
@@ -239,8 +269,8 @@ async fn i1586_the_snapshot_keeps_its_old_keys() {
     let json = serde_json::to_value(&snap).expect("serializes");
     assert_eq!(
         keys(&json),
-        set_of(&["reads", "folds", "callers"]),
-        "I1586 top level: the two old keys and the additive one"
+        set_of(&["reads", "folds", "callers", "caller_label_refusals"]),
+        "I1586 top level: the two old keys and the additive ones"
     );
     for r in json["reads"].as_array().expect("reads") {
         assert_eq!(

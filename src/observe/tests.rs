@@ -312,6 +312,7 @@ fn i551_samples_carry_exactly_the_catalogued_names_and_labels() {
             })
             .collect(),
         callers: Vec::new(),
+        caller_label_refusals: 0,
     };
     let samples = full.samples();
     let names: BTreeSet<&str> = samples.iter().map(|s| s.name).collect();
