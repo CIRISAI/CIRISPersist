@@ -74,6 +74,13 @@
 //!   `sub` naming another accord is refused by Verify's reader, and the
 //!   offer check names Verify's `statement_sub_not_family`; the object id
 //!   does not move with the header.
+//! - I2270 (pure; SC-fix1): the six genesis charter scopes Eric ruled
+//!   (`infra:serve`, `infra:attest`, `infra:detect`, `infra:attest_assurance`,
+//!   `assure:age`, `assure:capacity`) in ANY input order (lexicographic,
+//!   reversed, natural, with a duplicate) give ONE payload encoding, whose
+//!   `charter.scope` is in CDE set order (`assure:age`, `infra:serve`,
+//!   `infra:attest`, `infra:detect`, `assure:capacity`,
+//!   `infra:attest_assurance`), and the bundle is placed.
 //! - I2289 (pure; CE-fix2): CEREMONY step 3 before step 4.
 //!   [`c::check_offer_with_halts`] passes with exactly one sealed halt per
 //!   listed holder, and the coverage names each holder's halt.
@@ -1510,5 +1517,84 @@ fn i2295_a_bundle_voice_states_its_lineage_as_sub() {
         super::genesis::bundle_object_id(&payload),
         c::bundle_object_id(&off.terms),
         "I2295"
+    );
+}
+
+/// **I2270** — the charter scope is a set: any input order, one encoding,
+/// CDE set order, placed.
+#[test]
+fn i2270_the_charter_scope_is_written_in_set_order() {
+    add_test_attestation_root(mock_attestation_root_der());
+    let (_, off) = fixed();
+    let six = |xs: &[&str]| xs.iter().map(|x| (*x).to_owned()).collect::<Vec<String>>();
+    let natural = six(&[
+        "infra:serve",
+        "infra:attest",
+        "infra:detect",
+        "infra:attest_assurance",
+        "assure:age",
+        "assure:capacity",
+    ]);
+    let mut lexicographic = natural.clone();
+    lexicographic.sort();
+    let mut reversed = lexicographic.clone();
+    reversed.reverse();
+    let mut doubled = natural.clone();
+    doubled.push("infra:attest".to_owned());
+    let cde_order = six(&[
+        "assure:age",
+        "infra:serve",
+        "infra:attest",
+        "infra:detect",
+        "assure:capacity",
+        "infra:attest_assurance",
+    ]);
+    let payload_of = |scope: &[String]| {
+        let mut t = off.terms.clone();
+        t.scope = scope.to_vec();
+        (t.clone(), c::bundle_payload(&t))
+    };
+    let (_, first) = payload_of(&natural);
+    for (what, scope) in [
+        ("lexicographic", &lexicographic),
+        ("reversed", &reversed),
+        ("doubled", &doubled),
+        ("already in set order", &cde_order),
+    ] {
+        assert_eq!(
+            ciris_verify_core::cde::encode(&payload_of(scope).1),
+            ciris_verify_core::cde::encode(&first),
+            "I2270 {what}: one encoding whatever the input order"
+        );
+    }
+    let written: Vec<String> = first
+        .get_text("charter")
+        .and_then(|c| c.get_text("scope"))
+        .and_then(Value::as_array)
+        .expect("I2270: charter.scope")
+        .iter()
+        .map(|v| v.as_text().expect("text").to_owned())
+        .collect();
+    assert_eq!(
+        written, cde_order,
+        "I2270: CDE set order (shortest first, then bytewise)"
+    );
+    // The bundle with the six, signed by every holder, is placed.
+    let (terms, _) = payload_of(&lexicographic);
+    let mut st: Vec<Vec<u8>> = off
+        .statements()
+        .into_iter()
+        .take(off.statements().len() - off.voices.len())
+        .collect();
+    st.extend(
+        off.holders
+            .iter()
+            .map(|(k, _)| sign(k, &c::bundle_voice_draft(k.public_key(), &terms))),
+    );
+    let placed = c::check_genesis_offer(&st, &off.anchor(), CHECK_AT)
+        .unwrap_or_else(|e| panic!("I2270: the six-scope bundle is placed: {e:?}"));
+    assert_eq!(
+        placed[0].charter.scope, cde_order,
+        "I2270: the reader reads the six"
     );
 }

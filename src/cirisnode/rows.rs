@@ -476,6 +476,11 @@ pub fn plan_takedown_notice_row(
     members["subject_kind"] = serde_json::json!(TAKEDOWN_NOTICE_SUBJECT_KIND);
     members["claimant_key_id"] = serde_json::json!(signer_key_id);
     members["legal_basis"] = serde_json::json!(p.legal_basis.as_str());
+    // CC 2.6.1.2: `content_holders` is stated always, and an empty set is a
+    // set. The body's serde form omits an empty list, so it is restated here:
+    // without it a notice naming no holder is refused
+    // `edition2_payload_invalid` before the duty-holder gate reads it.
+    members["content_holder_key_ids"] = serde_json::json!(p.content_holder_key_ids);
     if let Some(m) = members.as_object_mut() {
         m.remove("expires_at");
     }
@@ -1411,6 +1416,11 @@ mod tests {
         assert_eq!(v["dimension"], "takedown_notice:dmca512:v1");
         assert_eq!(v["legal_basis"], "dmca512");
         assert_eq!(v["claimant_key_id"], "claimant-k");
+        assert_eq!(
+            v["content_holder_key_ids"],
+            serde_json::json!([]),
+            "I1170: a notice naming no holder states the empty set (CC 2.6.1.2: always)"
+        );
         assert_eq!(v["subject_kind"], TAKEDOWN_NOTICE_SUBJECT_KIND);
         assert_eq!(v["score"], serde_json::json!(-1.0));
         assert!(v.get("expires_at").is_none() || v["expires_at"].is_null());

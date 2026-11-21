@@ -627,6 +627,12 @@ pub struct SecondSignerRole {
     pub parties: Vec<SecondSignerParty>,
 }
 
+/// v62.0.0 (WD-fix1) — the composer row types that RETRACT their target
+/// (CC 2.4.1.1): each concludes on its own author's voice and takes no
+/// second-signer role from the target's family ([`second_signer_roles`]).
+/// The third composer, `supersedes`, restates content and keeps the roles.
+pub const RETRACTION_ROW_TYPES: &[&str] = &["withdraws", "recants"];
+
 /// v62.0.0 (K2-fix4, K2-fix6; CC 2.6.1.9 (P2:1147): "The second consent of a
 /// scoped delegates_to is a second statement over the same payload, signed
 /// by the delegate, the row's sub. A scoped delegation seats only with that
@@ -678,6 +684,20 @@ pub fn second_signer_roles(bytes: &[u8]) -> Vec<SecondSignerRole> {
                 .ok()
                 .map(|b| b.leaf)
         });
+    // v62.0.0 (WD-fix1; CC 2.4.1.1 / CC 3.2.3 rules 1–4) — a RETRACTION
+    // composer (`withdraws`, `recants`) carries its TARGET's family and sub
+    // but is its own author's act: it takes NO second-signer role from the
+    // target's family. WHO may author it is the withdraws admission rules'
+    // (the producer, a listed subject, the consent-revocation proxies, a
+    // holder's resignation), never the target family's voice roles. A
+    // COUNTED withdrawal (no author, act = group) is untouched: it falls to
+    // the group carve-out below and keeps its count (`check_counted_withdrawal`).
+    // `supersedes` is a composer too but restates content, so it keeps the
+    // family's roles.
+    let row_type = protected.get_int(-70001).and_then(Value::as_text);
+    if row_type.is_some_and(|t| RETRACTION_ROW_TYPES.contains(&t)) {
+        return Vec::new();
+    }
     let ctx = door_context(bytes, SelectContext::default());
     // CC's carve-out: a group act (a counted row) has no second signer.
     if ctx.act != Some(Act::Own) {

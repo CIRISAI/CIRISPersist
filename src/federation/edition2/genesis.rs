@@ -1433,7 +1433,11 @@ pub struct BundleTerms {
     pub cites: Vec<Digest32>,
     /// `charter.recovery_commitments`: one per holder, by identity-ref.
     pub recovery_commitments: Vec<(String, Digest32)>,
-    /// `charter.scope`: at least `infra:attest` and `infra:serve`.
+    /// `charter.scope`: at least `infra:attest` and `infra:serve`. A SET: the
+    /// host passes it in any order, and [`bundle_payload`] writes it in CDE set
+    /// order (shortest encoding first, then bytewise), the order Verify's
+    /// reader requires (a lexicographic list is `federation_set_semantics_
+    /// unsorted` there). A repeated token is collapsed, not refused.
     pub scope: Vec<String>,
     /// `charter.halt_fuse_secs`; `None` leaves the reader's default.
     pub halt_fuse_secs: Option<u32>,

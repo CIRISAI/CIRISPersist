@@ -388,7 +388,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 3.1.5	CLM-canonical-rebind	CIRISPersist	src/federation/edition2/transport_rebind.rs#seat_transit_key	ciris-persist@61.4.2	9532999f487eadb3e24ce21507b62d39ed69b7fc01d04830d3040e7da470fe9f
 3.1.1	CLM-takedown-notice-row	CIRISPersist	src/federation/takedown_tombstone.rs#check_takedown_notice_row_admission	ciris-persist@61.4.2	2c2bbc8adc94c4363383d8b675ce9f24647bcdf81c7032ad7f602f2c52c02761
 3.1.1	CLM-takedown-notice-row	CIRISPersist	src/federation/takedown_tombstone.rs#takedown_terms	ciris-persist@61.4.2	72445dfb40f4d94f9e86c58d0cfd6b796f13eff023e8bce7d8dbd18dd7d24215
-3.1.1	CLM-takedown-notice-row	CIRISPersist	src/cirisnode/rows.rs#plan_takedown_notice_row	ciris-persist@61.4.2	279734963c54d4b1915662c34cd6406f192a38820e448ef878e2f1c34f083b3e
+3.1.1	CLM-takedown-notice-row	CIRISPersist	src/cirisnode/rows.rs#plan_takedown_notice_row	ciris-persist@61.4.2	e49e34cac00e949c84e3e2bfd6d6f52c987a9d6f69b16a28a4182a105f09103e
 2.4.2	CLM-silo-projection-rebuildable	CIRISPersist	src/federation/ledger_projection.rs#project_ledger_row	ciris-persist@61.4.2	0d61a666eb85d937e15732ed289e39d4115b70e314ed1cbd6bfaff519405ff5e
 2.4.2	CLM-silo-projection-rebuildable	CIRISPersist	src/federation/goal_projection.rs#fold_goal	ciris-persist@61.4.2	0e2ae819b2b1e281f1aff672ccfbe9a0d6a2c428832f9b3e21bf5fc6875634eb
 # v60.0.0 (S6v, CC v1.0-rc9 at the tag) — the CC governance policy table is a runtime
