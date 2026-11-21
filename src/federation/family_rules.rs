@@ -114,15 +114,15 @@
 //!   `slashing:` through
 //!   [`check_moderation_admission`](super::admission::check_moderation_admission)'s
 //!   duty-holder walk"*. Executed:
-//!   [`super::admission::check_delegated_duty_scores_admission`] routes
+//!   [`super::admission::check_delegated_duty_scores_admission`] routed
 //!   `moderation:` → `moderate`, `reconsideration:` → `review` and
-//!   `quarantine:` → `slash`. **`slashing:` is not gated at admission by
-//!   persist at all** — the only `slashing` surface in the crate is the
-//!   `cirisnode`-feature-gated typed table, a different plane. The two families
-//!   persist gates there and had never enumerated are `moderation:` and
-//!   `reconsideration:`. Pinned by
-//!   [`tests::slashing_is_not_a_persist_ruled_family`] so the correction cannot
-//!   rot back.
+//!   `quarantine:` → `slash`, and **`slashing:` was not gated at admission by
+//!   persist at all**. The two families persist gated there and had never
+//!   enumerated were `moderation:` and `reconsideration:`. v62.0.0 (SL-fix1;
+//!   CC 3.4.7, CC 4.5.5; CIRISConstitution divergences C447 / C458) closed the
+//!   other half: `slashing:` → `slash` is the gate's fourth arm, read at
+//!   [`admission::SLASHING_DIMENSION_PREFIX`], and the family is inventoried
+//!   in [`RULES_NOT_ON_THE_ROW`] beside `quarantine:`.
 //! - The sharpest entry in the inventory is
 //!   `provenance:build_manifest`: `registry::class_for` hardcodes
 //!   `AuthorityClass::AccordCoScrub` for it, so **the manifest-derived
@@ -486,6 +486,17 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
                  reserved_rule)",
     },
     PersistFamilyRule {
+        prefix: "slashing:",
+        rule: "slash-duty-holder-only, in the row's community (a verdict naming no community \
+               is refused `slashing_community_required`) — the same holder resolution and \
+               walk as `quarantine:` (CC 3.4.7, CC 4.5.5; v62.0.0 SL-fix1)",
+        enforced_at: &["federation::admission::check_delegated_duty_scores_admission"],
+        gap: RowRuleGap::NoRuleOnTheRow,
+        minted_by_persist: false,
+        cc_ask: "CIRISConstitution#67 (CC 3.4.7's enforcement table states the signer and its \
+                 duty; the registry row carries no reserved_rule)",
+    },
+    PersistFamilyRule {
         prefix: "reconsideration:",
         rule: "a filing: the subject of the held target attestation (its signed subjects) or a \
                review duty-holder of the target's community; a ruling (an `outcome`): the \
@@ -701,26 +712,6 @@ pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
          fusion the parameter removes. No dimension ever carries this stem.",
     ),
     (
-        "slashing:",
-        "a RETENTION rule, not an admission rule — and the distinction is the whole \
-         entry. v31.0.0 (CIRISPersist#650) names this stem in \
-         `federation::migration::is_exclusion_bearing`, which decides what the v31 \
-         in-place migration may DELETE. It never decides what may be WRITTEN: \
-         persist still gates nothing on `slashing:` at admission (the module note \
-         above, and `tests::slashing_is_not_a_persist_ruled_family`, both hold \
-         unchanged — the only other `slashing` surface in the crate remains \
-         CIRISNode's `cirisnode_slashing_attestations`, a different plane). \
-         Naming it here is the same move `moderation:` / `quarantine:` / \
-         `reconsideration:` get from their inventory rows: a slashing outcome is \
-         one of the classes whose deletion would silently RE-ADMIT the key it \
-         excluded, because exclusion in this substrate is not structural — no \
-         fresh trust root removes an old key, and `federation_revocations` has no \
-         replication cursor to refill it from. So the migration refuses to purge \
-         it. Purge polarity is not a dimension-family rule and must not be \
-         derived into `persist_ruled_prefixes()`; if persist ever gates \
-         `slashing:` at a WRITE door, this entry must go.",
-    ),
-    (
         "regime:",
         "NOT persist-ruled, and still deliberately so (CIRISPersist#571) — but the \
          REASON changed at the rc3 re-vendor and the old one is dead. It used to \
@@ -910,6 +901,8 @@ pub fn persist_ruled_prefixes() -> Vec<String> {
                 admission::MODERATION_DIMENSION_PREFIX,
                 admission::RECONSIDERATION_DIMENSION_PREFIX,
                 admission::QUARANTINE_DIMENSION_PREFIX,
+                // v62.0.0 (SL-fix1) — the duty gate's fourth arm.
+                admission::SLASHING_DIMENSION_PREFIX,
                 registry::ACCORD_CO_SCRUB_MATCH_PREFIX,
                 admission::LEDGER_DIMENSION_PREFIX,
                 // v38.7.0 (CIRISPersist#782) — persist rules on `session:`:
@@ -1517,21 +1510,5 @@ mod tests {
             RowRuleGap::ClassAssertedByPersistNotTheRow.as_str(),
             "class_asserted_by_persist_not_the_row"
         );
-    }
-
-    /// The correction recorded in this module's doc, executed rather than
-    /// asserted: `slashing:` is NOT ruled on by persist.
-    #[test]
-    fn slashing_is_not_a_persist_ruled_family() {
-        let ruled: BTreeSet<String> = persist_ruled_prefixes().into_iter().collect();
-        assert!(
-            !ruled.contains("slashing:"),
-            "persist now rules on `slashing:` — add it to the inventory (its row carries no \
-             reserved_rule) and delete this test's premise from the module doc"
-        );
-        assert!(rule_not_on_the_row_for("slashing:suspension:v1").is_none());
-        // …while the two it DOES gate through that walk are both inventoried.
-        assert!(rule_not_on_the_row_for("moderation:x:v1").is_some());
-        assert!(rule_not_on_the_row_for("reconsideration:x:v1").is_some());
     }
 }

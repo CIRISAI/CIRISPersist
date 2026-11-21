@@ -596,20 +596,31 @@ where
         fault_kind,
         detail,
     };
+    // v62.0.0 (RL-fix6; CC 5.3.4, CC 2.7.3) — an empty roster is no longer a
+    // COMPILED one (C5-fix1 deleted it): it is the holders of the bundle in
+    // force, and empty means no bundle is in force yet — a rootless node,
+    // a supported state. That is a wait on the import door, never a
+    // discard: held with the same token, reading "the bundle in force"
+    // (the only key a placement can touch for holders this node has never
+    // seen). Outside a fold attempt it is the refusal it was.
     if roster_key_ids.is_empty() {
-        return Err(refuse(
-            "absent",
-            "the accord-holder roster is empty before any lookup — there is no authority set \
-             for this decision to be tallied against"
-                .to_owned(),
+        crate::federation::edition2::genesis::reads_bundle_in_force();
+        return Err(crate::federation::edition2::fold::hold(
+            crate::federation::edition2::fold::reason::gc8::NO_CONSTITUTIONAL_ROOT_YET,
+            refuse(
+                "absent",
+                "the accord-holder roster is empty before any lookup — there is no authority \
+                 set for this decision to be tallied against"
+                    .to_owned(),
+            ),
         ));
     }
     // v62.0.0 (wave GC8; CC 2.7.3) — "no root yet" is a wait on the
     // ceremony: the holders' key records (and the genesis bundle that seats
     // them) are other rows. An absent root is a fold condition, held with
     // `federation_no_constitutional_root_yet` and re-folded when a holder's
-    // record or a bundle lands. An empty COMPILED roster (above) and a
-    // directory that cannot answer (below) stay refusals: neither is a row.
+    // record or a bundle lands. A directory that cannot answer (below)
+    // stays a refusal: it is not a row.
     // A bundle seating a holder touches `key:<holder>` (G0 v3 §2), so the
     // holders' keys are the whole read set (no `family:` key, G0 v4).
     for kid in roster_key_ids {

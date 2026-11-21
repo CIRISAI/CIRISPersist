@@ -335,6 +335,41 @@ pub(crate) async fn after_edition2_occurrence<D: FederationDirectory + ?Sized>(
     Ok(())
 }
 
+/// v62.0.0 (SR-fix2; I2111) — **project again the route of every occurrence
+/// held under `occurrence`**: each held row inside its half-open window now
+/// (the write-side rule of [`plan_occurrence`]) that carries a transport
+/// binding projects its route at its own `asserted_at`, through the same
+/// step a fresh write takes
+/// ([`super::transport_routes::project_occurrence_route`]: no route for an
+/// agent key). For a caller whose offer wrote no occurrence because the bind
+/// is already held (the genesis import skips a named row it holds), so
+/// [`after_edition2_occurrence`] never runs for it. The projection is the
+/// route table's monotonic upsert: over a held route it changes nothing,
+/// and it never replaces a newer route (I2112).
+///
+/// # Errors
+/// The held occurrences' read; a binding's route encoding; the projection's
+/// write.
+pub(crate) async fn reproject_held_occurrence_routes<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    occurrence: &str,
+) -> Result<(), Error> {
+    let now = crate::host::clock::now();
+    for o in dir
+        .list_identity_occurrences_by_occurrence_key(occurrence)
+        .await?
+    {
+        if !o.valid_until.is_none_or(|u| now < u) {
+            continue;
+        }
+        if let Some(tb) = &o.transport_binding {
+            let route = tb.project_route(&o.occurrence_key_id, o.asserted_at)?;
+            super::transport_routes::project_occurrence_route(dir, &route).await?;
+        }
+    }
+    Ok(())
+}
+
 /// v62.0.0 (wave O1; CC 3.3.6) — the door's write: every backend's
 /// `put_identity_occurrence_edition2`. The gates ran in
 /// [`super::edition2::occurrence::put_occurrence_voice`]; this plans

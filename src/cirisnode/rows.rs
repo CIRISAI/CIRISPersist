@@ -72,8 +72,9 @@ pub mod refusal {
 pub const CONTRIBUTION_PREFIX: &str = "contribution:";
 /// The `vote:{contribution_id}` family stem (CC 3.1.9.3).
 pub const VOTE_PREFIX: &str = "vote:";
-/// The `slashing:{outcome}` family stem (CC 3.1.9.2).
-pub const SLASHING_PREFIX: &str = "slashing:";
+/// The `slashing:{outcome}` family stem (CC 3.1.9.2): the one spelling the
+/// duty gate branches on (v62.0.0, SL-fix1).
+pub const SLASHING_PREFIX: &str = crate::federation::admission::SLASHING_DIMENSION_PREFIX;
 /// The `moderation:{allegation_type}` family stem (CC 3.1.9.2).
 pub const MODERATION_PREFIX: &str = crate::federation::admission::MODERATION_DIMENSION_PREFIX;
 /// The `reconsideration:{grounds}` family stem (CC 3.1.9.2).
@@ -954,17 +955,65 @@ impl crate::Engine {
     }
 
     /// v60.0.0 — **record a slashing**: the `slashing:{outcome}` row.
+    /// Returns its `attestation_id` once the row has LANDED (concluded on the
+    /// attestation plane).
+    ///
+    /// v62.0.0 (SL-fix1; CC 3.4.7, CC 4.5.5) — the plane admits a slashing
+    /// only from a holder of the `slash` duty in the moderation's community
+    /// (as itself, or on a live slash-scoped chain at the row's instant). A
+    /// verdict from this engine's key without that duty is HELD by the
+    /// statement door (kept, concluding nothing, re-folded when a seat or
+    /// chain lands, CC 2.7.3), and this verb returns that hold as an error
+    /// instead of the row id: `federation_delegated_scope_unauthorized` (its
+    /// detail names the held row), or `cirisnode_not_authorized` for a hold
+    /// under any other reason. Before v62.0.0 every registered key's verdict
+    /// landed.
     ///
     /// # Errors
     ///
-    /// [`plan_slashing_row`]'s; the plane's.
+    /// [`plan_slashing_row`]'s; the plane's (`slashing_community_required`
+    /// for a moderation event naming no community); the hold, as above.
     pub async fn cirisnode_put_slashing_attestation(
         &self,
         s: &SlashingInput,
     ) -> Result<String, Error> {
         let dir = self.federation_directory();
         let row = plan_slashing_row(dir.as_ref(), s).await?;
-        self.cirisnode_emit(row).await
+        let id = self.cirisnode_emit(row).await?;
+        if dir.get_attestation(&id).await?.is_some() {
+            return Ok(id);
+        }
+        let rid = hex::decode(&id)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            .map(crate::federation::edition2::names::RowId);
+        let held = match rid {
+            Some(rid) => crate::federation::edition2::fold::why_held(dir.as_ref(), &rid).await?,
+            None => None,
+        };
+        match held {
+            Some(h)
+                if h.reason
+                    == crate::federation::edition2::fold::reason::gc1::DELEGATED_SCOPE_UNAUTHORIZED =>
+            {
+                Err(Error::from(
+                    crate::federation::Error::DelegatedScopeUnauthorized {
+                        signer: self.cirisnode_signer_key_id().await?,
+                        on_behalf_of: format!(
+                            "slashing row {id}, held (kept, concludes nothing until a slash seat \
+                             or chain lands): {}",
+                            h.detail
+                        ),
+                        scope: crate::federation::admission::DELEGATION_SCOPE_SLASH.to_owned(),
+                    },
+                ))
+            }
+            Some(h) => Err(Error::NotAuthorized(format!(
+                "slashing row {id} is held ({}): {}",
+                h.reason, h.detail
+            ))),
+            None => Ok(id),
+        }
     }
 
     /// v60.0.0 — **file a reconsideration**: the `reconsideration:{grounds}`

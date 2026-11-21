@@ -896,6 +896,83 @@ pub(crate) mod engine_bodies {
             .expect("I1170: rehomed, the ledger is its rebuild");
         assert_eq!(e.cirisnode_rehome_ledgers().await.unwrap(), 0);
     }
+
+    // ── I4127 ─────────────────────────────────────────────────────────────
+    /// v62.0.0 (SL-fix1; CC 3.4.7, CC 4.5.5) — **the slashing verb returns
+    /// the hold.** A moderation event in a room this engine holds no duty in
+    /// (founded by `alice`); `cirisnode_put_slashing_attestation` from this
+    /// engine's key is held by the duty gate, and the verb returns
+    /// `federation_delegated_scope_unauthorized` naming the held row instead
+    /// of an id, with no typed row; the hold is recorded under the GC1 reason.
+    pub(crate) async fn i4127_the_slashing_verb_returns_the_hold(dsn: &str, tag: &str) {
+        use crate::federation::edition2::fold;
+        let e = engine(dsn, &format!("i4127-node-{tag}")).await;
+        let dir = e.federation_directory();
+        let alice = super::bodies::who(dir.as_ref(), &format!("i4127-alice-{tag}")).await;
+        let accused = super::bodies::who(dir.as_ref(), &format!("i4127-accused-{tag}")).await;
+        let comm = format!("i4127-comm-{tag}");
+        crate::federation::doors_takedown_invariants::bodies::community_of(
+            dir.as_ref(),
+            &comm,
+            &alice.id,
+        )
+        .await;
+        let mid = super::bodies::emit(
+            dir.as_ref(),
+            &alice,
+            rows::plan_moderation_row(&crate::cirisnode::ModerationInput {
+                target_contributor: accused.id.clone(),
+                allegation_type: "rogue_vote".into(),
+                community_id: comm.clone(),
+                payload: serde_json::json!({}),
+            })
+            .unwrap(),
+        )
+        .await
+        .expect("I4127: the room's founder files the moderation event");
+        assert!(
+            dir.get_attestation(&mid).await.unwrap().is_some(),
+            "I4127: the moderation event landed"
+        );
+        let err = e
+            .cirisnode_put_slashing_attestation(&crate::cirisnode::SlashingInput {
+                moderation_id: mid,
+                outcome: "proven_rogue".into(),
+                payload: serde_json::json!({}),
+            })
+            .await
+            .expect_err("I4127: a verdict from a key with no slash duty is not reported landed");
+        assert_eq!(
+            err.kind(),
+            "federation_delegated_scope_unauthorized",
+            "I4127: {err}"
+        );
+        let slashing_family = ciris_verify_core::namespace_match::family_id("slashing:{outcome}");
+        let held: Vec<_> = fold::held_rows(dir.as_ref(), None, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|h| h.family == slashing_family)
+            .collect();
+        assert_eq!(held.len(), 1, "I4127: the verdict is kept, held: {held:?}");
+        assert_eq!(
+            held[0].reason,
+            fold::reason::gc1::DELEGATED_SCOPE_UNAUTHORIZED,
+            "I4127: {:?}",
+            held[0]
+        );
+        assert!(
+            err.to_string().contains(&held[0].row_id.hex()),
+            "I4127: the error names the held row: {err}"
+        );
+        assert!(
+            dir.get_attestation(&held[0].row_id.hex())
+                .await
+                .unwrap()
+                .is_none(),
+            "I4127: no typed row"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -951,6 +1028,28 @@ mod run {
             &tag(),
         ))
         .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i4127_sqlite_engine() {
+        Box::pin(
+            super::engine_bodies::i4127_the_slashing_verb_returns_the_hold(
+                "sqlite::memory:",
+                &tag(),
+            ),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i4127_postgres_engine() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        Box::pin(super::engine_bodies::i4127_the_slashing_verb_returns_the_hold(&dsn, &tag()))
+            .await;
     }
 
     #[cfg(feature = "sqlite")]

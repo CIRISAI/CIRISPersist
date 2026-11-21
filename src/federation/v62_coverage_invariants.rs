@@ -385,6 +385,58 @@ pub(crate) async fn i3233_founding_needs_a_margin(d: &dyn FederationDirectory) {
     );
 }
 
+fn is_m_refusal(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::CommunityConsensusProtocolViolation { rule, .. }
+            if *rule == crate::federation::admission::INFRA_RULE_QUORUM_M_NOT_STRICT_MAJORITY
+    )
+}
+
+/// **I4104** (IM-fix1; Eric's ruling 2026-11-21, CC 3.2) — **a trust-root-
+/// grade room's `M` is the strict majority of its founder count**, judged by
+/// the trust-root shape (the first gate a trust-root row meets, at its birth
+/// and at every link). `quorum:3/3` over three founders, and `quorum:2/5` and
+/// `quorum:4/5` over five, are refused `quorum_m_not_strict_majority` and
+/// nothing lands. Before this cut `3/3` and `4/5` were refused for the
+/// founding margin only, and `2/5` passed the shape and the margin. The
+/// controls `quorum:2/3` and `quorum:3/5` are never refused for it (they may
+/// be refused for a later leg, e.g. their founders' conferral).
+pub(crate) async fn i4104_a_trust_root_m_is_the_strict_majority(d: &dyn FederationDirectory) {
+    // Each room has its own founders (seeds distinct in their first bytes).
+    let founders_of =
+        |room: &str, n: usize| -> Vec<String> { (1..=n).map(|i| format!("f{i}-{room}")).collect() };
+    for (room, n, protocol) in [
+        ("im-room-33", 3, "quorum:3/3"),
+        ("im-room-25", 5, "quorum:2/5"),
+        ("im-room-45", 5, "quorum:4/5"),
+    ] {
+        let founders = founders_of(room, n);
+        let refs: Vec<&str> = founders.iter().map(String::as_str).collect();
+        let refused = found_room(d, room, &refs, protocol).await;
+        assert!(
+            refused.as_ref().is_some_and(is_m_refusal),
+            "I4104: {protocol} over {n} founders, got {refused:?}"
+        );
+        assert!(
+            d.lookup_community(&e2::kid(room)).await.unwrap().is_none(),
+            "I4104: {protocol}: nothing lands"
+        );
+    }
+    for (room, n, protocol) in [
+        ("im-room-23", 3, "quorum:2/3"),
+        ("im-room-35", 5, "quorum:3/5"),
+    ] {
+        let founders = founders_of(room, n);
+        let refs: Vec<&str> = founders.iter().map(String::as_str).collect();
+        let control = found_room(d, room, &refs, protocol).await;
+        assert!(
+            !control.as_ref().is_some_and(is_m_refusal),
+            "I4104: {protocol} over {n} founders is the strict majority: {control:?}"
+        );
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 //  (c) A seat's transit key (CC 3.3.6.2): only the bundle or a counted re-bind
 // ─────────────────────────────────────────────────────────────────────────
@@ -1837,6 +1889,21 @@ async fn i3233_postgres() {
         return;
     };
     Box::pin(i3233_founding_needs_a_margin(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i4104_sqlite() {
+    Box::pin(i4104_a_trust_root_m_is_the_strict_majority(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i4104_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(i4104_a_trust_root_m_is_the_strict_majority(&b)).await;
 }
 
 #[cfg(feature = "sqlite")]

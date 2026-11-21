@@ -311,6 +311,15 @@ where
     if door == CommunityDoor::Local {
         super::admission::check_infrastructure_record_admission(dir, row, received_at).await?;
     } else {
+        // v62.0.0 (IM-fix1) — this branch is the EARLIER-FORM replicated
+        // entry (`apply_replicated_community`), shut since slice F
+        // (`refuse_earlier_form("community")`; its row in
+        // `scripts/earlier_form_doors.tsv`). An edition-2 roster version,
+        // replicated or not, takes the Local branch above. With nothing
+        // stored, or a stored version already non-conformant, this branch
+        // keeps a record as data WITHOUT the strict-majority rule
+        // (`check_infrastructure_quorum_strict_majority`): whoever reopens
+        // this door adds that call here first.
         super::admission::check_replicated_supersede_does_not_degrade(dir, row, received_at)
             .await?;
     }

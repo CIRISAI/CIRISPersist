@@ -318,6 +318,10 @@ mod retraction_invariants;
 /// v61 S2 (CIRISPersist#1161) — I1512: room moderation in CC's shape.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod room_moderation_invariants;
+/// v62.0.0 (SL-fix1; CC 3.4.7, CC 4.5.5) — I4120–I4126: a slashing verdict
+/// counts only from a holder of the `slash` duty.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod slashing_duty_invariants;
 // v53.0.0 (CIRISPersist#969) — I310–I319: one DEK per (stream, epoch).
 /// v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — affiliations: the declared
 /// cohort and the typed config record (I592–I594).
@@ -14407,11 +14411,6 @@ pub mod malformed_row {
     /// extension `1.3.6.1.4.1.41482.3.7`). A shared `f9` or intermediate is
     /// not a shared device. The bundle is Invalid; nothing of it is stored.
     pub const HOLDER_DEVICE_SHARED: &str = "holder_device_shared";
-    /// v62.0.0 (C4-fix2; CC 4.2.3) — a seated `YubiKey_5_FIPS` holder's
-    /// attestation leaf names no device: it carries no readable
-    /// `1.3.6.1.4.1.41482.3.7` serial, so one device per holder cannot be
-    /// judged. The bundle is refused; nothing of it is stored.
-    pub const HOLDER_DEVICE_UNNAMED: &str = "holder_device_unnamed";
     /// v62.0.0 (slice J0; CC 2.6.1.12) — an earlier-form verification (a
     /// JSON row, a JSON key registration, a plane object signed over its JCS
     /// image) whose signer is an edition-2 key: its `federation_keys` row is
@@ -14632,7 +14631,8 @@ pub mod malformed_row {
         LICENCE_WITHDRAWAL_NO_HEAD,
         // v62.0.0 (C4-fix2; CC 4.2.3) — appended.
         HOLDER_DEVICE_SHARED,
-        HOLDER_DEVICE_UNNAMED,
+        // v62.0.0 (DV-fix1) — HOLDER_DEVICE_UNNAMED removed: CC 4.2.3 binds
+        // only "where the leaf of a holder's chain names its device".
     ];
 }
 

@@ -9311,8 +9311,10 @@ pub const DELEGATION_SCOPE_REVIEW: &str = "review";
 /// The #333 lesson this repo keeps re-learning is that a conferral nothing
 /// gates on is a stored label. `slash` gates a real door from the moment it
 /// exists: [`check_delegated_duty_scores_admission`] routes every
-/// [`QUARANTINE_DIMENSION_PREFIX`] row through it, so a quarantine marker
-/// authored by a key with no live `slash` chain is refused and never stored —
+/// [`QUARANTINE_DIMENSION_PREFIX`] and (v62.0.0, SL-fix1)
+/// [`SLASHING_DIMENSION_PREFIX`] row through it, so a quarantine marker or a
+/// slashing verdict authored by a key with no live `slash` chain is refused
+/// (held, at the statement door) and never stored —
 /// which in turn is what lets the serve path treat "held" as "authorized"
 /// without re-walking the graph on every page.
 pub const DELEGATION_SCOPE_SLASH: &str = "slash";
@@ -12161,6 +12163,26 @@ pub const RECONSIDERATION_DIMENSION_PREFIX: &str = "reconsideration:";
 ///
 /// [`slash`]: DELEGATION_SCOPE_SLASH
 pub const QUARANTINE_DIMENSION_PREFIX: &str = "quarantine:";
+
+/// v62.0.0 (SL-fix1; CC 3.4.7, CC 4.5.5; CIRISConstitution divergence
+/// `persist/slashing:{outcome}/signer_rule`, C447 / C458) — the
+/// `slashing:{outcome}` family stem (CC 3.1.9.2). A slashing verdict is the
+/// `slash` duty's other act beside the quarantine marker (CC 3.4.7: *"
+/// `slashing:{outcome}`, `quarantine:{state}` | the holder of the slashing
+/// duty | `slash` | the community's authority set"*), gated by
+/// [`check_delegated_duty_scores_admission`]'s fourth arm. Before v62.0.0 the
+/// family had no arm, and any registered key's slashing row was admitted.
+pub const SLASHING_DIMENSION_PREFIX: &str = "slashing:";
+
+/// v62.0.0 (SL-fix1; CC 3.4.7 "Conferred by: the community's authority set")
+/// — the refusal token of a `slashing:{outcome}` row that names no
+/// `community_id`: the `slash` duty a verdict is admitted under is conferred
+/// by a community's authority set, so a verdict in no community's name has
+/// no duty-holder set to be checked against. A fact of the row's own bytes:
+/// refused, never held (unlike `quarantine:*`, which names the federation
+/// scope by naming no community, CIRISPersist#632). `Error::InvalidArgument`
+/// (Python `ValueError`); the token is its stable prefix.
+pub const SLASHING_COMMUNITY_REQUIRED: &str = "slashing_community_required";
 
 /// v8.7.1 (CIRISPersist#233, CEG RC24 §11.10) — the §11.10 delegated-duty
 /// depth bound (§13.3: depth ≤ 5). The walk's `effective_depth` is
@@ -17172,6 +17194,13 @@ pub const INFRA_RULE_NO_FOUNDER: &str = "no_founder";
 /// make it so. The evaluator reads an ABSOLUTE `M`, so `quorum:1/1` over three
 /// founders would let one of them admit alone.
 pub const INFRA_RULE_QUORUM_N_NOT_FOUNDERS: &str = "quorum_n_not_founder_count";
+/// v62.0.0 (IM-fix1; Eric's ruling 2026-11-21, CC 3.2) — rule: an
+/// `infrastructure` record's declared `M` is not the strict majority of its
+/// founder count (`⌊N/2⌋ + 1`, [`strict_majority`]). An infrastructure room
+/// is held to the accord's own rule: `quorum:2/3` and `quorum:3/5` are
+/// conformant; `quorum:3/3`, `quorum:2/5` and `quorum:4/5` are not.
+/// [`check_infrastructure_quorum_strict_majority`].
+pub const INFRA_RULE_QUORUM_M_NOT_STRICT_MAJORITY: &str = "quorum_m_not_strict_majority";
 /// v50.0.0 (merge prep for CIRISPersist#926) — rule: a record that must be
 /// `infrastructure` (e.g. `ciris-canonical`) does not carry that subkind.
 pub const INFRA_RULE_SUBKIND_NOT_INFRASTRUCTURE: &str = "subkind_not_infrastructure";
@@ -17220,6 +17249,16 @@ pub const TRUST_ROOT_RULE_RESIGNATION_BACKDATED: &str = "resignation_backdated";
 /// 3.2: "a single founder must not be able to admit unilaterally";
 /// v62.0.0 (TR-fix2): `quorum:1/1` is refused too, CC rc21 3.2 T7).
 /// `Some((M, N))` when conformant. One parser, shared with #926.
+///
+/// v62.0.0 (IM-fix1) — the parser answers what a record DECLARES, and its
+/// readers need that answer for a record already held (the liveness fold's
+/// `M`, the founder-count gate's "is this a conformant room"). That `M` is
+/// the strict majority of the founder count is a rule over the record AND its
+/// founders, judged at the doors by
+/// [`check_infrastructure_quorum_strict_majority`], never here: a parser that
+/// answered `None` for `quorum:2/5` would rename the refusal
+/// (`protocol_not_quorum_m_of_n`) and switch the founder-count gate off for
+/// that room.
 #[must_use]
 pub fn infrastructure_quorum(protocol: &str) -> Option<(u32, u32)> {
     let (m, n) = protocol
@@ -17482,7 +17521,8 @@ pub fn check_infrastructure_consensus_protocol(community: &super::Community) -> 
             .filter(|m| m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
             .count();
         if n as usize == founders {
-            return Ok(());
+            // v62.0.0 (IM-fix1) — and M is the strict majority of that count.
+            return check_infrastructure_quorum_strict_majority(community);
         }
         return Err(Error::CommunityConsensusProtocolViolation {
             community_key_id: community.community_key_id.clone(),
@@ -17500,6 +17540,63 @@ pub fn check_infrastructure_consensus_protocol(community: &super::Community) -> 
             "consensus_protocol {p:?} is not a conformant quorum:M/N (1 <= M <= N, and \
              M >= 2 when N >= 2 — CC 3.2: founder_only / unanimous / bare majority are \
              non-conformant, and a single founder must not admit unilaterally)"
+        ),
+    })
+}
+
+/// v62.0.0 (IM-fix1; Eric's ruling 2026-11-21, CC 3.2) — **an infrastructure
+/// room's `M` is the strict majority of its founder count**, the accord's own
+/// rule: `M == ⌊N/2⌋ + 1` over the founders the record lists (3 → 2, 4 → 3,
+/// 5 → 3). Any other `M` is refused
+/// [`INFRA_RULE_QUORUM_M_NOT_STRICT_MAJORITY`], naming the declared `M` and
+/// `N` and the expected `M`. The expected count is [`strict_majority`], the
+/// one computation (Verify's `edition2::strict_majority`), never re-derived.
+///
+/// Pure, over the record. It is called from the two places every door that
+/// judges an infrastructure protocol already runs:
+/// - [`check_infrastructure_consensus_protocol`] (a labelled record: the
+///   `group:roster` door's founding and every later version, which under
+///   edition 2 is also the door a replicated version takes), after `N` is the
+///   founder count;
+/// - `canonical_community::check_trust_root_shape` (a trust-root-grade row:
+///   the birth, every amendment link of an offered chain, and the standing
+///   read, so a held row at another `M` reads `NotRooted`).
+///
+/// A protocol [`infrastructure_quorum`] does not parse is `Ok` here: the
+/// protocol gate names that refusal. With `M` the strict majority, the floor
+/// `M ≥ 2` refuses one founder and the trust-root margin `N ≥ M + 1` refuses
+/// two, so the smallest trust-root room is three founders at `quorum:2/3`.
+///
+/// # Errors
+///
+/// [`Error::CommunityConsensusProtocolViolation`].
+pub fn check_infrastructure_quorum_strict_majority(
+    community: &super::Community,
+) -> Result<(), Error> {
+    let p = community.consensus_protocol.as_str();
+    let Some((m, n)) = infrastructure_quorum(p) else {
+        return Ok(());
+    };
+    let founders = community
+        .members
+        .iter()
+        .filter(|m| m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
+        .count();
+    // No founder at all is the `no_founder` rule's refusal.
+    if founders == 0 {
+        return Ok(());
+    }
+    let expected = strict_majority(founders);
+    if m as usize == expected {
+        return Ok(());
+    }
+    Err(Error::CommunityConsensusProtocolViolation {
+        community_key_id: community.community_key_id.clone(),
+        rule: INFRA_RULE_QUORUM_M_NOT_STRICT_MAJORITY,
+        detail: format!(
+            "consensus_protocol {p:?} declares M = {m} of N = {n} over {founders} founder(s): an \
+             infrastructure room's M is the strict majority of its founder count, expected M = \
+             {expected} (CC 3.2: the accord's own rule)"
         ),
     })
 }
@@ -19286,8 +19383,9 @@ pub fn moderation_subject_digest(
 /// v8.7.1 (CIRISPersist#233, CEG RC24/RC25 §11.10) — `put_attestation`
 /// entry point for the **report → `scores`** half of the moderation gate.
 /// A no-op (`Ok(())`) for any attestation that is not a `scores` row on a
-/// `moderation:*` or `reconsideration:*` dimension; for those it resolves
-/// the governing duty (`moderate` / `review`), computes the target's
+/// `moderation:*`, `reconsideration:*`, `quarantine:*` or (v62.0.0, SL-fix1)
+/// `slashing:*` dimension; for those it resolves the governing duty
+/// (`moderate` / `review` / `slash` / `slash`), computes the target's
 /// duty-holders from the row's `subject_key_ids` + the envelope
 /// `community_id`, and runs [`check_moderation_admission`] with the row's
 /// `attesting_key_id` as the signer.
@@ -19323,6 +19421,17 @@ pub async fn check_delegated_duty_scores_admission(
         // record: terminal).
         super::quarantine::check_signer_kind(directory, row).await?;
         DELEGATION_SCOPE_SLASH
+    } else if dimension.starts_with(SLASHING_DIMENSION_PREFIX) {
+        // v62.0.0 (SL-fix1; CC 3.4.7, CC 4.5.5; C447 / C458) — the fourth
+        // arm. A slashing verdict is the `slash` duty's act beside the
+        // quarantine marker, so it is checked by the SAME holder resolution
+        // and the same `check_moderation_admission` walk below: the signer
+        // holds `slash` in the row's community at the row's signed instant,
+        // as itself or on a live slash-scoped chain, else it is held
+        // `delegated_scope_unauthorized` and re-folds when a seat or chain
+        // lands. Before this arm the family had none, so any registered
+        // key's verdict was admitted.
+        DELEGATION_SCOPE_SLASH
     } else {
         return Ok(());
     };
@@ -19341,6 +19450,20 @@ pub async fn check_delegated_duty_scores_admission(
     // not authority). [`check_reconsideration_admission`] is that decision.
     if dimension.starts_with(RECONSIDERATION_DIMENSION_PREFIX) {
         return check_reconsideration_admission(directory, row, dimension, community_id).await;
+    }
+    // v62.0.0 (SL-fix1; CC 3.4.7) — a slashing verdict is conferred by "the
+    // community's authority set": one in no community's name has no
+    // duty-holder set, and the accord resolver below is the quarantine arm's
+    // alone (a federation-scope de-admission, #632). Refused by name, from
+    // the row's own bytes, so it can never fall through to an empty-set walk
+    // nor to "any registered key".
+    if dimension.starts_with(SLASHING_DIMENSION_PREFIX) && community_id.is_empty() {
+        return Err(Error::InvalidArgument(format!(
+            "{SLASHING_COMMUNITY_REQUIRED}: {} by {} names no `community_id`: a slashing \
+             verdict is admitted under the `slash` duty a community's authority set confers \
+             (CC 3.4.7, CC 4.5.5)",
+            row.attestation_id, row.attesting_key_id
+        )));
     }
     // v30.10.0 (CIRISPersist#632) — SCOPE SELECTS THE RESOLVER.
     //

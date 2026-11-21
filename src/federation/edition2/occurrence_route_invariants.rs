@@ -35,6 +35,20 @@
 //! - I2113 (the occurrence door): the same holds for a bind landed through
 //!   the statement door: its route row gone, the same statement put again
 //!   projects it.
+//! - I2109 (the binding first): a seat's key record and binding put alone
+//!   through the statement door before the bundle, then the bundle
+//!   imported: the seat's occurrence row is held and its route is projected,
+//!   as for every other seat (whatever the statement door answered alone).
+//! - I2118 (a re-keyed seat): a seat rotated to a new signing key by a
+//!   `key:record` chain (the predecessor's voice, then the new key's, through
+//!   the statement door). Its binding signed by the NEW key, put alone, is
+//!   refused `occurrence_voice_not_own_key` and nothing is kept: no
+//!   statement, no fold hold, the seat's occurrence row and route unchanged.
+//!   So a seat binding is never held back, and the import's skip of a stored
+//!   named row is a skip of a landed one. The later bundle that seats the
+//!   new key is then imported: it is in force with the seat at the new key,
+//!   the seat's occurrence row is the new binding's, and its one live route
+//!   is the new binding's destination.
 
 use ciris_crypto::composite::CompositeSigningKey;
 use ciris_verify_core::cde::Value;
@@ -662,6 +676,222 @@ async fn reput_route_body(d: &dyn FederationDirectory) {
         before,
         "I2113: the re-put projects the missing route again"
     );
+}
+
+/// Every seat of `c`: an occurrence row at its identity reference carrying
+/// a transport binding, and exactly one live route to the destination its
+/// binding states.
+async fn assert_seats_reachable(
+    d: &dyn FederationDirectory,
+    c: &super::fixture_genesis::TestCeremonyV2,
+    tag: &str,
+) {
+    for seat in &c.seats {
+        let id = &seat.identity_ref;
+        let held = d
+            .list_identity_occurrences_by_occurrence_key(id)
+            .await
+            .unwrap();
+        assert!(
+            held.iter()
+                .any(|o| &o.identity_key_id == id && o.transport_binding.is_some()),
+            "{tag}: the seat's occurrence row is held with its transport binding: {held:?}"
+        );
+        let routes = d.list_transport_destinations_for(id).await.unwrap();
+        assert_eq!(
+            routes.len(),
+            1,
+            "{tag}: the seat has exactly one live route: {routes:?}"
+        );
+        assert_eq!(
+            routes[0].destination,
+            hex::encode(stated_destination_hash(&seat.binding.statement)),
+            "{tag}: the destination is the hex of the binding's destination_hash"
+        );
+    }
+}
+
+/// I2109 on one backend: the first seat's key record and binding arrive
+/// alone, ahead of the bundle. What the statement door answers alone is
+/// printed, not asserted: the invariant is the state after the import.
+async fn binding_first_body(d: &dyn FederationDirectory) {
+    use super::fixture_genesis::{bundle_v2, install_v2};
+    let c = bundle_v2();
+    let seat = &c.seats[0];
+    let record = Box::pin(put_statement(d, &seat.record.statement, None, INGEST_TIER)).await;
+    let binding = Box::pin(put_statement(d, &seat.binding.statement, None, INGEST_TIER)).await;
+    eprintln!("I2109: alone, the record: {record:?}; the binding: {binding:?}");
+    install_v2(d).await.unwrap();
+    assert_seats_reachable(d, c, "I2109").await;
+}
+
+/// I2118 on one backend: a re-keyed seat's binding alone, then its bundle.
+/// The dates are the bundles' own (the rotation and the new binding one
+/// second before the later bundle).
+async fn rekeyed_seat_body(d: &dyn FederationDirectory) {
+    use super::fixture_genesis::{
+        bundle_v2, install_ceremony_v2, install_v2, kid_of, rekey_seat_v2, HOLDER_SEEDS,
+    };
+    use super::genesis::genesis_in_force;
+    use super::names::RowId;
+    use crate::federation::{malformed_row, Error};
+    /// A key seed no fixture party uses.
+    const NEW_KEY_SEED: u8 = 21;
+    install_v2(d).await.unwrap();
+    let c1 = bundle_v2();
+    let old = &c1.seats[0];
+    let seat = &old.identity_ref;
+    let (c2, by_predecessor) = rekey_seat_v2(c1, old.seed, NEW_KEY_SEED, &HOLDER_SEEDS[..2]);
+    let new = &c2.seats[0];
+    let old_destination = hex::encode(stated_destination_hash(&old.binding.statement));
+    let new_destination = hex::encode(stated_destination_hash(&new.binding.statement));
+    assert_ne!(
+        old_destination, new_destination,
+        "I2118: the control: the new binding states another destination"
+    );
+    let occurrences_before = d
+        .list_identity_occurrences_by_occurrence_key(seat)
+        .await
+        .unwrap();
+    let routes_before = d.list_transport_destinations_for(seat).await.unwrap();
+    assert_eq!(
+        routes_before.len(),
+        1,
+        "I2118: the control: the seat's first route is held"
+    );
+
+    // The rotation, through the statement door: the predecessor's voice,
+    // then the new key's (the new key's alone waits on the predecessor's).
+    Box::pin(put_statement(d, &by_predecessor, None, INGEST_TIER))
+        .await
+        .expect("I2118: the predecessor's voice over the rotation record");
+    Box::pin(put_statement(d, &new.record.statement, None, INGEST_TIER))
+        .await
+        .expect("I2118: the new key's voice: the rotation stands");
+
+    // The new key's binding, alone: refused by name, nothing kept.
+    let refusal = Box::pin(put_statement(d, &new.binding.statement, None, INGEST_TIER))
+        .await
+        .expect_err("I2118: a re-keyed seat's binding alone is refused");
+    assert!(
+        matches!(
+            &refusal,
+            Error::MalformedRow { reason, .. }
+                if *reason == malformed_row::OCCURRENCE_VOICE_NOT_OWN_KEY
+        ),
+        "I2118: refused `occurrence_voice_not_own_key`: {refusal:?}"
+    );
+    let binding_row = RowId(new.binding.row_id);
+    assert!(
+        d.edition2_voices(&binding_row).await.unwrap().is_empty(),
+        "I2118: no statement of the refused binding is kept"
+    );
+    assert!(
+        d.fold_held(&binding_row).await.unwrap().is_none(),
+        "I2118: the refused binding is not held back"
+    );
+    assert_eq!(
+        d.list_identity_occurrences_by_occurrence_key(seat)
+            .await
+            .unwrap(),
+        occurrences_before,
+        "I2118: the seat's occurrence row is unchanged"
+    );
+    assert_eq!(
+        d.list_transport_destinations_for(seat).await.unwrap(),
+        routes_before,
+        "I2118: the seat's route is unchanged"
+    );
+
+    // The later bundle that seats the new key.
+    install_ceremony_v2(d, &c2)
+        .await
+        .expect("I2118: the bundle that re-seats the seat at its new key is placed");
+    let in_force = genesis_in_force(d).await.unwrap();
+    assert_eq!(
+        in_force.seat(seat).map(|s| s.kid),
+        Some(kid_of(NEW_KEY_SEED)),
+        "I2118: the bundle in force seats the new key for the seat"
+    );
+    let landed = d
+        .list_identity_occurrences_by_occurrence_key(seat)
+        .await
+        .unwrap();
+    assert_ne!(
+        landed, occurrences_before,
+        "I2118: the import wrote the new binding's occurrence row"
+    );
+    let routes = d.list_transport_destinations_for(seat).await.unwrap();
+    assert_eq!(
+        routes.len(),
+        1,
+        "I2118: the re-keyed seat has exactly one live route: {routes:?}"
+    );
+    assert_eq!(
+        routes[0].destination, new_destination,
+        "I2118: the route is the new binding's destination"
+    );
+    // The other seat keeps its route.
+    for other in c2.seats.iter().skip(1) {
+        assert_eq!(
+            d.list_transport_destinations_for(&other.identity_ref)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "I2118: the other seats keep their routes"
+        );
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2118_rekeyed_seat_sqlite() {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(rekeyed_seat_body(&b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2118_rekeyed_seat_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::empty_dsn() else {
+        return;
+    };
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(rekeyed_seat_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2109_binding_before_bundle_sqlite() {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(binding_first_body(&b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2109_binding_before_bundle_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::empty_dsn() else {
+        return;
+    };
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(binding_first_body(&b)).await;
 }
 
 #[cfg(feature = "sqlite")]

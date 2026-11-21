@@ -4163,7 +4163,10 @@ impl PyEngine {
     /// each `(backend, door)` that served a read; `folds` lists every fold;
     /// `callers` (v61.1.0, CIRISPersist#1235, additive) splits each door's
     /// reads by the caller label set with `set_caller_scope`, with
-    /// `"unattributed"` for reads made under none. Process-wide counters
+    /// `"unattributed"` for reads made under none. `"caller_label_refusals"`
+    /// (v62.0.0, additive) is the number of times a label was refused a slot
+    /// because the cap was full: refusals, not distinct labels (a re-made
+    /// overflow label counts again). Process-wide counters
     /// (`crate::observe`); names per `TELEMETRY_CATALOG`.
     fn telemetry_snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         self.ensure_usable()?;
@@ -4203,6 +4206,8 @@ impl PyEngine {
         dict.set_item("reads", reads)?;
         dict.set_item("folds", folds)?;
         dict.set_item("callers", callers)?;
+        // OB-fix1 — additive: refusals of a caller slot at intern time.
+        dict.set_item("caller_label_refusals", snap.caller_label_refusals)?;
         Ok(dict)
     }
 
@@ -21843,7 +21848,10 @@ impl PyEngine {
 
     /// v60.0.0 — Record a slashing: `body_json` is a
     /// [`SlashingInput`](crate::cirisnode::SlashingInput) (`moderation_id`,
-    /// `outcome`, `payload`). Returns the `slashing:{outcome}` row's id.
+    /// `outcome`, `payload`). Returns the `slashing:{outcome}` row's id once
+    /// it has landed. v62.0.0 (SL-fix1) — a verdict from a key holding no
+    /// `slash` duty in the community is held, and raises `ValueError`
+    /// (`federation_delegated_scope_unauthorized`) instead of returning an id.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_put_slashing_attestation(
         &self,
@@ -37206,8 +37214,8 @@ fn engine_teardown_wait(py: Python<'_>, timeout_seconds: f64) -> &'static str {
 /// calling thread, so the label covers the calls this thread makes until it
 /// is changed. A label is 1 to 48 bytes of `[a-z][a-z0-9_.:-]*` and not
 /// `"unattributed"`; anything else raises `ValueError` and leaves the scope
-/// unchanged. Past 32 distinct labels per process every new label is counted
-/// under `"other"`.
+/// unchanged. Past 128 distinct labels per process (`MAX_CALLER_LABELS`;
+/// 32 before v62.0.0) every new label is counted under `"other"`.
 #[pyfunction]
 #[pyo3(signature = (label=None))]
 fn set_caller_scope(label: Option<&str>) -> PyResult<Option<String>> {

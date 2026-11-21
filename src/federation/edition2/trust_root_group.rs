@@ -153,6 +153,10 @@ pub async fn bundle_quorum_over<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (RL-fix6) — a birth counted short over no (or an earlier)
+    // bundle's holders re-folds at a placement. `bundle_holder_refs` itself
+    // does not declare it: it is also the standing cache's key input.
+    super::genesis::reads_bundle_in_force();
     let holders = bundle_holder_refs(dir).await?;
     let distinct_holders = holders.iter().filter(|h| signers.contains(*h)).count();
     Ok(SignerCount {

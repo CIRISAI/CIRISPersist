@@ -166,6 +166,21 @@ pub fn typed_plane_of_row(row: &AdmittedRow) -> Option<TypedPlane> {
     Some(plane)
 }
 
+/// v62.0.0 (SL-fix1) — the `slashing:{outcome}` family, as CC's registry
+/// spells it (CC 3.1.9.2): the header id its statements carry is
+/// `namespace_match::family_id` of it.
+const SLASHING_NAMESPACE_FAMILY: &str = "slashing:{outcome}";
+
+/// v62.0.0 (K2-fix13, SL-fix1) — is `family` (a header family id) one of the
+/// two `slash` duty families, `quarantine:{state}` or `slashing:{outcome}`?
+/// CC's family model states ONE authorship cell for both (`group=affiliations
+/// & seats=one => counted ; authored`), so the door supplies both the same
+/// context.
+fn is_slash_family(family: &str) -> bool {
+    family == namespace_match::family_id(crate::federation::quarantine::NAMESPACE_FAMILY)
+        || family == namespace_match::family_id(SLASHING_NAMESPACE_FAMILY)
+}
+
 /// v62.0.0 (T2-fix3) — **the selector keys a typed family's authorship cell
 /// reads, from the statement's bytes alone**, for an admit that supplies
 /// none (`door::door_context`; a key already `Some` is kept):
@@ -180,6 +195,9 @@ pub fn typed_plane_of_row(row: &AdmittedRow) -> Option<TypedPlane> {
 ///   ([`family_context`]) when the row was first admitted, and a counted row
 ///   carries no author by CC 2.6.1.3, so a re-admission of held bytes reaches
 ///   the verdict it was admitted under.
+/// - `quarantine:{state}` and (v62.0.0, SL-fix1) `slashing:{outcome}`: an
+///   AUTHORED statement is the authored arm's (`seats = 0`); a counted one
+///   needs the held community ([`family_context`]).
 pub fn fill_context_from_bytes(
     bytes: &[u8],
     ctx: &mut ciris_verify_core::edition2::family::SelectContext,
@@ -203,7 +221,7 @@ pub fn fill_context_from_bytes(
         if ctx.seats.is_none() && ctx.group.is_none() {
             ctx.seats = Some(0);
         }
-    } else if family == namespace_match::family_id(crate::federation::quarantine::NAMESPACE_FAMILY)
+    } else if is_slash_family(family)
         && ctx.group.is_none()
         && ctx.seats.is_none()
         && payload.get_text("author").is_some()
@@ -244,6 +262,11 @@ pub fn fill_context_from_bytes(
 ///   notice's affiliation arm): `group` = the cohort of the held record of
 ///   the marker's `community_id`; `seats` = an affiliation's members; a
 ///   community not held reads `seats = 0`.
+/// - v62.0.0 (SL-fix1) `slashing:{outcome}`: the same cell as the quarantine
+///   marker's (CC's family model states both `group=affiliations &
+///   seats=one => counted ; authored`), read the same way from the row's
+///   `community_id`. Without it the cell's first arm reads unknown, and a
+///   slashing statement is `authorship_undetermined` at the door.
 /// - every other family: the default (the door derives `act`).
 ///
 /// # Errors
@@ -297,8 +320,7 @@ where
             },
             Some(_) => None,
         };
-    } else if family == namespace_match::family_id(crate::federation::quarantine::NAMESPACE_FAMILY)
-    {
+    } else if is_slash_family(family) {
         // v62.0.0 (K2-fix13; CC rc21 family model, `quarantine:{state}`:
         // `group=affiliations & seats=one => counted ; authored`) — `group`
         // is the cohort the held record of the marker's `community_id`

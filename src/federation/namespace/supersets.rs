@@ -1847,7 +1847,10 @@ mod tests {
         // (`edition2::peer_rooting::peer_rooting`). Recount on a merge.
         // v62.0.0 (4g-regen): recounted from the registry on the merged 4g tree
         // (405 src/ rows).
-        const EXPECTED: usize = 405;
+        // v62.0.0 (IM-fix1): +1, CLM-infrastructure-quorum-m-of-n at the
+        // strict-majority check (`check_infrastructure_quorum_strict_majority`).
+        // Recount on a merge.
+        const EXPECTED: usize = 406;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

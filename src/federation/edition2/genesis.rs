@@ -57,7 +57,7 @@ pub use ciris_verify_core::edition2::genesis::{
     Anchor, BundleReading, Fork, GenesisCharter, GenesisPlacement, GenesisVerdict, PlacedHolder,
     PlacedSeat, PlacedWitness, TipsInCommon,
 };
-use ciris_verify_core::edition2::keys::{check_key_record, KeyRecord, KEY_RECORD_FAMILY};
+use ciris_verify_core::edition2::keys::{check_key_record, KEY_RECORD_FAMILY};
 use ciris_verify_core::edition2::{
     object_id, statement_id, Digest32, KeyDirectory, KeyLookup, KeyOf,
 };
@@ -80,7 +80,7 @@ pub mod token {
         GENESIS_BUNDLE_NOT_ANCHORED as NOT_ANCHORED,
         GENESIS_BUNDLE_PREV_NOT_VALID as PREV_NOT_VALID, GENESIS_BUNDLE_ROW_INVALID as ROW_INVALID,
         GENESIS_BUNDLE_ROW_UNPLACED as ROW_UNPLACED, GENESIS_HOLDER_CUSTODY as HOLDER_CUSTODY,
-        HOLDER_DEVICE_SHARED as DEVICE_SHARED, HOLDER_DEVICE_UNNAMED as DEVICE_UNNAMED,
+        HOLDER_DEVICE_SHARED as DEVICE_SHARED,
     };
 
     /// The label of a bundle that waits on a named row or its predecessor
@@ -661,6 +661,22 @@ pub(crate) fn in_force_of(
 
 /// The rows each voice's payload names, by row id: the held one, else the
 /// `carried` one, if given. Also the ids of those that are held.
+///
+/// "Held" here is one fact only: this node stores at least one statement of
+/// the row id (`ceg_statements`). For the rows a bundle names that is also
+/// "landed", so `admit_named` skips a held row (SR-fix2):
+/// - a `key:record` is never held back by the fold (it is a door input); its
+///   read model is re-derived for a placed key by `plan_keys`, whether or not
+///   the offer carries it;
+/// - a seat binding has the shape Verify's reader requires (`author`,
+///   `identity_key_id`, `occurrence_key_id` and the statement's `iss` and
+///   `sub` are all the seat's identity reference), so alone at the occurrence
+///   door it speaks in the occurrence key's own role: signed by that key it
+///   lands at once (the identity's own key answers for it), signed by any
+///   other key it is refused `occurrence_voice_not_own_key` and nothing is
+///   kept. A binding stored here was therefore written with its occurrence
+///   row; its route is projected again by the import
+///   (`occurrence_admit::reproject_held_occurrence_routes`).
 async fn named_rows<F>(
     dir: &F,
     voices: &[Vec<u8>],
@@ -680,12 +696,27 @@ where
     let mut rows = BTreeMap::new();
     let mut held = BTreeSet::new();
     for id in want {
-        if let Some(h) = dir.edition2_voices(&RowId(id)).await?.into_iter().next() {
-            rows.insert(id, h);
-            held.insert(id);
-        } else if let Some(c) = carried.get(&id) {
-            rows.insert(id, c.clone());
+        let mut voices = dir.edition2_voices(&RowId(id)).await?;
+        if voices.is_empty() {
+            if let Some(c) = carried.get(&id) {
+                rows.insert(id, c.clone());
+            }
+            continue;
         }
+        // v62.0.0 (SR-fix2; I2118) — the reader verifies a named
+        // `key:record` under the key it records, so the voice it is handed
+        // is that key's OWN. A rotation record is one row with two voices
+        // (the new key's and its predecessor's, CC 2.4.1.1), read back in
+        // statement-id order: the first could be the predecessor's, which
+        // the reader cannot verify under the recorded key. Any other row
+        // (one voice, or no recorded key): the first.
+        let own = voices.iter().position(|v| {
+            super::ingest::is_key_record(v)
+                && super::liveness::recorded_kid(v)
+                    .is_some_and(|k| super::ingest::statement_kid(v) == Some(k))
+        });
+        rows.insert(id, voices.swap_remove(own.unwrap_or(0)));
+        held.insert(id);
     }
     Ok((rows, held))
 }
@@ -777,6 +808,40 @@ where
     Ok(f)
 }
 
+/// v62.0.0 (RL-fix6; CC 2.7.3, CC 5.3.4) — **the read key of "the bundle in
+/// force"**: `family:ceg-genesis-bundle/2`, one key for the node. The
+/// bundle in force is a node-wide reading (every held voice, one lineage),
+/// so no narrower key is correct: a gate that waits because NO bundle is in
+/// force cannot name a family or a holder it has never seen.
+///
+/// The import door touches it on every placement ([`put_genesis_bundle`]: a
+/// first bundle, an amend, a successor, a recovery, a re-seat — each is a
+/// placement). A halt latching or lifting does not change the bundle in
+/// force (the reading reads voices, their named rows and the bundles' own
+/// holds, never a lifecycle row), so it does not touch it.
+#[must_use]
+pub fn bundle_in_force_read_key() -> String {
+    super::fold::Dep::Family(GENESIS_BUNDLE_TYP.to_owned()).read_key()
+}
+
+/// v62.0.0 (RL-fix6) — declare [`bundle_in_force_read_key`] read by the
+/// running fold attempt (a no-op outside one: `fold::reads` is a
+/// `try_with`). Called by the readers a GATE asks "is this a seat / a holder
+/// of the bundle in force" through ([`bundles_in_force`],
+/// [`is_canonical_by_bundle`], [`bundle_seats_in_force`],
+/// `trust_root_group::bundle_quorum_over`), by the founder check
+/// (`canonical_community::reads_founder`, for `is_bundle_holder`) and by the
+/// no-root hold (`posture::require_seated_accord_roster` on an empty
+/// roster). NOT by [`genesis_in_force`] itself: every edition-2 row reads it
+/// (`recovery_signer::refuse_recovery_key_signer` runs on each), so the key
+/// there would put every row of the node in `ceg_fold_reads` and re-fold
+/// all of them on every placement. Nor by `is_bundle_holder` or
+/// `bundle_holder_refs`, which `trust_root_valid` and the standing cache
+/// walk for every row a trusted root's conferral gates.
+pub fn reads_bundle_in_force() {
+    super::fold::reads(super::fold::Dep::Family(GENESIS_BUNDLE_TYP.to_owned()));
+}
+
 /// **The bundles in force**: the tips of the held Valid lineage (one
 /// without a fork), followed by `refs.prev`, never by instant (CC 2.6.1.11).
 ///
@@ -786,6 +851,7 @@ pub async fn bundles_in_force<F>(dir: &F) -> Result<Vec<GenesisPlacement>, Error
 where
     F: FederationDirectory + ?Sized,
 {
+    reads_bundle_in_force();
     let f = genesis_in_force(dir).await?;
     Ok(f.tips().into_iter().cloned().collect())
 }
@@ -800,6 +866,7 @@ pub async fn is_canonical_by_bundle<F>(dir: &F, identity_ref: &str) -> Result<bo
 where
     F: FederationDirectory + ?Sized,
 {
+    reads_bundle_in_force();
     Ok(genesis_in_force(dir).await?.is_canonical(identity_ref))
 }
 
@@ -813,6 +880,7 @@ pub async fn bundle_seats_in_force<F>(dir: &F) -> Result<BundleSeats, Error>
 where
     F: FederationDirectory + ?Sized,
 {
+    reads_bundle_in_force();
     Ok(genesis_in_force(dir).await?.bundle_seats())
 }
 
@@ -873,7 +941,23 @@ fn not_placed(
 ) -> Option<NotPlaced> {
     let (token, detail, waiting) = match v {
         GenesisVerdict::Valid(_) => return None,
-        GenesisVerdict::Invalid(m) => (token::MALFORMED, Some(m.reason().to_owned()), false),
+        // v62.0.0 (DV-fix1) — one fault, one spelling. Since CIRISVerify
+        // 23.3.3 / 23.4.0 the bundle reader judges "one device per holder"
+        // (CC 4.2.3) itself, as `Invalid(Malformed::HolderDeviceShared)`
+        // (reason `holder_device_shared`); persist keeps no second check.
+        // It surfaces persist's `holder_device_shared` token (C4-fix2), with
+        // Verify's reason as the detail; every other Invalid reason stays
+        // `genesis_bundle_malformed` (Verify's vectors: the
+        // `recovery_commitment_*` reasons included).
+        GenesisVerdict::Invalid(m) => (
+            if m.reason() == token::DEVICE_SHARED {
+                token::DEVICE_SHARED
+            } else {
+                token::MALFORMED
+            },
+            Some(m.reason().to_owned()),
+            false,
+        ),
         GenesisVerdict::Waiting(w) => {
             let mut on: Vec<String> = w
                 .rows
@@ -1097,9 +1181,6 @@ fn named_row_refused(object: &Digest32, row: &Digest32, e: Error) -> Error {
 /// # Errors
 /// The first named row's refusal, under the row's own token
 /// ([`named_row_refused`]).
-/// The hardware class whose device a leaf names by its token serial.
-const CLASS_YUBIKEY_5_FIPS: &str = "YubiKey_5_FIPS";
-
 /// The YubiKey serial extension (`1.3.6.1.4.1.41482.3.7`), its OID's DER
 /// content bytes.
 const OID_YUBICO_SERIAL: [u8; 10] = [0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0xc4, 0x0a, 0x03, 0x07];
@@ -1198,160 +1279,57 @@ pub fn yubikey_serial(leaf_der: &[u8]) -> Option<u64> {
     None
 }
 
-/// v62.0.0 (C4-fix2/3; CC 4.2.3) — what a seated holder's attestation
-/// leaf names as its device.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DeviceName {
-    /// The maker's device serial (YubiKey: `1.3.6.1.4.1.41482.3.7`).
-    Serial(u64),
-    /// The SHA-256 of a leaf that names no serial and chains to no vendor
-    /// root (only to a caller-supplied anchor: Verify's vector PKI and the
-    /// test ceremony's MOCK root are such anchors).
-    LeafFingerprint([u8; 32]),
-}
-
-/// v62.0.0 (C4-fix3; CC 4.2.3) — the device a holder's leaf names, by its
-/// HARDWARE CLASS and the provenance of the anchor its chain verifies to:
-///
-/// - `YubiKey_5_FIPS`: the leaf's `.3.7` serial ([`yubikey_serial`]); a leaf
-///   naming none is its own device by fingerprint ONLY if its chain reaches
-///   no vendor anchor (`vendor_rooted == false`), and otherwise names no
-///   device (`None`);
-/// - any other class, or no leaf: `None`.
-///
-/// The same code runs in every build. A production node's attestation store
-/// is Verify's baked store, whose YubiKey anchor is vendor-sourced
-/// (`HardwareValidated`), so every leaf it seats is vendor-rooted and must
-/// name its serial; only a store that also holds a caller-supplied anchor
-/// (a test registers one) seats a leaf that reaches no vendor anchor.
-#[must_use]
-pub fn device_of(
-    hardware_class: &str,
-    leaf: Option<&[u8]>,
-    vendor_rooted: bool,
-) -> Option<DeviceName> {
-    if hardware_class != CLASS_YUBIKEY_5_FIPS {
-        return None;
+/// v62.0.0 (DV-fix1) — **name the shared device** in a not-placed bundle's
+/// detail when Verify's reader refused it `holder_device_shared` (its
+/// verdict names the fault, not the device): from the bundle's own named
+/// holder `key:record`s, the serial two listed holders' leaves both name
+/// (persist's own [`yubikey_serial`], the parse the door already uses).
+/// Appended after Verify's reason: `holder_device_shared; holders A and B
+/// both name YubiKey serial N`. Nothing is judged here; a bundle whose
+/// device cannot be named keeps Verify's reason alone.
+fn name_shared_device(n: &mut NotPlaced, o: &LineageObject, rows: &BTreeMap<Digest32, Vec<u8>>) {
+    if n.detail.as_deref() != Some(token::DEVICE_SHARED) {
+        return;
     }
-    let leaf = leaf?;
-    match yubikey_serial(leaf) {
-        Some(serial) => Some(DeviceName::Serial(serial)),
-        None if !vendor_rooted => {
-            use sha2::Digest as _;
-            Some(DeviceName::LeafFingerprint(
-                sha2::Sha256::digest(leaf).into(),
-            ))
-        }
-        None => None,
-    }
-}
-
-/// One seated holder's device, as [`distinct_devices`] judges it.
-#[derive(Clone, Copy, Debug)]
-pub struct HolderDevice<'a> {
-    /// The holder's identity reference.
-    pub identity_ref: &'a str,
-    /// What its leaf names ([`device_of`]); `None` names no device.
-    pub device: Option<DeviceName>,
-}
-
-/// v62.0.0 (C4-fix2/3; CC rc21 ad52eb6, CC 4.2.3 "One device per holder")
-/// — the holders a bundle seats name DISTINCT devices. A shared `f9` or
-/// intermediate certificate is not a shared device: only the leaf is read.
-/// `bundle` names the bundle in the message.
-///
-/// # Errors
-/// - `holder_device_unnamed`: a holder names no device;
-/// - `holder_device_shared`: two holders name one device.
-pub fn distinct_devices(bundle: &str, holders: &[HolderDevice<'_>]) -> Result<(), Error> {
-    let mut seen: BTreeMap<DeviceName, &str> = BTreeMap::new();
-    for h in holders {
-        let Some(device) = h.device else {
-            return Err(refuse(
-                token::DEVICE_UNNAMED,
-                format!(
-                    "holder_device_unnamed: holder {}'s attestation leaf names no device (for \
-                     YubiKey_5_FIPS, no serial 1.3.6.1.4.1.41482.3.7): bundle {bundle} is not \
-                     placed (CC 4.2.3); nothing of it is stored",
-                    h.identity_ref
-                ),
-            ));
-        };
-        let shown = match device {
-            DeviceName::Serial(n) => format!("YubiKey serial {n}"),
-            DeviceName::LeafFingerprint(f) => format!("the leaf {}", hex::encode(f)),
-        };
-        if let Some(other) = seen.insert(device, h.identity_ref) {
-            return Err(refuse(
-                token::DEVICE_SHARED,
-                format!(
-                    "holder_device_shared: holders {other} and {} both name {shown}: bundle \
-                     {bundle} is not placed (CC 4.2.3); nothing of it is stored",
-                    h.identity_ref
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Does `rec`'s chain verify to a VENDOR-sourced YubiKey anchor of `roots`
-/// (provenance `VendorOfficial` or stronger)?
-fn vendor_rooted(rec: &KeyRecord, roots: &TrustAnchorStore) -> bool {
-    use ciris_crypto::composite::MLDSA65_PK_LEN;
-    use ciris_verify_core::accord_custody_attestation::verify_yubikey_piv_attestation;
-    use ciris_verify_core::trust_anchor_store::{environments, AnchorProvenance, Purpose};
-    let Some((leaf, above)) = rec.chain.split_first() else {
-        return false;
+    let Some(payload) = o.kept.iter().find_map(|v| cose_parts(v)).map(|p| p.payload) else {
+        return;
     };
-    let above: Vec<&[u8]> = above.iter().map(Vec::as_slice).collect();
-    let ed = &rec.key.as_bytes()[MLDSA65_PK_LEN..];
-    roots
-        .resolve_x509_min_provenance(
-            Purpose::KeyAttestation,
-            environments::YUBIKEY_PIV,
-            AnchorProvenance::VendorOfficial,
-        )
-        .into_iter()
-        .any(|root| verify_yubikey_piv_attestation(leaf, &above, root, ed).is_ok())
-}
-
-/// [`distinct_devices`] over a Valid bundle's placement: each seated
-/// holder's leaf, read from its named `key:record`, judged by
-/// [`device_of`] against the custody gate's own store `roots`. Run on every
-/// Valid offered bundle before anything is stored. CIRISVerify's reader is
-/// told of the rule; until it carries the check, this door does.
-///
-/// # Errors
-/// As [`distinct_devices`].
-fn check_holder_devices(
-    object: &Digest32,
-    p: &GenesisPlacement,
-    rows: &BTreeMap<Digest32, Vec<u8>>,
-    roots: &TrustAnchorStore,
-) -> Result<(), Error> {
-    let devices: Vec<HolderDevice<'_>> = p
-        .holders
-        .iter()
-        .map(|h| {
-            let rec = rows
-                .get(&h.record)
-                .and_then(|s| cose_parts(s))
-                .and_then(|c| check_key_record(&c.payload).ok());
-            let device = rec.as_ref().and_then(|r| {
-                device_of(
-                    &h.hardware_class,
-                    r.chain.first().map(Vec::as_slice),
-                    vendor_rooted(r, roots),
-                )
-            });
-            HolderDevice {
-                identity_ref: h.identity_ref.as_str(),
-                device,
-            }
-        })
-        .collect();
-    distinct_devices(&hex::encode(object), &devices)
+    let holders: BTreeSet<&str> = payload
+        .get_text("holders")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_text).collect())
+        .unwrap_or_default();
+    let mut by_serial: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
+    for id in &o.named {
+        let Some(p) = rows.get(id).and_then(|st| cose_parts(st)) else {
+            continue;
+        };
+        let Ok(rec) = check_key_record(&p.payload) else {
+            continue;
+        };
+        let Some(author) = p
+            .payload
+            .get_text("author")
+            .and_then(Value::as_text)
+            .filter(|a| holders.contains(a))
+        else {
+            continue;
+        };
+        if let Some(serial) = rec.chain.first().and_then(|leaf| yubikey_serial(leaf)) {
+            by_serial
+                .entry(serial)
+                .or_default()
+                .insert(author.to_owned());
+        }
+    }
+    if let Some((serial, who)) = by_serial.into_iter().find(|(_, w)| w.len() > 1) {
+        let who: Vec<String> = who.into_iter().collect();
+        n.detail = Some(format!(
+            "{}; holders {} both name YubiKey serial {serial}",
+            token::DEVICE_SHARED,
+            who.join(" and ")
+        ));
+    }
 }
 
 fn admit_named(
@@ -1588,7 +1566,7 @@ pub fn bundle_voice_draft(
 /// retryable unknown-signer error for a bundle waiting on a row it does not
 /// carry, Verify's inconclusive tokens (`genesis_bundle_not_anchored`,
 /// `genesis_bundle_count_unmet`, `genesis_holder_custody`, …),
-/// `holder_device_shared` / `holder_device_unnamed`, and a named row's own
+/// `holder_device_shared` (Verify's, the device named), and a named row's own
 /// refusal.
 pub fn check_genesis_offer(
     statements: &[Vec<u8>],
@@ -1637,14 +1615,15 @@ pub fn check_genesis_offer(
     let mut placed = Vec::new();
     let mut refused = Vec::new();
     for o in &reading.objects {
-        if let Some(n) = not_placed(o.reading.object_id, &o.reading.verdict, &o.reading.refused) {
+        if let Some(mut n) = not_placed(o.reading.object_id, &o.reading.verdict, &o.reading.refused)
+        {
+            name_shared_device(&mut n, o, &rows);
             refused.push(n);
             continue;
         }
         let Some(p) = o.reading.verdict.placement() else {
             continue;
         };
-        check_holder_devices(&o.reading.object_id, p, &rows, &roots)?;
         // The seat binding's typed payload (`occurrence::read_payload`, pure)
         // is read; the occurrence write plan and its route projection are the
         // store's (backend-gated `occurrence_admit`), run by the real door
@@ -2011,7 +1990,9 @@ where
         if !o.offered {
             continue;
         }
-        if let Some(n) = not_placed(o.reading.object_id, &o.reading.verdict, &o.reading.refused) {
+        if let Some(mut n) = not_placed(o.reading.object_id, &o.reading.verdict, &o.reading.refused)
+        {
+            name_shared_device(&mut n, o, &rows);
             if let GenesisVerdict::Nothing(i) = &o.reading.verdict {
                 // Held only on a lineage this node roots: a later bundle
                 // whose predecessor it stores, or a first bundle whose
@@ -2048,9 +2029,9 @@ where
         let Some(p) = o.reading.verdict.placement() else {
             continue;
         };
-        // v62.0.0 (C4-fix2; CC 4.2.3) — one device per holder, before
-        // anything is stored.
-        check_holder_devices(&o.reading.object_id, p, &rows, &roots)?;
+        // v62.0.0 (DV-fix1) — one device per holder (CC 4.2.3) is Verify's
+        // reader's (`holder_device_shared`, judged before a placement exists);
+        // persist keeps no second check.
         let admitted = admit_named(&o.reading.object_id, p, &o.named, &rows, &held_rows)?;
         plans.push((o, p, admitted));
     }
@@ -2121,9 +2102,7 @@ where
     // The routes the bindings project go through their own door after the
     // commit (wave O1's `after_edition2_occurrence`; no re-wrap for a seat,
     // whose pair is itself). A failure here leaves the genesis held with a
-    // seat's route missing. Offering the same bundle again projects it
-    // (SR-fix1, I2111): the upsert does not apply then, and the route is
-    // projected because the held binding still projects exactly it.
+    // seat's route missing.
     for (((identity, occurrence), route), applied) in after.iter().zip(applied) {
         crate::federation::occurrence_admit::after_edition2_occurrence(
             dir,
@@ -2133,6 +2112,25 @@ where
             route.as_ref(),
         )
         .await?;
+    }
+    // v62.0.0 (SR-fix2; I2111) — offering the same bundle again projects a
+    // missing route. A named row this node already holds is not admitted
+    // again (`admit_named`), so a held binding plans no occurrence and the
+    // loop above never sees it: each placed seat whose binding this offer
+    // did not write has the routes of its held occurrences projected again
+    // (the route table's monotonic upsert: nothing changes over a held
+    // route, and a newer route is never replaced).
+    let written: BTreeSet<&str> = after
+        .iter()
+        .map(|((_, occurrence), _)| occurrence.as_str())
+        .collect();
+    let mut reprojected: BTreeSet<&str> = BTreeSet::new();
+    for seat in placed.iter().flat_map(|p| p.seats.iter()) {
+        let key = seat.identity_ref.as_str();
+        if written.contains(key) || !reprojected.insert(key) {
+            continue;
+        }
+        crate::federation::occurrence_admit::reproject_held_occurrence_routes(dir, key).await?;
     }
     // v62.0.0 (wave GC5) — a bundle held short that this offer completed
     // concludes: its hold is cleared (after the write, so its voices never
@@ -2156,6 +2154,14 @@ where
     // bundle (a seat re-bind's `refs.head`) re-folds when it is placed.
     for p in &placed {
         touched.insert(super::fold::Dep::Row(RowId(p.object_id)).read_key());
+    }
+    // v62.0.0 (RL-fix6) — and "the bundle in force" itself: a row held
+    // because no bundle (or an earlier one) was in force declared this key
+    // (`reads_bundle_in_force`), whatever bundle, holder or seat it never
+    // got to name. Every placement touches it (a re-offer of a held bundle
+    // too: the rows it wakes re-fold to the answer they had).
+    if !placed.is_empty() {
+        touched.insert(bundle_in_force_read_key());
     }
     // fix4 — a row is never its own fold dependent.
     Box::pin(super::fold::refold_touched_excluding(dir, touched, &own)).await?;

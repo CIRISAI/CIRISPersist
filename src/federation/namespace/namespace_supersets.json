@@ -15004,6 +15004,14 @@
    },
    {
     "decimal_id": "3.2",
+    "claim_id": "CLM-infrastructure-quorum-m-of-n",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_infrastructure_quorum_strict_majority",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "IM-fix1"
+   },
+   {
+    "decimal_id": "3.2",
     "claim_id": "CLM-family-root-charter",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/trust_root.rs#ConferralPlane",

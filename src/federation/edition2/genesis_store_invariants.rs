@@ -888,18 +888,41 @@ pub(crate) async fn body_capsule(
         other => panic!("I2323 earlier form: {other:?}"),
     }
 
-    // missing
+    // missing — v62.0.0 (TF-fix1): since wave GC5 (CC 2.6.1.11, "a count not
+    // yet met concludes nothing, and the bundle is held") a first bundle one
+    // holder short is HELD under its anchor: the op answers the admission
+    // (nothing placed, the bundle not placed `genesis_bundle_count_unmet`, not
+    // waiting), its voices are kept and held with that reason, and the node
+    // stays pre-genesis. The direct door's I2315 / I3832 read the same; this
+    // leg asserted the pre-GC5 refusal.
+    let short = case(f, "missing_holder_signature");
     match import_case(missing, f, "missing_holder_signature").await {
-        DirectoryOpResult::Err(e) => assert!(
-            e.contains(malformed_row::GENESIS_BUNDLE_COUNT_UNMET),
-            "I2323 missing: {e}"
-        ),
+        DirectoryOpResult::GenesisAdmission(a) => {
+            assert!(a.placed.is_empty(), "I2323 missing: concludes nothing");
+            assert_eq!(
+                a.not_placed.first().map(|n| n.token.as_str()),
+                Some(malformed_row::GENESIS_BUNDLE_COUNT_UNMET),
+                "I2323 missing: {a:?}"
+            );
+            assert!(
+                a.not_placed.iter().all(|n| !n.waiting),
+                "I2323 missing: not a wait"
+            );
+            assert!(a.tips.is_empty(), "I2323 missing: nothing in force");
+        }
         other => panic!("I2323 missing: {other:?}"),
     }
     assert_eq!(
-        held_voices(missing).await,
-        0,
-        "I2323 missing: nothing stored"
+        super::fold::why_held(missing, &RowId(oid(short)))
+            .await
+            .unwrap()
+            .map(|h| h.reason),
+        Some(malformed_row::GENESIS_BUNDLE_COUNT_UNMET.to_owned()),
+        "I2323 missing: held, its reason the count"
+    );
+    assert!(
+        held_voices(missing).await > 0,
+        "I2323 missing: its voices are kept (held short)"
     );
     assert!(
         !genesis_in_force(missing).await.unwrap().is_held(),
@@ -1008,25 +1031,18 @@ pub(crate) async fn body_capsule(
 /// v62.0.0 (C4-fix2; CC rc21 ad52eb6, CC 4.2.3 "One device per holder") —
 /// **I2394–I2395**:
 ///
-/// The device is keyed on the HARDWARE CLASS and the provenance of the
-/// anchor the leaf's chain verifies to, never on a build flag (C4-fix3):
-/// the same code runs in every build, and a production store (Verify's
-/// baked, vendor-sourced Yubico root only) seats no leaf that would take the
-/// fingerprint arm.
-///
 /// - I2394 (pure): the July leaves name three token serials (A1 38165850,
 ///   B1 38165563, C1 38165401; extension `1.3.6.1.4.1.41482.3.7`) though
-///   they share one f9, and `distinct_devices` passes them; the same leaf
-///   twice is `holder_device_shared`; a vendor-rooted YubiKey leaf with no
-///   serial, no leaf, or another class is `holder_device_unnamed`; a leaf
-///   with no serial reaching only a caller-supplied anchor (the vector /
-///   MOCK PKI) is its own device by fingerprint.
+///   they share one f9; the MOCK PKI's leaves name none.
 /// - I2395 (sqlite, postgres): through `put_genesis_bundle`, a first bundle
-///   whose holders 1 and 2 name one serial in DISTINCT leaves, or whose
-///   holders 1 and 2 carry ONE leaf (two distinct composite keys sharing
-///   their Ed25519 half, which the leaf attests, so both pass custody), is
-///   refused `holder_device_shared` and nothing is stored; the same holders
-///   with three distinct serials are placed.
+///   whose holders 1 and 2 name one serial in DISTINCT leaves is refused
+///   `holder_device_shared` (Verify's reader; persist names the serial) and
+///   nothing is stored; a leaf naming no device is not compared (CC 4.2.3),
+///   so two holders on ONE serial-less leaf, three serials, and Verify's
+///   `one_leaf_names_no_device` shape are placed (the last through the door).
+///
+/// v62.0.0 (DV-fix1): persist's own device check and `holder_device_unnamed`
+/// are deleted; CC 4.2.3 binds only where the leaf names its device.
 ///
 /// The real July chains cannot be placed through the door (no holder-signed
 /// statements exist for the July keys; §3 witness 5), so their distinct
@@ -1055,9 +1071,7 @@ mod real_custody {
     use super::super::fixture_genesis_real_custody::{
         RealHolder, GENESIS_2_SHA256, REAL_CHAIN_HEX, REAL_CHAIN_SHA256, REAL_HOLDERS,
     };
-    use super::super::genesis::{
-        device_of, distinct_devices, yubikey_serial, DeviceName, HolderDevice,
-    };
+    use super::super::genesis::yubikey_serial;
 
     const CLASS: &str = "YubiKey_5_FIPS";
 
@@ -1438,24 +1452,15 @@ mod real_custody {
             .unwrap_or_else(|| panic!("no mock chain for seed {seed}"))
     }
 
-    /// A holder whose `YubiKey_5_FIPS` leaf is judged by [`device_of`].
-    fn device<'a>(iref: &'a str, leaf: Option<&Vec<u8>>, vendor_rooted: bool) -> HolderDevice<'a> {
-        HolderDevice {
-            identity_ref: iref,
-            device: device_of(CLASS, leaf.map(Vec::as_slice), vendor_rooted),
-        }
-    }
-
-    /// `distinct_devices`' refusal over `hs`: (reason, message).
-    fn refusal(hs: &[HolderDevice<'_>]) -> (&'static str, String) {
-        let e = distinct_devices("b", hs).unwrap_err();
-        (reason(&e), message(&e))
-    }
-
-    /// **I2394** — one device per holder, at the judge, keyed on the hardware
-    /// class and the anchor's provenance (no build flag).
+    /// **I2394** — the leaf's device, as CC 4.2.3 names it: the token serial
+    /// a `YubiKey_5_FIPS` leaf carries in `1.3.6.1.4.1.41482.3.7`, read by
+    /// persist's `yubikey_serial` (the parse `name_shared_device` uses). v62.0.0
+    /// (DV-fix1): the judge assertions (`device_of`, `distinct_devices`,
+    /// `holder_device_unnamed`, the leaf-fingerprint device) are DELETED with
+    /// persist's own device check: CC 4.2.3 binds only "where the leaf of a
+    /// holder's chain names its device", and Verify's reader judges it.
     #[test]
-    fn i2394_one_device_per_holder_at_the_judge() {
+    fn i2394_the_leaf_names_its_serial() {
         let leaves: Vec<Vec<u8>> = REAL_HOLDERS.iter().map(leaf).collect();
         let serials: Vec<Option<u64>> = leaves.iter().map(|l| yubikey_serial(l)).collect();
         assert_eq!(
@@ -1466,76 +1471,37 @@ mod real_custody {
         for (h, s) in REAL_HOLDERS.iter().zip(&serials) {
             assert_eq!(*s, Some(u64::from(h.serial)), "I2394: {}", h.name);
         }
-        // Vendor-rooted (the baked Yubico root): the device is the serial.
-        // The three share one f9 (the fixture carries one chain) and pass.
-        let real: Vec<HolderDevice<'_>> = REAL_HOLDERS
-            .iter()
-            .zip(&leaves)
-            .map(|(h, l)| device(h.name, Some(l), true))
-            .collect();
-        for (d, s) in real.iter().zip(&serials) {
-            assert_eq!(d.device, s.map(DeviceName::Serial), "I2394: the serial");
-        }
-        distinct_devices("b", &real).expect("I2394: three devices");
-        let twice = [
-            device("A1", Some(&leaves[0]), true),
-            device("X", Some(&leaves[0]), true),
-        ];
-        let (r, m) = refusal(&twice);
-        assert_eq!(r, malformed_row::HOLDER_DEVICE_SHARED, "I2394: {m}");
-        assert!(m.contains("38165850"), "I2394: names the serial: {m}");
-        // A leaf naming a serial is that serial whatever its anchor.
-        assert_eq!(
-            device("A1", Some(&leaves[0]), false).device,
-            Some(DeviceName::Serial(38_165_850))
-        );
-        // A YubiKey leaf naming NO serial: vendor-rooted, it names no device
-        // (what a production store sees); reaching only a caller-supplied
-        // anchor (the vector / MOCK PKI), it is its own device by fingerprint.
+        // The vector / MOCK PKI's leaves name no serial: no device (CC 4.2.3:
+        // such a leaf is not compared).
         let m1 = mock_chain(&HOLDER_CHAINS_HEX, 1);
-        let m2 = mock_chain(&HOLDER_CHAINS_HEX, 2);
         assert_eq!(
             yubikey_serial(&m1[0]),
             None,
             "I2394: the vector PKI's leaves carry no serial"
         );
-        let (r, _) = refusal(&[device("1", Some(&m1[0]), true)]);
-        assert_eq!(
-            r,
-            malformed_row::HOLDER_DEVICE_UNNAMED,
-            "I2394: vendor-rooted, no serial"
-        );
-        assert!(matches!(
-            device("1", Some(&m1[0]), false).device,
-            Some(DeviceName::LeafFingerprint(_))
-        ));
-        distinct_devices(
-            "b",
+        // The verdict (Verify's `one_leaf_names_no_device`, pinned Valid): a
+        // bundle seating a holder whose leaf names no device is SEATED by the
+        // door's reading, the no-serial holder among the placed holders.
+        add_test_attestation_root(mock_attestation_root_der());
+        let spec = CeremonySpec::standard();
+        let serial = |n: u8| holder(n, n, n + 100, mock_chain(&SERIAL_CHAINS_HEX, n));
+        let mixed = ceremony_v2_with_holders(
+            &spec,
             &[
-                device("1", Some(&m1[0]), false),
-                device("2", Some(&m2[0]), false),
+                serial(1),
+                holder(2, 2, 102, mock_chain(&HOLDER_CHAINS_HEX, 2)),
+                serial(3),
             ],
-        )
-        .expect("I2394: two mock leaves, two devices");
-        let (r, _) = refusal(&[
-            device("1", Some(&m1[0]), false),
-            device("2", Some(&m1[0]), false),
-        ]);
-        assert_eq!(
-            r,
-            malformed_row::HOLDER_DEVICE_SHARED,
-            "I2394: one mock leaf twice"
         );
-        // No leaf, or a class that names no device: unnamed.
-        let (r, _) = refusal(&[device("1", None, false)]);
-        assert_eq!(r, malformed_row::HOLDER_DEVICE_UNNAMED, "I2394: no leaf");
-        for class in ["TPM_2_0", "Apple_Secure_Enclave", "MOCK"] {
-            assert_eq!(
-                device_of(class, Some(leaves[0].as_slice()), true),
-                None,
-                "I2394: {class}"
-            );
-        }
+        let placed = door_reads(&mixed).unwrap_or_else(|e| {
+            panic!("I2394: a holder whose leaf names no device is seated: {e:?}")
+        });
+        assert_eq!(placed.len(), 1, "I2394: one bundle");
+        assert_eq!(
+            placed[0].holders.len(),
+            3,
+            "I2394: all three holders seated"
+        );
         // The serial-bearing mock leaves read back; the shared one names 1's.
         for n in 1..=3u8 {
             let c = mock_chain(&SERIAL_CHAINS_HEX, n);
@@ -1619,13 +1585,39 @@ mod real_custody {
         }
     }
 
-    /// **I2395** — one device per holder, through the bundle door.
+    /// The door's reading of `t` on a fresh node (`check_genesis_offer`, no
+    /// store): the placement, or the refusal.
+    fn door_reads(
+        t: &TestCeremonyV2,
+    ) -> Result<Vec<super::super::genesis::GenesisPlacement>, Error> {
+        let mut statements: Vec<Vec<u8>> = t
+            .rows_in_put_order()
+            .into_iter()
+            .map(|r| r.statement.clone())
+            .collect();
+        statements.extend(t.voices.iter().cloned());
+        super::super::genesis::check_genesis_offer(
+            &statements,
+            Some(&t.anchor()),
+            chrono::Utc::now(),
+        )
+    }
+
+    /// **I2395** — one device per holder, through the bundle door (CC 4.2.3:
+    /// "Where the leaf of a holder's chain names its device, the holders a
+    /// bundle seats name distinct devices"). v62.0.0 (DV-fix1): Verify's
+    /// reader judges it; persist names the device in the refusal; a leaf that
+    /// names no device is not compared, so a bundle seating one is placed
+    /// (Verify's `genesis_holder_device_v2` case `one_leaf_names_no_device`,
+    /// pinned Valid), and so is one seating two holders on ONE serial-less
+    /// leaf (the earlier persist-only fingerprint refusal is DELETED).
     pub(super) async fn body_one_device(d: &dyn FederationDirectory) {
         add_test_attestation_root(mock_attestation_root_der());
         let spec = CeremonySpec::standard();
         let serial = |n: u8| holder(n, n, n + 100, mock_chain(&SERIAL_CHAINS_HEX, n));
 
-        // Holders 1 and 2 name one serial in two distinct leaves.
+        // Holders 1 and 2 name one serial in two distinct leaves: Verify's
+        // `holder_device_shared`, and persist names the holders and serial.
         let shared_chain: Vec<Vec<u8>> = SHARED_SERIAL_CHAIN_HEX.iter().map(|h| der(h)).collect();
         let t = ceremony_v2_with_holders(
             &spec,
@@ -1638,34 +1630,45 @@ mod real_custody {
             "I2395 serial: {e:?}"
         );
         assert!(
-            message(&e).contains(&format!("YubiKey serial {}", SERIAL_BASE + 1)),
-            "I2395 serial: {e:?}"
+            message(&e).starts_with("holder_device_shared; holders "),
+            "I2395 serial: Verify's reason first: {e:?}"
+        );
+        assert!(
+            message(&e).contains(&format!("both name YubiKey serial {}", SERIAL_BASE + 1)),
+            "I2395 serial: the shared serial is named: {e:?}"
         );
         still_pre_genesis(d, &t, "one serial").await;
 
-        // Holders 1 and 2 carry ONE leaf: holder 2's key shares holder 1's
-        // Ed25519 half (seed 101), so the leaf attests both and both pass
-        // custody; only the device rule refuses the seat.
-        let t = ceremony_v2_with_holders(
+        // Two holders on ONE leaf that names no serial (two composite keys
+        // sharing the Ed25519 half the leaf attests): no device, not
+        // compared, so the door places it.
+        let one_leaf = ceremony_v2_with_holders(
             &spec,
             &[holder(2, 2, 101, mock_chain(&HOLDER_CHAINS_HEX, 1))],
         );
-        let e = offer(d, &t).await;
-        assert_eq!(
-            reason(&e),
-            malformed_row::HOLDER_DEVICE_SHARED,
-            "I2395 leaf: {e:?}"
-        );
-        still_pre_genesis(d, &t, "one leaf").await;
-
+        door_reads(&one_leaf).unwrap_or_else(|e| {
+            panic!("I2395 one serial-less leaf twice: not compared, placed: {e:?}")
+        });
         // Three serials: placed.
-        let t = ceremony_v2_with_holders(&spec, &[serial(1), serial(2), serial(3)]);
-        install_ceremony_v2(d, &t)
+        let three = ceremony_v2_with_holders(&spec, &[serial(1), serial(2), serial(3)]);
+        door_reads(&three).unwrap_or_else(|e| panic!("I2395 three serials: {e:?}"));
+
+        // `one_leaf_names_no_device`: two serials and one leaf naming none,
+        // through the REAL door: placed and in force.
+        let mixed = ceremony_v2_with_holders(
+            &spec,
+            &[
+                serial(1),
+                holder(2, 2, 102, mock_chain(&HOLDER_CHAINS_HEX, 2)),
+                serial(3),
+            ],
+        );
+        install_ceremony_v2(d, &mixed)
             .await
-            .unwrap_or_else(|e| panic!("I2395 three serials: {e:?}"));
+            .unwrap_or_else(|e| panic!("I2395 one leaf names no device: placed: {e:?}"));
         assert!(
             genesis_in_force(d).await.unwrap().head.is_some(),
-            "I2395: placed"
+            "I2395 one leaf names no device: in force"
         );
     }
 }

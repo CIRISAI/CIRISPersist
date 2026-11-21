@@ -86,6 +86,12 @@ use serde::{Deserialize, Serialize};
 fn reads_founder(founder: &str) {
     fold::reads(Dep::key(founder));
     fold::reads(Dep::key(accord_family_key_id()));
+    // v62.0.0 (RL-fix6) — the holder arm answers from the bundle in force
+    // (`is_bundle_holder`): a founding held before (or under an earlier)
+    // bundle re-folds at a placement. Declared here, not in
+    // `is_bundle_holder`, which `trust_root_valid` also walks for every row
+    // a trusted root's conferral gates.
+    super::edition2::genesis::reads_bundle_in_force();
 }
 
 /// The shipped default trust-root community id (CC 3.2 worked example; CC 4.4
@@ -210,7 +216,10 @@ pub fn check_trust_root_shape(community: &Community) -> Result<(), Error> {
             "a trust-root community names no founder",
         ));
     }
-    Ok(())
+    // v62.0.0 (IM-fix1; Eric's ruling 2026-11-21) — M is the strict majority
+    // of the founder count (`quorum_m_not_strict_majority`): judged here so
+    // the birth, every amendment link and the standing read all hold it.
+    super::admission::check_infrastructure_quorum_strict_majority(community)
 }
 
 /// CIRISPersist#972 — the arm a founder of an infrastructure

@@ -48,6 +48,15 @@
 //!   chokepoint answers the typed `federation_no_constitutional_root_yet`
 //!   (a fold hold, GC8) — and once the ceremony's bundle is installed the
 //!   same chokepoint passes, while the mesh planes above never asked.
+//! - **I2267** — (RL-fix6) rootless → rooted re-folds what waited: an
+//!   infrastructure community's founding, voiced by the holders whose own
+//!   key records crossed before Rooted, is HELD and kept on a rootless node
+//!   (counted over no bundle's holders) and declares "the bundle in force"
+//!   read (`family:ceg-genesis-bundle/2`); the ceremony's import lands it,
+//!   with no further act.
+//! - **I2268** — (RL-fix6) the negative: the same founding voiced by one
+//!   holder (short of the strict majority) is held while rootless and STAYS
+//!   held after the import re-folds it; nothing concludes it.
 
 use ciris_crypto::composite::CompositeSigningKey;
 use ciris_verify_core::cde::Value;
@@ -344,6 +353,232 @@ pub(crate) async fn i2241_first_contact(
     assert_rootless(b, &format!("{tag} B after")).await;
 }
 
+/// RL-fix6 — a founding `group:roster` v1 of an `infrastructure` community
+/// at `root`, founded by `founders` and voiced by `keys`, stated at `at_ms`:
+/// the shape `fixture_trust_root` founds (W1b), built here so it can be
+/// put BEFORE any bundle is in force.
+fn founding_voices(
+    root: &str,
+    founders: &[String],
+    keys: &[CompositeSigningKey],
+    at_ms: u64,
+) -> Vec<Vec<u8>> {
+    use crate::federation::types::{Community, CommunityMember};
+    let founded_at = i64::try_from(at_ms - 30_000)
+        .ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .expect("RL-fix6: an instant");
+    let community = Community {
+        community_key_id: root.to_owned(),
+        community_name: format!("rl6 founding {root}"),
+        members: founders
+            .iter()
+            .map(|f| CommunityMember {
+                key_id: f.clone(),
+                joined_at: founded_at,
+                role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
+            })
+            .collect(),
+        founded_at,
+        consensus_protocol: "quorum:2/3".to_owned(),
+        policy_blob: Some(serde_json::json!({
+            "cohort_subkind": crate::federation::canonical_community::COHORT_SUBKIND_INFRASTRUCTURE,
+            "cohort_subkind_payload": {
+                "infrastructure_constraint": {
+                    "admission_quorum_basis":
+                        crate::federation::canonical_community::ADMISSION_QUORUM_BASIS_FOUNDERS,
+                },
+            },
+            "consensus_protocol_entrenched": true,
+        })),
+        prev_head_digest: String::new(),
+        charter_digest: String::new(),
+        persist_row_hash: String::new(),
+    };
+    let refs: Vec<&CompositeSigningKey> = keys.iter().collect();
+    super::group_fixtures::roster_voices(
+        &super::group::GroupRecord::Community(community),
+        1,
+        None,
+        at_ms,
+        &refs,
+    )
+}
+
+/// RL-fix6 — put `voices` on a rootless `d`: the founding is HELD (kept,
+/// concluding nothing), never refused. Its row id.
+async fn put_held_founding(
+    d: &dyn FederationDirectory,
+    root: &str,
+    voices: &[Vec<u8>],
+    tag: &str,
+) -> RowId {
+    let birth = super::group_fixtures::row_id_of(&voices[0]);
+    let out = Box::pin(super::group_fixtures::put_voices(d, voices))
+        .await
+        .unwrap_or_else(|e| {
+            panic!("[{tag}] a rootless node keeps the founding, never refuses: {e}")
+        });
+    assert!(
+        !matches!(out, StatementOutcome::Row { .. }),
+        "[{tag}] rootless, the founding concludes nothing: {out:?}"
+    );
+    assert!(
+        super::fold::why_held(d, &birth)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] why_held reads: {e}"))
+            .is_some(),
+        "[{tag}] the founding is held and KEPT (a fold hold, recorded)"
+    );
+    assert!(
+        d.lookup_community(root)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] lookup_community reads: {e}"))
+            .is_none(),
+        "[{tag}] nothing is in the typed table while rootless"
+    );
+    birth
+}
+
+/// **I2267** on one backend: `d` rootless; `scratch` another empty node
+/// (the ceremony is installed there only to read the instant W1b founds
+/// at, so `d` stays rootless until its own import).
+pub(crate) async fn i2267_a_held_founding_lands_on_import(
+    d: &dyn FederationDirectory,
+    scratch: &dyn FederationDirectory,
+    tag: &str,
+) {
+    use super::fixture_genesis::{self as g, HOLDER_SEEDS};
+    use super::fixture_switch as e2;
+    use super::genesis::{bundle_in_force_read_key, genesis_in_force};
+    assert_rootless(d, tag).await;
+    g::install_v2(scratch)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the scratch node installs: {e}"));
+    let at = genesis_in_force(scratch)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the scratch genesis reads: {e}"))
+        .tips()
+        .iter()
+        .map(|t| t.asserted_at)
+        .max()
+        .unwrap_or_else(|| panic!("[{tag}] the scratch node holds a tip"))
+        + 60_000;
+    // The holders' own key records cross before Rooted (bootstrap kinds).
+    for h in &g::bundle_v2().holders {
+        Box::pin(put_statement(d, &h.record.statement, None, INGEST_TIER))
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] a holder's own key record crosses: {e}"));
+    }
+    let root_seed = "rl6-founding-root";
+    let _ = e2::put_key(d, root_seed, &["user"]).await;
+    let root = e2::kid(root_seed);
+    let founders: Vec<String> = HOLDER_SEEDS
+        .iter()
+        .map(|s| g::identity_ref_of(*s))
+        .collect();
+    let keys: Vec<CompositeSigningKey> = HOLDER_SEEDS.iter().map(|s| g::test_key(*s)).collect();
+    let voices = founding_voices(&root, &founders, &keys, at);
+    let birth = put_held_founding(d, &root, &voices, tag).await;
+    // Why the declaration is NECESSARY for this row (read-checked): the
+    // founding's own reads are `row:<birth>`, `key:<root>`, `key:<group>`,
+    // each founder's `key:<holder>` and `key:humanity-accord`. The import
+    // writes only the named rows NOT already held (`genesis::admit_named_at`
+    // skips `held`), and the holders' records ARE held: they had to be, for
+    // the founding's voices to be admitted at all (an unknown signer is not
+    // kept). So the import touches the seats' rows, their keys and
+    // families, and `row:<bundle>`: none of the founding's reads. Without
+    // `family:ceg-genesis-bundle/2` nothing wakes it. (Mutation: drop the
+    // declaration from `bundle_quorum_over` and `reads_founder`, and both
+    // the dependents assertion and the landing below red.)
+    let readers = d
+        .fold_dependents(&[bundle_in_force_read_key()])
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] fold_dependents reads: {e}"));
+    assert!(
+        readers.contains(&birth),
+        "[{tag}] I2267: the held founding reads the bundle in force: {readers:?}"
+    );
+    // The import: the ceremony's bundle is placed, and nothing else is done.
+    g::install_v2(d)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the ceremony installs on a rootless node: {e}"));
+    assert_eq!(
+        super::fold::why_held(d, &birth)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] why_held reads: {e}"))
+            .map(|h| h.reason),
+        None,
+        "[{tag}] I2267: the import re-folds the held founding: it concludes"
+    );
+    assert!(
+        d.lookup_community(&root)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] lookup_community reads: {e}"))
+            .is_some(),
+        "[{tag}] I2267: the founding lands with no further act"
+    );
+}
+
+/// **I2268** on one backend: the same founding voiced by ONE holder (short
+/// of the holders' strict majority) is held while rootless, and STAYS held
+/// after the import re-folds it: the re-fold concludes only what the
+/// placed bundle satisfies.
+pub(crate) async fn i2268_a_short_founding_stays_held(
+    d: &dyn FederationDirectory,
+    scratch: &dyn FederationDirectory,
+    tag: &str,
+) {
+    use super::fixture_genesis::{self as g, HOLDER_SEEDS};
+    use super::fixture_switch as e2;
+    use super::genesis::genesis_in_force;
+    assert_rootless(d, tag).await;
+    g::install_v2(scratch)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the scratch node installs: {e}"));
+    let at = genesis_in_force(scratch)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the scratch genesis reads: {e}"))
+        .tips()
+        .iter()
+        .map(|t| t.asserted_at)
+        .max()
+        .unwrap_or_else(|| panic!("[{tag}] the scratch node holds a tip"))
+        + 60_000;
+    for h in &g::bundle_v2().holders {
+        Box::pin(put_statement(d, &h.record.statement, None, INGEST_TIER))
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] a holder's own key record crosses: {e}"));
+    }
+    let root_seed = "rl6-short-root";
+    let _ = e2::put_key(d, root_seed, &["user"]).await;
+    let root = e2::kid(root_seed);
+    let founders: Vec<String> = HOLDER_SEEDS
+        .iter()
+        .map(|s| g::identity_ref_of(*s))
+        .collect();
+    let keys = vec![g::test_key(HOLDER_SEEDS[0])];
+    let voices = founding_voices(&root, &founders, &keys, at);
+    let birth = put_held_founding(d, &root, &voices, tag).await;
+    g::install_v2(d)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the ceremony installs on a rootless node: {e}"));
+    assert!(
+        super::fold::why_held(d, &birth)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] why_held reads: {e}"))
+            .is_some(),
+        "[{tag}] I2268: re-folded, a founding one holder voiced is still held"
+    );
+    assert!(
+        d.lookup_community(&root)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] lookup_community reads: {e}"))
+            .is_none(),
+        "[{tag}] I2268: nothing concludes it"
+    );
+}
+
 /// **I2244** on one backend.
 pub(crate) async fn i2244_agent_and_federation_wait(d: &dyn FederationDirectory, tag: &str) {
     assert_rootless(d, tag).await;
@@ -507,6 +742,23 @@ mod sqlite {
         assert_rootless(&ba, "sqlite A after").await;
         assert_rootless(&bb, "sqlite B after").await;
     }
+
+    /// I2267 — a founding held while rootless lands on the import.
+    #[tokio::test]
+    async fn i2267_a_founding_held_while_rootless_lands_on_import_sqlite() {
+        let (d, scratch) = (fresh().await, fresh().await);
+        Box::pin(i2267_a_held_founding_lands_on_import(
+            &d, &scratch, "sqlite",
+        ))
+        .await;
+    }
+
+    /// I2268 — a founding short of its count stays held after the import.
+    #[tokio::test]
+    async fn i2268_a_short_founding_stays_held_after_import_sqlite() {
+        let (d, scratch) = (fresh().await, fresh().await);
+        Box::pin(i2268_a_short_founding_stays_held(&d, &scratch, "sqlite")).await;
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -592,5 +844,26 @@ mod postgres {
         .await;
         assert_rootless(&ba, "postgres A after").await;
         assert_rootless(&bb, "postgres B after").await;
+    }
+
+    #[tokio::test]
+    async fn i2267_a_founding_held_while_rootless_lands_on_import_postgres() {
+        let (Some(d), Some(scratch)) = (fresh().await, fresh().await) else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        Box::pin(i2267_a_held_founding_lands_on_import(
+            &d, &scratch, "postgres",
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn i2268_a_short_founding_stays_held_after_import_postgres() {
+        let (Some(d), Some(scratch)) = (fresh().await, fresh().await) else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        Box::pin(i2268_a_short_founding_stays_held(&d, &scratch, "postgres")).await;
     }
 }

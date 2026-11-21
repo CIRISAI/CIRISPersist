@@ -1110,6 +1110,127 @@ pub fn reseat_xwing_v2(
     )
 }
 
+/// v62.0.0 (SR-fix2; CC 2.4.1.1, CC 2.6.1.11) — **a later bundle that
+/// re-seats a seat at a NEW signing key**, and the predecessor's voice the
+/// statement door needs to read the rotation alone. Over `prev`, the seat
+/// `seat_seed` (identity reference unchanged: it names the genesis key)
+/// gets:
+/// - a rotation `key:record` of `test_key(new_key_seed)`: `node`, authored
+///   and issued under the seat's identity, naming the seat's `prev` record
+///   by `refs.target`, asserted one second before the bundle and ending
+///   where the first record ends. One row, two voices: the new key's own
+///   (the bundle's named row) and the predecessor key's (returned beside the
+///   bundle; a bundle places the key without it, the statement door's chain
+///   rule does not);
+/// - a NEW binding signed by the new key under the seat's identity: its
+///   `prev` binding's payload with that instant, a fresh
+///   `transport_destination` derived from `new_key_seed`, and `refs` naming
+///   the rotation record.
+///
+/// Every holder and every other seat are as `prev` has them. `signers` are
+/// holder seeds, signing as in [`later_v2`]. The bundle is asserted
+/// [`LATER_STEP_MS`] after prev.
+///
+/// # Panics
+/// `seat_seed` is not a seat of `prev`.
+#[must_use]
+pub fn rekey_seat_v2(
+    prev: &TestCeremonyV2,
+    seat_seed: u8,
+    new_key_seed: u8,
+    signers: &[u8],
+) -> (TestCeremonyV2, Vec<u8>) {
+    let asserted_at = prev.asserted_at_ms + LATER_STEP_MS;
+    let rows_at = asserted_at - 1_000;
+    let i = prev
+        .seats
+        .iter()
+        .position(|s| s.seed == seat_seed)
+        .unwrap_or_else(|| panic!("rekey_seat_v2: {seat_seed} is not a seat of prev"));
+    let old = &prev.seats[i];
+    let iref = old.identity_ref.clone();
+    let (k0, k1) = (test_key(old.seed), test_key(new_key_seed));
+    // A key record is filed under the key it records (its `sub`).
+    let new_ref = identity_ref_of(new_key_seed);
+    let record_payload = map(vec![
+        ("key", cose_key(k1.public_key())),
+        ("author", text(&iref)),
+        ("asserted_at", Value::Uint(rows_at)),
+        ("identity_type", text_set(&["node"])),
+        ("valid_until", Value::Uint(prev.spec.t0_ms + YEAR_MS)),
+        ("refs", map(vec![("target", row_ref(&old.record.row_id))])),
+    ]);
+    let record = sign_row_as(&k1, &iref, &new_ref, KEY_RECORD_FAMILY, &record_payload);
+    let by_predecessor = sign_row_as(&k0, &iref, &new_ref, KEY_RECORD_FAMILY, &record_payload);
+    assert_eq!(
+        record.row_id, by_predecessor.row_id,
+        "rekey_seat_v2: one rotation row, two voices"
+    );
+    let rx = derived(b"rns-x25519", new_key_seed, 32);
+    let re = derived(b"rns-ed25519", new_key_seed, 32);
+    let td = map(vec![
+        ("reticulum_x25519_pubkey", Value::Bytes(rx.clone())),
+        ("reticulum_ed25519_pubkey", Value::Bytes(re.clone())),
+        ("app_name", text(APP_NAME)),
+        ("aspects", Value::Array(vec![text(ASPECT)])),
+        (
+            "destination_hash",
+            Value::Bytes(rns_destination_hash(&rx, &re, APP_NAME, &[ASPECT])),
+        ),
+    ]);
+    let refs = map(vec![
+        ("head", row_ref(&record.row_id)),
+        (
+            "also",
+            map(vec![("cites", Value::Array(vec![row_ref(&record.row_id)]))]),
+        ),
+    ]);
+    let (_, payload) = super::liveness::statement_parts(&old.binding.statement)
+        .expect("a fixture binding is a statement");
+    let members: Vec<(Value, Value)> = payload
+        .as_map()
+        .expect("a fixture binding's payload is a map")
+        .iter()
+        .map(|(k, v)| {
+            let v = match k.as_text() {
+                Some("asserted_at") => Value::Uint(rows_at),
+                Some("transport_destination") => td.clone(),
+                Some("refs") => refs.clone(),
+                _ => v.clone(),
+            };
+            (k.clone(), v)
+        })
+        .collect();
+    let binding = sign_row_as(&k1, &iref, &iref, BINDING_FAMILY, &Value::Map(members));
+    let mut seats = prev.seats.clone();
+    seats[i] = SeatV2 {
+        seed: new_key_seed,
+        kid: kid_of(new_key_seed),
+        record,
+        binding,
+        ..old.clone()
+    };
+    let voices: Vec<(CompositeSigningKey, String)> = signers
+        .iter()
+        .map(|s| {
+            let h = holder_of(prev, *s);
+            (test_key(h.seed), h.identity_ref.clone())
+        })
+        .collect();
+    let bundle = assemble_bundle(
+        &prev.spec,
+        prev.version + 1,
+        Some(prev.object_id),
+        asserted_at,
+        prev.holders.clone(),
+        seats,
+        Vec::new(),
+        &voices,
+        None,
+    );
+    (bundle, by_predecessor.statement)
+}
+
 fn holder_of(prev: &TestCeremonyV2, holder_seed: u8) -> &HolderV2 {
     prev.holders
         .iter()

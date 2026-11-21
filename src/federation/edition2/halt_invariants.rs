@@ -411,15 +411,19 @@ pub(crate) async fn body(d: &dyn crate::federation::FederationDirectory) {
 ///
 /// - I3790, `early` then `late`: `late` is HELD (kept, no latch, reason
 ///   `accord_invocation_replayed`); `early` is counted and is the active halt.
-/// - I3791, `late` then `early` (another nonce): `late` is counted and
-///   latches first; `early`'s arrival UN-concludes it (held, reason
+/// - I3791, `late` then `early` (another nonce), on a FRESH node (no halt in
+///   force: C2-fix's latch table holds a halt arriving while another is in
+///   force to "changes nothing"): `late` is counted and latches first; `early`'s arrival UN-concludes it (held, reason
 ///   `accord_invocation_replayed`, its latch cleared) and `early` is the
 ///   active halt — the same standing as I3790.
 ///
 /// Mutation targets: the rank comparison in `replay_fold`, the
 /// `clear_active_halt` of a row that becomes a replay.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-pub(crate) async fn replay_order_body(d: &dyn crate::federation::FederationDirectory) {
+pub(crate) async fn replay_order_body(
+    d: &dyn crate::federation::FederationDirectory,
+    d2: &dyn crate::federation::FederationDirectory,
+) {
     use super::fold::{reason, why_held};
     use super::halt::put_invocation;
     use super::names::RowId;
@@ -461,7 +465,20 @@ pub(crate) async fn replay_order_body(d: &dyn crate::federation::FederationDirec
         "I3790: early is the active halt"
     );
 
-    // I3791: late, then early.
+    // I3791: late, then early. v62.0.0 (TF-fix1): on a FRESH node. Since
+    // C2-fix (the latch table, CC 4.2.1.1) a halt that arrives while another
+    // is in force (here I3790's `early`, latched at receipt and inside its
+    // fuse) changes nothing, so "alone" must mean no halt in force: I3791's
+    // two halts run on `d2`, with I3790's standing left behind on `d`.
+    let d = d2;
+    let held_reason =
+        |row: RowId| async move { why_held(d, &row).await.unwrap().map(|h| h.reason) };
+    let active = || async {
+        d.get_active_halt(ACCORD)
+            .await
+            .unwrap()
+            .map(|h| h.active_halt_id)
+    };
     let early = halt(&b1, "gc4-early-2", 0x41, 7_000_000, 8_000_000);
     let late = halt(&c1, "gc4-late-2", 0x41, 7_500_000, 8_500_000);
     let l = put_invocation(d, &late, Some(genesis))
@@ -504,21 +521,29 @@ async fn i3790_i3791_replay_order_sqlite() {
         .await
         .unwrap();
     b.run_migrations().await.unwrap();
-    Box::pin(replay_order_body(&b)).await;
+    let b2 = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b2.run_migrations().await.unwrap();
+    Box::pin(replay_order_body(&b, &b2)).await;
 }
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn i3790_i3791_replay_order_postgres() {
     use crate::store::Backend as _;
-    let Some(dsn) = crate::test_pg::empty_dsn() else {
+    let (Some(dsn), Some(dsn2)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
         return;
     };
     let b = crate::store::postgres::PostgresBackend::connect(&dsn)
         .await
         .unwrap();
     b.run_migrations().await.unwrap();
-    Box::pin(replay_order_body(&b)).await;
+    let b2 = crate::store::postgres::PostgresBackend::connect(&dsn2)
+        .await
+        .unwrap();
+    b2.run_migrations().await.unwrap();
+    Box::pin(replay_order_body(&b, &b2)).await;
 }
 
 #[cfg(feature = "sqlite")]

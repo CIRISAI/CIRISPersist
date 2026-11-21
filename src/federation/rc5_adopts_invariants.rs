@@ -534,6 +534,227 @@ pub mod bodies {
         );
     }
 
+    /// The statements of `signed` as version `version` of its room, each put
+    /// as a PEER offers it: under its row id (the replicated statement door,
+    /// `ingest::put_statement` with an offered id). The first refusal returns.
+    async fn offer_replicated(
+        d: &dyn FederationDirectory,
+        signed: &crate::federation::SignedCommunity,
+        version: u64,
+        head: Option<&crate::federation::edition2::names::RowId>,
+    ) -> Result<crate::federation::edition2::ingest::StatementOutcome, Error> {
+        use crate::federation::edition2::ingest::{put_statement, INGEST_TIER};
+        use crate::federation::edition2::names::RowId;
+        let mut last = None;
+        for v in e2::community_voices(signed, version, head, now_ms()) {
+            let id = RowId::of_statement(&v)
+                .expect("a roster voice names its row")
+                .0;
+            last = Some(put_statement(d, &v, Some(&id), INGEST_TIER).await?);
+        }
+        Ok(last.expect("a signed community has a voice"))
+    }
+
+    /// The protocol of the room this node holds at `room` (a seed), if any.
+    async fn held_protocol(d: &dyn FederationDirectory, room: &str) -> Option<String> {
+        d.lookup_community(&e2::kid(room))
+            .await
+            .unwrap()
+            .map(|c| c.consensus_protocol)
+    }
+
+    /// **I4100–I4103 (IM-fix1; Eric's ruling 2026-11-21, CC 3.2) — an
+    /// infrastructure room's `M` is the strict majority of its founder
+    /// count**, at every door that judges its protocol, refused by name
+    /// (`quorum_m_not_strict_majority`):
+    ///
+    /// - **I4100, founding.** `quorum:2/3` over three founders and
+    ///   `quorum:3/5` over five land. `quorum:3/3` over three, and
+    ///   `quorum:2/5` and `quorum:4/5` over five, are refused with the rule
+    ///   and nothing is stored. (Before this cut each of the three was a
+    ///   conformant `quorum:M/N` whose `N` is the founder count, and landed.)
+    /// - **I4101, a supersede that keeps `N` and changes `M`** (`3/5` →
+    ///   `4/5`, the same five founders) is refused with the rule; the held
+    ///   head is unchanged.
+    /// - **I4102, a supersede that changes the founder count restates both.**
+    ///   Five founders become three: keeping `quorum:3/5` is refused
+    ///   `quorum_n_not_founder_count`; `quorum:3/3` is refused with the rule;
+    ///   `quorum:2/3`, the new strict majority, is admitted and becomes the
+    ///   held protocol.
+    /// - **I4103, a replicated version** (each statement offered under its
+    ///   row id): a founding at `quorum:2/5` and a supersede of a held
+    ///   conformant room to `quorum:4/5` are refused with the rule, and
+    ///   nothing is stored or moved. Under edition 2 a replicated roster
+    ///   version takes the door the local one takes.
+    pub async fn infrastructure_quorum_m_is_the_strict_majority(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::admission::{
+            INFRA_RULE_QUORUM_M_NOT_STRICT_MAJORITY, INFRA_RULE_QUORUM_N_NOT_FOUNDERS,
+        };
+        // Seeds lead with their distinguishing part (a test signer seeds from
+        // the first 32 bytes of its name).
+        let f: Vec<String> = (0..5).map(|i| format!("a{i}-{tag}")).collect();
+        for k in &f {
+            e2::put_key(d, k, &[it::USER]).await;
+        }
+        let founders = |n: usize| -> Vec<CommunityMember> {
+            f[..n].iter().map(|k| seat(k, "founder")).collect()
+        };
+        let room_of = |name: &str| format!("{name}-{tag}");
+        // ── I4100: founding ───────────────────────────────────────────────
+        for (name, p, n) in [("ok23", "quorum:2/3", 3), ("ok35", "quorum:3/5", 5)] {
+            let room = room_of(name);
+            authorized_room_key(d, &room).await;
+            found(
+                d,
+                ts::sign_community(&f[0], infra_room(&room, p, founders(n))),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("I4100: {p} over {n} founders is conformant: {e}"));
+            assert_eq!(
+                held_protocol(d, &room).await.as_deref(),
+                Some(p),
+                "I4100: {p} over {n} founders lands"
+            );
+        }
+        for (name, p, n) in [
+            ("no33", "quorum:3/3", 3),
+            ("no25", "quorum:2/5", 5),
+            ("no45", "quorum:4/5", 5),
+        ] {
+            let room = room_of(name);
+            authorized_room_key(d, &room).await;
+            let err = found(
+                d,
+                ts::sign_community(&f[0], infra_room(&room, p, founders(n))),
+            )
+            .await
+            .expect_err("I4100: M is the strict majority of the founder count");
+            assert_eq!(
+                violation_rule(&err),
+                INFRA_RULE_QUORUM_M_NOT_STRICT_MAJORITY,
+                "I4100: {p} over {n} founders: {err}"
+            );
+            let expected = crate::federation::admission::strict_majority(n);
+            assert!(
+                err.to_string()
+                    .contains(&format!("expected M = {expected}")),
+                "I4100: the refusal names the expected M: {err}"
+            );
+            assert_eq!(
+                held_protocol(d, &room).await,
+                None,
+                "I4100: {p} over {n} founders: nothing is stored"
+            );
+        }
+
+        // ── I4101: a supersede that keeps N and changes M ─────────────────
+        let room = room_of("ok35");
+        let err = supersede_voiced(
+            d,
+            &ts::sign_community(&f[0], infra_room(&room, "quorum:4/5", founders(5))),
+            &room,
+        )
+        .await
+        .expect_err("I4101: a supersede cannot move M off the strict majority");
+        assert_eq!(
+            violation_rule(&err),
+            INFRA_RULE_QUORUM_M_NOT_STRICT_MAJORITY,
+            "I4101: {err}"
+        );
+        assert_eq!(
+            held_protocol(d, &room).await.as_deref(),
+            Some("quorum:3/5"),
+            "I4101: the held head is unchanged"
+        );
+
+        // ── I4103: a replicated version ───────────────────────────────────
+        // (before I4102 moves the room's head)
+        let (head, version) = e2::held_head(d, &e2::kid(&room))
+            .await
+            .expect("I4103: the conformant room is held");
+        let err = offer_replicated(
+            d,
+            &ts::sign_community(&f[0], infra_room(&room, "quorum:4/5", founders(5))),
+            version + 1,
+            Some(&head),
+        )
+        .await
+        .expect_err("I4103: a replicated supersede off the strict majority");
+        assert_eq!(
+            violation_rule(&err),
+            INFRA_RULE_QUORUM_M_NOT_STRICT_MAJORITY,
+            "I4103 supersede: {err}"
+        );
+        assert_eq!(
+            held_protocol(d, &room).await.as_deref(),
+            Some("quorum:3/5"),
+            "I4103: the held head is unchanged"
+        );
+        let peer_room = room_of("rep25");
+        authorized_room_key(d, &peer_room).await;
+        let err = offer_replicated(
+            d,
+            &ts::sign_community(&f[0], infra_room(&peer_room, "quorum:2/5", founders(5))),
+            1,
+            None,
+        )
+        .await
+        .expect_err("I4103: a replicated founding off the strict majority");
+        assert_eq!(
+            violation_rule(&err),
+            INFRA_RULE_QUORUM_M_NOT_STRICT_MAJORITY,
+            "I4103 founding: {err}"
+        );
+        assert_eq!(
+            held_protocol(d, &peer_room).await,
+            None,
+            "I4103: a replicated non-conformant founding is not stored"
+        );
+
+        // ── I4102: a supersede that changes the founder count ─────────────
+        let err = supersede_voiced(
+            d,
+            &ts::sign_community(&f[0], infra_room(&room, "quorum:3/5", founders(3))),
+            &room,
+        )
+        .await
+        .expect_err("I4102: three founders under a declared N = 5");
+        assert_eq!(
+            violation_rule(&err),
+            INFRA_RULE_QUORUM_N_NOT_FOUNDERS,
+            "I4102: N is restated: {err}"
+        );
+        let err = supersede_voiced(
+            d,
+            &ts::sign_community(&f[0], infra_room(&room, "quorum:3/3", founders(3))),
+            &room,
+        )
+        .await
+        .expect_err("I4102: N restated, M not the new strict majority");
+        assert_eq!(
+            violation_rule(&err),
+            INFRA_RULE_QUORUM_M_NOT_STRICT_MAJORITY,
+            "I4102: {err}"
+        );
+        // Three of the five founders (the prior `quorum:3/5`'s count) voice
+        // the version that restates both N and M.
+        supersede_voiced(
+            d,
+            &ts::sign_community(&f[0], infra_room(&room, "quorum:2/3", founders(3))),
+            &room,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("I4102: restated at the new strict majority: {e}"));
+        assert_eq!(
+            held_protocol(d, &room).await.as_deref(),
+            Some("quorum:2/3"),
+            "I4102: the version at the new strict majority is the held head"
+        );
+    }
+
     /// **#925 review, H3's fifth door — `add_peer_record` is a local mint.**
     /// An operator-added peer record carries a caller-supplied
     /// `identity_type`; a `{node,agent}` / `{node,user}` one is refused by the
@@ -963,6 +1184,8 @@ mod runners {
                 }
                 flipped!(node_key_cannot_be_infrastructure_founder);
                 flipped!(infrastructure_protocol_must_be_quorum);
+                // IM-fix1 (I4100–I4103).
+                flipped!(infrastructure_quorum_m_is_the_strict_majority);
                 flipped!(delegation_graph_defaults_to_five_hops);
                 flipped!(withdraws_walk_depth_defaults_to_five_hops);
                 flipped!(moderation_walk_depth_defaults_to_five_hops);
