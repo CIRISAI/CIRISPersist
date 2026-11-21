@@ -351,6 +351,17 @@ pub fn pure_statement_gates(bytes: &[u8], keys: &dyn KeyDirectory) -> Result<(),
         .get_int(-70001)
         .and_then(Value::as_text)
         .unwrap_or_default();
+    // v62.0.0 (RL-fix19; CC 2.6.1.11) — a group-plane statement about the
+    // accord is refused BY NAME before its shape is judged (the accord's id
+    // is no identity-ref: the shape check would name it payload-invalid).
+    if super::group::group_plane_of(row_type, family, &payload).is_some() {
+        let sub = protected
+            .get_int(15)
+            .and_then(|c| c.get_int(2))
+            .and_then(Value::as_text)
+            .unwrap_or_default();
+        super::group::refuse_accord_group_statement(sub, &payload)?;
+    }
     super::payloads::check_by_id(family, row_type, &payload)?;
     // v62.0.0 (wave P1e; CC rc21 CC 2.7.11) — the verifier's pure rules over
     // an `admission:unit` payload, each with its own token.

@@ -444,9 +444,17 @@ fn owner_is_a_person(identity_type: &str) -> Result<(), OwnerBindingFault> {
 /// v62.0.0 (KR-fix12) — [`verify_owner_binding_statement`] against a NODE's
 /// own key plane (`Engine::check_owner_binding`): the owner's key is the one
 /// this directory holds for the statement's `iss`, LIVE at the statement's
-/// instant (the door's own verification, `edition2::door::admit_row` over
-/// `held_keys_for`), and its held record names `user`. `Ok(None)`: nothing is
-/// wrong.
+/// instant, and its held record names `user`. `Ok(None)`: nothing is wrong.
+///
+/// The signature and the key's liveness are Verify's `verify_row_statement`
+/// over the keys this node holds for the signer
+/// (`edition2::ingest::held_keys_for`): the key plane the door reads, with
+/// its windows and revocations. It is NOT `door::admit_row`: the family's
+/// rules (authorship, second signers) and the admission gates are the door's
+/// own and are not run here; the shape this check needs is
+/// `owner_binding_shape`'s. (The pure forms go through
+/// `edition2::self_check::verify_statement_signature`; this one differs only
+/// in where the key comes from.)
 ///
 /// # Errors
 /// Directory reads.

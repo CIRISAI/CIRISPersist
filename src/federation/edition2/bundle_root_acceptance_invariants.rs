@@ -81,13 +81,20 @@ async fn rooted(e: &crate::Engine, what: &str) {
     );
 }
 
-async fn owned_by(e: &crate::Engine, alias: &str, owner: &str) {
-    let dir = e.federation_directory();
-    super::fixture_switch::put_key(dir.as_ref(), owner, &[identity_type::USER]).await;
-    let binding = ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), owner, alias);
-    super::fixture_switch::land_owner_binding(dir.as_ref(), &binding, alias)
-        .await
-        .expect("I2418: the owner binding lands");
+/// v62.0.0 (RL-fix18) — `owner` (a seed) owns the Engine's node, bound the
+/// ceremony's way (`bind_owner`: the Engine's drafts, dated now). The
+/// builder `ts::owner_binding_attestation` dates its binding inside a
+/// DEFAULT node record's window (180 days back plus an offset), before the
+/// record `register_self_federation_key` gave this node now: the node's
+/// voice waited `AttesterKeyUnknown`.
+async fn owned_by(e: &crate::Engine, alias: &str, owner_seed: &str) {
+    let owner = super::fixture_switch::put_key(
+        e.federation_directory().as_ref(),
+        owner_seed,
+        &[identity_type::USER],
+    )
+    .await;
+    bind_owner(e, alias, &owner, owner_seed, "I2418").await;
 }
 
 /// I2416 / I2418: import, then accept.
@@ -313,10 +320,43 @@ pub(crate) async fn switch_over(dsn: &str, alias: &str, owner_seed: &str) {
         .await
         .expect("reads")
         .expect("the owner's acceptance is held");
-    let w = super::fixture_switch::composer_of("withdraws", &acceptance, owner_seed);
-    super::fixture_switch::put_signed(dir.as_ref(), &w)
+    // v62.0.0 (RL-fix17) — the owner's `withdraws`, signed with the LITERAL
+    // root as its `sub` (as its target's) and the target's `dimension`
+    // restated (Verify 23.4.0: a composer of a leaf family restates it).
+    // `e2::composer_of` ran the target's subject through the fixture codec
+    // (`subject_of` → `kid_or_keep`), which reads "humanity-accord" as a SEED
+    // and names a key of that name: the 4vh run's withdrawal was never of the
+    // acceptance, and the witness never asserted it landed.
+    let w = {
+        use ciris_verify_core::cde::Value;
+        let acc_ms = u64::try_from(acceptance.asserted_at.timestamp_millis()).unwrap_or(0);
+        let at = now_ms().max(acc_ms + 1);
+        let Value::Map(mut m) = super::typed::withdraws_payload(&owner, &id, at) else {
+            panic!("I2465: a withdraws payload is a map");
+        };
+        m.push((
+            Value::Text("dimension".to_owned()),
+            Value::Text(crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION.to_owned()),
+        ));
+        m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
+        ciris_verify_core::edition2::sign_row_statement(
+            &super::fixture_switch::signing_key(owner_seed),
+            &owner,
+            fg::FAMILY_KEY_ID,
+            crate::federation::types::attestation_type::WITHDRAWS,
+            &ciris_verify_core::namespace_match::family_id("trust:{job}:{version}"),
+            &Value::Map(m),
+            vec![],
+        )
+        .expect("I2465: the withdrawal signs")
+    };
+    let out = super::ingest::put_statement(dir.as_ref(), &w, None, super::ingest::INGEST_TIER)
         .await
         .expect("I2465: the owner withdraws its acceptance");
+    assert!(
+        matches!(out, super::ingest::StatementOutcome::Row { .. }),
+        "I2465: the withdrawal LANDED (not held, not shape-refused): {out:?}"
+    );
     rootless(
         &e,
         "I2465 the owner withdrew; the node's own edge is never read again",

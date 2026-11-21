@@ -1039,3 +1039,128 @@ async fn av26_cold_boot(dsn: String) {
          schema_history has {count} migration rows"
     );
 }
+
+// ─── scenario I: the ceremony's host verbs, awaited in a spawned task ──
+
+/// v62.0.0 (KR-fix16; the rule after BF22: a host's `tokio::spawn` of a
+/// persist future is verified from an EXTERNAL crate, never ruled from
+/// reading) — **every Engine verb the genesis ceremony calls is awaited
+/// inside `tokio::spawn`.** `tokio::spawn` requires the future to be `Send +
+/// 'static`; proving that walks the whole future, so an opaque recursive
+/// future (E0275, the recursion-depth overflow BF22 fixed at
+/// `put_admitted_row`) or a `!Send` value held across an await fails THIS
+/// FILE's build. No behaviour is asserted: each verb is called with
+/// placeholder arguments and its `Result` dropped; the claim is that the
+/// file compiles and each task joins without a panic.
+///
+/// The verbs: `accept_root`, `accept_root_draft`, `root_standing` (steps 7
+/// and 8); `owner_binding_draft`, `check_owner_binding`,
+/// `submit_owner_binding`, `node_owner_binding`,
+/// `serve_seat_owner_announced` (step 9); and the draft-and-voice surface
+/// they stand on, none of which this file named before: `statement_draft`,
+/// `submit_voice`, `voice_status`, `held_rows_for`, `voice_draft`,
+/// `voice_held_row`, plus `root_grants_for` and `owner_of`.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn ceremony_verbs_are_awaitable_in_a_spawned_task() {
+    use ciris_persist::Engine;
+    let pqc = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+        &[0x16u8; 32],
+        "qa-ceremony-verbs".to_owned(),
+    )
+    .expect("ml-dsa seed");
+    let signer = Arc::new(LocalSigner::from_parts(
+        SigningKey::from_bytes(&[0x16u8; 32]),
+        "qa-ceremony-verbs".to_owned(),
+        Some(Arc::new(pqc)),
+        Some("qa-ceremony-verbs".to_owned()),
+    ));
+    let engine = Arc::new(
+        Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("an Engine"),
+    );
+    // Placeholders: well-formed where a verb parses its argument first.
+    struct Args {
+        node: String,
+        owner: String,
+        hex32: String,
+        scopes: Vec<String>,
+        statement: Vec<u8>,
+    }
+    let args = Arc::new(Args {
+        node: "urn:ciris:placeholder-node".to_owned(),
+        owner: "urn:ciris:placeholder-owner".to_owned(),
+        hex32: "00".repeat(32),
+        scopes: vec!["infra:serve".to_owned(), "infra:attest".to_owned()],
+        statement: b"not a statement".to_vec(),
+    });
+
+    // Each verb in a task of its own: `$e` is the Engine, `$a` the
+    // arguments, both moved into the spawned future.
+    macro_rules! spawned {
+        ($name:literal, |$e:ident, $a:ident| $body:expr) => {{
+            let $e = Arc::clone(&engine);
+            let $a = Arc::clone(&args);
+            tokio::spawn(async move {
+                let _ = &$a;
+                let _ = $body;
+            })
+            .await
+            .unwrap_or_else(|err| panic!("{}: the spawned task did not join: {err}", $name));
+        }};
+    }
+
+    // Steps 7 and 8: this node accepts the root.
+    spawned!("accept_root", |e, a| e.accept_root("humanity-accord").await);
+    spawned!("accept_root_draft", |e, a| e
+        .accept_root_draft("humanity-accord", &a.owner, &a.hex32, 1)
+        .await);
+    spawned!("root_standing", |e, a| e.root_standing().await);
+    // Step 9: the seat's owner binding.
+    spawned!("owner_binding_draft", |e, a| e
+        .owner_binding_draft(&a.node, &a.scopes, &a.owner, &a.hex32, 1)
+        .await);
+    spawned!("check_owner_binding", |e, a| e
+        .check_owner_binding(&a.statement, &a.node, &["infra:attest"])
+        .await);
+    spawned!("submit_owner_binding", |e, a| e
+        .submit_owner_binding(&a.statement)
+        .await);
+    spawned!("node_owner_binding", |e, a| e
+        .node_owner_binding(&a.node)
+        .await);
+    spawned!("serve_seat_owner_announced", |e, a| e
+        .serve_seat_owner_announced(&a.node)
+        .await);
+    spawned!("owner_of", |e, a| e.owner_of(&a.node).await);
+    // The draft-and-voice surface.
+    spawned!("statement_draft", |e, a| {
+        let envelope =
+            serde_json::json!({"dimension": "trust:confers:v1", "scope": ["infra:attest"]});
+        e.statement_draft(
+            "delegates_to",
+            &envelope,
+            &a.owner,
+            &a.hex32,
+            &a.node,
+            1,
+            None,
+        )
+        .await
+    });
+    spawned!("submit_voice", |e, a| e.submit_voice(&a.statement).await);
+    spawned!("voice_status", |e, a| e.voice_status(&a.hex32).await);
+    spawned!("held_rows_for", |e, a| e
+        .held_rows_for(Some(a.node.as_str()), Some("bound_node"), None, 10)
+        .await);
+    spawned!("voice_draft", |e, a| e
+        .voice_draft(&a.hex32, &a.owner)
+        .await);
+    spawned!("voice_held_row", |e, a| e
+        .voice_held_row(&a.hex32, None)
+        .await);
+    spawned!("root_grants_for", |e, a| e
+        .root_grants_for(&a.node, None)
+        .await);
+}

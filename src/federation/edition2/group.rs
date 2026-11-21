@@ -132,6 +132,35 @@ pub enum GroupPlane {
     Removal,
 }
 
+/// v62.0.0 (RL-fix7, RL-fix19; CC 2.6.1.11, CC 4.2.6) — **a group-plane
+/// statement about the accord is refused by name**: a roster version at the
+/// accord's id, or a membership change of it (`sub` or the payload's
+/// `group` is the accord's `family_key_id`). The accord's roster, seats and
+/// recovery are the genesis bundle in force and no row; a change is a later
+/// bundle at the import door. Pure (the statement's own bytes), so the
+/// statement door runs it among its pure gates BEFORE the payload's shape:
+/// the accord's id is no identity-ref, so the shape check alone would answer
+/// `edition2_payload_invalid` and this name could never be reached.
+///
+/// # Errors
+/// `accord_version_is_a_bundle`.
+pub fn refuse_accord_group_statement(sub: &str, payload: &Value) -> Result<(), Error> {
+    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    if sub == accord || payload.get_text("group").and_then(Value::as_text) == Some(accord) {
+        return Err(Error::malformed_row(
+            PLANE,
+            malformed_row::ACCORD_VERSION_IS_A_BUNDLE,
+            format!(
+                "{}: a group-plane statement about {accord}; the accord's roster is the \
+                 genesis bundle in force, changed by a later bundle at the import door \
+                 (CC 2.6.1.11)",
+                malformed_row::ACCORD_VERSION_IS_A_BUNDLE,
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// **Is this row a group plane's?** `group:roster`, or `membership:{stage}`
 /// at a counted leaf (`widening`, `removal`; Verify's matcher binds the
 /// leaf from `dimension`). A composer (`withdraws`, `recants`,
@@ -1201,24 +1230,10 @@ where
         super::payloads::check(table, &row.payload)?;
     }
     // v62.0.0 (RL-fix7; CC 2.6.1.11, CC 4.2.6) — the accord's roster, seats
-    // and recovery are the genesis bundle in force and no row. A group
-    // statement about the accord (a roster version at its id, or a
-    // membership change of it) is refused by its bytes, before any read, a
-    // count or a kept voice, the same on a rooted and a rootless node: a
-    // change is a later bundle at the import door.
-    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
-    if row.sub == accord || row.payload.get_text("group").and_then(Value::as_text) == Some(accord) {
-        return Err(Error::malformed_row(
-            PLANE,
-            malformed_row::ACCORD_VERSION_IS_A_BUNDLE,
-            format!(
-                "{}: a `{}` statement about {accord}; the accord's roster is the genesis \
-                 bundle in force, changed by a later bundle at the import door (CC 2.6.1.11)",
-                malformed_row::ACCORD_VERSION_IS_A_BUNDLE,
-                row.family
-            ),
-        ));
-    }
+    // and recovery are the genesis bundle in force and no row (the shared
+    // rule, [`refuse_accord_group_statement`], which the statement door's
+    // pure gates also run AHEAD of the payload shape, RL-fix19).
+    refuse_accord_group_statement(&row.sub, &row.payload)?;
     // v62.0.0 (T1-fix2; G0.api "every door is already inside an attempt")
     // — the group door runs inside `ingest::put_admitted_row`'s ONE fold
     // attempt (no inner attempt: it would swallow the marks and reads the

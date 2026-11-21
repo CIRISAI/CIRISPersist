@@ -34,7 +34,6 @@ pub(crate) mod bodies {
         found_community, found_public_room, id_of, proposal, put_e2, reg, reply, rule_of,
         widen_community,
     };
-    use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::COMMUNITY;
     use crate::federation::types::consensus_protocol::OPEN_SELF_ADMIT;
     use crate::federation::types::{attestation_type, device_class};
@@ -89,22 +88,27 @@ pub(crate) mod bodies {
         e.to_string().contains(NODE_GIVES_NO_CONSENT)
     }
 
-    /// `signer`'s `withdraws` of the row `target`.
+    /// `signer`'s `withdraws` of the row `target`, in the one shape the
+    /// suite's composers take (`e2::composer_of`): `refs.target`, the
+    /// target's family, AND the target's `dimension`.
+    ///
+    /// KR-fix15 — the dimension is what the first cut of this helper left
+    /// out. A composer of `membership:{stage}` with no `dimension` has no
+    /// leaf, and that family's authorship cell (`leaf=widening|removal =>
+    /// counted ; authored`) cannot be decided without one: the door refuses
+    /// it `authorship_undetermined` whoever signs it (I214, I1504 and I1624
+    /// fail the same way with the proposer's OWN key). So the first cut's
+    /// device leg was refused for its shape, and its node leg passed for the
+    /// same wrong reason.
     fn withdrawal(signer: &str, target: &Attestation) -> Attestation {
-        let mut w = ts::bare_attestation(
-            &uuid::Uuid::new_v4().to_string(),
-            signer,
-            signer,
-            &serde_json::json!({
-                "id": uuid::Uuid::new_v4().to_string(),
-                "references_attestation_id": e2::rid(target),
-                "withdrawal_reason": "rescinded",
-            }),
-        );
-        w.attestation_type = attestation_type::WITHDRAWS.into();
-        w.weight = None;
-        ts::seal_row_in_place(signer, &mut w);
-        w
+        e2::composer_of(attestation_type::WITHDRAWS, target, signer)
+    }
+
+    /// A refusal that is about the statement's SHAPE (Verify could not read
+    /// it as a row of its family), not about who may retract.
+    fn shape_refusal(e: &crate::federation::Error) -> bool {
+        let t = e.to_string();
+        t.contains("authorship_undetermined") || t.contains("edition2_family_invalid")
     }
 
     /// **I4280.**
@@ -234,7 +238,16 @@ pub(crate) mod bodies {
         put_e2(d, &reply(&m1, &m1, &p1, true, now))
             .await
             .expect("I4282: M1 accepts");
-        let _ = put_e2(d, &withdrawal(&node, &p1)).await;
+        // KR-fix15 — the leg is real only if the node's withdrawal is a
+        // well-formed composer: whatever the door answers, it is not a
+        // refusal of the statement's shape.
+        if let Err(e) = put_e2(d, &withdrawal(&node, &p1)).await {
+            assert!(
+                !shape_refusal(&e),
+                "I4282: the node's withdrawal is a well-formed composer; it is judged on who \
+                 signed it, not refused for its shape: {e}"
+            );
+        }
         widen_community(d, &cid, &[&founder], &m1, None, now)
             .await
             .expect("I4282: a node's withdrawal does not retract its owner's proposal");
