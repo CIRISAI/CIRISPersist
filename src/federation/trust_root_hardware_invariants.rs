@@ -90,8 +90,12 @@ pub mod bodies {
 
         set_policy(Arc::new(policy(4_158)));
         let before = count(&r.founders);
-        let v1 = trust_root_valid(d, &node, &r.root).await.unwrap();
-        let v2 = trust_root_valid(d, &node, &r.root).await.unwrap();
+        let v1 = trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+            .await
+            .unwrap();
+        let v2 = trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+            .await
+            .unwrap();
         assert!(
             v1.valid && v1.holders_hardware_attested && v1 == v2,
             "I158: a memo hit is the same verdict: {v1:?}"
@@ -110,8 +114,12 @@ pub mod bodies {
         // A different policy object that judges the same way: the inputs
         // changed, so every holder is evaluated again — and only once.
         set_policy(Arc::new(policy(4_159)));
-        let v3 = trust_root_valid(d, &node, &r.root).await.unwrap();
-        trust_root_valid(d, &node, &r.root).await.unwrap();
+        let v3 = trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+            .await
+            .unwrap();
+        trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+            .await
+            .unwrap();
         assert!(
             v3.valid && v3.holders_hardware == v1.holders_hardware,
             "I158: the freshness window is not a validity input: {v3:?}"

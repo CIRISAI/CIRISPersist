@@ -1128,14 +1128,14 @@ where
                 continue;
             };
             tokio::task::yield_now().await;
-            // Cheapest first: most blobs carry no tombstone at all (and a
-            // backend without the purge plane tombstones nothing).
+            // Cheapest first: most blobs carry no tombstone at all. v62.0.0
+            // (PX-fix3) — a directory that cannot answer (`Unsupported`)
+            // fails the re-ack, never reads "not tombstoned" (I2190).
             let tombstoned = match backend
                 .purge_tombstone_notices(super::steward_purge::PurgePlane::Blob.as_str(), &hex_sha)
                 .await
             {
                 Ok(n) => !n.is_empty(),
-                Err(Error::Unsupported { .. }) => false,
                 Err(e) => return Err(BlobError::Backend(format!("reack: {e}"))),
             };
             if tombstoned

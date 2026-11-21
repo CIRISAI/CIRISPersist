@@ -2831,6 +2831,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .await
     }
 
+    async fn edition2_first_held_us(
+        &self,
+        row_id: &crate::federation::edition2::names::RowId,
+    ) -> Result<Option<i64>, crate::federation::Error> {
+        let row_id = *row_id;
+        self.read(move |conn| {
+            crate::federation::edition2::store::first_held_us_sqlite(conn, &row_id)
+        })
+        .await
+    }
+
     async fn put_edition2_statement(
         &self,
         row: &crate::federation::edition2::door::AdmittedRow,
@@ -2927,6 +2938,76 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
     async fn fold_any_refolding(&self) -> Result<bool, crate::federation::Error> {
         self.read(crate::federation::edition2::fold::any_refolding_sqlite)
+            .await
+    }
+
+    async fn note_accord_skip(
+        &self,
+        feed: &crate::federation::edition2::accord_rescan::FeedPosition,
+        at_ms: i64,
+    ) -> Result<(), crate::federation::Error> {
+        let feed = feed.clone();
+        self.write(move |conn| {
+            crate::federation::edition2::accord_rescan::note_skip_sqlite(conn, &feed, at_ms)
+        })
+        .await
+    }
+
+    async fn accord_skips(
+        &self,
+    ) -> Result<
+        Vec<crate::federation::edition2::accord_rescan::AccordRescan>,
+        crate::federation::Error,
+    > {
+        self.read(crate::federation::edition2::accord_rescan::skips_sqlite)
+            .await
+    }
+
+    async fn clear_accord_skip(
+        &self,
+        plane: &str,
+        peer: &str,
+        from_position: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let (plane, peer, from) = (plane.to_owned(), peer.to_owned(), from_position.to_owned());
+        self.write(move |conn| {
+            crate::federation::edition2::accord_rescan::clear_skip_sqlite(
+                conn, &plane, &peer, &from,
+            )
+        })
+        .await
+    }
+
+    async fn put_dial_hints(
+        &self,
+        hints: &crate::federation::edition2::contact::DialHints,
+    ) -> Result<(), crate::federation::Error> {
+        let hints = hints.clone();
+        self.write(move |conn| crate::federation::edition2::contact::put_sqlite(conn, &hints))
+            .await
+    }
+
+    async fn dial_hints_for(
+        &self,
+        node: &str,
+    ) -> Result<Option<crate::federation::edition2::contact::DialHints>, crate::federation::Error>
+    {
+        let node = node.to_owned();
+        self.read(move |conn| crate::federation::edition2::contact::get_sqlite(conn, &node))
+            .await
+    }
+
+    async fn list_dial_hints(
+        &self,
+    ) -> Result<Vec<crate::federation::edition2::contact::DialHints>, crate::federation::Error>
+    {
+        self.read(crate::federation::edition2::contact::list_sqlite)
+            .await
+    }
+
+    async fn remove_dial_hints(&self, node: &str) -> Result<bool, crate::federation::Error> {
+        let node = node.to_owned();
+        self.write(move |conn| crate::federation::edition2::contact::remove_sqlite(conn, &node))
             .await
     }
 
@@ -38749,6 +38830,20 @@ mod tests {
         .await;
     }
 
+    /// v62.0.0 (K2-fix17) — I2048–I2050, the minor-band standing
+    /// protections (CC 5.4.6, CC 3.2), sqlite arm.
+    #[tokio::test]
+    async fn i2048_i2050_minor_owner_standing_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        Box::pin(
+            crate::federation::tier_ingest::test_support::exercise_minor_owner_standing(
+                &backend, "sqlite",
+            ),
+        )
+        .await;
+    }
+
     /// v38.2.0 (CIRISPersist#757) — owner-signed community row, sqlite arm.
     #[tokio::test]
     async fn owner_signed_community_row_sqlite_757() {
@@ -48001,6 +48096,7 @@ mod tests {
             &backend,
             &kid_any("mod-comm"),
             DELEGATION_SCOPE_MODERATE,
+            crate::host::clock::now(),
         )
         .await
         .unwrap();

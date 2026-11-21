@@ -236,6 +236,7 @@ pub(crate) async fn conferred_detector_body(d: &dyn FederationDirectory) {
         &e2::kid(node),
         &e2::kid(det),
         crate::federation::types::delegation_scope::INFRA_DETECT,
+        crate::host::clock::now(),
     )
     .await
     .expect("I3081: capability_roots_to_trusted_root");

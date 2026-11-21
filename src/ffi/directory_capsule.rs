@@ -1880,6 +1880,173 @@ pub enum DirectoryOp {
     /// v62.0.0 (PX-fix1) — [`FederationDirectory::fold_any_refolding`].
     /// Result rides `Bool`. APPEND-ONLY (Growth).
     FoldAnyRefolding {},
+    /// v62.0.0 (PR-fix1; CC 3.2 T8, CC 5.3.4) —
+    /// [`peer_rooting`](crate::federation::edition2::peer_rooting::peer_rooting):
+    /// is the peer Rooted for the reader node at the signer-stamped instant
+    /// `at_ms`. Result rides `PeerRooting`. APPEND-ONLY (Growth).
+    PeerRooting {
+        /// The reader node's identity-ref (its owner's acceptance edges are
+        /// read).
+        reader_node: String,
+        /// The peer's identity-ref.
+        peer_identity_ref: String,
+        /// The key the peer speaks with.
+        claimed_key: crate::federation::edition2::peer_rooting::ClaimedKeyWire,
+        /// The signer-stamped instant judged at (POSIX ms), never the
+        /// reader's clock for a stored outcome.
+        at_ms: u64,
+    },
+    /// v62.0.0 (AU-fix2; CC 2.7.11) —
+    /// [`FederationDirectory::admission_unit_rows`]: the LIVE
+    /// `admission:unit` rows about `sub` at `at_ms` (concluded, in lease, not
+    /// withdrawn, signers live persons). The trait default reads the
+    /// edition-2 store, which REFUSES through the proxy, so the whole read
+    /// crosses. Result rides `AdmissionUnitRows`. APPEND-ONLY (Growth).
+    AdmissionUnitRows {
+        /// The unit's `canonical:sha256:{hex}`.
+        sub: String,
+        /// The instant asked (POSIX ms).
+        at_ms: u64,
+        /// The host owner the standing legs read; `None`: the node's own.
+        owner: Option<String>,
+    },
+    /// v62.0.0 (AU-fix2; CC 2.7.11) —
+    /// [`admission_unit_runnable`](crate::federation::edition2::admission_unit::admission_unit_runnable):
+    /// may the unit row `row_id` admits run on the HOST's store at `at_ms`
+    /// (every leg: concluded, lease, end, persons, standing, receipt). A free
+    /// fold persist runs over its own directory. Result rides
+    /// `AdmissionUnitAnswer`. APPEND-ONLY (Growth).
+    AdmissionUnitRunnable {
+        /// The `admission:unit` row id.
+        row_id: [u8; 32],
+        /// The instant asked (POSIX ms).
+        at_ms: u64,
+        /// The host owner the standing legs read; `None`: the node's own.
+        owner: Option<String>,
+    },
+    /// v62.0.0 (PX-fix1) — [`FederationDirectory::put_touch_claim_local`]:
+    /// the node-local touch (RULINGS: a touch claim is node-local), the
+    /// replacement for the retired signed `put_touch_claim` a host called.
+    /// Result rides `TouchApplied`. APPEND-ONLY (Growth).
+    PutTouchClaimLocal {
+        /// The touched target.
+        target_key_id: String,
+        /// The target's kind.
+        target_kind: String,
+        /// The instant the target is fresh as of.
+        fresh_as_of: chrono::DateTime<chrono::Utc>,
+        /// The mandatory cohort scope.
+        cohort_scope: String,
+    },
+    /// v62.0.0 (PX-fix1) — [`FederationDirectory::freshness_floor`]: the
+    /// floor this node holds for a target. Result rides `FreshnessFloorOf`.
+    /// APPEND-ONLY (Growth).
+    FreshnessFloor {
+        /// The target.
+        target_key_id: String,
+        /// The target's kind.
+        target_kind: String,
+    },
+    /// v62.0.0 (RL-fix1, lead ruling (B)) —
+    /// [`crate::federation::edition2::ingest::apply_replicated_statement_at_feed`]:
+    /// the replicated statement door with the host's feed position, so an
+    /// accord row this node cannot judge (no genesis bundle held) advances
+    /// the cursor and leaves a watermark. Result rides
+    /// `ReplicatedStatementOutcome`. APPEND-ONLY (Growth).
+    ApplyReplicatedStatementAtFeed {
+        /// The statement's bytes as the peer delivered them.
+        statement: Vec<u8>,
+        /// The row id the peer offered it as.
+        offered_row_id: [u8; 32],
+        /// Where the host's feed stands.
+        feed: crate::federation::edition2::accord_rescan::FeedPosition,
+    },
+    /// v62.0.0 (RL-fix1, ruling (B)) —
+    /// [`crate::federation::edition2::accord_rescan::rescan_needed`]: the
+    /// feeds to re-pull once a genesis bundle is in force. Result rides
+    /// `AccordRescans`. APPEND-ONLY (Growth).
+    AccordRescanNeeded {},
+    /// v62.0.0 (RL-fix1, ruling (B)) —
+    /// [`crate::federation::edition2::accord_rescan::ack_rescan`]: the host
+    /// re-pulled a feed past its watermark. Result rides `Bool`. APPEND-ONLY
+    /// (Growth).
+    AckAccordRescan {
+        /// The plane the feed carries.
+        plane: String,
+        /// The peer (or feed) the host pulls from.
+        peer: String,
+        /// The watermark's first position.
+        from_position: String,
+    },
+    /// v62.0.0 (RL-fix3) —
+    /// [`crate::federation::edition2::contact::record_dial_hints`]: a
+    /// contact's local, unsigned dial hint. Result rides `Unit`.
+    /// APPEND-ONLY (Growth).
+    RecordDialHints {
+        /// The decoded record.
+        hints: crate::federation::edition2::contact::DialHints,
+    },
+    /// v62.0.0 (RL-fix3) — the dial hint held for `node`. Result rides
+    /// `DialHints`. APPEND-ONLY (Growth).
+    DialHintsFor {
+        /// The node's identity-ref.
+        node: String,
+    },
+    /// v62.0.0 (RL-fix3) — every dial hint held. Result rides
+    /// `DialHintsList`. APPEND-ONLY (Growth).
+    ListDialHints {},
+    /// v62.0.0 (RL-fix3) — remove `node`'s dial hint. Result rides `Bool`.
+    /// APPEND-ONLY (Growth).
+    RemoveDialHints {
+        /// The node's identity-ref.
+        node: String,
+    },
+    /// v62.0.0 (RL-fix3; CC 5.3.3.10 E1) —
+    /// [`crate::federation::edition2::contact::admit_pre_seal_answer`].
+    /// Result rides `PreSealAdmission`. APPEND-ONLY (Growth).
+    AdmitPreSealAnswer {
+        /// The dialled node's identity-ref.
+        dialled: String,
+        /// The node's own key record.
+        key_record: Vec<u8>,
+        /// The node's own bind, carrying its route and transit key.
+        route: Vec<u8>,
+    },
+    /// v62.0.0 (RL-fix3) —
+    /// [`crate::federation::edition2::contact::admit_contact_owner_rows`].
+    /// Result rides `ContactOwner`. APPEND-ONLY (Growth).
+    AdmitContactOwnerRows {
+        /// The node's identity-ref.
+        node: String,
+        /// The code's identity-ref.
+        identity: String,
+        /// The owner's own key record.
+        owner_key_record: Vec<u8>,
+        /// The owner binding's voices.
+        binding: Vec<Vec<u8>>,
+    },
+    /// v62.0.0 (PX-fix3) — [`FederationDirectory::list_group_tips`]: the
+    /// versions held as TIPS beside a group's head. The authorized roster
+    /// fold a consumer composes over the proxy (`active_family_members`, the
+    /// room rosters) reads it to keep only the members common to all tips;
+    /// its `Unsupported` was read as "not forked". Result rides `GroupTips`.
+    /// APPEND-ONLY (Growth).
+    ListGroupTips {
+        /// `cohort`.
+        cohort: cohort::Cohort,
+        /// `group_key_id`.
+        group_key_id: String,
+    },
+    /// v62.0.0 (K2-fix20; CC 5.4.6 as ruled for rc22, CC 3.4.13 Q5) —
+    /// [`may_publish_federation_rendezvous`](crate::federation::age::may_publish_federation_rendezvous),
+    /// run inside persist's `.so`: the producing node's authoring check
+    /// before it publishes a federation-scope `rendezvous:route` for
+    /// `key_id`. `Unit` when it may; the `scope_minor_rendezvous_at_federation`
+    /// refusal rides `TypedErr`. APPEND-ONLY (Growth).
+    MayPublishFederationRendezvous {
+        /// The person, a key acting for them, or their node.
+        key_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -2238,6 +2405,76 @@ pub enum DirectoryOpResult {
     FoldHeldReasons(Vec<Edition2HeldReason>),
     /// v62.0.0 (PX-fix1) — `fold_state`. APPEND-ONLY (Growth).
     FoldStateOf(Option<Edition2FoldState>),
+    /// v62.0.0 (PR-fix1) — `PeerRooting`: the peer verdict, intact (a
+    /// `not_rooted` or `cannot_tell_yet` answer rides inside it). A failed
+    /// directory read is the top-level `TypedErr`. APPEND-ONLY (Growth).
+    PeerRooting(crate::federation::edition2::peer_rooting::PeerRooting),
+    /// v62.0.0 (AU-fix2) — `admission_unit_rows`. APPEND-ONLY (Growth).
+    AdmissionUnitRows(Vec<crate::federation::edition2::admission_unit::AdmissionUnitRow>),
+    /// v62.0.0 (AU-fix2) — `AdmissionUnitRunnable`: the host's answer.
+    /// APPEND-ONLY (Growth).
+    AdmissionUnitAnswer(AdmissionUnitAnswerWire),
+    /// v62.0.0 (PX-fix1) — `put_touch_claim_local`. APPEND-ONLY (Growth).
+    TouchApplied(crate::federation::freshness::TouchApplyOutcome),
+    /// v62.0.0 (PX-fix1) — `freshness_floor`. APPEND-ONLY (Growth).
+    FreshnessFloorOf(Option<types::FreshnessFloor>),
+    /// v62.0.0 (RL-fix1, ruling (B)) — `AccordRescanNeeded`. APPEND-ONLY
+    /// (Growth).
+    AccordRescans(Vec<crate::federation::edition2::accord_rescan::AccordRescan>),
+    /// v62.0.0 (RL-fix3) — `DialHintsFor`. APPEND-ONLY (Growth).
+    DialHints(Option<crate::federation::edition2::contact::DialHints>),
+    /// v62.0.0 (RL-fix3) — `ListDialHints`. APPEND-ONLY (Growth).
+    DialHintsList(Vec<crate::federation::edition2::contact::DialHints>),
+    /// v62.0.0 (RL-fix3) — `AdmitPreSealAnswer`. APPEND-ONLY (Growth).
+    PreSealAdmission(Edition2PreSealAdmission),
+    /// v62.0.0 (RL-fix3) — `AdmitContactOwnerRows`. APPEND-ONLY (Growth).
+    ContactOwner(Edition2ContactOwner),
+    /// v62.0.0 (PX-fix3) — `list_group_tips`. APPEND-ONLY (Growth).
+    GroupTips(Vec<cohort::GroupTip>),
+}
+
+/// v62.0.0 (AU-fix2; CC 2.7.11) — the host's answer for one
+/// `admission:unit` row
+/// ([`AdmissionAnswer`](crate::federation::edition2::admission_unit::AdmissionAnswer))
+/// as it crosses the capsule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionUnitAnswerWire {
+    /// May the unit run?
+    pub runnable: bool,
+    /// The failing leg's token (`None` when runnable).
+    pub token: Option<String>,
+    /// The failing leg's detail (`None` when runnable).
+    pub detail: Option<String>,
+    /// The Transparency Service whose receipt verified (runnable only).
+    pub service: Option<String>,
+    /// The voice the receipt registered, hex (runnable only).
+    pub statement_id: Option<String>,
+    /// The row the answer read, if any.
+    pub row: Option<crate::federation::edition2::admission_unit::AdmissionUnitRow>,
+}
+
+impl AdmissionUnitAnswerWire {
+    /// The wire form of `a`.
+    #[must_use]
+    pub fn of(a: &crate::federation::edition2::admission_unit::AdmissionAnswer) -> Self {
+        use crate::federation::edition2::admission_unit::AdmissionAnswer;
+        let (service, statement_id) = match a {
+            AdmissionAnswer::Runnable {
+                service,
+                statement_id,
+                ..
+            } => (Some(service.clone()), Some(hex::encode(statement_id))),
+            AdmissionAnswer::NotRunnable { .. } => (None, None),
+        };
+        Self {
+            runnable: a.is_runnable(),
+            token: a.token().map(str::to_owned),
+            detail: a.detail().map(str::to_owned),
+            service,
+            statement_id,
+            row: a.row().cloned(),
+        }
+    }
 }
 
 /// v62.0.0 (F0-cp5) — a refusal of
@@ -2516,6 +2753,47 @@ impl From<crate::federation::edition2::ingest::ReplicatedStatementOutcome>
             R::Admitted(s) => Self::Admitted(s.into()),
             R::Unchanged(s) => Self::Unchanged(s.into()),
             R::Refused { reason } => Self::Refused { reason },
+        }
+    }
+}
+
+/// v62.0.0 (RL-fix3) — the wire mirror of
+/// [`crate::federation::edition2::contact::PreSealAdmission`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edition2PreSealAdmission {
+    /// The node's key record at the replicated door.
+    pub key_record: Edition2ReplicatedOutcome,
+    /// The node's bind at the replicated door.
+    pub route: Edition2ReplicatedOutcome,
+    /// Does `transit_kex_pair_for(node)` answer now?
+    pub transit_ready: bool,
+}
+
+impl From<crate::federation::edition2::contact::PreSealAdmission> for Edition2PreSealAdmission {
+    fn from(a: crate::federation::edition2::contact::PreSealAdmission) -> Self {
+        Self {
+            key_record: a.key_record.into(),
+            route: a.route.into(),
+            transit_ready: a.transit_ready,
+        }
+    }
+}
+
+/// v62.0.0 (RL-fix3) — the wire mirror of
+/// [`crate::federation::edition2::contact::ContactOwner`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edition2ContactOwner {
+    /// The outcomes, the owner's key record first.
+    pub outcomes: Vec<Edition2ReplicatedOutcome>,
+    /// Does the node's one live owner resolve to the code's identity now?
+    pub owner_resolved: bool,
+}
+
+impl From<crate::federation::edition2::contact::ContactOwner> for Edition2ContactOwner {
+    fn from(o: crate::federation::edition2::contact::ContactOwner) -> Self {
+        Self {
+            outcomes: o.outcomes.into_iter().map(Into::into).collect(),
+            owner_resolved: o.owner_resolved,
         }
     }
 }
@@ -3042,7 +3320,26 @@ pub fn earlier_form_op_plane(op: &DirectoryOp) -> Option<&'static str> {
         | DirectoryOp::FoldState { .. }
         | DirectoryOp::FoldSlotRows { .. }
         | DirectoryOp::FoldSlotHeld { .. }
-        | DirectoryOp::FoldAnyRefolding { .. } => None,
+        | DirectoryOp::FoldAnyRefolding { .. }
+        // v62.0.0 (PX-fix1) — the node-local touch and its floor: unsigned,
+        // this node's own state; no signed object rides them.
+        | DirectoryOp::PutTouchClaimLocal { .. }
+        | DirectoryOp::FreshnessFloor { .. }
+        // v62.0.0 (PX-fix3) — a read of held tips; no signed object rides it.
+        | DirectoryOp::ListGroupTips { .. } => None,
+        // v62.0.0 (RL-fix1) — the replicated edition-2 door with a feed
+        // position, and the accord-rescan watermark read and ack.
+        | DirectoryOp::ApplyReplicatedStatementAtFeed { .. }
+        | DirectoryOp::AccordRescanNeeded { .. }
+        | DirectoryOp::AckAccordRescan { .. }
+        // v62.0.0 (RL-fix3) — the contact path: a local unsigned record, and
+        // two edition-2 doors that refuse an earlier-form object themselves.
+        | DirectoryOp::RecordDialHints { .. }
+        | DirectoryOp::DialHintsFor { .. }
+        | DirectoryOp::ListDialHints { .. }
+        | DirectoryOp::RemoveDialHints { .. }
+        | DirectoryOp::AdmitPreSealAnswer { .. }
+        | DirectoryOp::AdmitContactOwnerRows { .. } => None,
         // TODO(json-cut): detection events are MESH (RULINGS "Planes"), but
         // no edition-2 detection door exists yet and the Rust door
         // (`derived::put_edge_detection_event`) is not wired to the
@@ -3052,6 +3349,12 @@ pub fn earlier_form_op_plane(op: &DirectoryOp) -> Option<&'static str> {
         // a retired arm that reads nothing, the composite one admits nothing.
         DirectoryOp::VerifyHybridViaDirectory { .. }
         | DirectoryOp::VerifyCompositeViaDirectory { .. } => None,
+        // v62.0.0 (PR-fix1) — the edition-2 peer verdict: a read.
+        DirectoryOp::PeerRooting { .. } => None,
+        // v62.0.0 (AU-fix2) — edition-2 reads: no earlier-form object.
+        DirectoryOp::AdmissionUnitRows { .. } | DirectoryOp::AdmissionUnitRunnable { .. } => None,
+        // v62.0.0 (K2-fix20) — an authoring read: carries no signed object.
+        DirectoryOp::MayPublishFederationRendezvous { .. } => None,
     }
 }
 
@@ -3764,6 +4067,48 @@ pub async fn dispatch_directory_op(
                 Err(e) => op_err_typed(&e),
             }
         }
+        DirectoryOp::AdmissionUnitRows { sub, at_ms, owner } => {
+            let Some(at) = i64::try_from(at_ms)
+                .ok()
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            else {
+                return op_err(&crate::federation::Error::InvalidArgument(format!(
+                    "admission_unit_rows: at_ms {at_ms} is out of range"
+                )));
+            };
+            match Box::pin(dir.admission_unit_rows(&sub, at, owner.as_deref())).await {
+                Ok(v) => DirectoryOpResult::AdmissionUnitRows(v),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::AdmissionUnitRunnable {
+            row_id,
+            at_ms,
+            owner,
+        } => {
+            let Some(at) = i64::try_from(at_ms)
+                .ok()
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            else {
+                return op_err(&crate::federation::Error::InvalidArgument(format!(
+                    "admission_unit_runnable: at_ms {at_ms} is out of range"
+                )));
+            };
+            let row_id = crate::federation::edition2::names::RowId(row_id);
+            match Box::pin(
+                crate::federation::edition2::admission_unit::admission_unit_runnable(
+                    dir,
+                    &row_id,
+                    at,
+                    owner.as_deref(),
+                ),
+            )
+            .await
+            {
+                Ok(a) => DirectoryOpResult::AdmissionUnitAnswer(AdmissionUnitAnswerWire::of(&a)),
+                Err(e) => op_err_typed(&e),
+            }
+        }
         DirectoryOp::ListCommunityMembershipRevocationsFor { community_key_id } => {
             match dir
                 .list_community_membership_revocations_for(&community_key_id)
@@ -3915,8 +4260,13 @@ pub async fn dispatch_directory_op(
         DirectoryOp::TrustRootValid {
             user_key_id,
             root_key_id,
-        } => match crate::federation::trust_root::trust_root_valid(dir, &user_key_id, &root_key_id)
-            .await
+        } => match crate::federation::trust_root::trust_root_valid(
+            dir,
+            &user_key_id,
+            &root_key_id,
+            crate::host::clock::now(),
+        )
+        .await
         {
             Ok(v) => DirectoryOpResult::TrustRootVerdict(v),
             Err(e) => op_err(&e),
@@ -3930,6 +4280,7 @@ pub async fn dispatch_directory_op(
             &user_key_id,
             &subject_key_id,
             &scope,
+            crate::host::clock::now(),
         )
         .await
         {
@@ -4577,6 +4928,186 @@ pub async fn dispatch_directory_op(
             Ok(b) => DirectoryOpResult::Bool(b),
             Err(e) => op_err_typed(&e),
         },
+        DirectoryOp::PeerRooting {
+            reader_node,
+            peer_identity_ref,
+            claimed_key,
+            at_ms,
+        } => {
+            let parsed =
+                match claimed_key.composite() {
+                    Ok(p) => p,
+                    Err(_) => return op_err_typed(&crate::federation::Error::InvalidArgument(
+                        "peer_rooting: claimed_key's composite bytes are no composite public key"
+                            .into(),
+                    )),
+                };
+            let Some(claim) = claimed_key.as_claim(parsed.as_ref()) else {
+                return op_err_typed(&crate::federation::Error::InvalidArgument(
+                    "peer_rooting: no claim".into(),
+                ));
+            };
+            match Box::pin(crate::federation::edition2::peer_rooting::peer_rooting(
+                dir,
+                &reader_node,
+                &peer_identity_ref,
+                claim,
+                at_ms,
+            ))
+            .await
+            {
+                Ok(v) => DirectoryOpResult::PeerRooting(v),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::PutTouchClaimLocal {
+            target_key_id,
+            target_kind,
+            fresh_as_of,
+            cohort_scope,
+        } => match dir
+            .put_touch_claim_local(&target_key_id, &target_kind, fresh_as_of, &cohort_scope)
+            .await
+        {
+            Ok(o) => DirectoryOpResult::TouchApplied(o),
+            Err(e) => op_err_typed(&e),
+        },
+        DirectoryOp::FreshnessFloor {
+            target_key_id,
+            target_kind,
+        } => match dir.freshness_floor(&target_key_id, &target_kind).await {
+            Ok(f) => DirectoryOpResult::FreshnessFloorOf(f),
+            Err(e) => op_err_typed(&e),
+        },
+        DirectoryOp::ApplyReplicatedStatementAtFeed {
+            statement,
+            offered_row_id,
+            feed,
+        } => match Box::pin(
+            crate::federation::edition2::ingest::apply_replicated_statement_at_feed(
+                dir,
+                &statement,
+                &offered_row_id,
+                &feed,
+            ),
+        )
+        .await
+        {
+            Ok(o) => DirectoryOpResult::ReplicatedStatementOutcome(o.into()),
+            Err(e) => op_err_typed(&e),
+        },
+        DirectoryOp::AccordRescanNeeded {} => {
+            match Box::pin(crate::federation::edition2::accord_rescan::rescan_needed(
+                dir,
+            ))
+            .await
+            {
+                Ok(v) => DirectoryOpResult::AccordRescans(v),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::AckAccordRescan {
+            plane,
+            peer,
+            from_position,
+        } => match Box::pin(crate::federation::edition2::accord_rescan::ack_rescan(
+            dir,
+            &plane,
+            &peer,
+            &from_position,
+        ))
+        .await
+        {
+            Ok(b) => DirectoryOpResult::Bool(b),
+            Err(e) => op_err_typed(&e),
+        },
+        DirectoryOp::RecordDialHints { hints } => {
+            match Box::pin(crate::federation::edition2::contact::record_dial_hints(
+                dir, hints,
+            ))
+            .await
+            {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::DialHintsFor { node } => {
+            match Box::pin(crate::federation::edition2::contact::dial_hints_for(
+                dir, &node,
+            ))
+            .await
+            {
+                Ok(v) => DirectoryOpResult::DialHints(v),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::ListDialHints {} => {
+            match Box::pin(crate::federation::edition2::contact::list_dial_hints(dir)).await {
+                Ok(v) => DirectoryOpResult::DialHintsList(v),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::RemoveDialHints { node } => {
+            match Box::pin(crate::federation::edition2::contact::remove_dial_hints(
+                dir, &node,
+            ))
+            .await
+            {
+                Ok(b) => DirectoryOpResult::Bool(b),
+                Err(e) => op_err_typed(&e),
+            }
+        }
+        DirectoryOp::AdmitPreSealAnswer {
+            dialled,
+            key_record,
+            route,
+        } => match Box::pin(crate::federation::edition2::contact::admit_pre_seal_answer(
+            dir,
+            &dialled,
+            &key_record,
+            &route,
+        ))
+        .await
+        {
+            Ok(a) => DirectoryOpResult::PreSealAdmission(a.into()),
+            Err(e) => op_err_typed(&e),
+        },
+        DirectoryOp::AdmitContactOwnerRows {
+            node,
+            identity,
+            owner_key_record,
+            binding,
+        } => match Box::pin(
+            crate::federation::edition2::contact::admit_contact_owner_rows(
+                dir,
+                &node,
+                &identity,
+                &owner_key_record,
+                &binding,
+            ),
+        )
+        .await
+        {
+            Ok(o) => DirectoryOpResult::ContactOwner(o.into()),
+            Err(e) => op_err_typed(&e),
+        },
+        DirectoryOp::ListGroupTips {
+            cohort,
+            group_key_id,
+        } => match dir.list_group_tips(cohort, &group_key_id).await {
+            Ok(v) => DirectoryOpResult::GroupTips(v),
+            Err(e) => op_err_typed(&e),
+        },
+        DirectoryOp::MayPublishFederationRendezvous { key_id } => {
+            match Box::pin(crate::federation::age::may_publish_federation_rendezvous(
+                dir, &key_id,
+            ))
+            .await
+            {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => op_err_typed(&e),
+            }
+        }
     }
 }
 
@@ -5241,6 +5772,29 @@ pub fn build_ops_directory(
 ) -> Result<Arc<dyn FederationDirectory>, Error> {
     let proxy: Arc<dyn FederationDirectory> = build_ops_directory_proxy(directory, executor)?;
     Ok(proxy)
+}
+
+/// v62.0.0 (PX-fix1) — TESTS: the consumer proxy over `dir` exactly as a host
+/// builds it (`build_persist_directory` → [`build_ops_directory`]), driven by
+/// an executor capsule on a runtime of its own. The runtime is never dropped:
+/// a runtime may not be dropped inside an async test, and the proxy may
+/// outlive the caller's scope.
+///
+/// # Panics
+/// The runtime cannot be built, or the ABI check fails.
+#[cfg(test)]
+pub(crate) fn test_proxy(dir: Arc<dyn FederationDirectory>) -> Arc<dyn FederationDirectory> {
+    let rt = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_stack_size(16 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("PX-fix1: the proxy's runtime"),
+    );
+    std::mem::forget(rt.clone());
+    let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(rt));
+    build_ops_directory(build_persist_directory(dir), executor).expect("PX-fix1: abi ok")
 }
 
 /// v61.4.0 (CIRISPersist#1244) — [`build_ops_directory`], returning the
@@ -7040,6 +7594,34 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
+    /// v62.0.0 (AU-fix2; CC 2.7.11) — the live `admission:unit` rows,
+    /// proxied: the default reads the edition-2 store, which refuses through
+    /// the proxy, so the whole read crosses.
+    async fn admission_unit_rows(
+        &self,
+        sub: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        owner: Option<&str>,
+    ) -> Result<Vec<crate::federation::edition2::admission_unit::AdmissionUnitRow>, Error> {
+        let at_ms = u64::try_from(at.timestamp_millis()).map_err(|_| {
+            Error::InvalidArgument(format!("admission_unit_rows: {at} is before the epoch"))
+        })?;
+        match self
+            .run_op(&DirectoryOp::AdmissionUnitRows {
+                sub: sub.to_owned(),
+                at_ms,
+                owner: owner.map(str::to_owned),
+            })
+            .await?
+        {
+            DirectoryOpResult::AdmissionUnitRows(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
     /// v62.0.0 (JSON-cut slice D) — the edition-2 serve listing, proxied.
     /// The trait default answers EMPTY, which a serving consumer would read
     /// as "nothing held" (the #1244 fail-open class), so the read crosses.
@@ -7298,6 +7880,54 @@ impl FederationDirectory for OpsDirectory {
     async fn fold_any_refolding(&self) -> Result<bool, Error> {
         match self.run_op(&DirectoryOp::FoldAnyRefolding {}).await? {
             DirectoryOpResult::Bool(b) => Ok(b),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v62.0.0 (PX-fix1) — the node-local touch, proxied: the replacement for
+    /// the retired signed `put_touch_claim` (RULINGS: a touch claim is
+    /// node-local), answered by the host's own floor.
+    async fn put_touch_claim_local(
+        &self,
+        target_key_id: &str,
+        target_kind: &str,
+        fresh_as_of: chrono::DateTime<chrono::Utc>,
+        cohort_scope: &str,
+    ) -> Result<crate::federation::freshness::TouchApplyOutcome, Error> {
+        match self
+            .run_op(&DirectoryOp::PutTouchClaimLocal {
+                target_key_id: target_key_id.to_owned(),
+                target_kind: target_kind.to_owned(),
+                fresh_as_of,
+                cohort_scope: cohort_scope.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::TouchApplied(o) => Ok(o),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v62.0.0 (PX-fix1) — the floor this node holds, proxied.
+    async fn freshness_floor(
+        &self,
+        target_key_id: &str,
+        target_kind: &str,
+    ) -> Result<Option<types::FreshnessFloor>, Error> {
+        match self
+            .run_op(&DirectoryOp::FreshnessFloor {
+                target_key_id: target_key_id.to_owned(),
+                target_kind: target_kind.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::FreshnessFloorOf(f) => Ok(f),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -7939,6 +8569,29 @@ impl FederationDirectory for OpsDirectory {
             )),
         }
     }
+    /// v62.0.0 (PX-fix3) — the held tips, proxied: the roster fold composed
+    /// over this proxy reads them, and their `Unsupported` read as "not
+    /// forked" (a forked group's roster read as its head's).
+    async fn list_group_tips(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Vec<cohort::GroupTip>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListGroupTips {
+                cohort,
+                group_key_id: group_key_id.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::GroupTips(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
     async fn list_group_versions(
         &self,
         cohort: cohort::Cohort,
@@ -8769,14 +9422,29 @@ mod tests {
         // v62.0.0 (F0-cp5) — GROWTH: `VerifyCompositeViaDirectory` APPENDED;
         // `VerifyHybridViaDirectory` keeps its fields (its arm now refuses);
         // ABI stays 14. (X2 pass 4d: re-pinned over the integrated order.)
+        // v62.0.0 (AU-fix2) — GROWTH: `AdmissionUnitRows` and
+        // `AdmissionUnitRunnable` APPENDED after PX-fix1's reads; ABI stays
+        // 14 (the pin is 4g-regen's, on the merged file).
         // v62.0.0 (PX-fix1) — GROWTH: the 13 edition-2 and fold store reads
-        // (`Edition2StatementsAbout` … `FoldAnyRefolding`) APPENDED after
-        // `VerifyCompositeViaDirectory`; ABI stays 14. (Another wave that
+        // (`Edition2StatementsAbout` … `FoldAnyRefolding`), then the node-local
+        // touch (`PutTouchClaimLocal`, `FreshnessFloor`) APPENDED after
+        // `VerifyCompositeViaDirectory`; ABI stays 14.
+        // v62.0.0 (PX-fix3) — GROWTH: `ListGroupTips` APPENDED; ABI stays 14. (Another wave that
         // appends ops re-pins over the MERGED order: the python port is
         // FSD/v62_wip/parallel/tools/structural_digest.py.)
+        // v62.0.0 (PR-fix1) — GROWTH: `PeerRooting` APPENDED (the peer
+        // verdict, CC 3.2 T8); ABI stays 14. Merged with another wave that
+        // appends ops (PX-fix1, AU-fix2): recompute on the merged file.
+        // v62.0.0 (RL-fix1) — GROWTH: `ApplyReplicatedStatementAtFeed`,
+        // `AccordRescanNeeded`, `AckAccordRescan` APPENDED; ABI stays 14
+        // (re-pinned with the python port of `structural_digest`).
+        // v62.0.0 (RL-fix3) — GROWTH: the contact path's six ops APPENDED.
+        // v62.0.0 (4g-regen) — re-pinned over the MERGED 4g order (PR-fix1,
+        // AU-fix2, PX-fix2, RL-fix2, RL-fix3, PX-fix3, K2-fix20 after 4f's
+        // PX-fix1). GROWTH; ABI stays 14.
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "97f8ce7e6bc3d732db8c72d303684c8da76506cc5e57954b4cda7155dcb82947",
+            "6582bd9de3c7639ae42507f4a29c2caae82b1d52cfb7298009115b000d25f385",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -8852,13 +9520,20 @@ mod tests {
         // v62.0.0 (ceremony gap 2, C3) — GROWTH: `RebindHeld` APPENDED.
         // v62.0.0 (L1-fix3) — re-pinned over the merged order: `HeldRows`,
         // `VoiceOutcome`, `GenesisAdmission`, `RebindHeld`. GROWTH.
+        // v62.0.0 (PR-fix1) — GROWTH: `PeerRooting` APPENDED; ABI stays 14.
+        // Recompute on a merge with another op-appending wave.
+        // v62.0.0 (AU-fix2) — GROWTH: `AdmissionUnitRows` and
+        // `AdmissionUnitAnswer` APPENDED; ABI stays 14 (pinned by 4g-regen).
         assert_eq!(
             // v62.0.0 (F0-cp5) — GROWTH: `CompositeVerify` APPENDED.
             // v62.0.0 (PX-fix1) — GROWTH: `Edition2Statements`,
             // `Edition2RowIds`, `Edition2StatementIds`, `FoldHeldReason`,
-            // `FoldHeldReasons`, `FoldStateOf` APPENDED; ABI stays 14.
+            // `FoldHeldReasons`, `FoldStateOf`, `TouchApplied`,
+            // `FreshnessFloorOf` APPENDED; ABI stays 14.
+            // v62.0.0 (PX-fix3) — GROWTH: `GroupTips` APPENDED.
+            // v62.0.0 (4g-regen) — re-pinned over the merged 4g order.
             structural_digest("DirectoryOpResult"),
-            "c41ae393fb69c755e4e84c8f2ea0e4ad773ca4b6eba17aeb92d4b55cb76d5335",
+            "87b3f03e2055a1af8c997bbc7a2f086bcd07aa007842fa6389090bc85e6ba0b0",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
@@ -12439,14 +13114,95 @@ mod tests {
                 DirectoryOp::FoldAnyRefolding {},
                 |p| Box::pin(async move { p.fold_any_refolding().await.map(|v| format!("{v:?}")) }),
             ),
+            // v62.0.0 (AU-fix2) — the live admission read: a trait DEFAULT
+            // whose first leaf is `edition2_statements_about`.
+            (
+                "admission_unit_rows",
+                "edition2_statements_about",
+                false,
+                DirectoryOp::AdmissionUnitRows {
+                    sub: "x".into(),
+                    at_ms: 1_000,
+                    owner: None,
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.admission_unit_rows(
+                            "x",
+                            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_000)
+                                .expect("an instant"),
+                            None,
+                        )
+                        .await
+                        .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            // v62.0.0 (PX-fix1) — the node-local touch (the retired signed
+            // touch's replacement) and its floor.
+            (
+                "put_touch_claim_local",
+                "put_touch_claim_local",
+                true,
+                DirectoryOp::PutTouchClaimLocal {
+                    target_key_id: "x".into(),
+                    target_kind: "y".into(),
+                    fresh_as_of: at_1890(),
+                    cohort_scope: "self".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.put_touch_claim_local("x", "y", at_1890(), "self")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
+            (
+                "freshness_floor",
+                "freshness_floor",
+                false,
+                DirectoryOp::FreshnessFloor {
+                    target_key_id: "x".into(),
+                    target_kind: "y".into(),
+                },
+                |p| {
+                    Box::pin(
+                        async move { p.freshness_floor("x", "y").await.map(|v| format!("{v:?}")) },
+                    )
+                },
+            ),
+            // v62.0.0 (PX-fix3) — the held tips the roster fold reads.
+            (
+                "list_group_tips",
+                "list_group_tips",
+                false,
+                DirectoryOp::ListGroupTips {
+                    cohort: cohort::Cohort::Family,
+                    group_key_id: "x".into(),
+                },
+                |p| {
+                    Box::pin(async move {
+                        p.list_group_tips(cohort::Cohort::Family, "x")
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
+                },
+            ),
         ];
         // v62.0.0 (L1-fix3) — + `held_rows_for`, `voice_status`; with O1 fix 5's
         // `edition2_roster_proposal` the table is 34 rows (`submit_voice` is
         // I1894's: its first act is a parse, no leaf to fail).
         // v62.0.0 (X2 pass 4d) — 31: F0's CP2 cut deleted the three earlier-form
         // accord doors (`put_accord_proposal` / `_participation` / `_decision`).
+        // v62.0.0 (AU-fix2) — + `admission_unit_rows` (45 on the merged
+        // file; the count is 4g-regen's to pin).
         // v62.0.0 (PX-fix1) — 44: + the 13 edition-2 and fold store reads.
-        assert_eq!(table.len(), 44, "I1890: one row per routed method");
+        // v62.0.0 (PX-fix1) — 46: + the 13 edition-2 and fold store reads, the
+        // node-local touch and its floor.
+        // v62.0.0 (PX-fix3) — 47: + `list_group_tips`.
+        // v62.0.0 (4g-regen) — 48: counted on the merged table.
+        assert_eq!(table.len(), 48, "I1890: one row per routed method");
         let mut red = Vec::new();
         for (method, fault, write, op, call) in table {
             let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -13093,32 +13849,48 @@ mod tests {
         vec![
             (
                 "trust_root_valid key root",
-                answer_1774(trust_root_valid(d, &q.node, &q.root).await),
+                answer_1774(trust_root_valid(d, &q.node, &q.root, crate::host::clock::now()).await),
             ),
             (
                 "trust_root_valid self root",
-                answer_1774(trust_root_valid(d, &q.node, &q.node).await),
+                answer_1774(trust_root_valid(d, &q.node, &q.node, crate::host::clock::now()).await),
             ),
             (
                 "trust_root_valid family-quorum root",
-                answer_1774(trust_root_valid(d, &q.node, &q.root_f).await),
+                answer_1774(
+                    trust_root_valid(d, &q.node, &q.root_f, crate::host::clock::now()).await,
+                ),
             ),
             (
                 "trust_root_valid unknown root",
-                answer_1774(trust_root_valid(d, &q.node, "eq-nobody").await),
+                answer_1774(
+                    trust_root_valid(d, &q.node, "eq-nobody", crate::host::clock::now()).await,
+                ),
             ),
             (
                 "capability key root",
                 answer_1774(
-                    capability_roots_to_trusted_root(d, &q.node, &q.subject_a, INFRA_SERVE_SCOPE)
-                        .await,
+                    capability_roots_to_trusted_root(
+                        d,
+                        &q.node,
+                        &q.subject_a,
+                        INFRA_SERVE_SCOPE,
+                        crate::host::clock::now(),
+                    )
+                    .await,
                 ),
             ),
             (
                 "capability family root",
                 answer_1774(
-                    capability_roots_to_trusted_root(d, &q.node, &q.subject_f, INFRA_SERVE_SCOPE)
-                        .await,
+                    capability_roots_to_trusted_root(
+                        d,
+                        &q.node,
+                        &q.subject_f,
+                        INFRA_SERVE_SCOPE,
+                        crate::host::clock::now(),
+                    )
+                    .await,
                 ),
             ),
             (
@@ -13518,7 +14290,47 @@ mod tests {
                                 (the door crosses as its op and runs in persist's .so over \
                                 the host's store); its default was a silent Ok(()), so a door \
                                 composed over the proxy claimed a write it never made";
+    const REFUSED_DEFAULT_PX: &str = "v62.0.0 (PX-fix1): the trait default answered \
+                                      Err(Backend(..)) through the proxy; an unrouted method \
+                                      now fails Unsupported and nothing else (I2180); no \
+                                      call in CIRISEdge's production code reaches it (I1893)";
+    const RETIRED_FOR_EDGE_PX: &str = "v62.0.0 (PX-fix2): an earlier-form verb CIRISEdge v45.1.6 \
+                                       calls; retired from the capsule, its Unsupported names \
+                                       the edition-2 replacement (EDGE_RETIRED_VERBS, I1893)";
     const PROXY_UNSUPPORTED_ALLOWLIST: &[(&str, &str)] = &[
+        // v62.0.0 (PX-fix1) — the four Edge verbs retired from the capsule.
+        ("record_canonical_withdrawal", RETIRED_FOR_EDGE_PX),
+        ("record_role_withdrawal", RETIRED_FOR_EDGE_PX),
+        ("put_touch_claim", RETIRED_FOR_EDGE_PX),
+        ("put_identity_occurrence_local", RETIRED_FOR_EDGE_PX),
+        // v62.0.0 (PX-fix1) — the `Err(Backend)` defaults, now refusing.
+        ("put_edition2_object", REFUSED_DEFAULT_PX),
+        ("put_edition2_statement", REFUSED_DEFAULT_PX),
+        ("upsert_edition2_key_projection", REFUSED_DEFAULT_PX),
+        ("put_family_local", REFUSED_DEFAULT_PX),
+        (
+            "put_identity_occurrence_revocation_local",
+            REFUSED_DEFAULT_PX,
+        ),
+        ("grant_trust", REFUSED_DEFAULT_PX),
+        ("revoke_trust", REFUSED_DEFAULT_PX),
+        ("lookup_trust", REFUSED_DEFAULT_PX),
+        ("list_trusted_keys", REFUSED_DEFAULT_PX),
+        ("get_goal", REFUSED_DEFAULT_PX),
+        ("list_goals", REFUSED_DEFAULT_PX),
+        (
+            "list_transport_destinations_for_unfolded",
+            REFUSED_DEFAULT_PX,
+        ),
+        ("remove_transport_destination", REFUSED_DEFAULT_PX),
+        ("lookup_freshness_floor", REFUSED_DEFAULT_PX),
+        ("record_hard_case", REFUSED_DEFAULT_PX),
+        ("list_hard_case_events", REFUSED_DEFAULT_PX),
+        ("put_wholeness_witness", REFUSED_DEFAULT_PX),
+        ("list_wholeness_witnesses_for_peer", REFUSED_DEFAULT_PX),
+        ("last_witness_epoch_for_peer", REFUSED_DEFAULT_PX),
+        ("list_witness_peer_ids", REFUSED_DEFAULT_PX),
+        ("list_consent_revocations", REFUSED_DEFAULT_PX),
         // v62.0.0 (PX-fix1) — the silent no-op hooks, now refusing.
         ("rewrap_own_epochs_for_device", DOOR_HOOK_PX),
         ("project_key_grant_row", DOOR_HOOK_PX),
@@ -13576,6 +14388,14 @@ mod tests {
         ("drop_cosign_rows", COSIGN_1252),
         ("note_cosign_alias", COSIGN_1252),
         ("read_group_plane_object", COSIGN_1252),
+        // v62.0.0 (AU-fix1) — node-local: when THIS node first held a row,
+        // read only by the host's answer, which runs host-side (the
+        // `AdmissionUnitRunnable` op); a proxy holds no store.
+        (
+            "edition2_first_held_us",
+            "v62.0.0 (AU-fix1): node-local first-held instant of a row; the host's admission \
+             answer reads it on the host's own store, never through a proxy",
+        ),
         ("purge_scan_attestations", INHERITED_DEFAULT),
         ("purge_trace_ids_for_llm_model", INHERITED_DEFAULT),
         ("purge_trace_ids_signed_by", INHERITED_DEFAULT),
@@ -13616,16 +14436,8 @@ mod tests {
              node's own door (`edition2::genesis::put_genesis_bundle`); no DirectoryOp \
              carries a bundle's GenesisWrite",
         ),
-        (
-            "put_touch_claim_local",
-            "v62.0.0 (P5b) — the node-local touch claim is this node's own derived \
-             state (RULINGS: a touch claim is node-local); no DirectoryOp carries it yet",
-        ),
-        (
-            "freshness_floor",
-            "v62.0.0 (P5b) — the node-local freshness floor read; no DirectoryOp \
-             carries it yet",
-        ),
+        // v62.0.0 (PX-fix1) — `put_touch_claim_local` and `freshness_floor`
+        // left this list: routed (`PutTouchClaimLocal`, `FreshnessFloor`).
         (
             "put_fold_record",
             "v62.0.0 (wave G0; CC 2.7.3) — the fold's record of a held row is written \
@@ -13641,6 +14453,45 @@ mod tests {
             "put_fold_reason",
             "v62.0.0 (wave G0 fix4) — the re-fold's marker and its restore run in the \
              process that owns the store (`edition2::fold`); no DirectoryOp carries it",
+        ),
+        // v62.0.0 (RL-fix1, ruling (B)) — the accord-rescan watermark store
+        // is written and read by the free doors persist runs over its own
+        // directory (`ApplyReplicatedStatementAtFeed`, `AccordRescanNeeded`,
+        // `AckAccordRescan`); the proxy holds no store of its own.
+        (
+            "note_accord_skip",
+            "v62.0.0 (RL-fix1) — written by `apply_replicated_statement_at_feed` in the \
+             process that owns the store; the consumer sends ApplyReplicatedStatementAtFeed",
+        ),
+        (
+            "accord_skips",
+            "v62.0.0 (RL-fix1) — read by `accord_rescan::rescan_needed` in the process that \
+             owns the store; the consumer sends AccordRescanNeeded",
+        ),
+        (
+            "put_dial_hints",
+            "v62.0.0 (RL-fix3) — written by `contact::record_dial_hints` in the process that \
+             owns the store; the consumer sends RecordDialHints",
+        ),
+        (
+            "dial_hints_for",
+            "v62.0.0 (RL-fix3) — read in the process that owns the store; the consumer sends \
+             DialHintsFor",
+        ),
+        (
+            "list_dial_hints",
+            "v62.0.0 (RL-fix3) — read in the process that owns the store; the consumer sends \
+             ListDialHints",
+        ),
+        (
+            "remove_dial_hints",
+            "v62.0.0 (RL-fix3) — removed in the process that owns the store; the consumer \
+             sends RemoveDialHints",
+        ),
+        (
+            "clear_accord_skip",
+            "v62.0.0 (RL-fix1) — cleared by `accord_rescan::ack_rescan` in the process that \
+             owns the store; the consumer sends AckAccordRescan",
         ),
         (
             "clear_occurrence_projection",
@@ -13668,11 +14519,8 @@ mod tests {
             "v62.0.0 (O1) — THIS node's open self-roster proposals, read \
              by its own sweep; node-local, no DirectoryOp carries it",
         ),
-        (
-            "list_group_tips",
-            "v62.0.0 (kernel pass 2, K1): a node-local read of the tips this \
-          node holds; no DirectoryOp carries it yet",
-        ),
+        // v62.0.0 (PX-fix3) — `list_group_tips` left this list: routed
+        // (`ListGroupTips`).
     ];
 
     /// **I1162 — proxy parity.** Every `FederationDirectory` method the
@@ -13834,6 +14682,10 @@ mod tests {
     /// strings blanked, so a commented-out override or a `"Unsupported"` in
     /// a message cannot pass for one.
     ///
+    /// A default that answers an error OTHER than `Unsupported`
+    /// (`Err(Error::Backend(..))`) is red too (lead's ruling): an unrouted
+    /// method fails `Unsupported` and nothing else.
+    ///
     /// Blind spot (as I1162's): a COMPOSING default is not classified — it
     /// answers through the methods it calls, which this gate classifies.
     #[test]
@@ -13900,10 +14752,19 @@ mod tests {
             "I2180 recognizer: a composition is seen"
         );
 
+        // v62.0.0 (PX-fix1, lead's ruling) — an unrouted method fails
+        // `Unsupported` and nothing else: a default that answers another
+        // error (`Err(Backend(..))`) is red too, so a host can always tell
+        // "not on the capsule" from a failure of the host's store.
         let silent: BTreeSet<&str> = tr
             .keys()
             .map(String::as_str)
-            .filter(|&n| inherited(n) == Some(DefaultAnswer::Silent))
+            .filter(|&n| {
+                matches!(
+                    inherited(n),
+                    Some(DefaultAnswer::Silent | DefaultAnswer::Refuses)
+                )
+            })
             .collect();
         let allow: BTreeMap<&str, &str> = PROXY_SILENT_DEFAULT_ALLOWLIST.iter().copied().collect();
         assert_eq!(
@@ -13918,9 +14779,9 @@ mod tests {
         let unlisted: Vec<&&str> = silent.iter().filter(|m| !allow.contains_key(**m)).collect();
         assert!(
             unlisted.is_empty(),
-            "I2180 these trait defaults answer empty / None / false / Ok(()) through the \
-             capsule proxy, so every fold over it reads 'nothing held': {unlisted:?}. Route \
-             each (append a DirectoryOp, override it on OpsDirectory), make the default \
+            "I2180 these trait defaults answer empty / None / false / Ok(()) — or an error \
+             other than Unsupported — through the capsule proxy: {unlisted:?}. Route each \
+             (append a DirectoryOp, override it on OpsDirectory), make the default \
              `Err(Error::Unsupported {{ .. }})`, or allowlist it WITH a reason"
         );
         let stale: Vec<&&str> = allow.keys().filter(|m| !silent.contains(**m)).collect();
@@ -13939,6 +14800,12 @@ mod tests {
     /// Edge's tree is not a persist input, and a gate that reads a sibling
     /// checkout fails toward whatever happens to be checked out. Re-derive it
     /// on an Edge re-pin (`L1.md` has the script).
+    ///
+    /// v62.0.0 (PX-fix2) — the list holds only the calls that SUCCEED over
+    /// the v62 capsule: the four earlier-form verbs v62 retired
+    /// (`record_canonical_withdrawal`, `record_role_withdrawal`,
+    /// `put_touch_claim`, `put_identity_occurrence_local`) moved to
+    /// [`EDGE_RETIRED_VERBS`], each with its edition-2 replacement.
     const EDGE_V45_1_6_PRODUCTION_CALLS: &[&str] = &[
         "active_community_key_ids_for",
         "active_community_members",
@@ -13985,13 +14852,9 @@ mod tests {
         "put_community",
         "put_community_membership_revocation",
         "put_family_membership_widening",
-        "put_identity_occurrence_local",
         "put_public_key",
         "put_signed_transport_destination",
-        "put_touch_claim",
         "rebuild_signed_wire_index",
-        "record_canonical_withdrawal",
-        "record_role_withdrawal",
         "release_shared_instance_lease",
         "remove_peer_record",
         "resolve_scoped_consent",
@@ -14035,7 +14898,45 @@ mod tests {
             allowlisted.is_empty(),
             "I1893 Edge calls these, and the proxy answers them Unsupported: {allowlisted:?}"
         );
+        // v62.0.0 (PX-fix1) — a RETIRED verb Edge still calls answers
+        // `Unsupported` naming its edition-2 replacement, read from the
+        // default's own text (strings kept: the message is the contract).
+        let raw = std::fs::read_to_string(root.join("src/federation/mod.rs")).expect("read");
+        for (verb, replacement) in EDGE_RETIRED_VERBS {
+            assert!(
+                !EDGE_V45_1_6_PRODUCTION_CALLS.contains(verb),
+                "I1893 a retired verb is no call that succeeds (drop it from the production list): {verb}"
+            );
+            assert!(
+                matches!(tr.get(*verb), Some(Some(b)) if b.contains("Unsupported")),
+                "I1893 {verb}: the trait default must answer Unsupported"
+            );
+            let message = format!("method: \"{verb} — retired");
+            let at = raw
+                .find(&message)
+                .unwrap_or_else(|| panic!("I1893 {verb}: its Unsupported says it is retired"));
+            let line_end = at + raw[at..].find('\n').unwrap_or(raw.len() - at);
+            assert!(
+                raw[at..line_end].contains(replacement),
+                "I1893 {verb}: its Unsupported names the replacement `{replacement}`"
+            );
+            assert!(
+                PROXY_UNSUPPORTED_ALLOWLIST.iter().any(|(n, _)| n == verb),
+                "I1893 {verb}: listed with I1162"
+            );
+        }
     }
+
+    /// v62.0.0 (PX-fix2) — the earlier-form verbs CIRISEdge v45.1.6 calls from
+    /// production that v62 retired from the capsule, each with the edition-2
+    /// replacement its `Unsupported` names (ADOPTION-NOTES "PX-fix2" says what
+    /// Edge calls instead). Disjoint from the production-call list.
+    const EDGE_RETIRED_VERBS: &[(&str, &str)] = &[
+        ("record_canonical_withdrawal", "PutGenesisBundle"),
+        ("record_role_withdrawal", "PutEdition2Statement"),
+        ("put_touch_claim", "put_touch_claim_local"),
+        ("put_identity_occurrence_local", "PutEdition2Statement"),
+    ];
 }
 
 /// v60.0.0 (CIRISPersist#787) — the consumer side of every op.
@@ -14059,13 +14960,8 @@ mod proxy_gate {
         // v62.0.0 (round 6) — the accord proposal / participation / decision
         // trait doors are deleted (JSON-cut slice F; a roster change is a later
         // genesis bundle); their append-only ops stay as refusing arms.
-        // v62.0.0 (F0-cp9r) — the lineage-head cosign trait door is deleted;
-        // the op keeps its fields (ABI 14) and refuses `Unsupported`.
-        (
-            "PutLineageHeadCosign",
-            "retired at v62.0.0 (F0-cp9r): its trait door is deleted; the op stays so an \
-             old consumer's call is refused by name, never issued by a current proxy",
-        ),
+        // v62.0.0 (PX-fix3, 4g merge) — PX-fix3's `PutLineageHeadCosign` row is
+        // the one 4f-regen already carries (below); one row per op.
         (
             "PutAccordDecision",
             "retired at v62.0.0 (slice F): its trait door is deleted; the op stays so an \
@@ -14086,9 +14982,68 @@ mod proxy_gate {
             "the verify runs inside persist's .so against its own vtable, by design: a \
              consumer-side proxy would reintroduce the vtable skew the op exists to avoid",
         ),
+        // v62.0.0 (AU-fix2; CC 2.7.11) — the host's whole answer is a free
+        // fold over the host's store; the consumer sends the op.
+        (
+            "AdmissionUnitRunnable",
+            "`edition2::admission_unit::admission_unit_runnable` is a free fold persist runs \
+             over its own directory (every leg on the host's store); no trait method to proxy",
+        ),
         (
             "BuildDelegationGraph",
             "a free walk persist runs over its own directory; no trait method to proxy",
+        ),
+        // v62.0.0 (4f-regen) — F0-cp9r deleted the lineage-head cosign door
+        // (one verify path); the op stays as a refusing arm for the ABI.
+        (
+            "PutLineageHeadCosign",
+            "retired at v62.0.0 (F0-cp9r): its trait door is deleted and its arm \
+             refuses; the op stays for the ABI, never issued by a current proxy",
+        ),
+        // v62.0.0 (RL-fix1, ruling (B)) — free doors and reads persist runs
+        // over its own directory.
+        (
+            "ApplyReplicatedStatementAtFeed",
+            "`edition2::ingest::apply_replicated_statement_at_feed` is a free door persist \
+             runs over its own directory; no trait method to proxy",
+        ),
+        (
+            "AccordRescanNeeded",
+            "`edition2::accord_rescan::rescan_needed` is a free read over the genesis in \
+             force and the watermarks; no trait method to proxy",
+        ),
+        (
+            "AckAccordRescan",
+            "`edition2::accord_rescan::ack_rescan` is a free door over the watermark store; \
+             no trait method to proxy",
+        ),
+        // v62.0.0 (RL-fix3) — the contact path's free doors and reads.
+        (
+            "RecordDialHints",
+            "`edition2::contact::record_dial_hints` is a free door (bounds and the CC 2.6.8 \
+             guard) persist runs over its own directory",
+        ),
+        (
+            "DialHintsFor",
+            "`edition2::contact::dial_hints_for` is a free read over the dial-hint store, not a trait method to proxy",
+        ),
+        (
+            "ListDialHints",
+            "`edition2::contact::list_dial_hints` is a free read over the dial-hint store, not a trait method to proxy",
+        ),
+        (
+            "RemoveDialHints",
+            "`edition2::contact::remove_dial_hints` is a free door over the dial-hint store, not a trait method to proxy",
+        ),
+        (
+            "AdmitPreSealAnswer",
+            "`edition2::contact::admit_pre_seal_answer` is a free door persist runs over its \
+             own directory (pure checks, then the replicated door)",
+        ),
+        (
+            "AdmitContactOwnerRows",
+            "`edition2::contact::admit_contact_owner_rows` is a free door persist runs over \
+             its own directory",
         ),
         (
             "PutIdentityOccurrenceRevocation",
@@ -14134,6 +15089,16 @@ mod proxy_gate {
             "RebindHeldFor",
             "`edition2::transport_rebind::rebind_held_for` is a free read over the held \
              genesis lineage and re-bind voices, not a trait method",
+        ),
+        (
+            "PeerRooting",
+            "`edition2::peer_rooting::peer_rooting` is a free read over the held genesis, \
+             key plane and trust rows, not a trait method",
+        ),
+        (
+            "MayPublishFederationRendezvous",
+            "`age::may_publish_federation_rendezvous` is a free authoring check over the held \
+             age rows, not a trait method; the host sends the op before it publishes",
         ),
     ];
 
@@ -14641,6 +15606,11 @@ mod edition2_ops {
             "the replicated edition-2 door; the same form check runs inside put_statement",
         ),
         (
+            "ApplyReplicatedStatementAtFeed",
+            "the replicated edition-2 door with a feed position; the same form check runs \
+             inside put_statement",
+        ),
+        (
             "PutGenesisBundle",
             "the edition-2 genesis door itself; it refuses an earlier-form object (a bundle/1 \
              JSON) by its own form check",
@@ -14649,6 +15619,11 @@ mod edition2_ops {
             "PutEdgeDetectionEvent",
             "TODO(json-cut): MESH by ruling, but no edition-2 detection door exists and the Rust \
              door is not on the switch; the capsule follows the Rust door",
+        ),
+        (
+            "PutTouchClaimLocal",
+            "v62.0.0 (PX-fix1): the node-local touch carries no signed object at all (RULINGS: \
+             a touch claim is node-local), so there is no earlier form to refuse",
         ),
     ];
 
@@ -15015,7 +15990,9 @@ mod wait_relay {
 ///   (`bytes_servable`, `is_held_back`) agree.
 /// - **I2184** — a method the proxy does not route answers `Unsupported`
 ///   naming itself, never an empty `Ok`: the three write hooks whose
-///   defaults were a silent `Ok(())`, and an inherited fold-store write.
+///   defaults were a silent `Ok(())`, and an inherited fold-store write; the
+///   retired Edge withdrawal verbs (their default was `Err(Backend)`) answer
+///   `Unsupported` naming their edition-2 replacement.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod proxy_fail_open {
     use super::*;
@@ -15269,6 +16246,24 @@ mod proxy_fail_open {
         named(
             p.put_fold_reason(&RowId([9u8; 32]), None).await.map(|_| ()),
             "put_fold_reason",
+        );
+        // The retired Edge verbs refuse by name AND name their replacement.
+        let retired = |r: Result<(), Error>, verb: &str, replacement: &str| match r {
+            Err(Error::Unsupported { method }) => assert!(
+                method.starts_with(verb) && method.contains(replacement),
+                "I2184 {verb}: the refusal names its replacement: {method}"
+            ),
+            other => panic!("I2184 {verb}: through the proxy answered {other:?}"),
+        };
+        retired(
+            p.record_canonical_withdrawal("k", None, "d").await,
+            "record_canonical_withdrawal",
+            "PutGenesisBundle",
+        );
+        retired(
+            p.record_role_withdrawal("steward", "k", None, "d").await,
+            "record_role_withdrawal",
+            "PutEdition2Statement",
         );
     }
 

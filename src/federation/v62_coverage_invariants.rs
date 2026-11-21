@@ -1270,7 +1270,9 @@ pub(crate) async fn i3248_i3249_trust_root_valid_and_the_walk(d: &dyn Federation
     let node = d.node_key_id().expect("the runner set the node key");
 
     // I3248 — trust_root_valid.
-    let v = trust_root_valid(d, &node, &r.root).await.unwrap();
+    let v = trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+        .await
+        .unwrap();
     assert!(
         v.edge_exists && v.root_self_declares && v.charter_has_recovery,
         "I3248: every leg at the root's own id: {v:?}"
@@ -1288,10 +1290,16 @@ pub(crate) async fn i3248_i3249_trust_root_valid_and_the_walk(d: &dyn Federation
     let grant = put_conferral(d, &r, subject_seed, &[INFRA_SERVE_SCOPE])
         .await
         .expect("I3249: the root confers, the subject co-signs");
-    let found = capability_roots_to_trusted_root(d, &node, &subject, INFRA_SERVE_SCOPE)
-        .await
-        .unwrap()
-        .expect("I3249: the walk reaches a trusted root");
+    let found = capability_roots_to_trusted_root(
+        d,
+        &node,
+        &subject,
+        INFRA_SERVE_SCOPE,
+        crate::host::clock::now(),
+    )
+    .await
+    .unwrap()
+    .expect("I3249: the walk reaches a trusted root");
     assert_eq!(found.root_key_id, r.root, "I3249: the edition-2 root");
     assert_eq!(
         found.grant_attestation_id,
@@ -1306,14 +1314,23 @@ pub(crate) async fn i3248_i3249_trust_root_valid_and_the_walk(d: &dyn Federation
         .await
         .expect("I3249: the node withdraws its acceptance");
     assert!(
-        !trust_root_valid(d, &node, &r.root).await.unwrap().valid,
+        !trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+            .await
+            .unwrap()
+            .valid,
         "I3249: not valid without the edge"
     );
     assert!(
-        capability_roots_to_trusted_root(d, &node, &subject, INFRA_SERVE_SCOPE)
-            .await
-            .unwrap()
-            .is_none(),
+        capability_roots_to_trusted_root(
+            d,
+            &node,
+            &subject,
+            INFRA_SERVE_SCOPE,
+            crate::host::clock::now()
+        )
+        .await
+        .unwrap()
+        .is_none(),
         "I3249: and the walk reaches nothing"
     );
 }
@@ -1427,14 +1444,23 @@ pub(crate) async fn i3253_no_key_arm_for_a_community_root(d: &dyn FederationDire
     let subject = e2::kid(subject_seed);
     // The positive control: valid, and the walk reaches it.
     assert!(
-        trust_root_valid(d, &node, &r.root).await.unwrap().valid,
+        trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+            .await
+            .unwrap()
+            .valid,
         "I3253: valid first"
     );
     assert!(
-        capability_roots_to_trusted_root(d, &node, &subject, INFRA_SERVE_SCOPE)
-            .await
-            .unwrap()
-            .is_some(),
+        capability_roots_to_trusted_root(
+            d,
+            &node,
+            &subject,
+            INFRA_SERVE_SCOPE,
+            crate::host::clock::now()
+        )
+        .await
+        .unwrap()
+        .is_some(),
         "I3253: reached first"
     );
     // Transit's own positive control: bundle seat 0 is a node, offers
@@ -1472,7 +1498,9 @@ pub(crate) async fn i3253_no_key_arm_for_a_community_root(d: &dyn FederationDire
         ),
         "I3253: the community chain no longer roots"
     );
-    let v = trust_root_valid(d, &node, &r.root).await.unwrap();
+    let v = trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+        .await
+        .unwrap();
     assert!(!v.valid, "I3253: not valid: {v:?}");
     assert_eq!(
         v.root_kind,
@@ -1481,10 +1509,16 @@ pub(crate) async fn i3253_no_key_arm_for_a_community_root(d: &dyn FederationDire
     );
     assert!(v.not_rooted.is_some(), "I3253: not valid BY NAME: {v:?}");
     assert!(
-        capability_roots_to_trusted_root(d, &node, &subject, INFRA_SERVE_SCOPE)
-            .await
-            .unwrap()
-            .is_none(),
+        capability_roots_to_trusted_root(
+            d,
+            &node,
+            &subject,
+            INFRA_SERVE_SCOPE,
+            crate::host::clock::now()
+        )
+        .await
+        .unwrap()
+        .is_none(),
         "I3253: the walk reaches nothing"
     );
     assert!(
@@ -1704,7 +1738,9 @@ pub(crate) async fn i3256_a_holder_reports_the_measured_class_and_a_walked_chain
 
     let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
     let node = d.node_key_id().expect("the runner set the node key");
-    let v = trust_root_valid(d, &node, &r.root).await.unwrap();
+    let v = trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+        .await
+        .unwrap();
     assert!(
         v.valid && v.holders_hardware_attested,
         "I3256: the rooted root is valid and attested: {v:?}"
@@ -2120,4 +2156,399 @@ async fn i3256_postgres() {
         return;
     };
     Box::pin(i3256_a_holder_reports_the_measured_class_and_a_walked_chain(&b)).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  (TR-fix1) The standing machine in line with CC rc21 3.2 T7 / T8
+// ─────────────────────────────────────────────────────────────────────────
+
+const TR5_ROOM: &str = "tr-fix1-five-founder-root";
+
+/// Five holders (seeds 1–5): a root founded by all five at `quorum:3/5`.
+fn five_holders() -> fixture_genesis::TestCeremonyV2 {
+    let mut spec = fixture_genesis::CeremonySpec::standard();
+    spec.holders = vec![1, 2, 3, 4, 5];
+    fixture_genesis::ceremony_v2(&spec)
+}
+
+/// **I2225 / I2226 / I2227** (TR-fix1; CC rc21 3.2 T7 l.1232 "live while its
+/// active founder set holds at least M + 1 signers and stalled when it holds
+/// M or fewer"; T8 l.1257) — the margin, not "a founder stopped counting":
+///
+/// - I2225: five holder founders at `quorum:3/5` are Rooted and live (5 ≥ 4).
+/// - I2226: one resigns, 4 active = M + 1: still **Rooted** (before TR-fix1
+///   this read Stalled because a recorded founder stopped counting).
+/// - I2227: a second resigns, 3 active = M: **Stalled**, not live; and the
+///   stalled root still authorises a purge (`trust_root_head` is its head:
+///   T7 l.1240, non-admitting is only the founders' roster count and a
+///   ceremony conferral).
+pub(crate) async fn i2225_i2227_the_t7_margin(d: &dyn FederationDirectory) {
+    use crate::federation::canonical_community::{founder_liveness, StoredStanding};
+    use crate::federation::edition2::group::MembershipRecord;
+    use crate::federation::edition2::group_fixtures::membership_voices;
+    use crate::federation::types::CommunityMembershipRevocation;
+
+    let c = five_holders();
+    fixture_genesis::install_ceremony_v2(d, &c)
+        .await
+        .expect("I2225: five holders install");
+    let gid = e2::kid(TR5_ROOM);
+    let base = crate::host::clock::now().timestamp_millis() - 2 * 3_600_000;
+    let ms = |offset: i64| u64::try_from(base + offset).unwrap();
+    let now = crate::host::clock::now();
+
+    let mut room = infrastructure_room(TR5_ROOM, &[], "quorum:3/5");
+    if let GroupRecord::Community(r) = &mut room {
+        r.founded_at = at(base);
+        r.members = (0..5)
+            .map(|i| CommunityMember {
+                key_id: c.holder_identity_ref(i).to_owned(),
+                joined_at: at(base),
+                role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
+            })
+            .collect();
+    }
+    let keys: Vec<_> = (0..5).map(|i| c.holder_key(i)).collect();
+    let voices: Vec<Vec<u8>> = (0..5)
+        .map(|i| roster_voices(&room, 1, None, ms(60_000), &[&keys[i]]).remove(0))
+        .collect();
+    for v in &voices {
+        e2::put_statement(d, v)
+            .await
+            .expect("I2225: a holder founder's voice");
+    }
+    let v1_id = row_id_of(&voices[0]);
+    let StoredStanding::Rooted(signed) =
+        crate::federation::canonical_community::chain_standing_at(d, &gid, now)
+            .await
+            .unwrap()
+    else {
+        panic!("I2225: five founders at quorum:3/5 are Rooted");
+    };
+    assert_eq!(
+        founder_liveness(d, &signed, now).await.unwrap(),
+        (5, 3),
+        "I2225: five active, M = 3"
+    );
+
+    let resign = |i: usize, offset: i64| {
+        let r = MembershipRecord::CommunityRemoval(CommunityMembershipRevocation {
+            community_key_id: gid.clone(),
+            removed_identity_key_id: c.holder_identity_ref(i).to_owned(),
+            removed_at: at(base + offset),
+            effective_at: at(base + offset),
+            reason: None,
+            witness_set: Vec::new(),
+            persist_row_hash: String::new(),
+        });
+        membership_voices(&r, Some(&v1_id), &[&keys[i]])
+    };
+
+    // I2226 — 4 = M + 1: Rooted.
+    put_voices(d, &resign(4, 600_000))
+        .await
+        .expect("I2226: a founder resigns alone");
+    let StoredStanding::Rooted(signed) =
+        crate::federation::canonical_community::chain_standing_at(d, &gid, now)
+            .await
+            .unwrap()
+    else {
+        panic!("I2226: four active founders at quorum:3/5 (M + 1) stay Rooted (CC 3.2 T7)");
+    };
+    assert_eq!(
+        founder_liveness(d, &signed, now).await.unwrap(),
+        (4, 3),
+        "I2226: four active"
+    );
+
+    // I2227 — 3 = M: Stalled, valid, and it still authorises a purge.
+    put_voices(d, &resign(3, 700_000))
+        .await
+        .expect("I2227: a second founder resigns");
+    let StoredStanding::Stalled { held, .. } =
+        crate::federation::canonical_community::chain_standing_at(d, &gid, now)
+            .await
+            .unwrap()
+    else {
+        panic!("I2227: three active founders at quorum:3/5 (= M) are Stalled");
+    };
+    assert_eq!(
+        founder_liveness(d, &held, now).await.unwrap(),
+        (3, 3),
+        "I2227: three active"
+    );
+    assert!(
+        !crate::federation::canonical_community::is_live(d, &held, now)
+            .await
+            .unwrap(),
+        "I2227: not live"
+    );
+}
+
+/// **I2227b** (TR-fix1; CC rc21 3.2 T7 l.1240) — a STALLED root still
+/// authorises a purge: W1b's root (three holder founders at `quorum:2/3`,
+/// chartered, accepted here) loses one founder, so 2 = M is Stalled, and
+/// `trust_root_head` (the purge authorisation's root read) answers its head,
+/// not `stalled`.
+pub(crate) async fn i2227b_a_stalled_root_authorises_a_purge(d: &dyn FederationDirectory) {
+    use crate::federation::canonical_community::{
+        stored_standing_at, trust_root_head, StoredStanding,
+    };
+    use crate::federation::edition2::fixture_trust_root::rooted_trust_root;
+    use crate::federation::edition2::group::MembershipRecord;
+    use crate::federation::edition2::group_fixtures::membership_voices;
+    use crate::federation::types::CommunityMembershipRevocation;
+    let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
+    let tip = crate::federation::edition2::genesis::genesis_in_force(d)
+        .await
+        .unwrap()
+        .tips()
+        .iter()
+        .map(|t| t.asserted_at)
+        .max()
+        .expect("a tip");
+    let when = at(i64::try_from(tip + 120_000).unwrap());
+    let resignation = MembershipRecord::CommunityRemoval(CommunityMembershipRevocation {
+        community_key_id: r.root.clone(),
+        removed_identity_key_id: r.founders[2].clone(),
+        removed_at: when,
+        effective_at: when,
+        reason: None,
+        witness_set: Vec::new(),
+        persist_row_hash: String::new(),
+    });
+    let key = r.founder_key(2);
+    put_voices(d, &membership_voices(&resignation, Some(&r.birth), &[&key]))
+        .await
+        .expect("I2227b: a founder resigns alone");
+    let now = crate::host::clock::now();
+    assert!(
+        matches!(
+            stored_standing_at(d, &r.root, now).await.unwrap(),
+            StoredStanding::Stalled { .. }
+        ),
+        "I2227b: two of three founders at quorum:2/3 is Stalled"
+    );
+    assert!(
+        trust_root_head(d, &r.root, now).await.unwrap().is_ok(),
+        "I2227b: the stalled root's head authorises a purge (CC 3.2 T7: non-admitting is \
+         only the founders' roster count and a ceremony conferral)"
+    );
+}
+
+/// **I2228** (TR-fix1; CC rc21 3.2 T4, T8 (ii) "a lapsed timer never moves
+/// Rooted or Stalled to NotRooted"; T8 l.1251 "t is a signer-stamped instant,
+/// never the evaluating clock") — `trust_root_valid` and
+/// `capability_roots_to_trusted_root` are judged at the caller's instant: the
+/// rooted root and a conferral from it read the same at `t` and 200 days
+/// later, with no drill or heartbeat row ever held (the drill band red).
+pub(crate) async fn i2228_v_at_a_signer_stamped_instant(d: &dyn FederationDirectory) {
+    use crate::federation::edition2::fixture_trust_root::{put_conferral, rooted_trust_root};
+    use crate::federation::trust_root::{
+        capability_roots_to_trusted_root, trust_root_valid, DrillFreshness, INFRA_SERVE_SCOPE,
+    };
+    let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
+    let node = d.node_key_id().expect("the runner set the node key");
+    put_conferral(d, &r, "tr-fix1-subject", &[INFRA_SERVE_SCOPE])
+        .await
+        .expect("I2228: the root confers");
+    let t = crate::host::clock::now();
+    let later = t + chrono::Duration::days(200);
+    let v = trust_root_valid(d, &node, &r.root, t).await.unwrap();
+    let w = trust_root_valid(d, &node, &r.root, later).await.unwrap();
+    assert!(
+        v.valid && w.valid,
+        "I2228: valid at t and t + 200d: {v:?} / {w:?}"
+    );
+    assert_eq!(
+        w.drill_freshness,
+        DrillFreshness::Red,
+        "I2228: no drill: red"
+    );
+    for at in [t, later] {
+        assert!(
+            capability_roots_to_trusted_root(
+                d,
+                &node,
+                &e2::kid("tr-fix1-subject"),
+                INFRA_SERVE_SCOPE,
+                at
+            )
+            .await
+            .unwrap()
+            .is_some_and(|g| g.root_key_id == r.root),
+            "I2228: the conferral reaches the root at {at}"
+        );
+    }
+}
+
+/// **I2229** (TR-fix1; CC rc21 3.2 T8 l.1255 "Holder custody … is an
+/// admission gate at the seating row, never a leg of V") — with a hostile
+/// custody policy (no hardware type, no custody tier and a foreign Yubico
+/// root accepted), the rooted root's verdict is the edge ∧ charter ∧
+/// recovery conjunction, and valid: custody is reported, not ANDed.
+pub(crate) async fn i2229_custody_is_not_a_leg(
+    d: &dyn FederationDirectory,
+    set_policy: &dyn Fn(std::sync::Arc<crate::federation::HardwareAttestationPolicy>),
+) {
+    use crate::federation::edition2::fixture_trust_root::rooted_trust_root;
+    use crate::federation::trust_root::trust_root_valid;
+    let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
+    let node = d.node_key_id().expect("the runner set the node key");
+    let hostile = crate::federation::HardwareAttestationPolicy {
+        accepted_hardware_types: std::collections::HashSet::new(),
+        accepted_custody_tiers: std::collections::HashSet::new(),
+        yubico_root_der: std::borrow::Cow::Borrowed(&[0x30, 0x00]),
+        ..crate::federation::HardwareAttestationPolicy::default()
+    };
+    set_policy(std::sync::Arc::new(hostile));
+    let v = trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+        .await
+        .unwrap();
+    set_policy(std::sync::Arc::new(
+        crate::federation::HardwareAttestationPolicy::default(),
+    ));
+    assert_eq!(
+        v.valid,
+        v.edge_exists && v.root_self_declares && v.charter_has_recovery,
+        "I2229: valid is the edge, charter and recovery legs only: {v:?}"
+    );
+    assert!(v.valid, "I2229: valid whatever custody reads: {v:?}");
+}
+
+/// **I2230 / I2231** (TR-fix1; CC rc21 3.1.3.2 "For `ciris-canonical` the
+/// conferral is instead the accord's genesis bundle, whose count seats the
+/// node"; CC 4.2.2.1 custody at seating) — the canonical conferral is a
+/// serve seat of the bundle in force, whose holders carry valid edition-2
+/// custody (the bundle reader's gate seated them): the seat holds it; a
+/// holder and an ordinary node do not; `canonical_servers_among` returns the
+/// seat alone. A bundle with a holder whose custody fails is not placed at
+/// all (genesis_store_invariants I2393), so it seats nobody.
+pub(crate) async fn i2230_i2231_canonical_is_the_bundle_seat(d: &dyn FederationDirectory) {
+    use crate::federation::admission::{canonical_conferral_coscrub, canonical_servers_among};
+    let c = fixture_genesis::bundle_v2();
+    let seat = c.serve_node_identity_ref(0).to_owned();
+    let holder = c.holder_identity_ref(0).to_owned();
+    let plain = e2::put_key(d, "tr-fix1-plain-node", &["node"]).await;
+    let record = |k: String| async move {
+        d.lookup_public_key(&k)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("I2230: a key record for {k}"))
+    };
+    let p = record(plain.clone()).await;
+    assert!(
+        canonical_conferral_coscrub(d, &p, &[]).await.is_err(),
+        "I2230: pre-genesis nothing is canonical"
+    );
+    fixture_genesis::install_v2(d)
+        .await
+        .expect("I2230: the bundle installs");
+    for (k, want) in [
+        (seat.clone(), true),
+        (holder.clone(), false),
+        (plain.clone(), false),
+    ] {
+        let rec = record(k.clone()).await;
+        assert_eq!(
+            canonical_conferral_coscrub(d, &rec, &[]).await.is_ok(),
+            want,
+            "I2230: {k} canonical = {want}"
+        );
+    }
+    let got = canonical_servers_among(d, vec![seat.clone(), holder, plain])
+        .await
+        .unwrap();
+    assert_eq!(
+        got.iter().map(|r| r.key_id.clone()).collect::<Vec<_>>(),
+        vec![seat],
+        "I2231: the bundle's seat is the one canonical server"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2225_i2227_sqlite() {
+    Box::pin(i2225_i2227_the_t7_margin(&sqlite_with_node().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2225_i2227_postgres() {
+    let Some(b) = postgres_with_node().await else {
+        return;
+    };
+    Box::pin(i2225_i2227_the_t7_margin(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2227b_sqlite() {
+    Box::pin(i2227b_a_stalled_root_authorises_a_purge(
+        &sqlite_with_node().await,
+    ))
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2227b_postgres() {
+    let Some(b) = postgres_with_node().await else {
+        return;
+    };
+    Box::pin(i2227b_a_stalled_root_authorises_a_purge(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2228_sqlite() {
+    Box::pin(i2228_v_at_a_signer_stamped_instant(
+        &sqlite_with_node().await,
+    ))
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2228_postgres() {
+    let Some(b) = postgres_with_node().await else {
+        return;
+    };
+    Box::pin(i2228_v_at_a_signer_stamped_instant(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2229_sqlite() {
+    let b = sqlite_with_node().await;
+    let set = |p| b.set_hardware_attestation_policy(p);
+    Box::pin(i2229_custody_is_not_a_leg(&b, &set)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2229_postgres() {
+    let Some(b) = postgres_with_node().await else {
+        return;
+    };
+    let set = |p| b.set_hardware_attestation_policy(p);
+    Box::pin(i2229_custody_is_not_a_leg(&b, &set)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2230_i2231_sqlite() {
+    Box::pin(i2230_i2231_canonical_is_the_bundle_seat(
+        &sqlite_with_node().await,
+    ))
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2230_i2231_postgres() {
+    let Some(b) = postgres_with_node().await else {
+        return;
+    };
+    Box::pin(i2230_i2231_canonical_is_the_bundle_seat(&b)).await;
 }

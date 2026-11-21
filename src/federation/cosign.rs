@@ -1060,7 +1060,7 @@ where
 {
     match dir.read_group_plane_object(&event.link()).await {
         Ok(Some((held, _))) => same_act(&held, event),
-        Ok(None) | Err(Error::Unsupported { .. }) => Ok(false),
+        Ok(None) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -1099,7 +1099,7 @@ where
 {
     let held = match dir.read_group_plane_object(&offered.link()).await {
         Ok(Some((held, Some(id)))) => (held, id),
-        Ok(_) | Err(Error::Unsupported { .. }) => return Ok(None),
+        Ok(_) => return Ok(None),
         Err(e) => return Err(e),
     };
     if held.1 == offered_row.attestation_id || !same_act(&held.0, offered)? {
@@ -1354,7 +1354,7 @@ where
     }
     match dir.cosign_alias(target_id).await {
         Ok(Some((_, held))) => dir.get_attestation(&held).await,
-        Ok(None) | Err(Error::Unsupported { .. }) => Ok(None),
+        Ok(None) => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -1454,7 +1454,6 @@ where
                 ids.push(held);
             }
         }
-        Err(Error::Unsupported { .. }) => {}
         Err(e) => return Err(e),
     }
     ids.sort();
@@ -1476,18 +1475,13 @@ pub(crate) async fn held_rows_of_act<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    let rows = match dir
+    let rows = dir
         .list_targeted_by_dimension_prefix(
             &[signed.kind().as_str()],
             signed.group_key_id(),
             signed.family().dimension(),
         )
-        .await
-    {
-        Ok(rows) => rows,
-        Err(Error::Unsupported { .. }) => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
+        .await?;
     let mut out = Vec::new();
     for row in rows {
         if let Ok(Some(held)) = super::group_plane::group_signed_of_row(&row) {

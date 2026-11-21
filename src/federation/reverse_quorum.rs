@@ -1771,7 +1771,6 @@ where
     let group = match directory.lookup_group(cohort, cohort_key_id).await {
         Ok(Some(g)) => g,
         Ok(None) => return Ok(None),
-        Err(Error::Unsupported { .. }) => return Ok(None),
         Err(e) => return Err(e),
     };
     let policy = group
@@ -1780,7 +1779,6 @@ where
         .and_then(ReverseQuorumPolicy::parse);
     let roster: Vec<String> = match directory.active_members(cohort, cohort_key_id).await {
         Ok(members) => members.into_iter().map(|m| m.key_id).collect(),
-        Err(Error::Unsupported { .. }) => Vec::new(),
         Err(e) => return Err(e),
     };
     Ok(Some((roster, policy)))
@@ -1920,11 +1918,7 @@ where
         Ok(())
     }
     .await;
-    match read {
-        Ok(()) => {}
-        Err(Error::Unsupported { .. }) => rows.clear(),
-        Err(e) => return Err(e),
-    }
+    read?;
     Ok(rows
         .into_iter()
         .filter(|r| {
@@ -2074,6 +2068,9 @@ pub(crate) async fn resolve_reverse_quorum_with(
                 directory,
                 cohort_key_id,
                 super::admission::DELEGATION_SCOPE_MODERATE,
+                // K2-fix16 (T8): the fold's own instant, `now` as the caller
+                // states it.
+                now,
             )
             .await?
         }
@@ -2111,11 +2108,7 @@ pub(crate) async fn resolve_reverse_quorum_with(
     let persons = known.held_with(&selves);
     // The window's start, if this node noted one (a read with no receipt reads
     // the action's signed instant).
-    let first_held = match directory.vote_window_first_held(action.action_id).await {
-        Ok(at) => at,
-        Err(Error::Unsupported { .. }) => None,
-        Err(e) => return Err(e),
-    };
+    let first_held = directory.vote_window_first_held(action.action_id).await?;
     let ballot_rows = standing_votes(ballot_rows, &retractions, persons);
     let objection_rows = standing_votes(objection_rows, &retractions, persons);
 

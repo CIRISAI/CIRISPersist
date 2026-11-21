@@ -594,7 +594,7 @@ where
                         format!("trace_id={} notice_id={notice_id}", trace.trace_id),
                     ));
                 }
-                Ok(None) | Err(crate::federation::Error::Unsupported { .. }) => {}
+                Ok(None) => {}
                 Err(e) => return Err(IngestError::Store(StoreError::Backend(e.to_string()))),
             }
             // v56.0.0 (#1089) — the signed run_kind from either place it is

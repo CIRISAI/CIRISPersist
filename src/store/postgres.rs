@@ -8609,6 +8609,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         crate::federation::edition2::store::voices_of_postgres(&client, row_id).await
     }
 
+    async fn edition2_first_held_us(
+        &self,
+        row_id: &crate::federation::edition2::names::RowId,
+    ) -> Result<Option<i64>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::store::first_held_us_postgres(&client, row_id).await
+    }
+
     async fn put_edition2_statement(
         &self,
         row: &crate::federation::edition2::door::AdmittedRow,
@@ -8724,6 +8735,92 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(crate::store::Error::into_federation)?;
         crate::federation::edition2::fold::any_refolding_postgres(&client).await
+    }
+
+    async fn note_accord_skip(
+        &self,
+        feed: &crate::federation::edition2::accord_rescan::FeedPosition,
+        at_ms: i64,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::accord_rescan::note_skip_postgres(&client, feed, at_ms).await
+    }
+
+    async fn accord_skips(
+        &self,
+    ) -> Result<
+        Vec<crate::federation::edition2::accord_rescan::AccordRescan>,
+        crate::federation::Error,
+    > {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::accord_rescan::skips_postgres(&client).await
+    }
+
+    async fn clear_accord_skip(
+        &self,
+        plane: &str,
+        peer: &str,
+        from_position: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::accord_rescan::clear_skip_postgres(
+            &client,
+            plane,
+            peer,
+            from_position,
+        )
+        .await
+    }
+
+    async fn put_dial_hints(
+        &self,
+        hints: &crate::federation::edition2::contact::DialHints,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::contact::put_postgres(&client, hints).await
+    }
+
+    async fn dial_hints_for(
+        &self,
+        node: &str,
+    ) -> Result<Option<crate::federation::edition2::contact::DialHints>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::contact::get_postgres(&client, node).await
+    }
+
+    async fn list_dial_hints(
+        &self,
+    ) -> Result<Vec<crate::federation::edition2::contact::DialHints>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::contact::list_postgres(&client).await
+    }
+
+    async fn remove_dial_hints(&self, node: &str) -> Result<bool, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::contact::remove_postgres(&client, node).await
     }
 
     async fn clear_occurrence_projection(
@@ -37180,6 +37277,28 @@ mod tests {
         .await;
     }
 
+    /// v62.0.0 (K2-fix17) — I2048–I2050, the minor-band standing
+    /// protections (CC 5.4.6, CC 3.2), postgres arm.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn i2048_i2050_minor_owner_standing_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        crate::store::backend::Backend::run_migrations(&backend)
+            .await
+            .unwrap();
+        let suffix = uuid_like();
+        Box::pin(
+            crate::federation::tier_ingest::test_support::exercise_minor_owner_standing(
+                &backend, &suffix,
+            ),
+        )
+        .await;
+    }
+
     /// v50.0.0 (CIRISPersist#924, CC 5.4.6 / CC 3.4.13 Q5) — a minor's
     /// owner-binding is never announced, postgres arm.
     #[tokio::test]
@@ -46855,6 +46974,7 @@ mod tests {
             &backend,
             &pg_id(&mod_comm),
             DELEGATION_SCOPE_MODERATE,
+            crate::host::clock::now(),
         )
         .await
         .unwrap();

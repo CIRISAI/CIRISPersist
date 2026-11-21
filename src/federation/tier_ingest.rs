@@ -3352,8 +3352,11 @@ pub mod test_support {
             "({suffix}) the held binding owns nothing"
         );
 
-        // (2) The DERIVED plane — the same binding at `self` lands, and the
-        // node is the minor's.
+        // (2) The DERIVED plane — the same binding at `self` lands. v62.0.0
+        // (K2-fix17; CC rc21 3.2 l.961: "A binding whose owner a row on
+        // record places in a minor band counts for nothing"; a minor's nodes
+        // are owned by a guardian) — it names NO owner while the minor row
+        // stands (it was `Some(minor)` before).
         let self_binding = binding(&minor, &node_b, cohort_scope::SELF);
         let self_binding_id = self_binding.attestation.attestation_id.clone();
         put_sealed_owner_binding(dir, &self_binding.attestation, &node_b)
@@ -3363,7 +3366,8 @@ pub mod test_support {
             crate::federation::admission::owner_of(dir, &id_of(&node_b))
                 .await
                 .unwrap(),
-            Some(id_of(&minor))
+            None,
+            "({suffix}) CC 3.2: a minor owner's binding counts for nothing"
         );
 
         // (2b) "admission MUST refuse the PROMOTION" — the promote door's own
@@ -3429,6 +3433,241 @@ pub mod test_support {
         widen(dir, &stored, crate::federation::Audience::Federation, &[])
             .await
             .unwrap_or_else(|e| panic!("({suffix}) a non-minor's binding widens: {e}"));
+    }
+
+    /// v62.0.0 (K2-fix17; CC 5.4.6, CC 3.2 l.961, CC 3.4.13 Q5) — **the
+    /// minor-band STANDING protections, in both arrival orders** (class 2,
+    /// judged against the rows held now, `age::age_band_held`):
+    ///
+    /// - **I2048** — a federation owner-binding lands (the owner has no age
+    ///   row: it counts); THEN the owner self-declares minor: the promotion
+    ///   re-folds to HELD (`minor_owner_binding_at_federation`), owns
+    ///   nothing, and is not in `nodes_owned_by`; the owner withdraws the
+    ///   minor row: restored, with no re-binding.
+    /// - **I2049** — the other order: the minor row first, then the
+    ///   federation binding: held; withdrawn: restored.
+    /// - **I2056** (K2-fix20) — `age::may_publish_federation_rendezvous`:
+    ///   no age row allows; a held minor row refuses, for the person and for
+    ///   the node they own; withdrawn allows.
+    /// - **I2050** — a `self`-scope owner-binding (no announce): the owner
+    ///   later reads minor, and the binding counts for nothing (`owner_of`
+    ///   `None`); withdrawn, it counts again. The other order too.
+    ///
+    /// Edition-2 only (the switch's default); a no-op under the earlier form.
+    pub(crate) async fn exercise_minor_owner_standing(
+        dir: &dyn crate::federation::FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::fold::{
+            reason::gc1::MINOR_OWNER_BINDING_AT_FEDERATION, why_held,
+        };
+        use crate::federation::edition2::ingest::StatementOutcome;
+        use crate::federation::edition2::names::RowId;
+        use crate::federation::types::{
+            attestation_type, cohort_scope, delegation_scope as ds, owner_binding,
+        };
+        if !e2::emit_edition2() {
+            return;
+        }
+        let k = |n: &str| format!("{n}-k2f17-{suffix}");
+        let binding = |owner: &str, node: &str, scope: &str| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut b = bare_attestation(
+                &id,
+                owner,
+                node,
+                &serde_json::json!({
+                    "id": id,
+                    "kind": "delegates_to",
+                    "dimension": owner_binding::DIMENSION,
+                    "delegation_purpose": owner_binding::PURPOSE,
+                    "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+                }),
+            );
+            b.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+            b.cohort_scope = scope.to_owned();
+            seal_row_in_place(owner, &mut b);
+            b
+        };
+        let declare_minor = |person: String| async move {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut decl =
+                bare_attestation(&id, &person, &person, &serde_json::json!({ "id": id }));
+            decl.attestation_type = "age_self_declared:band:minor:v1".to_owned();
+            seal_row_in_place(&person, &mut decl);
+            e2::put_signed(dir, &decl)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) self-declared minor: {e}"));
+            decl
+        };
+        let withdraw = |row: Attestation, by: String| async move {
+            let w = e2::composer_of(attestation_type::WITHDRAWS, &row, &by);
+            let out = e2::put_signed(dir, &w)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) withdraw the minor row: {e}"));
+            assert!(
+                matches!(out, StatementOutcome::Row { .. }),
+                "({suffix}) the withdrawal lands: {out:?}"
+            );
+        };
+        let held_minor = |b: Attestation| async move {
+            why_held(dir, &RowId(e2::rid_digest(&b)))
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) read the hold: {e}"))
+                .is_some_and(|w| w.reason == MINOR_OWNER_BINDING_AT_FEDERATION)
+        };
+        let owner = |node: String| async move {
+            crate::federation::admission::owner_of(dir, &e2::kid(&node))
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) owner_of: {e}"))
+        };
+        let owns = |person: String, node: String| async move {
+            crate::federation::admission::nodes_owned_by(dir, &e2::kid(&person))
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) nodes_owned_by: {e}"))
+                .contains(&e2::kid(&node))
+        };
+
+        // ── I2048: federation binding first, THEN the owner's minor row.
+        let (o1, n1) = (k("o1"), k("n1"));
+        register_user_role_key(dir, &o1).await;
+        register_hybrid_key(dir, &n1).await;
+        let b1 = binding(&o1, &n1, cohort_scope::FEDERATION);
+        put_sealed_owner_binding(dir, &b1, &n1)
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2048: an owner with no band announces: {e}"));
+        assert_eq!(
+            owner(n1.clone()).await,
+            Some(e2::kid(&o1)),
+            "({suffix}) I2048: an owner with no band on record counts"
+        );
+        let m1 = declare_minor(o1.clone()).await;
+        assert!(
+            held_minor(b1.clone()).await,
+            "({suffix}) I2048: a LATER minor row holds the announced binding at once (re-fold)"
+        );
+        assert!(
+            owner(n1.clone()).await.is_none() && !owns(o1.clone(), n1.clone()).await,
+            "({suffix}) I2048: the held promotion owns nothing and is not discoverable"
+        );
+        withdraw(m1, o1.clone()).await;
+        assert!(
+            !held_minor(b1.clone()).await && owner(n1.clone()).await == Some(e2::kid(&o1)),
+            "({suffix}) I2048: withdrawn, the promotion is restored with no re-binding"
+        );
+        assert!(
+            owns(o1.clone(), n1.clone()).await,
+            "({suffix}) I2048: discoverable again"
+        );
+
+        // ── I2049: the minor row first, then the federation binding.
+        let (o2, n2) = (k("o2"), k("n2"));
+        register_user_role_key(dir, &o2).await;
+        register_hybrid_key(dir, &n2).await;
+        let m2 = declare_minor(o2.clone()).await;
+        let b2 = binding(&o2, &n2, cohort_scope::FEDERATION);
+        let out = e2::land_owner_binding(dir, &b2, &n2)
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2049: kept, not refused: {e}"));
+        assert!(
+            matches!(out, StatementOutcome::Pending { .. }) && held_minor(b2.clone()).await,
+            "({suffix}) I2049: held: {out:?}"
+        );
+        assert!(
+            owner(n2.clone()).await.is_none(),
+            "({suffix}) I2049: owns nothing"
+        );
+        withdraw(m2, o2.clone()).await;
+        assert!(
+            !held_minor(b2.clone()).await && owner(n2.clone()).await == Some(e2::kid(&o2)),
+            "({suffix}) I2049: withdrawn, restored"
+        );
+
+        // ── I2050: a self-scope binding; its owner reads minor: counts for
+        // nothing while the row stands; both orders.
+        let (o3, n3) = (k("o3"), k("n3"));
+        register_user_role_key(dir, &o3).await;
+        register_hybrid_key(dir, &n3).await;
+        let b3 = binding(&o3, &n3, cohort_scope::SELF);
+        put_sealed_owner_binding(dir, &b3, &n3)
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2050: a self-scope binding lands: {e}"));
+        assert_eq!(
+            owner(n3.clone()).await,
+            Some(e2::kid(&o3)),
+            "({suffix}) I2050: counts"
+        );
+        let m3 = declare_minor(o3.clone()).await;
+        assert!(
+            owner(n3.clone()).await.is_none(),
+            "({suffix}) I2050: a minor owner's binding counts for nothing"
+        );
+        withdraw(m3, o3.clone()).await;
+        assert_eq!(
+            owner(n3.clone()).await,
+            Some(e2::kid(&o3)),
+            "({suffix}) I2050: withdrawn, it counts again"
+        );
+        let (o4, n4) = (k("o4"), k("n4"));
+        register_user_role_key(dir, &o4).await;
+        register_hybrid_key(dir, &n4).await;
+        let m4 = declare_minor(o4.clone()).await;
+        put_sealed_owner_binding(dir, &binding(&o4, &n4, cohort_scope::SELF), &n4)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("({suffix}) I2050: a minor's self binding is admitted: {e}")
+            });
+        assert!(
+            owner(n4.clone()).await.is_none(),
+            "({suffix}) I2050 (other order): counts for nothing"
+        );
+        withdraw(m4, o4.clone()).await;
+        assert_eq!(
+            owner(n4.clone()).await,
+            Some(e2::kid(&o4)),
+            "({suffix}) I2050: counts"
+        );
+
+        // ── I2056 (K2-fix20; CC 5.4.6 rc22) — the producing node's
+        // authoring check for a federation-scope rendezvous route: no age row
+        // allows; a held minor row refuses `scope_minor_rendezvous_at_federation`
+        // (asked of the person AND of the node they own); withdrawn allows.
+        let may = |key: String| async move {
+            crate::federation::age::may_publish_federation_rendezvous(dir, &e2::kid(&key)).await
+        };
+        let refused_minor = |r: Result<(), crate::federation::Error>| {
+            matches!(
+                r,
+                Err(crate::federation::Error::WriteScopeRefused(
+                    crate::scope::ScopeRefusalReason::MinorRendezvousAtFederation
+                ))
+            )
+        };
+        let (o5, n5) = (k("o5"), k("n5"));
+        register_user_role_key(dir, &o5).await;
+        register_hybrid_key(dir, &n5).await;
+        put_sealed_owner_binding(dir, &binding(&o5, &n5, cohort_scope::SELF), &n5)
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I2056: o5 owns n5: {e}"));
+        assert!(
+            may(o5.clone()).await.is_ok() && may(n5.clone()).await.is_ok(),
+            "({suffix}) I2056: no age row: the route may be published"
+        );
+        let m5 = declare_minor(o5.clone()).await;
+        assert!(
+            refused_minor(may(o5.clone()).await),
+            "({suffix}) I2056: a held minor row refuses the person's route"
+        );
+        assert!(
+            refused_minor(may(n5.clone()).await),
+            "({suffix}) I2056: and the route of the node they own (the raw owner seat)"
+        );
+        withdraw(m5, o5.clone()).await;
+        assert!(
+            may(o5.clone()).await.is_ok() && may(n5.clone()).await.is_ok(),
+            "({suffix}) I2056: withdrawn, the route may be published again"
+        );
     }
 
     /// v38.2.0 — register `key_id` with real hybrid pubkeys as a USER-role

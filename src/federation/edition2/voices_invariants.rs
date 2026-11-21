@@ -115,7 +115,7 @@ pub(crate) async fn found_family(
 
 /// Found a community (first member `founder`) under `protocol`, with
 /// `policy_blob` (e.g. `cohort_scope: affiliations`).
-async fn found_community(
+pub(crate) async fn found_community(
     d: &dyn FederationDirectory,
     group_seed: &str,
     members: &[&str],

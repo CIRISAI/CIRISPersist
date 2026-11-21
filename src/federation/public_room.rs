@@ -355,6 +355,8 @@ pub async fn check_community_listing_admission(
             k,
             community_key_id,
             super::admission::DELEGATION_SCOPE_MODERATE,
+            // K2-fix16 (T8): the listing's seat, at the listing's instant.
+            row.asserted_at,
         )
         .await?
         {

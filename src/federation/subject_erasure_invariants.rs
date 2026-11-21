@@ -625,11 +625,11 @@ pub(crate) mod bodies {
         .await;
         let subject = &e2::kid(subject_seed);
         for basis in td::IMMEDIATE_REMOVAL_BASES {
-            let e = td::takedown_authority(dir, stranger, &sha, basis)
+            let e = td::takedown_authority(dir, stranger, &sha, basis, crate::host::clock::now())
                 .await
                 .expect_err("I970: an immediate-removal basis from a non-duty-holder");
             assert_eq!(e.kind(), token::UNAUTHORISED, "I970 {basis}: {e}");
-            td::takedown_authority(dir, subject, &sha, basis)
+            td::takedown_authority(dir, subject, &sha, basis, crate::host::clock::now())
                 .await
                 .unwrap_or_else(|e| {
                     panic!("I970 {basis}: the content's subject holds the duty: {e}")

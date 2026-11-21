@@ -35,10 +35,12 @@
 //!      presumption-of-sovereignty default: a person with no age proof is
 //!      NOT treated as a stewardable minor; CC 1.15.6).
 //!
-//! **Liveness:** a retracted row (`withdraws` / `recants`, the one composer
-//! precedence) never counts. [`age_band`] / [`age_band_fine`] judge expiry
-//! by the reader's clock (a present-tense read); [`age_band_as_of`] judges
-//! it at a stated instant, for folds. The three-valued band is exposed verbatim over FFI so #309
+//! **Liveness (v62.0.0 K2-fix16, the T8 pattern):** the reading is taken at
+//! an instant t: each signer's newest non-retracted row dated at or before t,
+//! counted only if it covers t (`asserted_at <= t < expires_at`); a
+//! retraction counts from its own instant. [`age_band_as_of`] takes t from
+//! the act being judged; [`age_band`] / [`age_band_fine`] are HOST-EDGE
+//! reads at this node's clock (CC 2.7.9). The three-valued band is exposed verbatim over FFI so #309
 //! can layer a content-protective `unknown → minor` resolution on the CONTENT
 //! axis without changing THIS primitive (the steward-binding axis keeps
 //! `unknown` = non-minor = self-sovereign).
@@ -236,41 +238,133 @@ pub async fn age_band(directory: &dyn FederationDirectory, k: &str) -> Result<Ag
     Ok(age_band_fine(directory, k).await?.coarsen())
 }
 
-/// v62.0.0 (K2-fix14; CC 2.7: a fold is a function of the held rows) —
-/// [`age_band`] judged at an INSTANT, never the reader's clock, so two nodes
-/// holding the same rows agree whenever they ask:
+/// v62.0.0 (K2-fix14, K2-fix16; the T8 pattern, CC 2.7.9) — the CURRENT age
+/// band of `k` AS OF the signer-stamped instant `t`: the asserted_at of the
+/// act being judged. Never the reader's clock, so two nodes holding the same
+/// rows agree whenever they ask. Each signer's current row at `t` is its
+/// newest non-retracted age row dated at or before `t`
+/// (`current_age_rows`); it counts only if it COVERS `t` (half-open:
+/// `asserted_at <= t < expires_at`, an absent `expires_at` covers every
+/// later `t`); a retraction counts only if asserted at or before `t` (a
+/// retraction is not retroactive, CC 2.4.1). Then the cross-signer read-union
+/// (`band_fine_of_rows`).
 ///
-/// - `Some(t)`: the band AS OF `t`. A row counts only if asserted at or
-///   before `t` and unexpired at `t` (`expires_at` absent or `> t`); a
-///   retraction counts only if asserted at or before `t`. The delegation
-///   walk's instant lens reads an edge the same way.
-/// - `None`: the band as of the NEWEST held evidence about `k`: `t` = the
-///   latest `asserted_at` among `k`'s age rows and the retractions naming
-///   them (`evidence_instant`). An expiry before that instant counts; an
-///   expiry after it does not, until a later row lands (which re-folds:
-///   `key:<k>`). This is how an assured `minor` row that lapsed before a
-///   later adult proof stops counting without the wall clock.
+/// A host display with no act to judge passes its own clock explicitly at
+/// the edge (CC 2.7.9: such a reading means nothing beyond that node).
 ///
 /// # Errors
 /// Directory reads.
 pub async fn age_band_as_of(
     directory: &dyn FederationDirectory,
     k: &str,
-    as_of: Option<chrono::DateTime<chrono::Utc>>,
+    t: chrono::DateTime<chrono::Utc>,
 ) -> Result<AgeBand, Error> {
     super::edition2::fold::reads(super::edition2::fold::Dep::key(k));
     let rows = age_rows_about(directory, k).await?;
-    Ok(band_as_of_rows(&rows, as_of).coarsen())
+    Ok(band_as_of_rows(&rows, t).coarsen())
 }
 
-/// [`age_band_as_of`] over rows already read (newest first).
+/// v62.0.0 (K2-fix20; CC 3.5.1 rule 3, ruled 2026-11-20) — **the ONE
+/// same-signer same-instant tie-break** of the current band: when one
+/// signer holds two age rows with the same `asserted_at`, the row with the
+/// LOWEST `attestation_id` is that signer's current row, whatever its band
+/// (CC 3.5.1 rule 3 has no protective exception). `attestation_id` of an
+/// edition-2 row is the lowercase hex of its 32-byte row id
+/// (`edition2::names::RowId::hex`: SHA-256 over
+/// `CDE(["CEG-row/2", type, family, sub, author, payload])`, CC 2.6.1.3), so
+/// this `str` comparison is the byte-wise comparison of the digests, done
+/// here in Rust over the fetched text on every backend (no collation). If a
+/// protective tie-break is ever written into the text, it changes HERE only.
+fn same_instant_tie_replaces(
+    candidate: &super::types::Attestation,
+    current: &super::types::Attestation,
+) -> bool {
+    candidate.attestation_id < current.attestation_id
+}
+
+/// v62.0.0 (K2-fix20; CC 5.4.6 as ruled for rc22, CC 3.4.13 Q5) — **may the
+/// producing node publish a federation-scope `rendezvous:route` for
+/// `key`?** The route's own key is a fresh per-period rendezvous key,
+/// unlinkable to its person by design (CC 3.1.4), so no receiver can check
+/// this and none needs to: publishing is the producing node's own present
+/// act, judged against the rows it holds at publish time. It MUST NOT
+/// publish one for a person a held row places in a minor band. `key` is the
+/// person, a key that acts for them, or their node: the person is `key`,
+/// its active identity, and (for a node) its RAW owner seat
+/// (`kernel_owner_selves`, not `owner_of`, which already drops a minor
+/// owner). Each is read with [`age_band_held`] (class 2: the held rows, no
+/// instant, no expiry). A person with no age row may publish.
+///
+/// AUTHORING SIDE ONLY. There is no receive-side gate, and persist has no
+/// local authoring door for route rows: the host (Edge) MUST call this
+/// before it publishes (Engine `may_publish_federation_rendezvous`, PyO3
+/// `may_publish_federation_rendezvous`, capsule
+/// `DirectoryOp::MayPublishFederationRendezvous`).
+///
+/// # Errors
+/// [`Error::WriteScopeRefused`]`(`[`crate::scope::ScopeRefusalReason::MinorRendezvousAtFederation`]`)`
+/// (`scope_minor_rendezvous_at_federation`); directory reads.
+pub async fn may_publish_federation_rendezvous(
+    directory: &dyn FederationDirectory,
+    key: &str,
+) -> Result<(), Error> {
+    let mut persons: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::from([key.to_owned()]);
+    persons.insert(directory.active_identity_for_occurrence(key).await?);
+    persons.extend(
+        super::admission::kernel_owner_selves(
+            directory,
+            key,
+            crate::kernel::owner::Cosign::Required,
+        )
+        .await?,
+    );
+    for p in &persons {
+        if age_band_held(directory, p).await? == AgeBand::Minor {
+            return Err(Error::WriteScopeRefused(
+                crate::scope::ScopeRefusalReason::MinorRendezvousAtFederation,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// v62.0.0 (K2-fix17; CC 5.4.6, CC 3.2 l.961, CC 3.4.13 Q5) — **the
+/// HELD-ROW band**, for a STANDING PROTECTION keyed to a minor band (class 2
+/// of the three, K2-fix17.md): judged against the rows HELD NOW, for as long
+/// as the minor row stands. Each signer's current row is its newest
+/// non-retracted held row (`current_age_rows`, every retraction held
+/// counting); `expires_at` is NOT consulted, so the reading is a function of
+/// the held rows alone (a fold hold over it re-folds only when an age row or
+/// a retraction about `k` lands: `key:<k>`), and it fails toward
+/// protection: a minor row does not stop standing by lapsing. A later minor
+/// row takes effect at once; its withdrawal, or being outranked, restores.
+/// No age row reads `Unknown`, which no standing protection treats as minor.
+///
+/// Contrast [`age_band_as_of`] (class 1: an ACT judged at its own instant)
+/// and [`duty_edge_void_for_minor`] (class 3: the appointment's history).
+///
+/// # Errors
+/// Directory reads.
+pub async fn age_band_held<F: FederationDirectory + ?Sized>(
+    directory: &F,
+    k: &str,
+) -> Result<AgeBand, Error> {
+    super::edition2::fold::reads(super::edition2::fold::Dep::key(k));
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::to(k, FOLD_PAGE).pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
+    let retired = retired_age_rows(&rows, None);
+    Ok(band_fine_of_rows(&rows, &retired, |_| true, |_| true).coarsen())
+}
+
+/// [`age_band_as_of`] over rows already read, at the finer grain.
 fn band_as_of_rows(
     rows: &[super::types::Attestation],
-    as_of: Option<chrono::DateTime<chrono::Utc>>,
+    t: chrono::DateTime<chrono::Utc>,
 ) -> AgeBandFine {
-    let Some(t) = as_of.or_else(|| evidence_instant(rows)) else {
-        return AgeBandFine::Unknown;
-    };
     let retired = retired_age_rows(rows, Some(t));
     band_fine_of_rows(
         rows,
@@ -278,36 +372,6 @@ fn band_as_of_rows(
         |r| r.asserted_at <= t,
         |r| r.expires_at.is_none_or(|exp| exp > t),
     )
-}
-
-/// Is `r` an age row (`age_assurance:*` or `age_self_declared:*`, either
-/// shape, [`super::row_type::claim_token`])?
-fn is_age_row(r: &super::types::Attestation) -> bool {
-    super::row_type::claim_token(r)
-        .is_some_and(|t| t.starts_with("age_assurance:") || t.starts_with("age_self_declared:"))
-}
-
-/// v62.0.0 (K2-fix14) — the newest `asserted_at` among `rows`' age rows and
-/// the retractions (`withdraws` / `recants`) that name one of them; `None`
-/// when no age row is held. A function of the held rows alone.
-fn evidence_instant(rows: &[super::types::Attestation]) -> Option<chrono::DateTime<chrono::Utc>> {
-    use super::types::attestation_type::{RECANTS, WITHDRAWS};
-    let age_ids: std::collections::HashSet<&str> = rows
-        .iter()
-        .filter(|r| is_age_row(r))
-        .map(|r| r.attestation_id.as_str())
-        .collect();
-    rows.iter()
-        .filter(|r| {
-            is_age_row(r)
-                || ((r.attestation_type == WITHDRAWS || r.attestation_type == RECANTS)
-                    && super::precedence::references_attestation_id_from_envelope(
-                        &r.attestation_envelope,
-                    )
-                    .is_some_and(|id| age_ids.contains(id)))
-        })
-        .map(|r| r.asserted_at)
-        .max()
 }
 
 /// v62.0.0 (K2-fix14) — the ids of `rows` a retraction among `rows` retires
@@ -382,8 +446,9 @@ pub const AGE_OWN_SERIES_NEWEST_WINS: bool = true;
 /// defense-in-depth, v13.0.0 CIRISPersist#368).
 ///
 /// Under [`AGE_OWN_SERIES_NEWEST_WINS`] (CC 3.5.1) each signer's NEWEST
-/// candidate is that signer's current row (ties at one instant keep the more
-/// protective band; chosen by `asserted_at`, never by position), and it
+/// candidate is that signer's current row (chosen by `asserted_at`, never by
+/// position; a tie at one instant goes to the lowest `attestation_id`, CC
+/// 3.5.1 rule 3, `same_instant_tie_replaces`), and it
 /// supersedes the older ones FOR GOOD: if it is not `unexpired`, the signer
 /// has NO current row, and an older row never comes back (age only
 /// increases: an expired newer `minor` must not resurrect an `adult` the
@@ -424,10 +489,9 @@ fn current_age_rows<'r>(
     for (r, at, b) in candidates {
         let replace = match newest.get(r.attesting_key_id.as_str()) {
             None => true,
-            Some((cur, _, cur_b)) => {
+            Some((cur, _, _)) => {
                 r.asserted_at > cur.asserted_at
-                    || (r.asserted_at == cur.asserted_at
-                        && b.protection_rank() < cur_b.protection_rank())
+                    || (r.asserted_at == cur.asserted_at && same_instant_tie_replaces(r, cur))
             }
         };
         if replace {
@@ -518,11 +582,12 @@ fn band_fine_of_rows(
 ///    expiry does not launder an appointment made during minority); AND
 /// 2. no ASSURED-adult row about `T` (an `age_assurance:*` rung parsing to
 ///    adult; a self-declared adult never counts, the one-way ratchet) is
-///    dated before `edge`'s `asserted_at` and unexpired AT that instant.
-///    v62.0.0 (K2-fix14): the instant is `edge`'s own, never the reader's
-///    clock (`void_over_rows`) — before this a proof that lapsed after
-///    `edge` was made voided `edge` on a node that read after the lapse and
-///    seated it on one that read before.
+///    dated before `edge`'s `asserted_at`. v62.0.0 (K2-fix16; CC rc21 3.2
+///    wording, CIRISKernel MinorVoid.tla): NO expiry appears. Age only
+///    increases, so a proof's later lapse un-proves nothing; and an expiry
+///    clause broke "backdating can only void" (an earlier D could dodge a
+///    proof that had lapsed by a later D). Whether a RETRACTED proof still
+///    lifts is [`RETRACTED_ADULT_PROOF_LIFTS_VOID`].
 ///
 /// Why it converges (CC 2.7): it is a function of the held rows `{edge, T's
 /// age rows}` alone, never of arrival order or of what this node saw first.
@@ -558,10 +623,9 @@ pub enum DutyEdgeStanding {
     /// Not a duty edge, or a duty edge that counts.
     Counted,
     /// VOID (`minor_appointment_void`, [`duty_edge_void_for_minor`]): a minor
-    /// row about T is held and no assured-adult proof dated before `edge`
-    /// was live at its `asserted_at`. A property of the edge, fixed by the
-    /// held rows and the edge's own instant: it never seats and is never
-    /// revived.
+    /// row about T is held and no assured-adult proof is dated before
+    /// `edge`'s `asserted_at`. A property of the edge, fixed by the held rows
+    /// and two `asserted_at` values: it never seats and is never revived.
     Void,
     /// SUSPENDED: not void, but T's band RESOLVES `minor` FROM AN AGE ROW
     /// ([`age_band_as_of`] at the walk's instant). Not counted while that
@@ -572,19 +636,21 @@ pub enum DutyEdgeStanding {
     Suspended,
 }
 
-/// v62.0.0 (K2-fix14) — [`DutyEdgeStanding`] of `edge` under the walk's
-/// instant `as_of` (`Some(t)`: the instant lens; `None`: the timeless lens,
-/// read as of the newest held age evidence, [`age_band_as_of`]). Neither
-/// arm reads the reader's clock, so a fold that walked `edge` and a
-/// read-time `is_named_moderator` over the same rows agree. Both declare
-/// `key:<T>`, so a T age row or retraction landing re-folds the walk.
+/// v62.0.0 (K2-fix14, K2-fix16) — [`DutyEdgeStanding`] of `edge`, the seat
+/// judged at `band_at`: the asserted_at of the act being judged (the T8
+/// pattern; the walk's `band_at`, else its `as_of`). `Some(t)`: VOID, else
+/// SUSPENDED iff T's band at `t` ([`age_band_as_of`]) is minor from a row,
+/// else COUNTED. `None` (a walk that judges no act, e.g. a bare
+/// reachability question): only VOID applies. Neither arm reads the
+/// reader's clock. Both declare `key:<T>`, so a T age row or retraction
+/// landing re-folds the walk.
 ///
 /// # Errors
 /// Directory reads.
 pub async fn duty_edge_standing(
     directory: &dyn FederationDirectory,
     edge: &super::types::Attestation,
-    as_of: Option<chrono::DateTime<chrono::Utc>>,
+    band_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<DutyEdgeStanding, Error> {
     if !is_duty_edge(directory, edge).await? {
         return Ok(DutyEdgeStanding::Counted);
@@ -594,7 +660,7 @@ pub async fn duty_edge_standing(
     let rows = age_rows_about(directory, t).await?;
     Ok(if void_over_rows(edge, &rows) {
         DutyEdgeStanding::Void
-    } else if band_as_of_rows(&rows, as_of).is_minor() {
+    } else if band_at.is_some_and(|t| band_as_of_rows(&rows, t).is_minor()) {
         DutyEdgeStanding::Suspended
     } else {
         DutyEdgeStanding::Counted
@@ -632,19 +698,48 @@ async fn is_duty_edge(
     Ok(scopes.iter().any(|s| is_duty_scope(s, &duties)))
 }
 
-/// v62.0.0 (K2-fix11, K2-fix14; CC 3.2 rc21) — the void rule over T's held
-/// age `rows`, judged at `edge`'s OWN `asserted_at` `d` and never at the
-/// reader's clock:
-///
-/// 1. a minor-band row is held (an assurance rung, not self-emitted, or a
-///    self-declaration; any liveness: an expired or retracted minor row
-///    still counts, CC 3.2 "live or retracted"); AND
-/// 2. no ASSURED-adult row (`age_assurance:*` parsing to adult, not
-///    self-emitted) is dated before `d` AND still unexpired at `d`
-///    (`expires_at` absent or `> d`). A proof that had lapsed when `edge`
-///    was made proved nothing at `d`; a proof that lapses AFTER `d` proved
-///    what it had to, and its later lapse changes nothing.
+/// v62.0.0 (K2-fix16; pending Eric — CC recommends `false`) — **does a
+/// RETRACTED assured-adult proof dated before D still lift the void?**
+/// `true` (today's behaviour): yes, a held proof counts whether or not its
+/// witness withdrew it. `false` (the CC recommendation): no — a witness
+/// withdrawing an adult assurance puts the adult fact itself in doubt, so
+/// the rule fails toward protecting a possible minor. One compile-time
+/// constant, no runtime flag: two nodes on one build never disagree. The
+/// pure table `i2047_void_rule_table` witnesses BOTH values through
+/// `void_over_rows_with`. Model: CIRISKernel MinorVoid.tla's
+/// `RETRACTED_ADULT_LIFTS` (`TRUE` today; `FALSE` in
+/// `MinorVoid_retracted_adult`).
+pub const RETRACTED_ADULT_PROOF_LIFTS_VOID: bool = true;
+
+/// v62.0.0 (K2-fix11, K2-fix14, K2-fix16; CC rc21 3.2) — the void rule over
+/// T's held age `rows`, as `void_over_rows_with` under
+/// [`RETRACTED_ADULT_PROOF_LIFTS_VOID`].
 fn void_over_rows(edge: &super::types::Attestation, rows: &[super::types::Attestation]) -> bool {
+    let retired = retired_age_rows(rows, None);
+    void_over_rows_with(edge, rows, &retired, RETRACTED_ADULT_PROOF_LIFTS_VOID)
+}
+
+/// The void rule, the switch passed in (so a table can witness both
+/// values). D (`edge`, `d` = its `asserted_at`) is void iff
+///
+/// 1. a minor-band row about T is held (an assurance rung, not
+///    self-emitted, or a self-declaration), whatever its liveness,
+///    retraction or supersession (CC 3.2 "live or retracted"; the
+///    own-series newest-wins of the CURRENT band never applies here); AND
+/// 2. no ASSURED-adult row (`age_assurance:*` parsing to adult, not
+///    self-emitted) has `asserted_at < d` — expired or not; a RETRACTED one
+///    (named in `retired`) counts only when `retracted_adult_lifts`.
+///
+/// It reads only held rows and two `asserted_at` values (no clock, no
+/// expiry), so it is order-independent and node-agreeing; and it is
+/// MONOTONE in `d`: the set of proofs dated before `d` only grows as `d`
+/// grows, so an earlier (backdated) D can only be void.
+fn void_over_rows_with(
+    edge: &super::types::Attestation,
+    rows: &[super::types::Attestation],
+    retired: &std::collections::HashSet<String>,
+    retracted_adult_lifts: bool,
+) -> bool {
     let d = edge.asserted_at;
     let mut minor = false;
     let mut adult_before = false;
@@ -659,7 +754,8 @@ fn void_over_rows(edge: &super::types::Attestation, rows: &[super::types::Attest
             match parse_age_band_token(token) {
                 Some(AgeBand::Minor) => minor = true,
                 Some(AgeBand::Adult)
-                    if r.asserted_at < d && r.expires_at.is_none_or(|exp| exp > d) =>
+                    if r.asserted_at < d
+                        && (retracted_adult_lifts || !retired.contains(&r.attestation_id)) =>
                 {
                     adult_before = true;
                 }
@@ -697,15 +793,13 @@ pub async fn age_band_fine(
     // A PRESENT-TENSE read (the reader's clock judges expiry). v62.0.0
     // (K2-fix14): retractions now count, and the resolution is CC 3.4.11's
     // (`band_fine_of_rows`).
+    // K2-fix16 — HOST EDGE (CC 2.7.9): no act is judged, so the reading is
+    // taken at this node's own clock, explicitly, and means nothing beyond
+    // this node. A fold or a gate asks `age_band_as_of` with the act's
+    // instant instead.
     let now = crate::host::clock::now();
     let rows = age_rows_about(directory, k).await?;
-    let retired = retired_age_rows(&rows, None);
-    Ok(band_fine_of_rows(
-        &rows,
-        &retired,
-        |_| true,
-        |r| r.expires_at.is_none_or(|exp| exp > now),
-    ))
+    Ok(band_as_of_rows(&rows, now))
 }
 
 #[cfg(test)]
@@ -819,8 +913,14 @@ mod tests {
     /// **I2038: the band resolution's precedence**, pure (no backend): the
     /// highest witness level wins; at an equal level the more protective
     /// band wins; a self-declared minor lowers and never raises; a
-    /// self-declared adult raises nothing; a retracted row never counts; the
-    /// timeless read judges expiry at the newest held evidence.
+    /// self-declared adult raises nothing; a retracted row never counts.
+    /// Instant cases: MinorSuspend.tla Inv_LaterRowsNotYet (a row dated after
+    /// t is not yet the signer's word), Inv_RetractedOut (a retraction counts
+    /// from its own instant) and Inv_SelfAdultAloneIsNone (self adult alone).
+    /// K2-fix15/16: newest-per-signer applies to the CURRENT band only
+    /// (`newest_per_signer_current_band_only`), and the reading is taken at
+    /// an instant t (each signer's newest non-retracted row dated <= t that
+    /// covers t).
     #[test]
     fn i2038_band_read_union_precedence() {
         use std::collections::HashSet;
@@ -986,8 +1086,9 @@ mod tests {
             AgeBand::Adult,
             "I2038: a retracted newer row lets the previous one stand"
         );
-        // The timeless read: an assured minor that lapsed before a later
-        // adult proof is judged at the newest held evidence (the proof).
+        // K2-fix16 (T8): the reading is taken at an instant t: each signer's
+        // newest non-retracted row dated <= t that COVERS t (half-open
+        // asserted_at <= t < expires_at).
         let lapsed = row(
             "lm",
             "w",
@@ -1004,20 +1105,543 @@ mod tests {
             t0 + h * 2,
             Some(t0 + h * 3),
         );
+        let both = [later.clone(), lapsed.clone()];
         assert_eq!(
-            evidence_instant(&[later.clone(), lapsed.clone()]),
-            Some(t0 + h * 2),
-            "I2038: the evidence instant is the newest age row"
+            band_as_of_rows(&both, t0 + h / 2).coarsen(),
+            AgeBand::Minor,
+            "I2038: at t0+30m the adult row is not yet the witness's word: minor"
         );
         assert_eq!(
-            band_as_of_rows(&[later.clone(), lapsed.clone()], None).coarsen(),
-            AgeBand::Adult,
-            "I2038: timeless: the lapsed minor is out, the proof is live"
-        );
-        assert_eq!(
-            band_as_of_rows(&[later, lapsed], Some(t0 + h * 4)).coarsen(),
+            band_as_of_rows(&both, t0 + h + h / 2).coarsen(),
             AgeBand::Unknown,
-            "I2038: at an instant after both lapse, nothing is live"
+            "I2038: at t0+90m the minor (newest at t) has lapsed: no current row"
+        );
+        assert_eq!(
+            band_as_of_rows(&both, t0 + h * 2).coarsen(),
+            AgeBand::Adult,
+            "I2038: at t0+2h the adult row covers t (half-open: asserted_at <= t)"
+        );
+        assert_eq!(
+            band_as_of_rows(&both, t0 + h * 3).coarsen(),
+            AgeBand::Unknown,
+            "I2038: at t0+3h it no longer covers (t < expires_at fails): no current row"
+        );
+        // A retraction counts only from its own instant (not retroactive).
+        let mut wd = row(
+            "wd",
+            "w",
+            "t",
+            crate::federation::types::attestation_type::WITHDRAWS,
+            t0 + h * 2 + h / 2,
+            None,
+        );
+        wd.attestation_envelope = serde_json::json!({ "references_attestation_id": "la" });
+        let with_wd = [wd, later, lapsed];
+        assert_eq!(
+            band_as_of_rows(&with_wd, t0 + h * 2).coarsen(),
+            AgeBand::Adult,
+            "I2038: before its retraction the adult row is current"
+        );
+        assert_eq!(
+            band_as_of_rows(&with_wd, t0 + h * 2 + h / 2).coarsen(),
+            AgeBand::Unknown,
+            "I2038: retracted, the previous row (lapsed by then) stands: none covers t"
+        );
+    }
+
+    /// v62.0.0 (K2-fix16; CC rc21 3.2) — the void rule checked against
+    /// CIRISKernel's MinorVoid.tla (PR #7) properties, under ONE value of the
+    /// retracted-adult-proof switch. Each section names the model property.
+    fn void_table(lifts: bool) {
+        use std::collections::HashSet;
+        type A = super::super::types::Attestation;
+        let t0 = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).expect("t0");
+        let h = chrono::Duration::hours(1);
+        let d_at = |at| row("d", "f", "t", "delegates_to", at, None);
+        let d = d_at(t0 + h * 10);
+        let none: HashSet<String> = HashSet::new();
+        let void_at = |dd: &A, rows: &[A], retired: &HashSet<String>| {
+            void_over_rows_with(dd, rows, retired, lifts)
+        };
+        let void = |rows: &[A], retired: &HashSet<String>| void_at(&d, rows, retired);
+        let ids = |rows: &[A]| -> HashSet<String> {
+            rows.iter().map(|r| r.attestation_id.clone()).collect()
+        };
+        let is_minor_row =
+            |r: &A| parse_age_band_token(&r.attestation_type) == Some(AgeBand::Minor);
+        let sm = row("sm", "t", "t", "age_self_declared:band:minor:v1", t0, None);
+        let sa = row(
+            "sa",
+            "t",
+            "t",
+            "age_self_declared:band:adult:v1",
+            t0 + h,
+            None,
+        );
+        let wm = row(
+            "wm",
+            "w",
+            "t",
+            "age_assurance:provider:minor:v1",
+            t0 + h * 2,
+            None,
+        );
+        let pa = row(
+            "pa",
+            "w",
+            "t",
+            "age_assurance:provider:adult:v1",
+            t0 + h * 5,
+            None,
+        );
+        let pa_exp = row(
+            "pae",
+            "w",
+            "t",
+            "age_assurance:provider:adult:v1",
+            t0 + h * 5,
+            Some(t0 + h * 6),
+        );
+        let pa_late = row(
+            "pal",
+            "w",
+            "t",
+            "age_assurance:provider:adult:v1",
+            t0 + h * 11,
+            None,
+        );
+        let pa_self = row(
+            "pas",
+            "t",
+            "t",
+            "age_assurance:provider:adult:v1",
+            t0 + h * 5,
+            None,
+        );
+        let tag = if lifts { "lifts=true" } else { "lifts=false" };
+        // The held sets the properties quantify over.
+        let sets: Vec<Vec<A>> = vec![
+            vec![],
+            vec![sm.clone()],
+            vec![wm.clone()],
+            vec![sm.clone(), pa.clone()],
+            vec![sm.clone(), pa_exp.clone()],
+            vec![sm.clone(), pa_late.clone()],
+            vec![sm.clone(), sa.clone()],
+            vec![sm.clone(), pa_self.clone()],
+            vec![wm.clone(), sa.clone(), pa.clone()],
+            vec![sm.clone(), wm.clone(), sa.clone(), pa_late.clone()],
+        ];
+        let instants: Vec<chrono::DateTime<chrono::Utc>> = [0, 3, 5, 6, 10, 11, 20]
+            .iter()
+            .map(|n| t0 + h * *n)
+            .collect();
+
+        // The plain table.
+        assert!(!void(&[], &none), "I2047 ({tag}): no age row: not void");
+        assert!(
+            void(std::slice::from_ref(&sm), &none),
+            "I2047 ({tag}): a minor row: void"
+        );
+        assert!(
+            !void(&[sm.clone(), pa.clone()], &none),
+            "I2047 ({tag}): an assured adult dated before D lifts it"
+        );
+        assert!(
+            void(&[sm.clone(), pa_self.clone()], &none),
+            "I2047 ({tag}): a self-emitted assurance lifts nothing"
+        );
+
+        // Inv_NodesAgree: the verdict reads no clock. The only time-varying
+        // field a row carries is `expires_at`; a proof expired long before D
+        // gives the verdict an unexpired one gives, so a reader at any
+        // instant gets the same answer.
+        assert_eq!(
+            void(&[sm.clone(), pa_exp.clone()], &none),
+            void(&[sm.clone(), pa.clone()], &none),
+            "I2047 ({tag}) Inv_NodesAgree: expiry never enters the verdict"
+        );
+
+        // Inv_Fold: kept incrementally in every arrival order, the verdict is
+        // the verdict over the set (persist re-folds the held set on each
+        // landing; every permutation's final verdict, and each prefix's,
+        // equals the set's verdict over that prefix's rows).
+        let base = [sm.clone(), wm.clone(), sa.clone(), pa.clone()];
+        let mut perm = [0usize, 1, 2, 3];
+        let want = void(&base, &none);
+        loop {
+            let ordered: Vec<A> = perm.iter().map(|i| base[*i].clone()).collect();
+            for k in 0..=ordered.len() {
+                let prefix = &ordered[..k];
+                let mut sorted: Vec<A> = prefix.to_vec();
+                sorted.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
+                assert_eq!(
+                    void(prefix, &none),
+                    void(&sorted, &none),
+                    "I2047 ({tag}) Inv_Fold: prefix {k} of {perm:?}"
+                );
+            }
+            assert_eq!(
+                void(&ordered, &none),
+                want,
+                "I2047 ({tag}) Inv_Fold: {perm:?}"
+            );
+            // next lexicographic permutation
+            let Some(i) = (0..3).rev().find(|&i| perm[i] < perm[i + 1]) else {
+                break;
+            };
+            let j = (i + 1..4).rev().find(|&j| perm[j] > perm[i]).expect("j");
+            perm.swap(i, j);
+            perm[i + 1..].reverse();
+        }
+
+        // Inv_BackdateOnlyVoids: D1.at < D2.at and void(D2) ⇒ void(D1).
+        for set in &sets {
+            for (x, a1) in instants.iter().enumerate() {
+                for a2 in &instants[x + 1..] {
+                    let (d1, d2) = (d_at(*a1), d_at(*a2));
+                    assert!(
+                        !void_at(&d2, set, &none) || void_at(&d1, set, &none),
+                        "I2047 ({tag}) Inv_BackdateOnlyVoids: {a1} < {a2} over {:?}",
+                        ids(set)
+                    );
+                }
+            }
+        }
+
+        // Inv_RetractionChangesNothing: removing every retraction changes no
+        // verdict (lifts = true). Under the pending value (lifts = false) it
+        // weakens to: removing retractions of MINOR rows changes no verdict.
+        for set in &sets {
+            let retired: HashSet<String> = if lifts {
+                ids(set)
+            } else {
+                set.iter()
+                    .filter(|r| is_minor_row(r))
+                    .map(|r| r.attestation_id.clone())
+                    .collect()
+            };
+            assert_eq!(
+                void(set, &retired),
+                void(set, &none),
+                "I2047 ({tag}) Inv_RetractionChangesNothing over {:?}",
+                ids(set)
+            );
+        }
+        // ...and the switch itself: a retracted assured adult proof dated
+        // before D lifts the void iff `lifts`.
+        let retired_pa: HashSet<String> = std::iter::once("pa".to_owned()).collect();
+        assert_eq!(
+            void(&[sm.clone(), pa.clone()], &retired_pa),
+            !lifts,
+            "I2047 ({tag}): RETRACTED_ADULT_PROOF_LIFTS_VOID"
+        );
+
+        // Inv_RetractedMinorCounts: a retracted minor row still voids D when
+        // no assured proof is dated before D.at.
+        let retired_sm: HashSet<String> = std::iter::once("sm".to_owned()).collect();
+        assert!(
+            void(std::slice::from_ref(&sm), &retired_sm),
+            "I2047 ({tag}) Inv_RetractedMinorCounts"
+        );
+        assert!(
+            void(&[sm.clone(), pa_late.clone()], &retired_sm),
+            "I2047 ({tag}) Inv_RetractedMinorCounts: a later proof does not change it"
+        );
+
+        // Inv_SelfAdultLiftsNothing: removing every self-declared adult row
+        // never turns void into not-void.
+        for set in &sets {
+            let without: Vec<A> = set
+                .iter()
+                .filter(|r| r.attestation_type != "age_self_declared:band:adult:v1")
+                .cloned()
+                .collect();
+            assert!(
+                !void(set, &none) || void(&without, &none),
+                "I2047 ({tag}) Inv_SelfAdultLiftsNothing over {:?}",
+                ids(set)
+            );
+            assert_eq!(
+                void(set, &none),
+                void(&without, &none),
+                "I2047 ({tag}) Inv_SelfAdultLiftsNothing (equality) over {:?}",
+                ids(set)
+            );
+        }
+
+        // Inv_SupersededMinorStillVoids: a minor row superseded by its own
+        // signer's newer adult row still voids D with no ASSURED proof
+        // dated before D.at (the current-band newest-wins never applies).
+        assert!(
+            void(&[sa.clone(), sm.clone()], &none),
+            "I2047 ({tag}) Inv_SupersededMinorStillVoids"
+        );
+
+        // Prop_LaterProofNoRevive: once void, an adult proof dated at or
+        // after D.at never makes D not-void.
+        for at in [t0 + h * 10, t0 + h * 11, t0 + h * 40] {
+            let later = row(
+                "lp",
+                "w",
+                "t",
+                "age_assurance:government:adult:v1",
+                at,
+                None,
+            );
+            assert!(
+                void(std::slice::from_ref(&sm), &none) && void(&[sm.clone(), later], &none),
+                "I2047 ({tag}) Prop_LaterProofNoRevive: a proof at {at}"
+            );
+        }
+    }
+
+    /// v62.0.0 (K2-fix16) — **I2047: the void rule against MinorVoid.tla's
+    /// properties** (Inv_NodesAgree, Inv_Fold, Inv_BackdateOnlyVoids,
+    /// Inv_RetractionChangesNothing, Inv_RetractedMinorCounts,
+    /// Inv_SelfAdultLiftsNothing, Inv_SupersededMinorStillVoids,
+    /// Prop_LaterProofNoRevive), under BOTH values of
+    /// [`RETRACTED_ADULT_PROOF_LIFTS_VOID`] (pending Eric; CC recommends
+    /// `false`), so flipping the const needs no new test.
+    #[test]
+    fn i2047_void_rule_table() {
+        void_table(true);
+        void_table(false);
+    }
+
+    /// v62.0.0 (K2-fix19) — **I2054: the SUSPENSION read (the current band at
+    /// an act's instant t, `band_as_of_rows`) against CIRISKernel's
+    /// MinorSuspend.tla** (PR #7, df93bb1), pure. Each section names the
+    /// model invariant it witnesses: Inv_NodesAgree, Inv_SeriesFold,
+    /// Inv_Fold, Inv_LaterRowsNotYet, Inv_RetractedOut, Inv_SelfNeverRaises,
+    /// Inv_SelfAdultAloneIsNone, Inv_SuspendedNeedsMinorRow.
+    #[test]
+    fn i2054_suspension_read_table() {
+        type A = super::super::types::Attestation;
+        let t0 = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).expect("t0");
+        let h = chrono::Duration::hours(1);
+        let wa = row("wa", "w", "t", "age_assurance:provider:adult:v1", t0, None);
+        let wm = row(
+            "wm",
+            "w2",
+            "t",
+            "age_assurance:provider:minor:v1",
+            t0 + h,
+            None,
+        );
+        let ga = row(
+            "ga",
+            "w3",
+            "t",
+            "age_assurance:government:adult:v1",
+            t0 + h * 2,
+            Some(t0 + h * 6),
+        );
+        let sm = row(
+            "sm",
+            "t",
+            "t",
+            "age_self_declared:band:minor:v1",
+            t0 + h * 3,
+            None,
+        );
+        let sa = row(
+            "sa",
+            "t",
+            "t",
+            "age_self_declared:band:adult:v1",
+            t0 + h * 4,
+            None,
+        );
+        let wm_self = row(
+            "wm1",
+            "w",
+            "t",
+            "age_assurance:provider:minor:v1",
+            t0 + h * 3,
+            None,
+        );
+        let retract = |x: &A, at| {
+            let mut r = row(
+                &format!("rx-{}", x.attestation_id),
+                &x.attesting_key_id,
+                "t",
+                super::super::types::attestation_type::WITHDRAWS,
+                at,
+                None,
+            );
+            r.attestation_envelope =
+                serde_json::json!({ "references_attestation_id": x.attestation_id });
+            r
+        };
+        let instants: Vec<chrono::DateTime<chrono::Utc>> = [-1, 0, 1, 2, 3, 4, 5, 7]
+            .iter()
+            .map(|n| t0 + h * *n)
+            .collect();
+        let read = |rows: &[A], t| band_as_of_rows(rows, t).coarsen();
+        let sets: Vec<Vec<A>> = vec![
+            vec![],
+            vec![wa.clone()],
+            vec![wa.clone(), wm.clone()],
+            vec![wa.clone(), wm.clone(), ga.clone()],
+            vec![wa.clone(), sm.clone()],
+            vec![wa.clone(), sm.clone(), sa.clone()],
+            vec![wa.clone(), wm_self.clone()],
+            vec![sa.clone()],
+            vec![
+                wm.clone(),
+                ga.clone(),
+                sm.clone(),
+                sa.clone(),
+                wm_self.clone(),
+            ],
+        ];
+
+        // Inv_NodesAgree: the read takes the act's instant and the held rows,
+        // and no clock (its signature is the witness); the same rows at the
+        // same t give the same band however often, wherever, it is read.
+        for set in &sets {
+            for t in &instants {
+                assert_eq!(read(set, *t), read(set, *t), "I2054 Inv_NodesAgree");
+            }
+        }
+
+        // Inv_SeriesFold + Inv_Fold: rows arriving in any order give the
+        // reading of the held set (every rotation and the reversal of the
+        // widest set; every prefix equals the same prefix re-sorted).
+        let widest = sets.last().expect("sets").clone();
+        for t in &instants {
+            let want = read(&widest, *t);
+            for k in 0..widest.len() {
+                let mut rot = widest.clone();
+                rot.rotate_left(k);
+                assert_eq!(
+                    read(&rot, *t),
+                    want,
+                    "I2054 Inv_SeriesFold: rotation {k} at {t}"
+                );
+                let mut rev = rot.clone();
+                rev.reverse();
+                assert_eq!(
+                    read(&rev, *t),
+                    want,
+                    "I2054 Inv_SeriesFold: reversed {k} at {t}"
+                );
+                let prefix = &rot[..k];
+                let mut sorted = prefix.to_vec();
+                sorted.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
+                assert_eq!(
+                    read(prefix, *t),
+                    read(&sorted, *t),
+                    "I2054 Inv_Fold: prefix {k}"
+                );
+            }
+        }
+
+        // Inv_LaterRowsNotYet: a row dated after t changes nothing at t.
+        for set in &sets {
+            for t in &instants {
+                for later in [&wa, &wm, &ga, &sm, &sa, &wm_self] {
+                    if later.asserted_at > *t {
+                        let mut plus = set.clone();
+                        plus.push(later.clone());
+                        assert_eq!(
+                            read(&plus, *t),
+                            read(set, *t),
+                            "I2054 Inv_LaterRowsNotYet: {} at {t}",
+                            later.attestation_id
+                        );
+                    }
+                }
+            }
+        }
+
+        // Inv_RetractedOut: dropping a retracted row TOGETHER with its
+        // retraction changes nothing. Witnessed for retractions dated at or
+        // before t only: a retraction dated AFTER t is not counted at t by
+        // persist (K2-fix19.md, difference (a), pending Constitution).
+        for set in &sets {
+            for x in [&wm, &sm, &ga, &wm_self] {
+                for t in &instants {
+                    if x.asserted_at > *t {
+                        continue;
+                    }
+                    let mut with = set.clone();
+                    if !with.iter().any(|r| r.attestation_id == x.attestation_id) {
+                        with.push(x.clone());
+                    }
+                    with.push(retract(x, *t));
+                    let without: Vec<A> = set
+                        .iter()
+                        .filter(|r| r.attestation_id != x.attestation_id)
+                        .cloned()
+                        .collect();
+                    assert_eq!(
+                        read(&with, *t),
+                        read(&without, *t),
+                        "I2054 Inv_RetractedOut: {} at {t}",
+                        x.attestation_id
+                    );
+                }
+            }
+        }
+
+        // Inv_SelfNeverRaises: when the witnesses alone read minor, the
+        // person reads minor, whatever they declare.
+        let witnesses_minor = vec![wa.clone(), wm.clone()];
+        for t in &instants {
+            if read(&witnesses_minor, *t) != AgeBand::Minor {
+                continue;
+            }
+            for selfs in [
+                vec![sa.clone()],
+                vec![sm.clone()],
+                vec![sm.clone(), sa.clone()],
+            ] {
+                let mut plus = witnesses_minor.clone();
+                plus.extend(selfs);
+                assert_eq!(
+                    read(&plus, *t),
+                    AgeBand::Minor,
+                    "I2054 Inv_SelfNeverRaises at {t}"
+                );
+            }
+        }
+
+        // Inv_SelfAdultAloneIsNone: a self-declared adult row alone never
+        // reads adult.
+        for t in &instants {
+            assert_ne!(
+                read(std::slice::from_ref(&sa), *t),
+                AgeBand::Adult,
+                "I2054 Inv_SelfAdultAloneIsNone at {t}"
+            );
+        }
+
+        // Inv_SuspendedNeedsMinorRow: with no minor-band row held, never minor
+        // (no age row at all reads Unknown, never the under_13 default).
+        for set in &sets {
+            let any_minor = set
+                .iter()
+                .any(|r| parse_age_band_token(&r.attestation_type) == Some(AgeBand::Minor));
+            if any_minor {
+                continue;
+            }
+            for t in &instants {
+                assert_ne!(
+                    read(set, *t),
+                    AgeBand::Minor,
+                    "I2054 Inv_SuspendedNeedsMinorRow over {:?} at {t}",
+                    set.iter()
+                        .map(|r| r.attestation_id.as_str())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        assert_eq!(
+            read(&[], t0),
+            AgeBand::Unknown,
+            "I2054: no age row is Unknown"
         );
     }
 }

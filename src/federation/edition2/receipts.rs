@@ -52,16 +52,18 @@
 //!   receipt's detached payload; the receipt's signature over that payload
 //!   verifies under the trusted service's key, and the receipt's protected
 //!   `alg` MUST equal the key's.
-//! - **the answer** ([`admission_unit_runnable`]): `Runnable` when a held
+//! - **the receipt leg** ([`admission_unit_receipt`]): `Runnable` when a held
 //!   receipt of a voice of the `admission:unit` row verifies under a trusted
 //!   service's key; otherwise the unit waits ([`ADMISSION_RECEIPT_MISSING`],
 //!   detail `none`, `unverifiable` or `untrusted_service`, in CC's
 //!   precedence).
 //!
 //! **What the answer is NOT.** It is the receipt leg of CC 2.7.11 only. The
-//! lease, the standing of the author or group at this host, a withdrawal and
-//! the halt are the host's other legs; `Runnable` here means "the receipt
-//! does not hold the unit back".
+//! conclusion, the lease, a withdrawal, the signers and the standing of the
+//! author or group at this host are the other legs
+//! ([`super::admission_unit::admission_unit_runnable`], AU-fix1; the halt is
+//! the host's, at each effect); `Runnable` here means "the receipt does not
+//! hold the unit back".
 //!
 //! **The leaf** (CC ruling, point 1): the statement with an EMPTY
 //! unprotected header ([`leaf_of`]): the signed statement as its issuer
@@ -985,8 +987,10 @@ pub fn receipt_rule(
     }
 }
 
-/// v62.0.0 (P10; CC rc21 2.7.11) — **may the unit an `admission:unit` row
-/// admits run, as far as its receipt goes**: [`AdmissionReceipt::Runnable`]
+/// v62.0.0 (P10; CC rc21 2.7.11; AU-fix1: renamed from
+/// `admission_unit_runnable`, which is now the whole answer,
+/// [`super::admission_unit::admission_unit_runnable`]) — **may the unit an
+/// `admission:unit` row admits run, as far as its receipt goes**: [`AdmissionReceipt::Runnable`]
 /// when a receipt held on a voice of the row verifies ([`read_receipt`])
 /// under the key of a service THIS host trusts ([`trusted_services`]);
 /// `Waiting(..)` ([`ADMISSION_RECEIPT_MISSING`]) otherwise; `NotHeld` when
@@ -997,7 +1001,7 @@ pub fn receipt_rule(
 ///
 /// # Errors
 /// Directory read failures.
-pub async fn admission_unit_runnable<F>(
+pub async fn admission_unit_receipt<F>(
     dir: &F,
     row_id: &super::names::RowId,
     now: chrono::DateTime<chrono::Utc>,

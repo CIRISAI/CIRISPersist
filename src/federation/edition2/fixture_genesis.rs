@@ -41,8 +41,7 @@ use ciris_verify_core::edition2::genesis::{Anchor, BINDING_FAMILY, XWING_PUBKEY_
 use ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY;
 use ciris_verify_core::edition2::recovery::recovery_commitment;
 use ciris_verify_core::edition2::{
-    cose_key, hash_digest_value, identity_ref, row_ref, sig_structure, sign_row_statement,
-    thumbprint, Digest32,
+    cose_key, identity_ref, row_ref, sign_row_statement, thumbprint, Digest32,
 };
 use ciris_verify_core::trust_anchor_store::{environments, single, Purpose, TrustAnchorStore};
 use sha2::Digest as _;
@@ -53,7 +52,6 @@ use super::fixture_genesis_custody::{
 };
 use super::genesis::GENESIS_BUNDLE_TYP;
 use super::names::RowId;
-use super::produce::{assemble, object_protected};
 use crate::federation::{Error, FederationDirectory};
 
 /// Holder seeds of the standard ceremony (Verify's vector keys A, B, C).
@@ -365,12 +363,6 @@ fn map(mut m: Vec<(&str, Value)>) -> Value {
     Value::Map(m.into_iter().map(|(k, v)| (text(k), v)).collect())
 }
 
-/// A deterministic map keyed by owned text.
-fn map_owned(mut m: Vec<(String, Value)>) -> Value {
-    m.sort_by_key(|(k, _)| cde::encode(&text(k)));
-    Value::Map(m.into_iter().map(|(k, v)| (Value::Text(k), v)).collect())
-}
-
 /// A CBOR set: members sorted by their encodings.
 fn set(mut xs: Vec<Value>) -> Value {
     xs.sort_by_key(cde::encode);
@@ -609,7 +601,9 @@ fn check_spec(spec: &CeremonySpec) {
     }
 }
 
-/// The bundle payload over minted holders and seats (CC 2.6.1.11).
+/// The bundle payload over minted holders and seats (CC 2.6.1.11): the
+/// production builder ([`super::genesis::bundle_payload`], CE-fix1) over
+/// this ceremony's parties.
 fn bundle_payload(
     spec: &CeremonySpec,
     version: u64,
@@ -619,58 +613,37 @@ fn bundle_payload(
     seats: &[SeatV2],
     extra_rows: &[NamedRow],
 ) -> Value {
-    let cited: Vec<Value> = holders
-        .iter()
-        .map(|h| row_ref(&h.record.row_id))
-        .chain(extra_rows.iter().map(|r| row_ref(&r.row_id)))
-        .chain(seats.iter().map(|s| row_ref(&s.record.row_id)))
-        .chain(seats.iter().map(|s| row_ref(&s.binding.row_id)))
-        .collect();
-    let mut refs = vec![("also", map(vec![("cites", set(cited))]))];
-    if let Some(p) = prev {
-        refs.push(("prev", row_ref(p)));
-    }
-    let commitments = map_owned(
-        holders
+    super::genesis::bundle_payload(&super::genesis::BundleTerms {
+        version,
+        prev: prev.copied(),
+        asserted_at_ms,
+        family_key_id: spec.family_key_id.clone(),
+        holders: holders.iter().map(|h| h.identity_ref.clone()).collect(),
+        serve_nodes: seats.iter().map(|s| s.identity_ref.clone()).collect(),
+        cites: holders
             .iter()
-            .map(|h| {
-                (
-                    h.identity_ref.clone(),
-                    hash_digest_value(&h.recovery_commitment),
-                )
-            })
+            .map(|h| h.record.row_id)
+            .chain(extra_rows.iter().map(|r| r.row_id))
+            .chain(seats.iter().map(|s| s.record.row_id))
+            .chain(seats.iter().map(|s| s.binding.row_id))
             .collect(),
-    );
-    let charter = map(vec![
-        ("recovery_commitments", commitments),
-        ("scope", text_set(&["infra:attest", "infra:serve"])),
-        ("halt_fuse_secs", Value::Uint(86_400)),
-    ]);
-    map(vec![
-        ("refs", map(refs)),
-        ("version", Value::Uint(version)),
-        ("asserted_at", Value::Uint(asserted_at_ms)),
-        ("family_key_id", text(&spec.family_key_id)),
-        (
-            "holders",
-            set(holders.iter().map(|h| text(&h.identity_ref)).collect()),
-        ),
-        (
-            "serve_nodes",
-            set(seats.iter().map(|s| text(&s.identity_ref)).collect()),
-        ),
-        ("charter", charter),
-    ])
+        recovery_commitments: holders
+            .iter()
+            .map(|h| (h.identity_ref.clone(), h.recovery_commitment))
+            .collect(),
+        scope: vec!["infra:attest".to_owned(), "infra:serve".to_owned()],
+        halt_fuse_secs: Some(86_400),
+    })
 }
 
-/// One signer's `ceg-genesis-bundle/2` statement over `payload`.
-fn voice(k: &CompositeSigningKey, iss: &str, payload_bytes: &[u8], asserted_at_ms: u64) -> Vec<u8> {
+/// One signer's `ceg-genesis-bundle/2` statement over `payload`: the
+/// production draft ([`super::genesis::bundle_voice_draft`], CE-fix1),
+/// signed by the fixture key.
+fn voice(k: &CompositeSigningKey, iss: &str, payload: &Value, asserted_at_ms: u64) -> Vec<u8> {
     let kid = thumbprint(k.public_key());
-    let protected = object_protected(&kid, iss, GENESIS_BUNDLE_TYP, Some(asserted_at_ms / 1000));
-    let sig = k
-        .sign(&sig_structure(&protected, payload_bytes))
-        .expect("a fixture key signs");
-    assemble(protected, payload_bytes.to_vec(), sig)
+    let draft = super::genesis::bundle_voice_draft(&kid, iss, payload, asserted_at_ms);
+    let sig = k.sign(&draft.sig_structure).expect("a fixture key signs");
+    draft.assemble(sig)
 }
 
 /// One bundle over placed parties, signed by `signers` (key, `iss`).
@@ -699,7 +672,7 @@ fn assemble_bundle(
     let object_id = RowId::of_object(GENESIS_BUNDLE_TYP, None, &payload_bytes).0;
     let voices = signers
         .iter()
-        .map(|(k, iss)| voice(k, iss, &payload_bytes, asserted_at_ms))
+        .map(|(k, iss)| voice(k, iss, &payload, asserted_at_ms))
         .collect();
     TestCeremonyV2 {
         spec: spec.clone(),

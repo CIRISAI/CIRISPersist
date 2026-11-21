@@ -705,3 +705,92 @@ async fn i3834_non_member_cosign_kept_postgres() {
     };
     Box::pin(cosign_non_member_body(&b)).await;
 }
+
+/// **I2187 (v62.0.0, PX-fix1) — a genesis bundle held SHORT of its count is
+/// not read as concluded THROUGH the capsule proxy.** I3832's first leg,
+/// written on the backend and read through the proxy (backend ← capsule
+/// dispatch ← `OpsDirectory`): one holder's voice over a later bundle is held
+/// `genesis_bundle_count_unmet`, the proxy reads it held, and
+/// `genesis_in_force` over the proxy keeps the FIRST bundle as head — the same
+/// reading as over the backend. Before PX-fix1, routing `edition2_objects`
+/// alone (with `fold_held` still the `None` default) would have read the
+/// short voice as concluded. The voice that meets the count moves the head
+/// through the proxy too.
+async fn held_short_through_proxy_body(dir: std::sync::Arc<dyn FederationDirectory>) {
+    let proxy = crate::ffi::directory_capsule::test_proxy(dir.clone());
+    let (d, p) = (dir.as_ref(), proxy.as_ref());
+    let first = ceremony_v2(&CeremonySpec::at(T));
+    install_ceremony_v2(d, &first).await.unwrap();
+    let later = later_v2(&first, &HOLDER_SEEDS, &SERVE_NODE_SEEDS, &HOLDER_SEEDS[..2]);
+    assert_eq!(later.voices.len(), 2, "I2187: two voices");
+    let rows: Vec<Vec<u8>> = later
+        .rows_in_put_order()
+        .into_iter()
+        .map(|r| r.statement.clone())
+        .collect();
+    let offer = |i: usize| {
+        let mut s = rows.clone();
+        s.push(later.voices[i].clone());
+        s
+    };
+
+    let out = put_genesis_bundle(d, &offer(0), None).await.unwrap();
+    assert!(out.placed.is_empty(), "I2187: one voice concludes nothing");
+    let held = p
+        .fold_held(&RowId(later.object_id))
+        .await
+        .unwrap()
+        .map(|h| h.reason);
+    assert_eq!(
+        held.as_deref(),
+        Some(reason::GENESIS_BUNDLE_COUNT_UNMET),
+        "I2187: the proxy reads the short bundle held"
+    );
+    let direct = genesis_in_force(d).await.unwrap();
+    let via = genesis_in_force(p).await.unwrap();
+    assert_eq!(
+        via.head.as_ref().map(|h| h.object_id),
+        Some(first.object_id),
+        "I2187: through the proxy the held-short bundle is NOT in force"
+    );
+    assert!(
+        !via.valid.iter().any(|v| v.object_id == later.object_id),
+        "I2187: nor among the valid bundles through the proxy"
+    );
+    assert_eq!(
+        format!("{:?}", via.valid),
+        format!("{:?}", direct.valid),
+        "I2187: the proxy reads the backend's lineage"
+    );
+    assert_eq!(via.statements, direct.statements, "I2187: served lineage");
+
+    let out = put_genesis_bundle(d, &offer(1), None).await.unwrap();
+    assert_eq!(
+        out.placed.iter().map(|x| x.object_id).collect::<Vec<_>>(),
+        vec![later.object_id],
+        "I2187: the voice that meets the count concludes it"
+    );
+    assert_eq!(
+        genesis_in_force(p).await.unwrap().head.map(|h| h.object_id),
+        Some(later.object_id),
+        "I2187: concluded, it is the head through the proxy"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2187_held_short_bundle_not_in_force_through_the_proxy_sqlite() {
+    Box::pin(held_short_through_proxy_body(std::sync::Arc::new(
+        sqlite().await,
+    )))
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2187_held_short_bundle_not_in_force_through_the_proxy_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(held_short_through_proxy_body(std::sync::Arc::new(b))).await;
+}

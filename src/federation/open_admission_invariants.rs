@@ -530,6 +530,139 @@ pub(crate) mod bodies {
         assert!(active(d, &closed, &late).await);
     }
 
+    /// v62.0.0 (K2-fix18) — `seed` self-declares minor (the subject-signed
+    /// self rung); returns the held row, for its withdrawal.
+    async fn declare_minor(
+        d: &dyn FederationDirectory,
+        seed: &str,
+    ) -> crate::federation::Attestation {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut a = ts::bare_attestation(&id, seed, seed, &serde_json::json!({ "id": id }));
+        a.attestation_type = "age_self_declared:band:minor:v1".to_owned();
+        ts::seal_row_in_place(seed, &mut a);
+        e2::put_signed(d, &a)
+            .await
+            .expect("the self-declared minor row");
+        a
+    }
+
+    /// v62.0.0 (K2-fix18) — `seed` withdraws its own `row`.
+    async fn withdraw_own(
+        d: &dyn FederationDirectory,
+        row: &crate::federation::Attestation,
+        seed: &str,
+    ) {
+        let w = e2::composer_of(
+            crate::federation::types::attestation_type::WITHDRAWS,
+            row,
+            seed,
+        );
+        landed(
+            e2::put_signed(d, &w).await,
+            "the withdrawal of the minor row",
+        );
+    }
+
+    /// v62.0.0 (K2-fix18; CC 3.4.13 Q5, CC 5.4.6; class 2) — **I2051–I2053:
+    /// a public room never lists a minor; the derived plane is untouched.**
+    /// The room is `public` under `quorum:1/1` (an invitation the founder
+    /// widens), so the joiner is a PERSON key; the open-join path needs a
+    /// federation owner binding (`joiner_owner_unbound`), which K2-fix17
+    /// already holds for a minor owner.
+    ///
+    /// - **I2051** — the growth lands and the person is listed; THEN the
+    ///   person self-declares minor: the growth re-folds to held
+    ///   (`minor_public_roster_entry`), the person is not listed; they
+    ///   withdraw the row: listed again, with no new growth.
+    /// - **I2052** — the other order: the minor row first, then the
+    ///   invitation, acceptance and growth: not admitted (held); withdrawn:
+    ///   listed.
+    /// - **I2053** — the derived plane: the same minor joins a PRIVATE room
+    ///   (`quorum:1/1`, not `public`): listed there, while the minor row
+    ///   stands.
+    pub(crate) async fn i2051_i2053_a_public_room_never_lists_a_minor(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let (founder, p1, p2, pubr, privr) = (
+            format!("i2051-f-{s}"),
+            format!("i2051-p1-{s}"),
+            format!("i2051-p2-{s}"),
+            format!("i2051-pub-{s}"),
+            format!("i2051-priv-{s}"),
+        );
+        reg(d, &[&founder, &p1, &p2, &pubr, &privr]).await;
+        let (f, k1, k2, cid, priv_cid) = (
+            id_of(&founder),
+            id_of(&p1),
+            id_of(&p2),
+            id_of(&pubr),
+            id_of(&privr),
+        );
+        found_public_room(d, &cid, "quorum:1/1", &[&f], &[])
+            .await
+            .expect("a public room under quorum:1/1");
+        found_community(d, &priv_cid, "quorum:1/1", &[&f], &[])
+            .await
+            .expect("a private room");
+        let at = Utc::now() - Duration::hours(1);
+        let invite = |room: String, who: String, t: DateTime<Utc>| {
+            let f = f.clone();
+            async move {
+                let p = proposal(&f, COMMUNITY, &room, &who, None, t, Some(Duration::days(7)));
+                put(d, &p).await.expect("the founder's invitation");
+                put(d, &reply(&who, &who, &p, true, t + Duration::seconds(1)))
+                    .await
+                    .expect("the person's acceptance");
+            }
+        };
+
+        // ── I2051: listed, then a minor row, then its withdrawal.
+        invite(cid.clone(), k1.clone(), at).await;
+        landed(
+            widen(d, &cid, &[&f], &k1, None, at + Duration::seconds(2)).await,
+            "I2051: the growth lands",
+        );
+        assert!(active(d, &cid, &k1).await, "I2051: listed (no age row)");
+        let m1 = declare_minor(d, &p1).await;
+        assert!(
+            !active(d, &cid, &k1).await,
+            "I2051: a LATER minor row takes the person off the public roster (re-fold)"
+        );
+        withdraw_own(d, &m1, &p1).await;
+        assert!(
+            active(d, &cid, &k1).await,
+            "I2051: withdrawn, listed again with no new growth"
+        );
+
+        // ── I2052: the minor row first.
+        let m2 = declare_minor(d, &p2).await;
+        invite(cid.clone(), k2.clone(), at + Duration::seconds(10)).await;
+        not_admitted(
+            widen(d, &cid, &[&f], &k2, None, at + Duration::seconds(12)).await,
+            &[crate::federation::membership_acceptance::RULE_MINOR_PUBLIC_ROSTER_ENTRY],
+            "I2052: a minor's growth on a public room",
+        );
+        assert!(!active(d, &cid, &k2).await, "I2052: not listed");
+
+        // ── I2053: the derived plane — a private room lists the same minor.
+        invite(priv_cid.clone(), k2.clone(), at + Duration::seconds(20)).await;
+        landed(
+            widen(d, &priv_cid, &[&f], &k2, None, at + Duration::seconds(22)).await,
+            "I2053: a private room's growth of the minor lands",
+        );
+        assert!(
+            active(d, &priv_cid, &k2).await,
+            "I2053: the minor is in their private room while the row stands"
+        );
+
+        withdraw_own(d, &m2, &p2).await;
+        assert!(
+            active(d, &cid, &k2).await,
+            "I2052: withdrawn, the held growth concludes: listed"
+        );
+    }
+
     /// **I1515** — the removal window under `open:self_admit`.
     pub(crate) async fn i1515_removal_window_under_open_self_admit(
         d: &dyn FederationDirectory,
@@ -1048,6 +1181,7 @@ mod runners {
                 case!(i1502_the_joiner_admits_themselves);
                 case!(i1503_removal_takes_two_voices);
                 case!(i1515_removal_window_under_open_self_admit);
+                case!(i2051_i2053_a_public_room_never_lists_a_minor);
 
                 #[tokio::test]
                 async fn i1624_a_standing_proposal_is_judged_at_the_read() {

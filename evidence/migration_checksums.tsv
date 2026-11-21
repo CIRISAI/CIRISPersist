@@ -20,5 +20,11 @@
 # v62.0.0 (P8-fix14): re-pinned over V300's appended restatement_key column (plain TEXT, written beside the row) and its index (both dialects; V300 is unshipped).
 # v62.0.0 (P1-fix8): re-pinned for the exact ledger columns (numeric / canonical
 # decimal TEXT); V300 is still unshipped. Recomputed on the 4e-prep merged tree (1be745c6 + 4d.3 + P1-fix6/7/8).
-sqlite	300	edition2_baseline	3123189220795043183
-postgres	300	edition2_baseline	17856288883111543973
+# v62.0.0 (AU-fix3): re-pinned over ceg_statements.first_held_us (both dialects, in the
+# CREATE TABLE; V300 is unshipped). Computed by a SipHash-1-3 port that reproduced the prior pins.
+# v62.0.0 (RL-fix2): re-pinned over V300's appended ceg_accord_rescan table (both dialects; V300 is unshipped). Recomputed on 38f93735 + RL-fix1-v1 + RL-fix2; 4g-regen recomputes on the merged tree.
+# v62.0.0 (4g-prep): recomputed on the merged V300 (AU-fix3 first_held_us + RL-fix2 ceg_accord_rescan), SipHash-1-3 port.
+# v62.0.0 (RL-fix3): re-pinned over V300's appended ceg_dial_hints table (both dialects; unshipped); 4g-regen recomputes on the merged tree.
+# v62.0.0 (4g-prep): recomputed on the merged V300 (+ RL-fix3 ceg_dial_hints), SipHash-1-3 port.
+sqlite	300	edition2_baseline	13783235775852624063
+postgres	300	edition2_baseline	5560204115403096562

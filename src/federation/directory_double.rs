@@ -134,9 +134,15 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 172 delegations, generated. Every one: fault first, then delegate.
+// 202 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
+    async fn accord_skips(&self) -> Result<Vec<edition2::accord_rescan::AccordRescan>, Error> {
+        if let Some(e) = self.faulted("accord_skips") {
+            return Err(e);
+        }
+        self.inner.accord_skips().await
+    }
     async fn apply_replicated_accord_evidence(
         &self,
         evidence: &accord_carriage::AccordQuorumEvidence,
@@ -204,6 +210,19 @@ impl FederationDirectory for FaultInjectingDirectory {
             .attestations_binding_content_with_placements(content_sha256)
             .await
     }
+    async fn clear_accord_skip(
+        &self,
+        plane: &str,
+        peer: &str,
+        from_position: &str,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("clear_accord_skip") {
+            return Err(e);
+        }
+        self.inner
+            .clear_accord_skip(plane, peer, from_position)
+            .await
+    }
     async fn clear_active_halt(
         &self,
         family_key_id: &str,
@@ -267,6 +286,15 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.dag_manifests_of_chunk(chunk_sha256).await
     }
+    async fn dial_hints_for(
+        &self,
+        node: &str,
+    ) -> Result<Option<edition2::contact::DialHints>, Error> {
+        if let Some(e) = self.faulted("dial_hints_for") {
+            return Err(e);
+        }
+        self.inner.dial_hints_for(node).await
+    }
     async fn drop_cosign_rows(&self, quorum_key: &str) -> Result<u64, Error> {
         if let Some(e) = self.faulted("drop_cosign_rows") {
             return Err(e);
@@ -285,6 +313,15 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .drop_group_tips(cohort, group_key_id, persist_row_hashes)
             .await
+    }
+    async fn edition2_first_held_us(
+        &self,
+        row_id: &edition2::names::RowId,
+    ) -> Result<Option<i64>, Error> {
+        if let Some(e) = self.faulted("edition2_first_held_us") {
+            return Err(e);
+        }
+        self.inner.edition2_first_held_us(row_id).await
     }
     async fn edition2_objects(&self, typ: &str) -> Result<Vec<Vec<u8>>, Error> {
         if let Some(e) = self.faulted("edition2_objects") {
@@ -521,6 +558,18 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.get_attestation(attestation_id).await
     }
+    async fn get_goal(&self, goal_id: &str) -> Result<Option<Goal>, Error> {
+        if let Some(e) = self.faulted("get_goal") {
+            return Err(e);
+        }
+        self.inner.get_goal(goal_id).await
+    }
+    async fn grant_trust(&self, grant: SignedTrustGrant) -> Result<(), Error> {
+        if let Some(e) = self.faulted("grant_trust") {
+            return Err(e);
+        }
+        self.inner.grant_trust(grant).await
+    }
     async fn insert_known_wire_hash(
         &self,
         kind: &str,
@@ -555,6 +604,12 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .known_wire_hash_contains(kind, content_hash)
             .await
+    }
+    async fn last_witness_epoch_for_peer(&self, peer_id: &str) -> Result<Option<u64>, Error> {
+        if let Some(e) = self.faulted("last_witness_epoch_for_peer") {
+            return Err(e);
+        }
+        self.inner.last_witness_epoch_for_peer(peer_id).await
     }
     async fn list_accord_participations(
         &self,
@@ -729,6 +784,15 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.list_consent_peers_for(for_key_id).await
     }
+    async fn list_consent_revocations(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("list_consent_revocations") {
+            return Err(e);
+        }
+        self.inner.list_consent_revocations(since).await
+    }
     async fn list_cosign_aliases(&self, quorum_key: &str) -> Result<Vec<(String, String)>, Error> {
         if let Some(e) = self.faulted("list_cosign_aliases") {
             return Err(e);
@@ -752,6 +816,12 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.list_derived_hex(original_sha256_hex).await
+    }
+    async fn list_dial_hints(&self) -> Result<Vec<edition2::contact::DialHints>, Error> {
+        if let Some(e) = self.faulted("list_dial_hints") {
+            return Err(e);
+        }
+        self.inner.list_dial_hints().await
     }
     async fn list_expired_attestation_ids(
         &self,
@@ -799,6 +869,12 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_family_membership_widenings_for(family_key_id)
             .await
     }
+    async fn list_goals(&self, filter: GoalsFilter) -> Result<Vec<Goal>, Error> {
+        if let Some(e) = self.faulted("list_goals") {
+            return Err(e);
+        }
+        self.inner.list_goals(filter).await
+    }
     async fn list_group_tips(
         &self,
         cohort: cohort::Cohort,
@@ -818,6 +894,15 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.list_group_versions(cohort, group_key_id).await
+    }
+    async fn list_hard_case_events(
+        &self,
+        filter: hard_case::HardCaseFilter,
+    ) -> Result<Vec<hard_case::HardCaseEvent>, Error> {
+        if let Some(e) = self.faulted("list_hard_case_events") {
+            return Err(e);
+        }
+        self.inner.list_hard_case_events(filter).await
     }
     async fn list_held_fountain_content(
         &self,
@@ -1169,6 +1254,32 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_targeted_by_dimension_prefix(cohort_scopes, cohort_target, dimension_prefix)
             .await
     }
+    async fn list_transport_destinations_for_unfolded(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        if let Some(e) = self.faulted("list_transport_destinations_for_unfolded") {
+            return Err(e);
+        }
+        self.inner
+            .list_transport_destinations_for_unfolded(occurrence_key_id)
+            .await
+    }
+    async fn list_trusted_keys(&self, filter: TrustFilter) -> Result<Vec<TrustRow>, Error> {
+        if let Some(e) = self.faulted("list_trusted_keys") {
+            return Err(e);
+        }
+        self.inner.list_trusted_keys(filter).await
+    }
+    async fn list_wholeness_witnesses_for_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<crate::witness::StoredWitness>, Error> {
+        if let Some(e) = self.faulted("list_wholeness_witnesses_for_peer") {
+            return Err(e);
+        }
+        self.inner.list_wholeness_witnesses_for_peer(peer_id).await
+    }
     async fn list_widening_candidates(
         &self,
         after_attestation_id: Option<&str>,
@@ -1194,6 +1305,12 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_wire_hashes_since(kind, after_content_hash, limit)
             .await
     }
+    async fn list_witness_peer_ids(&self) -> Result<Vec<String>, Error> {
+        if let Some(e) = self.faulted("list_witness_peer_ids") {
+            return Err(e);
+        }
+        self.inner.list_witness_peer_ids().await
+    }
     async fn lookup_community(&self, community_key_id: &str) -> Result<Option<Community>, Error> {
         if let Some(e) = self.faulted("lookup_community") {
             return Err(e);
@@ -1205,6 +1322,18 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.lookup_family(family_key_id).await
+    }
+    async fn lookup_freshness_floor(
+        &self,
+        target_key_id: &str,
+        target_kind: &str,
+    ) -> Result<Option<types::SignedTouchClaim>, Error> {
+        if let Some(e) = self.faulted("lookup_freshness_floor") {
+            return Err(e);
+        }
+        self.inner
+            .lookup_freshness_floor(target_key_id, target_kind)
+            .await
     }
     async fn lookup_identity_for_occurrence(
         &self,
@@ -1249,6 +1378,22 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .lookup_signed_record_by_content_hash(kind, content_hash)
             .await
+    }
+    async fn lookup_trust(&self, key: &str) -> Result<Option<TrustRow>, Error> {
+        if let Some(e) = self.faulted("lookup_trust") {
+            return Err(e);
+        }
+        self.inner.lookup_trust(key).await
+    }
+    async fn note_accord_skip(
+        &self,
+        feed: &edition2::accord_rescan::FeedPosition,
+        at_ms: i64,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("note_accord_skip") {
+            return Err(e);
+        }
+        self.inner.note_accord_skip(feed, at_ms).await
     }
     async fn note_cosign_alias(
         &self,
@@ -1459,6 +1604,12 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.put_delivery_receipt_edition2(receipt).await
     }
+    async fn put_dial_hints(&self, hints: &edition2::contact::DialHints) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_dial_hints") {
+            return Err(e);
+        }
+        self.inner.put_dial_hints(hints).await
+    }
     async fn put_edition2_genesis(
         &self,
         write: &edition2::genesis::GenesisWrite,
@@ -1491,6 +1642,12 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.put_family(family).await
+    }
+    async fn put_family_local(&self, family: Family) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_family_local") {
+            return Err(e);
+        }
+        self.inner.put_family_local(family).await
     }
     async fn put_family_membership_revocation(
         &self,
@@ -1546,6 +1703,26 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.put_identity_occurrence_edition2(bind).await
     }
+    async fn put_identity_occurrence_local(
+        &self,
+        occurrence: types::IdentityOccurrence,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_identity_occurrence_local") {
+            return Err(e);
+        }
+        self.inner.put_identity_occurrence_local(occurrence).await
+    }
+    async fn put_identity_occurrence_revocation_local(
+        &self,
+        revocation: types::IdentityOccurrenceRevocation,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_identity_occurrence_revocation_local") {
+            return Err(e);
+        }
+        self.inner
+            .put_identity_occurrence_revocation_local(revocation)
+            .await
+    }
     async fn put_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error> {
         if let Some(e) = self.faulted("put_location_proof") {
             return Err(e);
@@ -1564,6 +1741,15 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.put_revocation(revocation).await
     }
+    async fn put_touch_claim(
+        &self,
+        claim: &types::SignedTouchClaim,
+    ) -> Result<freshness::TouchApplyOutcome, Error> {
+        if let Some(e) = self.faulted("put_touch_claim") {
+            return Err(e);
+        }
+        self.inner.put_touch_claim(claim).await
+    }
     async fn put_touch_claim_local(
         &self,
         target_key_id: &str,
@@ -1576,6 +1762,29 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .put_touch_claim_local(target_key_id, target_kind, fresh_as_of, cohort_scope)
+            .await
+    }
+    async fn put_wholeness_witness(
+        &self,
+        witness: &ciris_verify_core::substrate::WholenessWitness,
+        signature: &crate::verify::sig19::Sig19,
+        pqc_key_id: &str,
+        ed25519_pubkey_b64: &str,
+        ml_dsa_65_pubkey_b64: Option<&str>,
+        disclosed_leaves: Option<&[Vec<u8>]>,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_wholeness_witness") {
+            return Err(e);
+        }
+        self.inner
+            .put_wholeness_witness(
+                witness,
+                signature,
+                pqc_key_id,
+                ed25519_pubkey_b64,
+                ml_dsa_65_pubkey_b64,
+                disclosed_leaves,
+            )
             .await
     }
     async fn read_group_plane_object(
@@ -1612,6 +1821,58 @@ impl FederationDirectory for FaultInjectingDirectory {
                 claimed_identity_type,
                 last_seen,
             )
+            .await
+    }
+    async fn record_canonical_withdrawal(
+        &self,
+        key_id: &str,
+        superseded_by: Option<&str>,
+        authority_decision_digest: &str,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("record_canonical_withdrawal") {
+            return Err(e);
+        }
+        self.inner
+            .record_canonical_withdrawal(key_id, superseded_by, authority_decision_digest)
+            .await
+    }
+    async fn record_hard_case(&self, event: hard_case::HardCaseEvent) -> Result<(), Error> {
+        if let Some(e) = self.faulted("record_hard_case") {
+            return Err(e);
+        }
+        self.inner.record_hard_case(event).await
+    }
+    async fn record_role_withdrawal(
+        &self,
+        role: &str,
+        key_id: &str,
+        superseded_by: Option<&str>,
+        authority_decision_digest: &str,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("record_role_withdrawal") {
+            return Err(e);
+        }
+        self.inner
+            .record_role_withdrawal(role, key_id, superseded_by, authority_decision_digest)
+            .await
+    }
+    async fn remove_dial_hints(&self, node: &str) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("remove_dial_hints") {
+            return Err(e);
+        }
+        self.inner.remove_dial_hints(node).await
+    }
+    async fn remove_transport_destination(
+        &self,
+        occurrence_key_id: &str,
+        transport_kind: &str,
+        destination: &str,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("remove_transport_destination") {
+            return Err(e);
+        }
+        self.inner
+            .remove_transport_destination(occurrence_key_id, transport_kind, destination)
             .await
     }
     async fn reseal_attestation_v31(&self, resealed: &Attestation) -> Result<bool, Error> {
@@ -1654,6 +1915,12 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .revocations_for_subject(revoked_key_sha256_ed25519_raw)
             .await
+    }
+    async fn revoke_trust(&self, revocation: SignedTrustRevocation) -> Result<(), Error> {
+        if let Some(e) = self.faulted("revoke_trust") {
+            return Err(e);
+        }
+        self.inner.revoke_trust(revocation).await
     }
     async fn rewrap_own_epochs_for_device(&self, owner: &str, device: &str) -> Result<(), Error> {
         if let Some(e) = self.faulted("rewrap_own_epochs_for_device") {

@@ -155,7 +155,9 @@ pub(crate) mod bodies {
             .expect("I1842: the user's acceptance edge");
         // v62 (E4): the store names each key by its identity-ref.
         let (user_s, user, root) = (user.clone(), e2::kid(&user), r.root.clone());
-        let v = trust_root_valid(d, &user, &root).await.expect("verdict");
+        let v = trust_root_valid(d, &user, &root, crate::host::clock::now())
+            .await
+            .expect("verdict");
         assert!(v.edge_exists, "I1842: the user's acceptance edge is live");
         assert!(v.valid, "I1842: a valid root: {v:?}");
         let edge = d
@@ -168,7 +170,9 @@ pub(crate) mod bodies {
             })
             .expect("I1842: the user's edge to the root");
         withdraw(d, &user_s, &edge.attestation_id).await;
-        let v = trust_root_valid(d, &user, &root).await.expect("verdict");
+        let v = trust_root_valid(d, &user, &root, crate::host::clock::now())
+            .await
+            .expect("verdict");
         assert!(
             !v.edge_exists,
             "I1842: the user's own withdraws ends the edge"
@@ -469,7 +473,7 @@ pub(crate) mod bodies {
         // (c) the walk over held rows is bounded and gives no edge.
         let v = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            trust_root_valid(d, &user, &root),
+            trust_root_valid(d, &user, &root, crate::host::clock::now()),
         )
         .await
         .expect("I1846: the trust walk returns within a bound")

@@ -20,7 +20,7 @@
 
 **CC rc21 (kernel admission, CC 2.7.11; v62.0.0 wave P1e).** Three additions:
 
-- a new family, `admission:unit` (wire `admission:unit:v1`, row type `scores`), the code scope. An owner-alone (authored) row is at `cohort_scope: self`; a counted row may be at any scope its signers choose (CC ruling). Its verifier's rules are refused with their own tokens (`admission_unit_malformed`, `admission_capability_unknown`, `admission_lease_out_of_window`, `admission_effect_needs_count`, `admission_issuer_not_person`). The host's tokens (`admission_issuer_not_reached`, `admission_count_unmet`, `admission_none`, `admission_capability_not_admitted`, `admission_capability_not_held`, `admission_halted`) are the loader's, and no row is refused for them;
+- a new family, `admission:unit` (wire `admission:unit:v1`, row type `scores`), the code scope. One person's (authored) row that names an effect is at `cohort_scope: self` and admits only on a host that person owns; any other row may be at any scope its signers choose (CC 2.7.11; AU-fix1). Its verifier's rules are refused with their own tokens (`admission_unit_malformed`, `admission_capability_unknown`, `admission_lease_out_of_window`, `admission_owner_row_not_self`, `admission_issuer_not_person`). A counted row is held (`count_short`, answered `admission_count_unmet`) until its count is met at the head it names. The host's tokens (`admission_issuer_not_reached`, `admission_count_unmet`, `admission_none`, `admission_capability_not_admitted`, `admission_capability_not_held`, `admission_halted`) are answers, and no row is refused for them;
 - `identity_amendment` gains `refs.prev`, the link it follows (the profile scope; the link with no `prev` is the base);
 - `deferral:response:approved` gains `call_fingerprint` (the action scope), beside `amendment_digest`.
 - **rc21 member homes:** an `identity_amendment`'s approval stands under `refs.also.cites` (exactly one; no `authorized_by` member, no `evidence_refs`). A `deferral:response:*` names its request under `refs.answers` (never `refs.target`) and carries `deferral_id` (REQUIRED: it correlates on it) and never `reason_digest`. A `deferral:request` REQUIRES `deferral_id` and `reason_digest` (FINAL, CC ruling). Both route by `community_id`, the pair room (a two-person community record); there is no `room` member (FINAL, CC). No payload carries Server's envelope uuid `id`: the row id is computed.
@@ -315,9 +315,9 @@ Co-signatures now counted voices: none (the author's statement alone).
 ### `admission:unit`
 
 - **Replaces:** nothing: new in rc21 (CC 2.7.11, the code scope of kernel admission; wire admission:unit:v1, row type scores)
-- **Authorship:** counted where refs.head is present (act = group), authored otherwise; an effect capability needs a count; every signer a person (identity_type holds user or accord_holder); no delegate role
+- **Authorship:** counted where refs.head is present (act = group), authored otherwise; one person's (authored) row naming an effect is at cohort_scope self and admits only on a host that person owns; every signer a person (identity_type holds user or accord_holder); no delegate role
 - **`sub`:** the unit digest as tagged text, canonical:sha256:{hex} (not an identity-ref)
-- **Lands in:** ceg_statements + federation_attestations (the mapped scores row); no typed plane: standing, the lease and the halt are read by the host
+- **Lands in:** ceg_statements + federation_attestations (the mapped scores row), held count_short until a counted row's count is met; no typed plane: the host's answer (admission_unit_runnable) reads the conclusion, the lease, the withdrawal, the standing and the receipt
 
 | member | CBOR type | presence | maps from |
 |---|---|---|---|
@@ -328,10 +328,10 @@ Co-signatures now counted voices: none (the author's statement alone).
 
 Verifier rules (each refused with its own token):
 
-- `admission_unit_malformed`: `author` and `refs.head` are not both present or both absent; an owner-alone (authored) row is at `cohort_scope: self`; `sub` is `canonical:sha256:{hex}` of `unit`
+- `admission_unit_malformed`: `author` and `refs.head` are not both present or both absent; `sub` is `canonical:sha256:{hex}` of `unit`
 - `admission_capability_unknown`: `capabilities` is non-empty and within the closed set
 - `admission_lease_out_of_window`: `asserted_at < valid_until <= asserted_at + unit_lease_max_secs * 1000` (86400 s)
-- `admission_effect_needs_count`: an authored row names no effect capability (`net_send`, `submit`, `sign`, `store_write`, `actuate`)
+- `admission_owner_row_not_self`: one person's (authored) row that names an effect capability (`net_send`, `submit`, `sign`, `store_write`, `actuate`) is at `cohort_scope: self`
 - `admission_issuer_not_person`: every signer's key record holds `user` or `accord_holder` (the statement alone is refused)
 
 | earlier-form co-signature (not a payload member) | now |

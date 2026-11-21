@@ -544,11 +544,7 @@ where
         if identity_key_id != identity || target_key_id != identity || proposer == identity {
             continue;
         }
-        let receipt = match dir.edition2_roster_proposal(&id).await {
-            Ok(r) => r,
-            Err(Error::Unsupported { .. }) => None,
-            Err(e) => return Err(e),
-        };
+        let receipt = dir.edition2_roster_proposal(&id).await?;
         if receipt.is_some_and(|r| r.outcome.as_deref().is_some_and(|o| landed.contains(&o))) {
             since = Some(since.map_or(asserted_at, |s| s.min(asserted_at)));
         }
@@ -1641,7 +1637,6 @@ where
     // successors).
     let settled = match dir.edition2_roster_proposal(&id).await {
         Ok(r) => r.and_then(|r| r.outcome),
-        Err(Error::Unsupported { .. }) => None,
         Err(e) => return Err(e),
     };
     match settled.as_deref() {
@@ -1902,11 +1897,7 @@ where
         landed_outcome(LandingPath::Quorum),
         landed_outcome(LandingPath::Lone),
     ];
-    let receipt = match dir.edition2_roster_proposal(&row.hex()).await {
-        Ok(r) => r,
-        Err(Error::Unsupported { .. }) => None,
-        Err(e) => return Err(e),
-    };
+    let receipt = dir.edition2_roster_proposal(&row.hex()).await?;
     let outcome = receipt.and_then(|r| r.outcome);
     let void = outcome.as_deref() == Some(VOID_OUTCOME);
     if !void && !outcome.as_deref().is_some_and(|o| landed.contains(&o)) {
@@ -2163,11 +2154,7 @@ async fn void_for_reader<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    let settled = match dir.list_settled_edition2_roster_proposals(identity).await {
-        Ok(r) => r,
-        Err(Error::Unsupported { .. }) => Vec::new(),
-        Err(e) => return Err(e),
-    };
+    let settled = dir.list_settled_edition2_roster_proposals(identity).await?;
     let landed = [
         landed_outcome(LandingPath::Quorum),
         landed_outcome(LandingPath::Lone),
@@ -2245,8 +2232,9 @@ where
         .ok_or_else(|| Error::unknown_signer(identity, "self_roster"))
 }
 
-/// v62.0.0 (wave O1, S1) — this node's open edition-2 receipts; none from a
-/// directory that keeps no edition-2 store (`Unsupported`).
+/// v62.0.0 (wave O1, S1) — this node's open edition-2 receipts. v62.0.0
+/// (PX-fix3) — a directory that keeps no edition-2 store (`Unsupported`) is an
+/// error, never "none open" (I2190).
 async fn open_edition2_receipts<D>(
     dir: &D,
     identity: Option<&str>,
@@ -2254,11 +2242,7 @@ async fn open_edition2_receipts<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    match dir.list_open_edition2_roster_proposals(identity).await {
-        Ok(r) => Ok(r),
-        Err(Error::Unsupported { .. }) => Ok(Vec::new()),
-        Err(e) => Err(e),
-    }
+    dir.list_open_edition2_roster_proposals(identity).await
 }
 
 /// Settle a proposal in the ledger that holds it: an edition-2 bind's in

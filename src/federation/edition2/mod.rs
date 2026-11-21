@@ -54,6 +54,12 @@ pub(crate) mod fixture_genesis_real_custody;
 pub mod fixture_occurrence;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod fixture_switch;
+// v62.0.0 (RL-fix1, ruling (B)) — accord rows a rootless node skips, and the
+// feed watermarks it re-pulls from once rooted.
+pub mod accord_rescan;
+// v62.0.0 (RL-fix2) — first contact by node code: the local dial hint, the
+// checked pre-seal admission and the post-seal owner check.
+pub mod contact;
 pub mod fold;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod fold_invariants;
@@ -69,6 +75,15 @@ mod admission_fold_invariants;
 // v62.0.0 (wave GC8) — the CC 2.7 conversion's witnesses (I3950–I3960).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod fold_gc8_invariants;
+// v62.0.0 (RL-fix1; CC 5.3.4) — a rootless node runs the P2P mesh (I2240–I2243).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod rootless_mesh_invariants;
+// v62.0.0 (RL-fix1, ruling (B)) — I2246: accord rows skipped rootless, rescanned once rooted.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod accord_rescan_invariants;
+// v62.0.0 (RL-fix2) — I2247–I2252: first contact by node code.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod contact_invariants;
 // v62.0.0 (wave W1b) — a ROOTED edition-2 trust root, for any test.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod fixture_trust_root;
@@ -83,12 +98,22 @@ pub mod liveness;
 pub mod names;
 pub mod occurrence;
 pub mod payloads;
+/// v62.0.0 (PR-fix1; CC 3.2 T8) — is this peer Rooted for this reader.
+pub mod peer_rooting;
 pub mod produce;
 pub mod projection;
 pub mod recovery_signer;
 // v62.0.0 (P10; CC rc21 2.7.11) — SCITT receipts (RFC 9942, label 394) held
 // with their statements; the receipt leg of running admitted code.
 pub mod receipts;
+// v62.0.0 (AU-fix1; CC rc21 2.7.11) — the host's whole answer for a unit an
+// `admission:unit` row admits: concluded, in lease, not withdrawn, signers
+// persons, standing at this host, and the receipt.
+pub mod admission_unit;
+// v62.0.0 (AU-fix1) — I2150–I2161: the count, the voice listing and the
+// answer, on sqlite and postgres.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod admission_unit_invariants;
 // v62.0.0 (v62 P8-fix5; CC 2.6.1.9, 2.7.3, 4.4.3.19) — a second signer's
 // voice over a held row, in any role K2's resolver names: list (by the
 // awaited key), draft, voice, submit, outcome.
@@ -115,6 +140,10 @@ pub(crate) mod voices_invariants;
 mod composer_invariants;
 #[cfg(test)]
 mod door_invariants;
+// v62.0.0 (CE-fix1) — I2280–I2287: the offline ceremony builders
+// (`crate::ceremony`), pure and on sqlite + postgres.
+#[cfg(test)]
+mod ceremony_invariants;
 // v62.0.0 (wave P1e) — I2925: the emit side states every family digest
 // member (needs edition2::payloads, so it lands at syn1 with P1e.patch).
 #[cfg(test)]
@@ -200,6 +229,9 @@ mod projection_invariants;
 // its capsule op and the X-Wing transit pair, on sqlite and postgres.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod rebind_held_invariants;
+// v62.0.0 (PR-fix1) — the peer verdict on sqlite and postgres.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod peer_rooting_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod recovery_signer_invariants;
 // v62.0.0 (JSON-cut slice F) — I2874–I2876: an edition-2 holder recovery,

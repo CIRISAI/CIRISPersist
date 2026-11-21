@@ -728,7 +728,7 @@ pub(crate) async fn resolve_trust_root_signal(
 
     let mut first: Option<(String, TrustRootVerdict)> = None;
     for root in candidates {
-        match super::trust_root::trust_root_valid(directory, user, &root).await {
+        match super::trust_root::trust_root_valid(directory, user, &root, now).await {
             Ok(v) if v.valid => {
                 return trust_root_signal(
                     TrustRootStanding::Valid,

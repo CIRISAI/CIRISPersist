@@ -1840,7 +1840,14 @@ mod tests {
         // pin of 402 (counted from the file by the predicate below).
         // v62.0.0 (X2 pass 4d.2): set ONCE from the registry on the merged tree
         // (402 src/ rows), not from any single patch's value.
-        const EXPECTED: usize = 400;
+        // v62.0.0 (4f-regen): -2, recounted from the registry on the merged
+        // tree: F0-cp9r deleted CLM-signed-object at `check_content_hash` and
+        // CLM-witnessed-lineage at `admit_lineage_head_cosign` with their fns.
+        // v62.0.0 (PR-fix1): +1, CLM-standing-verdict at the peer verdict
+        // (`edition2::peer_rooting::peer_rooting`). Recount on a merge.
+        // v62.0.0 (4g-regen): recounted from the registry on the merged 4g tree
+        // (405 src/ rows).
+        const EXPECTED: usize = 405;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

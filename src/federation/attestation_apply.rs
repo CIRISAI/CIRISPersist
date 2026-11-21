@@ -136,6 +136,16 @@ pub enum AttestationRefusalReason {
     /// ([`Self::is_local_decline`]). Only the earlier form can reach it: an
     /// edition-2 row is applied as its statement and the fold decides it.
     NotInAudience,
+    /// v62.0.0 (RL-fix1, lead ruling (B); CC 5.4: a node "carries none it
+    /// cannot verify") — an accord row (a halt invocation, notify, drill or
+    /// lifecycle row) offered to a node that holds NO genesis bundle, so no
+    /// accord root to judge it under. Not kept, the store untouched, and the
+    /// sender's cursor ADVANCES (a bundle never arrives down a feed, so a
+    /// wait here would hold the feed forever). A LOCAL decline: the
+    /// door called with the host's feed position records a watermark
+    /// (`edition2::accord_rescan`), and the host re-pulls from it once a
+    /// bundle is in force. APPENDED.
+    AccordRootNotHeld,
 }
 
 impl AttestationRefusalReason {
@@ -154,6 +164,7 @@ impl AttestationRefusalReason {
             Self::SelfRosterPending => "self_roster_pending",
             Self::GroupPlaneRefused => "group_plane_refused",
             Self::NotInAudience => "not_in_audience",
+            Self::AccordRootNotHeld => "accord_root_not_held",
         }
     }
 
@@ -165,7 +176,10 @@ impl AttestationRefusalReason {
     pub const fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::SelfRosterPending | Self::StoreConflict | Self::NotInAudience
+            Self::SelfRosterPending
+                | Self::StoreConflict
+                | Self::NotInAudience
+                | Self::AccordRootNotHeld
         )
     }
 
@@ -175,7 +189,7 @@ impl AttestationRefusalReason {
     /// against it, and it is taken once the local answer changes.
     #[must_use]
     pub const fn is_local_decline(&self) -> bool {
-        matches!(self, Self::NotInAudience)
+        matches!(self, Self::NotInAudience | Self::AccordRootNotHeld)
     }
 
     /// The reason a self-roster door's [`Error::SelfRosterNotLanded`] maps to:
@@ -200,6 +214,7 @@ impl AttestationRefusalReason {
         Self::SelfRosterPending,
         Self::GroupPlaneRefused,
         Self::NotInAudience,
+        Self::AccordRootNotHeld,
     ];
 }
 
@@ -657,9 +672,9 @@ where
                 incoming,
             )?)
         }
-        // The #603 arm: this directory cannot answer, so apply plan-free.
-        Err(Error::Unsupported { .. }) => None,
-        // Every other failure is *could not ask*, which is never *absent*.
+        // v62.0.0 (PX-fix3) — the #603 plan-free arm is gone: a directory that
+        // cannot answer (`Unsupported`) fails like every other could-not-ask,
+        // which is never *absent* (I2190).
         Err(e) => return Err(e),
     };
     match planned {
@@ -1066,65 +1081,9 @@ mod tests {
         );
     }
 
-    /// `Refused { StoreConflict }` — the plan-free fallback: a directory that
-    /// cannot answer `get_attestation` (the #603 `Unsupported` arm) still
-    /// applies, and a duplicate id surfaces as the store-step conflict, not
-    /// as a `federation_backend` error. This is the Key plane's plan-free
-    /// default-body shape, reached through the double built for exactly this
-    /// arm.
-    #[tokio::test]
-    async fn apply_without_a_plan_maps_duplicate_key_to_store_conflict() {
-        let author = "att-apply-race-author";
-        let dir = std::sync::Arc::new(test_backend_with_author(author).await);
-        let first = sealed_row(author, envelope(DIMENSION, serde_json::json!({})));
-        dir.apply_replicated_attestation(SignedAttestation {
-            attestation: first.clone(),
-        })
-        .await
-        .expect("first apply");
-
-        let planless = crate::federation::directory_double::FaultInjectingDirectory::new(
-            dir.clone() as std::sync::Arc<dyn FederationDirectory>,
-        )
-        .unsupported("get_attestation");
-        // v50.0.0 (CIRISPersist#917 review) — the held row re-offered where no
-        // plan can run: the store answers `AlreadyHeld`, the same answer a lost
-        // plan/act race gets, and that is `Unchanged` on both typed doors —
-        // never `Inserted`, which would claim a state change that did not
-        // happen.
-        assert_eq!(
-            planless
-                .apply_replicated_attestation(SignedAttestation {
-                    attestation: first.clone(),
-                })
-                .await
-                .expect("plan-free re-offer"),
-            ReplicatedAttestationOutcome::Unchanged
-        );
-        assert_eq!(
-            planless
-                .put_attestation_synced(SignedAttestation { attestation: first }, author)
-                .await
-                .expect("plan-free synced re-offer"),
-            ReplicatedAttestationOutcome::Unchanged
-        );
-        // v62.0.0 (JSON cut, E7) — the earlier "rival mint of the same id"
-        // arm is gone: an edition-2 row id is computed from the row's own
-        // bytes, so different content cannot carry the held row's id (the
-        // door refuses an offered id that is not the computed one).
-        // And a FRESH row through the plan-free door still inserts — the
-        // fallback degrades the plan, not the write.
-        let fresh = sealed_row(author, envelope(DIMENSION, serde_json::json!({})));
-        assert_eq!(
-            planless
-                .apply_replicated_attestation(SignedAttestation { attestation: fresh })
-                .await
-                .expect("fresh apply"),
-            ReplicatedAttestationOutcome::Inserted
-        );
-        // The UNSANCTIONED side is witnessed separately — see
-        // `a_generic_get_failure_propagates_and_does_not_degrade_624`.
-    }
+    // v62.0.0 (PX-fix3) — `apply_without_a_plan_maps_duplicate_key_to_store_conflict`
+    // is deleted with the #603 plan-free arm it witnessed: a directory that
+    // cannot answer `get_attestation` now fails the apply (I2190).
 
     /// v36.0.0 (CIRISPersist#624 M6) — **a generic `get_attestation` failure
     /// must PROPAGATE, never degrade to the plan-free path.**
@@ -1141,6 +1100,8 @@ mod tests {
     /// *this directory cannot answer*, and proceeding plan-free is correct;
     /// `Backend` means *the answer was attempted and failed*, and proceeding
     /// would decide a convergence conflict on evidence the node never read.
+    /// v62.0.0 (PX-fix3) — `Unsupported` no longer degrades either: it
+    /// propagates like this `Backend` failure (I2190).
     #[tokio::test]
     async fn a_generic_get_failure_propagates_and_does_not_degrade_624() {
         let author = "att-apply-geterr-author";

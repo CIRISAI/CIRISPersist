@@ -56,13 +56,13 @@
 //!   refused as unlisted members.
 //! - **I2921** (wave P1e, CC rc21 CC 2.7.11) — `admission:unit`: the member
 //!   list, then the verifier's pure rules with their own tokens: authored XOR
-//!   counted (`admission_unit_malformed`), an owner-alone row at
-//!   `cohort_scope: self` and a counted row at any scope (CC ruling;
-//!   `admission_unit_malformed`), `sub` the unit's digest
+//!   counted (`admission_unit_malformed`), `sub` the unit's digest
 //!   (`admission_unit_malformed`), capabilities closed and non-empty
 //!   (`admission_capability_unknown`), the lease window
-//!   (`admission_lease_out_of_window`), no effect on an authored row
-//!   (`admission_effect_needs_count`); a counted row may name effects.
+//!   (`admission_lease_out_of_window`); AU-fix1 (CC 2.7.11 P2:1682): one
+//!   person's row naming an effect at `self` only
+//!   (`admission_owner_row_not_self`), one naming no effect and a counted row
+//!   at any scope.
 //! - **I2922** (wave P1e) — an `admission:unit` signer is a person:
 //!   `admission_issuer_not_person` for a key whose record holds neither
 //!   `user` nor `accord_holder`; other families are untouched.
@@ -1516,21 +1516,27 @@ fn i2921_an_admission_unit() {
         mr::ADMISSION_UNIT_MALFORMED,
         "I2921 neither"
     );
-    // CC ruling: an owner-alone row is at `cohort_scope: self`; a counted
-    // row at any scope its signers choose.
+    // AU-fix1 (CC 2.7.11 P2:1682): one person's row that names an effect
+    // is at `self` (`admission_owner_row_not_self` elsewhere, an absent scope
+    // included); one that names no effect, and a counted row, at any scope.
     for scope in [Some("federation"), Some("community"), None] {
-        let p = match scope {
+        let at = |caps: &[&str]| match scope {
             Some(sc) => with(
-                &admission_unit(true, &["read"]),
+                &admission_unit(true, caps),
                 vec![("cohort_scope", txt(sc))],
                 &[],
             ),
-            None => with(&admission_unit(true, &["read"]), vec![], &["cohort_scope"]),
+            None => with(&admission_unit(true, caps), vec![], &["cohort_scope"]),
         };
         assert_eq!(
-            admission_reason(&p),
-            mr::ADMISSION_UNIT_MALFORMED,
-            "I2921 an owner-alone row at {scope:?} is not at self"
+            admission_reason(&at(&["compute", "net_send"])),
+            mr::ADMISSION_OWNER_ROW_NOT_SELF,
+            "I2921 one person's effect row at {scope:?} is not at self"
+        );
+        assert_eq!(
+            admission_reason(&at(&["read"])),
+            "ok",
+            "I2921 one person's compute/read row at {scope:?}"
         );
     }
     for sc in ["self", "community", "federation"] {
@@ -1586,11 +1592,12 @@ fn i2921_an_admission_unit() {
         "ok",
         "I2921 exactly unit_lease_max_secs"
     );
-    // An effect needs a count.
+    // AU-fix1 (CC 2.7.11): one person's effect row at `self` is well
+    // formed; it admits only on that person's own host (the host's read).
     assert_eq!(
         admission_reason(&admission_unit(true, &["compute", "actuate"])),
-        mr::ADMISSION_EFFECT_NEEDS_COUNT,
-        "I2921 authored effect"
+        "ok",
+        "I2921 one person's effect row at self"
     );
     // Shape faults stay the list's.
     let unsorted = with(

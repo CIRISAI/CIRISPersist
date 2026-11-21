@@ -220,6 +220,31 @@ mod run {
                     )
                     .await
                 }
+                /// **I2188 (v62.0.0, PX-fix1)** — the node-local touch (the
+                /// replacement for the retired signed `put_touch_claim` a host
+                /// called) crosses the capsule: I3114 runs THROUGH the proxy
+                /// (backend ← capsule dispatch ← `OpsDirectory`), and the
+                /// floor it leaves is the backend's own.
+                #[tokio::test]
+                async fn i2188_the_local_touch_crosses_the_proxy() {
+                    let Some(d) = $fresh.await else { return };
+                    let backend: std::sync::Arc<dyn FederationDirectory> = std::sync::Arc::new(d);
+                    let proxy = crate::ffi::directory_capsule::test_proxy(backend.clone());
+                    bodies::i3114_monotonic_max(proxy.as_ref()).await;
+                    let direct = backend
+                        .freshness_floor("i3114-target", "ownership_binding")
+                        .await
+                        .expect("I2188: the backend's floor");
+                    assert!(direct.is_some(), "I2188: the touch landed on the backend");
+                    assert_eq!(
+                        proxy
+                            .freshness_floor("i3114-target", "ownership_binding")
+                            .await
+                            .expect("I2188: the floor through the proxy"),
+                        direct,
+                        "I2188: the proxy reads the backend's floor"
+                    );
+                }
             }
         };
     }

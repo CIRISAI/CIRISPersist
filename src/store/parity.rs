@@ -936,6 +936,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v62.0.0 (wave V1b, CC 4.4.3.12) — an affiliation's counted officer
     // appointment; at the edition-2 door it waits (`Pending`).
     ("check_officer_appointment_counted", Class::Gate),
+    ("check_admission_unit_counted", Class::Gate),
     // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — refuses a community record
     // whose declared cohort or affiliation config is malformed or invalid.
     ("check_community_record", Class::Gate),

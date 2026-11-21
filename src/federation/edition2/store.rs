@@ -21,7 +21,7 @@
 use super::door::AdmittedRow;
 
 /// The `ceg_statements` columns, in the baseline's order.
-pub const STATEMENT_COLUMNS: [&str; 12] = [
+pub const STATEMENT_COLUMNS: [&str; 13] = [
     "statement_id",
     "row_id",
     "typ",
@@ -34,6 +34,8 @@ pub const STATEMENT_COLUMNS: [&str; 12] = [
     "asserted_at_ms",
     "bytes",
     "admitted_us",
+    // AU-fix3 — written once at insert, never updated.
+    "first_held_us",
 ];
 
 /// The `ceg_row_names` columns.
@@ -266,8 +268,8 @@ pub fn put_row_sqlite(
     let n = tx
         .execute(
             "INSERT OR IGNORE INTO ceg_statements (statement_id, row_id, typ, row_type, family, \
-             kid, iss, sub, author, asserted_at_ms, bytes, admitted_us) VALUES (?1, ?2, ?3, ?4, \
-             ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             kid, iss, sub, author, asserted_at_ms, bytes, admitted_us, first_held_us) VALUES \
+             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
             rusqlite::params![
                 &row.statement_id[..],
                 &row.row_id.0[..],
@@ -377,8 +379,9 @@ where
     let n = client
         .execute(
             "INSERT INTO cirislens.ceg_statements (statement_id, row_id, typ, row_type, family, \
-             kid, iss, sub, author, asserted_at_ms, bytes, admitted_us) VALUES ($1, $2, $3, $4, \
-             $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (statement_id) DO NOTHING",
+             kid, iss, sub, author, asserted_at_ms, bytes, admitted_us, first_held_us) VALUES \
+             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12) ON CONFLICT (statement_id) \
+             DO NOTHING",
             &[
                 &&row.statement_id[..],
                 &&row.row_id.0[..],
@@ -491,6 +494,47 @@ pub fn voices_of_sqlite(
     rows.collect::<Result<Vec<_>, _>>().map_err(be)
 }
 
+/// v62.0.0 (AU-fix1, AU-fix3) — sqlite: the least `first_held_us` (written
+/// once at insert, never updated) over the held voices of one row id (`None` when none is held).
+///
+/// # Errors
+/// sqlite errors.
+#[cfg(feature = "sqlite")]
+pub fn first_held_us_sqlite(
+    conn: &rusqlite::Connection,
+    row_id: &super::names::RowId,
+) -> Result<Option<i64>, crate::federation::Error> {
+    conn.query_row(
+        "SELECT MIN(first_held_us) FROM ceg_statements WHERE row_id = ?1",
+        rusqlite::params![&row_id.0[..]],
+        |r| r.get::<_, Option<i64>>(0),
+    )
+    .map_err(|e| crate::federation::Error::Backend(format!("ceg_statements: {e}")))
+}
+
+/// v62.0.0 (AU-fix1, AU-fix3) — postgres: the least `first_held_us`
+/// (written once at insert, never updated) over the held voices of one row id (`None` when none is held).
+///
+/// # Errors
+/// postgres errors.
+#[cfg(feature = "postgres")]
+pub async fn first_held_us_postgres<C>(
+    client: &C,
+    row_id: &super::names::RowId,
+) -> Result<Option<i64>, crate::federation::Error>
+where
+    C: deadpool_postgres::GenericClient + Sync,
+{
+    let row = client
+        .query_one(
+            "SELECT MIN(first_held_us) FROM cirislens.ceg_statements WHERE row_id = $1",
+            &[&&row_id.0[..]],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("ceg_statements: {e}")))?;
+    Ok(row.get::<_, Option<i64>>(0))
+}
+
 /// postgres: every held voice (statement) of one row id, as received.
 ///
 /// # Errors
@@ -551,7 +595,7 @@ pub fn put_object_sqlite(
     let n = conn
         .execute(
             "INSERT OR IGNORE INTO ceg_statements (statement_id, row_id, typ, kid, iss, bytes, \
-             admitted_us) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             admitted_us, first_held_us) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
             rusqlite::params![
                 &o.statement_id[..],
                 &o.object_id.0[..],
@@ -613,8 +657,8 @@ where
     let n = client
         .execute(
             "INSERT INTO cirislens.ceg_statements (statement_id, row_id, typ, kid, iss, bytes, \
-             admitted_us) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (statement_id) DO \
-             NOTHING",
+             admitted_us, first_held_us) VALUES ($1, $2, $3, $4, $5, $6, $7, $7) ON CONFLICT \
+             (statement_id) DO NOTHING",
             &[
                 &&o.statement_id[..],
                 &&o.object_id.0[..],

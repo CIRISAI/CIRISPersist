@@ -899,8 +899,9 @@ pub struct TrustRootVerdict {
     /// gate is its only gate. It stays on the verdict because a halt must be
     /// observable.
     pub halt_latched: Option<bool>,
-    /// The gate: every leg holds (including charter recovery and holder
-    /// hardware). Neither the drill nor the halt latch is a leg.
+    /// The gate: every leg holds (the edge, the charter, its recovery
+    /// commitment). Neither the drill, the halt latch nor holder custody is a
+    /// leg (v62.0.0 TR-fix1; CC rc21 3.2 T8 l.1255).
     pub valid: bool,
     /// v24.0.0 (CIRISPersist#557) — which arm produced this verdict. `#[serde(default)]`
     /// = [`RootKind::Key`], so payloads from pre-v24 producers deserialize unchanged.
@@ -920,9 +921,10 @@ pub struct TrustRootVerdict {
     /// nothing judged and [`Self::holders_hardware_attested`] false.
     #[serde(default)]
     pub holders_hardware: Vec<HolderHardware>,
-    /// v47.3.0 (CIRISPersist#901) — the leg: every entry of
+    /// v47.3.0 (CIRISPersist#901) — every entry of
     /// [`Self::holders_hardware`] passes Layer A and no entry fails Layer B.
-    /// Folded into [`Self::valid`]. A root is as attested as its holders.
+    /// v62.0.0 (TR-fix1; CC rc21 3.2 T8 l.1255) — REPORTED, no longer folded
+    /// into [`Self::valid`]: custody is gated where a bundle seats the key.
     #[serde(default)]
     pub holders_hardware_attested: bool,
     /// v24.1.0 (CIRISPersist#561) — **the instant this verdict can first stop
@@ -987,6 +989,7 @@ fn community_not_rooted_verdict(reason: String) -> TrustRootVerdict {
 async fn community_record_not_rooted<F>(
     directory: &F,
     root_ref: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<String>, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -998,13 +1001,7 @@ where
         return Ok(None);
     }
     use super::canonical_community::StoredStanding;
-    let why = match super::canonical_community::chain_standing_at(
-        directory,
-        root_ref,
-        crate::host::clock::now(),
-    )
-    .await?
-    {
+    let why = match super::canonical_community::chain_standing_at(directory, root_ref, now).await? {
         StoredStanding::NotRooted { reason } => reason,
         StoredStanding::Absent => "no community row".to_owned(),
         StoredStanding::Rooted(_) | StoredStanding::Stalled { .. } => {
@@ -1154,7 +1151,6 @@ where
     .await;
     let by_node = match read {
         Ok(()) => with_slice_composers(directory, rows, None, Some(node_key_id)).await?,
-        Err(Error::Unsupported { .. }) => Vec::new(),
         Err(e) => return Err(e),
     };
     let refs: Vec<&Attestation> = by_node.iter().collect();
@@ -1239,10 +1235,9 @@ pub(crate) fn tombstoned_ids(rows: &[&Attestation]) -> std::collections::HashSet
 /// this node has stored?
 ///
 /// The ONE place the two arms of [`trust_root_valid`] are chosen between, so
-/// they can never be selected by two different rules. A backend that cannot
-/// answer (the FFI directory capsule reports [`Error::Unsupported`] for
-/// `lookup_family`) reads as "no family" — the pre-v24 key-only behaviour —
-/// rather than guessing, exactly as the halt leg already does.
+/// they can never be selected by two different rules. v62.0.0 (PX-fix3) — a
+/// directory that cannot answer (`Unsupported`) propagates; it no longer reads
+/// as "no family" (I2190).
 /// `pub(crate)` since v28.3.0 — [`crate::federation::mesh_config`] asks the
 /// same question (KEY root or FAMILY root?) to decide what "the root's own
 /// quorum" means for a durable config row, and asking it a second way is how
@@ -1254,11 +1249,7 @@ pub(crate) async fn resolve_family_root<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    match directory.lookup_family(root_ref).await {
-        Ok(found) => Ok(found),
-        Err(Error::Unsupported { .. }) => Ok(None),
-        Err(e) => Err(e),
-    }
+    directory.lookup_family(root_ref).await
 }
 
 /// v24.0.0 (CIRISPersist#557) — the threshold this node's OWN state demands of
@@ -1384,7 +1375,6 @@ where
         let roster: Vec<String> = match directory.active_family_members(&family.family_key_id).await
         {
             Ok(members) => members.into_iter().map(|m| m.key_id).collect(),
-            Err(Error::Unsupported { .. }) => Vec::new(),
             Err(e) => return Err(e),
         };
         let counted =
@@ -1423,7 +1413,6 @@ where
     // being frozen at admission.
     let roster: Vec<String> = match directory.active_family_members(&family.family_key_id).await {
         Ok(members) => members.into_iter().map(|m| m.key_id).collect(),
-        Err(Error::Unsupported { .. }) => Vec::new(),
         Err(e) => return Err(e),
     };
     Ok(family_quorum_holders_over_roster(directory, envelope, scrubs, family, roster).await)
@@ -1448,7 +1437,6 @@ where
     let roster: Vec<String> =
         match super::authorized_family_roster_at(directory, family, as_of).await {
             Ok(members) => members.into_iter().map(|m| m.key_id).collect(),
-            Err(Error::Unsupported { .. }) => Vec::new(),
             Err(e) => return Err(e),
         };
     Ok(family_quorum_holders_over_roster(directory, envelope, scrubs, family, roster).await)
@@ -1492,7 +1480,8 @@ where
 /// 2. `root` self-declares (`delegates_to(root → root)` with an
 ///    `infra:attest` / `infra:serve` scope), live, carrying a recovery
 ///    pre-commitment;
-/// 3. every holder of a family root is hardware-attested (v47.3.0, #901).
+/// 3. (reported, not a leg since v62.0.0 TR-fix1, CC rc21 3.2 T8) every
+///    holder of a family root is hardware-attested (v47.3.0, #901).
 ///
 /// A latched constitutional halt is **not** a leg (v58.0.0, CIRISPersist#1094;
 /// CC 3.2 T3/T8 and 4.2.1.1 as ruled 2026-10-15). It is read and reported as
@@ -1539,13 +1528,14 @@ pub async fn trust_root_valid<F>(
     directory: &F,
     user_key_id: &str,
     root_ref: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<TrustRootVerdict, Error>
 where
     F: FederationDirectory + ?Sized,
 {
     crate::observe::fold(
         crate::observe::Fold::TrustRootValid,
-        trust_root_valid_body(directory, user_key_id, root_ref),
+        trust_root_valid_body(directory, user_key_id, root_ref, now),
     )
     .await
 }
@@ -1563,15 +1553,10 @@ pub struct OwnChain {
     pub chartered: bool,
 }
 
-/// The live acceptance edge leg of `user` to `root` (the kernel's one-hop
-/// walk over the user's labelled edges and their composers), and whether
-/// `user` holds any `trust:accepts:v1` row at all.
-async fn acceptance_of<F>(
-    directory: &F,
-    user: &str,
-    root: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<(bool, bool), Error>
+/// `user`'s acceptance slice: its `delegates_to` / `supersedes` rows that are
+/// not another trust job, with their composers, and whether `user` holds any
+/// `trust:accepts:v1` row at all.
+async fn acceptance_slice<F>(directory: &F, user: &str) -> Result<(Vec<Attestation>, bool), Error>
 where
     F: FederationDirectory + ?Sized,
 {
@@ -1584,14 +1569,128 @@ where
     while let Some(page) = pages.next(directory).await? {
         rows.extend(page);
     }
-    let signed_any = rows.iter().any(|a| {
-        a.attestation_type == attestation_type::DELEGATES_TO
-            && super::admission::envelope_dimension(&a.attestation_envelope)
-                == Some(TRUST_ACCEPTS_DIMENSION)
-    });
+    let signed_any = rows.iter().any(is_labelled_acceptance);
     let by_user = with_slice_composers(directory, rows, None, Some(user)).await?;
+    Ok((by_user, signed_any))
+}
+
+/// A `delegates_to` row labelled `trust:accepts:v1` (live or not).
+fn is_labelled_acceptance(a: &Attestation) -> bool {
+    a.attestation_type == attestation_type::DELEGATES_TO
+        && super::admission::envelope_dimension(&a.attestation_envelope)
+            == Some(TRUST_ACCEPTS_DIMENSION)
+}
+
+/// The live acceptance edge leg of `user` to `root` (the kernel's one-hop
+/// walk over the user's labelled edges and their composers), whether `user`
+/// holds any `trust:accepts:v1` row at all, and whether it holds one toward
+/// `root` (live or not: the reason split of [`ChainLegs::edge_held`]).
+async fn acceptance_of<F>(
+    directory: &F,
+    user: &str,
+    root: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(bool, bool, bool), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let (by_user, signed_any) = acceptance_slice(directory, user).await?;
+    let held = by_user
+        .iter()
+        .any(|a| is_labelled_acceptance(a) && a.attested_key_id == root);
     let edge = kernel_edge_leg(directory, &by_user, user, root, now).await?;
-    Ok((edge.value, signed_any))
+    Ok((edge.value, signed_any, held))
+}
+
+/// The key whose acceptance edges a node reads (CC 3.2 T3, "Acceptance is the
+/// owner's"): its owner once the owner has signed any acceptance edge; until
+/// then the node itself. An ambiguous owner reads as unowned.
+async fn governing_owner<F>(directory: &F, node: &str) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let owner = match super::admission::owner_of_unmarked(directory, node).await {
+        Ok(o) => o,
+        Err(Error::AmbiguousNodeOwner { .. }) => None,
+        Err(e) => return Err(e),
+    };
+    Ok(owner.filter(|o| o != node))
+}
+
+/// v62.0.0 (PR-fix1; CC 3.2 T3) — the roots `node`'s governing acceptor
+/// (its owner once the owner has signed any acceptance edge, else the node)
+/// names by a `trust:accepts:v1` row, live or not, in the order held. A
+/// candidate list for a standing read: whether each edge is live is the
+/// kernel's ([`chain_legs_of`]), never this list's.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub(crate) async fn accepted_roots_of<F>(directory: &F, node: &str) -> Result<Vec<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut slice = None;
+    if let Some(o) = governing_owner(directory, node).await? {
+        let (rows, any) = acceptance_slice(directory, &o).await?;
+        if any {
+            slice = Some((o, rows));
+        }
+    }
+    let (acceptor, rows) = match slice {
+        Some(s) => s,
+        None => (node.to_owned(), acceptance_slice(directory, node).await?.0),
+    };
+    let mut roots: Vec<String> = Vec::new();
+    for a in rows.iter().filter(|a| is_labelled_acceptance(a)) {
+        if a.attested_key_id != acceptor && !roots.contains(&a.attested_key_id) {
+            roots.push(a.attested_key_id.clone());
+        }
+    }
+    Ok(roots)
+}
+
+/// v62.0.0 (PR-fix1; CC 3.2 T3, T8 `NotRooted`) — the charter leg of a T3
+/// chain, split by why it fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CharterLeg {
+    /// A live labelled self-charter with scope `infra:serve` and
+    /// `infra:attest` and a well-formed pre-rotation commitment
+    /// ([`OwnChain::chartered`]).
+    Complete,
+    /// A live labelled self-charter is held, but none carries both scopes and
+    /// a well-formed commitment (T8: "the charter missing its recovery
+    /// commitment or its scope").
+    MissingCommitmentOrScope,
+    /// Every labelled self-charter held is withdrawn, recanted, tombstoned or
+    /// expired (T8: "the charter … withdrawn").
+    NotLive,
+    /// No labelled self-charter is held.
+    Absent,
+}
+
+/// v62.0.0 (PR-fix1) — the legs of a node's T3 chain to a root, with the
+/// reason split a verdict names. [`Self::own_chain`] is [`OwnChain`] exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainLegs {
+    /// [`OwnChain::accepted`].
+    pub accepted: bool,
+    /// The governing acceptor (the key whose edges are read for `accepted`)
+    /// holds a `trust:accepts:v1` row toward the root, live or not.
+    pub edge_held: bool,
+    /// The charter leg.
+    pub charter: CharterLeg,
+}
+
+impl ChainLegs {
+    /// The two legs as [`OwnChain`].
+    #[must_use]
+    pub fn own_chain(&self) -> OwnChain {
+        OwnChain {
+            accepted: self.accepted,
+            chartered: self.charter == CharterLeg::Complete,
+        }
+    }
 }
 
 /// v62.0.0 (wave W1b; CC 3.2 T3, CC 4.4.3.34) — **THIS node's own T3 chain to
@@ -1604,6 +1703,8 @@ where
 /// charter). Reads rows only: it never resolves a community arm, so a
 /// standing read may call it.
 ///
+/// v62.0.0 (PR-fix1) — [`chain_legs_of`] at this directory's node key.
+///
 /// # Errors
 ///
 /// Directory read failures.
@@ -1615,21 +1716,42 @@ pub async fn own_chain_to<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let accepted = match directory.node_key_id() {
-        None => false,
+    let node = directory.node_key_id();
+    Ok(chain_legs_of(directory, node.as_deref(), root, now)
+        .await?
+        .own_chain())
+}
+
+/// v62.0.0 (PR-fix1; CC 3.2 T3) — **a node's T3 chain to `root`, for any
+/// reader node**: the one body behind [`own_chain_to`] (which asks it for
+/// this directory's node key), so a peer verdict judged FOR a named reader
+/// reads the same legs. `node = None`: nothing is accepted.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn chain_legs_of<F>(
+    directory: &F,
+    node: Option<&str>,
+    root: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<ChainLegs, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let (accepted, edge_held) = match node {
+        None => (false, false),
         Some(node) => {
-            let owner = match super::admission::owner_of_unmarked(directory, &node).await {
-                Ok(o) => o,
-                Err(Error::AmbiguousNodeOwner { .. }) => None,
-                Err(e) => return Err(e),
-            };
-            let by_owner = match owner.as_deref() {
-                Some(o) if o != node => Some(acceptance_of(directory, o, root, now).await?),
-                _ => None,
+            let by_owner = match governing_owner(directory, node).await? {
+                Some(o) => Some(acceptance_of(directory, &o, root, now).await?),
+                None => None,
             };
             match by_owner {
-                Some((edge, true)) => edge,
-                _ => acceptance_of(directory, &node, root, now).await?.0,
+                Some((edge, true, held)) => (edge, held),
+                _ => {
+                    let (edge, _, held) = acceptance_of(directory, node, root, now).await?;
+                    (edge, held)
+                }
             }
         }
     };
@@ -1644,22 +1766,37 @@ where
     let by_root = with_slice_composers(directory, rows, None, Some(root)).await?;
     let refs: Vec<&Attestation> = by_root.iter().collect();
     let dead = tombstoned_ids(&refs);
-    let chartered = by_root.iter().any(|a| {
+    let labelled = |a: &&Attestation| {
         a.attestation_type == attestation_type::DELEGATES_TO
             && a.attesting_key_id == root
             && a.attested_key_id == root
-            && !dead.contains(&a.attestation_id)
-            && !is_expired(a, now)
-            && counts_in_capability_walk(a)
             && super::admission::envelope_dimension(&a.attestation_envelope)
                 == Some(TRUST_CHARTER_DIMENSION)
-            && scope_contains(&a.attestation_envelope, INFRA_SERVE_SCOPE)
+    };
+    let live = |a: &&Attestation| {
+        !dead.contains(&a.attestation_id) && !is_expired(a, now) && counts_in_capability_walk(a)
+    };
+    let complete = |a: &&Attestation| {
+        scope_contains(&a.attestation_envelope, INFRA_SERVE_SCOPE)
             && scope_contains(&a.attestation_envelope, INFRA_ATTEST_SCOPE)
             && charter_commitment_well_formed(&a.attestation_envelope)
-    });
-    Ok(OwnChain {
+    };
+    let charter = if by_root
+        .iter()
+        .any(|a| labelled(&a) && live(&a) && complete(&a))
+    {
+        CharterLeg::Complete
+    } else if by_root.iter().any(|a| labelled(&a) && live(&a)) {
+        CharterLeg::MissingCommitmentOrScope
+    } else if by_root.iter().any(|a| labelled(&a)) {
+        CharterLeg::NotLive
+    } else {
+        CharterLeg::Absent
+    };
+    Ok(ChainLegs {
         accepted,
-        chartered,
+        edge_held,
+        charter,
     })
 }
 
@@ -1882,6 +2019,7 @@ async fn trust_root_valid_body<F>(
     directory: &F,
     user_key_id: &str,
     root_ref: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<TrustRootVerdict, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -1927,7 +2065,7 @@ where
     let mut legs_ref = root_ref.to_owned();
     if family.is_none() {
         if let Some(family_id) =
-            super::canonical_community::rooted_community_family(directory, root_ref).await?
+            super::canonical_community::rooted_community_family_at(directory, root_ref, now).await?
         {
             family = resolve_family_root(directory, &family_id).await?;
             legs_ref = family_id;
@@ -1941,7 +2079,7 @@ where
     // valid, by name. Else a community whose founders' count went short would
     // read valid as the 1-of-1 key root at its own identity-ref.
     if root_kind == RootKind::Key {
-        if let Some(reason) = community_record_not_rooted(directory, root_ref).await? {
+        if let Some(reason) = community_record_not_rooted(directory, root_ref, now).await? {
             return Ok(community_not_rooted_verdict(reason));
         }
     }
@@ -1995,7 +2133,9 @@ where
     }
     let about_root = with_slice_composers(directory, about_selected, Some(legs_ref), None).await?;
 
-    let now = crate::host::clock::now();
+    // v62.0.0 (TR-fix1; CC 3.2 T8) — `now` is the caller's signer-stamped
+    // instant: V "is evaluated at a signer-stamped instant, never the
+    // evaluating clock" (rc21 3.2 l.1251).
 
     // 1. Edge: live (non-tombstoned, non-expired) delegates_to(user → root).
     // v23.0.0 (#551 item 2): the row may NAME itself `trust:accepts:v1`; one
@@ -2144,7 +2284,6 @@ where
                     let roster_size =
                         match directory.active_family_members(&fam.family_key_id).await {
                             Ok(m) => m.len(),
-                            Err(Error::Unsupported { .. }) => 0,
                             Err(e) => return Err(e),
                         };
                     CharterQuorum {
@@ -2222,8 +2361,8 @@ where
         .max();
     let drill_freshness = DrillFreshness::of(last_drill_at.map(|t| now.signed_duration_since(t)));
 
-    // 4. Halt latch (kill-switch state), REPORTED ONLY. Unsupported backends
-    // report None — honestly unknown, never guessed.
+    // 4. Halt latch (kill-switch state), REPORTED ONLY. v62.0.0 (PX-fix3) —
+    // a directory that cannot answer (`Unsupported`) propagates (I2190).
     // v24.0.0 (CIRISPersist#557) — on the FAMILY arm this argument is finally
     // the kind of id the halt table is keyed by (`accord_active_halt` has
     // `family_key_id` as its PRIMARY KEY), so the accord's 2-of-3 kill switch
@@ -2231,7 +2370,6 @@ where
     // it stays a key id and, as before, resolves to "no halt".
     let halt_latched = match directory.get_active_halt(legs_ref).await {
         Ok(v) => Some(v.is_some()),
-        Err(Error::Unsupported { .. }) => None,
         Err(e) => return Err(e),
     };
 
@@ -2249,8 +2387,15 @@ where
     // under a halt, which CC 4.2.1.1 names as a breaker. The latch is still
     // READ and reported beside the verdict — a halt must be observable —
     // exactly as the drill is.
-    let valid =
-        edge_exists && root_self_declares && charter_has_recovery && holders_hardware_attested;
+    // v62.0.0 (TR-fix1; CC rc21 3.2 T8 l.1255, ruled with Constitution
+    // 2026-11-20) — holder custody is DELIBERATELY absent too: "Holder custody
+    // (CC 4.2.2.1) is an admission gate at the seating row, never a leg of V —
+    // an attestation chain can lapse without a row, and V has no inputs but
+    // rows". The gate is the genesis bundle that seats each holder key
+    // (`edition2::genesis` custody gate, per seated key, every bundle in
+    // force). `holders_hardware` / `holders_hardware_attested` stay REPORTED
+    // beside the verdict, like the drill and the halt.
+    let valid = edge_exists && root_self_declares && charter_has_recovery;
 
     // v24.1.0 (CIRISPersist#561) — when this verdict can first lapse on time.
     // Each leg survives while ANY of its rows is live (latest expiry wins,
@@ -2418,6 +2563,7 @@ pub async fn capability_roots_to_trusted_root<F>(
     user_key_id: &str,
     subject_key_id: &str,
     scope: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<TrustedGrant>, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -2428,6 +2574,7 @@ where
         subject_key_id,
         scope,
         &super::admission::accord_holder_roster(directory).await?,
+        now,
     )
     .await
 }
@@ -2530,30 +2677,23 @@ where
     Ok(false)
 }
 
-/// v22.1.0 (CIRISPersist#548) — the roster-parameterized core of
-/// [`capability_roots_to_trusted_root`], mirroring the
-/// [`has_accord_conferred_role`](super::admission::has_accord_conferred_role) /
-/// [`has_accord_conferred_role_over_roster`](super::admission::has_accord_conferred_role_over_roster)
-/// split and for the same reason: the production roster is the node's OWN
-/// genesis-derived accord holders (whose private halves live in the #268
-/// hardware ceremony), so an explicit-roster variant is the only way a test
-/// or a downstream conformance run can drive the ceremony arm with keys it
-/// actually holds.
-// v30.3.0 (CIRISPersist#611) — generic over `?Sized` rather than taking
-// `&dyn FederationDirectory`, matching `trust_root_valid` and
-// `family_quorum_over`, which were already written this way. The change is
-// source-compatible (every `&dyn` and `&Concrete` call site still compiles) and
-// it is what lets a DEFAULT TRAIT METHOD reach this resolver: inside a default
-// body `Self` is not known to be `Sized`, so `&self` does not coerce to `&dyn`.
-// `lookup_trusted_publisher_chain` is such a method, and that coercion was the
-// only thing standing between it and the conferral check #611 needed.
-pub async fn capability_roots_to_trusted_root_over_roster<F>(
+/// v62.0.0 (PR-fix1; CC 3.2 T2) — **the live conferral rows about
+/// `subject` carrying `scope`, at `now`**: the conferral-shaped rows
+/// (`delegates_to` / a rotating `supersedes`, labelled `trust:confers:v1` or
+/// unlabelled, not a self-grant, not tombstoned or expired at `now`) that
+/// confer now ([`live_conferrals`]). The one body behind
+/// [`capability_roots_to_trusted_root_over_roster`]'s candidate roots and
+/// the peer verdict's delegation plane (`edition2::peer_rooting`).
+///
+/// # Errors
+///
+/// Directory read failures.
+pub(crate) async fn live_conferral_rows<F>(
     directory: &F,
-    user_key_id: &str,
     subject_key_id: &str,
     scope: &str,
-    accord_roster_key_ids: &[String],
-) -> Result<Option<TrustedGrant>, Error>
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<Attestation>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
@@ -2574,7 +2714,7 @@ where
         with_slice_composers(directory, conferrals, Some(subject_key_id), None).await?;
     let about_refs: Vec<&Attestation> = about_subject.iter().collect();
     let dead = tombstoned_ids(&about_refs);
-    let now = crate::host::clock::now();
+    // v62.0.0 (TR-fix1; CC 3.2 T8) — `now` is the caller's instant.
 
     // Candidate roots: distinct granters of a live (non-tombstoned,
     // non-expired — #488 delta 3) scoped delegates_to edge to the subject
@@ -2606,6 +2746,41 @@ where
     // [`live_conferrals`].
     let shaped: Vec<&Attestation> = about_subject.iter().filter(conferral_shaped).collect();
     let live = live_conferrals(directory, shaped).await?;
+    Ok(live.into_iter().cloned().collect())
+}
+
+/// v22.1.0 (CIRISPersist#548) — the roster-parameterized core of
+/// [`capability_roots_to_trusted_root`], mirroring the
+/// [`has_accord_conferred_role`](super::admission::has_accord_conferred_role) /
+/// [`has_accord_conferred_role_over_roster`](super::admission::has_accord_conferred_role_over_roster)
+/// split and for the same reason: the production roster is the node's OWN
+/// genesis-derived accord holders (whose private halves live in the #268
+/// hardware ceremony), so an explicit-roster variant is the only way a test
+/// or a downstream conformance run can drive the ceremony arm with keys it
+/// actually holds.
+// v30.3.0 (CIRISPersist#611) — generic over `?Sized` rather than taking
+// `&dyn FederationDirectory`, matching `trust_root_valid` and
+// `family_quorum_over`, which were already written this way. The change is
+// source-compatible (every `&dyn` and `&Concrete` call site still compiles) and
+// it is what lets a DEFAULT TRAIT METHOD reach this resolver: inside a default
+// body `Self` is not known to be `Sized`, so `&self` does not coerce to `&dyn`.
+// `lookup_trusted_publisher_chain` is such a method, and that coercion was the
+// only thing standing between it and the conferral check #611 needed.
+pub async fn capability_roots_to_trusted_root_over_roster<F>(
+    directory: &F,
+    user_key_id: &str,
+    subject_key_id: &str,
+    scope: &str,
+    accord_roster_key_ids: &[String],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<TrustedGrant>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    // v62.0.0 (PR-fix1) — the live conferral rows, by the one body
+    // [`live_conferral_rows`]; TR-fix1: at the caller's instant.
+    let live_rows = live_conferral_rows(directory, subject_key_id, scope, now).await?;
+    let live: Vec<&Attestation> = live_rows.iter().collect();
 
     let mut seen = std::collections::HashSet::new();
     let candidates: Vec<(&str, &str)> = live
@@ -2617,7 +2792,7 @@ where
 
     // First candidate root the user actually trusts wins.
     for (root_key_id, grant_id) in candidates {
-        let verdict = trust_root_valid(directory, user_key_id, root_key_id).await?;
+        let verdict = trust_root_valid(directory, user_key_id, root_key_id, now).await?;
         if verdict.valid {
             return Ok(Some(TrustedGrant {
                 root_key_id: root_key_id.to_owned(),
@@ -2646,9 +2821,7 @@ where
             .await
         {
             Ok(f) => f,
-            // Honestly unknown, never guessed — same treatment the halt leg
-            // gives a backend that cannot answer.
-            Err(Error::Unsupported { .. }) => Vec::new(),
+            // v62.0.0 (PX-fix3) — `Unsupported` propagates (I2190).
             Err(e) => return Err(e),
         };
         for family in families {
@@ -2662,7 +2835,8 @@ where
             if !quorum.met() {
                 continue;
             }
-            let verdict = trust_root_valid(directory, user_key_id, &family.family_key_id).await?;
+            let verdict =
+                trust_root_valid(directory, user_key_id, &family.family_key_id, now).await?;
             if verdict.valid {
                 return Ok(Some(TrustedGrant {
                     root_key_id: family.family_key_id,
@@ -2722,7 +2896,7 @@ where
         )
         .await?
     {
-        let verdict = trust_root_valid(directory, user_key_id, subject_key_id).await?;
+        let verdict = trust_root_valid(directory, user_key_id, subject_key_id, now).await?;
         if verdict.valid {
             return Ok(Some(TrustedGrant {
                 root_key_id: subject_key_id.to_owned(),
@@ -2944,7 +3118,7 @@ where
     let signer_seated = roster
         .as_ref()
         .is_some_and(|r| r.iter().any(|k| k == signer_key_id));
-    let edge_exists = trust_root_valid(directory, self_key_id, root_ref)
+    let edge_exists = trust_root_valid(directory, self_key_id, root_ref, crate::host::clock::now())
         .await?
         .edge_exists;
     Ok(RelayVerdict {
@@ -3655,14 +3829,14 @@ pub(crate) async fn transit_eligibility_walk(
     let mut roots_walked = 0usize;
     for candidate in transit_candidate_roots(&by_user, user_key_id, now) {
         roots_walked += 1;
-        let ours = trust_root_valid(directory, user_key_id, &candidate.root_ref).await?;
+        let ours = trust_root_valid(directory, user_key_id, &candidate.root_ref, now).await?;
         if !ours.valid {
             continue;
         }
         // Only now is the peer's side worth reading: a root WE do not validly
         // trust cannot be a SHARED root however the peer feels about it, and
         // checking us first keeps the per-candidate cost on our own records.
-        let theirs = trust_root_valid(directory, peer_key_id, &candidate.root_ref).await?;
+        let theirs = trust_root_valid(directory, peer_key_id, &candidate.root_ref, now).await?;
         if !theirs.valid {
             continue;
         }
@@ -4460,6 +4634,7 @@ where
             subject_key_id,
             INFRA_SERVE_SCOPE,
             roster_key_ids,
+            crate::host::clock::now(),
         )
         .await?
         .is_some()
@@ -5162,7 +5337,9 @@ pub(crate) mod v53_1_6_reference {
         // valid, by name. Else a community whose founders' count went short would
         // read valid as the 1-of-1 key root at its own identity-ref.
         if root_kind == RootKind::Key {
-            if let Some(reason) = community_record_not_rooted(directory, root_ref).await? {
+            if let Some(reason) =
+                community_record_not_rooted(directory, root_ref, chrono::Utc::now()).await?
+            {
                 return Ok(community_not_rooted_verdict(reason));
             }
         }
@@ -5422,8 +5599,8 @@ pub(crate) mod v53_1_6_reference {
         // under a halt, which CC 4.2.1.1 names as a breaker. The latch is still
         // READ and reported beside the verdict — a halt must be observable —
         // exactly as the drill is.
-        let valid =
-            edge_exists && root_self_declares && charter_has_recovery && holders_hardware_attested;
+        // TR-fix1 — the reference mirrors the verdict: custody is not a leg.
+        let valid = edge_exists && root_self_declares && charter_has_recovery;
 
         // v24.1.0 (CIRISPersist#561) — when this verdict can first lapse on time.
         // Each leg survives while ANY of its rows is live (latest expiry wins,

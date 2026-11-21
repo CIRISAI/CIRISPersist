@@ -824,7 +824,7 @@ where
             // stood here (v53.0.0) is folded into it: on a re-rooted node an
             // accord-rooted community is not a Commons audience.
         }
-        Ok(None) | Err(Error::Unsupported { .. }) => {}
+        Ok(None) => {}
         Err(e) => return Err(e),
     }
     // Codex on #978 (CC 3.2 T6, v53 R2a): for a root that holds a lineage

@@ -854,6 +854,7 @@ pub(crate) async fn exercise_seedless_gate_refusals(dir: &dyn FederationDirector
             "some-user",
             "some-key",
             "infra:serve",
+            crate::host::clock::now(),
         )
         .await
         .expect("walk")
@@ -866,10 +867,14 @@ pub(crate) async fn exercise_seedless_gate_refusals(dir: &dyn FederationDirector
             .expect("read"),
         "[{tag}] no roster ⇒ the effective-role read is FALSE"
     );
-    let verdict =
-        crate::federation::trust_root::trust_root_valid(dir, "some-user", "humanity-accord")
-            .await
-            .expect("walk");
+    let verdict = crate::federation::trust_root::trust_root_valid(
+        dir,
+        "some-user",
+        "humanity-accord",
+        crate::host::clock::now(),
+    )
+    .await
+    .expect("walk");
     assert!(
         !verdict.valid,
         "[{tag}] no charter ⇒ the constitutional root is NOT valid"

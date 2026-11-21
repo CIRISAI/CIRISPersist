@@ -75,7 +75,7 @@ pub(crate) mod bodies {
             .await
             .expect("the second root stands up");
         assert!(
-            trust_root_valid(d, &node, &r1.root)
+            trust_root_valid(d, &node, &r1.root, crate::host::clock::now())
                 .await
                 .unwrap()
                 .edge_exists,
@@ -134,13 +134,15 @@ pub(crate) mod bodies {
     ) {
         let e = rotate_the_edge(d, tag).await;
         assert!(
-            !trust_root_valid(d, &e.node, &e.r1)
+            !trust_root_valid(d, &e.node, &e.r1, crate::host::clock::now())
                 .await
                 .unwrap()
                 .edge_exists,
             "I437: the superseded edge to r1 is not live"
         );
-        let v2 = trust_root_valid(d, &e.node, &e.r2).await.unwrap();
+        let v2 = trust_root_valid(d, &e.node, &e.r2, crate::host::clock::now())
+            .await
+            .unwrap();
         assert!(
             v2.edge_exists && v2.valid,
             "I437: the successor edge to r2 is the live edge (depends on W1): {v2:?}"
@@ -190,7 +192,10 @@ pub(crate) mod bodies {
         let node = ops::e2_node(d, tag);
         let r = e2::rooted_trust_root(d, &HOLDER_SEEDS, "quorum:2/3").await;
         assert!(
-            trust_root_valid(d, &node, &r.root).await.unwrap().valid,
+            trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+                .await
+                .unwrap()
+                .valid,
             "I439 CONTROL: the root is valid for this node (depends on W1)"
         );
         let subject_seed = format!("i439-subject-{tag}");
@@ -208,10 +213,16 @@ pub(crate) mod bodies {
             .await
             .expect("the delegate's voice");
         assert_eq!(
-            capability_roots_to_trusted_root(d, &node, &subject, INFRA_SERVE_SCOPE)
-                .await
-                .unwrap()
-                .map(|g| g.root_key_id),
+            capability_roots_to_trusted_root(
+                d,
+                &node,
+                &subject,
+                INFRA_SERVE_SCOPE,
+                crate::host::clock::now()
+            )
+            .await
+            .unwrap()
+            .map(|g| g.root_key_id),
             None,
             "I439: one founder's grant is no grant by the root"
         );
@@ -223,10 +234,16 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I439: the root's grant admits");
-        let g = capability_roots_to_trusted_root(d, &node, &subject, INFRA_SERVE_SCOPE)
-            .await
-            .unwrap()
-            .expect("I439: the root's own grant confers");
+        let g = capability_roots_to_trusted_root(
+            d,
+            &node,
+            &subject,
+            INFRA_SERVE_SCOPE,
+            crate::host::clock::now(),
+        )
+        .await
+        .unwrap()
+        .expect("I439: the root's own grant confers");
         assert_eq!(
             g.root_key_id, r.root,
             "I439: the threshold root is the root"

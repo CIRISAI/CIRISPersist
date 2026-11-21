@@ -1639,11 +1639,7 @@ pub async fn current_roster_heads<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let settled = match dir.list_settled_edition2_roster_proposals(identity).await {
-        Ok(r) => r,
-        Err(Error::Unsupported { .. }) => Vec::new(),
-        Err(e) => return Err(e),
-    };
+    let settled = dir.list_settled_edition2_roster_proposals(identity).await?;
     let mut landed: Vec<(RowId, Vec<RowId>)> = Vec::new();
     for r in settled.iter().filter(|r| {
         r.outcome
@@ -1715,7 +1711,10 @@ where
 
 /// v62.0.0 (v62 P8) — **what a producer binds** (CC 3.3.6): the payload
 /// members of one `identity:occurrence` row, every key an identity-ref.
-#[derive(Clone, Debug)]
+// v62.0.0 (CE-fix1) — `Default`: a construction site names the members it
+// states and takes `..Default::default()` for the rest, so a member added
+// later (as `cites` was) breaks no caller.
+#[derive(Clone, Debug, Default)]
 pub struct BindTerms {
     /// Who authors the bind: the identity itself, or an agent's owner.
     pub author: String,
@@ -1742,6 +1741,11 @@ pub struct BindTerms {
     pub head: Option<RowId>,
     /// `refs.further_heads`, optional (a bind over a forked roster).
     pub further_heads: Vec<RowId>,
+    /// v62.0.0 (CE-fix1; CC 2.6.1.11) — `refs.also.cites`, optional: the
+    /// rows the bind cites. A genesis seat binding cites the seat's own
+    /// `key:record` here (Verify's bundle reader: `binding_names_no_record`
+    /// otherwise). Empty: no `also`.
+    pub cites: Vec<RowId>,
 }
 
 /// v62.0.0 (v62 P8) — **a bind's transport members** (CC 3.3.6.2): the
@@ -1832,8 +1836,9 @@ pub fn bind_payload(t: &BindTerms) -> Result<Value, Error> {
             m.push((text(ONION_HOP_XWING_PUBKEY_MEMBER), Value::Bytes(x.clone())));
         }
     }
+    let mut refs: Vec<(Value, Value)> = Vec::new();
     if let Some(h) = &t.head {
-        let mut refs = vec![(text("head"), ciris_verify_core::edition2::row_ref(&h.0))];
+        refs.push((text("head"), ciris_verify_core::edition2::row_ref(&h.0)));
         if !t.further_heads.is_empty() {
             let mut further: Vec<Value> = t
                 .further_heads
@@ -1844,6 +1849,23 @@ pub fn bind_payload(t: &BindTerms) -> Result<Value, Error> {
             further.dedup();
             refs.push((text("further_heads"), Value::Array(further)));
         }
+    }
+    // v62.0.0 (CE-fix1) — `refs.also.cites`, a row-ref set (sorted by
+    // encoding, no duplicate).
+    if !t.cites.is_empty() {
+        let mut cites: Vec<Value> = t
+            .cites
+            .iter()
+            .map(|r| ciris_verify_core::edition2::row_ref(&r.0))
+            .collect();
+        cites.sort_by_key(ciris_verify_core::cde::encode);
+        cites.dedup();
+        refs.push((
+            text("also"),
+            Value::Map(vec![(text("cites"), Value::Array(cites))]),
+        ));
+    }
+    if !refs.is_empty() {
         refs.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
         m.push((text("refs"), Value::Map(refs)));
     }

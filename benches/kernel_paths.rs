@@ -569,13 +569,23 @@ fn bench_trust_root(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("valid_root", extra), |b| {
             let f = fx();
             let v = rt
-                .block_on(trust_root_valid(&f.store.backend, &f.user, &f.root))
+                .block_on(trust_root_valid(
+                    &f.store.backend,
+                    &f.user,
+                    &f.root,
+                    chrono::Utc::now(),
+                ))
                 .expect("walk");
             assert!(v.valid, "the rooted root is valid: {v:?}");
             b.iter(|| {
                 black_box(
-                    rt.block_on(trust_root_valid(&f.store.backend, &f.user, &f.root))
-                        .unwrap(),
+                    rt.block_on(trust_root_valid(
+                        &f.store.backend,
+                        &f.user,
+                        &f.root,
+                        chrono::Utc::now(),
+                    ))
+                    .unwrap(),
                 )
             });
         });
@@ -583,13 +593,23 @@ fn bench_trust_root(c: &mut Criterion) {
             group.bench_function(BenchmarkId::new("uncharted_root", extra), |b| {
                 let f = fx();
                 let v = rt
-                    .block_on(trust_root_valid(&f.store.backend, &f.user, &f.uncharted))
+                    .block_on(trust_root_valid(
+                        &f.store.backend,
+                        &f.user,
+                        &f.uncharted,
+                        chrono::Utc::now(),
+                    ))
                     .expect("walk");
                 assert!(!v.valid, "a root with no charter is not valid: {v:?}");
                 b.iter(|| {
                     black_box(
-                        rt.block_on(trust_root_valid(&f.store.backend, &f.user, &f.uncharted))
-                            .unwrap(),
+                        rt.block_on(trust_root_valid(
+                            &f.store.backend,
+                            &f.user,
+                            &f.uncharted,
+                            chrono::Utc::now(),
+                        ))
+                        .unwrap(),
                     )
                 });
             });
@@ -1312,11 +1332,21 @@ fn smoke() {
             Box::new(|| {
                 let f = rt.block_on(trust_fixture(2));
                 let v = rt
-                    .block_on(trust_root_valid(&f.store.backend, &f.user, &f.root))
+                    .block_on(trust_root_valid(
+                        &f.store.backend,
+                        &f.user,
+                        &f.root,
+                        chrono::Utc::now(),
+                    ))
                     .expect("walk");
                 assert!(v.valid, "valid_root: {v:?}");
                 let u = rt
-                    .block_on(trust_root_valid(&f.store.backend, &f.user, &f.uncharted))
+                    .block_on(trust_root_valid(
+                        &f.store.backend,
+                        &f.user,
+                        &f.uncharted,
+                        chrono::Utc::now(),
+                    ))
                     .expect("walk");
                 assert!(!u.valid, "uncharted_root: {u:?}");
                 for root in [f.root.as_str(), f.uncharted.as_str()] {

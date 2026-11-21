@@ -24,7 +24,6 @@
 //! target by `refs.target` (`composer_of`).
 
 use crate::federation::attestation_apply::ReplicatedAttestationOutcome;
-use crate::federation::directory_double::FaultInjectingDirectory;
 use crate::federation::edition2::fixture_switch as e2;
 use crate::federation::types::{attestation_tier, attestation_type};
 use crate::federation::{read_probe, Attestation, FederationDirectory, SignedAttestation};
@@ -219,19 +218,9 @@ async fn i1340(dir: Arc<dyn FederationDirectory>, tag: &str) {
         "{tag} I1340 the distinct composer is held"
     );
 
-    // Plan-free (this directory cannot answer `get_attestation`): no
-    // read-back is attempted, so a fresh row inserts.
-    let planless = FaultInjectingDirectory::new(dir.clone()).unsupported("get_attestation");
-    assert_eq!(
-        planless
-            .apply_replicated_attestation(SignedAttestation {
-                attestation: scores(&author, serde_json::json!({})),
-            })
-            .await
-            .expect("I1340 a plan-free apply never asks the store what it did"),
-        ReplicatedAttestationOutcome::Inserted,
-        "{tag} I1340 plan-free fresh"
-    );
+    // v62.0.0 (PX-fix3) — the plan-free leg is deleted with the #603 arm it
+    // witnessed: a directory that cannot answer `get_attestation` now fails
+    // the apply (I2190), it no longer applies without a plan.
 }
 
 async fn i1341(dir: Arc<dyn FederationDirectory>, tag: &str) {

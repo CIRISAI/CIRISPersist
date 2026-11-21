@@ -431,6 +431,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("edition2_statements_about", ConnClass::Read),
     ("edition2_objects", ConnClass::Read),
     ("edition2_voices", ConnClass::Read),
+    // v62.0.0 (AU-fix1) — the first-held instant of a row.
+    ("edition2_first_held_us", ConnClass::Read),
     ("edition2_rows_naming", ConnClass::Read),
     ("put_edition2_object", ConnClass::Write),
     ("put_edition2_statement", ConnClass::Write),

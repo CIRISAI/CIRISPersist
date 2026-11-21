@@ -2425,6 +2425,7 @@ where
         transport: None,
         head,
         further_heads,
+        cites: Vec::new(),
     };
     publish_bind(backend, Some(signer), author_signer, &terms).await
 }

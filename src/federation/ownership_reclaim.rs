@@ -961,11 +961,9 @@ async fn wa_quorum_over_body(
     policy: &ReclaimPolicy,
     finding: &Attestation,
 ) -> Result<Result<WaQuorum, (ReclaimRefusal, String)>, Error> {
-    // A backend that cannot answer the family question (the FFI directory
-    // capsule reports `Unsupported` for `lookup_family`) is honestly unable to
-    // re-derive the authority, which is `WaBodyUnknown` — never a hard error
-    // that a caller might retry into, and never a guess. Same discipline
-    // `check_attested_subject_admission` applies to the same call.
+    // A family this node does not hold is `WaBodyUnknown`. v62.0.0 (PX-fix3)
+    // — a directory that cannot answer (`Unsupported`) is an error, not an
+    // unknown body (I2190).
     // v62.0.0 (wave GC3) — the WA body, its roster, its members' cards and
     // the finding's voices are all OTHER rows: declared for the fold.
     fold::reads(Dep::key(&policy.wa_family_key_id));
@@ -974,7 +972,7 @@ async fn wa_quorum_over_body(
     );
     let family = match directory.lookup_family(&policy.wa_family_key_id).await {
         Ok(Some(f)) => f,
-        Ok(None) | Err(Error::Unsupported { .. }) => {
+        Ok(None) => {
             return Ok(Err((
                 ReclaimRefusal::WaBodyUnknown,
                 format!(
@@ -991,7 +989,6 @@ async fn wa_quorum_over_body(
         .await
     {
         Ok(members) => members.into_iter().map(|m| m.key_id).collect(),
-        Err(Error::Unsupported { .. }) => Vec::new(),
         Err(e) => return Err(e),
     };
     if roster.is_empty() {

@@ -243,6 +243,7 @@ where
             &node,
             emitter,
             delegation_scope::INFRA_CLASSIFY_CONTENT,
+            crate::host::clock::now(),
         )
         .await?;
         if conferred.is_none() {

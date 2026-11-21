@@ -1419,15 +1419,20 @@ pub mod test_support {
 
         // THE #548 ASSERTION — the walk sees the conferral, through the
         // node's own chain.
-        let grant =
-            capability_roots_to_trusted_root(directory, &node, &canonical, INFRA_SERVE_SCOPE)
-                .await?
-                .unwrap_or_else(|| {
-                    panic!(
-                        "({tag}) #548: a conferral of {INFRA_SERVE_SCOPE} from a root the node \
+        let grant = capability_roots_to_trusted_root(
+            directory,
+            &node,
+            &canonical,
+            INFRA_SERVE_SCOPE,
+            crate::host::clock::now(),
+        )
+        .await?
+        .unwrap_or_else(|| {
+            panic!(
+                "({tag}) #548: a conferral of {INFRA_SERVE_SCOPE} from a root the node \
                          accepted, plus the node's own live chain, must satisfy the walk"
-                    )
-                });
+            )
+        });
         assert_eq!(
             grant.root_key_id, r.root,
             "({tag}) #548: the root that conferred is the one named"
@@ -1439,7 +1444,8 @@ pub mod test_support {
         );
 
         // THE DRILL IS A SIGNAL, NOT A GATE (v23.0.0, CIRISPersist#551 item 4).
-        let undrilled = trust_root_valid(directory, &node, &r.root).await?;
+        let undrilled =
+            trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
         assert!(
             undrilled.valid,
             "({tag}) #551 item 4: an UNDRILLED root must still serve: {undrilled:?}"
@@ -1468,9 +1474,15 @@ pub mod test_support {
         e2::put_statement(directory, &holder_grant).await?;
         e2::put_statement(directory, &e2::voice_of(&holder_grant, &weak_seed)).await?;
         assert!(
-            capability_roots_to_trusted_root(directory, &node, &weak, INFRA_SERVE_SCOPE)
-                .await?
-                .is_none(),
+            capability_roots_to_trusted_root(
+                directory,
+                &node,
+                &weak,
+                INFRA_SERVE_SCOPE,
+                crate::host::clock::now()
+            )
+            .await?
+            .is_none(),
             "({tag}) #548: ONE holder is not the threshold root — no candidate"
         );
         // (b) …and a root conferring a DIFFERENT scope confers nothing here.
@@ -1487,7 +1499,8 @@ pub mod test_support {
                 directory,
                 &node,
                 &e2::kid(&other_seed),
-                INFRA_SERVE_SCOPE
+                INFRA_SERVE_SCOPE,
+                crate::host::clock::now()
             )
             .await?
             .is_none(),
@@ -1497,9 +1510,14 @@ pub mod test_support {
         // THE LEVER — withdraw the node's one acceptance edge; trust must
         // collapse, emergent, with the conferral still fully valid.
         withdraw_e2(directory, &node, &r.root, &r.acceptance).await?;
-        let after =
-            capability_roots_to_trusted_root(directory, &node, &canonical, INFRA_SERVE_SCOPE)
-                .await?;
+        let after = capability_roots_to_trusted_root(
+            directory,
+            &node,
+            &canonical,
+            INFRA_SERVE_SCOPE,
+            crate::host::clock::now(),
+        )
+        .await?;
         assert!(
             after.is_none(),
             "({tag}) #548: withdrawing the node's ONE acceptance edge must collapse trust — \
@@ -1579,6 +1597,7 @@ pub mod test_support {
             user_key_id,
             subject_key_id,
             scope,
+            crate::host::clock::now(),
         )
         .await?;
         if grant.is_none() {
@@ -1700,6 +1719,7 @@ pub mod test_support {
             directory,
             "__side_probe__",
             root_key_id,
+            crate::host::clock::now(),
         )
         .await?;
         let drilled = probe.drill_freshness == crate::federation::trust_root::DrillFreshness::Green;
@@ -1816,7 +1836,7 @@ pub mod test_support {
         )
         .await;
 
-        let v = trust_root_valid(directory, &node, &r.root)
+        let v = trust_root_valid(directory, &node, &r.root, crate::host::clock::now())
             .await
             .expect("trust_root_valid walk");
         assert!(
@@ -1838,12 +1858,16 @@ pub mod test_support {
         .await
         .unwrap_or_else(|e| panic!("({tag}) the root confers infra:serve: {e}"));
         let subject = e2::kid(&subject_seed);
-        let grant = capability_roots_to_trusted_root(directory, &node, &subject, INFRA_SERVE_SCOPE)
-            .await
-            .expect("capability walk")
-            .unwrap_or_else(|| {
-                panic!("({tag}) subject's infra:serve must root to the trusted root")
-            });
+        let grant = capability_roots_to_trusted_root(
+            directory,
+            &node,
+            &subject,
+            INFRA_SERVE_SCOPE,
+            crate::host::clock::now(),
+        )
+        .await
+        .expect("capability walk")
+        .unwrap_or_else(|| panic!("({tag}) subject's infra:serve must root to the trusted root"));
         assert_eq!(
             grant.root_key_id, r.root,
             "({tag}) the winning root is the one we established"
@@ -2261,7 +2285,11 @@ pub mod test_support {
         let grant_row = confer_e2(directory, root_seed, subject_seed, &[scope]).await?;
         let subject = e2::kid(subject_seed);
         let grant = crate::federation::trust_root::capability_roots_to_trusted_root(
-            directory, &node, &subject, scope,
+            directory,
+            &node,
+            &subject,
+            scope,
+            crate::host::clock::now(),
         )
         .await?;
         match grant {
@@ -2708,7 +2736,8 @@ pub mod test_support {
             own.accepted && own.chartered,
             "({tag}) (d) THIS node's own chain: accepted and chartered: {own:?}"
         );
-        let verdict = trust_root_valid(directory, &node, &r.root).await?;
+        let verdict =
+            trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
         assert!(
             verdict.valid && verdict.root_kind == RootKind::Community,
             "({tag}) (d) a founded, chartered threshold root the node has accepted IS a valid \
@@ -2723,14 +2752,20 @@ pub mod test_support {
         )
         .await?;
         let subject = e2::kid(&subject_seed);
-        let grant = capability_roots_to_trusted_root(directory, &node, &subject, INFRA_SERVE_SCOPE)
-            .await?
-            .unwrap_or_else(|| {
-                panic!(
-                    "({tag}) (d) the subject's {INFRA_SERVE_SCOPE} must root to the threshold \
+        let grant = capability_roots_to_trusted_root(
+            directory,
+            &node,
+            &subject,
+            INFRA_SERVE_SCOPE,
+            crate::host::clock::now(),
+        )
+        .await?
+        .unwrap_or_else(|| {
+            panic!(
+                "({tag}) (d) the subject's {INFRA_SERVE_SCOPE} must root to the threshold \
                      root that conferred it"
-                )
-            });
+            )
+        });
         assert_eq!(
             grant.root_key_id, r.root,
             "({tag}) (d) the winning root is the THRESHOLD root"
@@ -2759,9 +2794,9 @@ pub mod test_support {
         // on the root the verdict reads its legs at, is REPORTED, and moves
         // no trust state.
         let halt_id = format!("{tag}-halt-1");
-        let before = trust_root_valid(directory, &node, &r.root).await?;
+        let before = trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
         directory.set_active_halt(&r.root, &halt_id).await?;
-        let halted = trust_root_valid(directory, &node, &r.root).await?;
+        let halted = trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
         assert!(
             halted.halt_latched == Some(true),
             "({tag}) (e) the halt latch is REPORTED on the root's verdict: {halted:?}"
@@ -2772,13 +2807,20 @@ pub mod test_support {
              before it: before={before:?} halted={halted:?}"
         );
         assert!(
-            capability_roots_to_trusted_root(directory, &node, &subject, INFRA_SERVE_SCOPE)
-                .await?
-                .is_some(),
+            capability_roots_to_trusted_root(
+                directory,
+                &node,
+                &subject,
+                INFRA_SERVE_SCOPE,
+                crate::host::clock::now()
+            )
+            .await?
+            .is_some(),
             "({tag}) (e) …and the capability walk agrees — a halted root still confers"
         );
         directory.clear_active_halt(&r.root, &halt_id).await?;
-        let resumed = trust_root_valid(directory, &node, &r.root).await?;
+        let resumed =
+            trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
         assert!(
             resumed.valid && resumed.halt_latched == Some(false),
             "({tag}) (e) a resume clears the REPORT and changes nothing else: {resumed:?}"
@@ -2822,7 +2864,9 @@ pub mod test_support {
             "({tag}) (b1) …the head did not move"
         );
         assert!(
-            trust_root_valid(directory, &node, &r.root).await?.valid,
+            trust_root_valid(directory, &node, &r.root, crate::host::clock::now())
+                .await?
+                .valid,
             "({tag}) (b1) …and the root still stands"
         );
 
@@ -2840,9 +2884,15 @@ pub mod test_support {
         e2::put_statement(directory, &lone_grant).await?;
         e2::put_statement(directory, &e2::voice_of(&lone_grant, &victim_seed)).await?;
         assert!(
-            capability_roots_to_trusted_root(directory, &node, &victim, INFRA_SERVE_SCOPE)
-                .await?
-                .is_none(),
+            capability_roots_to_trusted_root(
+                directory,
+                &node,
+                &victim,
+                INFRA_SERVE_SCOPE,
+                crate::host::clock::now()
+            )
+            .await?
+            .is_none(),
             "({tag}) (b2) a conferral carrying ONE seat's signature roots to nothing — the \
              grant is held, and it grants nothing"
         );
@@ -2893,7 +2943,7 @@ pub mod test_support {
              force, so the root's chain no longer roots — re-derived, not frozen at \
              admission: {regrown:?}"
         );
-        let after = trust_root_valid(directory, &node, &r.root).await?;
+        let after = trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
         assert!(
             !after.valid && after.root_kind == RootKind::Community && after.not_rooted.is_some(),
             "({tag}) (b4) the carried consensus_protocol still says quorum:2/3 and the node \
@@ -2901,9 +2951,15 @@ pub mod test_support {
              and never falls back to its key (the ruling): {after:?}"
         );
         assert!(
-            capability_roots_to_trusted_root(directory, &node, &subject, INFRA_SERVE_SCOPE)
-                .await?
-                .is_none(),
+            capability_roots_to_trusted_root(
+                directory,
+                &node,
+                &subject,
+                INFRA_SERVE_SCOPE,
+                crate::host::clock::now()
+            )
+            .await?
+            .is_none(),
             "({tag}) (b4) …and the capability walk agrees — an un-rooted threshold confers \
              nothing"
         );
@@ -2987,7 +3043,7 @@ pub mod test_support {
         confer_e2(directory, &root_seed, &subject_seed, &[INFRA_SERVE_SCOPE])
             .await
             .expect("({tag}) the root confers on the subject");
-        let va = trust_root_valid(directory, &node, &a.root)
+        let va = trust_root_valid(directory, &node, &a.root, crate::host::clock::now())
             .await
             .expect("walk A");
         assert!(
@@ -3000,10 +3056,16 @@ pub mod test_support {
              the EDGE, a hard gate; the drill would not have gated either way: {va:?}"
         );
         assert!(
-            capability_roots_to_trusted_root(directory, &node, &subject, INFRA_SERVE_SCOPE)
-                .await
-                .expect("cap walk A")
-                .is_none(),
+            capability_roots_to_trusted_root(
+                directory,
+                &node,
+                &subject,
+                INFRA_SERVE_SCOPE,
+                crate::host::clock::now()
+            )
+            .await
+            .expect("cap walk A")
+            .is_none(),
             "({tag}) a conferral from a root the node never accepted roots to nothing"
         );
         // A forged edge: the node's `iss`, signed by another key.
@@ -3042,7 +3104,7 @@ pub mod test_support {
             ),
             "({tag}) the refusal is the key-of-issuer check (kid_not_of_iss): {err:?}"
         );
-        let va2 = trust_root_valid(directory, &node, &a.root)
+        let va2 = trust_root_valid(directory, &node, &a.root, crate::host::clock::now())
             .await
             .expect("walk A2");
         assert!(
@@ -3054,19 +3116,25 @@ pub mod test_support {
         e2::put_statement(directory, &honest)
             .await
             .expect("({tag}) the node's own-signed edge admits");
-        let vb = trust_root_valid(directory, &node, &a.root)
+        let vb = trust_root_valid(directory, &node, &a.root, crate::host::clock::now())
             .await
             .expect("walk B");
         assert!(
             vb.valid && vb.edge_exists && vb.root_kind == RootKind::Community,
             "({tag}) valid once the node emits its own edge: {vb:?}"
         );
-        let grant = capability_roots_to_trusted_root(directory, &node, &subject, INFRA_SERVE_SCOPE)
-            .await
-            .expect("cap walk B")
-            .unwrap_or_else(|| {
-                panic!("({tag}) the subject's infra:serve roots to the root the node accepted")
-            });
+        let grant = capability_roots_to_trusted_root(
+            directory,
+            &node,
+            &subject,
+            INFRA_SERVE_SCOPE,
+            crate::host::clock::now(),
+        )
+        .await
+        .expect("cap walk B")
+        .unwrap_or_else(|| {
+            panic!("({tag}) the subject's infra:serve roots to the root the node accepted")
+        });
         assert_eq!(grant.root_key_id, a.root);
 
         // The twin of `establish_trust_root` keeps #536's self-enforcing
@@ -3086,7 +3154,8 @@ pub mod test_support {
                 directory,
                 &node,
                 &e2::kid(&est_subject),
-                INFRA_SERVE_SCOPE
+                INFRA_SERVE_SCOPE,
+                crate::host::clock::now()
             )
             .await
             .expect("cap walk est")
@@ -3540,7 +3609,7 @@ pub mod test_support {
 
         // ── CONTROL — a chartered threshold root, untouched. ─────────────
         let ctl = e2::rooted_trust_root(directory, &HOLDER_SEEDS, "quorum:2/3").await;
-        let v = trust_root_valid(directory, &node, &ctl.root).await?;
+        let v = trust_root_valid(directory, &node, &ctl.root, crate::host::clock::now()).await?;
         assert_eq!(
             v.root_kind,
             RootKind::Community,
@@ -3568,7 +3637,8 @@ pub mod test_support {
             ),
             "({tag}) LEG A: a store failure is not an entitlement answer: {leg_a:?}"
         );
-        let after_a = trust_root_valid(directory, &node, &ctl.root).await?;
+        let after_a =
+            trust_root_valid(directory, &node, &ctl.root, crate::host::clock::now()).await?;
         assert!(
             after_a.valid,
             "({tag}) LEG A: an unentitled withdraws ({leg_a:?}) must leave the charter standing: {after_a:?}"
@@ -3612,7 +3682,8 @@ pub mod test_support {
         // NOW the charter arrives, and the node accepts the root.
         e2::put_statement(directory, &atk_charter).await?;
         accept_e2_root(directory, &node, &atk_root).await?;
-        let after_b = trust_root_valid(directory, &node, &atk_root).await?;
+        let after_b =
+            trust_root_valid(directory, &node, &atk_root, crate::host::clock::now()).await?;
         assert!(
             after_b.valid,
             "({tag}) #686: a `withdraws` from `{foreign_seed}` — no seat, not the charter's \
@@ -3657,7 +3728,8 @@ pub mod test_support {
         // Each side names THE ROOT, never a holder.
         accept_e2_root(directory, &peer_seed, &r.root).await?;
 
-        let verdict = trust_root_valid(directory, &node, &r.root).await?;
+        let verdict =
+            trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
         assert_eq!(
             verdict.root_kind,
             RootKind::Community,
@@ -3693,7 +3765,8 @@ pub mod test_support {
              longer roots — and the hop it anchored goes with it, with nothing written on \
              the transport plane: {after_growth:?}"
         );
-        let regrown = trust_root_valid(directory, &node, &r.root).await?;
+        let regrown =
+            trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
         assert!(
             !regrown.valid
                 && regrown.root_kind == RootKind::Community

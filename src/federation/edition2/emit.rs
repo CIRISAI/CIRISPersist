@@ -543,6 +543,96 @@ pub fn key_record_payload(
     Ok(sorted_map(m))
 }
 
+/// v62.0.0 (CE-fix1) — **the end a self-signed `key:record` states** (CC
+/// 2.4.1.1): the end asked for, else, for an identity set naming `node` or
+/// `agent`, the longest a record may run
+/// (`asserted_at + KEY_RECORD_MAX_SECS`); a `user` / `accord_holder` record
+/// asked no end carries none. Pure: the instant is the caller's.
+#[must_use]
+pub fn key_record_end(
+    identity_type: &[&str],
+    asserted_at_ms: u64,
+    valid_until_ms: Option<u64>,
+) -> Option<u64> {
+    use ciris_verify_core::edition2::keys::KEY_RECORD_MAX_SECS;
+    let must_end = identity_type
+        .iter()
+        .any(|r| matches!(r.trim(), "node" | "agent"));
+    match valid_until_ms {
+        Some(u) => Some(u),
+        None if must_end => Some(asserted_at_ms.saturating_add(KEY_RECORD_MAX_SECS * 1000)),
+        None => None,
+    }
+}
+
+/// v62.0.0 (CE-fix1) — **a key's own `key:record` payload**: authored by the
+/// key's own identity-ref (`identity_ref(thumbprint(key))`), ending at
+/// [`key_record_end`]. The one payload producer of
+/// `Engine::register_self_federation_key` and of the offline ceremony
+/// (`crate::ceremony`).
+///
+/// # Errors
+/// As [`key_record_payload`].
+pub fn self_key_record_payload(
+    key: &CompositePublicKey,
+    identity_type: &[&str],
+    asserted_at_ms: u64,
+    valid_until_ms: Option<u64>,
+    evidence: Option<&serde_json::Value>,
+) -> Result<Value, ProduceError> {
+    let iref =
+        ciris_verify_core::edition2::identity_ref(&ciris_verify_core::edition2::thumbprint(key));
+    key_record_payload(
+        key,
+        identity_type,
+        &iref,
+        asserted_at_ms,
+        key_record_end(identity_type, asserted_at_ms, valid_until_ms),
+        evidence,
+    )
+}
+
+/// v62.0.0 (CE-fix1) — **a key's own `key:record`, drafted** for the key
+/// itself to sign (a node's local signer, or an offline / hardware signer):
+/// row type `scores`, family `key:record`, `kid` the key's thumbprint, `iss`
+/// and `sub` its identity-ref, over `payload` (a
+/// [`self_key_record_payload`]).
+///
+/// # Errors
+/// As [`draft_row`].
+pub fn key_record_statement_draft(
+    key: &CompositePublicKey,
+    payload: &Value,
+) -> Result<Draft, ProduceError> {
+    let kid = ciris_verify_core::edition2::thumbprint(key);
+    let iref = ciris_verify_core::edition2::identity_ref(&kid);
+    draft_row(
+        &kid,
+        &iref,
+        &iref,
+        crate::federation::types::attestation_type::SCORES,
+        KEY_RECORD_FAMILY,
+        payload,
+    )
+}
+
+/// v62.0.0 (CE-fix1) — [`self_key_record_payload`] then
+/// [`key_record_statement_draft`]: a key's own `key:record`, drafted.
+///
+/// # Errors
+/// As those two.
+pub fn key_record_draft(
+    key: &CompositePublicKey,
+    identity_type: &[&str],
+    asserted_at_ms: u64,
+    valid_until_ms: Option<u64>,
+    evidence: Option<&serde_json::Value>,
+) -> Result<Draft, ProduceError> {
+    let payload =
+        self_key_record_payload(key, identity_type, asserted_at_ms, valid_until_ms, evidence)?;
+    key_record_statement_draft(key, &payload)
+}
+
 /// v62.0.0 (JSON-cut slice B) — **a row drafted for an external signer**:
 /// what a producer hands a holder (a WA member, a founder, a roster member)
 /// to sign with its own composite key, in place of the earlier JSON envelope
@@ -623,12 +713,20 @@ pub fn draft_from_envelope(
     target: Option<(&Digest32, &str)>,
 ) -> Result<Draft, Error> {
     let family = family_for(row_type, target.map(|(_, f)| f), envelope, None)?;
-    let authored = family_is_authored(
-        &family,
-        envelope
-            .get("dimension")
-            .and_then(serde_json::Value::as_str),
-    );
+    // v62.0.0 (AU-fix2; CC 2.7.11 P2:952) — an `admission:unit` row that
+    // names its roster head (`head`) is COUNTED: "absent on a counted row,
+    // whose voices are its statements", so no `author` is stated for it (the
+    // vendored cell is `act=group => counted ; authored`, and a draft has no
+    // statement to read `act` from).
+    let counted_admission =
+        family == super::payloads::ADMISSION_UNIT_FAMILY && envelope.get("head").is_some();
+    let authored = !counted_admission
+        && family_is_authored(
+            &family,
+            envelope
+                .get("dimension")
+                .and_then(serde_json::Value::as_str),
+        );
     let drop: &[&str] = if super::payloads::COMPOSER_ROW_TYPES.contains(&row_type) {
         COMPOSER_EARLIER_MEMBERS
     } else {
@@ -642,6 +740,17 @@ pub fn draft_from_envelope(
         drop,
     )
     .map_err(|e| produce_error("draft", e))?;
+    // v62.0.0 (AU-fix2; CC 2.7.11) — `capabilities` is a deterministic set
+    // (sorted by encoding, unique): stated so whatever order the host gave.
+    if family == super::payloads::ADMISSION_UNIT_FAMILY {
+        if let Some(Value::Array(caps)) = payload.get_text("capabilities") {
+            let mut caps = caps.clone();
+            caps.sort_by_key(cde::encode);
+            caps.dedup();
+            payload = with_member(payload, "capabilities", Value::Array(caps))
+                .map_err(|e| produce_error("draft", e))?;
+        }
+    }
     if let Some((t, _)) = target {
         // v62.0.0 (E2-fix9) — the target joins the roles the envelope already
         // states under `refs` (`payloads::REF_MEMBERS`: a reclaim withdraws's

@@ -1460,17 +1460,29 @@ pub(crate) mod bodies {
             }
         }
         assert_eq!(
-            capability_roots_to_trusted_root(d, &fx.user, &fx.subject, INFRA_SERVE_SCOPE)
-                .await
-                .unwrap()
-                .map(|g| g.grant_attestation_id),
+            capability_roots_to_trusted_root(
+                d,
+                &fx.user,
+                &fx.subject,
+                INFRA_SERVE_SCOPE,
+                crate::host::clock::now()
+            )
+            .await
+            .unwrap()
+            .map(|g| g.grant_attestation_id),
             Some(succ2.clone()),
             "I546: the head of the rotation confers"
         );
         assert_eq!(
-            capability_roots_to_trusted_root(d, &fx2.user, &fx2.subject, INFRA_SERVE_SCOPE)
-                .await
-                .unwrap(),
+            capability_roots_to_trusted_root(
+                d,
+                &fx2.user,
+                &fx2.subject,
+                INFRA_SERVE_SCOPE,
+                crate::host::clock::now()
+            )
+            .await
+            .unwrap(),
             None,
             "I546: the withdrawn grant confers nothing"
         );
@@ -1607,7 +1619,9 @@ pub(crate) mod bodies {
             for root in roots {
                 let l = same!(
                     format!("trust_root_valid({u}, {root})"),
-                    tr::trust_root_valid(d, u, root).await.unwrap(),
+                    tr::trust_root_valid(d, u, root, crate::host::clock::now())
+                        .await
+                        .unwrap(),
                     r::trust_root_valid_reference(d, u, root).await.unwrap()
                 );
                 reference_slice_reads += slice_reads(&l);
@@ -1617,9 +1631,16 @@ pub(crate) mod bodies {
             for scope in [INFRA_SERVE_SCOPE, INFRA_ATTEST_SCOPE] {
                 let l = same!(
                     format!("capability_roots({u}, {subj}, {scope})"),
-                    tr::capability_roots_to_trusted_root_over_roster(d, u, subj, scope, &roster)
-                        .await
-                        .unwrap(),
+                    tr::capability_roots_to_trusted_root_over_roster(
+                        d,
+                        u,
+                        subj,
+                        scope,
+                        &roster,
+                        crate::host::clock::now()
+                    )
+                    .await
+                    .unwrap(),
                     r::capability_roots_to_trusted_root_over_roster_reference(
                         d, u, subj, scope, &roster
                     )
@@ -1675,7 +1696,9 @@ pub(crate) mod bodies {
         // The root's about-read returns its charters, never the bystanders'
         // acceptance edges naming it.
         for fam in [&ra.root, &rb.root] {
-            let _ = tr::trust_root_valid(d, &u1, fam).await.unwrap();
+            let _ = tr::trust_root_valid(d, &u1, fam, crate::host::clock::now())
+                .await
+                .unwrap();
             let log = read_probe::take();
             // v62.0.0 (round 6, E7) — the charter legs are read by the
             // root's OWN rows (`AttestationQuery::by(root)` excluding every
@@ -1698,7 +1721,8 @@ pub(crate) mod bodies {
                 fx_user,
                 fx_subject,
                 INFRA_SERVE_SCOPE,
-                &roster
+                &roster,
+                crate::host::clock::now()
             )
             .await
             .unwrap()
@@ -1710,13 +1734,24 @@ pub(crate) mod bodies {
             &u2,
             &s2,
             INFRA_SERVE_SCOPE,
-            &roster
+            &roster,
+            crate::host::clock::now()
         )
         .await
         .unwrap()
         .is_none());
-        assert!(tr::trust_root_valid(d, &u1, &ra.root).await.unwrap().valid);
-        assert!(!tr::trust_root_valid(d, &u3, &rc.root).await.unwrap().valid);
+        assert!(
+            tr::trust_root_valid(d, &u1, &ra.root, crate::host::clock::now())
+                .await
+                .unwrap()
+                .valid
+        );
+        assert!(
+            !tr::trust_root_valid(d, &u3, &rc.root, crate::host::clock::now())
+                .await
+                .unwrap()
+                .valid
+        );
         assert!(
             live_charter_rows(d, &rc.root).await.unwrap().is_empty(),
             "I547: rc's withdrawn charter is no live charter"

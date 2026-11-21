@@ -1464,6 +1464,11 @@ pub struct MeshConfigFold {
     /// separately. Until it exists, treat this field as reasoned-correct and
     /// unwitnessed; the consumer that reported the defect is the one exercising
     /// it, through their own directory implementation.
+    ///
+    /// v62.0.0 (PX-fix3) — ALWAYS EMPTY now: a root whose read cannot be
+    /// answered (`Unsupported`) fails `resolve_mesh_config` instead of being
+    /// folded as fewer restrictions and reported here (I2190). The field
+    /// stays for the wire shape adopters read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unreadable_roots: Vec<String>,
 }
@@ -1713,7 +1718,6 @@ where
         Ok(()) => {
             super::trust_root::with_slice_composers(directory, rows, None, Some(root_ref)).await?
         }
-        Err(Error::Unsupported { .. }) => Vec::new(),
         Err(e) => return Err(e),
     };
     let refs: Vec<&Attestation> = by_root.iter().collect();
@@ -1996,11 +2000,7 @@ where
         Ok(())
     }
     .await;
-    match read {
-        Ok(()) => {}
-        Err(Error::Unsupported { .. }) => held.clear(),
-        Err(e) => return Err(e),
-    }
+    read?;
     let same_key: Vec<(&Attestation, ParsedRow)> = held
         .iter()
         .filter_map(|r| parse_row(r).map(|p| (r, p)))
@@ -2103,7 +2103,6 @@ where
 {
     let roots = super::trust_root::trusted_roots_of(directory, node_key_id, now).await?;
     let mut rows: Vec<Attestation> = Vec::new();
-    let mut unreadable: Vec<String> = Vec::new();
     for root in &roots {
         // The root's `mesh_config:*` rows, every page.
         let mut found = Vec::new();
@@ -2123,27 +2122,18 @@ where
                     .into_iter()
                     .filter(|r| env_str(r, "dimension").is_some_and(is_mesh_config_dimension)),
             ),
-            // v30.0.0 (#601) — RECORDED, not swallowed. This arm used to be
-            // `{}`, which made an unanswerable backend indistinguishable from a
-            // silent root. It is still not an error: `Unsupported` is a
-            // legitimate answer from a backend that does not carry this plane,
-            // and failing the whole fold would take mesh-config resolution down
-            // on it entirely. But the caller has to be able to SEE it, because
-            // on a restrict-only plane a swallowed root reads as fewer
-            // restrictions than the node consented to.
-            Err(Error::Unsupported { .. }) => unreadable.push(root.clone()),
+            // v62.0.0 (PX-fix3) — an `Unsupported` read is an ERROR, as every
+            // other could-not-ask is. v30.0.0 (#601) recorded it in
+            // `unreadable_roots` and folded on: on a restrict-only plane that
+            // root then read as fewer restrictions than the node consented to,
+            // and through the capsule proxy that is the fail-open (I2190). On
+            // v62 both backends answer this read and the proxy routes it.
             Err(e) => return Err(e),
         }
     }
-    let mut fold = fold_mesh_config(node_key_id, baseline, &roots, &rows, now);
-    // Set here rather than inside `fold_mesh_config`, which stays a PURE
-    // function of held rows. Unreadability is a fact about this read, not about
-    // the rows — folding it in would make the pure fold's output depend on
-    // something no row carries.
-    unreadable.sort();
-    unreadable.dedup();
-    fold.unreadable_roots = unreadable;
-    Ok(fold)
+    // v62.0.0 (PX-fix3) — `unreadable_roots` stays empty: a root this node
+    // cannot read fails the resolution instead (I2190).
+    Ok(fold_mesh_config(node_key_id, baseline, &roots, &rows, now))
 }
 
 #[cfg(test)]

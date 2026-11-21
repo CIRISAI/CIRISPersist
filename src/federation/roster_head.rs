@@ -556,14 +556,9 @@ where
     F: FederationDirectory + ?Sized,
 {
     let action = ciris_verify_core::accord_live_quorum::AccordAction::RosterChange.as_str();
-    let proposals = match directory
+    let proposals = directory
         .list_accord_proposals_by_anchor(action, head_digest)
-        .await
-    {
-        Ok(p) => p,
-        Err(Error::Unsupported { .. }) => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
+        .await?;
     let mut out = Vec::new();
     for p in proposals {
         let Ok(closes) = chrono::DateTime::parse_from_rfc3339(&p.proposal.window_until)
@@ -577,7 +572,6 @@ where
         let digest = p.proposal.digest();
         let authorized = match directory.get_accord_decision(&digest).await {
             Ok(d) => d.is_some_and(|d| d.decision.authorized),
-            Err(Error::Unsupported { .. }) => false,
             Err(e) => return Err(e),
         };
         if authorized {

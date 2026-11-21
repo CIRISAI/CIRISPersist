@@ -165,6 +165,20 @@ Engine	apply_replicated_attestation	deontic
 Engine	apply_replicated_key_grant	deontic
 Engine	apply_replicated_key_record	deontic
 Engine	apply_replicated_statement	deontic	
+# v62.0.0 (RL-fix1) — the replicated door with a feed position is DEONTIC like the door;
+# the rescan read and its ack are PROCEDURAL: they decide WHEN a feed is re-pulled.
+Engine	apply_replicated_statement_at_feed	deontic	
+Engine	accord_rescan_needed_json	procedural	
+Engine	ack_accord_rescan	procedural	
+# v62.0.0 (RL-fix2) — the contact path. The two checked doors are DEONTIC: a wrong one
+# stores a key or a route a node did not sign. The dial hint is PRAGMATIC: it changes an
+# address to try, never a key, a pair or a permission; its reads are PRAGMATIC too.
+Engine	admit_pre_seal_answer	deontic	
+Engine	admit_contact_owner_rows	deontic	
+Engine	record_dial_hints	pragmatic	
+Engine	dial_hints_for_json	pragmatic	
+Engine	list_dial_hints_json	pragmatic	
+Engine	remove_dial_hints	pragmatic	
 Engine	held_rows_for	empirical	
 Engine	detection_draft	procedural	
 Engine	put_edition2_statement	deontic	
@@ -202,6 +216,9 @@ Engine	amendment_standings_json	deontic
 # v62.0.0 (ceremony gap 2) — the pre-roll gate's re-bind read is DEONTIC like
 # bundles_in_force_json: a wrong answer makes a key live a seat's holders never counted.
 Engine	rebind_held_for_json	deontic	
+# v62.0.0 (PR-fix1) — the peer verdict is DEONTIC: a wrong Rooted serves the
+# federation tier to a peer whose standing never reached this node's root (CC 3.2 T8).
+Engine	peer_rooting_json	deontic	
 Engine	build_corpus_want_v1	deontic	
 Engine	build_storage_budget_v1	deontic	
 Engine	cache_budget_bytes	epistemic	
@@ -316,6 +333,9 @@ Engine	edition2_held_reason	empirical
 # v62.0.0 (P10; CC 2.7.11) — the receipt leg is DEONTIC: a wrong answer runs
 # admitted code no trusted Transparency Service registered.
 Engine	admission_unit_runnable	deontic	
+# v62.0.0 (AU-fix2; CC 2.7.11) — the live admission read is DEONTIC: a held
+# or withdrawn row listed as live is code a host loads without an admission.
+Engine	admission_unit_rows	deontic	
 Engine	edition2_held_rows	empirical	
 Engine	licences_issued_under_json	deontic	
 Engine	licensure_status_set	deontic	
@@ -490,6 +510,7 @@ Engine	maintenance_tighten_vocabulary	nomological
 Engine	maintenance_vacuum	procedural	
 Engine	mark_ack_received	procedural	
 Engine	mark_replay_resolved	procedural	
+Engine	may_publish_federation_rendezvous	deontic	
 Engine	mark_transport_delivered	procedural	
 Engine	mark_transport_failed	procedural	
 Engine	match_ack_to_outbound	procedural	
@@ -698,6 +719,9 @@ Engine	verify_skill_import_manifest_b64	deontic
 Engine	verify_storage_budget_v1	deontic	
 Engine	verify_trace	epistemic	
 Engine	voice_draft	procedural	
+# v62.0.0 (AU-fix2) — the host-side draft of a new statement: PROCEDURAL, as
+# voice_draft (it signs nothing and admits nothing; the door judges the result).
+Engine	statement_draft	procedural	
 Engine	voice_held_row	deontic	
 Engine	voice_status	epistemic	
 Engine	wa_cert_get	empirical	

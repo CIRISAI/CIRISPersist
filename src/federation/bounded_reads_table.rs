@@ -693,6 +693,232 @@ pub(super) mod gates {
         );
     }
 
+    /// v62.0.0 (PX-fix3) — the match arms of a (blanked, production) text
+    /// that answer an `Err(.. Unsupported { .. } ..)` pattern with a VALUE
+    /// rather than an error: `(line, the answer's start)`. A pattern is
+    /// `Unsupported { .. }` or `Unsupported { method }` (a construction names
+    /// `method: …`); it counts only inside an `Err(` of its arm's pattern (a
+    /// `match e { Error::Unsupported { .. } => … }` maps an error, it does not
+    /// swallow one). An arm answers an error when its answer starts `Err(`,
+    /// `return Err(`, `return Some(Err(`, `panic!` or `unreachable!`, or uses
+    /// the `e @` binding its pattern names. Blind spot, stated: a condition
+    /// (`matches!` / `if let`) is not an arm and is not scanned.
+    pub(super) fn unsupported_swallows(text: &str) -> Vec<(usize, String)> {
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let mut out = Vec::new();
+        for (at, m) in text.match_indices("Unsupported") {
+            if text[..at].ends_with(ident) {
+                continue;
+            }
+            let after = &text[at + m.len()..];
+            let Some(inner) = after.trim_start().strip_prefix('{') else {
+                continue;
+            };
+            let inner = inner.trim_start();
+            let pattern = inner.starts_with("..")
+                || inner
+                    .strip_prefix("method")
+                    .is_some_and(|r| r.trim_start().starts_with(['}', ',']));
+            if !pattern {
+                continue;
+            }
+            let cut = ['{', ',', ';']
+                .iter()
+                .filter_map(|c| text[..at].rfind(*c))
+                .chain(text[..at].rfind("=>").map(|i| i + 1))
+                .max()
+                .map_or(0, |i| i + 1);
+            let arm = &text[cut..at];
+            let Some(binding) = arm.rsplit("Err(").next().filter(|_| arm.contains("Err(")) else {
+                continue;
+            };
+            let Some(close) = after.find('}') else {
+                continue;
+            };
+            let rest = &after[close + 1..];
+            let Some(arrow) = rest.find("=>") else {
+                continue;
+            };
+            if rest[..arrow].contains([';', '{']) {
+                continue;
+            }
+            let answer = rest[arrow + 2..]
+                .trim_start()
+                .trim_start_matches('{')
+                .trim_start();
+            let bound = binding
+                .split('@')
+                .next()
+                .filter(|_| binding.contains('@'))
+                .map(str::trim)
+                .filter(|b| !b.is_empty() && b.chars().all(ident));
+            let uses_binding = bound.is_some_and(|b| {
+                answer.char_indices().take(200).any(|(i, _)| {
+                    answer[i..].starts_with(b)
+                        && !answer[..i].ends_with(ident)
+                        && !answer[i + b.len()..].starts_with(ident)
+                })
+            });
+            let propagates = [
+                "Err(",
+                "return Err(",
+                "return Some(Err(",
+                "panic!",
+                "unreachable!",
+            ]
+            .iter()
+            .any(|p| answer.starts_with(p))
+                || uses_binding;
+            if !propagates {
+                let line = text[..at].matches('\n').count() + 1;
+                let shown: String = answer.chars().take(60).collect();
+                out.push((line, shown.split_whitespace().collect::<Vec<_>>().join(" ")));
+            }
+        }
+        out
+    }
+
+    /// The scanner's own witness (I2190): the swallow shapes it must see, and
+    /// the propagating / mapping / constructing shapes it must not.
+    #[test]
+    fn i2190_the_scanner_sees_an_unsupported_swallow_and_nothing_else() {
+        let scan =
+            |src: &str| unsupported_swallows(&production(&blank_comments_and_strings(src)).0);
+        for yes in [
+            "fn f() { match r { Ok(v) => v, Err(Error::Unsupported { .. }) => Vec::new(), Err(e) => return Err(e), } }",
+            "fn f() { match r { Ok(None) | Err(Error::Unsupported { .. }) => return Ok(false), Err(e) => return Err(e), } }",
+            "fn f() { match r { Err(crate::federation::Error::Unsupported {\n ..\n }) => {} other => return other, } }",
+            "fn f() { match r { Err(Error::Unsupported { method }) => { tracing::debug!(method); Ok(()) } Err(e) => Err(e), } }",
+            "fn f() { match r { Err(Error::InvalidArgument(_) | Error::Unsupported { .. }) => None, Err(e) => return Err(e), } }",
+            "fn f() { match r { Ok(()) | Err(super::Error::Unsupported { .. }) => Ok(()), Err(e) => Err(e), } }",
+        ] {
+            assert_eq!(scan(yes).len(), 1, "I2190 sees the swallow in {yes:?}");
+        }
+        for no in [
+            "fn f() { match r { Ok(v) => v, Err(e @ Error::Unsupported { .. }) => return Refused(e), } }",
+            "fn f() { match r { Err(Error::Unsupported { .. }) => Err(other()), Ok(v) => Ok(v), } }",
+            "fn f() { match r { Err(Error::Unsupported { .. }) => return Err(x), Ok(v) => Ok(v), } }",
+            "fn f() { match e { Error::Backend(_) | Error::Unsupported { .. } => e, other => hold(other), } }",
+            "fn f() -> Error { Error::Unsupported { method: \"m\" } }",
+            "fn f() { Some(Error::Unsupported { method }) }",
+            "fn f() { assert!(!matches!(r, Err(Error::Unsupported { .. }))); x(); }",
+            "fn f() { // Err(Error::Unsupported { .. }) => Vec::new(),\n }",
+            "#[cfg(test)]\nmod t { fn f() { match r { Err(Error::Unsupported { .. }) => Vec::new(), _ => x } } }",
+        ] {
+            assert!(scan(no).is_empty(), "I2190 does not count {no:?}: {:?}", scan(no));
+        }
+    }
+
+    /// **I2190 (v62.0.0, PX-fix3) — no production arm reads `Unsupported` as
+    /// "none".** On v62 the two backends implement every directory method and
+    /// the capsule proxy answers `Unsupported` for what it does not route, so
+    /// an arm turning `Err(Unsupported)` into an empty / `None` / `false` /
+    /// `Ok` answer is dead on both backends and the fail-open through the
+    /// proxy (a forked group read as unforked). Every such arm propagates;
+    /// the few sites where "cannot answer" truly is "none" call
+    /// [`unsupported_is_none`](crate::federation::optional_capability::unsupported_is_none)
+    /// with a key of `OPTIONAL_CAPABILITY_SITES`, each key used exactly once.
+    /// From disk, comments and strings blanked, test-gated items and test
+    /// files removed (I915's walk).
+    #[test]
+    fn i2190_no_production_arm_reads_unsupported_as_none() {
+        use crate::federation::optional_capability::OPTIONAL_CAPABILITY_SITES;
+        const HELPER: &str = "src/federation/optional_capability.rs";
+        let mut files = Vec::new();
+        walk(&root().join("src"), &mut files);
+        let mut gated: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut texts = BTreeMap::new();
+        for p in &files {
+            let src = std::fs::read_to_string(p).unwrap();
+            let (prod, mods) = production(&blank_comments_and_strings(&src));
+            let dir = if p
+                .file_name()
+                .is_some_and(|f| f == "mod.rs" || f == "lib.rs")
+            {
+                p.parent().unwrap().to_path_buf()
+            } else {
+                p.with_extension("")
+            };
+            for m in mods {
+                gated.insert(dir.join(format!("{m}.rs")));
+                gated.insert(dir.join(m).join("mod.rs"));
+            }
+            texts.insert(p.clone(), (prod, src));
+        }
+        let mut hits = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
+        let mut scanned = 0;
+        for (p, (prod, src)) in &texts {
+            if is_test_file(p)
+                || gated.iter().any(|g| p.starts_with(g.with_extension("")))
+                || gated.contains(p)
+            {
+                continue;
+            }
+            let rel = p.strip_prefix(root()).unwrap().display().to_string();
+            if rel == HELPER {
+                continue;
+            }
+            scanned += 1;
+            for (line, answer) in unsupported_swallows(prod) {
+                hits.push(format!("{rel}:{line}: => {answer}"));
+            }
+            // Each production call's site key: the first string literal after
+            // the call, read from the source (the blanked text has none).
+            for (at, _) in prod.match_indices("unsupported_is_none(") {
+                let line = prod[..at].matches('\n').count();
+                let tail: String = src
+                    .lines()
+                    .skip(line)
+                    .take(6)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let from = tail.find("unsupported_is_none(").unwrap_or(0);
+                let key = tail[from..]
+                    .split('"')
+                    .nth(1)
+                    .unwrap_or_else(|| panic!("I2190 {rel}:{}: a call names its site", line + 1));
+                keys.push(key.to_owned());
+            }
+        }
+        assert!(scanned > 100, "I2190 scanned {scanned} production files");
+        assert!(
+            hits.is_empty(),
+            "I2190 production arms read `Unsupported` as a value (through the capsule proxy \
+             that is the fail-open): propagate the error, route the method, or — where \
+             \"cannot answer\" truly is \"none\" — call `unsupported_is_none` with an \
+             allowlisted site: {hits:#?}"
+        );
+        let allow: BTreeSet<&str> = OPTIONAL_CAPABILITY_SITES.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            allow.len(),
+            OPTIONAL_CAPABILITY_SITES.len(),
+            "I2190 a duplicate site key"
+        );
+        assert!(
+            OPTIONAL_CAPABILITY_SITES
+                .iter()
+                .all(|(_, why)| why.split_whitespace().count() >= 10),
+            "I2190 every site carries its reason"
+        );
+        let unknown: Vec<&String> = keys
+            .iter()
+            .filter(|k| !allow.contains(k.as_str()))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "I2190 calls naming no allowlisted site: {unknown:?}"
+        );
+        let stale: Vec<&&str> = allow
+            .iter()
+            .filter(|k| keys.iter().filter(|c| c.as_str() == **k).count() != 1)
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "I2190 allowlisted sites not called exactly once (stale or shared): {stale:?}"
+        );
+    }
+
     /// The production `list_*` methods of the trait, with their signatures.
     fn trait_list_methods() -> BTreeMap<String, String> {
         let src = std::fs::read_to_string(root().join("src/federation/mod.rs")).unwrap();

@@ -260,6 +260,10 @@ pub(crate) async fn list_attestation_log_planned(
     // dropped here (retained locally, reversible).
     let items =
         super::quarantine::filter_withheld_rows(dir, rows, crate::host::clock::now()).await?;
+    // v62.0.0 (RL-fix2; CC 5.3.4, lead ruling (A): one rule, every serve
+    // path) — a node not rooted withholds federation-tier rows from this
+    // relay read as the statement serve does (`edition2::serve`).
+    let items = Box::pin(super::edition2::serve::withhold_waiting_rows(dir, items)).await?;
     crate::observe::record_read(
         backend,
         crate::observe::Door::ListAttestationLog,

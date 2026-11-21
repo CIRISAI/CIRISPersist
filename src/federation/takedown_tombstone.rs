@@ -432,6 +432,8 @@ pub async fn check_takedown_notice_row_admission(
         &row.attesting_key_id,
         &shape.content_sha256,
         &shape.legal_basis,
+        // K2-fix16 (T8): the notice's seat is judged at its own instant.
+        row.asserted_at,
     )
     .await
     .map_err(|e| match e {
@@ -586,6 +588,10 @@ pub async fn verify_takedown_authority(
         &terms.signer,
         &terms.content_sha256,
         &terms.legal_basis,
+        // K2-fix16 (T8): re-asked at EXECUTION, a host act at this node's
+        // own clock (`now`, the caller's; CC 2.7.9): standing that lapsed
+        // since the notice was filed authorises nothing.
+        now,
     )
     .await
     .map_err(|e| match e {
@@ -718,6 +724,7 @@ pub async fn takedown_authority(
     signer: &str,
     content_sha256: &str,
     _legal_basis: &str,
+    at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
     // v62.0.0 (wave GC2; CC 2.7.3) — the decision's reads, declared for the
     // fold (no-ops outside an attempt): the binding rows, the signer (the
@@ -756,6 +763,7 @@ pub async fn takedown_authority(
         &holders,
         duty,
         TAKEDOWN_NOTICE_SUBJECT_KIND,
+        at,
     )
     .await
     {
@@ -859,11 +867,7 @@ pub async fn standing_tombstone(
     plane: &str,
     record_ref: &str,
 ) -> Result<Option<String>, Error> {
-    let notices = match directory.purge_tombstone_notices(plane, record_ref).await {
-        Ok(n) => n,
-        Err(Error::Unsupported { .. }) => return Ok(None),
-        Err(e) => return Err(e),
-    };
+    let notices = directory.purge_tombstone_notices(plane, record_ref).await?;
     for notice_id in notices {
         if takedown_reversal(directory, &notice_id).await?.is_none() {
             return Ok(Some(notice_id));
@@ -924,18 +928,13 @@ pub async fn takedown_reversal(
         super::types::cohort_scope::AFFILIATIONS,
     ];
     for community in &binding.communities {
-        let rulings = match directory
+        let rulings = directory
             .list_targeted_by_dimension_prefix(
                 &scopes,
                 community,
                 super::admission::RECONSIDERATION_DIMENSION_PREFIX,
             )
-            .await
-        {
-            Ok(rows) => rows,
-            Err(Error::Unsupported { .. }) => return Ok(None),
-            Err(e) => return Err(e),
-        };
+            .await?;
         for ruling in rulings {
             if !is_reversal_of(&ruling, &notice_row_id)
                 || ruling.expires_at.is_some_and(|e| e <= now)
@@ -951,6 +950,8 @@ pub async fn takedown_reversal(
                 &holders,
                 super::admission::DELEGATION_SCOPE_REVIEW,
                 TAKEDOWN_NOTICE_SUBJECT_KIND,
+                // K2-fix16 (T8): the ruling's seat, at the ruling's instant.
+                ruling.asserted_at,
             )
             .await
             {

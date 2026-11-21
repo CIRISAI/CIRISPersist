@@ -57,6 +57,10 @@ pub mod audit;
 // invalidation (CIRISPersist#160 comment 2). Additive; wiring into the
 // aggregate read primitives is Commit G.
 pub mod cache;
+// v62.0.0 (CE-fix1) — the trust-root ceremony's OFFLINE builders: pure
+// drafts, assembly and self-checks for every statement the ceremony signs
+// (no engine, no store, no clock, no test-anchor).
+pub mod ceremony;
 #[cfg(feature = "cirisnode")]
 pub mod cirisnode;
 // v4.0 (FSD §3) — CEG topic-namespace read surface. The v3.x `read`

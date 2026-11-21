@@ -686,6 +686,98 @@ class Engine:
                 malformed ``offered_row_id``.
         """
 
+    def apply_replicated_statement_at_feed(
+        self,
+        statement: bytes,
+        offered_row_id: str,
+        plane: str,
+        peer: str,
+        position: str,
+    ) -> str:
+        """v62.0.0 (RL-fix1) — ``apply_replicated_statement`` with the host's
+        feed position (``plane``, ``peer``, ``position``; each 1..=512 bytes,
+        stored opaquely). An accord row this node cannot judge (no genesis
+        bundle held) answers ``{"outcome": "refused", "reason":
+        "accord_root_not_held", "advances_cursor": true}``: advance the cursor;
+        the feed's first such position is kept for ``accord_rescan_needed_json``.
+        """
+
+    def accord_rescan_needed_json(self) -> str:
+        """v62.0.0 (RL-fix1) — the feeds to re-pull for accord rows skipped
+        while this node held no accord root: a JSON list of ``{"plane",
+        "peer", "from_position", "skipped_at_ms"}``, empty until a genesis
+        bundle is in force. Re-pull each feed from ``from_position``, then
+        call ``ack_accord_rescan``.
+        """
+
+    def ack_accord_rescan(self, plane: str, peer: str, from_position: str) -> bool:
+        """v62.0.0 (RL-fix1) — the host re-pulled ``plane`` from ``peer`` past
+        ``from_position``: clear that watermark. ``False`` when none matches.
+        """
+
+    def record_dial_hints(
+        self,
+        node: str,
+        transport_identity_hex: str,
+        hints_json: str,
+        identity: str | None = None,
+        kind: str | None = None,
+    ) -> None:
+        """v62.0.0 (RL-fix2) — record a contact's dial hint from a decoded node
+        code: ``node`` (identity-ref), ``transport_identity_hex`` (64 bytes,
+        X25519 ‖ Ed25519), ``hints_json`` (``[{"tag": int, "body_hex": hex},
+        ...]``, Verify's edition-2 FedCode hints in order, unknown tags
+        included; at most 4 hints of at most 255 bytes within the 1024-byte
+        payload), and the code's ``identity`` / ``kind`` (``"user"``
+        | ``"node"``). Local, unsigned, never a transit pair, never served;
+        replaces the node's list.
+
+        Raises:
+            ValueError: ``federation_malformed_row: contact:
+                dial_hint_out_of_bounds`` or
+                ``fedcode_transport_is_federation_key``.
+        """
+
+    def dial_hints_for_json(self, node: str) -> str:
+        """v62.0.0 (RL-fix2) — the dial hint held for ``node`` as JSON (the
+        ``list_dial_hints_json`` entry shape), or ``null``.
+        """
+
+    def list_dial_hints_json(self) -> str:
+        """v62.0.0 (RL-fix2) — every dial hint held, by node: ``[{"node",
+        "transport_identity_hex", "hints": [{"tag", "body_hex"}],
+        "identity", "kind", "recorded_at_ms"}]``.
+        """
+
+    def remove_dial_hints(self, node: str) -> bool:
+        """v62.0.0 (RL-fix2) — remove a contact's dial hint (call it when the
+        contact is removed). ``False`` when none was held.
+        """
+
+    def admit_pre_seal_answer(self, dialled: str, key_record: bytes, route: bytes) -> str:
+        """v62.0.0 (RL-fix2; CC 5.3.3.10 E1) — the checked admission of a
+        pre-seal answer: the dialled node's own key record and its own bind
+        (route + transit key). Returns ``{"key_record": outcome, "route":
+        outcome, "transit_ready": bool}``.
+
+        Raises:
+            ValueError: ``federation_malformed_row: contact:
+                code_node_key_mismatch`` / ``code_route_signer_mismatch`` /
+                ``code_route_carries_no_transit_key`` (nothing stored).
+        """
+
+    def admit_contact_owner_rows(
+        self, node: str, identity: str, owner_key_record: bytes, binding: list[bytes]
+    ) -> str:
+        """v62.0.0 (RL-fix2) — the post-seal owner check of a ``user`` code.
+        Returns ``{"outcomes": [outcome, ...], "owner_resolved": bool}``.
+
+        Raises:
+            ValueError: ``federation_malformed_row: contact:
+                code_owner_mismatch`` / ``code_owner_binding_not_for_node``
+                (nothing of the owner rows stored).
+        """
+
     def amendment_standings_json(self, agent: str) -> str:
         """v62.0.0 (CC 2.7, CC 3.1.5) — the standing of every identity
         amendment about ``agent``, read now. An amendment is admitted and HELD
@@ -752,6 +844,34 @@ class Engine:
         "transit_xwing_pubkey_base64": str, "head": hex}``: the re-bind row,
         the X-Wing key it makes live (1216 bytes, standard base64), and the
         bundle it is counted over.
+        """
+
+    def peer_rooting_json(
+        self,
+        peer_identity_ref: str,
+        claimed_key_form: str,
+        claimed_key: bytes,
+        at_ms: int,
+        reader_node: str | None = None,
+    ) -> str:
+        """v62.0.0 (CC 3.2 T8, CC 5.3.4) — is the peer Rooted for this reader
+        node at ``at_ms``? Replaces the removed ``root_binding``.
+
+        ``claimed_key_form``: ``"composite"`` (the composite public key
+        bytes), ``"kid"`` (the 32-byte thumbprint) or ``"ed25519"`` (the
+        32-byte Ed25519 half; transitional, an identity match retired once
+        the caller carries the composite). ``at_ms``: the signer-stamped instant of the
+        thing judged, never this node's clock for a stored outcome.
+        ``reader_node``: the reader's identity-ref; default this node's key.
+
+        Returns JSON: ``{"state": "rooted" | "stalled", "root", "plane",
+        "via", "record"}``, ``{"state": "not_rooted", "reason": {"token",
+        ...}}`` or ``{"state": "cannot_tell_yet", "missing": {"token",
+        ...}}``. A NotRooted peer is not dropped: only the federation tier
+        waits (CC 5.3.4): rootless is a supported state, and a
+        ``not_rooted`` / ``cannot_tell_yet`` peer still gets the mesh planes
+        (pairing, dial, cohort delivery). Raises ``ValueError`` for an unknown form, a wrong
+        length, no reader, or a reader that is not an identity-ref.
         """
 
     def sign_composite(self, domain: str, message: bytes) -> bytes:
@@ -2614,24 +2734,78 @@ class Engine:
             ValueError: a malformed id.
         """
 
-    def admission_unit_runnable(self, row_id: str) -> str:
-        """v62.0.0 (CC 2.7.11) — the receipt leg of running admitted code.
-        ``row_id`` is the ``admission:unit`` row's id, 64 hex. The unit may
-        run, as far as its receipt goes, when a SCITT receipt (RFC 9942,
-        the statement's unprotected ``receipts`` parameter, label 394) held
-        on a voice of the row verifies and comes from a Transparency Service
-        this host trusts (a live ``trust:accepts`` edge of the host owner, at
-        ``self`` scope, whose ``trust_classes`` lists ``transparency``, names
-        it; its ``service_key`` is a CEG identity-ref or a COSE_Key). Returns JSON
-        ``{"row_id", "runnable", "answer", "token", "detail", "service",
-        "statement_id"}``: ``answer`` is ``runnable``, ``waiting`` (token
-        ``admission_receipt_missing``, detail ``none``, ``unverifiable`` or
-        ``untrusted_service``) or ``not_held`` (token ``admission_none``,
-        detail ``no_row``). The lease, standing, withdrawal and halt are the
-        host's other legs.
+    def admission_unit_runnable(
+        self, row_id: str, at_ms: int | None = None, owner_key_id: str | None = None
+    ) -> str:
+        """v62.0.0 (CC 2.7.11; AU-fix1) — may the unit an ``admission:unit``
+        row admits run on this host at ``at_ms`` (POSIX ms; None = now)?
+        ``row_id`` is the row's id, 64 hex; ``owner_key_id`` the host owner the
+        standing legs read (None: this node's owner binding). ``runnable`` is
+        true only when
+        the row is held and CONCLUDED (a counted row's count met at the
+        roster head it names, never on fewer than two persons), its lease
+        covers the instant (``asserted_at <= at < valid_until``), no entitled
+        withdrawal asserted by then retires it, every signer is still a live
+        person's key, the author or group stands at this host (the host
+        owner's own key, or the owner's ``admission`` acceptance walk; one
+        person's effect row only on that person's own host), and a SCITT
+        receipt (RFC 9942, label 394) from a Transparency Service this host
+        trusts is held. Returns JSON ``{"row_id", "runnable", "token",
+        "detail", "service", "statement_id", "row"}``; tokens:
+        ``admission_none`` (``no_row``, ``lease_not_open``, ``lease_ended``,
+        ``withdrawn``), ``admission_count_unmet``, ``admission_unit_held``,
+        ``admission_issuer_not_person`` (``signer_not_live``),
+        ``admission_issuer_not_reached`` (``no_host_owner``,
+        ``not_owner_host``, ``not_reached``), ``admission_receipt_missing``
+        (``none``, ``unverifiable``, ``untrusted_service``). The halt is the
+        host's, read before each effect.
 
         Raises:
-            ValueError: a malformed id.
+            ValueError: a malformed id, or an instant out of range.
+        """
+
+    def admission_unit_rows(
+        self, sub: str, at_ms: int | None = None, owner_key_id: str | None = None
+    ) -> str:
+        """v62.0.0 (CC 2.7.11; AU-fix2) — the LIVE ``admission:unit`` rows about
+        ``sub`` (a unit's ``canonical:sha256:{hex}``) at ``at_ms`` (POSIX ms;
+        None = now) on a host owned by ``owner_key_id`` (None: this node's
+        owner binding): the issuer standing there, concluded (a held row is
+        never listed), the lease
+        covering the instant, not withdrawn, every signer a live person's key.
+        Returns a JSON array of ``{"row_id", "sub", "unit", "capabilities",
+        "asserted_at_ms", "valid_until_ms", "signers", "authored", "author",
+        "group", "cohort_scope"}``. Whether one runs on this host is
+        ``admission_unit_runnable``'s.
+
+        Raises:
+            ValueError: an instant out of range.
+        """
+
+    def statement_draft(
+        self,
+        row_type: str,
+        envelope_json: str,
+        signer_iss: str,
+        signer_kid_hex: str,
+        sub: str,
+        asserted_at_ms: int,
+        target_row_id: str | None = None,
+    ) -> str:
+        """v62.0.0 (CC 2.6.1.1; AU-fix2) — draft a NEW edition-2 statement for a
+        pen elsewhere (a hardware-custodied owner), for any family: the
+        payload from the row's JSON members (the family from ``dimension``;
+        ``author`` = ``signer_iss`` for an authored family; instants RFC
+        3339; digests 64-hex; an ``admission:unit`` row's roster head as
+        ``head``, which makes it counted), under a header naming
+        ``signer_iss`` / ``signer_kid_hex``. ``target_row_id`` names a
+        composer's held target. Returns JSON ``{"protected", "payload",
+        "sig_structure"}`` (hex): sign ``sig_structure`` with the composite
+        key, assemble the ``COSE_Sign1``, then ``put_edition2_statement``.
+
+        Raises:
+            ValueError: malformed input, an unregistered dimension, a target
+                not held.
         """
 
     def edition2_held_rows(self, after: str | None = None, limit: int = 1000) -> str:
@@ -3934,6 +4108,9 @@ class Engine:
 
     def mark_replay_resolved(self, queue_id: str) -> None:
         """(derived) procedural — v0.4.0 — Treat a previously-sent row as delivered (the receiver replied replay_detected; the original send already landed before the ACK could arri..."""
+
+    def may_publish_federation_rendezvous(self, key_id: str) -> None:
+        """(derived) deontic — v62.0.0 (K2-fix20; CC 5.4.6 as ruled for rc22, CC 3.4.13 Q5) — the producing node's authoring check before it publishes a federation-scope..."""
 
     def mark_transport_delivered(self, queue_id: str, transport: str) -> None:
         """(derived) procedural — v0.4.0 — Transport reports successful delivery. Transitions the row to delivered (no ACK) or awaiting_ack (ACK required)."""

@@ -249,7 +249,10 @@ pub const MAX_HELD_ROWS_PAGE: u32 = 1000;
 /// HELD (`fold_state`), `key` has not voiced it yet, and
 /// [`resolved_second_signer_roles`] over its author's statement lists `key`
 /// as a party of a role. Rows held for another reason that also read
-/// `Dep::key(key)` are dropped by that last check.
+/// `Dep::key(key)` are dropped by that last check. AU-fix1: a COUNTED
+/// `admission:unit` row lists `key` in the role `member` when `key` is a
+/// person of the roster version its `refs.head` names
+/// (`admission::admission_unit_voice_parties`).
 ///
 /// # Errors
 /// Directory reads.
@@ -289,6 +292,35 @@ where
         let Ok((family, row_type, sub, _)) = row_parts(st) else {
             continue;
         };
+        // AU-fix1 (CC 2.7.11, CC 2.6.1.9) — a COUNTED `admission:unit` row
+        // has no second-signer role (a group act); every person of the
+        // roster version its `refs.head` names may voice it, in the role
+        // `member` (key_roles.json), and its count decides it
+        // (`admission::check_admission_unit_counted`).
+        if let Some(parties) =
+            crate::federation::admission::admission_unit_voice_parties(dir.as_dyn_directory(), st)
+                .await?
+        {
+            let member = crate::federation::admission::ADMISSION_UNIT_MEMBER_ROLE;
+            if role.is_none_or(|want| want == member) && parties.iter().any(|p| p == key) {
+                out.push(HeldRow {
+                    row_id: row_id.hex(),
+                    family: family.clone(),
+                    row_type: row_type.clone(),
+                    author: statement_iss(st).unwrap_or_default(),
+                    sub: sub.clone(),
+                    role: member.to_owned(),
+                    parties,
+                    reason: held.reason.clone(),
+                    detail: held.detail.clone(),
+                    statement: st.clone(),
+                });
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+            continue;
+        }
         for r in resolved_second_signer_roles(dir, st).await? {
             if role.is_some_and(|want| want != r.role) {
                 continue;

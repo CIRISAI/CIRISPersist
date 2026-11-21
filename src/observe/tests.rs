@@ -924,7 +924,9 @@ pub(crate) async fn i549_counters_equal_the_probe(
     let (_, walk_rows) = step!(
         "trust_root_valid",
         Fold::TrustRootValid,
-        tr::trust_root_valid(d, &a, &root).await.unwrap()
+        tr::trust_root_valid(d, &a, &root, crate::host::clock::now())
+            .await
+            .unwrap()
     );
     assert!(walk_rows > 0, "I549 the trust-root walk read no rows");
     step!(

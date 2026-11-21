@@ -3216,6 +3216,7 @@ impl PyEngine {
                                 &*backend as &dyn crate::federation::FederationDirectory,
                                 &user,
                                 &root,
+                                crate::host::clock::now(),
                             )
                             .await
                             .map_err(federation_err_to_py)
@@ -3229,6 +3230,7 @@ impl PyEngine {
                                 &*backend as &dyn crate::federation::FederationDirectory,
                                 &user,
                                 &root,
+                                crate::host::clock::now(),
                             )
                             .await
                             .map_err(federation_err_to_py)
@@ -6499,6 +6501,318 @@ impl PyEngine {
         })
     }
 
+    /// v62.0.0 (RL-fix1, lead ruling (B)) — [`apply_replicated_statement`](Self::apply_replicated_statement)
+    /// with the host's feed position (`plane`, `peer`, `position`, each
+    /// 1..=512 bytes, stored opaquely). An accord row this node cannot judge
+    /// (no genesis bundle held) answers `{"outcome": "refused", "reason":
+    /// "accord_root_not_held", "advances_cursor": true}` and the feed's first
+    /// such position is kept for [`accord_rescan_needed_json`](Self::accord_rescan_needed_json).
+    fn apply_replicated_statement_at_feed(
+        &self,
+        py: Python<'_>,
+        statement: &[u8],
+        offered_row_id: &str,
+        plane: &str,
+        peer: &str,
+        position: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let offered = parse_digest32_hex("offered_row_id", offered_row_id)?;
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let statement = statement.to_vec();
+            let feed = crate::federation::edition2::accord_rescan::FeedPosition {
+                plane: plane.to_owned(),
+                peer: peer.to_owned(),
+                position: position.to_owned(),
+            };
+            let outcome = py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::edition2::ingest::apply_replicated_statement_at_feed(
+                        dir.as_ref(),
+                        &statement,
+                        &offered,
+                        &feed,
+                    )
+                    .await
+                    .map_err(federation_err_to_py)
+                })
+            })?;
+            Ok(replicated_statement_outcome_json(&outcome).to_string())
+        })
+    }
+
+    /// v62.0.0 (RL-fix1, lead ruling (B)) — **the feeds to re-pull** for
+    /// accord rows skipped while this node held no accord root: a JSON list
+    /// of `{"plane", "peer", "from_position", "skipped_at_ms"}`, empty until a
+    /// genesis bundle is in force.
+    fn accord_rescan_needed_json(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let out = py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::edition2::accord_rescan::rescan_needed(dir.as_ref())
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })?;
+            serde_json::to_string(&out)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// v62.0.0 (RL-fix1, lead ruling (B)) — the host re-pulled `plane` from
+    /// `peer` past `from_position`: clear that watermark. `False` when none
+    /// matches.
+    fn ack_accord_rescan(
+        &self,
+        py: Python<'_>,
+        plane: &str,
+        peer: &str,
+        from_position: &str,
+    ) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let (plane, peer, from) = (plane.to_owned(), peer.to_owned(), from_position.to_owned());
+            py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::edition2::accord_rescan::ack_rescan(
+                        dir.as_ref(),
+                        &plane,
+                        &peer,
+                        &from,
+                    )
+                    .await
+                    .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v62.0.0 (RL-fix2) — **record a contact's dial hint** from a decoded
+    /// node code: `node` (identity-ref), `transport_identity_hex` (64 bytes,
+    /// X25519 ‖ Ed25519), `hints_json` (a JSON list, most preferred first,
+    /// possibly empty: `[{"tag": int, "body_hex": hex}, ...]`, each hint as
+    /// Verify's edition-2 FedCode `Hint` encodes it, unknown tags included),
+    /// the code's `identity` / `kind` (`"user"` | `"node"`) if it named them.
+    /// Local, unsigned, never a transit pair, never served; replaces the
+    /// node's list. Raises `ValueError` `federation_malformed_row: contact:
+    /// dial_hint_out_of_bounds` / `fedcode_transport_is_federation_key`.
+    #[pyo3(signature = (node, transport_identity_hex, hints_json, identity = None, kind = None))]
+    fn record_dial_hints(
+        &self,
+        py: Python<'_>,
+        node: &str,
+        transport_identity_hex: &str,
+        hints_json: &str,
+        identity: Option<String>,
+        kind: Option<String>,
+    ) -> PyResult<()> {
+        use crate::federation::edition2::contact::{ContactKind, DialHint, DialHints};
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let transport_identity = hex::decode(transport_identity_hex).map_err(|e| {
+                PyValueError::new_err(format!("transport_identity_hex: not hex: {e}"))
+            })?;
+            let raw: Vec<serde_json::Value> = serde_json::from_str(hints_json)
+                .map_err(|e| PyValueError::new_err(format!("hints_json: {e}")))?;
+            let mut hints = Vec::with_capacity(raw.len());
+            for (i, h) in raw.iter().enumerate() {
+                let tag = h
+                    .get("tag")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|t| u16::try_from(t).ok());
+                let body = h.get("body_hex").and_then(serde_json::Value::as_str);
+                let (Some(tag), Some(body)) = (tag, body) else {
+                    return Err(PyValueError::new_err(format!(
+                        "hints_json[{i}]: needs `tag` (0..=65535) and `body_hex`"
+                    )));
+                };
+                let body = hex::decode(body).map_err(|e| {
+                    PyValueError::new_err(format!("hints_json[{i}].body_hex: not hex: {e}"))
+                })?;
+                hints.push(DialHint { tag, body });
+            }
+            let kind = match kind.as_deref() {
+                None => None,
+                Some("user") => Some(ContactKind::User),
+                Some("node") => Some(ContactKind::Node),
+                Some(other) => {
+                    return Err(PyValueError::new_err(format!(
+                        "kind: `user` or `node`, not {other:?}"
+                    )))
+                }
+            };
+            let record = DialHints {
+                node: node.to_owned(),
+                transport_identity,
+                hints,
+                identity,
+                kind,
+                recorded_at_ms: 0,
+            };
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::edition2::contact::record_dial_hints(dir.as_ref(), record)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v62.0.0 (RL-fix2) — the dial hint held for `node`, as JSON
+    /// (`dial_hints_json`'s entry shape), or `null`.
+    fn dial_hints_for_json(&self, py: Python<'_>, node: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let node = node.to_owned();
+            let held = py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::edition2::contact::dial_hints_for(dir.as_ref(), &node)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })?;
+            Ok(held
+                .as_ref()
+                .map_or(serde_json::Value::Null, dial_hints_json)
+                .to_string())
+        })
+    }
+
+    /// v62.0.0 (RL-fix2) — every dial hint held, by node: a JSON list of
+    /// `{"node", "transport_identity_hex", "hints": [{"tag", "body_hex"}...],
+    /// "identity", "kind", "recorded_at_ms"}`.
+    fn list_dial_hints_json(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let all = py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::edition2::contact::list_dial_hints(dir.as_ref())
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })?;
+            Ok(serde_json::Value::Array(all.iter().map(dial_hints_json).collect()).to_string())
+        })
+    }
+
+    /// v62.0.0 (RL-fix2) — remove a contact's dial hint (call it when the
+    /// contact is removed). `False` when none was held.
+    fn remove_dial_hints(&self, py: Python<'_>, node: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let node = node.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::edition2::contact::remove_dial_hints(dir.as_ref(), &node)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v62.0.0 (RL-fix2; CC 5.3.3.10 E1 steps 5–9) — **the checked admission
+    /// of a pre-seal answer** for the dialled node: its own key record and its
+    /// own bind (route + transit key). Returns JSON `{"key_record":
+    /// outcome, "route": outcome, "transit_ready": bool}` (each outcome in
+    /// `apply_replicated_statement`'s shape). A mismatch raises `ValueError`
+    /// `federation_malformed_row: contact: code_node_key_mismatch` /
+    /// `code_route_signer_mismatch` / `code_route_carries_no_transit_key`
+    /// with nothing stored.
+    fn admit_pre_seal_answer(
+        &self,
+        py: Python<'_>,
+        dialled: &str,
+        key_record: &[u8],
+        route: &[u8],
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let (dialled, key_record, route) =
+                (dialled.to_owned(), key_record.to_vec(), route.to_vec());
+            let a = py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::edition2::contact::admit_pre_seal_answer(
+                        dir.as_ref(),
+                        &dialled,
+                        &key_record,
+                        &route,
+                    )
+                    .await
+                    .map_err(federation_err_to_py)
+                })
+            })?;
+            Ok(serde_json::json!({
+                "key_record": replicated_statement_outcome_json(&a.key_record),
+                "route": replicated_statement_outcome_json(&a.route),
+                "transit_ready": a.transit_ready,
+            })
+            .to_string())
+        })
+    }
+
+    /// v62.0.0 (RL-fix2) — **the post-seal owner check** of a `user` code:
+    /// the owner's own key record and the owner binding's voices. Returns
+    /// JSON `{"outcomes": [outcome, ...], "owner_resolved": bool}`. A mismatch
+    /// raises `ValueError` `federation_malformed_row: contact:
+    /// code_owner_mismatch` / `code_owner_binding_not_for_node`, nothing of
+    /// the owner rows stored.
+    fn admit_contact_owner_rows(
+        &self,
+        py: Python<'_>,
+        node: &str,
+        identity: &str,
+        owner_key_record: &[u8],
+        binding: Vec<Vec<u8>>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let (node, identity, record) = (
+                node.to_owned(),
+                identity.to_owned(),
+                owner_key_record.to_vec(),
+            );
+            let o = py.detach(move || {
+                runtime.block_on(async move {
+                    crate::federation::edition2::contact::admit_contact_owner_rows(
+                        dir.as_ref(),
+                        &node,
+                        &identity,
+                        &record,
+                        &binding,
+                    )
+                    .await
+                    .map_err(federation_err_to_py)
+                })
+            })?;
+            Ok(serde_json::json!({
+                "outcomes": o.outcomes.iter().map(replicated_statement_outcome_json).collect::<Vec<_>>(),
+                "owner_resolved": o.owner_resolved,
+            })
+            .to_string())
+        })
+    }
+
     /// v62.0.0 (JSON-cut slice D; CC 2.6.1.11, CC 2.7.8) — **the genesis
     /// bundles in force** on this node: the tips of the held genesis lineage
     /// as CIRISVerify places them
@@ -6668,6 +6982,86 @@ impl PyEngine {
                     })
                 })
                 .to_string())
+        })
+    }
+
+    /// v62.0.0 (PR-fix1; CC 3.2 T8, CC 5.3.4) — **is the peer Rooted for
+    /// this reader node at `at_ms`?** FFI mirror of
+    /// [`peer_rooting`](crate::federation::edition2::peer_rooting::peer_rooting).
+    /// Replaces the removed `root_binding`.
+    ///
+    /// `claimed_key_form` names how `claimed_key` is read: `"composite"` (the
+    /// composite public key bytes), `"kid"` (the 32-byte thumbprint) or
+    /// `"ed25519"` (the 32-byte Ed25519 half). `at_ms` is the signer-stamped
+    /// instant of the thing being judged (never this node's clock for a
+    /// stored outcome). `reader_node`: the reader's identity-ref; default this
+    /// node's key.
+    ///
+    /// Returns the verdict JSON: `{"state": "rooted" | "stalled", "root",
+    /// "plane": "ceremony" | "delegation", "via": "accord_holder" |
+    /// "serve_seat" | "conferred_seat", "record": {...}}`, `{"state":
+    /// "not_rooted", "reason": {"token": ..., ...}}` or `{"state":
+    /// "cannot_tell_yet", "missing": {"token": ..., ...}}`. An unknown form,
+    /// a wrong length, no reader, or a reader that is not an identity-ref
+    /// raises `ValueError`; a directory read failure raises as the other
+    /// federation reads.
+    #[pyo3(signature = (peer_identity_ref, claimed_key_form, claimed_key, at_ms, reader_node=None))]
+    fn peer_rooting_json(
+        &self,
+        py: Python<'_>,
+        peer_identity_ref: &str,
+        claimed_key_form: &str,
+        claimed_key: &[u8],
+        at_ms: u64,
+        reader_node: Option<&str>,
+    ) -> PyResult<String> {
+        use crate::federation::edition2::peer_rooting::{peer_rooting, ClaimedKeyWire};
+        self.ensure_usable()?;
+        let thirty_two = |what: &str| -> PyResult<[u8; 32]> {
+            <[u8; 32]>::try_from(claimed_key).map_err(|_| {
+                PyValueError::new_err(format!(
+                    "peer_rooting: a {what} claim is 32 bytes, not {}",
+                    claimed_key.len()
+                ))
+            })
+        };
+        let wire = match claimed_key_form {
+            "composite" => ClaimedKeyWire::Composite(claimed_key.to_vec()),
+            "kid" => ClaimedKeyWire::Kid(thirty_two("kid")?),
+            // Transitional (Edge v62.0): the Ed25519 half, an identity match.
+            "ed25519" => ClaimedKeyWire::Ed25519Half(thirty_two("ed25519")?),
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "peer_rooting: claimed_key_form {other:?} is not composite, kid or ed25519"
+                )))
+            }
+        };
+        let parsed = wire.composite().map_err(|_| {
+            PyValueError::new_err("peer_rooting: claimed_key is no composite public key")
+        })?;
+        catch_panic(|| {
+            let dir = self.federation_directory_arc();
+            let reader = match reader_node {
+                Some(r) => r.to_owned(),
+                None => crate::federation::FederationDirectory::node_key_id(dir.as_ref())
+                    .ok_or_else(|| {
+                        PyValueError::new_err("peer_rooting: this node has no node key")
+                    })?,
+            };
+            let runtime = self.runtime.clone();
+            let peer = peer_identity_ref.to_owned();
+            let verdict = py.detach(move || {
+                runtime.block_on(async move {
+                    let Some(claim) = wire.as_claim(parsed.as_ref()) else {
+                        return Err(PyValueError::new_err("peer_rooting: no claim"));
+                    };
+                    peer_rooting(dir.as_ref(), &reader, &peer, claim, at_ms)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })?;
+            serde_json::to_string(&verdict)
+                .map_err(|e| PyValueError::new_err(format!("peer_rooting: encode: {e}")))
         })
     }
     /// v62.0.0 (F0-cp5; RULINGS "composite signatures only") — verify ONE
@@ -7063,56 +7457,61 @@ impl PyEngine {
         })
     }
 
-    /// v62.0.0 (P10; CC rc21 2.7.11) — **the receipt leg of running admitted
-    /// code**: FFI mirror of
+    /// v62.0.0 (P10; AU-fix1; CC rc21 2.7.11) — **may the unit an
+    /// `admission:unit` row admits run on this host at an instant**: FFI
+    /// mirror of
     /// [`Engine::admission_unit_runnable`](crate::engine::Engine::admission_unit_runnable).
-    /// `row_id` is the `admission:unit` row's id, 64 hex. Returns JSON
-    /// `{"row_id", "runnable": bool, "answer": "runnable"|"waiting"|"not_held",
-    /// "token": null|"admission_receipt_missing"|"admission_none", "detail":
-    /// null|"none"|"unverifiable"|"untrusted_service"|"no_row", "service":
-    /// str|null, "statement_id": hex|null}`. Raises `ValueError` for a
-    /// malformed id.
-    fn admission_unit_runnable(&self, py: Python<'_>, row_id: &str) -> PyResult<String> {
+    /// `row_id` is the row's id, 64 hex; `at_ms` the instant asked (POSIX
+    /// ms), `None` = now, read here at the host boundary; `owner_key_id` the
+    /// host owner the standing legs read (`None`: this node's owner binding).
+    /// Returns JSON
+    /// `{"row_id", "runnable": bool, "token": null|str, "detail": null|str,
+    /// "service": str|null, "statement_id": hex|null, "row": {...}|null}`.
+    /// Tokens: `admission_none` (`no_row`, `lease_not_open`, `lease_ended`,
+    /// `withdrawn`), `admission_count_unmet`, `admission_unit_held`,
+    /// `admission_issuer_not_person` (`signer_not_live`),
+    /// `admission_issuer_not_reached` (`no_host_owner`, `not_owner_host`,
+    /// `not_reached`), `admission_receipt_missing` (`none`, `unverifiable`,
+    /// `untrusted_service`). Raises `ValueError` for a malformed id or an
+    /// instant out of range.
+    #[pyo3(signature = (row_id, at_ms=None, owner_key_id=None))]
+    fn admission_unit_runnable(
+        &self,
+        py: Python<'_>,
+        row_id: &str,
+        at_ms: Option<i64>,
+        owner_key_id: Option<&str>,
+    ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
-            use crate::federation::edition2::receipts::AdmissionReceipt;
             let id =
                 crate::federation::edition2::names::RowId(parse_digest32_hex("row_id", row_id)?);
+            let at = match at_ms {
+                None => crate::host::clock::now(),
+                Some(ms) => {
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "at_ms {ms} is out of range"
+                        ))
+                    })?
+                }
+            };
             let dir = self.federation_directory_arc();
             let runtime = self.runtime.clone();
+            let owner = owner_key_id.map(str::to_owned);
             let answer = py.detach(move || {
                 runtime.block_on(async move {
-                    crate::federation::edition2::receipts::admission_unit_runnable(
+                    crate::federation::edition2::admission_unit::admission_unit_runnable(
                         dir.as_ref(),
                         &id,
-                        crate::host::clock::now(),
+                        at,
+                        owner.as_deref(),
                     )
                     .await
                     .map_err(federation_err_to_py)
                 })
             })?;
-            let (kind, service, statement_id) = match &answer {
-                AdmissionReceipt::Runnable {
-                    service,
-                    statement_id,
-                } => (
-                    "runnable",
-                    Some(service.clone()),
-                    Some(hex::encode(statement_id)),
-                ),
-                AdmissionReceipt::Waiting(_) => ("waiting", None, None),
-                AdmissionReceipt::NotHeld => ("not_held", None, None),
-            };
-            Ok(serde_json::json!({
-                "row_id": id.hex(),
-                "runnable": answer.is_runnable(),
-                "answer": kind,
-                "token": answer.token(),
-                "detail": answer.detail(),
-                "service": service,
-                "statement_id": statement_id,
-            })
-            .to_string())
+            Ok(answer.to_json(&id).to_string())
         })
     }
 
@@ -8629,6 +9028,104 @@ impl PyEngine {
                         .map_err(federation_err_to_py)
                 })
             })
+        })
+    }
+
+    /// v62.0.0 (AU-fix2; CC 2.6.1.1, CC 2.7.11) — **a new statement,
+    /// drafted for a pen elsewhere**: FFI mirror of
+    /// [`Engine::statement_draft`](crate::engine::Engine::statement_draft).
+    /// `envelope_json` is the row's JSON members (instants RFC 3339, digests
+    /// 64-hex; an `admission:unit` row's roster head as `head`, 64-hex);
+    /// `signer_kid_hex` the signing key's thumbprint (64 hex);
+    /// `target_row_id` a composer's target (64 hex). Returns JSON
+    /// `{"protected", "payload", "sig_structure"}` (hex): sign
+    /// `sig_structure`, assemble the `COSE_Sign1`, then
+    /// `put_edition2_statement`. Raises `ValueError` for malformed input.
+    #[pyo3(signature = (row_type, envelope_json, signer_iss, signer_kid_hex, sub, asserted_at_ms, target_row_id=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn statement_draft(
+        &self,
+        py: Python<'_>,
+        row_type: &str,
+        envelope_json: &str,
+        signer_iss: &str,
+        signer_kid_hex: &str,
+        sub: &str,
+        asserted_at_ms: u64,
+        target_row_id: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let envelope: serde_json::Value = serde_json::from_str(envelope_json).map_err(|e| {
+                PyValueError::new_err(format!("statement_draft: envelope_json: {e}"))
+            })?;
+            let runtime = self.runtime.clone();
+            let backend = self.engine_backend();
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let (rt, iss, kid, sub, target) = (
+                row_type.to_owned(),
+                signer_iss.to_owned(),
+                signer_kid_hex.to_owned(),
+                sub.to_owned(),
+                target_row_id.map(str::to_owned),
+            );
+            py.detach(move || {
+                let engine = shared_view(backend, signer, local_signer)?;
+                runtime.block_on(async move {
+                    engine
+                        .statement_draft(
+                            &rt,
+                            &envelope,
+                            &iss,
+                            &kid,
+                            &sub,
+                            asserted_at_ms,
+                            target.as_deref(),
+                        )
+                        .await
+                        .map(|d| d.to_json().to_string())
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v62.0.0 (AU-fix2; CC 2.7.11) — **the LIVE `admission:unit` rows
+    /// about `sub`** (`canonical:sha256:{hex}`) at `at_ms` (POSIX ms; `None`
+    /// = now, read here at the host boundary): FFI mirror of
+    /// [`Engine::admission_unit_rows`](crate::engine::Engine::admission_unit_rows).
+    /// Returns a JSON array of `{"row_id", "sub", "unit", "capabilities",
+    /// "asserted_at_ms", "valid_until_ms", "signers", "authored", "author",
+    /// "group", "cohort_scope"}`; a held row is never listed. Raises
+    /// `ValueError` for an instant out of range.
+    #[pyo3(signature = (sub, at_ms=None, owner_key_id=None))]
+    fn admission_unit_rows(
+        &self,
+        py: Python<'_>,
+        sub: &str,
+        at_ms: Option<i64>,
+        owner_key_id: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let at = match at_ms {
+                None => crate::host::clock::now(),
+                Some(ms) => chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+                    .ok_or_else(|| PyValueError::new_err(format!("at_ms {ms} is out of range")))?,
+            };
+            let dir = self.federation_directory_arc();
+            let runtime = self.runtime.clone();
+            let owner = owner_key_id.map(str::to_owned);
+            let sub = sub.to_owned();
+            let rows = py.detach(move || {
+                runtime.block_on(async move {
+                    dir.admission_unit_rows(&sub, at, owner.as_deref())
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })?;
+            Ok(serde_json::Value::Array(rows.iter().map(|r| r.to_json()).collect()).to_string())
         })
     }
 
@@ -12312,6 +12809,9 @@ impl PyEngine {
                                 &key_id,
                                 &community_id,
                                 &duty,
+                                // K2-fix16 — HOST EDGE (CC 2.7.9): no act
+                                // is judged; read at this node's clock.
+                                crate::host::clock::now(),
                             )
                             .await
                             .map_err(federation_err_to_py)
@@ -12327,6 +12827,9 @@ impl PyEngine {
                                 &key_id,
                                 &community_id,
                                 &duty,
+                                // K2-fix16 — HOST EDGE (CC 2.7.9): no act
+                                // is judged; read at this node's clock.
+                                crate::host::clock::now(),
                             )
                             .await
                             .map_err(federation_err_to_py)
@@ -12490,6 +12993,48 @@ impl PyEngine {
                 };
                 serde_json::to_string(&report)
                     .map_err(|e| PyValueError::new_err(format!("row_type_report serialize: {e}")))
+            })
+        })
+    }
+
+    /// v62.0.0 (K2-fix20; CC 5.4.6 as ruled for rc22, CC 3.4.13 Q5) — the
+    /// producing node's authoring check before it publishes a
+    /// federation-scope `rendezvous:route` for `key_id` (the person, a key
+    /// acting for them, or their node). Returns `None`; raises the
+    /// `scope_minor_rendezvous_at_federation` refusal while a held row places
+    /// the person in a minor band. Edge MUST call it before publishing; no
+    /// receiver checks. Wraps
+    /// [`may_publish_federation_rendezvous`](crate::federation::age::may_publish_federation_rendezvous).
+    fn may_publish_federation_rendezvous(&self, py: Python<'_>, key_id: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::age::may_publish_federation_rendezvous(
+                            &*backend as &dyn crate::federation::FederationDirectory,
+                            &key_id,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::age::may_publish_federation_rendezvous(
+                            &*backend as &dyn crate::federation::FederationDirectory,
+                            &key_id,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
             })
         })
     }
@@ -23706,6 +24251,9 @@ impl PyEngine {
                                 &*backend,
                                 &community_key_id,
                                 &duty,
+                                // K2-fix16 — HOST EDGE (CC 2.7.9): no act
+                                // is judged; read at this node's clock.
+                                crate::host::clock::now(),
                             )
                             .await
                             .map_err(federation_err_to_py)
@@ -23719,6 +24267,9 @@ impl PyEngine {
                                 &*backend,
                                 &community_key_id,
                                 &duty,
+                                // K2-fix16 — HOST EDGE (CC 2.7.9): no act
+                                // is judged; read at this node's clock.
+                                crate::host::clock::now(),
                             )
                             .await
                             .map_err(federation_err_to_py)
@@ -32290,6 +32841,26 @@ fn edition2_statement_outcome_json(
 /// [`ReplicatedStatementOutcome`](crate::federation::edition2::ingest::ReplicatedStatementOutcome)
 /// as JSON: `outcome` (`admitted` / `unchanged` / `refused`),
 /// `advances_cursor`, and the placement or the refusal reason.
+/// v62.0.0 (RL-fix2) — a dial hint record as the Python host reads it (hex
+/// bytes).
+fn dial_hints_json(h: &crate::federation::edition2::contact::DialHints) -> serde_json::Value {
+    use crate::federation::edition2::contact::ContactKind;
+    serde_json::json!({
+        "node": h.node,
+        "transport_identity_hex": hex::encode(&h.transport_identity),
+        "hints": h.hints.iter().map(|x| serde_json::json!({
+            "tag": x.tag,
+            "body_hex": hex::encode(&x.body),
+        })).collect::<Vec<_>>(),
+        "identity": h.identity,
+        "kind": h.kind.map(|k| match k {
+            ContactKind::User => "user",
+            ContactKind::Node => "node",
+        }),
+        "recorded_at_ms": h.recorded_at_ms,
+    })
+}
+
 fn replicated_statement_outcome_json(
     outcome: &crate::federation::edition2::ingest::ReplicatedStatementOutcome,
 ) -> serde_json::Value {

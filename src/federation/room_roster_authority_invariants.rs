@@ -843,12 +843,16 @@ pub mod bodies {
                 DELEGATION_SCOPE_REVIEW,
             ] {
                 assert_eq!(
-                    moderators_of(d, &room, duty).await.unwrap(),
+                    moderators_of(d, &room, duty, crate::host::clock::now())
+                        .await
+                        .unwrap(),
                     vec![founder.clone()],
                     "I1522 {protocol}/{duty}: the founder alone, before any appointment"
                 );
                 assert_eq!(
-                    appointed_moderators_of(d, &room, duty).await.unwrap(),
+                    appointed_moderators_of(d, &room, duty, crate::host::clock::now())
+                        .await
+                        .unwrap(),
                     vec![founder.clone()],
                 );
                 let holders = duty_holders_for_community(d, &room, duty).await.unwrap();
@@ -857,7 +861,11 @@ pub mod bodies {
                     vec![founder.clone()],
                     "I1522 {protocol}/{duty}: the door's holders"
                 );
-                assert!(!is_named_moderator(d, plain, &room, duty).await.unwrap());
+                assert!(
+                    !is_named_moderator(d, plain, &room, duty, crate::host::clock::now())
+                        .await
+                        .unwrap()
+                );
             }
 
             // The door itself, not only its helpers: a plain member's
@@ -913,15 +921,25 @@ pub mod bodies {
             e2::try_put_row(d, &edge(founder, modk, &sd("appoint", &tag)), founder)
                 .await
                 .unwrap_or_else(|e| panic!("I1522 {protocol}: the appointment: {e}"));
+            assert!(is_named_moderator(
+                d,
+                modk,
+                &room,
+                DELEGATION_SCOPE_MODERATE,
+                crate::host::clock::now()
+            )
+            .await
+            .unwrap());
             assert!(
-                is_named_moderator(d, modk, &room, DELEGATION_SCOPE_MODERATE)
-                    .await
-                    .unwrap()
-            );
-            assert!(
-                !is_named_moderator(d, modk, &room, DELEGATION_SCOPE_TAKEDOWN)
-                    .await
-                    .unwrap(),
+                !is_named_moderator(
+                    d,
+                    modk,
+                    &room,
+                    DELEGATION_SCOPE_TAKEDOWN,
+                    crate::host::clock::now()
+                )
+                .await
+                .unwrap(),
                 "I1522 {protocol}: moderate confers no takedown"
             );
 
@@ -930,9 +948,15 @@ pub mod bodies {
             let _ =
                 e2::try_put_row(d, &edge(plain, x, &format!("{tag}-self-appoint")), plain).await;
             assert!(
-                !is_named_moderator(d, x, &room, DELEGATION_SCOPE_MODERATE)
-                    .await
-                    .unwrap(),
+                !is_named_moderator(
+                    d,
+                    x,
+                    &room,
+                    DELEGATION_SCOPE_MODERATE,
+                    crate::host::clock::now()
+                )
+                .await
+                .unwrap(),
                 "I1522 {protocol}: a member cannot appoint alone"
             );
         }

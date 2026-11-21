@@ -150,6 +150,17 @@ pub enum ScopeRefusalReason {
          5.4.6 / CC 3.4.13 Q5); hold it at self"
     )]
     MinorOwnerBindingAtFederation,
+    /// v62.0.0 (K2-fix20; CC 5.4.6 as ruled for rc22, CC 3.4.13 Q5) — the
+    /// producing node may not publish a federation-scope `rendezvous:route`
+    /// for a person a held row places in a minor band
+    /// (`federation::age::may_publish_federation_rendezvous`). An authoring
+    /// refusal on the local path only; the person stays reachable on the
+    /// derived plane (their own nodes, the codes they hand out).
+    #[error(
+        "a federation-scope rendezvous route is not published for a minor (CC 5.4.6 / CC \
+         3.4.13 Q5); the person stays reachable on the derived plane"
+    )]
+    MinorRendezvousAtFederation,
 }
 
 impl ScopeRefusalReason {
@@ -166,6 +177,7 @@ impl ScopeRefusalReason {
             Self::InvalidCohortScope(_) => "scope_invalid_cohort_scope",
             Self::MembershipUnresolved => "scope_membership_unresolved",
             Self::MinorOwnerBindingAtFederation => "scope_minor_owner_binding_at_federation",
+            Self::MinorRendezvousAtFederation => "scope_minor_rendezvous_at_federation",
         }
     }
 }

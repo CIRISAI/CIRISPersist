@@ -197,6 +197,38 @@ where
     .await
 }
 
+/// v62.0.0 (CE-fix1) — **verify a domain's composite under a key in hand**:
+/// ONE composite over [`domain_preimage`]`(domain, message)` under `key`.
+/// Pure: no directory, no clock.
+///
+/// **A self-check before a bundle exists, and nothing else.** The offline
+/// ceremony (`crate::ceremony`) checks a holder's manifest signature under
+/// the composite key of the holder's own `key:record` before any node holds
+/// it. A HOST DECISION (an emergency shutdown, a manifest the Agent boots
+/// on, any authority) must resolve the signer through the directory:
+/// [`verify_domain_composite_via_directory`], [`verify_accord_manifest_v2`]
+/// (the holder check). A raw-key verify is not a host authority path
+/// (ruling, Eric): this stays Rust-only, with no PyO3 verb and no capsule op.
+///
+/// # Errors
+/// [`Error::SignatureInvalid`] leading with `verify_composite_invalid`.
+pub fn verify_domain_composite(
+    key: &ciris_crypto::composite::CompositePublicKey,
+    domain: SigningDomain,
+    message: &[u8],
+    composite_sig: &[u8],
+) -> Result<(), Error> {
+    key.verify(&domain_preimage(domain, message), composite_sig)
+        .map_err(|e| {
+            Error::SignatureInvalid(format!(
+                "{}: the composite signature does not verify under the given key in domain \
+                 {}: {e}",
+                super::composite_verify::VERIFY_COMPOSITE_INVALID,
+                domain.tag()
+            ))
+        })
+}
+
 /// **The accord manifest's signed message (v2)**: the 32-byte SHA-256 of the
 /// RFC 8785 (JCS) image of
 /// `{"domain": "ciris.accord_manifest.v2", "manifest_sha256": <hex>,
@@ -484,7 +516,6 @@ where
     }) {
         let seated = match dir.active_family_members(body).await {
             Ok(members) => members.iter().any(|m| m.key_id == identity_ref),
-            Err(Error::Unsupported { .. }) => false,
             Err(e) => return Err(e),
         };
         if seated {

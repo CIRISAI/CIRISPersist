@@ -62,6 +62,243 @@ pub struct ServedPage {
     /// withheld), so a page of withheld statements still advances. `None`
     /// when the store had nothing after the cursor.
     pub next: Option<StatementCursor>,
+    /// v62.0.0 (RL-fix1; CC 5.3.4) — how many scanned statements were
+    /// withheld because they WAIT for this node to reach a root
+    /// ([`SERVE_WAITS_FOR_ROOTED`]): federation-tier rows a rootless node
+    /// does not serve to a third party. A count a host can read and render;
+    /// zero on a node whose own standing chain reaches a root.
+    pub waiting_for_rooted: u32,
+}
+
+/// v62.0.0 (RL-fix1; CC 5.3.4 "What crosses before Rooted") — the reason a
+/// serve path withholds a federation-tier (commons) row on a node whose own
+/// standing chain reaches no root: "What waits for `Rooted` (CC 3.2 T8) is
+/// what the node serves to a third party: a federation-tier row, and any
+/// self-authored row about someone other than the peer." A wait, never a
+/// refusal: the row is held as it was, and is served once a root is reached.
+pub const SERVE_WAITS_FOR_ROOTED: &str = "serve_waits_for_rooted";
+
+/// Per serve call: this node's rooting, read once, and the waits counted.
+#[derive(Default)]
+struct ServeCtx {
+    rooted: std::sync::OnceLock<bool>,
+    waiting: std::sync::atomic::AtomicU32,
+}
+
+tokio::task_local! {
+    /// v62.0.0 (RL-fix1) — set while [`statements_served_to`] scans a page.
+    static SERVE_CTX: std::sync::Arc<ServeCtx>;
+}
+
+/// v62.0.0 (RL-fix1; CC 5.3.4, CC 5.4 "Who carries what") — **the
+/// bootstrap kinds and the allegiance facts**, by the statement's own
+/// family: what crosses to any peer before either side is Rooted. CC part_5
+/// l.1129: "the public self-authenticating rows, which are key records and
+/// revocations, occurrences, a sender's own allegiance rows and the routes
+/// of unowned nodes"; "the accord's rows and tombstones" (the halt, the
+/// notify, the drill, the lifecycle). So:
+///
+/// - `key:record`, `key:revocation` (served before this is asked);
+/// - `identity:occurrence` (an occurrence and its bind, which carries the
+///   route and the transit key: CC 5.3.4 l.730, "that identity's own
+///   hybrid-signed `transport_destination` row … from any source"),
+///   `identity:occurrence_revocation` and `revocation:{entity_type}:{reason}`;
+/// - `transport:canonical_rebind` (a seat's route);
+/// - an agent's owner binding (`ownership:{relation}:{target_kind}:{version}`);
+///   a person's owner binding (a `self:delegates_to` owner-binding row) is
+///   recognised by its row ([`commons_servable`]'s `allegiance`);
+/// - the accord's invocation and lifecycle rows (`edition2::halt`).
+///
+/// Signed objects (genesis bundle voices) are public and served before this
+/// is asked. The pairing plane's sealed asks (an invitation, a key grant, a
+/// device join) are rows ADDRESSED to the requester, served by
+/// `group_serve::delivered_to_requester`.
+#[must_use]
+pub fn is_bootstrap_kind(statement: &[u8]) -> bool {
+    use ciris_verify_core::namespace_match::family_id;
+    if super::halt::is_invocation(statement) || super::halt::is_lifecycle(statement) {
+        return true;
+    }
+    let Some((protected, _)) = statement_parts(statement) else {
+        return false;
+    };
+    let Some(family) = protected.get_int(-70002).and_then(Value::as_text) else {
+        return false;
+    };
+    let is = |f: &str| family == f || family == family_id(f);
+    is(ciris_verify_core::edition2::keys::KEY_RECORD_FAMILY)
+        || is(KEY_REVOCATION_FAMILY)
+        || is(super::occurrence::OCCURRENCE_FAMILY)
+        || is(super::occurrence::OCCURRENCE_REVOCATION_FAMILY)
+        || is(super::typed::OCCURRENCE_REVOCATION_PREFIX)
+        || is(super::typed::REVOCATION_PREFIX)
+        || is(super::transport_rebind::REBIND_FAMILY)
+        || is("ownership:{relation}:{target_kind}:{version}")
+}
+
+/// v62.0.0 (RL-fix2; CC 3.2 T8 reader-relative, for ITSELF; lead ruling
+/// (A)(i)) — **THE SEAM: is `node`'s own standing chain rooted at
+/// `at_ms`?** True when some trust root that a live acceptance edge of the
+/// node, or of its owner, names ([`transit_candidate_roots`](crate::federation::trust_root))
+/// reads `Rooted` or `Stalled` (valid but non-admitting, CC 3.2 T7) by the
+/// ONE standing primitive,
+/// [`stored_standing_at`](crate::federation::canonical_community::stored_standing_at):
+/// the root's chain from an accord birth, its live `trust:charter:v1`, and
+/// THIS node's own T3 chain to it ([`own_chain_to`](crate::federation::trust_root::own_chain_to):
+/// the owner's acceptance edge governs once the owner signed one). A genesis
+/// bundle held with no acceptance edge is no root this node reaches (CC 3.2
+/// T3). `node` is this directory's own node key (`node_key_id`), which
+/// `stored_standing_at` reads its own chain from.
+///
+/// **PR-fix1 / TR-fix1: re-point this body at the aligned standing
+/// primitive** (the "own standing reaches a root" verdict); every serve path
+/// asks only this.
+///
+/// # Errors
+/// Directory reads.
+pub async fn node_is_rooted<F>(dir: &F, node: &str, at_ms: u64) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use crate::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
+    use crate::federation::canonical_community::{stored_standing_at, StoredStanding};
+    let Some(now) = chrono::TimeZone::timestamp_millis_opt(
+        &chrono::Utc,
+        i64::try_from(at_ms).unwrap_or(i64::MAX),
+    )
+    .single() else {
+        return Ok(false);
+    };
+    let mut users = vec![node.to_owned()];
+    match crate::federation::admission::owner_of_unmarked(dir, node).await {
+        Ok(Some(o)) if o != node => users.push(o),
+        Ok(_) | Err(Error::AmbiguousNodeOwner { .. }) => {}
+        Err(e) => return Err(e),
+    }
+    for user in &users {
+        let mut rows = Vec::new();
+        let mut pages = AttestationQuery::by(user, FOLD_PAGE).pages();
+        while let Some(page) = pages.next(dir).await? {
+            rows.extend(page);
+        }
+        for c in crate::federation::trust_root::transit_candidate_roots(&rows, user, now) {
+            if matches!(
+                Box::pin(stored_standing_at(dir, &c.root_ref, now)).await?,
+                StoredStanding::Rooted(_) | StoredStanding::Stalled { .. }
+            ) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// This directory's node, rooted now ([`node_is_rooted`]); no node key is
+/// no root.
+async fn this_node_is_rooted<F>(dir: &F) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(node) = dir.node_key_id() else {
+        return Ok(false);
+    };
+    let now = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0);
+    Box::pin(node_is_rooted(dir, &node, now)).await
+}
+
+/// v62.0.0 (RL-fix2) — **the JSON attestation serve plane's wait**: the rows
+/// of a page a node that is not rooted ([`node_is_rooted`]) withholds, by
+/// the same rule as [`commons_servable`] (the page carries no requester, so
+/// no party exemption). A commons row waits unless it is an allegiance fact
+/// (an owner binding) or a bootstrap kind by its dimension (`identity:occurrence*`,
+/// `revocation:*`, `ownership:*`). Rows at any other placement pass
+/// untouched (their audience rule is the serve path's own).
+///
+/// # Errors
+/// Directory reads.
+pub async fn withhold_waiting_rows<F>(
+    dir: &F,
+    rows: Vec<crate::federation::Attestation>,
+) -> Result<Vec<crate::federation::Attestation>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let waits = |a: &crate::federation::Attestation| {
+        let commons = cs::Scope::parse(&a.cohort_scope).map(cs::Scope::placement)
+            == Some(cs::Placement::Commons);
+        if !commons
+            || crate::federation::admission::is_owner_binding_envelope(&a.attestation_envelope)
+        {
+            return false;
+        }
+        let dim =
+            crate::federation::admission::envelope_dimension(&a.attestation_envelope).unwrap_or("");
+        !(dim.starts_with("identity:occurrence")
+            || dim.starts_with("revocation:")
+            || dim.starts_with("ownership:"))
+    };
+    if !rows.iter().any(waits) || Box::pin(this_node_is_rooted(dir)).await? {
+        return Ok(rows);
+    }
+    let before = rows.len();
+    let kept: Vec<_> = rows.into_iter().filter(|a| !waits(a)).collect();
+    tracing::debug!(
+        reason = SERVE_WAITS_FOR_ROOTED,
+        withheld = before - kept.len(),
+        "federation-tier rows wait: this node's own standing chain reaches no root"
+    );
+    Ok(kept)
+}
+
+/// v62.0.0 (RL-fix1; CC 5.3.4) — **may a federation-tier (commons) row be
+/// served to `requester`?** Yes when it is a bootstrap kind or an
+/// allegiance fact ([`is_bootstrap_kind`]; `allegiance` for an owner-binding
+/// row), when the requester is one of `parties` (its author, or its
+/// subject: a row about the peer, never "about someone other than the
+/// peer"), or when this node's own standing chain reaches a root
+/// ([`node_is_rooted`]). Otherwise it WAITS
+/// ([`SERVE_WAITS_FOR_ROOTED`], counted on the page).
+///
+/// # Errors
+/// Directory reads.
+pub(crate) async fn commons_servable<F>(
+    dir: &F,
+    statement: &[u8],
+    requester: Option<&str>,
+    parties: &[&str],
+    allegiance: bool,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if allegiance || is_bootstrap_kind(statement) {
+        return Ok(true);
+    }
+    if requester.is_some_and(|p| !p.is_empty() && parties.contains(&p)) {
+        return Ok(true);
+    }
+    let ctx = SERVE_CTX.try_with(std::sync::Arc::clone).ok();
+    let rooted = match ctx.as_ref().and_then(|c| c.rooted.get().copied()) {
+        Some(r) => r,
+        None => {
+            let r = Box::pin(this_node_is_rooted(dir)).await?;
+            if let Some(c) = &ctx {
+                let _ = c.rooted.set(r);
+            }
+            r
+        }
+    };
+    if !rooted {
+        if let Some(c) = &ctx {
+            c.waiting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        tracing::debug!(
+            reason = SERVE_WAITS_FOR_ROOTED,
+            requester = requester.unwrap_or(""),
+            "a federation-tier row waits: this node's own standing chain reaches no root"
+        );
+    }
+    Ok(rooted)
 }
 
 /// Is `attestation_type` served under the row-type rule in force?
@@ -192,7 +429,18 @@ where
     }
     let placement = cs::Scope::parse(&row.cohort_scope).map(cs::Scope::placement);
     match (placement, requester) {
-        (Some(cs::Placement::Commons), _) => Ok(true),
+        // v62.0.0 (RL-fix1; CC 5.3.4) — a federation-tier row waits for a
+        // root on a node that reaches none, unless the text lets it cross.
+        (Some(cs::Placement::Commons), _) => {
+            Box::pin(commons_servable(
+                dir,
+                statement,
+                requester,
+                &[row.attesting_key_id.as_str(), row.attested_key_id.as_str()],
+                crate::federation::admission::is_owner_binding_envelope(&row.attestation_envelope),
+            ))
+            .await
+        }
         (None, _) | (Some(_), None) => Ok(false),
         (Some(placement), Some(peer)) => {
             let target =
@@ -285,11 +533,38 @@ pub async fn statements_served_to<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    let ctx = std::sync::Arc::new(ServeCtx::default());
+    SERVE_CTX
+        .scope(
+            ctx.clone(),
+            statements_served_to_scoped(dir, cursor, limit, requester, ctx),
+        )
+        .await
+}
+
+/// [`statements_served_to`]'s body, run inside its [`ServeCtx`].
+async fn statements_served_to_scoped<F>(
+    dir: &F,
+    cursor: Option<&StatementCursor>,
+    limit: u32,
+    requester: Option<&str>,
+    ctx: std::sync::Arc<ServeCtx>,
+) -> Result<ServedPage, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use std::sync::atomic::Ordering;
     let scanned = dir.edition2_statements_since(cursor, limit).await?;
     let next = scanned.last().map(|s| s.cursor);
     let mut statements: Vec<ServedStatement> = Vec::with_capacity(scanned.len());
+    let mut waiting_for_rooted = 0u32;
     for s in scanned {
-        if servable_to(dir, &s.bytes, requester).await? {
+        let waits_before = ctx.waiting.load(Ordering::Relaxed);
+        let served = servable_to(dir, &s.bytes, requester).await?;
+        if !served && ctx.waiting.load(Ordering::Relaxed) > waits_before {
+            waiting_for_rooted = waiting_for_rooted.saturating_add(1);
+        }
+        if served {
             // v62.0.0 (T2-fix4; CC 2.7.5, rc21 7f94be1) — the rows an
             // eviction cites (its voices' key records and bindings) are its
             // ancestors and TRAVEL with it: served just before it, at its
@@ -314,5 +589,9 @@ where
             }
         }
     }
-    Ok(ServedPage { statements, next })
+    Ok(ServedPage {
+        statements,
+        next,
+        waiting_for_rooted,
+    })
 }

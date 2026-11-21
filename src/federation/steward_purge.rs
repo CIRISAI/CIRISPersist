@@ -3402,14 +3402,9 @@ async fn withholding_notice<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let notices = match directory
+    let notices = directory
         .purge_tombstone_notices(PurgePlane::Blob.as_str(), sha_hex)
-        .await
-    {
-        Ok(n) => n,
-        Err(Error::Unsupported { .. }) => return Ok(None),
-        Err(e) => return Err(e),
-    };
+        .await?;
     let mut reversed = ReversedTakedowns::default();
     for notice_id in &notices {
         if super::takedown_tombstone::takedown_reversal(directory.as_dyn_directory(), notice_id)
@@ -3765,7 +3760,7 @@ where
         .purge_tombstoned(PurgePlane::Trace.as_str(), trace_id)
         .await
     {
-        Ok(None) | Err(Error::Unsupported { .. }) => return Ok(()),
+        Ok(None) => return Ok(()),
         Ok(Some(_)) => {}
         Err(e) => return Err(e),
     }

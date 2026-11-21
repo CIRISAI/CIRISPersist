@@ -1551,3 +1551,84 @@ both!(
     i3568_held_on_a_then_b_concludes_on_b_postgres,
     held_on_a_then_b_body
 );
+
+/// **I2185 (v62.0.0, PX-fix1) — the fold's held reads cross the capsule
+/// proxy.** State is written on the backend; every read is THROUGH the proxy
+/// (backend ← capsule dispatch ← `OpsDirectory`), beside the direct read:
+///
+/// - bytes a held byte row names are NOT servable (`fold::bytes_servable`
+///   answered TRUE through the proxy's empty `fold_slot_rows` / `false`
+///   `fold_slot_held` defaults before PX-fix1);
+/// - an owner binding held `count_short` IS held back (`fold::is_held_back`
+///   answered FALSE through the `None` `fold_held` default), and once its
+///   node's voice concludes it, it is not.
+pub(crate) async fn proxy_held_reads_body(dir: std::sync::Arc<dyn FederationDirectory>) {
+    let proxy = crate::ffi::directory_capsule::test_proxy(dir.clone());
+    let (d, p) = (dir.as_ref(), proxy.as_ref());
+
+    let sha = [0x6a; 32];
+    assert!(
+        fold::bytes_servable(p, &sha).await.unwrap(),
+        "I2185: bytes no folded row names are servable through the proxy"
+    );
+    fold::hold_bytes(
+        d,
+        rid(0x41),
+        &sha,
+        reason::BYTES_HELD_BACK,
+        "PX-fix1: the chunk's stream is not held",
+        BTreeSet::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !fold::bytes_servable(d, &sha).await.unwrap(),
+        "I2185: held back on the backend"
+    );
+    assert!(
+        !fold::bytes_servable(p, &sha).await.unwrap(),
+        "I2185: held-back bytes are NOT servable through the proxy"
+    );
+
+    let (owner, node) = ("px-i2185-o", "px-i2185-n");
+    let _ = e2::put_key(d, owner, &[identity_type::USER]).await;
+    let _ = e2::put_key(d, node, &[identity_type::NODE]).await;
+    let binding = owner_binding(owner, node);
+    let o = e2::put_signed(d, &binding).await.expect("I2185: kept");
+    assert!(pending(&o), "I2185: held for the node's voice: {o:?}");
+    let st = e2::carried_statement(&binding).expect("I2185: statement");
+    assert!(
+        fold::is_held_back(d, &st).await.unwrap(),
+        "I2185: held back on the backend"
+    );
+    assert!(
+        fold::is_held_back(p, &st).await.unwrap(),
+        "I2185: a held row IS held back through the proxy"
+    );
+    let o = e2::put_statement(d, &e2::voice_of(&st, node))
+        .await
+        .expect("I2185: the node's voice");
+    assert!(
+        matches!(o, StatementOutcome::Row { .. }),
+        "I2185: concluded: {o:?}"
+    );
+    assert!(
+        !fold::is_held_back(p, &st).await.unwrap(),
+        "I2185: a concluded row is not held back through the proxy"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2185_held_reads_cross_the_proxy_sqlite() {
+    Box::pin(proxy_held_reads_body(std::sync::Arc::new(sqlite().await))).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2185_held_reads_cross_the_proxy_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(proxy_held_reads_body(std::sync::Arc::new(b))).await;
+}

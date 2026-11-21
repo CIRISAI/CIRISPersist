@@ -1061,3 +1061,95 @@ async fn i3012_one_voice_countersign_holds_postgres() {
     };
     Box::pin(countersign_body(&b)).await;
 }
+
+/// **I2191 (v62.0.0, PX-fix3) — a forked group reads as FORKED through the
+/// capsule proxy.** I3001's shape, written on the backend and read through
+/// the proxy (backend ← capsule dispatch ← `OpsDirectory`): with a fork held
+/// as a tip, `list_group_tips` through the proxy answers the backend's tip,
+/// and the authorized roster a consumer composes over the proxy
+/// (`active_family_members`, a trait default over `forked_tip_members`) is
+/// the members COMMON to both tips — never the head's own roster. Before
+/// PX-fix3 the proxy answered `list_group_tips` `Unsupported` and
+/// `forked_tip_members` read that as "not forked" (fail-open: `c`, whom the
+/// fork drops, stayed a member).
+pub(crate) async fn fork_through_proxy_body(dir: std::sync::Arc<dyn FederationDirectory>) {
+    let proxy = crate::ffi::directory_capsule::test_proxy(dir.clone());
+    let (d, p) = (dir.as_ref(), proxy.as_ref());
+    let (a, b, c, g) = (key(191), key(192), key(193), key(194));
+    register(d, &[&a, &b, &c]).await;
+    let active = |x: &'static str, gid: String| {
+        let dd: &dyn FederationDirectory = if x == "proxy" { p } else { d };
+        async move {
+            sorted(
+                dd.active_family_members(&gid)
+                    .await
+                    .unwrap_or_else(|e| panic!("I2191 {x}: active_family_members: {e}"))
+                    .into_iter()
+                    .map(|m| m.key_id)
+                    .collect(),
+            )
+        }
+    };
+    let gid = iref(&g);
+    let abc = [(&a, None), (&b, None), (&c, None)];
+    let v1 = family(&g, "v1", "majority", &abc);
+    let mut v1_id = None;
+    for k in [&a, &b, &c] {
+        v1_id = landed(&put(d, &roster(&v1, 1, None, 2_000, k)).await.unwrap());
+    }
+    let v1_id = v1_id.expect("I2191 founded");
+    let head = family(&g, "head", "majority", &abc);
+    for k in [&a, &b] {
+        put(d, &roster(&head, 2, Some(&v1_id), 3_000, k))
+            .await
+            .unwrap();
+    }
+    let all = sorted(vec![iref(&a), iref(&b), iref(&c)]);
+    assert_eq!(active("direct", gid.clone()).await, all, "I2191 one head");
+    assert_eq!(
+        active("proxy", gid.clone()).await,
+        all,
+        "I2191 one head, through the proxy"
+    );
+    let fork = family(&g, "fork", "majority", &[(&a, None), (&b, None)]);
+    for k in [&a, &b] {
+        put(d, &roster(&fork, 2, Some(&v1_id), 4_000, k))
+            .await
+            .unwrap();
+    }
+    let direct_tips = d.list_group_tips(Cohort::Family, &gid).await.unwrap();
+    assert_eq!(direct_tips.len(), 1, "I2191 the fork is a tip");
+    assert_eq!(
+        p.list_group_tips(Cohort::Family, &gid)
+            .await
+            .expect("I2191 the proxy routes list_group_tips"),
+        direct_tips,
+        "I2191 the proxy reads the backend's tip"
+    );
+    let common = sorted(vec![iref(&a), iref(&b)]);
+    assert_eq!(
+        active("direct", gid.clone()).await,
+        common,
+        "I2191 forked: the members common to both tips"
+    );
+    assert_eq!(
+        active("proxy", gid.clone()).await,
+        common,
+        "I2191 forked THROUGH THE PROXY: the common members, never the head's roster"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2191_a_fork_reads_forked_through_the_proxy_sqlite() {
+    Box::pin(fork_through_proxy_body(std::sync::Arc::new(sqlite().await))).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2191_a_fork_reads_forked_through_the_proxy_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(fork_through_proxy_body(std::sync::Arc::new(b))).await;
+}

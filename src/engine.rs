@@ -783,6 +783,40 @@ impl Engine {
         .await
     }
 
+    /// v62.0.0 (PR-fix1; CC 3.2 T8, CC 5.3.4) — **is the peer Rooted for
+    /// THIS node at `at_ms`?** The reader is this engine's node key (its
+    /// owner's acceptance edges are read, CC 3.2 T3). `at_ms` is the
+    /// signer-stamped instant of the thing being judged, never this node's
+    /// wall clock for an outcome that is stored or replicated. See
+    /// [`peer_rooting`](crate::federation::edition2::peer_rooting::peer_rooting).
+    ///
+    /// # Errors
+    /// This engine has no node key, `at_ms` is no instant, or a directory
+    /// read failed.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn peer_rooting(
+        &self,
+        peer_identity_ref: &str,
+        claimed_key: crate::federation::edition2::peer_rooting::ClaimedKey<'_>,
+        at_ms: u64,
+    ) -> Result<crate::federation::edition2::peer_rooting::PeerRooting, crate::federation::Error>
+    {
+        let dir = self.federation_directory();
+        let Some(reader) = crate::federation::FederationDirectory::node_key_id(dir.as_ref()) else {
+            return Err(crate::federation::Error::InvalidArgument(
+                "peer_rooting: this engine has no node key (the reader)".into(),
+            ));
+        };
+        crate::federation::edition2::peer_rooting::peer_rooting(
+            dir.as_ref(),
+            &reader,
+            peer_identity_ref,
+            claimed_key,
+            at_ms,
+        )
+        .await
+    }
+
     /// Variant accepting raw signer Arcs — matches the issue's
     /// `Engine::with_signer_arcs(classical, pqc, dsn)` shape from
     /// CIRISPersist#43.
@@ -3095,9 +3129,8 @@ impl Engine {
         attestation_evidence: Option<serde_json::Value>,
     ) -> Result<String, crate::federation::Error> {
         use crate::federation::edition2::emit::{
-            key_record_payload, produce_error, KEY_RECORD_FAMILY,
+            key_record_statement_draft, produce_error, self_key_record_payload,
         };
-        use ciris_verify_core::edition2::keys::KEY_RECORD_MAX_SECS;
         use ciris_verify_core::edition2::{identity_ref, thumbprint};
 
         const PRODUCER: &str = "register_self_federation_key";
@@ -3136,17 +3169,14 @@ impl Engine {
                 })
             })
             .transpose()?;
-        let end = match asked_end {
-            Some(u) => Some(u),
-            None if must_end => Some(now_ms.saturating_add(KEY_RECORD_MAX_SECS * 1000)),
-            None => None,
-        };
-        let payload = key_record_payload(
+        // v62.0.0 (CE-fix1) — the one payload producer the offline ceremony
+        // calls too (`crate::ceremony::key_record_draft`): the end rule and
+        // the members, from the instant passed in.
+        let payload = self_key_record_payload(
             &key,
             &roles,
-            &iref,
             now_ms,
-            end,
+            asked_end,
             attestation_evidence.as_ref(),
         )
         .map_err(|e| produce_error(PRODUCER, e))?;
@@ -3175,15 +3205,15 @@ impl Engine {
             }
         }
 
-        let statement = crate::federation::edition2::produce::sign_row(
-            signer,
-            &iref,
-            crate::federation::types::attestation_type::SCORES,
-            KEY_RECORD_FAMILY,
-            &payload,
-        )
-        .await
-        .map_err(|e| produce_error(PRODUCER, e))?;
+        // v62.0.0 (CE-fix1) — the same draft the offline ceremony hands its
+        // hardware signer, signed here by the engine's composite signer.
+        let draft =
+            key_record_statement_draft(&key, &payload).map_err(|e| produce_error(PRODUCER, e))?;
+        let signature = signer
+            .sign_composite(&draft.sig_structure)
+            .await
+            .map_err(|e| produce_error(PRODUCER, e.into()))?;
+        let statement = draft.assemble(signature);
         crate::federation::edition2::ingest::put_statement_with_origin(
             dir.as_ref(),
             &statement,
@@ -5203,6 +5233,91 @@ impl Engine {
             ))
         })?;
         crate::federation::edition2::second_signer_voice::voice_draft(&st, signer_iss)
+    }
+
+    /// v62.0.0 (AU-fix2; CC 2.6.1.1, CC 2.7.11) — **a new statement,
+    /// drafted for a signer whose pen is elsewhere** (a hardware-custodied
+    /// owner): the row's payload from its JSON members
+    /// ([`draft_from_envelope`](crate::federation::edition2::emit::draft_from_envelope):
+    /// the family from the envelope's `dimension`, `author` = `signer_iss`
+    /// for an authored family, instants RFC 3339, digests 64-hex), under a
+    /// protected header naming `signer_iss` / `signer_kid`. The host signs
+    /// `sig_structure` with its composite key, assembles the statement
+    /// (`Draft::assemble`) and puts it through `put_edition2_statement`. A
+    /// composer names `target_row_id_hex`, whose family is read from its held
+    /// statement. For ANY family; an `admission:unit` row names its roster
+    /// head as the envelope member `head` (64-hex row id) and is then
+    /// counted (no `author`).
+    ///
+    /// # Errors
+    /// A `signer_kid_hex` that is not 32 bytes of hex; a target not held; the
+    /// draft's refusals (an unregistered dimension, a malformed member).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn statement_draft(
+        &self,
+        row_type: &str,
+        envelope: &serde_json::Value,
+        signer_iss: &str,
+        signer_kid_hex: &str,
+        sub: &str,
+        asserted_at_ms: u64,
+        target_row_id_hex: Option<&str>,
+    ) -> Result<crate::federation::edition2::emit::Draft, crate::federation::Error> {
+        let bad = |what: &str| {
+            crate::federation::Error::InvalidArgument(format!("statement_draft: {what}"))
+        };
+        let kid: crate::federation::edition2::Digest32 = hex::decode(signer_kid_hex)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            .ok_or_else(|| bad("signer_kid_hex is not 32 bytes of hex"))?;
+        let target = match target_row_id_hex {
+            None => None,
+            Some(t) => {
+                let rid = Self::voice_row_id(t)?;
+                let st = crate::federation::edition2::second_signer_voice::held_statement(
+                    &*self.federation_directory(),
+                    &rid,
+                )
+                .await?
+                .ok_or_else(|| bad(&format!("no statement of the target {t} is held")))?;
+                let (family, _) = crate::federation::edition2::emit::family_of_statement(&st)
+                    .ok_or_else(|| bad("the held target is not a row statement"))?;
+                Some((rid.0, family))
+            }
+        };
+        crate::federation::edition2::emit::draft_from_envelope(
+            &kid,
+            signer_iss,
+            sub,
+            row_type,
+            envelope,
+            asserted_at_ms,
+            target.as_ref().map(|(r, f)| (r, f.as_str())),
+        )
+    }
+
+    /// v62.0.0 (AU-fix2; CC 2.7.11) — **the LIVE `admission:unit` rows about
+    /// `sub`** (a unit's `canonical:sha256:{hex}`) at `at`: concluded, in
+    /// lease, not withdrawn, signers live persons; held rows are never
+    /// listed ([`crate::federation::FederationDirectory::admission_unit_rows`]).
+    /// Whether one runs HERE is [`Self::admission_unit_runnable`]'s.
+    ///
+    /// # Errors
+    /// Directory read failures.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn admission_unit_rows(
+        &self,
+        sub: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        owner_key_id: Option<&str>,
+    ) -> Result<
+        Vec<crate::federation::edition2::admission_unit::AdmissionUnitRow>,
+        crate::federation::Error,
+    > {
+        self.federation_directory()
+            .admission_unit_rows(sub, at, owner_key_id)
+            .await
     }
 
     /// v62.0.0 (v62 P8-fix5) — **submit a second signer's voice signed
@@ -9089,6 +9204,7 @@ impl Engine {
                         transport: occ.transport.clone(),
                         head,
                         further_heads,
+                        cites: Vec::new(),
                     };
                     let author_signer =
                         (signer.federation_id().await == terms.author).then_some(signer.as_ref());
@@ -10408,6 +10524,28 @@ impl Engine {
         crate::federation::age::age_band(&*self.federation_directory(), key_id).await
     }
 
+    /// v62.0.0 (K2-fix20; CC 5.4.6 as ruled for rc22, CC 3.4.13 Q5) — **may
+    /// this node publish a federation-scope `rendezvous:route` for
+    /// `key_id`** (the person, a key acting for them, or their node)? `Err`
+    /// `scope_minor_rendezvous_at_federation` while a held row places the
+    /// person in a minor band. The producing node's own authoring check: a
+    /// host (Edge) MUST call it before it publishes a route; no receiver
+    /// checks. See [`crate::federation::age::may_publish_federation_rendezvous`].
+    ///
+    /// # Errors
+    /// The refusal; directory reads.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn may_publish_federation_rendezvous(
+        &self,
+        key_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::age::may_publish_federation_rendezvous(
+            &*self.federation_directory(),
+            key_id,
+        )
+        .await
+    }
+
     /// v53.0.0 (CIRISPersist#975, CC 2.4 ask 4) — what the closed row-type
     /// slot sees on this node: held rows of an unregistered `attestation_type`
     /// (by exact type, never deleted), and since process start the unregistered
@@ -10481,6 +10619,10 @@ impl Engine {
             self.federation_directory().as_ref(),
             community_key_id,
             duty,
+            // K2-fix16 — HOST EDGE (CC 2.7.9): no act is judged; who is
+            // seated is read at this node's own clock and means nothing
+            // beyond this node.
+            crate::host::clock::now(),
         )
         .await
     }
@@ -10944,19 +11086,205 @@ impl Engine {
         .await
     }
 
-    /// v62.0.0 (P10; CC rc21 2.7.11) — **the receipt leg of running admitted
-    /// code**: may the unit the `admission:unit` row `row_id` admits run, as
-    /// far as its SCITT receipt goes? `Runnable` when a COSE receipt (RFC
-    /// 9942, the statement's unprotected `receipts` parameter, label 394)
-    /// held on a voice of the row verifies and comes from a Transparency
-    /// Service THIS host trusts: a live `trust:accepts` edge of the host
-    /// OWNER, at `self` scope, with the class `transparency` names it (a CEG
-    /// identity-ref or a COSE_Key, the edge's `service_key`). Otherwise the unit waits
-    /// (`admission_receipt_missing`: `none`, `unverifiable`,
-    /// `untrusted_service`); `NotHeld` (`admission_none`, `no_row`) when no
-    /// such row is held. Read now, nothing stored. The lease, standing,
-    /// withdrawal and halt legs are the host's
-    /// ([`receipts`](crate::federation::edition2::receipts)).
+    /// v62.0.0 (RL-fix1, lead ruling (B)) — **the replicated statement door
+    /// with the host's feed position**
+    /// ([`apply_replicated_statement_at_feed`](crate::federation::edition2::ingest::apply_replicated_statement_at_feed)):
+    /// an accord row this node cannot judge (no genesis bundle held) is
+    /// `Refused { accord_root_not_held }`, the cursor advances, and the
+    /// feed's first such position is kept for [`Self::accord_rescan_needed`].
+    ///
+    /// # Errors
+    /// As the replicated door; a feed field empty or too long.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn apply_replicated_statement_at_feed(
+        &self,
+        statement: &[u8],
+        offered_row_id: &ciris_verify_core::edition2::Digest32,
+        feed: &crate::federation::edition2::accord_rescan::FeedPosition,
+    ) -> Result<
+        crate::federation::edition2::ingest::ReplicatedStatementOutcome,
+        crate::federation::Error,
+    > {
+        crate::federation::edition2::ingest::apply_replicated_statement_at_feed(
+            self.federation_directory().as_ref(),
+            statement,
+            offered_row_id,
+            feed,
+        )
+        .await
+    }
+
+    /// v62.0.0 (RL-fix1, lead ruling (B)) — **the feeds to re-pull** for
+    /// accord rows skipped while this node held no accord root
+    /// ([`rescan_needed`](crate::federation::edition2::accord_rescan::rescan_needed)):
+    /// empty (a state) until a genesis bundle is in force.
+    ///
+    /// # Errors
+    /// Directory reads.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn accord_rescan_needed(
+        &self,
+    ) -> Result<
+        Vec<crate::federation::edition2::accord_rescan::AccordRescan>,
+        crate::federation::Error,
+    > {
+        crate::federation::edition2::accord_rescan::rescan_needed(
+            self.federation_directory().as_ref(),
+        )
+        .await
+    }
+
+    /// v62.0.0 (RL-fix1, lead ruling (B)) — **the host re-pulled** `plane`
+    /// from `peer` past `from_position`: clear that watermark
+    /// ([`ack_rescan`](crate::federation::edition2::accord_rescan::ack_rescan)).
+    ///
+    /// # Errors
+    /// The store.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn ack_accord_rescan(
+        &self,
+        plane: &str,
+        peer: &str,
+        from_position: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        crate::federation::edition2::accord_rescan::ack_rescan(
+            self.federation_directory().as_ref(),
+            plane,
+            peer,
+            from_position,
+        )
+        .await
+    }
+
+    /// v62.0.0 (RL-fix2) — **record a contact's dial hint** from a decoded
+    /// node code ([`record_dial_hints`](crate::federation::edition2::contact::record_dial_hints)):
+    /// local, unsigned, never a transit pair, never served. Replaces the
+    /// node's list.
+    ///
+    /// # Errors
+    /// `dial_hint_out_of_bounds`, `fedcode_transport_is_federation_key`;
+    /// the store.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn record_dial_hints(
+        &self,
+        hints: crate::federation::edition2::contact::DialHints,
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::edition2::contact::record_dial_hints(
+            self.federation_directory().as_ref(),
+            hints,
+        )
+        .await
+    }
+
+    /// v62.0.0 (RL-fix2) — the dial hint held for `node`, if any.
+    ///
+    /// # Errors
+    /// The store.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn dial_hints_for(
+        &self,
+        node: &str,
+    ) -> Result<Option<crate::federation::edition2::contact::DialHints>, crate::federation::Error>
+    {
+        crate::federation::edition2::contact::dial_hints_for(
+            self.federation_directory().as_ref(),
+            node,
+        )
+        .await
+    }
+
+    /// v62.0.0 (RL-fix2) — every dial hint held, by node.
+    ///
+    /// # Errors
+    /// The store.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn list_dial_hints(
+        &self,
+    ) -> Result<Vec<crate::federation::edition2::contact::DialHints>, crate::federation::Error>
+    {
+        crate::federation::edition2::contact::list_dial_hints(self.federation_directory().as_ref())
+            .await
+    }
+
+    /// v62.0.0 (RL-fix2) — remove a contact's dial hint (call it when the
+    /// contact is removed). `false` when none was held.
+    ///
+    /// # Errors
+    /// The store.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn remove_dial_hints(&self, node: &str) -> Result<bool, crate::federation::Error> {
+        crate::federation::edition2::contact::remove_dial_hints(
+            self.federation_directory().as_ref(),
+            node,
+        )
+        .await
+    }
+
+    /// v62.0.0 (RL-fix2; CC 5.3.3.10 E1 steps 5–9) — **the checked admission
+    /// of a pre-seal answer** for the dialled node
+    /// ([`admit_pre_seal_answer`](crate::federation::edition2::contact::admit_pre_seal_answer)).
+    ///
+    /// # Errors
+    /// `code_node_key_mismatch`, `code_route_signer_mismatch`,
+    /// `code_route_carries_no_transit_key` (nothing stored); the doors'.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn admit_pre_seal_answer(
+        &self,
+        dialled: &str,
+        key_record: &[u8],
+        route: &[u8],
+    ) -> Result<crate::federation::edition2::contact::PreSealAdmission, crate::federation::Error>
+    {
+        crate::federation::edition2::contact::admit_pre_seal_answer(
+            self.federation_directory().as_ref(),
+            dialled,
+            key_record,
+            route,
+        )
+        .await
+    }
+
+    /// v62.0.0 (RL-fix2) — **the post-seal owner check** of a `user` code
+    /// ([`admit_contact_owner_rows`](crate::federation::edition2::contact::admit_contact_owner_rows)).
+    ///
+    /// # Errors
+    /// `code_owner_mismatch`, `code_owner_binding_not_for_node` (nothing of
+    /// the owner rows stored); the doors'.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn admit_contact_owner_rows(
+        &self,
+        node: &str,
+        identity: &str,
+        owner_key_record: &[u8],
+        binding: &[Vec<u8>],
+    ) -> Result<crate::federation::edition2::contact::ContactOwner, crate::federation::Error> {
+        crate::federation::edition2::contact::admit_contact_owner_rows(
+            self.federation_directory().as_ref(),
+            node,
+            identity,
+            owner_key_record,
+            binding,
+        )
+        .await
+    }
+
+    /// v62.0.0 (P10; AU-fix1; CC rc21 2.7.11) — **may the unit the
+    /// `admission:unit` row `row_id` admits run on THIS host at `at`?**
+    /// `Runnable` only when the row is held and CONCLUDED (a counted row's
+    /// count met at the head it names, never on fewer than two persons), its
+    /// lease covers `at` (`asserted_at <= at < valid_until`), no entitled
+    /// withdrawal asserted by `at` retires it, every counted signer is still
+    /// a live person's key at `at`, the author or group stands at this host
+    /// (the owner's own key, or the owner's `admission` acceptance walk; one
+    /// person's effect row only on that person's own host), and a SCITT
+    /// receipt from a Transparency Service this host trusts is held. Each
+    /// failing leg has its own token and detail
+    /// ([`admission_unit`](crate::federation::edition2::admission_unit)).
+    /// `at` is the caller's: nothing inside reads the wall clock (a
+    /// present-tense host read passes `now`). `owner_key_id` is the host
+    /// owner the standing legs read (Server's `owner_key_id`); `None` reads
+    /// the owner this node's owner binding names. The halt is read by the
+    /// host at each effect, not here.
     ///
     /// # Errors
     /// Directory read failures.
@@ -10964,12 +11292,17 @@ impl Engine {
     pub async fn admission_unit_runnable(
         &self,
         row_id: &crate::federation::edition2::names::RowId,
-    ) -> Result<crate::federation::edition2::receipts::AdmissionReceipt, crate::federation::Error>
-    {
-        crate::federation::edition2::receipts::admission_unit_runnable(
+        at: chrono::DateTime<chrono::Utc>,
+        owner_key_id: Option<&str>,
+    ) -> Result<
+        crate::federation::edition2::admission_unit::AdmissionAnswer,
+        crate::federation::Error,
+    > {
+        crate::federation::edition2::admission_unit::admission_unit_runnable(
             self.federation_directory().as_ref(),
             row_id,
-            crate::host::clock::now(),
+            at,
+            owner_key_id,
         )
         .await
     }
@@ -20580,9 +20913,15 @@ mod tests {
 
         // Pre: not yet a moderator.
         assert!(
-            !is_named_moderator(&*sq, &moderator, &comm_1, SCOPE_MODERATE)
-                .await
-                .unwrap(),
+            !is_named_moderator(
+                &*sq,
+                &moderator,
+                &comm_1,
+                SCOPE_MODERATE,
+                crate::host::clock::now()
+            )
+            .await
+            .unwrap(),
             "not a moderator before appointment"
         );
 
@@ -20602,9 +20941,15 @@ mod tests {
         // v62 (E3, round 6): the appointment waits for the moderator's voice.
         land_held_row(&*sq, &appt).await;
         assert!(
-            is_named_moderator(&*sq, &moderator, &comm_1, SCOPE_MODERATE)
-                .await
-                .unwrap(),
+            is_named_moderator(
+                &*sq,
+                &moderator,
+                &comm_1,
+                SCOPE_MODERATE,
+                crate::host::clock::now()
+            )
+            .await
+            .unwrap(),
             "is_named_moderator TRUE after add_moderator (SCOPE_MODERATE matches the duty walk)"
         );
 
@@ -20614,9 +20959,15 @@ mod tests {
             .await
             .expect("remove_moderator");
         assert!(
-            !is_named_moderator(&*sq, &moderator, &comm_1, SCOPE_MODERATE)
-                .await
-                .unwrap(),
+            !is_named_moderator(
+                &*sq,
+                &moderator,
+                &comm_1,
+                SCOPE_MODERATE,
+                crate::host::clock::now()
+            )
+            .await
+            .unwrap(),
             "is_named_moderator FALSE after remove_moderator (withdraws revokes the edge)"
         );
     }
@@ -22338,9 +22689,15 @@ mod tests {
         // v62 (E3, round 6): the appointment waits for the moderator's voice.
         land_held_row(&*pg, &appt).await;
         assert!(
-            is_named_moderator(&*pg, &moderator, &community, SCOPE_MODERATE)
-                .await
-                .unwrap(),
+            is_named_moderator(
+                &*pg,
+                &moderator,
+                &community,
+                SCOPE_MODERATE,
+                crate::host::clock::now()
+            )
+            .await
+            .unwrap(),
             "is_named_moderator TRUE after add_moderator (PG)"
         );
         engine
@@ -22348,9 +22705,15 @@ mod tests {
             .await
             .expect("remove_moderator");
         assert!(
-            !is_named_moderator(&*pg, &moderator, &community, SCOPE_MODERATE)
-                .await
-                .unwrap(),
+            !is_named_moderator(
+                &*pg,
+                &moderator,
+                &community,
+                SCOPE_MODERATE,
+                crate::host::clock::now()
+            )
+            .await
+            .unwrap(),
             "is_named_moderator FALSE after remove_moderator (PG)"
         );
     }

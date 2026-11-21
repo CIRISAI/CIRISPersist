@@ -14361,6 +14361,14 @@
    },
    {
     "decimal_id": "3.2",
+    "claim_id": "CLM-standing-verdict",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/peer_rooting.rs#peer_rooting",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-pr-fix1"
+   },
+   {
+    "decimal_id": "3.2",
     "claim_id": "CLM-trust-not-membership",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#check_user_target_steward_binding_admission",
@@ -17683,6 +17691,42 @@
     "path#symbol": "src/federation/types.rs#identity_type::set_contains",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v62-c4-rc20"
+   },
+   {
+    "decimal_id": "2.7.11",
+    "claim_id": "CLM-admission-code",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_admission_unit_counted",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-au-fix1",
+    "witness": "I2150-I2153, I2159 (sqlite, postgres): a counted admission:unit row is held count_short until its group's protocol is met at the head it names, never on fewer than two persons; a program key's voice is admission_issuer_not_person"
+   },
+   {
+    "decimal_id": "2.7.11",
+    "claim_id": "CLM-admission-code",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/admission_unit.rs#admission_unit_runnable",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-au-fix1",
+    "witness": "I2150, I2151, I2154, I2155, I2160 (sqlite, postgres): runnable only when concluded, standing at this host (the owner's key or its admission walk; one person's effect row on the owner's host only) and receipted"
+   },
+   {
+    "decimal_id": "2.7.11",
+    "claim_id": "CLM-admission-lease",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/admission_unit.rs#admission_unit_runnable",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-au-fix1",
+    "witness": "I2156, I2157 (sqlite, postgres): the lease read at the instant asked (lease_not_open, lease_ended); the author's withdraws, or the same count, ends it (withdrawn)"
+   },
+   {
+    "decimal_id": "2.7.11",
+    "claim_id": "CLM-admission-lease",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/edition2/admission_unit.rs#admission_unit_rows",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v62-au-fix2",
+    "witness": "I2161, I2162 (sqlite, postgres): the live read lists only concluded rows in lease and not withdrawn, directly and through the capsule op"
    }
   ],
   "CIRISServer": [

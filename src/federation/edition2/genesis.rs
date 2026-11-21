@@ -1310,6 +1310,20 @@ fn admit_named(
     rows: &BTreeMap<Digest32, Vec<u8>>,
     held: &BTreeSet<Digest32>,
 ) -> Result<Vec<AdmittedRow>, Error> {
+    admit_named_at(object, p, named, rows, held, crate::host::clock::now())
+}
+
+/// [`admit_named`] with the clock-skew bound read at `now` (v62.0.0
+/// CE-fix1: the offline ceremony's [`check_genesis_offer`] passes its own
+/// instant; the door passes the host clock).
+fn admit_named_at(
+    object: &Digest32,
+    p: &GenesisPlacement,
+    named: &[Digest32],
+    rows: &BTreeMap<Digest32, Vec<u8>>,
+    held: &BTreeSet<Digest32>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<AdmittedRow>, Error> {
     let keys = BundleKeys::of(p, named, rows);
     let mut out = Vec::new();
     for id in named {
@@ -1356,13 +1370,241 @@ fn admit_named(
                         ),
                     )
                 })?;
-            crate::federation::operational::check_skew_bound(at, crate::host::clock::now())
+            crate::federation::operational::check_skew_bound(at, now)
                 .map_err(|e| named_row_refused(object, id, e))?;
         }
         out.push(a);
     }
     out.sort_by_key(|a| !(a.family == KEY_RECORD_FAMILY || a.family == KEY_REVOCATION_FAMILY));
     Ok(out)
+}
+
+// ------------------------------------------------------------------ the builders
+
+/// v62.0.0 (CE-fix1; CC 2.6.1.11, CC 5.3.4) — **what a `ceg-genesis-bundle/2`
+/// states**: the payload members Verify's bundle reader takes
+/// (`parse_payload`), with no witness directory. Every key is an
+/// identity-ref; every row is named by its row id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundleTerms {
+    /// `version`: 1 for a first bundle.
+    pub version: u64,
+    /// `refs.prev`: a later bundle's predecessor (none on version 1).
+    pub prev: Option<Digest32>,
+    /// `asserted_at`, POSIX ms (the voices' `iat` is its seconds).
+    pub asserted_at_ms: u64,
+    /// The accord's `family_key_id`.
+    pub family_key_id: String,
+    /// `holders`: the holders' identity-refs.
+    pub holders: Vec<String>,
+    /// `serve_nodes`: the seats' identity-refs.
+    pub serve_nodes: Vec<String>,
+    /// `refs.also.cites`: every row the bundle names (the holders' and
+    /// seats' `key:record`s, the seats' bindings, a recovery key's record).
+    pub cites: Vec<Digest32>,
+    /// `charter.recovery_commitments`: one per holder, by identity-ref.
+    pub recovery_commitments: Vec<(String, Digest32)>,
+    /// `charter.scope`: at least `infra:attest` and `infra:serve`.
+    pub scope: Vec<String>,
+    /// `charter.halt_fuse_secs`; `None` leaves the reader's default.
+    pub halt_fuse_secs: Option<u32>,
+}
+
+/// A CBOR set: members sorted by their encodings, no duplicate.
+fn cbor_set(mut xs: Vec<Value>) -> Value {
+    xs.sort_by_key(cde::encode);
+    xs.dedup();
+    Value::Array(xs)
+}
+
+/// v62.0.0 (CE-fix1) — **the payload of a genesis bundle** (CC 2.6.1.11),
+/// in the deterministic map order and with every set sorted by encoding:
+/// the one producer of the bundle the ceremony signs and of the test
+/// ceremony (`fixture_genesis`). Judging it is the reader's.
+#[must_use]
+pub fn bundle_payload(t: &BundleTerms) -> Value {
+    use super::emit::sorted_map;
+    use ciris_verify_core::edition2::{hash_digest_value, row_ref};
+    let text = |s: &str| Value::Text(s.to_owned());
+    let mut refs = vec![(
+        text("also"),
+        sorted_map(vec![(
+            text("cites"),
+            cbor_set(t.cites.iter().map(row_ref).collect()),
+        )]),
+    )];
+    if let Some(p) = &t.prev {
+        refs.push((text("prev"), row_ref(p)));
+    }
+    let mut charter = vec![
+        (
+            text("recovery_commitments"),
+            sorted_map(
+                t.recovery_commitments
+                    .iter()
+                    .map(|(h, c)| (text(h.as_str()), hash_digest_value(c)))
+                    .collect(),
+            ),
+        ),
+        (
+            text("scope"),
+            cbor_set(t.scope.iter().map(|s| text(s.as_str())).collect()),
+        ),
+    ];
+    if let Some(f) = t.halt_fuse_secs {
+        charter.push((text("halt_fuse_secs"), Value::Uint(u64::from(f))));
+    }
+    sorted_map(vec![
+        (text("refs"), sorted_map(refs)),
+        (text("version"), Value::Uint(t.version)),
+        (text("asserted_at"), Value::Uint(t.asserted_at_ms)),
+        (text("family_key_id"), text(t.family_key_id.as_str())),
+        (
+            text("holders"),
+            cbor_set(t.holders.iter().map(|h| text(h.as_str())).collect()),
+        ),
+        (
+            text("serve_nodes"),
+            cbor_set(t.serve_nodes.iter().map(|h| text(h.as_str())).collect()),
+        ),
+        (text("charter"), sorted_map(charter)),
+    ])
+}
+
+/// v62.0.0 (CE-fix1) — the bundle's object id (`["CEG-object/2", typ,
+/// null, payload]`): what an object-id anchor names, and what a holder
+/// publishes once the bundle is signed (CEREMONY step 5).
+#[must_use]
+pub fn bundle_object_id(payload: &Value) -> Digest32 {
+    object_id(GENESIS_BUNDLE_TYP, None, &cde::encode(payload))
+}
+
+/// v62.0.0 (CE-fix1; CC 5.3.4) — **one signer's voice over a bundle,
+/// drafted**: the object header (`kid`, `iss`, `typ` `ceg-genesis-bundle/2`,
+/// `iat` the bundle's `asserted_at` in seconds), the payload as encoded.
+/// The signer (a holder; a recovery key speaking as its holder's `iss`)
+/// signs `Draft::sig_structure` with its composite key.
+#[must_use]
+pub fn bundle_voice_draft(
+    kid: &Digest32,
+    iss: &str,
+    payload: &Value,
+    asserted_at_ms: u64,
+) -> super::emit::Draft {
+    let protected =
+        super::produce::object_protected(kid, iss, GENESIS_BUNDLE_TYP, Some(asserted_at_ms / 1000));
+    let payload = cde::encode(payload);
+    let sig_structure = ciris_verify_core::edition2::sig_structure(&protected, &payload);
+    super::emit::Draft {
+        protected,
+        payload,
+        sig_structure,
+    }
+}
+
+/// v62.0.0 (CE-fix1) — **the genesis door's reading of an offer on a fresh
+/// node, with no store**: what [`put_genesis_bundle`] would place on a node
+/// holding nothing, read from `statements` alone (bundle voices and the
+/// rows they name) under `anchor`, with the clock-skew bound at `now`.
+/// Every check the door runs before it writes runs here, in its order:
+/// the statement form and window of every statement; Verify's lineage
+/// reader (payload, count, anchor, custody gate against
+/// [`attestation_roots`]); one device per holder; each named row's own door
+/// under the keys the bundle places, its closed payload, and a seat
+/// binding's signer and typed payload. Pure: no I/O, no backend feature.
+///
+/// NOT covered (the store's, run only by the real door): the occurrence
+/// write plan and route projection of each seat binding, the key read
+/// models, the transaction, and anything that reads held rows (a later
+/// bundle's held predecessor, voices held short). For those, the ceremony's
+/// final gate is `crate::ceremony::import_offer_into_throwaway`.
+///
+/// A bundle the door would HOLD short (a count not yet met) is an error
+/// here: the ceremony seals only a bundle that places.
+///
+/// # Errors
+/// The door's own errors, by the same tokens: `earlier_form_object`,
+/// `genesis_bundle_malformed` (`no_voice`, or an Invalid bundle), the
+/// retryable unknown-signer error for a bundle waiting on a row it does not
+/// carry, Verify's inconclusive tokens (`genesis_bundle_not_anchored`,
+/// `genesis_bundle_count_unmet`, `genesis_holder_custody`, …),
+/// `holder_device_shared` / `holder_device_unnamed`, and a named row's own
+/// refusal.
+pub fn check_genesis_offer(
+    statements: &[Vec<u8>],
+    anchor: Option<&Anchor>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<GenesisPlacement>, Error> {
+    let mut offered: Vec<Vec<u8>> = Vec::new();
+    let mut carried: BTreeMap<Digest32, Vec<u8>> = BTreeMap::new();
+    for s in statements {
+        super::door::require_statement_form(s)?;
+        let parts = cose_parts(s);
+        if parts.as_ref().and_then(voice_of).is_some() {
+            if let Some(p) = parts.as_ref() {
+                super::door::check_valid_until_after_asserted_at(&p.payload)?;
+            }
+            offered.push(s.clone());
+        } else if let Some(id) = RowId::of_statement(s) {
+            carried.entry(id.0).or_insert_with(|| s.clone());
+        }
+    }
+    if offered.is_empty() {
+        return Err(refuse(
+            token::MALFORMED,
+            "no_voice: the statements carry no `ceg-genesis-bundle/2` voice",
+        ));
+    }
+    let mut rows = BTreeMap::new();
+    for v in &offered {
+        if let Some(p) = cose_parts(v) {
+            for id in named_by(&p.payload) {
+                if let Some(c) = carried.get(&id) {
+                    rows.insert(id, c.clone());
+                }
+            }
+        }
+    }
+    let roots = attestation_roots();
+    let reading = read_lineage(&LineageInput {
+        held: &[],
+        offered: &offered,
+        rows: &rows,
+        anchor,
+        attestation_roots: &roots,
+    });
+    let none_held = BTreeSet::new();
+    let mut placed = Vec::new();
+    let mut refused = Vec::new();
+    for o in &reading.objects {
+        if let Some(n) = not_placed(o.reading.object_id, &o.reading.verdict) {
+            refused.push(n);
+            continue;
+        }
+        let Some(p) = o.reading.verdict.placement() else {
+            continue;
+        };
+        check_holder_devices(&o.reading.object_id, p, &rows, &roots)?;
+        // The seat binding's typed payload (`occurrence::read_payload`, pure)
+        // is read; the occurrence write plan and its route projection are the
+        // store's (backend-gated `occurrence_admit`), run by the real door
+        // (`crate::ceremony::import_offer_into_throwaway`).
+        for a in admit_named_at(&o.reading.object_id, p, &o.named, &rows, &none_held, now)?
+            .iter()
+            .filter(|a| a.family == BINDING_FAMILY)
+        {
+            let _occurrence = super::occurrence::read_payload(a)?;
+        }
+        placed.push(p.clone());
+    }
+    match refused.first() {
+        Some(n) => Err(error_of(n)),
+        None if placed.is_empty() => Err(refuse(
+            token::MALFORMED,
+            "no_voice: no offered statement is a readable bundle voice",
+        )),
+        None => Ok(placed),
+    }
 }
 
 /// A test seam on [`GenesisWrite`]: a backend fails the transaction after

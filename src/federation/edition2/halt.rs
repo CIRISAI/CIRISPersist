@@ -233,6 +233,109 @@ fn replay_fold(mut held: Vec<HeldInvocation>) -> BTreeMap<RowId, RowId> {
     replays
 }
 
+/// v62.0.0 (CE-fix1) — **the invocation door's pure reading** under
+/// `roster` (the bundle in force for the statement's accord): the statement
+/// form, Verify's [`verify_invocation_row`], then the edition-2 door's
+/// [`admit_row`](super::door::admit_row) under the roster's keys. No store,
+/// no clock: what [`put_invocation_at`] reads before it keeps anything, and
+/// what an offline ceremony checks a pre-signed halt against before sealing
+/// it. The replay fold and the latch are the store's.
+///
+/// # Errors
+/// `earlier_form_object`; a waiting reading as the retryable
+/// `federation_attester_key_unknown`; `iss_not_holder`; every other refusal
+/// `accord_invocation_invalid` with the reader's token; the door's own
+/// refusals.
+pub fn read_invocation(
+    bytes: &[u8],
+    roster: &HaltRoster,
+) -> Result<(InvocationRow, AdmittedRow), Error> {
+    super::door::require_statement_form(bytes)?;
+    let inv = match verify_invocation_row(bytes, roster) {
+        HaltReading::Valid(inv) => inv,
+        HaltReading::Waiting(w) => return Err(waiting_error(&w)),
+        HaltReading::Refused(r) => return Err(refusal_error(&r)),
+    };
+    // No holder check here: Verify's verify_invocation_row already requires
+    // iss to be the bundle-placed holder key and author == iss (Verify
+    // v23.3.1 edition2/accord_halt.rs:718 and :800), under this same roster.
+    let admitted = super::door::admit_row(bytes, roster, None, SelectContext::default())?;
+    Ok((inv, admitted))
+}
+
+/// v62.0.0 (CE-fix1; CC 4.2.1.1) — **what an invocation states**: the
+/// closed member set Verify's reader takes (`author`, `accord_root`,
+/// `invocation_id`, `nonce`, `asserted_at`, `valid_until`, and
+/// `payload_digest` on a notify only). No `refs`: the reader's map is
+/// closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvocationTerms {
+    /// Which invocation (the row's family).
+    pub kind: InvokeKind,
+    /// The holder's identity-ref: `author`, `iss`.
+    pub holder: String,
+    /// The accord's `family_key_id`: `accord_root` and the CWT `sub`.
+    pub accord_root: String,
+    /// `invocation_id`.
+    pub invocation_id: String,
+    /// `nonce`, 32 bytes the signer chooses (the store's replay key).
+    pub nonce: [u8; 32],
+    /// `asserted_at`, POSIX ms.
+    pub asserted_at_ms: u64,
+    /// `valid_until`, POSIX ms, after `asserted_at`: it bounds the replay
+    /// window only, never the halt's reach.
+    pub valid_until_ms: u64,
+    /// `payload_digest` (SHA-256), a notify's only.
+    pub payload_digest: Option<super::Digest32>,
+}
+
+/// v62.0.0 (CE-fix1) — the payload of an invocation, in the deterministic
+/// map order.
+#[must_use]
+pub fn invocation_payload(t: &InvocationTerms) -> Value {
+    let text = |s: &str| Value::Text(s.to_owned());
+    let mut m = vec![
+        (text("author"), text(t.holder.as_str())),
+        (text("accord_root"), text(t.accord_root.as_str())),
+        (text("invocation_id"), text(t.invocation_id.as_str())),
+        (text("nonce"), Value::Bytes(t.nonce.to_vec())),
+        (text("asserted_at"), Value::Uint(t.asserted_at_ms)),
+        (text("valid_until"), Value::Uint(t.valid_until_ms)),
+    ];
+    if let Some(d) = &t.payload_digest {
+        m.push((
+            text("payload_digest"),
+            ciris_verify_core::edition2::hash_digest_value(d),
+        ));
+    }
+    super::emit::sorted_map(m)
+}
+
+/// v62.0.0 (CE-fix1; CC 4.2.1.1) — **an invocation drafted for its holder
+/// to sign** (a pre-signed, sealed halt included): row type `scores`, the
+/// kind's family, `sub` the accord, `iss` and `author` the holder's
+/// identity-ref, `kid` the thumbprint of the key the bundle in force places
+/// for the holder (its own identity-ref's key until a recovery re-seats it).
+/// The holder signs `Draft::sig_structure` with that composite key (both
+/// halves); `Draft::assemble` is the statement.
+///
+/// # Errors
+/// `edition2_payload_invalid`: a payload the door would refuse.
+pub fn invocation_draft(
+    t: &InvocationTerms,
+    kid: &super::Digest32,
+) -> Result<super::emit::Draft, Error> {
+    super::emit::draft_row(
+        kid,
+        &t.holder,
+        &t.accord_root,
+        ACCORD_ROW_TYPE,
+        t.kind.family(),
+        &invocation_payload(t),
+    )
+    .map_err(|e| super::emit::produce_error("accord_invocation", e))
+}
+
 /// **The invocation store door.** `roster` is the bundle in force for the
 /// statement's accord ([`roster_in_force`]); `None` waits on that bundle.
 ///
@@ -284,8 +387,8 @@ pub async fn put_invocation_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    super::door::require_statement_form(bytes)?;
     let Some(roster) = roster else {
+        super::door::require_statement_form(bytes)?;
         // No bundle in force is held for the accord: wait on it.
         return Err(Error::unknown_signer(
             &format!(
@@ -295,14 +398,10 @@ where
             PLANE,
         ));
     };
-    let inv = match verify_invocation_row(bytes, roster) {
-        HaltReading::Valid(inv) => inv,
-        HaltReading::Waiting(w) => return Err(waiting_error(&w)),
-        HaltReading::Refused(r) => return Err(refusal_error(&r)),
-    };
+    // v62.0.0 (CE-fix1) — the pure reading, shared with the offline
+    // ceremony's self-check (`crate::ceremony::check_halt`).
+    let (inv, admitted) = read_invocation(bytes, roster)?;
     let accord_root = roster.accord_root();
-    let admitted: AdmittedRow =
-        super::door::admit_row(bytes, roster, None, SelectContext::default())?;
     let new = dir.put_edition2_statement(&admitted).await?;
     // v62.0.0 (wave GC4; CC 2.7.2, 2.7.3) — the replay fold over every held
     // invocation of the accord, this one included (it is kept first: a

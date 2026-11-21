@@ -2225,17 +2225,13 @@ where
                     Error::Backend(format!("stored pubkey of {key_id:?} is malformed: {e}"))
                 })?
         }
-        Ok(None) | Err(Error::Unsupported { .. }) => String::new(),
+        Ok(None) => String::new(),
         Err(e) => return Err(e),
     };
     let revocations = if subject.is_empty() {
         Vec::new()
     } else {
-        match directory.revocations_for_subject(&subject).await {
-            Ok(rows) => rows,
-            Err(Error::Unsupported { .. }) => Vec::new(),
-            Err(e) => return Err(e),
-        }
+        directory.revocations_for_subject(&subject).await?
     };
     Ok(fold_key_statement_standing(
         key_id,

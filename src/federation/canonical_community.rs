@@ -258,7 +258,6 @@ where
     };
     match super::authorized_family_roster_at(directory, &family, at).await {
         Ok(seats) => Ok(seats.iter().any(|m| m.key_id == key_id)),
-        Err(Error::Unsupported { .. }) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -496,7 +495,6 @@ where
         .await
     {
         Ok(ws) => out.extend(ws.into_iter().map(|w| w.effective_at)),
-        Err(Error::Unsupported { .. }) => {}
         Err(e) => return Err(e),
     }
     match directory
@@ -504,7 +502,6 @@ where
         .await
     {
         Ok(rs) => out.extend(rs.into_iter().map(|r| r.effective_at)),
-        Err(Error::Unsupported { .. }) => {}
         Err(e) => return Err(e),
     }
     Ok(out)
@@ -747,9 +744,10 @@ impl Memo {
                         }
                     }
                 }
-                // No stored community yet (a birth being judged) or a directory
-                // that cannot answer: no resignations to fold.
-                Err(Error::Unsupported { .. } | Error::InvalidArgument(_)) => {}
+                // No stored community yet (a birth being judged): no
+                // resignations to fold. v62.0.0 (PX-fix3) — a directory that
+                // cannot answer (`Unsupported`) propagates (I2190).
+                Err(Error::InvalidArgument(_)) => {}
                 Err(e) => return Err(e),
             }
             self.resignations.insert(community_key_id.to_owned(), map);
@@ -794,14 +792,9 @@ impl Memo {
     where
         F: FederationDirectory + ?Sized,
     {
-        let stored = match directory
+        let stored = directory
             .get_accord_proposal(&w.authority_decision_digest)
-            .await
-        {
-            Ok(p) => p,
-            Err(Error::Unsupported { .. }) => None,
-            Err(e) => return Err(e),
-        };
+            .await?;
         Ok(stored
             .and_then(|p| chrono::DateTime::parse_from_rfc3339(&p.proposal.window_until).ok())
             .map(|t| t.with_timezone(&chrono::Utc))
@@ -1425,7 +1418,6 @@ where
         .await
     {
         Ok(c) => Some(c),
-        Err(Error::Unsupported { .. }) => None,
         Err(e) => return Err(e),
     };
     feed(
@@ -1529,7 +1521,7 @@ where
                 .await
             {
                 Ok(Some(p)) => serde_json::json!(p.proposal.window_until),
-                Ok(None) | Err(Error::Unsupported { .. }) => serde_json::json!("no-proposal"),
+                Ok(None) => serde_json::json!("no-proposal"),
                 Err(e) => return Err(e),
             },
             None => serde_json::Value::Null,
@@ -1567,7 +1559,7 @@ where
             })
             .map(|r| (r.member_key_id, r.effective_at.to_rfc3339()))
             .collect(),
-        Err(Error::Unsupported { .. } | Error::InvalidArgument(_)) => Vec::new(),
+        Err(Error::InvalidArgument(_)) => Vec::new(),
         Err(e) => return Err(e),
     };
     resignations.sort();
@@ -1580,11 +1572,7 @@ where
 /// answer, the empty plane included). Every other error propagates: a failed
 /// read is not an answer (PR #921 review, F1).
 fn answered<T>(read: Result<T, Error>) -> Result<Option<T>, Error> {
-    match read {
-        Ok(v) => Ok(Some(v)),
-        Err(Error::Unsupported { .. }) => Ok(None),
-        Err(e) => Err(e),
-    }
+    super::optional_capability::unsupported_is_none(read, "canonical_community::answered")
 }
 
 /// [`stored_standing_at`] at the wall clock: the one clock read, taken by the
@@ -1633,40 +1621,93 @@ pub async fn stored_standing_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    let node = directory.node_key_id();
+    stored_standing_for(directory, node.as_deref(), community_key_id, now).await
+}
+
+/// v62.0.0 (PR-fix1; CC 3.2 T3, T8) — [`stored_standing_at`] judged FOR the
+/// reader node `reader` (its owner's acceptance edges, CC 3.2 T3) rather than
+/// for this directory's node key: the one body both read, so a peer verdict
+/// for a named reader and this node's own read never disagree. `reader =
+/// None`: nothing is accepted.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn stored_standing_for<F>(
+    directory: &F,
+    reader: Option<&str>,
+    community_key_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<StoredStanding, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(reader_standing(directory, reader, community_key_id, now)
+        .await?
+        .0)
+}
+
+/// [`stored_standing_for`], with the T3 legs it read (`None` where it read
+/// none: no row, a chain that does not hold, or an earlier-form chain) so a
+/// caller can name why a `NotRooted` is not rooted.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub(crate) async fn reader_standing<F>(
+    directory: &F,
+    reader: Option<&str>,
+    community_key_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(StoredStanding, Option<super::trust_root::ChainLegs>), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let chain = chain_standing_at(directory, community_key_id, now).await?;
     let held = match &chain {
         StoredStanding::Rooted(h) | StoredStanding::Stalled { held: h, .. } => h.clone(),
-        StoredStanding::Absent | StoredStanding::NotRooted { .. } => return Ok(chain),
+        StoredStanding::Absent | StoredStanding::NotRooted { .. } => return Ok((chain, None)),
     };
     let edition2 = super::edition2::trust_root_group::version_signers(directory, &held.community)
         .await?
         .is_some();
     if !edition2 {
         if super::edition2::door::earlier_form_doors_shut() {
-            return Ok(StoredStanding::NotRooted {
-                reason: "an earlier-form trust-root chain: the earlier form is shut at this \
-                         node's doors (CC 2.6.1.12)"
-                    .into(),
-            });
+            return Ok((
+                StoredStanding::NotRooted {
+                    reason: "an earlier-form trust-root chain: the earlier form is shut at this \
+                             node's doors (CC 2.6.1.12)"
+                        .into(),
+                },
+                None,
+            ));
         }
-        return Ok(chain);
+        return Ok((chain, None));
     }
-    let own = super::trust_root::own_chain_to(directory, community_key_id, now).await?;
+    let legs = super::trust_root::chain_legs_of(directory, reader, community_key_id, now).await?;
+    let own = legs.own_chain();
     if !own.accepted {
-        return Ok(StoredStanding::NotRooted {
-            reason: "this node holds no live trust:accepts:v1 edge to the root (CC 3.2 T3: \
-                     the evaluating node's own chain)"
-                .into(),
-        });
+        return Ok((
+            StoredStanding::NotRooted {
+                reason: "this node holds no live trust:accepts:v1 edge to the root (CC 3.2 T3: \
+                         the evaluating node's own chain)"
+                    .into(),
+            },
+            Some(legs),
+        ));
     }
     if !own.chartered {
-        return Ok(StoredStanding::NotRooted {
-            reason: "the root holds no live trust:charter:v1 self-edge carrying a pre-rotation \
-                     commitment (CC 3.2 T3)"
-                .into(),
-        });
+        return Ok((
+            StoredStanding::NotRooted {
+                reason: "the root holds no live trust:charter:v1 self-edge carrying a \
+                         pre-rotation commitment (CC 3.2 T3)"
+                    .into(),
+            },
+            Some(legs),
+        ));
     }
-    Ok(chain)
+    Ok((chain, Some(legs)))
 }
 
 /// Re-judge the row stored at `community_key_id` AT `now` (see the module
@@ -1817,26 +1858,8 @@ pub async fn founder_liveness<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let m = super::admission::infrastructure_quorum(&signed.community.consensus_protocol)
-        .map(|(m, _)| m as usize)
-        .unwrap_or(usize::MAX);
-    let chain = chain_of(signed);
     let mut memo = Memo::at(now);
-    let mut active = 0;
-    for f in founders(&signed.community) {
-        if memo
-            .founder_counts(
-                directory,
-                &signed.community.community_key_id,
-                f,
-                None,
-                seated_since(&chain, f),
-            )
-            .await?
-        {
-            active += 1;
-        }
-    }
+    let (active, m, _) = active_founders(directory, signed, &mut memo).await?;
     Ok((active, m))
 }
 
@@ -1903,9 +1926,53 @@ where
         }
         _ => signed,
     };
-    let chain = chain_of(&signed);
+    // v62.0.0 (TR-fix1; CC rc21 3.2 T7 l.1232, T8 l.1257) — Stalled is the
+    // MARGIN, never "a recorded founder stopped counting": live while the
+    // active founder set holds at least M + 1 (M the absolute first number
+    // of `quorum:M/N`), stalled at M or fewer. Rooted and Stalled are both
+    // valid; Stalled is non-admitting only for the founders' count (T7).
+    let (active, m, not_counting) = active_founders(directory, &signed, &mut memo).await?;
+    if active >= m.saturating_add(1) {
+        return Ok((StoredStanding::Rooted(Box::new(signed)), memo.valid_until));
+    }
+    let reason = format!(
+        "{active} active founder(s) at {:?}: live needs M + 1 = {} (CC 3.2 T7); not counting \
+         now: {not_counting:?}. Valid but non-admitting: the recovery widening restores it",
+        signed.community.consensus_protocol,
+        m.saturating_add(1)
+    );
+    Ok((
+        StoredStanding::Stalled {
+            held: Box::new(signed),
+            reason,
+        },
+        memo.valid_until,
+    ))
+}
+
+/// v62.0.0 (TR-fix1; CC rc21 3.2 T7) — **the active founder set**, the ONE
+/// count behind [`compute_standing`] and [`founder_liveness`]: `(active, M,
+/// the recorded founders that do not count)`. A founder counts at the memo's
+/// instant per `Memo::founder_counts` (seated, not resigned or withdrawn
+/// since, its key not past `revoked_after`, not node-bearing, accord-
+/// conferred). `M` is `quorum:M/N`'s absolute first number; a protocol that
+/// does not parse reads `usize::MAX` (never live).
+async fn active_founders<F>(
+    directory: &F,
+    signed: &SignedCommunity,
+    memo: &mut Memo,
+) -> Result<(usize, usize, Vec<String>), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let m = super::admission::infrastructure_quorum(&signed.community.consensus_protocol)
+        .map(|(m, _)| m as usize)
+        .unwrap_or(usize::MAX);
+    let chain = chain_of(signed);
+    let mut active = 0;
+    let mut not_counting = Vec::new();
     for f in founders(&signed.community) {
-        if !memo
+        if memo
             .founder_counts(
                 directory,
                 &signed.community.community_key_id,
@@ -1915,20 +1982,12 @@ where
             )
             .await?
         {
-            let reason = format!(
-                "founder {f:?} is not eligible now (human, accord-conferred, not withdrawn, not \
-                 resigned since seated); a founders' amendment that retires it roots the row again"
-            );
-            return Ok((
-                StoredStanding::Stalled {
-                    held: Box::new(signed),
-                    reason,
-                },
-                memo.valid_until,
-            ));
+            active += 1;
+        } else {
+            not_counting.push(f.to_owned());
         }
     }
-    Ok((StoredStanding::Rooted(Box::new(signed)), memo.valid_until))
+    Ok((active, m, not_counting))
 }
 
 /// v51.0.0 (CIRISPersist#938) — what the witness plane says about a chain this
@@ -2265,11 +2324,7 @@ where
         });
     };
     let id = head.community.community_key_id.as_str();
-    let cosigns = match directory.list_lineage_head_cosigns_for(id).await {
-        Ok(c) => c,
-        Err(Error::Unsupported { .. }) => Vec::new(),
-        Err(e) => return Err(e),
-    };
+    let cosigns = directory.list_lineage_head_cosigns_for(id).await?;
     let known: Vec<(String, chrono::DateTime<chrono::Utc>)> = chain
         .iter()
         .map(|v| Ok((row_hash(&v.community)?, head_instant(v))))
@@ -2649,7 +2704,7 @@ where
     };
     let held = match directory.get_attestation(id).await {
         Ok(Some(h)) => h,
-        Ok(None) | Err(Error::Unsupported { .. }) => return Ok(false),
+        Ok(None) => return Ok(false),
         Err(e) => return Err(e),
     };
     if held.attesting_key_id != attesting_key_id || held.attested_key_id != root {
@@ -2729,11 +2784,7 @@ where
     let Some(fam) = directory.lookup_family(root).await? else {
         return Ok(None);
     };
-    let cosigns = match directory.list_lineage_head_cosigns_for(root).await {
-        Ok(c) => c,
-        Err(Error::Unsupported { .. }) => Vec::new(),
-        Err(e) => return Err(e),
-    };
+    let cosigns = directory.list_lineage_head_cosigns_for(root).await?;
     let known = vec![(fam.persist_row_hash.clone(), fam.founded_at)];
     let effective = effective_cosigns(directory, &cosigns, &known).await?;
     let members: Vec<String> = fam.members.iter().map(|m| m.key_id.clone()).collect();
@@ -2857,6 +2908,24 @@ pub async fn rooted_community_family<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    rooted_community_family_at(directory, community_key_id, crate::host::clock::now()).await
+}
+
+/// v62.0.0 (TR-fix1; CC 3.2 T8) — [`rooted_community_family`] judged at the
+/// caller's signer-stamped instant `now` (the standing verdict reads no
+/// clock).
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn rooted_community_family_at<F>(
+    directory: &F,
+    community_key_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     // v62.0.0 (wave W1b; CC 3.2 T3) — an EDITION-2 trust root is its own
     // root: its legs (the user's acceptance edge, its own charter self-edge)
     // are read at its own id, never at the accord family's name. Its CHAIN
@@ -2868,9 +2937,7 @@ where
             .is_some()
         {
             return Ok(
-                match chain_standing_at(directory, community_key_id, crate::host::clock::now())
-                    .await?
-                {
+                match chain_standing_at(directory, community_key_id, now).await? {
                     StoredStanding::Rooted(_) | StoredStanding::Stalled { .. } => {
                         Some(community_key_id.to_owned())
                     }
@@ -2888,7 +2955,7 @@ where
         Ok(StoredStanding::Rooted(_) | StoredStanding::Stalled { .. }) => {
             Some(accord_family_key_id().to_owned())
         }
-        Ok(_) | Err(Error::Unsupported { .. }) => None,
+        Ok(_) => None,
         Err(e) => return Err(e),
     })
 }
@@ -3473,11 +3540,7 @@ where
     let id = held.community.community_key_id.as_str();
     // v62.0.0 (wave GC8) — the witness plane's cosigns are other rows.
     fold::reads(Dep::key(id));
-    let cosigns = match directory.list_lineage_head_cosigns_for(id).await {
-        Ok(c) => c,
-        Err(Error::Unsupported { .. }) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    let cosigns = directory.list_lineage_head_cosigns_for(id).await?;
     // PR #943 review (I193b) — two chains: `held` is the judged (witnessed)
     // prefix the next amendment follows; the node may also STORE an
     // unwitnessed tail beyond it. A cosign shows the node is behind when it
@@ -3811,9 +3874,12 @@ pub async fn lookup_signed_community<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    match directory.lookup_signed_community(community_key_id).await {
-        Err(Error::Unsupported { .. }) => {}
-        other => return other,
+    // v62.0.0 (PX-fix3) — the fallback below pages for the same record.
+    if let Some(found) = super::optional_capability::unsupported_is_none(
+        directory.lookup_signed_community(community_key_id).await,
+        "canonical_community::lookup_signed_community",
+    )? {
+        return Ok(found);
     }
     const PAGE: u32 = 256;
     let mut cursor = None;
@@ -3859,7 +3925,7 @@ pub(crate) fn parse_quorum(s: &str) -> Option<(usize, usize)> {
 ///
 /// # Errors
 /// Directory reads.
-async fn trust_root_head<F>(
+pub(crate) async fn trust_root_head<F>(
     directory: &F,
     community_key_id: &str,
     now: chrono::DateTime<chrono::Utc>,
@@ -3875,14 +3941,12 @@ where
     // change). Outside an attempt nothing is marked.
     fold::reads(Dep::key(community_key_id));
     let out = match stored_standing_at(directory, community_key_id, now).await? {
-        StoredStanding::Rooted(head) => Ok(head),
-        StoredStanding::Stalled { reason, .. } => Err((
-            why::STALLED,
-            format!(
-                "the trust root {community_key_id:?} is stalled ({reason}): valid but \
-                 non-admitting (CC 3.2 T7), so it authorises nothing new"
-            ),
-        )),
+        // v62.0.0 (TR-fix1; CC rc21 3.2 T7 l.1240) — a STALLED root is valid,
+        // and "non-admitting means exactly" no roster widening or removal by
+        // the founders' count and no ceremony-plane conferral by this roster.
+        // A purge is neither, so a stalled root's founders still authorise it
+        // ("Everything else is unchanged").
+        StoredStanding::Rooted(head) | StoredStanding::Stalled { held: head, .. } => Ok(head),
         StoredStanding::NotRooted { reason } => Err((
             why::ROOT_NOT_ROOTED,
             format!("the row at {community_key_id:?} is not rooted ({reason})"),

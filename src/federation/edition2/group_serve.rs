@@ -116,7 +116,7 @@ where
     let Some(iss) = iss else {
         return Ok(false);
     };
-    scope_servable(dir, iss, &payload, requester).await
+    scope_servable(dir, iss, sub, statement, &payload, requester).await
 }
 
 /// How many `cosign` statements a cosign's `refs.target` chain follows to
@@ -319,6 +319,8 @@ where
 async fn scope_servable<F>(
     dir: &F,
     iss: &str,
+    sub: Option<&str>,
+    statement: &[u8],
     payload: &Value,
     requester: Option<&str>,
 ) -> Result<bool, Error>
@@ -334,7 +336,20 @@ where
         .unwrap_or(cs::FEDERATION);
     let placement = cs::Scope::parse(scope).map(cs::Scope::placement);
     match (placement, requester) {
-        (Some(cs::Placement::Commons), _) => Ok(true),
+        // v62.0.0 (RL-fix1; CC 5.3.4) — a federation-tier statement waits
+        // for a root on a node that reaches none, unless the text lets it
+        // cross (`serve::commons_servable`): its author and its subject are
+        // the parties.
+        (Some(cs::Placement::Commons), _) => {
+            Box::pin(super::serve::commons_servable(
+                dir,
+                statement,
+                requester,
+                &[iss, sub.unwrap_or("")],
+                false,
+            ))
+            .await
+        }
         (None, _) | (Some(_), None) => Ok(false),
         (Some(_), Some(peer)) => {
             let envelope = json_of(payload);

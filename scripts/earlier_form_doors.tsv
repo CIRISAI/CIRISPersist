@@ -110,6 +110,7 @@ pyo3	put_stream_sth	exempt	-	a signed tree head under a sig19 composite (slice D
 pyo3	put_wholeness_witness_json	composite	trait:put_wholeness_witness	CC 6.1 object: ONE composite over its 6.1 preimage (Sig19); a lone half / the bound-hybrid pair refused by name
 pyo3	rebind_held_for_json	exempt	-	a read: the counted edition-2 re-bind for a seat (transport_rebind::rebind_held_for, C3); writes nothing
 pyo3	rebind_key_record	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	record_dial_hints	exempt	-	node-local contact bookkeeping (a decoded node code's dial hints, unsigned, never served), not a signed CEG object (RL-fix3; classified by 4g-regen)
 pyo3	register_federation_key	refuses	-	refuses in its own body, before any decode (D1)
 pyo3	register_occurrence	exempt	-	agent-local store of an unsigned record; no signed object is admitted
 pyo3	register_self_federation_key	exempt	-	a producer: the node signs its own row from unsigned input (slice B re-targets it to sign_row)

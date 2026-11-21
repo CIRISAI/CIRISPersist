@@ -3508,6 +3508,11 @@ CREATE TABLE cirislens.ceg_statements (
     -- the last one handed out. The serve cursor is the pair
     -- (admitted_us, statement_id) (edition2_statements_since).
     admitted_us     bigint NOT NULL,
+    -- AU-fix3 (CC 2.7.11 "The lease"): when THIS node first held the
+    -- statement, POSIX microseconds; written once at insert (= admitted_us
+    -- then) and never updated (a receipt merge or a re-stamp moves
+    -- admitted_us only). Read only by the host's admission answer.
+    first_held_us   bigint NOT NULL,
     CHECK ((typ = 'ceg-row/2') = (row_type IS NOT NULL AND family IS NOT NULL
         AND sub IS NOT NULL AND asserted_at_ms IS NOT NULL))
 );
@@ -3601,3 +3606,27 @@ CREATE INDEX ceg_roster_proposals_open
 -- audience restates (store::edition_baseline::ATTESTATIONS_EDITION_TWO_POSTGRES).
 ALTER TABLE cirislens.federation_attestations ADD COLUMN restatement_key text;
 CREATE INDEX federation_attestations_restatement ON cirislens.federation_attestations USING btree (attesting_key_id, restatement_key) WHERE (restatement_key IS NOT NULL);
+
+-- v62.0.0 (RL-fix1, lead ruling (B); CC 5.4 "carries none it cannot verify"):
+-- the accord rows a node holding no accord root skipped, as feed WATERMARKS
+-- only (no row bytes): per (plane, peer) the first position skipped, so the
+-- host re-pulls from it once a genesis bundle is in force
+-- (edition2::accord_rescan). Node-local; never served.
+CREATE TABLE cirislens.ceg_accord_rescan (
+    plane           text    NOT NULL,
+    peer            text    NOT NULL,
+    from_position   text    NOT NULL,
+    skipped_at_ms   bigint  NOT NULL,
+    PRIMARY KEY (plane, peer)
+);
+
+-- v62.0.0 (RL-fix2; CC 5.3.4 "Before the first sealed link", CC 5.4.6): the
+-- LOCAL, UNSIGNED dial hint a host decoded from a contact's node code, per
+-- node: its transport identity and its ordered transport hints, as one JSON
+-- body (edition2::contact::DialHints). Never a transit pair, never served,
+-- never read by a route, binding or transit read.
+CREATE TABLE cirislens.ceg_dial_hints (
+    node            text    NOT NULL PRIMARY KEY,
+    body            text    NOT NULL,
+    recorded_at_ms  bigint  NOT NULL
+);

@@ -102,10 +102,10 @@ DELEGATED_DEFAULTS = (
     # fold store's reads below now default to `Unsupported`, so they are
     # found as leaves and left this list (with `edition2_statement` and
     # `edition2_statement_ids_since`, which the double did not delegate
-    # before).
-    "put_edition2_object",
-    "put_edition2_statement",
-    "upsert_edition2_key_projection",
+    # before). The store's WRITES (`put_edition2_object`,
+    # `put_edition2_statement`, `upsert_edition2_key_projection`) defaulted to
+    # a `Backend` refusal; PX-fix1 made every unrouted default `Unsupported`
+    # (I2180), so they are found too.
     "edition2_statements_since",
     # v62.0.0 (wave G0) — the fold store's reads (`fold_held`,
     # `fold_held_page`, `fold_dependents`, `fold_state`, `fold_slot_rows`,

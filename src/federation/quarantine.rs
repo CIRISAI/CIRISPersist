@@ -828,11 +828,7 @@ where
         Ok(())
     }
     .await;
-    match read {
-        Ok(()) => {}
-        Err(Error::Unsupported { .. }) => rows.clear(),
-        Err(e) => return Err(e),
-    }
+    read?;
     Ok(rows
         .into_iter()
         .filter(|r| envelope_str(r, "dimension").is_some_and(is_marker_dimension))
@@ -1527,6 +1523,7 @@ pub(crate) mod test_support {
                 &node,
                 &e2::kid(&witness),
                 INFRA_ATTEST_ASSURANCE,
+                crate::host::clock::now(),
             )
             .await
             .expect("capability_roots_to_trusted_root");
@@ -1564,6 +1561,23 @@ pub(crate) mod test_support {
         at: DateTime<Utc>,
         expires_at: Option<DateTime<Utc>>,
     ) -> Attestation {
+        let a = sealed_age_row(by, about, token, at, expires_at);
+        e2::put_signed(dir, &a)
+            .await
+            .unwrap_or_else(|e| panic!("the age row {token} about {about}: {e}"));
+        a
+    }
+
+    /// v62.0.0 (K2-fix20) — the age row [`put_age_row_until`] puts, sealed
+    /// and NOT put (its `attestation_id`, the node-computed row id, is
+    /// known before the put).
+    fn sealed_age_row(
+        by: &str,
+        about: &str,
+        token: &str,
+        at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Attestation {
         use crate::federation::tier_ingest::test_support as ts;
         let id = uuid::Uuid::new_v4().to_string();
         let mut a = ts::bare_attestation(&id, by, about, &serde_json::json!({ "id": id }));
@@ -1572,9 +1586,6 @@ pub(crate) mod test_support {
         a.scrub_timestamp = at;
         a.expires_at = expires_at;
         ts::seal_row_in_place(by, &mut a);
-        e2::put_signed(dir, &a)
-            .await
-            .unwrap_or_else(|e| panic!("the age row {token} about {about}: {e}"));
         a
     }
 
@@ -1809,9 +1820,15 @@ pub(crate) mod test_support {
             let who = e2::kid(who);
             let guild_k = guild_k.clone();
             async move {
-                is_named_moderator(dir, &who, &guild_k, DECLARED_DUTY)
-                    .await
-                    .expect("is_named_moderator")
+                is_named_moderator(
+                    dir,
+                    &who,
+                    &guild_k,
+                    DECLARED_DUTY,
+                    crate::host::clock::now(),
+                )
+                .await
+                .expect("is_named_moderator")
             }
         };
         put_age_row(
@@ -1876,20 +1893,20 @@ pub(crate) mod test_support {
     /// never counts). Held at the door with the GC1 fold reason
     /// `minor_appointment_void`; the duty walk never counts it.
     ///
-    /// - **I2863** (witness 9) — a self-declared minor and an assured minor:
+    /// - **I2863** (witness 9; MinorVoid.tla Inv_Fold, with I2864) — a self-declared minor and an assured minor:
     ///   D, landing AFTER the minor row, is held `minor_appointment_void`;
     ///   `is_named_moderator` is false; the minor's marker is not admitted.
-    /// - **I2864** (witness 9, the other arrival order) — D lands first and
+    /// - **I2864** (witness 9, the other arrival order; Inv_Fold) — D lands first and
     ///   SEATS (no age row yet); the minor row lands; the held row re-folds
     ///   (`why_held(D) == minor_appointment_void`), `is_named_moderator` is
     ///   false, and the marker is not admitted.
-    /// - **I2865** (witness 9) — D, then an assured-adult proof: still void
+    /// - **I2865** (witness 9; Prop_LaterProofNoRevive) — D, then an assured-adult proof: still void
     ///   (D predates every adult proof); a re-appointment D' after the proof
     ///   is not void but suspended while T's own minor declaration lowers the
     ///   band (K2-fix14); T withdraws it and D' counts, while D stays void.
-    /// - **I2866** (witness 9) — a BACKDATED D (dated before the adult proof,
+    /// - **I2866** (witness 9; Inv_BackdateOnlyVoids) — a BACKDATED D (dated before the adult proof,
     ///   put after it) is void.
-    /// - **I2867** (clarification (a)) — D after a self-declared ADULT row,
+    /// - **I2867** (clarification (a); Inv_SelfAdultLiftsNothing) — D after a self-declared ADULT row,
     ///   with an earlier self-declared minor row and no assurance: void.
     /// - **I2868** (K2-fix14 reverses clarification (b)) — an assured-adult
     ///   row before D and a self-declared minor row asserted AFTER D: D is
@@ -1953,9 +1970,15 @@ pub(crate) mod test_support {
             let who = e2::kid(who);
             let community_k = community_k.clone();
             async move {
-                is_named_moderator(dir, &who, &community_k, DELEGATION_SCOPE_SLASH)
-                    .await
-                    .expect("is_named_moderator")
+                is_named_moderator(
+                    dir,
+                    &who,
+                    &community_k,
+                    DELEGATION_SCOPE_SLASH,
+                    crate::host::clock::now(),
+                )
+                .await
+                .expect("is_named_moderator")
             }
         };
         let land = |e: Attestation, by: String| async move {
@@ -2226,24 +2249,28 @@ pub(crate) mod test_support {
     /// is PAST when the witness reads: the reader's clock disagrees with the
     /// instant each rule must use.
     ///
-    /// - **I2032** (clock, void side) — an assured minor that lapsed before
+    /// - **I2032** (clock, void side; MinorSuspend.tla Inv_NodesAgree for
+    ///   the act at x) — an assured minor that lapsed before
     ///   an assured-adult proof; the proof is dated before D and lapses AFTER
     ///   D (and before the run). D is not void and counts; read today, after
     ///   the proof lapsed, it STILL counts. Before K2-fix14 the void predicate
     ///   read `expires_at > now` and voided D here.
-    /// - **I2033** (clock, void side) — a self-declared minor; an
+    /// - **I2033** (clock, void side; MinorVoid.tla Inv_NodesAgree: an expired
+    ///   proof, read today, gives the verdict it gave when live) — a self-declared minor; an
     ///   assured-adult proof that lapsed BEFORE D's `asserted_at`: it lifts
     ///   nothing; D is held `minor_appointment_void`.
-    /// - **I2034** (suspension by the subject's own row) — an assured adult,
+    /// - **I2034** (suspension by the subject's own row; MinorSuspend.tla
+    ///   Inv_Fold, Inv_RetractedOut) — an assured adult,
     ///   D (counted), a later SELF-declared minor: the band lowers to minor
     ///   (CC 3.4.11), D is SUSPENDED (no hold, not counted); the subject
     ///   withdraws it and D counts again, with no re-appointment.
-    /// - **I2035** (suspension by a witness row; lifted by a newer one) — one
+    /// - **I2035** (suspension by a witness row; lifted by a newer one;
+    ///   MinorSuspend.tla Inv_SeriesFold) — one
     ///   witness: a provider adult, D (counted), its later provider minor
     ///   (K2-fix15: its newer row stands), so D is suspended (and absent from
     ///   `moderators_of`); its later government adult stands and D counts
     ///   again, with no re-appointment. (The two-witness tie is I2042.)
-    /// - **I2036** (no record) — T has no age row at all: D counts and the
+    /// - **I2036** (no record; MinorSuspend.tla Inv_SuspendedNeedsMinorRow) — T has no age row at all: D counts and the
     ///   band is `unknown`, never the CC 3.4.11 `under_13` default.
     /// - **I2039** (the steward-binding gate) — a guardianship from a granter
     ///   whose adult proof lapsed after the binding lands: the gate reads the
@@ -2253,13 +2280,16 @@ pub(crate) mod test_support {
     ///   lifts its older minor one (I2040); a witness's newer adult lifts its
     ///   own earlier minor (I2041); two DIFFERENT witnesses at an equal level
     ///   still tie to minor, so D is suspended (I2042); a void D stays void
-    ///   after the subject's newer declaration (I2043).
-    /// - **I2044** (permanent supersession) — a witness's newest row EXPIRED
+    ///   after the subject's newer declaration (I2043; Inv_SupersededMinorStillVoids).
+    ///   Invariant names: CIRISKernel MinorVoid.tla (PR #7); the suspension
+    ///   read (I2032, I2034, I2046) has no model names yet.
+    /// - **I2044** (permanent supersession; MinorSuspend.tla Inv_SeriesFold) — a witness's newest row EXPIRED
     ///   leaves that witness no current row: neither its superseded adult nor
     ///   its superseded minor returns.
-    /// - **I2045** (retraction) — the witness withdraws its newest row: the
+    /// - **I2045** (retraction; MinorSuspend.tla Inv_RetractedOut) — the witness withdraws its newest row: the
     ///   previous one stands.
-    /// - **I2037** (void is never revived) — a self-declared minor, D (void),
+    /// - **I2037** (void is never revived; Inv_RetractedMinorCounts,
+    ///   Prop_LaterProofNoRevive) — a self-declared minor, D (void),
     ///   an assured adult, then the subject withdraws the minor row: the band
     ///   is adult now, but D stays void and is not counted.
     pub(crate) async fn exercise_minor_void_instants(
@@ -2326,27 +2356,51 @@ pub(crate) mod test_support {
             let who = e2::kid(who);
             let community_k = community_k.clone();
             async move {
-                is_named_moderator(dir, &who, &community_k, DELEGATION_SCOPE_SLASH)
-                    .await
-                    .expect("is_named_moderator")
+                is_named_moderator(
+                    dir,
+                    &who,
+                    &community_k,
+                    DELEGATION_SCOPE_SLASH,
+                    crate::host::clock::now(),
+                )
+                .await
+                .expect("is_named_moderator")
             }
         };
         let listed = |who: &str| {
             let who = e2::kid(who);
             let community_k = community_k.clone();
             async move {
-                moderators_of(dir, &community_k, DELEGATION_SCOPE_SLASH)
-                    .await
-                    .expect("moderators_of")
-                    .contains(&who)
+                moderators_of(
+                    dir,
+                    &community_k,
+                    DELEGATION_SCOPE_SLASH,
+                    crate::host::clock::now(),
+                )
+                .await
+                .expect("moderators_of")
+                .contains(&who)
             }
         };
+        // K2-fix16: a test reading with no act to judge takes the test's own
+        // clock, explicitly (the host-edge pattern, CC 2.7.9). Every row and
+        // withdrawal below is dated before it.
         let band_timeless = |who: &str| {
             let who = e2::kid(who);
             async move {
-                age_band_as_of(dir, &who, None)
+                age_band_as_of(dir, &who, crate::host::clock::now())
                     .await
                     .expect("age_band_as_of")
+            }
+        };
+        // K2-fix16 (T8): the seat judged at an ACT's instant `at`.
+        let named_at = |who: &str, at: DateTime<Utc>| {
+            let who = e2::kid(who);
+            let community_k = community_k.clone();
+            async move {
+                is_named_moderator(dir, &who, &community_k, DELEGATION_SCOPE_SLASH, at)
+                    .await
+                    .expect("is_named_moderator")
             }
         };
         let land = |e: Attestation, by: String| async move {
@@ -2393,7 +2447,7 @@ pub(crate) mod test_support {
             "({suffix}) I2032 precondition: by the reader's clock both rows lapsed"
         );
         assert_eq!(
-            age_band_as_of(dir, &e2::kid(t1), Some(late + hour * 2))
+            age_band_as_of(dir, &e2::kid(t1), late + hour * 2)
                 .await
                 .expect("band at D"),
             AgeBand::Adult,
@@ -2412,18 +2466,35 @@ pub(crate) mod test_support {
             None,
             "({suffix}) I2032: no hold, though the proof lapsed before this read"
         );
+        // node agreement: the seat judged at an act's instant `x` reads the
+        // same rows the same way whenever, and wherever, it is read.
+        let x = late + hour * 2 + min * 30;
+        assert_eq!(
+            age_band_as_of(dir, &e2::kid(t1), x)
+                .await
+                .expect("band at x"),
+            AgeBand::Adult,
+            "({suffix}) I2032: at the act's instant the proof covers it"
+        );
+        assert!(
+            named_at(t1, x).await,
+            "({suffix}) I2032 (node agreement): counted for an act at x, read today, after the \
+             proof's lapse"
+        );
         assert_eq!(
             band_timeless(t1).await,
-            AgeBand::Adult,
-            "({suffix}) I2032: as of the newest held evidence the proof is live"
+            AgeBand::Unknown,
+            "({suffix}) I2032: today the witness's newest row has lapsed: no current row"
         );
         assert!(
             named(t1).await,
-            "({suffix}) I2032: still counted after the proof's lapse: the reader's clock does \
-             not unseat"
+            "({suffix}) I2032: and no current row is no minor reading: still counted"
         );
 
-        // ── I2033: the proof had lapsed at D: it lifts nothing.
+        // ── I2033 (REVERSED by K2-fix16; CC rc21 3.2, MinorVoid.tla): an
+        // assured adult proof dated before D lifts the void EXPIRED OR NOT.
+        // D is not void; at D the proof no longer covers, so the band at D
+        // is the subject's own minor declaration: SUSPENDED, not void.
         put_age_row(
             dir,
             t2,
@@ -2446,15 +2517,18 @@ pub(crate) mod test_support {
             .await
             .unwrap_or_else(|e| panic!("({suffix}) I2033: kept, not refused: {e}"));
         assert!(
-            matches!(out, StatementOutcome::Pending { .. }),
-            "({suffix}) I2033: held: {out:?}"
+            matches!(out, StatementOutcome::Row { .. }),
+            "({suffix}) I2033: lands: {out:?}"
         );
-        assert_eq!(
+        assert_ne!(
             held_why(d).await.as_deref(),
             Some(MINOR_APPOINTMENT_VOID),
-            "({suffix}) I2033: a proof expired at D's asserted_at lifts nothing"
+            "({suffix}) I2033: a proof dated before D lifts the void though it expired"
         );
-        assert!(!named(t2).await, "({suffix}) I2033: no minor moderator");
+        assert!(
+            !named_at(t2, late + hour * 6).await && !named(t2).await,
+            "({suffix}) I2033: SUSPENDED: the subject's own minor declaration is the reading"
+        );
 
         // ── I2034: counted → SUSPENDED (own declaration) → counted (withdrawn).
         put_age_row(
@@ -2504,6 +2578,25 @@ pub(crate) mod test_support {
         assert!(
             held_why(d).await.is_none() && named(t3).await && listed(t3).await,
             "({suffix}) I2034: counted again, the same D, no re-appointment"
+        );
+        // ── I2046 (K2-fix16, T8; MinorSuspend.tla Inv_LaterRowsNotYet, the
+        // withdrawal dated today changing nothing for an act at 9h): the seat
+        // is judged at the ACT's instant.
+        // Before the self-minor row (8h) the seat counts; for an act at 9h it
+        // is suspended, and STAYS suspended for that act after the
+        // withdrawal (dated today: a retraction is not retroactive); for an
+        // act today it counts.
+        assert!(
+            named_at(t3, late + hour * 7 + min * 30).await,
+            "({suffix}) I2046: an act before the minor row: counted"
+        );
+        assert!(
+            !named_at(t3, late + hour * 9).await,
+            "({suffix}) I2046: an act after the minor row, before its withdrawal: suspended"
+        );
+        assert!(
+            named_at(t3, crate::host::clock::now()).await,
+            "({suffix}) I2046: an act after the withdrawal: counted"
         );
 
         // ── I2035: counted → SUSPENDED (the witness's newer minor) → counted
@@ -2836,14 +2929,14 @@ pub(crate) mod test_support {
         .await;
         let v1k = e2::kid(v1);
         assert_eq!(
-            age_band_as_of(dir, &v1k, Some(late + hour * 31 + min))
+            age_band_as_of(dir, &v1k, late + hour * 31 + min)
                 .await
                 .expect("band"),
             AgeBand::Minor,
             "({suffix}) I2044: while live, the newer minor is the witness's current row"
         );
         assert_eq!(
-            age_band_as_of(dir, &v1k, Some(late + hour * 33))
+            age_band_as_of(dir, &v1k, late + hour * 33)
                 .await
                 .expect("band"),
             AgeBand::Unknown,
@@ -2873,7 +2966,7 @@ pub(crate) mod test_support {
         )
         .await;
         assert_eq!(
-            age_band_as_of(dir, &e2::kid(v2), Some(late + hour * 33))
+            age_band_as_of(dir, &e2::kid(v2), late + hour * 33)
                 .await
                 .expect("band"),
             AgeBand::Unknown,
@@ -2913,6 +3006,78 @@ pub(crate) mod test_support {
             AgeBand::Adult,
             "({suffix}) I2045: the present-tense read agrees"
         );
+
+        // ── I2055 (K2-fix20; CC 3.5.1 rule 3): one witness, two age rows
+        // about one person at ONE instant: the lowest `attestation_id`
+        // (the node-computed row id's lowercase hex) is the witness's current
+        // row, whatever its band, in either arrival order. The ids are
+        // hashes, so the fixture searches subjects until it holds both
+        // cases: the lower id on the MINOR row, and on the ADULT row (the
+        // LESS protective one).
+        let tie_at = late + hour * 40;
+        let mut cases: Vec<(String, Attestation, Attestation)> = Vec::new();
+        let (mut lower_minor, mut lower_adult) = (0, 0);
+        for i in 0..256 {
+            if lower_minor >= 2 && lower_adult >= 2 {
+                break;
+            }
+            let who = k(&format!("tie{i}"));
+            let m = sealed_age_row(
+                &witness,
+                &who,
+                "age_assurance:provider:minor:v1",
+                tie_at,
+                None,
+            );
+            let a = sealed_age_row(
+                &witness,
+                &who,
+                "age_assurance:provider:adult:v1",
+                tie_at,
+                None,
+            );
+            let adult_lower = a.attestation_id < m.attestation_id;
+            if adult_lower && lower_adult < 2 {
+                lower_adult += 1;
+                cases.push((who, m, a));
+            } else if !adult_lower && lower_minor < 2 {
+                lower_minor += 1;
+                cases.push((who, m, a));
+            }
+        }
+        assert!(
+            lower_minor == 2 && lower_adult == 2,
+            "({suffix}) I2055 fixture: both tie cases found ({lower_minor}, {lower_adult})"
+        );
+        for (n, (who, m, a)) in cases.into_iter().enumerate() {
+            register_user_key(dir, &who).await;
+            // Both arrival orders: even n the minor first, odd n the adult.
+            let (first, second) = if n % 2 == 0 { (&m, &a) } else { (&a, &m) };
+            for row in [first, second] {
+                e2::put_signed(dir, row)
+                    .await
+                    .unwrap_or_else(|e| panic!("({suffix}) I2055: the tied age row: {e}"));
+            }
+            let want = if a.attestation_id < m.attestation_id {
+                AgeBand::Adult
+            } else {
+                AgeBand::Minor
+            };
+            assert_eq!(
+                band_timeless(&who).await,
+                want,
+                "({suffix}) I2055: case {n} (adult id lower: {}): the lowest attestation_id \
+                 wins the tie",
+                a.attestation_id < m.attestation_id
+            );
+            assert_eq!(
+                age_band_as_of(dir, &e2::kid(&who), tie_at)
+                    .await
+                    .expect("band at the tie"),
+                want,
+                "({suffix}) I2055: case {n}, read at the tie's own instant"
+            );
+        }
     }
 
     /// v62.0.0 (K2-fix11) — **I2860–I2862: a PERSON as a named moderator.**
@@ -3046,9 +3211,15 @@ pub(crate) mod test_support {
              record) seats with the person's voice: {out:?}"
         );
         assert!(
-            is_named_moderator(dir, &e2::kid(&person), &community_k, DELEGATION_SCOPE_SLASH)
-                .await
-                .expect("I2860"),
+            is_named_moderator(
+                dir,
+                &e2::kid(&person),
+                &community_k,
+                DELEGATION_SCOPE_SLASH,
+                crate::host::clock::now()
+            )
+            .await
+            .expect("I2860"),
             "({suffix}) I2860: the person is a named moderator of C for slash (CC 4.5.4)"
         );
 
@@ -3100,7 +3271,8 @@ pub(crate) mod test_support {
                 dir,
                 &e2::kid(&custodied),
                 &community_k,
-                DELEGATION_SCOPE_SLASH
+                DELEGATION_SCOPE_SLASH,
+                crate::host::clock::now()
             )
             .await
             .expect("I2862"),
@@ -3150,9 +3322,15 @@ pub(crate) mod test_support {
              presumption of capacity): {held:?}"
         );
         assert!(
-            !is_named_moderator(dir, &e2::kid(&adult), &community_k, DELEGATION_SCOPE_SLASH)
-                .await
-                .expect("I2862"),
+            !is_named_moderator(
+                dir,
+                &e2::kid(&adult),
+                &community_k,
+                DELEGATION_SCOPE_SLASH,
+                crate::host::clock::now()
+            )
+            .await
+            .expect("I2862"),
             "({suffix}) I2862: a custody claim onto a proven adult seats no moderator"
         );
     }

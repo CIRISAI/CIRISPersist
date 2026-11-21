@@ -817,7 +817,7 @@ pub(crate) mod bodies {
         let dir = d.as_dyn_directory();
         let producer = "i772-producer";
         let auth = |signer: String, sha: String| async move {
-            td::takedown_authority(dir, &signer, &sha, "dmca512").await
+            td::takedown_authority(dir, &signer, &sha, "dmca512", crate::host::clock::now()).await
         };
         let unauthorised = |r: Result<(), crate::federation::Error>| matches!(&r, Err(e) if e.kind() == token::UNAUTHORISED);
 

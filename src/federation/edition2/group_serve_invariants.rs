@@ -246,6 +246,39 @@ pub(crate) async fn scope_body(d: &dyn FederationDirectory) {
     );
     assert!(!served(d, &own, None).await, "I3010 self: not anonymous");
     let commons = unit(Some("federation"));
+    let none = unit(None);
+    // v62.0.0 (RL-fix1; CC 5.3.4, lead ruling (A)) — on a node whose own
+    // standing chain reaches no root, a federation-tier statement WAITS: not
+    // served to a third party, nor anonymously. Its author is still served
+    // it (I2245). Then this node holds the test ceremony's bundle, and the
+    // earlier assertions (served to anyone) stand unchanged.
+    for st in [&commons, &none] {
+        assert!(
+            !served(d, st, Some(&other)).await && !served(d, st, None).await,
+            "I3010 rootless: a federation-tier statement waits for a root"
+        );
+        assert!(
+            served(d, st, Some(&author)).await,
+            "I3010 rootless: its author is a party"
+        );
+    }
+    // A bundle alone is not a root this node accepts (CC 3.2 T3): still
+    // waiting. Then a ROOTED trust root (the bundle's holders found it, it
+    // charters itself, and THIS node's acceptance edge names it), and the
+    // earlier assertions stand (served to anyone).
+    super::fixture_genesis::install_v2(d)
+        .await
+        .expect("I3010: the test ceremony installs");
+    assert!(
+        !served(d, &commons, Some(&other)).await,
+        "I3010: a bundle with no acceptance edge is no root this node reaches"
+    );
+    super::fixture_trust_root::rooted_trust_root(
+        d,
+        &super::fixture_genesis::HOLDER_SEEDS,
+        "quorum:2/3",
+    )
+    .await;
     assert!(
         served(d, &commons, Some(&other)).await,
         "I3010 federation: anyone"
@@ -254,7 +287,6 @@ pub(crate) async fn scope_body(d: &dyn FederationDirectory) {
         served(d, &commons, None).await,
         "I3010 federation: anonymous too"
     );
-    let none = unit(None);
     assert!(
         served(d, &none, Some(&other)).await,
         "I3010 no scope: served as federation, to anyone"
@@ -273,6 +305,8 @@ async fn i3010_statement_scope_served_sqlite() {
         .await
         .unwrap();
     b.run_migrations().await.unwrap();
+    // v62.0.0 (RL-fix2) — THIS node's key, for its acceptance edge.
+    b.set_node_key_id(super::fixture_switch::kid("i3010-node"));
     Box::pin(scope_body(&b)).await;
 }
 
@@ -287,6 +321,8 @@ async fn i3010_statement_scope_served_postgres() {
         .await
         .unwrap();
     b.run_migrations().await.unwrap();
+    // v62.0.0 (RL-fix2) — THIS node's key, for its acceptance edge.
+    b.set_node_key_id(super::fixture_switch::kid("i3010-node"));
     Box::pin(scope_body(&b)).await;
 }
 
@@ -492,4 +528,155 @@ async fn i3013_cited_ancestor_carried_postgres() {
         .unwrap();
     b.run_migrations().await.unwrap();
     Box::pin(carried_body(&b)).await;
+}
+
+/// **I2186 (v62.0.0, PX-fix1) — the copy rule's held-citer check runs
+/// THROUGH the capsule proxy.** I3013's shape, written on the backend and
+/// read through the proxy (backend ← capsule dispatch ← `OpsDirectory`):
+/// the concluded invitation citing the family's roster head carries the head
+/// to the invitee, through the proxy as directly. Then the invitation is held
+/// (its fold reason set on the backend): `group_serve::carried_by_a_naming_row`
+/// skips a held citer, so the head is NOT carried — through the proxy as
+/// directly. Before PX-fix1 the proxy's `fold_held` default answered `None`,
+/// read the held citer as concluded, and carried the head (fail-open). Its
+/// release carries it again.
+pub(crate) async fn held_citer_body(dir: std::sync::Arc<dyn FederationDirectory>) {
+    use super::fixture_switch as e2;
+    use super::group_serve::carried_by_a_naming_row;
+    use super::names::RowId;
+    use crate::federation::membership_acceptance::test_support::proposal_row;
+    let proxy = crate::ffi::directory_capsule::test_proxy(dir.clone());
+    let (d, p) = (dir.as_ref(), proxy.as_ref());
+    let founder = e2::put_key(d, "px-t1c-founder", &["user"]).await;
+    let joiner = e2::put_key(d, "px-t1c-joiner", &["user"]).await;
+    let stranger = e2::put_key(d, "px-t1c-stranger", &["user"]).await;
+    let kf = e2::signing_key("px-t1c-founder");
+    let g = key(233);
+    let gid = iref(&g);
+    let record = GroupRecord::Family(Family {
+        family_key_id: gid.clone(),
+        family_name: "citing-px".into(),
+        members: vec![FamilyMember {
+            key_id: founder.clone(),
+            joined_at: at(1_000),
+            role: Some("founder".into()),
+        }],
+        founded_at: at(1_000),
+        consensus_protocol: "founder_only".into(),
+        consensus_protocol_entrenched: false,
+        dissolved_at: None,
+        prev_head_digest: String::new(),
+        charter_digest: String::new(),
+        persist_row_hash: String::new(),
+    });
+    let payload = roster_payload(&record, 1, None, 2_000).unwrap();
+    let head_st = sign(&kf, &gid, GROUP_ROSTER_PREFIX, &payload);
+    let StatementOutcome::Row { row_id: head, .. } = put(d, &head_st).await else {
+        panic!("I2186 founded");
+    };
+    // CP2 skeleton: the builder's unsigned shape, re-signed as edition 2
+    // (`row_of`) before any door (I3013's).
+    let mut literal = e2::with_earlier_form(|| {
+        proposal_row("px-t1c-founder", "family", &gid, &joiner, None, at(6_000))
+    });
+    if let Some(o) = literal.attestation_envelope.as_object_mut() {
+        o.insert(
+            "refs".to_owned(),
+            serde_json::json!({ "also": { "cites": [[2, [-16, head.hex()]]] } }),
+        );
+    }
+    let invitation = e2::row_of(&literal, "px-t1c-founder");
+    e2::put_signed(d, &invitation)
+        .await
+        .unwrap_or_else(|e| panic!("I2186 the citing invitation: {e:?}"));
+    let inv_st = e2::carried_statement(&invitation).expect("I2186 the invitation's statement");
+    let inv = RowId::of_statement(&inv_st).expect("I2186 the invitation's row id");
+
+    // Concluded: carried, through the proxy as directly.
+    for (who, want) in [(&joiner, true), (&stranger, false)] {
+        let direct = carried_by_a_naming_row(d, &head_st, Some(who))
+            .await
+            .unwrap();
+        let via = carried_by_a_naming_row(p, &head_st, Some(who))
+            .await
+            .unwrap();
+        assert_eq!(direct, want, "I2186 concluded citer, direct, {who}");
+        assert_eq!(via, want, "I2186 concluded citer, through the proxy, {who}");
+        assert_eq!(
+            servable_to(p, &head_st, Some(who)).await.unwrap(),
+            servable_to(d, &head_st, Some(who)).await.unwrap(),
+            "I2186 servable_to agrees through the proxy, {who}"
+        );
+    }
+
+    // Held: the check skips the citer, through the proxy as directly.
+    assert!(
+        d.put_fold_reason(
+            &inv,
+            Some((
+                super::fold::reason::COUNT_SHORT.to_owned(),
+                "PX-fix1: held".to_owned()
+            )),
+        )
+        .await
+        .unwrap(),
+        "I2186 the invitation has a fold state to hold"
+    );
+    assert!(
+        p.fold_held(&inv).await.unwrap().is_some(),
+        "I2186 the proxy reads the citer held"
+    );
+    assert!(
+        !carried_by_a_naming_row(d, &head_st, Some(&joiner))
+            .await
+            .unwrap(),
+        "I2186 a held citer carries nothing, direct"
+    );
+    assert!(
+        !carried_by_a_naming_row(p, &head_st, Some(&joiner))
+            .await
+            .unwrap(),
+        "I2186 a held citer carries nothing THROUGH THE PROXY (fail-open before PX-fix1)"
+    );
+    assert!(
+        !servable_to(p, &head_st, Some(&joiner)).await.unwrap(),
+        "I2186 so the head is withheld from the invitee through the proxy"
+    );
+
+    // Released: carried again.
+    assert!(
+        d.put_fold_reason(&inv, None).await.unwrap(),
+        "I2186 release"
+    );
+    assert!(
+        carried_by_a_naming_row(p, &head_st, Some(&joiner))
+            .await
+            .unwrap(),
+        "I2186 a released citer carries again through the proxy"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2186_held_citer_skipped_through_the_proxy_sqlite() {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(held_citer_body(std::sync::Arc::new(b))).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2186_held_citer_skipped_through_the_proxy_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::empty_dsn() else {
+        return;
+    };
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(held_citer_body(std::sync::Arc::new(b))).await;
 }

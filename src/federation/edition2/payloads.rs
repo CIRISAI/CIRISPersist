@@ -517,7 +517,7 @@ pub const FAMILIES: &[FamilyPayload] = &[
     FamilyPayload {
         family: "admission:unit",
         replaces: "nothing: new in rc21 (CC 2.7.11, the code scope of kernel admission; wire admission:unit:v1, row type scores)",
-        authorship: "counted where refs.head is present (act = group), authored otherwise; an effect capability needs a count; every signer a person (identity_type holds user or accord_holder); no delegate role",
+        authorship: "counted where refs.head is present (act = group), authored otherwise; one person's (authored) row naming an effect is at cohort_scope self and admits only on a host that person owns; every signer a person (identity_type holds user or accord_holder); no delegate role",
         sub: "the unit digest as tagged text, canonical:sha256:{hex} (not an identity-ref)",
         members: &[
             m("unit", Ty::Digest, R, "SHA-256 over the unit's bytes as the host loads them (a multi-file unit: its manifest's digest)"),
@@ -530,7 +530,7 @@ pub const FAMILIES: &[FamilyPayload] = &[
         voices: &[
             Voice { from: "none (a new family)", becomes: "counted: one statement per voice over one payload, counted over the members at refs.head by the group's cosigned_act protocol, never fewer than two persons; a shortfall is held, never refused" },
         ],
-        table: "ceg_statements + federation_attestations (the mapped scores row); no typed plane: standing, the lease and the halt are read by the host",
+        table: "ceg_statements + federation_attestations (the mapped scores row), held count_short until a counted row's count is met; no typed plane: the host's answer (admission_unit_runnable) reads the conclusion, the lease, the withdrawal, the standing and the receipt",
     },
     FamilyPayload {
         family: "identity_amendment",
@@ -1123,7 +1123,9 @@ pub const ADMISSION_CAPABILITIES: &[&str] = &[
 ];
 
 /// v62.0.0 (wave P1e; CC 2.7.11) — the effect capabilities (`compute` and
-/// `read` are not effects): an authored row naming one is Invalid.
+/// `read` are not effects). A row naming one is counted (never on fewer than
+/// two persons), or one person's row at `cohort_scope: self` that admits only
+/// on a host that person owns (AU-fix1; CC 2.7.11 P2:1682).
 pub const ADMISSION_EFFECTS: &[&str] = &["net_send", "submit", "sign", "store_write", "actuate"];
 
 /// v62.0.0 (wave P1e; CC 2.7.11, constants.tsv) — `unit_lease_max_secs`, in
@@ -1142,7 +1144,7 @@ pub const ADMISSION_UNIT_SUB_PREFIX: &str = "canonical:sha256:";
 pub const ADMISSION_UNIT_RULES: &[(&str, &str)] = &[
     (
         crate::federation::malformed_row::ADMISSION_UNIT_MALFORMED,
-        "`author` and `refs.head` are not both present or both absent; an owner-alone (authored) row is at `cohort_scope: self`; `sub` is `canonical:sha256:{hex}` of `unit`",
+        "`author` and `refs.head` are not both present or both absent; `sub` is `canonical:sha256:{hex}` of `unit`",
     ),
     (
         crate::federation::malformed_row::ADMISSION_CAPABILITY_UNKNOWN,
@@ -1153,8 +1155,8 @@ pub const ADMISSION_UNIT_RULES: &[(&str, &str)] = &[
         "`asserted_at < valid_until <= asserted_at + unit_lease_max_secs * 1000` (86400 s)",
     ),
     (
-        crate::federation::malformed_row::ADMISSION_EFFECT_NEEDS_COUNT,
-        "an authored row names no effect capability (`net_send`, `submit`, `sign`, `store_write`, `actuate`)",
+        crate::federation::malformed_row::ADMISSION_OWNER_ROW_NOT_SELF,
+        "one person's (authored) row that names an effect capability (`net_send`, `submit`, `sign`, `store_write`, `actuate`) is at `cohort_scope: self`",
     ),
     (
         crate::federation::malformed_row::ADMISSION_ISSUER_NOT_PERSON,
@@ -1162,18 +1164,21 @@ pub const ADMISSION_UNIT_RULES: &[(&str, &str)] = &[
     ),
 ];
 
-/// v62.0.0 (wave P1e) — **the verifier's pure rules over an
+/// v62.0.0 (wave P1e; AU-fix1) — **the verifier's pure rules over an
 /// `admission:unit` payload** (CC 2.7.11), after its member list
-/// ([`check`]) passed: authored XOR counted, an owner-alone row at
-/// `cohort_scope: self` (CC ruling), `sub` is the unit's digest, the
-/// capabilities closed and non-empty, the lease window, and no effect on an
-/// authored row. Each refusal carries the verifier's token. Pure; the door
-/// runs it with its other pure gates. (The person rule needs the signer's
-/// key record and runs after Verify's verdict.)
+/// ([`check`]) passed: authored XOR counted, `sub` is the unit's digest, the
+/// capabilities closed and non-empty, the lease window, and one person's row
+/// that names an effect at `cohort_scope: self` (CC 2.7.11 P2:1682: "Such a
+/// row MUST be at `self` scope; at any other scope it is Invalid
+/// (`admission_owner_row_not_self`)"). An authored row that names no effect
+/// takes any scope, as a counted row does. Each refusal carries the
+/// verifier's token. Pure; the door runs it with its other pure gates. (The
+/// person rule needs the signer's key record and runs after Verify's
+/// verdict; the count is a fold, `admission::check_admission_unit_counted`.)
 ///
 /// # Errors
 /// `admission_unit_malformed`, `admission_capability_unknown`,
-/// `admission_lease_out_of_window`, `admission_effect_needs_count`.
+/// `admission_lease_out_of_window`, `admission_owner_row_not_self`.
 pub fn check_admission_unit(sub: &str, payload: &Value) -> Result<(), Error> {
     use crate::federation::malformed_row as mr;
     let fail = |reason: &'static str, msg: String| {
@@ -1187,16 +1192,6 @@ pub fn check_admission_unit(sub: &str, payload: &Value) -> Result<(), Error> {
         return Err(fail(
             mr::ADMISSION_UNIT_MALFORMED,
             "exactly one of `author` (authored) and `refs.head` (counted) is present".into(),
-        ));
-    }
-    // CC ruling (rc21): an owner-alone row (one signer, authored) stands at
-    // `cohort_scope: self`; a counted row may be at any scope its signers
-    // choose. An absent `cohort_scope` reads as the earlier default
-    // (`federation`), so an authored row states `self`.
-    if authored && payload.get_text("cohort_scope").and_then(Value::as_text) != Some("self") {
-        return Err(fail(
-            mr::ADMISSION_UNIT_MALFORMED,
-            "an owner-alone (authored) row is at `cohort_scope: self`".into(),
         ));
     }
     let unit_hex = payload
@@ -1236,11 +1231,19 @@ pub fn check_admission_unit(sub: &str, payload: &Value) -> Result<(), Error> {
             ));
         }
     }
-    if authored {
+    // AU-fix1 (CC 2.7.11 P2:1682) — one person's row that names an effect
+    // admits only on a host that person owns, and stands at `self`. An absent
+    // `cohort_scope` reads as the earlier default (`federation`), so such a
+    // row states `self`. (Which host it admits on is the host's read:
+    // `edition2::admission_unit::admission_unit_runnable`.)
+    if authored && payload.get_text("cohort_scope").and_then(Value::as_text) != Some("self") {
         if let Some(e) = caps.iter().find(|c| ADMISSION_EFFECTS.contains(c)) {
             return Err(fail(
-                mr::ADMISSION_EFFECT_NEEDS_COUNT,
-                format!("an authored row names the effect capability `{e}`: it needs a count"),
+                mr::ADMISSION_OWNER_ROW_NOT_SELF,
+                format!(
+                    "one person's row names the effect capability `{e}` at a scope other than \
+                     `self`: it admits only on that person's own host"
+                ),
             ));
         }
     }
@@ -1313,6 +1316,13 @@ pub const REF_MEMBERS: &[(&str, &str, &str, RefShape)] = &[
         "wa_adjudication_ref",
         RefShape::One,
     ),
+    // v62.0.0 (AU-fix2; CC 2.7.11's member table, P2:955: `head` | `"refs"`
+    // | refs.head, "The roster head the count is over") — a counted
+    // `admission:unit` row (and the group's counted withdrawal of one)
+    // names its roster head as the logical member `head` (64-hex row id) on
+    // the JSON surfaces: a host drafts it (`emit::draft_from_envelope`) and
+    // the mapping projects it back.
+    ("admission:unit", "head", "head", RefShape::One),
 ];
 
 /// v62.0.0 (wave P1e) — the [`REF_MEMBERS`] entries of the family a

@@ -585,6 +585,9 @@ pub mod session_claim;
 // field set as the typed licence payload on a `licensure:*` row, plus the
 // skew and payment-processor checks it ports.
 pub mod operational;
+// v62.0.0 (PX-fix3) — the one door by which `Unsupported` may read as "none"
+// (I2190).
+pub(crate) mod optional_capability;
 
 /// v18.3.0 (CIRISPersist#484) — the exported accord co-scrub test-minting
 /// surface: `Identity`, `signed_canonical_record[_with_roles]`, and
@@ -3845,6 +3848,41 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
+    /// v62.0.0 (AU-fix2; CC 2.7.11) — **the LIVE `admission:unit` rows about
+    /// `sub`** (a unit's `canonical:sha256:{hex}`) at `at`, on a host owned
+    /// by `owner` (`None`: this node's owner binding): the issuer standing
+    /// there, concluded (never a held row), in lease, not withdrawn
+    /// ([`edition2::admission_unit::admission_unit_rows`]). A default over
+    /// this directory's own reads (which a directory with no edition-2 store
+    /// refuses: `edition2_statements_about` is `Unsupported` by default); the
+    /// capsule proxy routes it as one op (`AdmissionUnitRows`).
+    async fn admission_unit_rows(
+        &self,
+        sub: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        owner: Option<&str>,
+    ) -> Result<Vec<edition2::admission_unit::AdmissionUnitRow>, Error> {
+        edition2::admission_unit::admission_unit_rows(self.as_dyn_directory(), sub, at, owner).await
+    }
+
+    /// v62.0.0 (AU-fix1; CC 2.7.11 "The lease": "It admits for at most
+    /// `unit_lease_max_secs` after the host first held it") — when THIS node
+    /// first held a voice of `row_id`: the least
+    /// `ceg_statements.first_held_us` (POSIX µs; AU-fix3: written once at
+    /// insert, never updated, unlike `admitted_us`, which a receipt merge
+    /// re-stamps) over the row's held voices; `None` when none is held. Node-local; read only by the host's
+    /// answer (`edition2::admission_unit`), never by a fold. A directory with
+    /// no edition-2 store refuses (`Unsupported`).
+    async fn edition2_first_held_us(
+        &self,
+        row_id: &edition2::names::RowId,
+    ) -> Result<Option<i64>, Error> {
+        let _ = row_id;
+        Err(Error::Unsupported {
+            method: "edition2_first_held_us",
+        })
+    }
+
     /// v62.0.0 (JSON-cut slice A, CC 2.6.1.3) — the held rows whose signed
     /// `refs` name `named` under `role` (`target`, `head`, `also:cites`, ...),
     /// from `ceg_row_names`: node-computed ids only. Refuses by default
@@ -3879,9 +3917,9 @@ pub trait FederationDirectory: Send + Sync {
         object: &edition2::store::HeldObject,
     ) -> Result<bool, Error> {
         let _ = object;
-        Err(Error::Backend(
-            "this directory holds no edition-2 statement store".to_owned(),
-        ))
+        Err(Error::Unsupported {
+            method: "put_edition2_object",
+        })
     }
 
     /// v62.0.0 (slice C1; CC 2.6.1.11, CC ruling (a)) — store a placed
@@ -3914,9 +3952,9 @@ pub trait FederationDirectory: Send + Sync {
         row: &edition2::door::AdmittedRow,
     ) -> Result<bool, Error> {
         let _ = row;
-        Err(Error::Backend(
-            "this directory holds no edition-2 statement store".to_owned(),
-        ))
+        Err(Error::Unsupported {
+            method: "put_edition2_statement",
+        })
     }
 
     /// v62.0.0 (wave G0; CC 2.7.3) — store what one fold evaluation found
@@ -4113,6 +4151,83 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
+    /// v62.0.0 (RL-fix1, lead ruling (B); CC 5.4) — record the FIRST skip of
+    /// an accord row on a feed while this node holds no accord root
+    /// (`edition2::accord_rescan`): `(plane, peer)` keeps its first
+    /// `position`, no row bytes. A directory with no rescan store refuses.
+    async fn note_accord_skip(
+        &self,
+        feed: &edition2::accord_rescan::FeedPosition,
+        at_ms: i64,
+    ) -> Result<(), Error> {
+        let _ = (feed, at_ms);
+        Err(Error::Unsupported {
+            method: "note_accord_skip",
+        })
+    }
+
+    /// v62.0.0 (RL-fix1, ruling (B)) — every accord-rescan watermark, in
+    /// `(plane, peer)` order. A directory with no rescan store refuses.
+    async fn accord_skips(&self) -> Result<Vec<edition2::accord_rescan::AccordRescan>, Error> {
+        Err(Error::Unsupported {
+            method: "accord_skips",
+        })
+    }
+
+    /// v62.0.0 (RL-fix1, ruling (B)) — clear the watermark of `(plane,
+    /// peer)` when its first position is `from_position`; `false` when none
+    /// matches. A directory with no rescan store refuses.
+    async fn clear_accord_skip(
+        &self,
+        plane: &str,
+        peer: &str,
+        from_position: &str,
+    ) -> Result<bool, Error> {
+        let _ = (plane, peer, from_position);
+        Err(Error::Unsupported {
+            method: "clear_accord_skip",
+        })
+    }
+
+    /// v62.0.0 (RL-fix2) — replace `hints.node`'s local dial hint
+    /// (`edition2::contact`; never signed, never served). A directory with
+    /// no dial-hint store refuses.
+    async fn put_dial_hints(&self, hints: &edition2::contact::DialHints) -> Result<(), Error> {
+        let _ = hints;
+        Err(Error::Unsupported {
+            method: "put_dial_hints",
+        })
+    }
+
+    /// v62.0.0 (RL-fix2) — the local dial hint of `node`, if held. A
+    /// directory with no dial-hint store refuses.
+    async fn dial_hints_for(
+        &self,
+        node: &str,
+    ) -> Result<Option<edition2::contact::DialHints>, Error> {
+        let _ = node;
+        Err(Error::Unsupported {
+            method: "dial_hints_for",
+        })
+    }
+
+    /// v62.0.0 (RL-fix2) — every local dial hint, by node. A directory with
+    /// no dial-hint store refuses.
+    async fn list_dial_hints(&self) -> Result<Vec<edition2::contact::DialHints>, Error> {
+        Err(Error::Unsupported {
+            method: "list_dial_hints",
+        })
+    }
+
+    /// v62.0.0 (RL-fix2) — remove `node`'s local dial hint; `false` when
+    /// none was held. A directory with no dial-hint store refuses.
+    async fn remove_dial_hints(&self, node: &str) -> Result<bool, Error> {
+        let _ = node;
+        Err(Error::Unsupported {
+            method: "remove_dial_hints",
+        })
+    }
+
     /// v62.0.0 (wave G0 v4) — take one occurrence pair's current-state row
     /// out of `federation_identity_occurrences` (its history stays): the
     /// occurrence plane's un-project hook (`edition2::fold::Plane`). `false`
@@ -4169,9 +4284,9 @@ pub trait FederationDirectory: Send + Sync {
         set: &edition2::projection::ProjectionSet,
     ) -> Result<(), Error> {
         let _ = set;
-        Err(Error::Backend(
-            "this directory holds no edition-2 statement store".to_owned(),
-        ))
+        Err(Error::Unsupported {
+            method: "upsert_edition2_key_projection",
+        })
     }
 
     /// v62.0.0 (slice J0) — the edition of the held `federation_keys` row of
@@ -4562,9 +4677,9 @@ pub trait FederationDirectory: Send + Sync {
         authority_decision_digest: &str,
     ) -> Result<(), Error> {
         let _ = (key_id, superseded_by, authority_decision_digest);
-        Err(Error::Backend(
-            "record_canonical_withdrawal is not supported by this backend".to_owned(),
-        ))
+        Err(Error::Unsupported {
+            method: "record_canonical_withdrawal — retired from the capsule at v62.0.0: a canonical seat is withdrawn by a later genesis bundle (PutGenesisBundle), and a tombstone from held accord evidence is materialized inside persist by its own admission gates",
+        })
     }
 
     /// v13.1.0 (CIRISPersist#377) — consult the canonical-role withdrawal
@@ -4610,9 +4725,9 @@ pub trait FederationDirectory: Send + Sync {
         authority_decision_digest: &str,
     ) -> Result<(), Error> {
         let _ = (role, key_id, superseded_by, authority_decision_digest);
-        Err(Error::Backend(
-            "record_role_withdrawal is not supported by this backend".to_owned(),
-        ))
+        Err(Error::Unsupported {
+            method: "record_role_withdrawal — retired from the capsule at v62.0.0: a conferred role is withdrawn by its granter's edition-2 `withdraws` row through the statement door (PutEdition2Statement), and a tombstone from held accord evidence is materialized inside persist by its own admission gates",
+        })
     }
 
     /// v16.0.0 (CIRISPersist#424) — consult the generic role-withdrawal
@@ -5826,6 +5941,7 @@ pub trait FederationDirectory: Send + Sync {
                 &node,
                 &publisher.key_id,
                 types::delegation_scope::INFRA_PUBLISH_RATING,
+                crate::host::clock::now(),
             )
             .await?;
             if conferred.is_none() {
@@ -6051,9 +6167,9 @@ pub trait FederationDirectory: Send + Sync {
         occurrence: types::IdentityOccurrence,
     ) -> Result<(), Error> {
         let _ = occurrence;
-        Err(Error::Backend(
-            "put_identity_occurrence_local not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "put_identity_occurrence_local — retired from the capsule at v62.0.0: an occurrence is the edition-2 identity:occurrence bind (edition2::occurrence::bind_draft, signed, then the statement door PutEdition2Statement)",
+        })
     }
 
     /// v62.0.0 (wave O1; CC 3.3.6, CC 3.3.6.4) — write an admitted
@@ -6602,9 +6718,9 @@ pub trait FederationDirectory: Send + Sync {
     /// trusted-local precedent. Default impl errors; backends override.
     async fn put_family_local(&self, family: Family) -> Result<(), Error> {
         let _ = family;
-        Err(Error::Backend(
-            "put_family_local not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "put_family_local",
+        })
     }
 
     /// v6.2.0 (CIRISPersist#161 A4/A5, CEG §11.7.1) — admit one identity
@@ -6820,9 +6936,9 @@ pub trait FederationDirectory: Send + Sync {
         revocation: types::IdentityOccurrenceRevocation,
     ) -> Result<(), Error> {
         let _ = revocation;
-        Err(Error::Backend(
-            "put_identity_occurrence_revocation_local not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "put_identity_occurrence_revocation_local",
+        })
     }
 
     /// v59.0.0 (CIRISPersist#1099, V199) — record that this node holds the
@@ -10028,9 +10144,9 @@ pub trait FederationDirectory: Send + Sync {
     /// implementation ahead of the shape validation.
     async fn grant_trust(&self, grant: SignedTrustGrant) -> Result<(), Error> {
         let _ = grant;
-        Err(Error::Backend(
-            "grant_trust not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "grant_trust",
+        })
     }
 
     /// Soft-delete a trust row by setting `expires_at = NOW()`.
@@ -10044,9 +10160,9 @@ pub trait FederationDirectory: Send + Sync {
     /// door validated `revoked_by` non-empty and then DISCARDED it.
     async fn revoke_trust(&self, revocation: SignedTrustRevocation) -> Result<(), Error> {
         let _ = revocation;
-        Err(Error::Backend(
-            "revoke_trust not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "revoke_trust",
+        })
     }
 
     /// Point lookup — the raw trust row, no transitive resolution.
@@ -10055,9 +10171,9 @@ pub trait FederationDirectory: Send + Sync {
     /// pre-V020 row, or a key registered without a trust grant).
     async fn lookup_trust(&self, key: &str) -> Result<Option<TrustRow>, Error> {
         let _ = key;
-        Err(Error::Backend(
-            "lookup_trust not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "lookup_trust",
+        })
     }
 
     /// All currently-trusted keys matching `filter`. Server-side
@@ -10067,9 +10183,9 @@ pub trait FederationDirectory: Send + Sync {
     /// only rows with an explicit trust grant.
     async fn list_trusted_keys(&self, filter: TrustFilter) -> Result<Vec<TrustRow>, Error> {
         let _ = filter;
-        Err(Error::Backend(
-            "list_trusted_keys not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "list_trusted_keys",
+        })
     }
 
     // v60.0.0 (CIRISPersist#988 item 4) — a Goal is a signed
@@ -10088,9 +10204,7 @@ pub trait FederationDirectory: Send + Sync {
     /// The projected [`Goal`] whose declaration is `goal_id`, or `None`.
     async fn get_goal(&self, goal_id: &str) -> Result<Option<Goal>, Error> {
         let _ = goal_id;
-        Err(Error::Backend(
-            "get_goal not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported { method: "get_goal" })
     }
 
     /// The projected [`Goal`]s matching `filter` (AND-composed; retired
@@ -10098,9 +10212,9 @@ pub trait FederationDirectory: Send + Sync {
     /// order.
     async fn list_goals(&self, filter: GoalsFilter) -> Result<Vec<Goal>, Error> {
         let _ = filter;
-        Err(Error::Backend(
-            "list_goals not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "list_goals",
+        })
     }
 
     // ── Peer-mutation surface (v3.1.0, CIRISPersist#117) ───────────
@@ -10444,9 +10558,9 @@ pub trait FederationDirectory: Send + Sync {
         occurrence_key_id: &str,
     ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
         let _ = occurrence_key_id;
-        Err(Error::Backend(
-            "list_transport_destinations_for not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "list_transport_destinations_for_unfolded",
+        })
     }
 
     /// v13.8.0 (CIRISPersist#411) — every stored reachable address across ALL
@@ -10532,9 +10646,9 @@ pub trait FederationDirectory: Send + Sync {
         destination: &str,
     ) -> Result<bool, Error> {
         let _ = (occurrence_key_id, transport_kind, destination);
-        Err(Error::Backend(
-            "remove_transport_destination not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "remove_transport_destination",
+        })
     }
 
     // ── freshness_floor (CIRISPersist#519 item 2a-iii) ─────────────
@@ -10558,9 +10672,9 @@ pub trait FederationDirectory: Send + Sync {
         claim: &types::SignedTouchClaim,
     ) -> Result<freshness::TouchApplyOutcome, Error> {
         let _ = claim;
-        Err(Error::Backend(
-            "put_touch_claim not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "put_touch_claim — retired at v62.0.0 (a touch claim is node-local): call put_touch_claim_local (DirectoryOp::PutTouchClaimLocal) and read the floor with freshness_floor",
+        })
     }
 
     /// v21.6.0 (CIRISPersist#519 item 2a-iii) — read the current freshness
@@ -10587,9 +10701,9 @@ pub trait FederationDirectory: Send + Sync {
         target_kind: &str,
     ) -> Result<Option<types::SignedTouchClaim>, Error> {
         let _ = (target_key_id, target_kind);
-        Err(Error::Backend(
-            "lookup_freshness_floor not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "lookup_freshness_floor",
+        })
     }
 
     /// v62.0.0 (v62 P5b; RULINGS "a touch claim is node-local";
@@ -10650,9 +10764,9 @@ pub trait FederationDirectory: Send + Sync {
     /// [`hard_case`](crate::federation::hard_case).
     async fn record_hard_case(&self, event: hard_case::HardCaseEvent) -> Result<(), Error> {
         let _ = event;
-        Err(Error::Backend(
-            "record_hard_case not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "record_hard_case",
+        })
     }
 
     /// CIRISServer#356 — this backend's **live peer-write-quota gauge**, or
@@ -10681,9 +10795,9 @@ pub trait FederationDirectory: Send + Sync {
         filter: hard_case::HardCaseFilter,
     ) -> Result<Vec<hard_case::HardCaseEvent>, Error> {
         let _ = filter;
-        Err(Error::Backend(
-            "list_hard_case_events not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "list_hard_case_events",
+        })
     }
 
     // ── §19.1 WholenessWitness corpus (CIRISPersist#228 items 1–2) ──
@@ -10725,9 +10839,9 @@ pub trait FederationDirectory: Send + Sync {
             ml_dsa_65_pubkey_b64,
             disclosed_leaves,
         );
-        Err(Error::Backend(
-            "put_wholeness_witness not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "put_wholeness_witness",
+        })
     }
 
     /// v8.2.0 (§19.1) — the verified witnesses currently stored for
@@ -10739,9 +10853,9 @@ pub trait FederationDirectory: Send + Sync {
         peer_id: &str,
     ) -> Result<Vec<crate::witness::StoredWitness>, Error> {
         let _ = peer_id;
-        Err(Error::Backend(
-            "list_wholeness_witnesses_for_peer not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "list_wholeness_witnesses_for_peer",
+        })
     }
 
     /// v8.2.0 (§19.1 N4 anti-rollback / eclipse guard) — the highest
@@ -10751,9 +10865,9 @@ pub trait FederationDirectory: Send + Sync {
     /// is rejected before a peer's witness is acted on as newer.
     async fn last_witness_epoch_for_peer(&self, peer_id: &str) -> Result<Option<u64>, Error> {
         let _ = peer_id;
-        Err(Error::Backend(
-            "last_witness_epoch_for_peer not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "last_witness_epoch_for_peer",
+        })
     }
 
     /// v8.2.0 (§19.1 N4 / WW→§10.1.6 subordination, CIRISPersist#228
@@ -10802,9 +10916,9 @@ pub trait FederationDirectory: Send + Sync {
     /// least one witness in the corpus. Feeds the compare-all path of
     /// [`compare_stored_witnesses`](Self::compare_stored_witnesses).
     async fn list_witness_peer_ids(&self) -> Result<Vec<String>, Error> {
-        Err(Error::Backend(
-            "list_witness_peer_ids not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "list_witness_peer_ids",
+        })
     }
 
     /// v16 (CIRISPersist#431, CC 6.1.1) — classify the stored, VERIFIED
@@ -11068,9 +11182,9 @@ pub trait FederationDirectory: Send + Sync {
         since: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<Attestation>, Error> {
         let _ = since;
-        Err(Error::Backend(
-            "list_consent_revocations not implemented for this backend".into(),
-        ))
+        Err(Error::Unsupported {
+            method: "list_consent_revocations",
+        })
     }
 
     /// CEG §8.1.11.3 + §10.1.3 — the consent observability watcher. One
@@ -14339,9 +14453,12 @@ pub mod malformed_row {
     /// v62.0.0 (wave P1e; CC 2.7.11) — `valid_until <= asserted_at`, or
     /// beyond `unit_lease_max_secs` after it.
     pub const ADMISSION_LEASE_OUT_OF_WINDOW: &str = "admission_lease_out_of_window";
-    /// v62.0.0 (wave P1e; CC 2.7.11) — an authored row names an effect
-    /// capability: an effect needs a count.
-    pub const ADMISSION_EFFECT_NEEDS_COUNT: &str = "admission_effect_needs_count";
+    /// v62.0.0 (AU-fix1; CC 2.7.11 P2:1682, the verifier's token) — one
+    /// person's (authored) `admission:unit` row that names an effect
+    /// capability at a `cohort_scope` other than `self`. (Replaces the
+    /// persist-local `admission_effect_needs_count`: CC admits such a row at
+    /// `self`, on the author's own host only.)
+    pub const ADMISSION_OWNER_ROW_NOT_SELF: &str = "admission_owner_row_not_self";
     /// v62.0.0 (wave P1e; CC 2.7.11) — a signer whose key record's
     /// `identity_type` holds neither `user` nor `accord_holder`.
     pub const ADMISSION_ISSUER_NOT_PERSON: &str = "admission_issuer_not_person";
@@ -14401,9 +14518,40 @@ pub mod malformed_row {
     /// can never land. Terminal.
     pub const LICENCE_WITHDRAWAL_NO_HEAD: &str = "licence_withdrawal_no_head";
 
+    /// v62.0.0 (RL-fix3; CC 5.3.3.10 E1 step 7) — a pre-seal answer's key
+    /// record is not the dialled node key's own (the code commits to the key
+    /// by its kid). Nothing is stored.
+    pub const CODE_NODE_KEY_MISMATCH: &str = "code_node_key_mismatch";
+    /// v62.0.0 (RL-fix3) — a pre-seal answer's route row is not the dialled
+    /// node's own `identity:occurrence` bind of itself, signed by it ("a row
+    /// signed by or about another key is refused and never stored").
+    pub const CODE_ROUTE_SIGNER_MISMATCH: &str = "code_route_signer_mismatch";
+    /// v62.0.0 (RL-fix3) — a pre-seal answer's bind carries no
+    /// `transport_destination` or no `transit_xwing_pubkey`.
+    pub const CODE_ROUTE_CARRIES_NO_TRANSIT_KEY: &str = "code_route_carries_no_transit_key";
+    /// v62.0.0 (RL-fix3) — a contact's owner key record is not the code's
+    /// identity kid's own.
+    pub const CODE_OWNER_MISMATCH: &str = "code_owner_mismatch";
+    /// v62.0.0 (RL-fix3) — a contact's owner binding does not bind the
+    /// code's node to the code's identity in the identity's own voice.
+    pub const CODE_OWNER_BINDING_NOT_FOR_NODE: &str = "code_owner_binding_not_for_node";
+    /// v62.0.0 (RL-fix3; CC 2.6.8 constraint 1) — a dial hint's transport
+    /// identity's Ed25519 half is the node's or its owner's federation key.
+    /// CIRISVerify's own token (`check_transport_keys`), reused so a host
+    /// sees one name whichever layer caught it.
+    pub const FEDCODE_TRANSPORT_IS_FEDERATION_KEY: &str = "fedcode_transport_is_federation_key";
+    /// v62.0.0 (RL-fix3) — a dial hint record over its bounds.
+    pub const DIAL_HINT_OUT_OF_BOUNDS: &str = "dial_hint_out_of_bounds";
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
         NO_SIGNER,
+        CODE_NODE_KEY_MISMATCH,
+        CODE_ROUTE_SIGNER_MISMATCH,
+        CODE_ROUTE_CARRIES_NO_TRANSIT_KEY,
+        CODE_OWNER_MISMATCH,
+        CODE_OWNER_BINDING_NOT_FOR_NODE,
+        FEDCODE_TRANSPORT_IS_FEDERATION_KEY,
+        DIAL_HINT_OUT_OF_BOUNDS,
         ENVELOPE_MEMBER_MISSING,
         ENVELOPE_MEMBER_INVALID,
         TYPED_DIVERGES_FROM_ENVELOPE,
@@ -14455,7 +14603,7 @@ pub mod malformed_row {
         ADMISSION_UNIT_MALFORMED,
         ADMISSION_CAPABILITY_UNKNOWN,
         ADMISSION_LEASE_OUT_OF_WINDOW,
-        ADMISSION_EFFECT_NEEDS_COUNT,
+        ADMISSION_OWNER_ROW_NOT_SELF,
         ADMISSION_ISSUER_NOT_PERSON,
         BODY_NUMBER_UNREPRESENTABLE,
         OCCURRENCE_VOICE_NOT_OWN_KEY,

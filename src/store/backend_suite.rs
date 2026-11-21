@@ -1483,16 +1483,17 @@ mod tests {
             .expect("the user's trust edge must admit");
 
         // Ask 3 — the walk: every hard leg green.
-        let v: TrustRootVerdict = trust_root_valid(&backend, &user, &r.root)
-            .await
-            .expect("walk");
+        let v: TrustRootVerdict =
+            trust_root_valid(&backend, &user, &r.root, crate::host::clock::now())
+                .await
+                .expect("walk");
         assert!(v.edge_exists, "(3) live user→root edge: {v:?}");
         assert!(v.root_self_declares, "(3) root self-declares: {v:?}");
         assert_ne!(v.halt_latched, Some(true), "(3) no halt latched");
         assert!(v.valid, "(3) all legs ⇒ valid: {v:?}");
 
         // A self-root is the immutable BASE, never a valid EXTERNAL root.
-        let v0 = trust_root_valid(&backend, &user, &user)
+        let v0 = trust_root_valid(&backend, &user, &user, crate::host::clock::now())
             .await
             .expect("walk self");
         assert!(
@@ -1505,7 +1506,7 @@ mod tests {
         withdraw_e2(&backend, "tr-user", &r.root, &edge)
             .await
             .expect("(4) withdraws on own edge must admit");
-        let v2 = trust_root_valid(&backend, &user, &r.root)
+        let v2 = trust_root_valid(&backend, &user, &r.root, crate::host::clock::now())
             .await
             .expect("walk post-tombstone");
         assert!(!v2.edge_exists, "(4) tombstoned edge is ABSENT to the walk");
@@ -1542,7 +1543,9 @@ mod tests {
             .expect("the user's edge");
 
         // Never drilled: valid, and RED.
-        let never = trust_root_valid(&backend, &user, &r.root).await.unwrap();
+        let never = trust_root_valid(&backend, &user, &r.root, crate::host::clock::now())
+            .await
+            .unwrap();
         assert!(
             never.valid,
             "an undrilled root still serves — governance signal, not a gate: {never:?}"
@@ -1554,7 +1557,9 @@ mod tests {
         withdraw_e2(&backend, "drill-user", &r.root, &edge)
             .await
             .expect("the user withdraws its edge");
-        let unrooted = trust_root_valid(&backend, &user, &r.root).await.unwrap();
+        let unrooted = trust_root_valid(&backend, &user, &r.root, crate::host::clock::now())
+            .await
+            .unwrap();
         assert!(
             !unrooted.valid,
             "un-trust still collapses validity: {unrooted:?}"
@@ -1613,9 +1618,14 @@ mod tests {
         resign_fix(&mut lc);
         put_voiced(&backend, &lc).await.unwrap();
 
-        let v = trust_root_valid(&backend, &e2::kid("e5-user"), &e2::kid("e5-root"))
-            .await
-            .unwrap();
+        let v = trust_root_valid(
+            &backend,
+            &e2::kid("e5-user"),
+            &e2::kid("e5-root"),
+            crate::host::clock::now(),
+        )
+        .await
+        .unwrap();
         assert!(!v.edge_exists, "local-tier edge must not count");
         assert!(!v.root_self_declares, "local-tier charter must not count");
         assert_eq!(
@@ -1692,9 +1702,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let v = trust_root_valid(&backend, &e2::kid("rc-user"), &e2::kid("rc-root2"))
-            .await
-            .unwrap();
+        let v = trust_root_valid(
+            &backend,
+            &e2::kid("rc-user"),
+            &e2::kid("rc-root2"),
+            crate::host::clock::now(),
+        )
+        .await
+        .unwrap();
         assert!(v.edge_exists);
         assert!(
             !v.root_self_declares && !v.valid,
@@ -1711,9 +1726,14 @@ mod tests {
         expired.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
         resign_fix(&mut expired);
         put_voiced(&backend, &expired).await.unwrap();
-        let v3 = trust_root_valid(&backend, &e2::kid("rc-user"), &e2::kid("rc-root"))
-            .await
-            .unwrap();
+        let v3 = trust_root_valid(
+            &backend,
+            &e2::kid("rc-user"),
+            &e2::kid("rc-root"),
+            crate::host::clock::now(),
+        )
+        .await
+        .unwrap();
         assert!(
             !v3.edge_exists,
             "(3) expired delegates_to is ABSENT to the walk"
@@ -1804,7 +1824,7 @@ mod tests {
             .await
             .expect("the user accepts the root");
         assert!(
-            trust_root_valid(&backend, &user, &r.root)
+            trust_root_valid(&backend, &user, &r.root, crate::host::clock::now())
                 .await
                 .unwrap()
                 .valid,
@@ -1817,20 +1837,32 @@ mod tests {
             .expect("the root confers on the peer");
 
         // #483 — the peer's infra:serve roots to a root the user trusts.
-        let grant = capability_roots_to_trusted_root(&backend, &user, &peer, "infra:serve")
-            .await
-            .expect("walk")
-            .expect("peer serves under a root the user trusts");
+        let grant = capability_roots_to_trusted_root(
+            &backend,
+            &user,
+            &peer,
+            "infra:serve",
+            crate::host::clock::now(),
+        )
+        .await
+        .expect("walk")
+        .expect("peer serves under a root the user trusts");
         assert_eq!(grant.root_key_id, r.root);
         assert_eq!(grant.grant_attestation_id, granted.hex());
         assert!(grant.verdict.valid);
 
         // A scope the peer was NOT granted → None.
         assert!(
-            capability_roots_to_trusted_root(&backend, &user, &peer, "infra:store")
-                .await
-                .unwrap()
-                .is_none(),
+            capability_roots_to_trusted_root(
+                &backend,
+                &user,
+                &peer,
+                "infra:store",
+                crate::host::clock::now()
+            )
+            .await
+            .unwrap()
+            .is_none(),
             "ungranted scope roots nowhere"
         );
 
@@ -1839,10 +1871,16 @@ mod tests {
             .await
             .expect("the user withdraws its edge");
         assert!(
-            capability_roots_to_trusted_root(&backend, &user, &peer, "infra:serve")
-                .await
-                .unwrap()
-                .is_none(),
+            capability_roots_to_trusted_root(
+                &backend,
+                &user,
+                &peer,
+                "infra:serve",
+                crate::host::clock::now()
+            )
+            .await
+            .unwrap()
+            .is_none(),
             "un-trusting the root stops the peer serving immediately (edge#386)"
         );
     }
@@ -3811,6 +3849,7 @@ mod tests {
             &node,
             &e2::kid(key_id),
             scope,
+            crate::host::clock::now(),
         )
         .await
         .expect("put_conferred_key: capability_roots_to_trusted_root");
@@ -3886,17 +3925,20 @@ mod tests {
         );
 
         // Add a self-declared MINOR → Minor (a subject may ratchet DOWN).
-        put_voiced(
-            &backend,
-            &fix_age_attestation(
-                "ab-self-minor",
-                "ab-subj",
-                "ab-subj",
-                "age_self_declared:band:minor",
-            ),
-        )
-        .await
-        .unwrap();
+        // v62.0.0 (K2-fix20; CC 3.5.1 rule 3) — dated one minute after the
+        // self-declared adult, so it is the subject's NEWEST row by instant
+        // (a same-instant tie now goes to the lowest attestation_id, which
+        // this test must not depend on).
+        let mut self_minor = fix_age_attestation(
+            "ab-self-minor",
+            "ab-subj",
+            "ab-subj",
+            "age_self_declared:band:minor",
+        );
+        self_minor.asserted_at += chrono::Duration::minutes(1);
+        self_minor.scrub_timestamp = self_minor.asserted_at;
+        resign_fix(&mut self_minor);
+        put_voiced(&backend, &self_minor).await.unwrap();
         assert_eq!(
             age_band(&backend, &e2::kid("ab-subj")).await.unwrap(),
             AgeBand::Minor
@@ -3963,6 +4005,13 @@ mod tests {
             "age_assurance:provider:adult:v1",
         );
         expired.expires_at = Some("2020-01-01T00:00:00Z".parse().unwrap());
+        // v62.0.0 (K2-fix20; CC 3.5.1 rule 3) — dated one minute BEFORE the
+        // witness's minor, so the minor is this witness's newest row by
+        // instant (a same-instant tie now goes to the lowest attestation_id,
+        // which this test must not depend on). An expired NEWEST row would
+        // leave the witness no current row at all (K2-fix15).
+        expired.asserted_at -= chrono::Duration::minutes(1);
+        expired.scrub_timestamp = expired.asserted_at;
         resign_fix(&mut expired);
         put_voiced(&backend, &expired).await.unwrap();
         assert_eq!(

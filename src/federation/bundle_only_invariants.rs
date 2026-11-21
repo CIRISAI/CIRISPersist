@@ -117,7 +117,7 @@ pub(crate) mod bodies {
         let s = suffix();
         let (bare, named) = (format!("i366-bare-{s}"), format!("i366-named-{s}"));
         key_root(d, &bare, None).await;
-        let v = trust_root_valid(d, "i366-probe", &e2::kid(&bare))
+        let v = trust_root_valid(d, "i366-probe", &e2::kid(&bare), crate::host::clock::now())
             .await
             .unwrap();
         assert!(
@@ -125,7 +125,7 @@ pub(crate) mod bodies {
             "I366: a new unlabelled self-directed row is no charter: {v:?}"
         );
         key_root(d, &named, Some(TRUST_CHARTER_DIMENSION)).await;
-        let v = trust_root_valid(d, "i366-probe", &e2::kid(&named))
+        let v = trust_root_valid(d, "i366-probe", &e2::kid(&named), crate::host::clock::now())
             .await
             .unwrap();
         assert!(
@@ -150,7 +150,9 @@ pub(crate) mod bodies {
         ] {
             edge(d, &user, &root, label).await;
             let user = e2::kid(&user);
-            let v = trust_root_valid(d, &user, &root).await.unwrap();
+            let v = trust_root_valid(d, &user, &root, crate::host::clock::now())
+                .await
+                .unwrap();
             assert!(
                 !v.edge_exists && !v.valid && v.root_self_declares,
                 "I367: a new edge labelled {label:?} gives no acceptance: {v:?}"
@@ -163,7 +165,9 @@ pub(crate) mod bodies {
         let user = format!("i367-named-{s}");
         edge(d, &user, &root, Some(TRUST_ACCEPTS_DIMENSION)).await;
         let user = e2::kid(&user);
-        let v = trust_root_valid(d, &user, &root).await.unwrap();
+        let v = trust_root_valid(d, &user, &root, crate::host::clock::now())
+            .await
+            .unwrap();
         assert!(
             v.edge_exists && v.valid,
             "I367 control: the labelled edge accepts: {v:?}"

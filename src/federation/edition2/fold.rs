@@ -630,6 +630,12 @@ pub mod reason {
         /// A replicated purge naming a held row a proven person is the subject of
         /// (INTERIM, until the notice is a row).
         pub const PURGE_HUMAN_SUBJECT: &str = "purge_human_subject_pending_notice_row";
+        /// v62.0.0 (K2-fix18; CC 3.4.13 Q5, CC 5.4.6) — a growth that would
+        /// list, on a `public` room's roster, a person a held age row places
+        /// in a minor band (`age::age_band_held`): held while the row stands,
+        /// restored when it is withdrawn or outranked. A standing protection
+        /// (class 2): it re-folds on `key:<person>`.
+        pub const MINOR_PUBLIC_ROSTER_ENTRY: &str = "minor_public_roster_entry";
 
         /// GC6's tokens.
         pub const ALL: &[&str] = &[
@@ -667,6 +673,7 @@ pub mod reason {
             ACCORD_CHARTER_COVERAGE,
             PURGE_RETRACTION_INADMISSIBLE,
             PURGE_HUMAN_SUBJECT,
+            MINOR_PUBLIC_ROSTER_ENTRY,
         ];
     }
     /// Wave GC7's reasons (GC7 owns this module).
@@ -1373,7 +1380,7 @@ where
         Some(a) => (a.tier, a.replicated, a.plane.to_owned(), a.slot),
         None => match dir.fold_state(&row_id).await {
             Ok(Some(s)) => (s.tier, s.replicated, s.plane, s.slot),
-            Ok(None) | Err(Error::Unsupported { .. }) => (
+            Ok(None) => (
                 tier.to_owned(),
                 false,
                 plane::ATTESTATION.to_owned(),
@@ -1392,14 +1399,7 @@ where
         held,
         reads,
     };
-    match dir.put_fold_record(&rec).await {
-        Ok(()) => Ok(()),
-        Err(Error::Unsupported { method }) => {
-            tracing::debug!(method, row_id = %row_id.hex(), "no fold store on this directory");
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
+    dir.put_fold_record(&rec).await
 }
 
 /// fix2 (triage round 2) — **record a door's `Pending`**, on EVERY hold:
@@ -1623,10 +1623,7 @@ where
         held,
         reads,
     };
-    match dir.put_fold_record(&rec).await {
-        Err(Error::Unsupported { .. }) => Ok(()),
-        other => other,
-    }
+    dir.put_fold_record(&rec).await
 }
 
 /// v4 — the boot hook: a re-fold interrupted between taking a row out of

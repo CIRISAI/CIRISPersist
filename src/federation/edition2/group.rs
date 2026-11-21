@@ -1434,10 +1434,7 @@ where
     if head.as_deref() != Some(offered_hash) {
         return Ok(());
     }
-    match dir.drop_group_tips(cohort, &view.group, merged).await {
-        Ok(()) | Err(Error::Unsupported { .. }) => Ok(()),
-        Err(e) => Err(e),
-    }
+    dir.drop_group_tips(cohort, &view.group, merged).await
 }
 
 /// The typed door for one roster version's record.
@@ -1793,8 +1790,10 @@ fn snapshot_members(s: &serde_json::Value) -> BTreeSet<String> {
 /// of the head's own authorized roster, only the members in the returned
 /// set: the roster is the members common to all tips.
 ///
-/// A directory with no tip store (`list_group_tips` unsupported) has no
-/// tips: `None`.
+/// v62.0.0 (PX-fix3) — a directory with no tip store (`list_group_tips`
+/// `Unsupported`) is an ERROR, never "no fork": read as `None`, a forked
+/// group's roster was the head's own (fail-open, through the capsule proxy
+/// before it routed the read; I2190, I2191).
 ///
 /// # Errors
 /// Directory read failures.
@@ -1807,11 +1806,7 @@ pub async fn forked_tip_members<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let tips = match dir.list_group_tips(cohort, group).await {
-        Ok(t) => t,
-        Err(Error::Unsupported { .. }) => return Ok(None),
-        Err(e) => return Err(e),
-    };
+    let tips = dir.list_group_tips(cohort, group).await?;
     if tips.is_empty() {
         return Ok(None);
     }

@@ -73,7 +73,7 @@ use super::fixture_switch as e2;
 use super::liveness::HeldKeys;
 use super::names::RowId;
 use super::receipts::{
-    self, admission_unit_runnable, receipts_of, with_receipts, AdmissionReceipt, ReceiptMissing,
+    self, admission_unit_receipt, receipts_of, with_receipts, AdmissionReceipt, ReceiptMissing,
     ReceiptReading,
 };
 use crate::federation::FederationDirectory;
@@ -373,7 +373,7 @@ async fn trust(d: &dyn FederationDirectory, seed: &str) -> Vec<u8> {
 
 async fn answer(d: &dyn FederationDirectory, statement: &[u8]) -> AdmissionReceipt {
     let id = RowId::of_statement(statement).expect("P10: a row statement");
-    admission_unit_runnable(d, &id, crate::host::clock::now())
+    admission_unit_receipt(d, &id, crate::host::clock::now())
         .await
         .expect("P10: the receipt leg reads")
 }
@@ -406,7 +406,7 @@ pub(crate) async fn no_receipt_waits_body(d: &dyn FederationDirectory) {
     assert_eq!(a.token(), Some(receipts::ADMISSION_RECEIPT_MISSING));
     assert_eq!(a.detail(), Some("none"));
     assert!(!a.is_runnable());
-    let none = admission_unit_runnable(d, &RowId([0x4f; 32]), crate::host::clock::now())
+    let none = admission_unit_receipt(d, &RowId([0x4f; 32]), crate::host::clock::now())
         .await
         .unwrap();
     assert_eq!(none, AdmissionReceipt::NotHeld, "I4040 no row");

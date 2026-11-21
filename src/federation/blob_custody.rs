@@ -219,7 +219,6 @@ where
                     size_bytes: c.size,
                 })
                 .collect(),
-            Err(crate::federation::Error::Unsupported { .. }) => Vec::new(),
             Err(e) => return Err(BlobError::Backend(format!("list_holders_sized: {e}"))),
         }
     } else {

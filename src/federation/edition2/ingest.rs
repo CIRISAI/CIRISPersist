@@ -1056,10 +1056,7 @@ where
                     StatementOutcome::Voice { row_id, .. }
                         if was_held && !records_itself(plane_name) =>
                     {
-                        match dir.put_fold_reason(row_id, None).await {
-                            Ok(_) | Err(Error::Unsupported { .. }) => {}
-                            Err(e) => return Err(e),
-                        }
+                        dir.put_fold_reason(row_id, None).await?;
                     }
                     // Concluded on a plane other than the attestation tail
                     // (which records its own, with its inner reads): the
@@ -1448,6 +1445,40 @@ where
     }
 }
 
+/// v62.0.0 (RL-fix1, lead ruling (B)) — [`apply_replicated_statement`] with
+/// the host's FEED POSITION of the offered statement: an accord row this node
+/// cannot judge (no genesis bundle held) answers
+/// `Refused { AccordRootNotHeld }` as it does there, the cursor advances, and
+/// the first such skip on `(feed.plane, feed.peer)` is recorded as a
+/// watermark ([`super::accord_rescan::note_skip`]); the host re-pulls from it
+/// once [`super::accord_rescan::rescan_needed`] names it. Every other
+/// outcome is [`apply_replicated_statement`]'s.
+///
+/// # Errors
+/// As [`apply_replicated_statement`]; a feed field empty or too long; the
+/// watermark store.
+pub async fn apply_replicated_statement_at_feed<F>(
+    dir: &F,
+    bytes: &[u8],
+    offered_id: &Digest32,
+    feed: &super::accord_rescan::FeedPosition,
+) -> Result<ReplicatedStatementOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use crate::federation::attestation_apply::AttestationRefusalReason;
+    let out = Box::pin(apply_replicated_statement(dir, bytes, offered_id)).await?;
+    if matches!(
+        out,
+        ReplicatedStatementOutcome::Refused {
+            reason: AttestationRefusalReason::AccordRootNotHeld
+        }
+    ) {
+        Box::pin(super::accord_rescan::note_skip(dir, feed)).await?;
+    }
+    Ok(out)
+}
+
 /// v62.0.0 (E6-fix9; CIRISPersist#804) — [`apply_replicated_statement`]
 /// under the CALL's write origin. The privileged sync door
 /// (`put_attestation_synced`, `WriteOrigin::Sync { peer_key_id }`) reaches
@@ -1468,6 +1499,16 @@ where
     F: FederationDirectory + ?Sized,
 {
     use crate::federation::attestation_apply::AttestationRefusalReason;
+    // v62.0.0 (RL-fix1, lead ruling (B); CC 5.4: a node "carries none it
+    // cannot verify") — an accord row at a node holding no genesis bundle is
+    // not kept and does not hold the sender's cursor: a bundle never arrives
+    // down a feed. `apply_replicated_statement_at_feed` records where the
+    // feed skipped it, for the re-pull once a bundle is in force.
+    if Box::pin(super::accord_rescan::accord_root_not_held(dir, bytes)).await? {
+        return Ok(ReplicatedStatementOutcome::Refused {
+            reason: AttestationRefusalReason::AccordRootNotHeld,
+        });
+    }
     match put_statement_with_origin(dir, bytes, Some(offered_id), INGEST_TIER, origin).await {
         Ok(out) => {
             rewrap_for_a_received_owner_binding(dir, bytes, &out).await;

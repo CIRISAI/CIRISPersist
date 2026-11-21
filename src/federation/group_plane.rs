@@ -1346,18 +1346,13 @@ pub async fn community_dissolved_at<D>(
 where
     D: super::FederationDirectory + ?Sized,
 {
-    let rows = match dir
+    let rows = dir
         .list_targeted_by_dimension_prefix(
             &[cohort_scope::COMMUNITY],
             community_key_id,
             GROUP_ROSTER_DIMENSION,
         )
-        .await
-    {
-        Ok(rows) => rows,
-        Err(Error::Unsupported { .. }) => return Ok(None),
-        Err(e) => return Err(e),
-    };
+        .await?;
     let mut at: Option<chrono::DateTime<chrono::Utc>> = None;
     for r in rows {
         match group_signed_of_row(&r)? {

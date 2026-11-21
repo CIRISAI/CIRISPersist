@@ -88,6 +88,12 @@ pub const RULE_OPEN_PROPOSAL_NOT_OPEN: &str = "membership_open_proposal_not_open
 /// from a key with no live federation-scope owner binding: it does not count
 /// (held, never refused, on the edition-2 door).
 pub const RULE_JOINER_OWNER_UNBOUND: &str = "joiner_owner_unbound";
+/// v62.0.0 (K2-fix18; CC 3.4.13 Q5 "contactable and discoverable by
+/// unconnected adults", CC 5.4.6) — the growth would list a person a held age
+/// row places in a minor band on a `public` room's roster: HELD (never
+/// refused) while the row stands ([`check_public_roster_not_minor`]). The
+/// spelling of `fold::reason::gc6::MINOR_PUBLIC_ROSTER_ENTRY`.
+pub const RULE_MINOR_PUBLIC_ROSTER_ENTRY: &str = "minor_public_roster_entry";
 
 /// The retryable rules: rows arrive out of order and persist holds no
 /// deferral queue, so the caller re-submits. v61 (CIRISPersist#1101): an
@@ -984,6 +990,9 @@ where
             note(RULE_PROPOSAL_EXPIRED);
             continue;
         }
+        // v62.0.0 (K2-fix18) — the member's consent is met; a public room
+        // still never LISTS a minor (a standing protection, class 2).
+        check_public_roster_not_minor(dir, scope, group, member).await?;
         return Ok(());
     }
     // A member who only ever DECLINED an invitation to this group is refused
@@ -1009,6 +1018,62 @@ where
     // tokens are `fold::reason`'s membership tokens, spelled the same).
     let rule = worst.unwrap_or(RULE_ACCEPTANCE_UNRESOLVED);
     Err(fold::hold(rule, refuse(group, member, rule)))
+}
+
+/// v62.0.0 (K2-fix18; CC 3.4.13 Q5, CC 5.4.6; class 2, K2-fix17.md) — **a
+/// public room never lists a minor.** A roster entry on a `public` room makes
+/// its member contactable and discoverable by unconnected adults, which the
+/// Q5 hard floor forbids for a minor. So a growth of a `public` room
+/// (`is_public_community`, at the room plane) whose member is, or acts for,
+/// or is a node owned by, a person a HELD age row places in a minor band
+/// (`age::age_band_held`: the rows held now, no instant, no expiry) is held
+/// [`RULE_MINOR_PUBLIC_ROSTER_ENTRY`]. Every read declares `key:<person>`, so
+/// a later minor row holds a concluded growth (re-fold) and its withdrawal,
+/// or being outranked, restores it. A person with no age row is listed. A
+/// private room, a family, the `self` cohort and every derived-plane path
+/// are untouched (the person stays reachable through their own nodes and the
+/// codes they hand out).
+///
+/// The node path: the owner seat read here is the kernel's RAW seat
+/// (`kernel_owner_selves`), not `owner_of`, because `owner_of` already
+/// drops a minor owner (CC 3.2 l.961) and would hide the very person this
+/// asks about.
+async fn check_public_roster_not_minor<F>(
+    dir: &F,
+    scope: &str,
+    group: &str,
+    member: &str,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if membership_plane(scope) != Some(cohort_scope::TargetPlane::Room) {
+        return Ok(());
+    }
+    if !dir
+        .lookup_community(group)
+        .await?
+        .is_some_and(|c| super::public_room::is_public_community(&c))
+    {
+        return Ok(());
+    }
+    let mut persons: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::from([member.to_owned()]);
+    persons.insert(dir.active_identity_for_occurrence(member).await?);
+    persons.extend(
+        super::admission::kernel_owner_selves(dir, member, crate::kernel::owner::Cosign::Required)
+            .await?,
+    );
+    for p in &persons {
+        fold::reads(Dep::key(p));
+        if super::age::age_band_held(dir, p).await? == super::age::AgeBand::Minor {
+            return Err(fold::hold(
+                RULE_MINOR_PUBLIC_ROSTER_ENTRY,
+                refuse(group, member, RULE_MINOR_PUBLIC_ROSTER_ENTRY),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Is `group` (at `scope`) an open `public` room held here?
@@ -1184,14 +1249,15 @@ where
         None => return Ok(Vec::new()),
     };
     let member_set: std::collections::BTreeSet<&str> = members.iter().map(String::as_str).collect();
-    let candidates: Vec<Attestation> = match dir
-        .list_targeted_by_dimension_prefix(scopes, group, PROPOSAL_DIMENSION)
-        .await
-    {
-        Ok(rows) => rows,
+    let candidates: Vec<Attestation> = match super::optional_capability::unsupported_is_none(
+        dir.list_targeted_by_dimension_prefix(scopes, group, PROPOSAL_DIMENSION)
+            .await,
+        "membership_acceptance::proposal_candidates",
+    )? {
+        Some(rows) => rows,
         // Pin compatibility: a directory without the targeted seek reads
         // each signer's proposal rows by dimension (V137) — bounded, same set.
-        Err(Error::Unsupported { .. }) => {
+        None => {
             let mut rows = Vec::new();
             for s in &signers_of_members(dir, members).await? {
                 let mut pages = AttestationQuery::by(s, FOLD_PAGE)
@@ -1203,7 +1269,6 @@ where
             }
             rows
         }
-        Err(e) => return Err(e),
     };
     let mut signers: Option<std::collections::BTreeSet<String>> = None;
     let mut out = std::collections::BTreeSet::new();

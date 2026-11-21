@@ -975,13 +975,12 @@ impl HardwareAttestationPolicy {
     /// *production* root runs **here, in persist**, roughly 4,300 lines below
     /// this comment:
     ///
-    /// - [`super::admission::verify_member_fips_custody_against`] — ungated
-    ///   `pub fn`, calling verify's `verify_accord_custody_attestation`.
-    /// - Reached at runtime from `verify_accord_family_coscrub_with`, under
-    ///   the canonical-role gate, against the pinned
-    ///   [`super::admission::YUBICO_ATTESTATION_ROOT_1_DER`] — production
-    ///   code, not a fixture. A caller-supplied root never reaches the
-    ///   admission path.
+    /// - v62.0.0 (TR-fix1): the earlier `admission::verify_member_fips_custody_against`
+    ///   (Verify's v1 `verify_accord_custody_attestation`) is DELETED. Custody
+    ///   is gated where the genesis bundle seats each holder key (CC 4.2.2.1:
+    ///   Verify's bundle reader runs `verify_yubikey_piv_attestation` per
+    ///   seated holder, every bundle in force), and the canonical-role gate
+    ///   reads the bundle's serve seats.
     /// - The **baked production holders have actually been walked**:
     ///   `baked_accord_holders_fips_custody_verifies_513` runs the real A1 /
     ///   B1 / C1 genesis records against the real pinned root — holder

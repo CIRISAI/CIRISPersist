@@ -1491,6 +1491,7 @@ pub mod bodies {
                 &node,
                 &e2::kid(&board),
                 DELEGATION_SCOPE_SLASH,
+                crate::host::clock::now(),
             )
             .await
             .expect("capability_roots_to_trusted_root");

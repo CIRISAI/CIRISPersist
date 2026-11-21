@@ -1336,6 +1336,10 @@ where
     // v62.0.0 (wave V1b, CC 4.4.3.12) — an affiliation's counted officer
     // appointment waits (`Pending`) for the quorum at the head it names.
     crate::federation::admission::check_officer_appointment_counted(dir, &row).await?;
+    // v62.0.0 (AU-fix1, CC 2.7.11 P2:1682) — a counted `admission:unit` row
+    // waits (`count_short`) for its group's count at the head it names,
+    // never on fewer than two persons.
+    crate::federation::admission::check_admission_unit_counted(dir, &row).await?;
 
     // v18.2.0 — trust-charter admission (the charter walk). AV-76: a
     // directory walk, so it stays in tier 4.
@@ -1505,7 +1509,27 @@ where
         crate::federation::edition2::receipts::is_self_certified_service_edge(dir, &row).await,
         Ok(true)
     );
-    if !self_certified {
+    // v62.0.0 (AU-fix1; CC 2.7.11, CC 3.1.3 "sub is the unit's digest as
+    // canonical:sha256:{hex} (not an identity-ref)") — an `admission:unit`
+    // row (and a composer of one) is ABOUT a unit, named by its digest, not
+    // a key: no key record, family or community holds it, so the subject
+    // rule held every such row `link_unheld` and none ever concluded. Its
+    // subject is checked by the door's pure rule instead (`sub` equals
+    // `canonical:sha256:{hex(unit)}`, `payloads::check_admission_unit`).
+    let unit_subject = row
+        .attested_key_id
+        .starts_with(crate::federation::edition2::payloads::ADMISSION_UNIT_SUB_PREFIX)
+        && crate::federation::admission::admission_unit_statement(&row).is_some();
+    // v62.0.0 (AU-fix1; CC 2.7.11 "Standing", CC 4.4.3.34) — a group is
+    // KEYLESS: an owner's `trust:accepts` edge listing the class `admission`
+    // to a HELD family or community (and a composer of such an edge) names a
+    // subject no key record holds. It is admitted on the held group record;
+    // while the record is not held the subject rule below holds it
+    // `link_unheld` and it re-folds on the record's arrival.
+    let group_subject = !unit_subject
+        && !self_certified
+        && crate::federation::admission::is_admission_edge_to_held_group(dir, &row).await?;
+    if !self_certified && !unit_subject && !group_subject {
         crate::federation::admission::check_attested_subject_admission(dir, &row.attested_key_id)
             .await?;
     }

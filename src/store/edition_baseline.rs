@@ -42,6 +42,10 @@ pub(crate) const EDITION_ONE_HEAD: i32 = 216;
 /// - `ceg_fold_state`, `ceg_fold_reads` — wave G0 (CC 2.7.3): each folded
 ///   row's arrival, plane and slot, why a held row concludes nothing, and
 ///   what each row's fold read.
+/// - `ceg_accord_rescan` — RL-fix1 (lead ruling (B); CC 5.4): the feed
+///   watermarks of accord rows a node holding no accord root skipped.
+/// - `ceg_dial_hints` — RL-fix2: the local, unsigned dial hints decoded from
+///   a contact's node code.
 #[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
 pub(crate) const EDITION_TWO_ADDITIONS: &[&str] = &[
     "store_edition_deletions",
@@ -51,6 +55,8 @@ pub(crate) const EDITION_TWO_ADDITIONS: &[&str] = &[
     "ceg_roster_proposals",
     "ceg_fold_state",
     "ceg_fold_reads",
+    "ceg_accord_rescan",
+    "ceg_dial_hints",
 ];
 
 /// The columns edition 2 adds to edition 1's `federation_keys`: the

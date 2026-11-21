@@ -76,10 +76,16 @@ pub(crate) mod bodies {
             })
             .expect("the root → subject grant")
             .attestation_id;
-        let walk = capability_roots_to_trusted_root(d, &user, &subject, INFRA_SERVE_SCOPE)
-            .await
-            .unwrap()
-            .expect("CONTROL — the grant roots before any supersede");
+        let walk = capability_roots_to_trusted_root(
+            d,
+            &user,
+            &subject,
+            INFRA_SERVE_SCOPE,
+            crate::host::clock::now(),
+        )
+        .await
+        .unwrap()
+        .expect("CONTROL — the grant roots before any supersede");
         assert_eq!(walk.grant_attestation_id, grant, "CONTROL — the grant");
         Fx {
             user,
@@ -188,7 +194,7 @@ pub(crate) mod bodies {
     }
 
     async fn walk(d: &dyn FederationDirectory, fx: &Fx, scope: &str) -> Option<String> {
-        capability_roots_to_trusted_root(d, &fx.user, &fx.subject, scope)
+        capability_roots_to_trusted_root(d, &fx.user, &fx.subject, scope, crate::host::clock::now())
             .await
             .unwrap()
             .map(|g| g.grant_attestation_id)
