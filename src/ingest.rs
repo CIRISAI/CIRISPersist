@@ -1482,12 +1482,11 @@ where
             // self-referential (#454), so without the second axis a
             // node-signed ingest exercised NO memberships. One spelling,
             // shared with the community write gate and AV-84.
-            let identity =
-                crate::federation::admission::admission_identity_for_writer(self.backend, signer)
-                    .await
-                    .map_err(|e| {
-                        IngestError::Store(StoreError::Backend(format!("writer principal: {e}")))
-                    })?;
+            let identity = crate::federation::admission::writer_principal(self.backend, signer)
+                .await
+                .map_err(|e| {
+                    IngestError::Store(StoreError::Backend(format!("writer principal: {e}")))
+                })?;
             let families = self
                 .backend
                 .admission_family_key_ids(&identity)

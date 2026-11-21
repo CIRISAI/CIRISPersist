@@ -188,6 +188,121 @@ pub fn owner_binding_delegates_to_envelope(
     })
 }
 
+/// v62.0.0 (KR-fix11; CC 3.2 "the first binding", CC 3.1.3.2: a serve seat's
+/// owner binding is carried at `federation`) — **the owner binding's envelope
+/// for a signer whose pen is elsewhere** (the operator's own person key, held
+/// on hardware): exactly the members the software producer states
+/// (`Engine::steward_bind(.., Some(owner_binding::PURPOSE))`:
+/// [`owner_binding_delegates_to_envelope`] through `EnvelopeCore`, placed at
+/// `cohort_scope: federation`). Hand it to
+/// `Engine::statement_draft("delegates_to", &envelope, owner_iss,
+/// owner_kid_hex, node_key_id, asserted_at_ms, None)`, or call
+/// `Engine::owner_binding_draft`, which does. Both producers then state the
+/// row through `emit::row_payload`.
+///
+/// `infra_scopes` is the CALLER's list (persist fixes none): `infra:*` tokens
+/// only, e.g. `infra:serve`, `infra:network_presence`, `infra:attest`.
+///
+/// # Errors
+/// `InvalidArgument`: no scope, or a token outside `infra:*`.
+pub fn owner_binding_draft_envelope(
+    node_key_id: &str,
+    infra_scopes: &[String],
+) -> Result<serde_json::Value, super::Error> {
+    let set: std::collections::HashSet<String> = infra_scopes.iter().cloned().collect();
+    if infra_scopes.is_empty() || !super::admission::scopes_are_infra_only(&set) {
+        return Err(super::Error::InvalidArgument(format!(
+            "owner binding: its scope is infra:* tokens only, and at least one; got \
+             {infra_scopes:?}"
+        )));
+    }
+    let mut envelope = super::envelope::EnvelopeCore::from_value(
+        owner_binding_delegates_to_envelope(node_key_id, infra_scopes),
+    )?
+    .to_value();
+    if let Some(o) = envelope.as_object_mut() {
+        o.insert(
+            "cohort_scope".into(),
+            serde_json::Value::String(super::types::cohort_scope::FEDERATION.to_owned()),
+        );
+        o.retain(|_, v| !v.is_null());
+    }
+    Ok(envelope)
+}
+
+/// v62.0.0 (KR-fix11) — **the self-check a ceremony tool runs on a signed
+/// owner binding before it submits it** (pure: no store). The statement is a
+/// `delegates_to` of the ownership family, `sub` = `node_key_id`, AUTHORED by
+/// its signer (`author` = `iss` = `owner_iss`), on the owner-binding
+/// dimension, placed at `cohort_scope: federation`, and its `scope` is
+/// `infra:*` only and carries every token of `required_scopes`.
+///
+/// It does not verify the signature (the door does) and does not know
+/// whether the node has voiced it.
+///
+/// # Errors
+/// `InvalidArgument` naming the first thing that is wrong.
+pub fn check_owner_binding_statement(
+    statement: &[u8],
+    owner_iss: &str,
+    node_key_id: &str,
+    required_scopes: &[&str],
+) -> Result<(), super::Error> {
+    use ciris_verify_core::cde::Value;
+    let bad = |what: String| super::Error::InvalidArgument(format!("owner binding: {what}"));
+    let (family, row_type) = super::edition2::emit::family_of_statement(statement)
+        .ok_or_else(|| bad("not a row statement".into()))?;
+    if row_type != super::types::attestation_type::DELEGATES_TO {
+        return Err(bad(format!("row type {row_type:?}, not delegates_to")));
+    }
+    if super::edition2::emit::family_of_dimension(super::types::owner_binding::DIMENSION).as_deref()
+        != Some(family.as_str())
+    {
+        return Err(bad(format!(
+            "family {family:?} is not the ownership family"
+        )));
+    }
+    let (protected, payload) = super::edition2::liveness::statement_parts(statement)
+        .ok_or_else(|| bad("undecodable".into()))?;
+    let claim = |n: i64| {
+        protected
+            .get_int(15)
+            .and_then(|c| c.get_int(n))
+            .and_then(Value::as_text)
+    };
+    let text = |k: &str| payload.get_text(k).and_then(Value::as_text);
+    if claim(1) != Some(owner_iss) || text("author") != Some(owner_iss) {
+        return Err(bad(format!(
+            "it is not authored and signed by the owner {owner_iss}"
+        )));
+    }
+    if claim(2) != Some(node_key_id) {
+        return Err(bad(format!("its sub is not the node {node_key_id}")));
+    }
+    if text("dimension") != Some(super::types::owner_binding::DIMENSION) {
+        return Err(bad("its dimension is not the owner binding's".into()));
+    }
+    if text("cohort_scope") != Some(super::types::cohort_scope::FEDERATION) {
+        return Err(bad(
+            "it is not placed at cohort_scope federation (a serve seat's binding is announced \
+             there, CC 3.1.3.2)"
+                .into(),
+        ));
+    }
+    let scope: Vec<&str> = payload
+        .get_text("scope")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_text).collect())
+        .unwrap_or_default();
+    if scope.is_empty() || scope.iter().any(|t| !t.starts_with("infra:")) {
+        return Err(bad(format!("its scope is not infra:* only: {scope:?}")));
+    }
+    if let Some(missing) = required_scopes.iter().find(|t| !scope.contains(t)) {
+        return Err(bad(format!("its scope lacks {missing}: {scope:?}")));
+    }
+    Ok(())
+}
+
 /// v61 (CIRISPersist#1126; CC 4.4.3.4.3.1, CC 3.3.5) — a partnership
 /// half is a **`consent_record`** row: `subject_kind: "consent_record"`, the
 /// `stance`, the singular `subject_key_id` naming the PARTNER (the agent

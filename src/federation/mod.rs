@@ -378,6 +378,10 @@ mod ledger_projection_invariants;
 /// divergence across backends, pinned (I951).
 #[cfg(test)]
 pub(crate) mod local_door_divergence_invariants;
+/// v62.0.0 (KR-fix10; CC 3.1.3.2, CC 3.3.6) — I4280–I4284: a node is its
+/// owner's writer, never its consent or its standing.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod node_gives_no_consent_invariants;
 /// CIRISPersist#972 — I335–I339, a node is seated without an acceptance.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod node_seat_invariants;
@@ -392,6 +396,10 @@ pub(crate) mod occurrence_history_invariants;
 /// owner, never an occurrence of the person.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod owner_audience_invariants;
+/// v62.0.0 (KR-fix11; CC 3.2, CC 3.1.3.2) — I4285–I4286: a canonical seat's
+/// owner binding, drafted, signed outside the Engine, voiced by the node.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod owner_binding_draft_invariants;
 /// v62.0.0 slice E1 (CIRISPersist#1274) — the CC rc20 rules on today's wire,
 /// I1870 onward, every backend.
 #[cfg(test)]
@@ -8037,6 +8045,18 @@ pub trait FederationDirectory: Send + Sync {
     /// own key and nothing more), which strips the inherited memberships
     /// without inventing a new refusal class.
     ///
+    /// v62.0.0 (v62 P5c, KR-fix10; CC 3.3.6) — **what this answers for a
+    /// NODE or AGENT key: the key itself.** A machine key is never a device
+    /// of a person: the doors refuse such an occurrence
+    /// (`occurrence_binds_machine_to_person`) and
+    /// [`Self::active_identities_for_occurrence`] skips a held one
+    /// (`replication_audience::occurrence_counts`). A node's human is its
+    /// OWNER, read by `admission::owner_of` and followed only by
+    /// `admission::writer_principal` (the right to write for the owner). The
+    /// #873 text below describes the form before v62, when a claimed node
+    /// carried a login anchor under its human and this answered the human; it
+    /// is kept as history and is no longer what a node resolves to.
+    ///
     /// v45.0.1 (CIRISPersist#873, `FSD/OCCURRENCE_PRINCIPAL.md` §2) — **the
     /// first of [`Self::active_identities_for_occurrence`], else the
     /// occurrence itself.** Before this cut the resolver took ONE row from
@@ -9825,11 +9845,9 @@ pub trait FederationDirectory: Send + Sync {
             // `retry_after_community_roster` FOREVER: the roster's members
             // are persons; the membership question was being asked about the
             // instrument instead of the principal.
-            let identity = crate::federation::admission::admission_identity_for_writer(
-                self,
-                writer_occurrence_key_id,
-            )
-            .await?;
+            let identity =
+                crate::federation::admission::writer_principal(self, writer_occurrence_key_id)
+                    .await?;
             // v62.0.0 (wave GC7; CC 2.7.3) — the target's record and roster
             // fold, and the writer's occurrence / owner-binding axes, are
             // other rows: a refusal on them HOLDS the row under a fold attempt

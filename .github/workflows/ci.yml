@@ -1747,6 +1747,8 @@ jobs:
           set -euo pipefail
           python3 scripts/one_threshold.py --self-test
           python3 scripts/one_threshold.py check
+          python3 scripts/one_consent.py --self-test
+          python3 scripts/one_consent.py check
       # v62.0.0 (SD-fix2; CLEAN-standing.md §6) — the standing questions
       # (roster, founders, duty holders, bundle holders, walks, protocol
       # parse, count shapes) have a closed, shrinking set of readers, and a

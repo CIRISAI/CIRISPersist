@@ -740,7 +740,7 @@ far member:
 ### 20.1 Admission asks about the principal
 
 `admit_replicated_key_grant` (epoch axis) resolves the minter through
-`admission_identity_for_writer`: an occurrence lifts to its identity, an owned
+`writer_principal`: an occurrence lifts to its identity, an owned
 node lifts to its single live owner (`owner_of`, the #578/#584 liveness fold),
 anything else stays itself. The **principal** must be an active member of the
 community at `asserted_at` per the replicated roster fold. A minter with

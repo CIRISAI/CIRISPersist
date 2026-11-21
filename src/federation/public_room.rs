@@ -336,8 +336,12 @@ pub async fn check_community_listing_admission(
             ),
         ));
     }
-    let signer =
-        super::admission::admission_identity_for_writer(directory, &row.attesting_key_id).await?;
+    // KR-fix10 (CC 3.1.3.2) — a founder's standing is its own key's: the
+    // signer's person, or the signing key itself (a member in its own right);
+    // never the signer's owner.
+    let signer = super::admission::consenting_person(directory, &row.attesting_key_id)
+        .await?
+        .unwrap_or_else(|| row.attesting_key_id.clone());
     fold::reads(Dep::key(&signer));
     let founder = super::effective_roster(directory, &room)
         .await?
@@ -431,9 +435,10 @@ where
         {
             continue;
         }
-        let proposer =
-            super::admission::admission_identity_for_writer(directory, &row.attesting_key_id)
-                .await?;
+        // KR-fix10 — the founder's own key, never the founder's node.
+        let proposer = super::admission::consenting_person(directory, &row.attesting_key_id)
+            .await?
+            .unwrap_or_else(|| row.attesting_key_id.clone());
         if !founders.contains(&proposer) && !founders.contains(&row.attesting_key_id) {
             continue;
         }
@@ -445,9 +450,12 @@ where
             if matches!(
                 c.attestation_type.as_str(),
                 attestation_type::WITHDRAWS | attestation_type::SUPERSEDES
-            ) && super::admission::admission_identity_for_writer(directory, &c.attesting_key_id)
-                .await?
-                == proposer
+            ) && super::membership_acceptance::same_consenting_party(
+                directory,
+                &c.attesting_key_id,
+                &row.attesting_key_id,
+            )
+            .await?
             {
                 retired = true;
                 break;

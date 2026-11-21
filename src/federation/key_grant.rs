@@ -985,7 +985,7 @@ where
 /// `as_of`, per this node's replicated roster fold — asked about the
 /// PRINCIPAL, not the instrument (CIRISPersist#851, the #765 lift):
 /// `signer` is first resolved through
-/// [`admission_identity_for_writer`](crate::federation::admission::admission_identity_for_writer)
+/// [`writer_principal`](crate::federation::admission::writer_principal)
 /// — an occurrence lifts to its identity, an owned node to its single live
 /// owner, anything else stays itself — and the principal must be on the
 /// roster minus effective removals

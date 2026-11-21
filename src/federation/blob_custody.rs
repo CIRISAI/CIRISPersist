@@ -114,7 +114,7 @@ where
     let mut by: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
     for d in devices {
-        let person = crate::federation::admission::admission_identity_for_writer(backend, &d)
+        let person = crate::federation::admission::writer_principal(backend, &d)
             .await
             .unwrap_or_else(|_| d.clone());
         by.entry(person).or_default().insert(d);

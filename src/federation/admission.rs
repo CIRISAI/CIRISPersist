@@ -3045,14 +3045,14 @@ pub async fn check_cohort_standing_resolved(
     )
 }
 
-/// v62.0.0 (wave GC1) — [`admission_identity_for_writer`] of a party the
+/// v62.0.0 (wave GC1) — [`writer_principal`] of a party the
 /// row names, declared as a fold read (its occurrences and owner bindings).
 async fn party_identity_read(
     directory: &dyn super::FederationDirectory,
     party: &str,
 ) -> Result<String, Error> {
     fold_reads_key(party);
-    admission_identity_for_writer(directory, party).await
+    writer_principal(directory, party).await
 }
 
 /// The body of [`check_cohort_standing_resolved`], its refusals unmarked.
@@ -3079,7 +3079,7 @@ async fn cohort_standing_resolved_verdict(
     // same comparisons, same refusal variants, in the same order — the
     // witness arms exercise both.
     let producer = row.attesting_key_id.as_str();
-    let producer_identity = admission_identity_for_writer(directory, producer).await?;
+    let producer_identity = writer_principal(directory, producer).await?;
     let refuse = |reason: CohortStandingRefusal, foreign: &str| {
         Err(Error::CohortStandingRefused {
             cohort_scope: row.cohort_scope.clone(),
@@ -5734,7 +5734,7 @@ pub async fn root_grant_consenter<F: super::FederationDirectory + ?Sized>(
     let Some(rec) = directory.lookup_public_key(grantee).await? else {
         // No held record: an occurrence key answers by its identity.
         return Ok(Some(
-            admission_identity_for_writer(directory, grantee).await?,
+            directory.active_identity_for_occurrence(grantee).await?,
         ));
     };
     let owner = if it::set_contains(&rec.identity_type, it::AGENT) {
@@ -5747,11 +5747,11 @@ pub async fn root_grant_consenter<F: super::FederationDirectory + ?Sized>(
         owner_of(directory, grantee).await?
     } else {
         return Ok(Some(
-            admission_identity_for_writer(directory, grantee).await?,
+            directory.active_identity_for_occurrence(grantee).await?,
         ));
     };
     match owner {
-        Some(o) => Ok(Some(admission_identity_for_writer(directory, &o).await?)),
+        Some(o) => Ok(Some(directory.active_identity_for_occurrence(&o).await?)),
         None => Ok(None),
     }
 }
@@ -5762,7 +5762,7 @@ pub async fn root_grant_consenter<F: super::FederationDirectory + ?Sized>(
 /// its person) is the grantee's consenter ([`root_grant_consenter`]).
 ///
 /// The key is NOT lifted to its owner here.
-/// [`admission_identity_for_writer`] lifts a node to its owner (#765: a
+/// [`writer_principal`] lifts a node to its owner (#765: a
 /// node writes on its owner's behalf), which is right for a write gate and
 /// wrong for a consent: a bound worker node's own signature read as its
 /// owner's, so the machine accepted its own grant. A machine's consent is
@@ -5783,7 +5783,44 @@ pub async fn signs_for_root_grantee<F: super::FederationDirectory + ?Sized>(
     let Some(consenter) = root_grant_consenter(directory, grantee, at).await? else {
         return Ok(false);
     };
-    Ok(directory.active_identity_for_occurrence(signer_key).await? == consenter)
+    // KR-fix10 — the one consent reading: a node key is nobody's consent.
+    Ok(consenting_person(directory, signer_key).await?.as_deref() == Some(consenter.as_str()))
+}
+
+/// v62.0.0 (KR-fix8; CC 2.4.1.1 rule 3) — **may `signer_key` give up the
+/// root grant to `grantee`, on the grantee's own rule?** Exactly two keys
+/// may, each compared by its OWN identity (`active_identity_for_occurrence`:
+/// a person's occurrence key answers by its person), never lifted to an
+/// owner:
+///
+/// - **the grantee itself**: a grantee may always give up what it was
+///   granted, a machine included (the worker node's own key);
+/// - **the grantee's consenter** ([`signs_for_root_grantee`]): the grantee's
+///   person, or a machine grantee's owner, by the owner's own key.
+///
+/// Before KR-fix8 this compared `writer_principal(signer)` with
+/// the consenter. That lifts ANY node bound to an owner to that owner, so
+/// the worker passed only by the lift, and a SIBLING node of the same owner
+/// (not the grantee) could withdraw another node's grant.
+///
+/// # Errors
+/// Directory reads.
+pub async fn may_withdraw_root_grant<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    signer_key: &str,
+    grantee: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error> {
+    // The grantee itself, by its raw key or as one of the grantee person's
+    // devices; a node grantee is its own key and nothing more.
+    if signer_key == grantee {
+        return Ok(true);
+    }
+    let grantee_person = directory.active_identity_for_occurrence(grantee).await?;
+    if consenting_person(directory, signer_key).await?.as_deref() == Some(grantee_person.as_str()) {
+        return Ok(true);
+    }
+    signs_for_root_grantee(directory, signer_key, grantee, at).await
 }
 
 /// v62.0.0 (KR-fix2; CC 2.4.1.1 rule 0, CC 4.5.5 "a seat stands on its own")
@@ -5822,12 +5859,19 @@ async fn check_root_grant_withdrawal(
     let counted = super::edition2::voices::carried_row_id(row).is_some()
         && row.attestation_envelope.get("author").is_none();
     if !counted {
-        let signer = admission_identity_for_writer(directory, &row.attesting_key_id).await?;
-        return match root_grant_consenter(directory, &target.attested_key_id, row.asserted_at)
-            .await?
+        // KR-fix8 — the grantee's own key, or its consenter's own key; never
+        // a key lifted to its owner (`may_withdraw_root_grant`).
+        return if may_withdraw_root_grant(
+            directory,
+            &row.attesting_key_id,
+            &target.attested_key_id,
+            row.asserted_at,
+        )
+        .await?
         {
-            Some(consenter) if consenter == signer => Ok(Some(3)),
-            _ => Err(not_admitted()),
+            Ok(Some(3))
+        } else {
+            Err(not_admitted())
         };
     }
     let Some(head) = edition2_named_head(row) else {
@@ -7733,7 +7777,7 @@ pub fn check_config_sensitive_leaf_floor(row: &super::Attestation) -> Result<(),
 /// here would let a co-steward of a node speak for its configuration — a
 /// widening nobody ratified.
 ///
-/// Occurrence→identity resolution ([`admission_identity_for_writer`]) is
+/// Occurrence→identity resolution ([`writer_principal`]) is
 /// deliberately NOT applied either. It would lift a node writer to its OWNER,
 /// which is the wrong direction for this comparison, and CC names two
 /// identities here exactly. A gate does not widen its own admitted set past the
@@ -12138,7 +12182,7 @@ pub async fn resolve_withdraws_admission_rule_at(
     }
     // Rule 1, lifted to the producer's PRINCIPAL — v51.0.0 (CIRISPersist#941,
     // CIRISEdge#675/#708; CC 3.4.7.3: a node acts for its single responsible
-    // owner, [`admission_identity_for_writer`]'s owner-binding axis). The live
+    // owner, [`writer_principal`]'s owner-binding axis). The live
     // owner of the NODE that attested `T` may withdraw `T`: a file written on
     // the owner's laptop before Edge authored files as the person is still the
     // person's to retract from their phone. Recorded as rule 1 (the producer's
@@ -14540,6 +14584,72 @@ async fn live_owner_binding_granters<F: super::FederationDirectory + ?Sized>(
     Ok(owners)
 }
 
+/// v62.0.0 (KR-fix10; CC 3.1.3.2 "A node gives no acceptance", CC 3.3.6,
+/// CC 3.4.7.1) — the prefix of the REFUSAL of a node key's signature where a
+/// person's (or an agent's own) consent or standing is asked:
+/// `node_gives_no_consent: …`. "A key whose identity_type includes node has
+/// no agency and is never asked for an acceptance."
+pub const NODE_GIVES_NO_CONSENT: &str = "node_gives_no_consent";
+
+/// v62.0.0 (KR-fix10; CC 3.1.3.2, CC 3.3.6) — **whose consent or standing is
+/// `signer_key`'s signature? `None`: nobody's** (the key's held record is
+/// typed `node`).
+///
+/// - a person's key, or one of a person's DEVICES (an active occurrence of
+///   the person, `active_identity_for_occurrence`): the person;
+/// - an `agent` key: the agent ITSELF, never its owner ("An agent key never
+///   signs as its owner");
+/// - a `node` key: `None`. The owner binding gives a node the right to WRITE
+///   for its owner ([`writer_principal`]) and nothing else: no acceptance,
+///   no founding voice, no retraction of the owner's proposal, no exercise
+///   of a founder's or a holder's standing.
+///
+/// It never reads an owner binding. Every consent and standing comparison
+/// calls this (a reader, which skips a `None`) or [`consenting_identity`] (a
+/// gate, which refuses it by name). A node acting as ITSELF (a node member of
+/// an `infrastructure` community, a grantee giving up its own grant) is the
+/// caller's raw-key comparison, made before this is asked.
+///
+/// # Errors
+/// Directory reads.
+pub async fn consenting_person<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    signer_key: &str,
+) -> Result<Option<String>, Error> {
+    use super::types::identity_type as it;
+    if directory
+        .lookup_public_key(signer_key)
+        .await?
+        .is_some_and(|r| it::set_contains(&r.identity_type, it::NODE))
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        directory.active_identity_for_occurrence(signer_key).await?,
+    ))
+}
+
+/// v62.0.0 (KR-fix10) — [`consenting_person`] at a GATE: a node key's
+/// signature is refused by name ([`NODE_GIVES_NO_CONSENT`]).
+///
+/// # Errors
+/// [`Error::InvalidArgument`] prefixed [`NODE_GIVES_NO_CONSENT`]; directory
+/// reads.
+pub async fn consenting_identity<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    signer_key: &str,
+) -> Result<String, Error> {
+    consenting_person(directory, signer_key)
+        .await?
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "{NODE_GIVES_NO_CONSENT}: {signer_key} is a node key: a node has no agency and \
+                 its signature is nobody's consent or standing; the person's own key signs (CC \
+                 3.1.3.2, CC 3.3.6)"
+            ))
+        })
+}
+
 /// v38.3.0 (CIRISPersist#765, measured by CIRISServer's two-node chat
 /// ladder) — **the writer-admission PRINCIPAL fold**: the identity whose
 /// memberships and standing a writer exercises at the cohort gates.
@@ -14578,7 +14688,7 @@ async fn live_owner_binding_granters<F: super::FederationDirectory + ?Sized>(
 /// gate ([`check_cohort_standing_resolved`] — fixing only membership would
 /// have moved the ladder exactly one gate deeper, onto AV-84's
 /// third-party refusal), and trace-ingest's `writer_admission`.
-pub async fn admission_identity_for_writer<F: super::FederationDirectory + ?Sized>(
+pub async fn writer_principal<F: super::FederationDirectory + ?Sized>(
     directory: &F,
     writer: &str,
 ) -> Result<String, Error> {
@@ -19720,7 +19830,7 @@ pub const MEMBER_ROLE_FOUNDER: &str = "founder";
 /// ([`FederationDirectory::active_identity_for_occurrence`](super::FederationDirectory::active_identity_for_occurrence)).
 /// A federation-identity moderator acting through one of its live occurrence
 /// keys therefore holds its duty, and the delegation walk reaches either the
-/// key or its identity. It is deliberately NOT [`admission_identity_for_writer`]:
+/// key or its identity. It is deliberately NOT [`writer_principal`]:
 /// that also resolves a NODE to its owner, and a node has no agency. A node
 /// gives no acceptance and holds no duty, so an owner's machine never acts as
 /// the moderator it belongs to (release lead's ruling). A key bound to nobody

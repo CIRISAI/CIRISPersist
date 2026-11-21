@@ -360,19 +360,40 @@ fn reply_matches(reply: &Attestation, p: &Proposal) -> bool {
             || env_role(reply).ok().flatten() == p.role)
 }
 
+/// v62.0.0 (KR-fix10; CC 3.1.3.2, CC 3.3.6) — **did the party that signed
+/// with `earlier` also sign with `later`?** The same key, or two keys of one
+/// consenting person ([`consenting_person`](super::admission::consenting_person):
+/// a person's devices). A node key is only ever itself: it never answers for
+/// its owner, and its owner's other nodes never answer for it.
+pub(crate) async fn same_consenting_party<F>(
+    dir: &F,
+    later: &str,
+    earlier: &str,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if later == earlier {
+        return Ok(true);
+    }
+    let Some(a) = super::admission::consenting_person(dir, later).await? else {
+        return Ok(false);
+    };
+    Ok(super::admission::consenting_person(dir, earlier).await? == Some(a))
+}
+
 pub(crate) async fn proposal_withdrawn<F>(dir: &F, p: &Proposal) -> Result<bool, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    let proposer =
-        super::admission::admission_identity_for_writer(dir, &p.row.attesting_key_id).await?;
+    // KR-fix10 (CC 3.1.3.2) — the proposer's own key, or the proposer's
+    // person; a node of the proposer's owner retracts nothing.
     for w in dir
         .list_attestations_referencing(&p.row.attestation_id)
         .await?
     {
         if w.attestation_type == attestation_type::WITHDRAWS
-            && super::admission::admission_identity_for_writer(dir, &w.attesting_key_id).await?
-                == proposer
+            && same_consenting_party(dir, &w.attesting_key_id, &p.row.attesting_key_id).await?
         {
             return Ok(true);
         }
@@ -542,14 +563,38 @@ where
                     refuse(&group, member, RULE_PROPOSAL_UNRESOLVED),
                 ));
             };
-            let signer =
-                super::admission::admission_identity_for_writer(dir, &row.attesting_key_id).await?;
             // v55.0.0 (CIRISPersist#1053) — a standing proposal's invitee is
             // resolved at acceptance: whoever the reply is attested to.
             let invitee_key = p.invitee.as_deref().unwrap_or(member);
             fold::reads(Dep::key(invitee_key));
-            let invitee = super::admission::admission_identity_for_writer(dir, invitee_key).await?;
-            if signer != invitee || !reply_matches(row, &p) {
+            // KR-fix10 (CC 3.1.3.2: "The consent this section requires is the
+            // joiner's own: a person's, or an agent's under its own key") —
+            // the signer's own person, compared with the invitee as a SUBJECT
+            // (its person, never its owner). A node key signing for a NAMED
+            // invitee is refused by name (`node_gives_no_consent`): it is not
+            // its owner's acceptance.
+            //
+            // OPEN CONFLICT, not decided here (see KR-fix10.md): a public
+            // room's STANDING proposal is accepted by "a key with a live
+            // federation-scope owner-binding" (CC 4.4.3.17 as corrected, X14,
+            // enforced just below), and such a key is an owned node's or
+            // agent's. That joiner signs about ITSELF with its own key (the
+            // reply is attested to the signing key), which lifts nothing, so
+            // this arm is left as it was; whether a node may be that joiner
+            // at all is the two texts' question.
+            let own_key_joins = p.invitee.is_none() && row.attesting_key_id == invitee_key;
+            if !own_key_joins {
+                let signer =
+                    super::admission::consenting_identity(dir, &row.attesting_key_id).await?;
+                let invitee = dir.active_identity_for_occurrence(invitee_key).await?;
+                if signer != invitee {
+                    return Err(fold::hold(
+                        reason::MEMBERSHIP_ACCEPTANCE_MISMATCH,
+                        refuse(&group, member, RULE_ACCEPTANCE_MISMATCH),
+                    ));
+                }
+            }
+            if !reply_matches(row, &p) {
                 return Err(fold::hold(
                     reason::MEMBERSHIP_ACCEPTANCE_MISMATCH,
                     refuse(&group, member, RULE_ACCEPTANCE_MISMATCH),
@@ -760,10 +805,11 @@ where
     let member = row.attested_key_id.as_str();
     // v62.0.0 (wave GC6) — the person bindings of the signer and the officer.
     fold::reads(Dep::key(&appointment.attested_key_id));
-    let signer =
-        super::admission::admission_identity_for_writer(dir, &row.attesting_key_id).await?;
-    let officer =
-        super::admission::admission_identity_for_writer(dir, &appointment.attested_key_id).await?;
+    // KR-fix10 — the officer's own consent: a node key is refused by name.
+    let signer = super::admission::consenting_identity(dir, &row.attesting_key_id).await?;
+    let officer = dir
+        .active_identity_for_occurrence(&appointment.attested_key_id)
+        .await?;
     let names = super::admission::envelope_cohort_target(&appointment.attestation_envelope)?;
     if signer != officer
         || member != appointment.attested_key_id
@@ -853,15 +899,12 @@ async fn reply_withdrawn<F>(dir: &F, reply: &Attestation) -> Result<bool, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    let signer =
-        super::admission::admission_identity_for_writer(dir, &reply.attesting_key_id).await?;
     for w in dir
         .list_attestations_referencing(&reply.attestation_id)
         .await?
     {
         if w.attestation_type == attestation_type::WITHDRAWS
-            && super::admission::admission_identity_for_writer(dir, &w.attesting_key_id).await?
-                == signer
+            && same_consenting_party(dir, &w.attesting_key_id, &reply.attesting_key_id).await?
         {
             return Ok(true);
         }
@@ -902,13 +945,16 @@ where
     {
         return Ok(false);
     }
-    let person = super::admission::admission_identity_for_writer(dir, officer).await?;
+    let person = dir.active_identity_for_occurrence(officer).await?;
     for r in replies
         .iter()
         .filter(|r| membership_row(r) == Some(MembershipRow::Acceptance))
     {
-        if super::admission::admission_identity_for_writer(dir, &r.attesting_key_id).await?
-            == person
+        // KR-fix10 — a node-signed reply is nobody's acceptance.
+        if super::admission::consenting_person(dir, &r.attesting_key_id)
+            .await?
+            .as_deref()
+            == Some(person.as_str())
         {
             return Ok(true);
         }
@@ -941,12 +987,15 @@ where
             super::public_room::is_public_community(&c)
                 && super::public_room::is_open_admission(&c)
                 && {
+                    // KR-fix10 — a founder's standing is exercised by the
+                    // founder's own key (or the founder key itself, a node
+                    // seated in its own right); never by the founder's node.
                     let proposer =
-                        super::admission::admission_identity_for_writer(dir, &row.attesting_key_id)
-                            .await?;
+                        super::admission::consenting_person(dir, &row.attesting_key_id).await?;
                     dir.active_community_members(group).await?.iter().any(|m| {
                         m.role.as_deref() == Some(super::admission::MEMBER_ROLE_FOUNDER)
-                            && (m.key_id == proposer || m.key_id == row.attesting_key_id)
+                            && (Some(&m.key_id) == proposer.as_ref()
+                                || m.key_id == row.attesting_key_id)
                     })
                 }
         }
@@ -974,8 +1023,11 @@ where
     // the proposer's binding: a fold (the reads are the proposal arm's).
     fold::reads(Dep::key(group));
     fold::reads(Dep::key(&row.attesting_key_id));
-    let proposer =
-        super::admission::admission_identity_for_writer(dir, &row.attesting_key_id).await?;
+    // KR-fix10 — the founder's own key: a founder's node is refused by name
+    // unless the node is itself the listed founder (its raw key).
+    let proposer = super::admission::consenting_person(dir, &row.attesting_key_id)
+        .await?
+        .unwrap_or_else(|| row.attesting_key_id.clone());
     let founder = Some(super::admission::MEMBER_ROLE_FOUNDER);
     let ok = if row.cohort_scope == cohort_scope::FAMILY {
         let Some(f) = dir.lookup_family(group).await? else {
@@ -1267,13 +1319,17 @@ where
     let mut signed = std::collections::BTreeSet::new();
     for s in signers {
         signed.insert((*s).to_owned());
-        signed.insert(super::admission::admission_identity_for_writer(dir, s).await?);
+        // KR-fix10 — a signer's voice is its own key's and its person's; a
+        // node signer founds for nobody but itself.
+        if let Some(person) = super::admission::consenting_person(dir, s).await? {
+            signed.insert(person);
+        }
     }
     for m in members {
         if signed.contains(*m) {
             continue;
         }
-        if signed.contains(&super::admission::admission_identity_for_writer(dir, m).await?) {
+        if signed.contains(&dir.active_identity_for_occurrence(m).await?) {
             continue;
         }
         return Err(refuse(group, m, RULE_FOUNDING_MEMBER_UNSIGNED));

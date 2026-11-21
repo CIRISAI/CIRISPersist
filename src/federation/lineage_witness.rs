@@ -209,7 +209,7 @@ pub enum WitnessStanding {
 /// A witness key's standing at `at`: registered, `identity_type ⊇ {witness}`,
 /// `valid_from <= at < valid_until`, no admitted revocation effective at or
 /// before `at`; and the PERSON it resolves to (occurrence axis, then
-/// owner-binding axis — [`crate::federation::admission::admission_identity_for_writer`]).
+/// owner-binding axis — [`crate::federation::admission::writer_principal`]).
 /// An ambiguous owner resolves to the key itself.
 pub async fn witness_standing_at<F>(
     directory: &F,
@@ -237,10 +237,9 @@ where
     {
         return Ok(WitnessStanding::NotValidAt);
     }
-    let principal =
-        crate::federation::admission::admission_identity_for_writer(directory, witness_key_id)
-            .await
-            .unwrap_or_else(|_| witness_key_id.to_owned());
+    let principal = crate::federation::admission::writer_principal(directory, witness_key_id)
+        .await
+        .unwrap_or_else(|_| witness_key_id.to_owned());
     Ok(WitnessStanding::Counts { principal })
 }
 
@@ -256,7 +255,7 @@ where
     let mut out = std::collections::BTreeSet::new();
     for k in keys {
         out.insert(
-            crate::federation::admission::admission_identity_for_writer(directory, k)
+            crate::federation::admission::writer_principal(directory, k)
                 .await
                 .unwrap_or_else(|_| k.clone()),
         );

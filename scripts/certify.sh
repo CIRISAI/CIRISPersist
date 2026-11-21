@@ -202,7 +202,7 @@ done
 # The leg is skippable ONLY by CERTIFY_SKIP_PYTHON=1, and never silently — the
 # verdict table carries a SKIPPED line and the run stops claiming full
 # certification.
-ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix mutscopes cachetrim cacheunits evidencetsv evidenceptr evidenceptrcc earlierform onethreshold onestanding sizetest sizereport floortoken$AXIS_KEYS"
+ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix mutscopes cachetrim cacheunits evidencetsv evidenceptr evidenceptrcc earlierform onethreshold oneconsent onestanding sizetest sizereport floortoken$AXIS_KEYS"
 
 FOCUS_LEG=""; FOCUS_FILTER=""
 if [ "$MODE" = "focus" ]; then
@@ -618,6 +618,9 @@ run_bg evidenceptrcc bash -c 'r="${CIRIS_CONSTITUTION_DIR:-../CIRISConstitution}
 run_bg earlierform bash -c 'python3 scripts/earlier_form_doors.py --self-test && python3 scripts/earlier_form_doors.py check'
 # v62.0.0 (TR-fix1) — one spelling of the holders' strict majority.
 run_bg onethreshold bash -c 'python3 scripts/one_threshold.py --self-test && python3 scripts/one_threshold.py check'
+# v62.0.0 (KR-fix10) — a node is its owner's writer, never its consent: no
+# call of the owner-lifting `writer_principal` outside the listed writer sites.
+run_bg oneconsent bash -c 'python3 scripts/one_consent.py --self-test && python3 scripts/one_consent.py check'
 # v62.0.0 (SD-fix2) — who stands where, and how many must agree, has a closed
 # set of readers (a ratchet: a new copy or a grown one is red; a duty walk
 # that reads its edges timelessly is red). From disk, no cargo.

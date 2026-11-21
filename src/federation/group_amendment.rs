@@ -920,7 +920,11 @@ where
             .chain(new.cosignatures.iter().map(|c| c.authority_key_id.as_str()))
         {
             allowed.insert(signer.to_owned());
-            allowed.insert(super::admission::admission_identity_for_writer(dir, signer).await?);
+            // KR-fix10 — a signer seats itself and its own person; a node
+            // signer seats nobody but itself.
+            if let Some(person) = super::admission::consenting_person(dir, signer).await? {
+                allowed.insert(person);
+            }
         }
     }
     super::membership_acceptance::check_supersede_adds_no_member(

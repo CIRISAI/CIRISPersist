@@ -4690,6 +4690,74 @@ impl Engine {
         .await
     }
 
+    /// v62.0.0 (KR-fix11; CC 3.2 "the first binding", CC 3.1.3.2) — **an
+    /// owner binding of `node_key_id`, drafted for an owner whose key is not
+    /// in this process** (the operator's own person key, on hardware): the
+    /// row [`Self::steward_bind`] states with
+    /// `Some(owner_binding::PURPOSE)`, at `cohort_scope: federation`, with the
+    /// caller's `infra:*` scope list, under a protected header naming
+    /// `owner_iss` / `owner_kid_hex`
+    /// ([`owner_binding_draft_envelope`](crate::federation::self_at_login::owner_binding_draft_envelope)
+    /// through [`Self::statement_draft`], the one payload builder).
+    ///
+    /// The host has the owner's key sign `sig_structure`, assembles
+    /// (`Draft::assemble`), may run
+    /// [`check_owner_binding_statement`](crate::federation::self_at_login::check_owner_binding_statement),
+    /// and submits with [`Self::submit_voice`]: `Waiting` (`count_short`)
+    /// until the NODE's own voice. The node voices it with
+    /// [`Self::voice_held_row`] (its key in this Engine) or
+    /// [`Self::voice_draft`] + [`Self::submit_voice`]; it finds the row with
+    /// `held_rows_for(Some(node), Some("bound_node"), ..)`. Then
+    /// [`Self::owner_of`] names the owner and
+    /// [`Self::serve_seat_owner_announced`] is true.
+    ///
+    /// # Errors
+    /// A scope list that is empty or not `infra:*` only; as
+    /// [`Self::statement_draft`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn owner_binding_draft(
+        &self,
+        node_key_id: &str,
+        infra_scopes: &[String],
+        owner_iss: &str,
+        owner_kid_hex: &str,
+        asserted_at_ms: u64,
+    ) -> Result<crate::federation::edition2::emit::Draft, crate::federation::Error> {
+        let envelope = crate::federation::self_at_login::owner_binding_draft_envelope(
+            node_key_id,
+            infra_scopes,
+        )?;
+        self.statement_draft(
+            crate::federation::types::attestation_type::DELEGATES_TO,
+            &envelope,
+            owner_iss,
+            owner_kid_hex,
+            node_key_id,
+            asserted_at_ms,
+            None,
+        )
+        .await
+    }
+
+    /// v62.0.0 (KR-fix11; CC 5.4.6, CC 3.1.3.2) — **is `node_key_id`'s owner
+    /// announced at federation scope?** What a host reads to confirm a serve
+    /// seat's owner binding landed where a seat needs it
+    /// ([`serve_seat_owner_announced`](crate::federation::admission::serve_seat_owner_announced)).
+    ///
+    /// # Errors
+    /// Directory reads.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn serve_seat_owner_announced(
+        &self,
+        node_key_id: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        crate::federation::admission::serve_seat_owner_announced(
+            self.federation_directory().as_ref(),
+            node_key_id,
+        )
+        .await
+    }
+
     /// v62.0.0 (v62 P8-fix4/fix5; CC 2.6.1.9, CC 2.7.3) —
     /// [`Self::grant_delegation`] with the row's STATE: `Seated` when it
     /// landed, `Waiting` (HTTP 424 on a host surface; reason `count_short`)
@@ -11164,7 +11232,7 @@ impl Engine {
                         ),
                     })?
             } else {
-                crate::federation::admission::admission_identity_for_writer(
+                crate::federation::admission::writer_principal(
                     self.federation_directory().as_ref(),
                     &iss,
                 )

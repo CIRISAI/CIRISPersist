@@ -711,6 +711,70 @@ pub(crate) async fn i4204_the_end_of_a_grant(d: &dyn FederationDirectory) {
     );
 }
 
+/// **I4219** (KR-fix8). Who may give up a root grant on the grantee's own
+/// rule: the grantee's own key and its owner's own key, and nobody else. A
+/// SIBLING node (another node bound to the same owner) and a stranger are
+/// not admitted; then the grantee (the worker node's own key) withdraws one
+/// grant and its owner withdraws another, each on rule 3.
+pub(crate) async fn i4219_who_gives_up_a_root_grant(d: &dyn FederationDirectory) {
+    let c = bundle_v2();
+    let head = install_v2(d)
+        .await
+        .expect("I4219: the bundle installs")
+        .object_id;
+    let at = grant_instant(d).await;
+    let (worker, owner) = worker_with_owner(d, "i4219").await;
+    let (worker_seed, sibling_seed, stranger_seed) = ("w-i4219", "w2-i4219", "s-i4219");
+    // A second node of the SAME owner; it is not the grantee.
+    e2::put_key(d, sibling_seed, &["node"]).await;
+    crate::federation::admission::steward_liveness_test_support::bind_machine_owner(
+        d,
+        &owner,
+        sibling_seed,
+    )
+    .await;
+    e2::put_key(d, stranger_seed, &["user"]).await;
+    let a = row_of_id(&land_grant(d, c, &worker, ATTEST_BUILD, &head, at, "I4219 a").await);
+    let b = row_of_id(&land_grant(d, c, &worker, ATTEST_EVIDENCE, &head, at, "I4219 b").await);
+    let now = u64::try_from(ms_now().timestamp_millis()).expect("after 1970");
+
+    for (i, (who, seed)) in [
+        ("a sibling node", sibling_seed),
+        ("a stranger", stranger_seed),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (j, target) in [&a, &b].into_iter().enumerate() {
+            let w = authored_withdrawal(seed, &worker, target, now + (i * 2 + j) as u64);
+            let wid = row_of(&w);
+            let _ = put_statement(d, &w, None, INGEST_TIER).await;
+            assert!(
+                held(d, &wid).await.is_none(),
+                "I4219: {who} never withdraws another key's root grant"
+            );
+        }
+    }
+    for (who, seed, target) in [
+        ("the grantee itself", worker_seed, &a),
+        ("the grantee's owner", owner.as_str(), &b),
+    ] {
+        let w = authored_withdrawal(seed, &worker, target, now + 10);
+        let wid = row_of(&w);
+        put_statement(d, &w, None, INGEST_TIER)
+            .await
+            .unwrap_or_else(|e| panic!("I4219: {who}'s withdrawal is admitted: {e}"));
+        let stored = held(d, &wid)
+            .await
+            .unwrap_or_else(|| panic!("I4219: {who}'s withdrawal lands"));
+        assert_eq!(
+            stored.withdraws_admission_rule,
+            Some(3),
+            "I4219: {who}, on the grantee's own rule"
+        );
+    }
+}
+
 /// **I4205.** An `agent` grantee.
 pub(crate) async fn i4205_an_agent_grantee_accepts_through_its_owner(d: &dyn FederationDirectory) {
     let c = bundle_v2();
@@ -1995,6 +2059,10 @@ mod sqlite {
     );
     on_one!(i4204_the_end_of_a_grant_sqlite, i4204_the_end_of_a_grant);
     on_one!(
+        i4219_who_gives_up_a_root_grant_sqlite,
+        i4219_who_gives_up_a_root_grant
+    );
+    on_one!(
         i4205_an_agent_grantee_accepts_through_its_owner_sqlite,
         i4205_an_agent_grantee_accepts_through_its_owner
     );
@@ -2139,6 +2207,10 @@ mod postgres {
         i4202_a_scope_outside_the_charter_is_refused
     );
     on_one!(i4204_the_end_of_a_grant_postgres, i4204_the_end_of_a_grant);
+    on_one!(
+        i4219_who_gives_up_a_root_grant_postgres,
+        i4219_who_gives_up_a_root_grant
+    );
     on_one!(
         i4205_an_agent_grantee_accepts_through_its_owner_postgres,
         i4205_an_agent_grantee_accepts_through_its_owner

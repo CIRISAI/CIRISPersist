@@ -4,7 +4,30 @@ Status: normative for persist's occurrence → identity resolvers, the
 hold-side audience question, and the `self` read gate. Tracking:
 CIRISPersist#873, CIRISPersist#888.
 
-## 1. Two rows for one key
+## 0. v62: a node is never an occurrence of a person (read this first)
+
+Since v62.0.0 (P5c; CC 3.3.6) a machine key (`node` or `agent`) is never a
+device of a person. The occurrence doors refuse such a binding
+(`occurrence_binds_machine_to_person`), and
+`active_identities_for_occurrence` skips a held one from an upgraded store.
+So for a node key, `active_identity_for_occurrence` answers **the node
+itself**. A node's human is its OWNER (the owner binding, `owner_of`).
+
+Two functions, two questions (KR-fix10; CC 3.1.3.2 "A node gives no
+acceptance"):
+
+| function | question | follows |
+|---|---|---|
+| `admission::writer_principal` (was `admission_identity_for_writer`) | on whose behalf does this key WRITE | device → person, else node → owner |
+| `admission::consenting_person` / `consenting_identity` | whose consent or standing is this signature | device → person only; a node key is nobody's (`node_gives_no_consent`); an agent is itself |
+
+`scripts/one_consent.py` keeps `writer_principal` to the listed writer,
+attribution and person-grouping sites.
+
+§1 below describes the form before v62 (the login anchor placing a node
+under its human). It is history: §2's rule still orders a PERSON's devices.
+
+## 1. Two rows for one key (the form before v62)
 
 Every claimed node carries TWO rows in `federation_identity_occurrences`
 for its own key: the boot **singleton** (`identity = node, occurrence =
@@ -20,7 +43,7 @@ A resolver that picked one row for the occurrence (`LIMIT 1` with no
 roster about the instrument instead of the principal, and `would_hold`
 would refuse every community blob a non-author pulled: `NotPartyTo` on a
 room the owner founded. The write side resolves the same way:
-`admission_identity_for_writer` (#765) falls back to `owner_of` when the
+`writer_principal` (#765) falls back to `owner_of` when the
 occurrence resolves to itself. §2 is the one rule both sides read.
 
 ## 2. The rule (stated once)
@@ -44,10 +67,10 @@ resolver applies; it is deterministic and identical on both backends.
 | symbol | meaning |
 |---|---|
 | `FederationDirectory::active_identities_for_occurrence(occ) -> Vec<String>` | default impl over `list_identity_occurrences_by_occurrence_key` + the active fold; every principal in §2 order; empty when the occurrence has no live non-singleton binding |
-| `FederationDirectory::active_identity_for_occurrence(occ) -> String` | the FIRST of the plural, else `occ` — deterministic; read by `admission_identity_for_writer`, `Backend::resolve_identity_for_occurrence`, `audience_memberships` |
+| `FederationDirectory::active_identity_for_occurrence(occ) -> String` | the FIRST of the plural, else `occ` — deterministic; read by `writer_principal`, `Backend::resolve_identity_for_occurrence`, `audience_memberships` |
 | `FederationDirectory::lookup_identity_for_occurrence(occ)` | the historical-row contract, ordered: non-singleton first, newest `asserted_at`, then `identity_key_id` — `ORDER BY` on sqlite and postgres. A `LIMIT 1` without an order is the defect class; I125 pins its absence at this site from disk |
 | `replication::hold::audience_memberships(our_key_id)` | unions the active memberships of EVERY principal AND of `our_key_id` itself (a shared device is party to both humans' rooms, and to the node's own) |
-| `admission_identity_for_writer` | deterministic by §2. A shared device writes as its newest-anchored human. Not a refusal: the anchor is re-asserted at login, so "newest" is a fact the node itself signed, not a coin toss |
+| `writer_principal` | deterministic by §2. A shared device writes as its newest-anchored human. Not a refusal: the anchor is re-asserted at login, so "newest" is a fact the node itself signed, not a coin toss |
 
 ## 4. Invariants
 
