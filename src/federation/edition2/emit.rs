@@ -1022,7 +1022,8 @@ fn draft_from_envelope_as(
     // `author` is stated for it (the vendored cell is `act=group => counted ;
     // authored`, and a draft has no statement to read `act` from). A trust
     // row with no `head` stays authored (an acceptance edge, a keyed root's
-    // own grant, a grantee's own withdrawal).
+    // own grant). KR-fix18: a grantee does not withdraw the grant; it
+    // withdraws its acceptance (`Engine::withdraw_statement`).
     let counted_root = super::typed::is_trust_family(&family) && envelope.get("head").is_some();
     let authored = !counted_admission
         && !counted_root

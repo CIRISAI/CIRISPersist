@@ -942,7 +942,15 @@ pub(crate) fn lifecycle_predicate(
 /// rule 1 (the producer's principal) and rule 5 (the CC 3.2 recovery
 /// ceremony), as `precedence::retraction_entitled`'s `Some(1 | 5)`. I1673
 /// pins the two against each other for every rule.
-pub(crate) const CARVED_OUT_ADMITTING_RULES: [u8; 2] = [1, 5];
+///
+/// v62.0.0 (KR-fix18.stamp; CC 2.4.1.1 rule 0) — and rule 0, APPENDED: a
+/// count that undoes a counted row
+/// (`admission::COUNT_UNDOES_COUNTED_RULE`). A counted target is a cosigned
+/// act, so the carve-out covers it; its own count must still retire it. The
+/// fold reads THIS list (`precedence::stamp_entitles`), so the two cannot
+/// differ.
+pub(crate) const CARVED_OUT_ADMITTING_RULES: [u8; 3] =
+    [1, 5, super::admission::COUNT_UNDOES_COUNTED_RULE];
 
 /// v61.1.0 (CIRISPersist#1218 review M1, CC 2.4.1.1) — "the held row `t`
 /// denies the subject-side withdrawal rules 2-4" as SQL: the fold's

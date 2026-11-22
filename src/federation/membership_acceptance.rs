@@ -447,6 +447,172 @@ where
     })
 }
 
+/// v62.0.0 (KR-fix17) — **the envelope of a `withdraws` of the held row
+/// `target`, placed where the target is**: the composer's own envelope
+/// (`withdraws_attestation_envelope`: the target's id and type) and, for a
+/// target in a room (`community` / `affiliations`), that room restated as
+/// `community_id` (a common member, so a composer may carry it; the serve
+/// rule reads the composer's own placement). A family target restates
+/// nothing: its family is read from the target ([`composer_placement`]).
+///
+/// The ONE envelope behind `Engine::withdraw_statement` (a software signer)
+/// and `Engine::withdraw_statement_draft` (a key elsewhere). The row is
+/// placed at `target.cohort_scope` and is about `target.attested_key_id`.
+///
+/// # Errors
+/// A target whose envelope names two different cohorts.
+pub fn withdrawal_envelope_of(target: &Attestation) -> Result<serde_json::Value, Error> {
+    let mut envelope =
+        super::withdraws_attestation_envelope(&target.attestation_id, &target.attestation_type);
+    let room = super::admission::envelope_cohort_target(&target.attestation_envelope)?;
+    if let (Some(room), Some(o)) = (room, envelope.as_object_mut()) {
+        if cohort_scope::target_plane(&target.cohort_scope) == Some(cohort_scope::TargetPlane::Room)
+        {
+            o.insert(
+                "community_id".to_owned(),
+                serde_json::Value::String(room.to_owned()),
+            );
+        }
+    }
+    Ok(envelope)
+}
+
+/// v62.0.0 (KR-fix17) — the prefix of the refusal of a `withdraws` /
+/// `recants` that is placed somewhere other than its target:
+/// `composer_placed_apart_from_target: …`.
+pub const COMPOSER_PLACED_APART_FROM_TARGET: &str = "composer_placed_apart_from_target";
+
+/// v62.0.0 (KR-fix17) — where a retraction's write-scope question is asked:
+/// its target's scope and room ([`composer_placement`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComposerPlacement {
+    /// The target row's `cohort_scope`.
+    pub cohort_scope: String,
+    /// The room or family the target row names, if any.
+    pub target: Option<String>,
+    /// The key that AUTHORED the target row (its `author`). `None` for a
+    /// COUNTED row (no `author`: a quorum's act, CC 2.4.1.1 rule 0): nobody
+    /// is its author, and no one voice of it retracts it alone.
+    pub attester: Option<String>,
+}
+
+/// v62.0.0 (KR-fix17; CC 2.4.1.1: a retraction acts on the row it names) —
+/// **the placement a `withdraws` / `recants` is judged at: its HELD TARGET's.**
+///
+/// `None`: `row` is not such a composer, or it is placed at no room and
+/// names none (the commons or `self`, as `Engine::revoke_delegation` and the
+/// erasure path place theirs): the caller's ordinary rule applies and no
+/// roster is read, as before.
+///
+/// Otherwise the composer claims a room (it is placed at a targeted scope,
+/// `family` / `community` / `affiliations`, or its envelope names a room or
+/// family). Then:
+/// - its target must be held, else the composer WAITS (`link_unheld`,
+///   `WithdrawsTargetUnheld`, the hold the dimension gate already raises:
+///   [`attestation_admit::withdraws_target_unheld`](super::attestation_admit::withdraws_target_unheld));
+/// - its own `cohort_scope` must be the target's, and a room it names must be
+///   the target's: otherwise refused [`COMPOSER_PLACED_APART_FROM_TARGET`]
+///   (a member of room B could name B on a withdrawal of a room-A row and
+///   have membership proved for B);
+/// - the answer is the TARGET's scope and room, so the signer's membership
+///   is asked about the room the withdrawn row is in. A composer that names
+///   no room of its own (every edition-2 composer the fixtures and
+///   `withdraws_attestation_envelope` build) is placed by its target.
+///
+/// Before KR-fix17 the room was read from the composer's own envelope only,
+/// which carries none: every retraction placed at a room was refused
+/// `NoCommunityMembership`, whoever signed it.
+///
+/// The target is read from its landed row (`get_attestation`, the mapped
+/// names), else from its held statement
+/// ([`edition2::typed::held_target_row`](super::edition2::typed::held_target_row),
+/// the one reader of a composer's held target).
+///
+/// # Errors
+/// The wait and the refusal above; directory reads.
+pub async fn composer_placement<F>(
+    dir: &F,
+    row: &Attestation,
+) -> Result<Option<ComposerPlacement>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use ciris_verify_core::cde::Value;
+    if !super::edition2::emit::carries_no_dimension(&row.attestation_type) {
+        return Ok(None);
+    }
+    let own_target = super::admission::envelope_cohort_target(&row.attestation_envelope)?;
+    if !cohort_scope::is_targeted(&row.cohort_scope) && own_target.is_none() {
+        return Ok(None);
+    }
+    let Some(named) = row
+        .attestation_envelope
+        .get(super::envelope::paths::REFERENCES_ATTESTATION_ID)
+        .and_then(serde_json::Value::as_str)
+    else {
+        // A composer naming no target: Verify's reader refuses it.
+        return Ok(None);
+    };
+    let placed = if let Some(t) = dir.get_attestation(named).await? {
+        Some(ComposerPlacement {
+            cohort_scope: t.cohort_scope.clone(),
+            target: super::admission::envelope_cohort_target(&t.attestation_envelope)?
+                .map(str::to_owned),
+            // An authored row's attester is its author. A counted row
+            // (it carries a statement and states no `author`) has none.
+            attester: (!super::admission::is_counted_row(&t)).then(|| t.attesting_key_id.clone()),
+        })
+    } else {
+        let held = match super::edition2::emit::carried_statement(row) {
+            Some(st) => super::edition2::typed::held_target_row(dir, &st).await?,
+            None => None,
+        };
+        held.map(|t| ComposerPlacement {
+            cohort_scope: t
+                .payload
+                .get_text("cohort_scope")
+                .and_then(Value::as_text)
+                .unwrap_or(cohort_scope::FEDERATION)
+                .to_owned(),
+            target: super::admission::COHORT_TARGET_ENVELOPE_FIELDS
+                .iter()
+                .find_map(|f| t.payload.get_text(f).and_then(Value::as_text))
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned),
+            attester: t
+                .payload
+                .get_text("author")
+                .and_then(Value::as_text)
+                .map(str::to_owned),
+        })
+    };
+    let Some(placed) = placed else {
+        return Err(super::attestation_admit::withdraws_target_unheld(
+            &row.attestation_id,
+            named,
+        ));
+    };
+    if row.cohort_scope != placed.cohort_scope
+        || own_target.is_some_and(|own| placed.target.as_deref() != Some(own))
+    {
+        return Err(Error::InvalidArgument(format!(
+            "{COMPOSER_PLACED_APART_FROM_TARGET}: {} {} is placed at {:?}{} and the row it names, \
+             {named}, is at {:?}{}: a retraction is placed where its target is (CC 2.4.1.1)",
+            row.attestation_type,
+            row.attestation_id,
+            row.cohort_scope,
+            own_target.map(|t| format!(" in {t}")).unwrap_or_default(),
+            placed.cohort_scope,
+            placed
+                .target
+                .as_deref()
+                .map(|t| format!(" in {t}"))
+                .unwrap_or_default(),
+        )));
+    }
+    Ok(Some(placed))
+}
+
 /// **The write-scope door for attestations** (AV-45 plus the two membership
 /// arms). Every backend's `put_attestation` calls this where it called
 /// `check_write_cohort_scope_for`.
@@ -469,6 +635,42 @@ where
     F: FederationDirectory + ?Sized,
 {
     let Some(kind) = membership_row(row) else {
+        // v62.0.0 (KR-fix17; CC 2.4.1.1) — a RETRACTION (`withdraws` /
+        // `recants`) is placed where its TARGET is: its room is the held
+        // target's, never the composer's own word.
+        if let Some(placed) = composer_placement(dir, row).await? {
+            // v62.0.0 (KR-fix17 rev 3; CC 2.4.1.1, the table's rule 1: "the
+            // key that signed T (T.attesting_key_id) | Condition: none";
+            // confirmed by Constitution) — THE AUTHOR OF THE TARGET ROW,
+            // RETRACTING IT, NEEDS NO MEMBERSHIP. A person's standing to
+            // retract their own statement does not lapse when they leave the
+            // room, and the retraction is placed where its target is: its
+            // audience is the target's audience.
+            // - "the key that signed T" is read as the IDENTITY: any of that
+            //   person's own device keys (`same_consenting_party`: device to
+            //   person), never a node for its owner.
+            // - A COUNTED row is rule 0's, not this arm's: it has no author
+            //   (`placed.attester` is `None`), so one voice of a quorum's act
+            //   never retracts it alone.
+            // - The former member is not in the room's audience and is served
+            //   nothing back; this decision reads nothing they would have to
+            //   be served. The door's answer is all they learn.
+            // `withdraws` / `recants` only; a retraction carries no content.
+            // Everyone else needs membership of the target's room, below.
+            if let Some(author) = placed.attester.as_deref() {
+                if same_consenting_party(dir, &row.attesting_key_id, author).await? {
+                    return Ok(());
+                }
+            }
+            return dir
+                .check_write_cohort_scope_for(
+                    &row.attesting_key_id,
+                    write_path,
+                    &placed.cohort_scope,
+                    placed.target.as_deref(),
+                )
+                .await;
+        }
         return dir
             .check_write_cohort_scope_for(
                 &row.attesting_key_id,
@@ -739,21 +941,38 @@ where
     Ok(())
 }
 
-/// v62.0.0 (KR-fix2) — **has the grantee of the counted root grant `grant`
-/// consented by `t`?** A held federation-tier `membership:acceptance:v1` at
-/// the federation scope ([`is_root_grant_reply`]), attested to the grantee,
-/// naming the grant, signed for the grantee (its person, or a machine
-/// grantee's owner at the acceptance's own instant), asserted by `t`, and no
-/// decline of it by `t`. The grant's count is the other consent
-/// (`admission::check_root_grant_counted`); it confers only when both hold.
+/// v62.0.0 (KR-fix2, KR-fix18; CC 3.2, CC 2.4.1.1: a conferral is TWO
+/// consents, the holders' counted grant and the grantee's separate
+/// acceptance; "either may be taken back by the one who gave it, alone, and
+/// the conferral holds only while both stand") — **the grantee's consent to
+/// the counted root grant `grant`, as it stands at `t`: the acceptance row
+/// that gives it, or `None`.**
+///
+/// An acceptance gives the consent when it is a held federation-tier
+/// `membership:acceptance:v1` at the federation scope
+/// ([`is_root_grant_reply`]), attested to the grantee, naming the grant,
+/// signed FOR the grantee (its person, or a machine grantee's owner at the
+/// acceptance's own instant: `admission::signs_for_root_grantee`), asserted
+/// by `t`, and NOT WITHDRAWN BY ITS OWN SIGNER by `t`
+/// ([`acceptance_withdrawn_by`]). No decline of the grant by `t`.
+///
+/// - **From then on.** A withdrawal counts from its own signed
+///   `asserted_at`: read at an instant before it, the acceptance still
+///   stands, so an act taken under the grant before the withdrawal verifies
+///   as of its own instant.
+/// - **A re-acceptance confers again.** A later acceptance of the same
+///   standing grant is its own row; the withdrawal of an earlier one does
+///   not reach it.
+/// - **The grant is not touched.** It is the holders' act (rule 0); it
+///   stands as history after the grantee has left.
 ///
 /// # Errors
 /// Directory reads.
-pub async fn root_grant_accepted_at<F>(
+pub async fn root_grant_acceptance_at<F>(
     dir: &F,
     grant: &Attestation,
     t: chrono::DateTime<chrono::Utc>,
-) -> Result<bool, Error>
+) -> Result<Option<String>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
@@ -767,7 +986,7 @@ where
         .iter()
         .any(|r| membership_row(r) == Some(MembershipRow::Decline))
     {
-        return Ok(false);
+        return Ok(None);
     }
     for r in replies
         .iter()
@@ -780,11 +999,84 @@ where
             r.asserted_at,
         )
         .await?
+            && !acceptance_withdrawn_by(dir, r, t).await?
+        {
+            return Ok(Some(r.attestation_id.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// v62.0.0 (KR-fix18) — **is `row` the acceptance of a counted grant from
+/// the root?** A federation-tier `membership:acceptance:v1` at the federation
+/// scope whose `references_attestation_id` names a held counted root grant
+/// (`admission::is_counted_root_grant_row`) attested to the same grantee.
+///
+/// # Errors
+/// Directory reads.
+pub async fn is_root_grant_acceptance<F>(dir: &F, row: &Attestation) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if row.tier != attestation_tier::FEDERATION
+        || !is_root_grant_reply(row)
+        || membership_row(row) != Some(MembershipRow::Acceptance)
+    {
+        return Ok(false);
+    }
+    let Some(grant_id) = env_str(row, "references_attestation_id") else {
+        return Ok(false);
+    };
+    Ok(dir.get_attestation(grant_id).await?.is_some_and(|g| {
+        super::admission::is_counted_root_grant_row(&g) && g.attested_key_id == row.attested_key_id
+    }))
+}
+
+/// v62.0.0 (KR-fix18; CC 2.4.1.1 rule 1) — **has the signer of `acceptance`
+/// taken it back by `t`?** A held `withdraws` naming the acceptance, signed
+/// by the same consenting party ([`same_consenting_party`]: the same key, or
+/// another key of the same person; never a node for its owner), whose own
+/// signed `asserted_at` is at or before `t`. The door admits such a
+/// withdrawal as the producer's own retraction (rule 1).
+///
+/// # Errors
+/// Directory reads.
+pub async fn acceptance_withdrawn_by<F>(
+    dir: &F,
+    acceptance: &Attestation,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    for w in dir
+        .list_attestations_referencing(&acceptance.attestation_id)
+        .await?
+    {
+        if w.attestation_type == attestation_type::WITHDRAWS
+            && w.asserted_at <= t
+            && same_consenting_party(dir, &w.attesting_key_id, &acceptance.attesting_key_id).await?
         {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// v62.0.0 (KR-fix2) — **has the grantee of the counted root grant `grant`
+/// consented, as of `t`?** [`root_grant_acceptance_at`] names the acceptance.
+///
+/// # Errors
+/// Directory reads.
+pub async fn root_grant_accepted_at<F>(
+    dir: &F,
+    grant: &Attestation,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(root_grant_acceptance_at(dir, grant, t).await?.is_some())
 }
 
 /// v62.0.0 (wave V1b; CC 4.4.3.12) — **a reply to a counted officer

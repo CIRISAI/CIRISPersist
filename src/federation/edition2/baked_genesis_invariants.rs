@@ -8,7 +8,9 @@
 //! (`baked/humanity-accord-v1/*.cose`), and ONE CDE array of them in put
 //! order (`baked/humanity-accord-genesis-v1.cbor`, the `BAKED_BUNDLES`
 //! entry). The pure legs are judged at a pinned instant ([`pinned_at`], an
-//! hour after t0; standing two hours after). The import door's only clock
+//! hour after t0, as a parameter only); a statement a door admits is stated
+//! at t0 + 1 s at most (never ahead of a real clock after the mint), with
+//! standing read at t0 + 2 s. The import door's only clock
 //! read is the seat binding's skew bound (not ahead of the node's clock), so
 //! the import legs hold on any clock after t0. No leg reads the wall clock in
 //! an assertion.
@@ -33,6 +35,12 @@
 //!   reopen places nothing; the node's acceptance of `humanity-accord`
 //!   (`accept_root_draft`, the builder `accept_root` uses) lands and the
 //!   node reads rooted through its own edge.
+//! - **I2472–I2475** (GB-fix2) a store that already holds a genesis that is
+//!   not the baked one is never offered the bake (no fork) and is REPORTED
+//!   (`genesis_store_root_is_not_the_baked_genesis`, at the open leg and on
+//!   `root_standing`): (i) a fixture lineage of another family, (ii) a fork
+//!   sibling `humanity-accord` v1; (iii) the baked lineage stays silent; the
+//!   pure rule covers a held successor of the baked bundle.
 //! - **I2471** (sqlite, postgres) the open leg's failure: a CORRUPTED COPY
 //!   (one byte of a voice's signature flipped; the baked bytes untouched) is
 //!   refused by its token, loudly, and the store holds no bundle: the node
@@ -59,7 +67,10 @@ const HOLDERS: [&str; 3] = [
 /// The serve seat `canonical-1` (`terms.json`).
 const SEAT: &str = "urn:ietf:params:oauth:ckt:sha-256:IiG-eTvirkDbYiqa-tuv3MxShjEDJen7FQMkiItujzQ";
 
-/// An hour after t0: the instant every pure leg is judged at.
+/// An hour after t0: the `now` every PURE leg is judged at (a reader's
+/// instant passed as a parameter, never a statement's `asserted_at` put
+/// through a door, so the door's future-skew bound against the wall clock
+/// never sees it; GB-fix3).
 pub(crate) fn pinned_at() -> chrono::DateTime<chrono::Utc> {
     chrono::TimeZone::timestamp_millis_opt(
         &chrono::Utc,
@@ -239,10 +250,13 @@ pub(crate) async fn i2469_a_fresh_store_imports_it(
         .await
         .expect("the test ceremony installs");
     let before = genesis_in_force(other).await.expect("reads");
-    assert_eq!(
-        import_baked_genesis(other).await.expect("reads"),
-        BakedImport::AlreadyHeld,
-        "[{tag}] I2469: a store holding a bundle is not offered the bake"
+    assert!(
+        matches!(
+            import_baked_genesis(other).await.expect("reads"),
+            BakedImport::ForeignRoot(_)
+        ),
+        "[{tag}] I2469: a store holding another bundle is not offered the bake (GB-fix2: \
+         it is reported)"
     );
     let after = genesis_in_force(other).await.expect("reads");
     assert_eq!(
@@ -259,8 +273,10 @@ pub(crate) async fn i2469_a_fresh_store_imports_it(
 }
 
 /// **I2470.** Every instant is pinned: the node's key record from a day
-/// before t0, the acceptance stated an hour after t0, standing read two
-/// hours after t0. (`Engine::accept_root` stamps the host clock and has no
+/// before t0, the acceptance stated one second after t0, standing read two
+/// seconds after t0 (GB-fix3: an instant a door's future-skew bound checks
+/// against the wall clock must never be ahead of a real clock after the
+/// mint; t0 + 1 h was, for the first hour). (`Engine::accept_root` stamps the host clock and has no
 /// instant parameter, so the acceptance here is the Engine's own drafted row,
 /// `accept_root_draft`, the same builder, signed with the node's key.)
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -291,7 +307,10 @@ pub(crate) async fn i2470_imported_is_not_accepted(dsn: &str, alias: &str) {
         ])),
         "I2470: the open leg imports the baked genesis"
     );
-    let rooted_at = T0_MS + 2 * 3_600_000;
+    // v62.0.0 (GB-fix3) — just after t0: never ahead of a real clock after
+    // the mint (the future-skew bound reads the wall clock), and in the past
+    // for ever (no door has a "not too old" bound on these rows).
+    let rooted_at = T0_MS + 2_000;
     assert_eq!(
         super::serve::rooted_under(dir.as_ref(), &node, rooted_at)
             .await
@@ -309,7 +328,7 @@ pub(crate) async fn i2470_imported_is_not_accepted(dsn: &str, alias: &str) {
             "humanity-accord",
             &node,
             &hex::encode(e2::kid_digest(alias)),
-            T0_MS + 3_600_000,
+            T0_MS + 1_000,
         )
         .await
         .expect("I2470: the acceptance drafts");
@@ -451,4 +470,276 @@ async fn i2471_postgres() {
         return;
     };
     Box::pin(i2471_a_corrupted_copy_is_refused_loudly(&b, "postgres")).await;
+}
+
+/// After the store's own genesis is put, the held bundle(s) are reported in
+/// `case`, nothing is imported, and the held reading is unchanged: at the
+/// open leg and on `root_standing`.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+async fn foreign_is_reported(
+    e: &crate::Engine,
+    object_id: [u8; 32],
+    case: super::genesis::ForeignCase,
+    what: &str,
+) {
+    use super::genesis::{ForeignGenesis, HeldRoot, GENESIS_STORE_ROOT_IS_NOT_THE_BAKED_GENESIS};
+    let dir = e.federation_directory();
+    let want = ForeignGenesis {
+        token: GENESIS_STORE_ROOT_IS_NOT_THE_BAKED_GENESIS,
+        case,
+        held_roots: vec![HeldRoot {
+            object_id: hex::encode(object_id),
+            valid: case == super::genesis::ForeignCase::HeldValidForeignRoot,
+        }],
+        baked: BAKED_GENESIS_OBJECT_ID.to_owned(),
+    };
+    let before = super::genesis::genesis_statements(dir.as_ref())
+        .await
+        .expect("reads");
+    let in_force_before = genesis_in_force(dir.as_ref()).await.expect("reads");
+    assert_eq!(
+        e.import_baked_genesis_at_boot().await,
+        BootImport::Done(BakedImport::ForeignRoot(want.clone())),
+        "{what}: the open leg reports the foreign root, its case and validity"
+    );
+    assert_eq!(
+        super::genesis::genesis_statements(dir.as_ref())
+            .await
+            .expect("reads"),
+        before,
+        "{what}: nothing imported (never a fork), nothing changed"
+    );
+    let g = genesis_in_force(dir.as_ref()).await.expect("reads");
+    assert_eq!(
+        g.valid.iter().map(|p| p.object_id).collect::<Vec<_>>(),
+        in_force_before
+            .valid
+            .iter()
+            .map(|p| p.object_id)
+            .collect::<Vec<_>>(),
+        "{what}: the held genesis reads as it did (no trust behaviour changed)"
+    );
+    let s = e.root_standing().await.expect("root_standing reads");
+    assert_eq!(
+        s.foreign_genesis,
+        Some(want),
+        "{what}: a host reads it on root_standing"
+    );
+}
+
+/// **I2472** — (i) held but NOT Valid here: a fixture lineage of another
+/// family, kept short of its count (one voice of three), the same reading a
+/// production build gives a fixture store whose mock chains it does not root
+/// (a lib test build always roots the mock chains, so the not-Valid reading
+/// is reached by the count). The node is rootless; the bake is not imported.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) async fn i2472_held_not_valid_is_reported(dsn: &str, alias: &str) {
+    use crate::federation::tier_ingest::test_support as ts;
+    let e = crate::Engine::with_signer_pre_genesis(ts::local_signer(alias), dsn)
+        .await
+        .expect("a fresh engine opens");
+    let spec = super::fixture_genesis::CeremonySpec {
+        family_key_id: "gb2-fixture-accord".to_owned(),
+        // v62.0.0 (GB-fix3) — the STANDARD (yesterday-relative) t0, never
+        // the real mint's: a fixture bundle is stated at `t0 + 12 h`, which
+        // the door's future-skew bound would refuse for 12 hours after the
+        // real mint.
+        ..super::fixture_genesis::CeremonySpec::standard()
+    };
+    let c = super::fixture_genesis::ceremony_v2(&spec);
+    let dir = e.federation_directory();
+    super::genesis::add_test_attestation_root(super::fixture_genesis::mock_attestation_root_der());
+    let mut offer: Vec<Vec<u8>> = c
+        .rows_in_put_order()
+        .into_iter()
+        .map(|r| r.statement.clone())
+        .collect();
+    offer.push(c.voices[0].clone());
+    let _ = super::genesis::put_genesis_bundle(dir.as_ref(), &offer, Some(&c.anchor())).await;
+    assert!(
+        !genesis_in_force(dir.as_ref())
+            .await
+            .expect("reads")
+            .is_held(),
+        "I2472: nothing reads Valid"
+    );
+    Box::pin(foreign_is_reported(
+        &e,
+        c.object_id,
+        super::genesis::ForeignCase::HeldNotValid,
+        "I2472",
+    ))
+    .await;
+    assert_eq!(
+        e.root_standing().await.expect("reads").root,
+        None,
+        "I2472: rootless"
+    );
+}
+
+/// **I2473** — (ii) held AND Valid here: another `humanity-accord` v1 (a
+/// fork sibling of the baked genesis: the test ceremony's), whose holders'
+/// chains this build roots. The node runs under a root that is NOT the one
+/// this binary bakes.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) async fn i2473_held_valid_foreign_root_is_reported(dsn: &str, alias: &str) {
+    use crate::federation::tier_ingest::test_support as ts;
+    let e = crate::Engine::with_signer_pre_genesis(ts::local_signer(alias), dsn)
+        .await
+        .expect("a fresh engine opens");
+    let c = super::fixture_genesis::bundle_v2();
+    assert_eq!(c.spec.family_key_id, "humanity-accord", "a fork sibling");
+    assert_ne!(hex::encode(c.object_id), BAKED_GENESIS_OBJECT_ID);
+    super::fixture_genesis::install_ceremony_v2(e.federation_directory().as_ref(), c)
+        .await
+        .expect("I2473: the store's own genesis installs");
+    Box::pin(foreign_is_reported(
+        &e,
+        c.object_id,
+        super::genesis::ForeignCase::HeldValidForeignRoot,
+        "I2473",
+    ))
+    .await;
+}
+
+/// **I2474** — (iii) a store holding the baked genesis is SILENT: the open
+/// leg reports nothing and `root_standing` carries no report. (A held
+/// successor of the baked bundle cannot be minted here, since it needs the
+/// holders' keys; its case is the pure rule, I2475.)
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) async fn i2474_the_baked_lineage_is_silent(dsn: &str, alias: &str) {
+    use crate::federation::tier_ingest::test_support as ts;
+    let e = crate::Engine::with_signer_pre_genesis(ts::local_signer(alias), dsn)
+        .await
+        .expect("a fresh engine opens");
+    assert!(
+        matches!(
+            e.import_baked_genesis_at_boot().await,
+            BootImport::Done(BakedImport::Imported(_))
+        ),
+        "I2474: the bake imports"
+    );
+    assert_eq!(
+        e.import_baked_genesis_at_boot().await,
+        BootImport::Done(BakedImport::AlreadyHeld),
+        "I2474: a reopen is silent"
+    );
+    assert_eq!(
+        e.root_standing()
+            .await
+            .expect("root_standing reads")
+            .foreign_genesis,
+        None,
+        "I2474: no report"
+    );
+}
+
+/// **I2475** (pure) — the rule: silent when nothing is held, when the baked
+/// bundle is held, or when it is the ancestor of a held successor; reported
+/// otherwise over the held FIRST bundles, each with whether it reads Valid,
+/// in case `HeldValidForeignRoot` when one does, else `HeldNotValid`.
+#[test]
+fn i2475_the_foreign_genesis_rule() {
+    use super::genesis::{foreign_genesis_of, ForeignCase, HeldRoot};
+    let placed = check_baked_bundle(bytes(), pinned_at()).expect("the bake");
+    let baked = placed[0].clone();
+    let oid = baked.object_id;
+    assert_eq!(
+        foreign_genesis_of(&[], &[], &oid),
+        None,
+        "I2475: nothing held"
+    );
+    assert_eq!(
+        foreign_genesis_of(&[(oid, None)], std::slice::from_ref(&baked), &oid),
+        None,
+        "I2475: the baked genesis held"
+    );
+    let mut later = baked.clone();
+    later.object_id = [0x42; 32];
+    later.prev = Some(oid);
+    later.version = 2;
+    assert_eq!(
+        foreign_genesis_of(
+            &[(oid, None), (later.object_id, Some(oid))],
+            &[baked.clone(), later],
+            &oid
+        ),
+        None,
+        "I2475: the baked genesis and its successor: silent"
+    );
+    let mut sibling = baked.clone();
+    sibling.object_id = [0x07; 32];
+    let f = foreign_genesis_of(&[([0x07; 32], None)], &[sibling], &oid).expect("I2475: reported");
+    assert_eq!(f.case, ForeignCase::HeldValidForeignRoot);
+    assert_eq!(
+        f.held_roots,
+        vec![HeldRoot {
+            object_id: hex::encode([0x07u8; 32]),
+            valid: true
+        }]
+    );
+    assert_eq!(f.baked, BAKED_GENESIS_OBJECT_ID);
+    let f = foreign_genesis_of(&[([0x09; 32], None)], &[], &oid).expect("I2475: reported");
+    assert_eq!(f.case, ForeignCase::HeldNotValid, "I2475: none Valid");
+    assert!(!f.held_roots[0].valid);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2472_sqlite() {
+    Box::pin(i2472_held_not_valid_is_reported(
+        "sqlite::memory:",
+        "gb2-i-sq",
+    ))
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2472_postgres() {
+    let Some(dsn) = crate::test_pg::isolated_dsn() else {
+        eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+        return;
+    };
+    Box::pin(i2472_held_not_valid_is_reported(&dsn, "gb2-i-pg")).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2473_sqlite() {
+    Box::pin(i2473_held_valid_foreign_root_is_reported(
+        "sqlite::memory:",
+        "gb2-ii-sq",
+    ))
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2473_postgres() {
+    let Some(dsn) = crate::test_pg::isolated_dsn() else {
+        eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+        return;
+    };
+    Box::pin(i2473_held_valid_foreign_root_is_reported(&dsn, "gb2-ii-pg")).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2474_sqlite() {
+    Box::pin(i2474_the_baked_lineage_is_silent(
+        "sqlite::memory:",
+        "gb2-iii-sq",
+    ))
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2474_postgres() {
+    let Some(dsn) = crate::test_pg::isolated_dsn() else {
+        eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+        return;
+    };
+    Box::pin(i2474_the_baked_lineage_is_silent(&dsn, "gb2-iii-pg")).await;
 }

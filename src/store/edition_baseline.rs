@@ -100,6 +100,23 @@ pub(crate) const ATTESTATIONS_EDITION_TWO_POSTGRES: &[&str] = &[
 #[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
 pub(crate) const ATTESTATIONS_EDITION_TWO_COLUMNS: &[&str] = &["restatement_key"];
 
+/// v62.0.0 (KR-fix18.stamp; CC 2.4.1.1 rule 0) — the range of
+/// `federation_attestations.withdraws_admission_rule`, edited in V300's
+/// CREATE TABLE: `(edition 1's text, edition 2's)`. 0 is a count undoing a
+/// counted row (`admission::COUNT_UNDOES_COUNTED_RULE`).
+#[cfg(test)]
+pub(crate) const STAMP_RANGE_SQLITE: (&str, &str) = (
+    "withdraws_admission_rule BETWEEN 1 AND 5",
+    "withdraws_admission_rule BETWEEN 0 AND 5",
+);
+
+/// [`STAMP_RANGE_SQLITE`], as PostgreSQL prints the constraint.
+#[cfg(test)]
+pub(crate) const STAMP_RANGE_POSTGRES: (&str, &str) = (
+    "((withdraws_admission_rule >= 1) AND (withdraws_admission_rule <= 5))",
+    "((withdraws_admission_rule >= 0) AND (withdraws_admission_rule <= 5))",
+);
+
 /// The PostgreSQL twin of [`KEYS_EDITION_TWO_SQLITE`], one statement.
 #[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
 pub(crate) const KEYS_EDITION_TWO_POSTGRES: &str = "ALTER TABLE cirislens.federation_keys\n    ADD COLUMN edition smallint DEFAULT 1 NOT NULL CONSTRAINT federation_keys_edition_check CHECK (edition IN (1, 2)),\n    ADD COLUMN record_row_id bytea CONSTRAINT federation_keys_record_row_id_check CHECK (octet_length(record_row_id) = 32),\n    ADD COLUMN kid bytea CONSTRAINT federation_keys_kid_check CHECK (octet_length(kid) = 32),\n    ADD CONSTRAINT federation_keys_edition_two_ids CHECK (edition <> 2 OR (record_row_id IS NOT NULL AND kid IS NOT NULL));";
@@ -439,8 +456,32 @@ mod tests {
     fn fixture(dialect: &str) -> Vec<String> {
         let text = std::fs::read_to_string(catalog::fixture_path(dialect))
             .expect("the frozen edition-1 catalog");
-        #[cfg_attr(not(feature = "sqlite"), allow(unused_mut))]
         let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        // v62.0.0 (KR-fix18.stamp) — the stamp's range, edited in V300's
+        // CREATE TABLE on both dialects (0 joins): the frozen edition-1 text
+        // is restated with edition 2's range before anything is compared.
+        let (head, (was, now)) = if dialect == "sqlite" {
+            (
+                "object\ttable\tfederation_attestations\tfederation_attestations\t",
+                super::STAMP_RANGE_SQLITE,
+            )
+        } else {
+            (
+                "con\tcirislens.federation_attestations\t\
+                 federation_attestations_withdraws_admission_rule_range\t",
+                super::STAMP_RANGE_POSTGRES,
+            )
+        };
+        let line = lines
+            .iter_mut()
+            .find(|l| l.starts_with(head))
+            .expect("the stamp's range in the fixture");
+        assert_eq!(
+            (line.matches(was).count(), line.matches(now).count()),
+            (1, 0),
+            "the frozen edition-1 range is 1..=5"
+        );
+        *line = line.replace(was, now);
         #[cfg(feature = "sqlite")]
         if dialect == "sqlite" {
             for (table, alters) in [
@@ -566,6 +607,18 @@ mod tests {
             assert!(!block.contains(c), "I1950: {c} is gone (postgres)");
         }
         assert!(block.contains("signature_composite bytea NOT NULL"));
+        // v62.0.0 (KR-fix18.stamp) — the stamp's range is 0..=5, V300's own
+        // text on both dialects; the edition-1 range is gone.
+        for (text, (was, now)) in [
+            (&sqlite, super::STAMP_RANGE_SQLITE),
+            (&pg, super::STAMP_RANGE_POSTGRES),
+        ] {
+            assert_eq!(
+                (text.matches(was).count(), text.matches(now).count()),
+                (0, 1),
+                "I1950: the stamp's range {now}"
+            );
+        }
         assert!(!pg.contains("DROP COLUMN"), "I1950: no DROP COLUMN in V300");
         assert!(
             !sqlite.contains("DROP COLUMN"),

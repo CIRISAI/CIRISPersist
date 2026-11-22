@@ -1125,7 +1125,8 @@ pub(crate) mod bodies {
                  additional_scrubs = '{scrubs}' WHERE attestation_id = '{target}'"
             ))
             .await;
-            for rule in [None, Some(1), Some(2), Some(3), Some(4), Some(5)] {
+            // KR-fix18.stamp — rule 0 (a count undoing a counted row) joins.
+            for rule in [None, Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)] {
                 raw.exec(&format!(
                     "UPDATE {table} SET attesting_key_id = '{}', \
                      withdraws_admission_rule = {} WHERE attestation_id = '{wid}'",
@@ -1165,7 +1166,7 @@ pub(crate) mod bodies {
                 // Not vacuous: the stamp's verdict is the rule's.
                 let want = match rule {
                     None => false,
-                    Some(1 | 5) => true,
+                    Some(0 | 1 | 5) => true,
                     Some(_) => !carved,
                 };
                 assert_eq!(fold, want, "I1673 {tag} {what}, stamp {rule:?}: the fold");

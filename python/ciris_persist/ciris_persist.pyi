@@ -864,12 +864,18 @@ class Engine:
         ``trust:confers:v1`` grant to ``grantee_key_id``: ``{"row_id": hex,
         "grantee": str, "scope": [str], "family_key_id": str, "bundle": hex,
         "bundle_in_force": bool, "accepted": bool, "withdrawn": bool,
-        "confers": bool}``. A grant is counted over the holders of the
+        "confers": bool, "acceptance_row_id": hex | null}``. A grant is
+        counted over the holders of the
         genesis bundle it names (a strict majority, by voices dated before
         that bundle's successor). ``confers`` is ``accepted and not
         withdrawn``: for a node or agent grantee only its owner's acceptance
-        counts. A grant still short of its holders' count is not listed; a
-        holder finds it with ``held_rows_for(role="root_holder")``.
+        counts. ``withdrawn`` is the root's counted withdrawal only
+        (KR-fix18): a grantee (for a node or agent, its owner) ends the
+        conferral by withdrawing the ACCEPTANCE row (``acceptance_row_id``);
+        the grant still lists, with ``accepted`` and ``confers`` false, and a
+        later acceptance confers again. A grant still short of its holders'
+        count is not listed; a holder finds it with
+        ``held_rows_for(role="root_holder")``.
         """
 
     def peer_rooting_json(

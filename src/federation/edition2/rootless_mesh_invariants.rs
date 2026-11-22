@@ -618,9 +618,20 @@ pub(crate) async fn i2415_a_pending_bind_stays_withheld(d: &dyn FederationDirect
     let out = Box::pin(put_statement(d, &own, None, INGEST_TIER))
         .await
         .unwrap_or_else(|e| panic!("[{tag}] the device's bind voice: {e}"));
+    // v62.0.0 (RL-fix22) — the door keeps a second signer's voice that
+    // arrives before the author's statement as a VOICE (`Voice`), not as a
+    // counted group row's `Pending` (that outcome is the group plane's): the
+    // bind is not concluded either way, which is what this leg asserts.
     assert!(
-        matches!(out, StatementOutcome::Pending { .. }),
-        "[{tag}] I2415: the device's lone voice waits for its identity: {out:?}"
+        matches!(out, StatementOutcome::Voice { .. }),
+        "[{tag}] I2415: the device's lone voice is kept as a voice, not a row: {out:?}"
+    );
+    assert!(
+        d.list_identity_occurrences_by_occurrence_key(&k)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] occurrences read: {e}"))
+            .is_empty(),
+        "[{tag}] I2415: a lone voice concludes no bind"
     );
     assert_eq!(
         served_count(d, &bind).await,

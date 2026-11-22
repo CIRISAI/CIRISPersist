@@ -478,7 +478,7 @@ CREATE TABLE cirislens.federation_attestations (
     CONSTRAINT federation_attestations_federation_tier_signed CHECK (((tier = 'local'::text) OR (scrub_signature_classical <> ''::text))),
     CONSTRAINT federation_attestations_subject_key_ids_is_array CHECK ((jsonb_typeof(subject_key_ids) = 'array'::text)),
     CONSTRAINT federation_attestations_tier_check CHECK ((tier = ANY (ARRAY['local'::text, 'federation'::text]))),
-    CONSTRAINT federation_attestations_withdraws_admission_rule_range CHECK (((withdraws_admission_rule IS NULL) OR ((withdraws_admission_rule >= 1) AND (withdraws_admission_rule <= 5))))
+    CONSTRAINT federation_attestations_withdraws_admission_rule_range CHECK (((withdraws_admission_rule IS NULL) OR ((withdraws_admission_rule >= 0) AND (withdraws_admission_rule <= 5))))
 );
 
 COMMENT ON COLUMN cirislens.federation_attestations.attestation_envelope IS 'v31.0.0 (CIRISPersist#645) — TEXT, not JSONB. Query sites that need to reach inside cast explicitly (attestation_envelope::jsonb->>…); the cast is immutable and the two expression indexes above are built over it. SQLite parity: TEXT since V004.';

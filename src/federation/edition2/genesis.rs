@@ -1800,15 +1800,178 @@ pub fn baked_genesis_anchor() -> Anchor {
     Anchor::ObjectId(oid)
 }
 
+/// v62.0.0 (GB-fix2) — the stable token of a store whose genesis is not the
+/// baked one.
+pub const GENESIS_STORE_ROOT_IS_NOT_THE_BAKED_GENESIS: &str =
+    "genesis_store_root_is_not_the_baked_genesis";
+
+/// v62.0.0 (GB-fix2) — one held FIRST bundle (no `prev`) of a foreign store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldRoot {
+    /// Its object id (hex).
+    pub object_id: String,
+    /// Whether this build's reader reads it Valid (under its attestation
+    /// roots; concluded, not held short of its count).
+    pub valid: bool,
+}
+
+/// v62.0.0 (GB-fix2) — which of the two foreign cases a store is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignCase {
+    /// Every held first bundle reads NOT Valid here (a fixture store under a
+    /// production build: its holders' chains are not under this build's
+    /// attestation roots; or a bundle held short of its count). The node is
+    /// ROOTLESS and the baked genesis was NOT imported.
+    HeldNotValid,
+    /// A held first bundle reads Valid here: the node runs under a root that
+    /// is NOT the one this binary bakes.
+    HeldValidForeignRoot,
+}
+
+impl ForeignCase {
+    /// The case's token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HeldNotValid => "held_not_valid",
+            Self::HeldValidForeignRoot => "held_valid_foreign_root",
+        }
+    }
+}
+
+/// v62.0.0 (GB-fix2) — **this store holds a genesis that is not the baked
+/// one** (nor a lineage descending from it). Reported, never acted on: no
+/// import is made (a second first bundle would fork) and the held bundles'
+/// reading is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignGenesis {
+    /// [`GENESIS_STORE_ROOT_IS_NOT_THE_BAKED_GENESIS`].
+    pub token: &'static str,
+    /// Which case ([`ForeignCase`]).
+    pub case: ForeignCase,
+    /// Every held first bundle, sorted by object id, with whether it reads
+    /// Valid.
+    pub held_roots: Vec<HeldRoot>,
+    /// The bundle this build bakes (hex).
+    pub baked: String,
+}
+
+/// v62.0.0 (GB-fix2) — **is the held genesis foreign to `baked`?** Pure:
+/// `held` every held bundle object, `(object id, prev)`, Valid or not;
+/// `valid` the Valid placements. `None` (silent) when nothing is held, when
+/// `baked` is held, or when it is a Valid placement (an ancestor of a held
+/// tip: a successor is read only once its `prev` is held). Else the report
+/// over the held FIRST bundles (no `prev`; when none is a first bundle, every
+/// held object).
+#[must_use]
+pub fn foreign_genesis_of(
+    held: &[(Digest32, Option<Digest32>)],
+    valid: &[GenesisPlacement],
+    baked: &Digest32,
+) -> Option<ForeignGenesis> {
+    if held.is_empty()
+        || held.iter().any(|(o, _)| o == baked)
+        || valid.iter().any(|p| p.object_id == *baked)
+    {
+        return None;
+    }
+    let firsts: Vec<&Digest32> = held
+        .iter()
+        .filter(|(_, prev)| prev.is_none())
+        .map(|(o, _)| o)
+        .collect();
+    let named: Vec<&Digest32> = if firsts.is_empty() {
+        held.iter().map(|(o, _)| o).collect()
+    } else {
+        firsts
+    };
+    let mut held_roots: Vec<HeldRoot> = named
+        .into_iter()
+        .map(|o| HeldRoot {
+            object_id: hex::encode(o),
+            valid: valid.iter().any(|p| p.object_id == *o),
+        })
+        .collect();
+    held_roots.sort_by(|a, b| a.object_id.cmp(&b.object_id));
+    held_roots.dedup();
+    let case = if held_roots.iter().any(|r| r.valid) {
+        ForeignCase::HeldValidForeignRoot
+    } else {
+        ForeignCase::HeldNotValid
+    };
+    Some(ForeignGenesis {
+        token: GENESIS_STORE_ROOT_IS_NOT_THE_BAKED_GENESIS,
+        case,
+        held_roots,
+        baked: hex::encode(baked),
+    })
+}
+
+/// v62.0.0 (GB-fix2) — every bundle object this store holds, `(object id,
+/// prev)`: concluded, or kept short of its count.
+async fn held_bundle_ids<F>(dir: &F) -> Result<Vec<(Digest32, Option<Digest32>)>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let (concluded, short) = held_voices(dir).await?;
+    let mut ids: Vec<(Digest32, Option<Digest32>)> = concluded
+        .iter()
+        .chain(short.iter())
+        .filter_map(|v| cose_parts(v).as_ref().and_then(voice_of))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// v62.0.0 (GB-fix2) — [`foreign_genesis_of`] over `dir`'s held bundles and
+/// the baked genesis ([`BAKED_GENESIS_OBJECT_ID`]). What a host reads
+/// (`Engine::root_standing`'s `foreign_genesis`). `None` too when this build
+/// bakes nothing.
+///
+/// # Errors
+/// Directory reads.
+pub async fn foreign_genesis<F>(dir: &F) -> Result<Option<ForeignGenesis>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Anchor::ObjectId(baked) = baked_genesis_anchor() else {
+        return Ok(None);
+    };
+    foreign_genesis_against(dir, &baked).await
+}
+
+async fn foreign_genesis_against<F>(
+    dir: &F,
+    baked: &Digest32,
+) -> Result<Option<ForeignGenesis>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if BAKED_BUNDLES.is_empty() {
+        return Ok(None);
+    }
+    let held = held_bundle_ids(dir).await?;
+    if held.is_empty() {
+        return Ok(None);
+    }
+    let g = genesis_in_force(dir).await?;
+    Ok(foreign_genesis_of(&held, &g.valid, baked))
+}
+
 /// v62.0.0 (GB-fix1) — what an import of baked bundles did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BakedImport {
     /// The node held no genesis bundle; the baked bundles were offered at the
     /// import door and these object ids (hex) were placed.
     Imported(Vec<String>),
-    /// The node already holds a genesis bundle (the baked one, a later one of
-    /// its lineage, or any other): nothing was offered and nothing changed.
+    /// The node already holds the baked genesis (or a later bundle of its
+    /// lineage): nothing was offered and nothing changed.
     AlreadyHeld,
+    /// v62.0.0 (GB-fix2) — the node holds a genesis that is NOT the baked one
+    /// (a fixture lineage, a fork sibling): nothing was offered (never a
+    /// fork), nothing changed, and this is reported.
+    ForeignRoot(ForeignGenesis),
     /// This build bakes no bundle.
     NoneBaked,
 }
@@ -1853,7 +2016,15 @@ where
     if bundles.is_empty() {
         return Ok(BakedImport::NoneBaked);
     }
-    if genesis_in_force(dir).await?.held > 0 {
+    // v62.0.0 (GB-fix2) — any bundle object held (concluded, or kept short
+    // of its count): never offered; foreign to the anchored bundle, it is
+    // reported.
+    if genesis_in_force(dir).await?.held > 0 || !held_bundle_ids(dir).await?.is_empty() {
+        if let Anchor::ObjectId(baked) = anchor {
+            if let Some(f) = foreign_genesis_against(dir, baked).await? {
+                return Ok(BakedImport::ForeignRoot(f));
+            }
+        }
         return Ok(BakedImport::AlreadyHeld);
     }
     let mut placed = Vec::new();
@@ -1917,19 +2088,47 @@ pub(crate) async fn import_bundles_at_boot<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    // (Never in lib unit tests: their witnesses run this leg itself.)
-    #[cfg(all(feature = "test-anchor", not(test)))]
-    if ciris_verify_core::test_anchor::test_anchor_active() {
+    // (Never in lib unit tests: their witnesses run this leg itself. GB-fix4:
+    // `cfg!(test)` in the condition, not a `cfg(all(feature, not(test)))`
+    // attribute, which the from-disk test-gate util does not recognise.)
+    #[cfg(feature = "test-anchor")]
+    if !cfg!(test) && ciris_verify_core::test_anchor::test_anchor_active() {
         return BootImport::TestAnchor;
     }
     match import_genesis_bundles(dir, bundles, anchor).await {
         Ok(done) => {
-            if let BakedImport::Imported(ids) = &done {
-                tracing::info!(
+            match &done {
+                BakedImport::Imported(ids) => tracing::info!(
                     bundles = ?ids,
                     "the baked genesis was imported at the import door (not accepted: the \
                      node roots nothing until it accepts the root)"
-                );
+                ),
+                BakedImport::ForeignRoot(f) => match f.case {
+                    ForeignCase::HeldValidForeignRoot => tracing::error!(
+                        token = f.token,
+                        case = f.case.as_str(),
+                        held_roots = ?f.held_roots,
+                        baked = %f.baked,
+                        "THIS NODE RUNS UNDER A ROOT THAT IS NOT THE ONE THIS BINARY BAKES \
+                         ({}): the store holds a first bundle that reads Valid here ({:?}); \
+                         this build bakes {}; nothing was imported",
+                        f.token,
+                        f.held_roots,
+                        f.baked
+                    ),
+                    ForeignCase::HeldNotValid => tracing::error!(
+                        token = f.token,
+                        case = f.case.as_str(),
+                        held_roots = ?f.held_roots,
+                        baked = %f.baked,
+                        "THIS STORE HOLDS A GENESIS THAT DOES NOT READ VALID HERE ({}): {:?}; \
+                         the node is ROOTLESS and the baked genesis {} was NOT imported",
+                        f.token,
+                        f.held_roots,
+                        f.baked
+                    ),
+                },
+                BakedImport::AlreadyHeld | BakedImport::NoneBaked => {}
             }
             BootImport::Done(done)
         }

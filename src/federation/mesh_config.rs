@@ -4232,6 +4232,32 @@ mod tests {
         };
         let st =
             e2::statement_of_with_key(&a, &fg::test_key(fg::HOLDER_SEEDS[0]), &e2::family_of(&a));
+        // v62.0.0 (RL-fix21) — re-signed with the LITERAL root as its `sub`:
+        // the fixture codec (`statement_of_with_key` → `subject_of` →
+        // `kid_or_keep`) reads "humanity-accord" as a SEED and states the row
+        // about a key of that name, so the door answered
+        // `NotFiledAgainstRoot` before it ever counted the holders.
+        let st = {
+            let (protected, payload) =
+                crate::federation::edition2::liveness::statement_parts(&st).expect("a statement");
+            let text = |k: i64| {
+                protected
+                    .get_int(k)
+                    .and_then(Value::as_text)
+                    .expect("a header member")
+                    .to_owned()
+            };
+            ciris_verify_core::edition2::sign_row_statement(
+                &fg::test_key(fg::HOLDER_SEEDS[0]),
+                &author,
+                root,
+                &text(-70001),
+                &text(-70002),
+                &payload,
+                vec![],
+            )
+            .expect("the holder's row signs")
+        };
         // RL-fix10 — the holder's key is placed by the bundle, not by a
         // fixture seed, so the row is admitted over THIS node's held keys
         // (`ingest::held_keys_for`), never the fixture's seed map.

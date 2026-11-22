@@ -1433,11 +1433,6 @@ pub(crate) async fn check_cosigned_withdraws(
         return Ok(None);
     };
     let issuer = row.attesting_key_id.as_str();
-    let rule = if issuer == target.attesting_key_id {
-        1
-    } else {
-        4
-    };
     // v62.0.0 (wave GC4; CC 2.7.3) — every verdict below reads the NAMED
     // target row (its kind, its signer) and, for a group's decision, the
     // group's record and roster: they are fold conditions. The `withdraws`
@@ -1590,7 +1585,9 @@ pub(crate) async fn check_cosigned_withdraws(
                 high_water: None,
             });
             if verdict.admits() {
-                Ok(Some(rule))
+                // KR-fix18.stamp — the group's protocol admitted it: a
+                // count undoing a group-plane row, rule 0.
+                Ok(Some(super::admission::COUNT_UNDOES_COUNTED_RULE))
             } else {
                 // v62.0.0 (wave GC4; CC 2.6.1.9) — the voices are short of
                 // the group's protocol over its roster: HELD `count_short`

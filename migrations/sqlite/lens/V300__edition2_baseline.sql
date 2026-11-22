@@ -1392,7 +1392,7 @@ CREATE TABLE federation_attestations (
                AND json_type(subject_key_ids) = 'array'),
     withdraws_admission_rule   INTEGER
         CHECK (withdraws_admission_rule IS NULL
-               OR withdraws_admission_rule BETWEEN 1 AND 5),
+               OR withdraws_admission_rule BETWEEN 0 AND 5),
     cohort_scope               TEXT NOT NULL DEFAULT 'federation'
         CHECK (cohort_scope IN (
             'self', 'family', 'community',

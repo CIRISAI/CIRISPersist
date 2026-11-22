@@ -36,8 +36,9 @@
 //!   first. On BOTH nodes EARLY is held and LATE is not: LATE never lands on
 //!   B and is un-concluded on A when the later bundle lands.
 //! - **I4204** — the end: one holder's counted withdrawal waits and two land
-//!   it; a stranger's authored withdrawal is not admitted; the worker's
-//!   owner's own withdrawal lands.
+//!   it; a stranger's authored withdrawal is not admitted, nor one holder's,
+//!   nor (KR-fix18) the worker's owner's: the grant is the holders' consent
+//!   and only their count undoes it.
 //! - **I4205** — an `agent` grantee: the grant lands on the holders' count;
 //!   the agent's own acceptance seats nothing; its owner's does.
 //! - **I4206** — the acceptance BEFORE the grant: it waits (held), and once
@@ -658,9 +659,13 @@ pub(crate) async fn i4204_the_end_of_a_grant(d: &dyn FederationDirectory) {
     )
     .await
     .expect("I4204: the second holder's withdrawal voice");
-    assert!(
-        held(d, &wid).await.is_some(),
-        "I4204: two of three holders withdraw the grant"
+    assert_eq!(
+        held(d, &wid)
+            .await
+            .expect("I4204: two of three holders withdraw the grant")
+            .withdraws_admission_rule,
+        Some(crate::federation::admission::COUNT_UNDOES_COUNTED_RULE),
+        "I4204: a count undoing a counted row is stamped rule 0 (KR-fix18.stamp)"
     );
 
     // A stranger's authored withdrawal is not admitted.
@@ -695,27 +700,27 @@ pub(crate) async fn i4204_the_end_of_a_grant(d: &dyn FederationDirectory) {
         held(d, &lid).await.is_none(),
         "I4204: one holder alone never withdraws the root's grant"
     );
-    // The worker's OWNER withdraws it: the grantee's own withdrawal.
+    // KR-fix18 — the worker's OWNER does not withdraw the GRANT either (the
+    // leg that asserted "the grantee's own withdrawal lands on rule 3" is
+    // deleted: that door is gone). The owner's consent is the acceptance;
+    // I4313 withdraws that.
     let w = authored_withdrawal(&owner, &worker, &target, now + 1);
     let oid = row_of(&w);
-    put_statement(d, &w, None, INGEST_TIER)
-        .await
-        .expect("I4204: the owner's withdrawal is admitted");
-    let stored = held(d, &oid)
-        .await
-        .expect("I4204: the grantee's own withdrawal (its owner's) lands");
-    assert_eq!(
-        stored.withdraws_admission_rule,
-        Some(3),
-        "I4204: admitted on the grantee's own rule"
+    let _ = put_statement(d, &w, None, INGEST_TIER).await;
+    assert!(
+        held(d, &oid).await.is_none(),
+        "I4204: the grantee's owner never withdraws the root's grant (KR-fix18)"
     );
+    assert!(held(d, &target).await.is_some(), "I4204: the grant stands");
 }
 
-/// **I4219** (KR-fix8). Who may give up a root grant on the grantee's own
-/// rule: the grantee's own key and its owner's own key, and nobody else. A
-/// SIBLING node (another node bound to the same owner) and a stranger are
-/// not admitted; then the grantee (the worker node's own key) withdraws one
-/// grant and its owner withdraws another, each on rule 3.
+/// **I4219** (KR-fix8, as re-ruled for KR-fix18). NO single key gives up a
+/// root grant: not a SIBLING node (another node bound to the same owner),
+/// not a stranger, and (KR-fix18) not the grantee's own key nor its owner's
+/// own key. The grant is the holders' consent; the grantee's is the
+/// acceptance (I4313). The two legs that asserted "the grantee itself" and
+/// "the grantee's owner" withdraw it on rule 3 are deleted; their setup is
+/// kept here, asserting the refusal.
 pub(crate) async fn i4219_who_gives_up_a_root_grant(d: &dyn FederationDirectory) {
     let c = bundle_v2();
     let head = install_v2(d)
@@ -741,6 +746,8 @@ pub(crate) async fn i4219_who_gives_up_a_root_grant(d: &dyn FederationDirectory)
     for (i, (who, seed)) in [
         ("a sibling node", sibling_seed),
         ("a stranger", stranger_seed),
+        ("the grantee itself", worker_seed),
+        ("the grantee's owner", owner.as_str()),
     ]
     .into_iter()
     .enumerate()
@@ -748,30 +755,13 @@ pub(crate) async fn i4219_who_gives_up_a_root_grant(d: &dyn FederationDirectory)
         for (j, target) in [&a, &b].into_iter().enumerate() {
             let w = authored_withdrawal(seed, &worker, target, now + (i * 2 + j) as u64);
             let wid = row_of(&w);
-            let _ = put_statement(d, &w, None, INGEST_TIER).await;
+            let out = put_statement(d, &w, None, INGEST_TIER).await;
             assert!(
                 held(d, &wid).await.is_none(),
-                "I4219: {who} never withdraws another key's root grant"
+                "I4219: {who} never withdraws a root grant: {out:?}"
             );
+            assert!(held(d, target).await.is_some(), "I4219: the grant stands");
         }
-    }
-    for (who, seed, target) in [
-        ("the grantee itself", worker_seed, &a),
-        ("the grantee's owner", owner.as_str(), &b),
-    ] {
-        let w = authored_withdrawal(seed, &worker, target, now + 10);
-        let wid = row_of(&w);
-        put_statement(d, &w, None, INGEST_TIER)
-            .await
-            .unwrap_or_else(|e| panic!("I4219: {who}'s withdrawal is admitted: {e}"));
-        let stored = held(d, &wid)
-            .await
-            .unwrap_or_else(|| panic!("I4219: {who}'s withdrawal lands"));
-        assert_eq!(
-            stored.withdraws_admission_rule,
-            Some(3),
-            "I4219: {who}, on the grantee's own rule"
-        );
     }
 }
 
@@ -2024,6 +2014,615 @@ pub(crate) async fn i4217_a_hardware_held_owner_accepts_by_draft(e: &crate::Engi
     );
 }
 
+/// **I4316** (KR-fix18.stamp; CC 2.4.1.1 rule 0). THE HOLDERS' COUNT RETIRES
+/// THE GRANT ON READ, whoever voiced first. The grant's first voice is
+/// holder 1's; the withdrawal's is holder 3's, then holder 2's. Before the
+/// stamp fix that withdrawal was stamped 4 ("a delegate"), which was not
+/// true of it; it did retire the grant, because a root grant is not a
+/// carved-out target (`precedence::stamp_policy`: any stamp counts). No
+/// witness read the retirement through the readers; this one does, and pins
+/// the stamp. The carved-out case, where a 4 retired nothing, is a counted
+/// licence: I3297.
+///
+/// - one holder's counted voice is not a count: it waits, nothing changes;
+/// - at the count: stamped 0; the fold counts it
+///   (`precedence::retraction_entitled`, and by its stamp alone under the
+///   producer-side policy); `root_grants_for` reads
+///   `withdrawn`, not conferring; `trust_root::live_conferral_rows` (the one
+///   read behind the capability walk and peer rooting's delegation seat) no
+///   longer returns the grant; the grant row is still held, as history.
+pub(crate) async fn i4316_the_holders_count_retires_the_grant_on_read(d: &dyn FederationDirectory) {
+    let c = bundle_v2();
+    let head = install_v2(d)
+        .await
+        .expect("I4316: the bundle installs")
+        .object_id;
+    let at = grant_instant(d).await;
+    let (worker, owner) = worker_with_owner(d, "i4316").await;
+    let grant = land_grant(d, c, &worker, ATTEST_BUILD, &head, at, "I4316").await;
+    let target = row_of_id(&grant);
+    e2::put_signed(d, &acceptance(&owner, &grant))
+        .await
+        .expect("I4316: the owner's acceptance is admitted");
+    let later = || ms_now() + chrono::Duration::seconds(1);
+    let view = || async {
+        let mut v = crate::federation::admission::root_grants_for(d, &worker, later())
+            .await
+            .expect("I4316: root_grants_for");
+        assert_eq!(v.len(), 1, "I4316: the grant is listed: {v:?}");
+        v.remove(0)
+    };
+    let live = || async {
+        crate::federation::trust_root::live_conferral_rows(d, &worker, ATTEST_BUILD, later())
+            .await
+            .expect("I4316: live_conferral_rows")
+            .iter()
+            .any(|r| r.attestation_id == grant.attestation_id)
+    };
+    assert!(
+        view().await.confers && live().await,
+        "I4316 premise: counted, accepted, conferring, a live conferral row"
+    );
+
+    // Holder 3 voices the withdrawal FIRST (the grant's first voice was
+    // holder 1's). One voice is not a count.
+    let w0 = holder_withdrawal(c, 2, &worker, &target, &head, at + 60_000);
+    let wid = row_of(&w0);
+    let o = put_statement(d, &w0, None, INGEST_TIER)
+        .await
+        .expect("I4316: one holder's withdrawal voice is kept");
+    assert!(pending(&o), "I4316: one holder's voice waits: {o:?}");
+    assert!(
+        held(d, &wid).await.is_none() && view().await.confers && live().await,
+        "I4316: a lone holder's voice is not a count: nothing changes"
+    );
+
+    put_statement(
+        d,
+        &holder_withdrawal(c, 1, &worker, &target, &head, at + 60_000),
+        None,
+        INGEST_TIER,
+    )
+    .await
+    .expect("I4316: the second holder's withdrawal voice");
+    let w = held(d, &wid)
+        .await
+        .expect("I4316: two of three holders land the withdrawal");
+    assert_ne!(
+        w.attesting_key_id, grant.attesting_key_id,
+        "I4316 premise: the withdrawal's first voice is not the grant's"
+    );
+    assert_eq!(
+        w.withdraws_admission_rule,
+        Some(crate::federation::admission::COUNT_UNDOES_COUNTED_RULE),
+        "I4316: a count undoing a counted row is stamped rule 0, never 1 or 4"
+    );
+    assert!(
+        crate::federation::precedence::retraction_entitled(&w, &grant)
+            && crate::federation::precedence::stamp_entitles(
+                &w,
+                crate::federation::precedence::StampPolicy::ProducerSide
+            ),
+        "I4316: the fold counts the holders' withdrawal, under the strictest stamp policy too"
+    );
+    let g = view().await;
+    assert!(
+        g.withdrawn && !g.confers,
+        "I4316: root_grants_for reads the grant withdrawn: {g:?}"
+    );
+    assert!(
+        !live().await,
+        "I4316: the capability walk's and peer rooting's live conferral rows drop the grant"
+    );
+    assert!(
+        held(d, &target).await.is_some(),
+        "I4316: the grant row still stands, as history"
+    );
+}
+
+/// The statement `seed` signs outside the Engine over a draft.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn signed_outside(seed: &str, draft: &super::emit::Draft, what: &str) -> Vec<u8> {
+    draft.assemble(
+        e2::signing_key(seed)
+            .sign(&draft.sig_structure)
+            .unwrap_or_else(|e| panic!("{what}: signed outside the Engine: {e}")),
+    )
+}
+
+/// The one grant `worker` holds, as the Engine reads it at `t`.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn the_grant(
+    e: &crate::Engine,
+    worker: &str,
+    t: DateTime<Utc>,
+    what: &str,
+) -> crate::federation::admission::RootGrantView {
+    let mut v = e
+        .root_grants_for(worker, Some(t))
+        .await
+        .unwrap_or_else(|e| panic!("{what}: Engine::root_grants_for: {e}"));
+    assert_eq!(v.len(), 1, "{what}: the grant is listed: {v:?}");
+    v.remove(0)
+}
+
+/// **I4313** (KR-fix18; CC 2.4.1.1 rule 1, as Constitution ruled
+/// 2026-11-21). A conferral is two consents. The grantee's is the
+/// ACCEPTANCE: a node worker's OWNER, with a software key, takes it back
+/// with `Engine::withdraw_statement` on the acceptance row, and the conferral
+/// ends: `root_grants_for` and `root_grant_of` (the one reader the capability
+/// walk and peer rooting ask) read no consent. The grant row still stands
+/// and still lists, as history, and is NOT `withdrawn`. The worker's OWN
+/// (node) key cannot take the owner's acceptance back, before or after. A
+/// later acceptance of the same standing grant confers AGAIN.
+///
+/// Ports the setup of I4204's and I4219's deleted "the grantee withdraws the
+/// grant" legs.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn i4313_the_owner_withdraws_the_acceptance(e: &crate::Engine) {
+    let c = bundle_v2();
+    let dir = e.federation_directory();
+    let d: &dyn FederationDirectory = dir.as_dyn_directory();
+    let head = c.object_id;
+    let (worker, owner_seed) = worker_with_owner(d, "i4313").await;
+    let worker_seed = "w-i4313";
+    let grant = land_grant(
+        d,
+        c,
+        &worker,
+        ATTEST_BUILD,
+        &head,
+        grant_instant(d).await,
+        "I4313",
+    )
+    .await;
+    let later = || ms_now() + chrono::Duration::seconds(1);
+    let accept = || async {
+        crate::federation::attestation_emit::emit_statement(
+            d,
+            &ts::local_signer(&owner_seed),
+            crate::federation::membership_acceptance::reply_input(&grant, true),
+            None,
+        )
+        .await
+    };
+    accept()
+        .await
+        .expect("I4313: the owner's acceptance is admitted");
+    let g = the_grant(e, &worker, later(), "I4313").await;
+    assert!(g.accepted && g.confers, "I4313 premise: conferring: {g:?}");
+    let first = g
+        .acceptance_row_id
+        .clone()
+        .expect("I4313: the view names the acceptance that gives the consent");
+
+    // The worker's own (node) key: a node gives no consent and takes none
+    // back for its owner.
+    let err = e
+        .withdraw_statement(&ts::local_signer(worker_seed), &first)
+        .await
+        .expect_err("I4313: the grantee node's own key cannot withdraw its owner's acceptance");
+    assert_eq!(
+        err.kind(),
+        "federation_withdraws_not_admitted",
+        "I4313: refused by the withdraws rule: {err}"
+    );
+    let g = the_grant(e, &worker, later(), "I4313").await;
+    assert!(
+        g.confers && g.acceptance_row_id.as_deref() == Some(first.as_str()),
+        "I4313: the node's refused withdrawal changed nothing: {g:?}"
+    );
+
+    // The owner takes the acceptance back.
+    let wid = e
+        .withdraw_statement(&ts::local_signer(&owner_seed), &first)
+        .await
+        .expect("I4313: the owner withdraws the acceptance they gave");
+    let w = d
+        .get_attestation(&wid)
+        .await
+        .expect("I4313: reads")
+        .expect("I4313: the withdrawal landed");
+    assert_eq!(
+        w.withdraws_admission_rule,
+        Some(1),
+        "I4313: the producer's own retraction (rule 1)"
+    );
+    let g = the_grant(e, &worker, later(), "I4313").await;
+    assert!(
+        !g.accepted && !g.confers && g.acceptance_row_id.is_none(),
+        "I4313: the acceptance withdrawn, no conferral: {g:?}"
+    );
+    assert!(
+        !g.withdrawn && g.row_id == grant.attestation_id,
+        "I4313: the GRANT is not withdrawn; it still lists, as history: {g:?}"
+    );
+    assert!(
+        held(d, &row_of_id(&grant)).await.is_some(),
+        "I4313: the grant row still stands"
+    );
+    assert!(
+        !root_grant_of(d, &grant, later())
+            .await
+            .expect("I4313: root_grant_of")
+            .expect("I4313: still a counted root grant")
+            .accepted,
+        "I4313: the reader the capability walk and peer rooting ask reads no consent"
+    );
+
+    // The node cannot re-accept for itself, nor undo the withdrawal.
+    let _ = e
+        .withdraw_statement(&ts::local_signer(worker_seed), &wid)
+        .await;
+    assert!(
+        !the_grant(e, &worker, later(), "I4313").await.confers,
+        "I4313: the node does not undo its owner's withdrawal"
+    );
+
+    // A re-acceptance of the same standing grant confers again.
+    accept()
+        .await
+        .expect("I4313: the owner's second acceptance is admitted");
+    let g = the_grant(e, &worker, later(), "I4313").await;
+    assert!(
+        g.accepted && g.confers,
+        "I4313: a re-acceptance of the same grant confers again: {g:?}"
+    );
+    let second = g.acceptance_row_id.expect("I4313: the second acceptance");
+    assert_ne!(
+        second, first,
+        "I4313: the consent is the NEW acceptance, not the withdrawn one"
+    );
+}
+
+/// **I4314** (KR-fix18). The same, for an owner whose key is HARDWARE (never
+/// in the Engine): the acceptance and its withdrawal are drafted
+/// (`Engine::statement_draft`, `Engine::withdraw_statement_draft`), signed
+/// outside, and submitted (`Engine::submit_voice`), each at a STATED instant,
+/// so the readings are exact:
+///
+/// - **from then on**: read at an instant before the withdrawal's own, the
+///   acceptance still stands (an act taken under the grant before the
+///   withdrawal verifies as of its own instant); at the withdrawal's instant
+///   and after, it does not;
+/// - the worker's own key, drafting the same withdrawal, is refused;
+/// - a re-acceptance at a later instant confers from ITS instant on, and
+///   does not reach back over the gap.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn i4314_a_hardware_owner_withdraws_the_acceptance_by_draft(e: &crate::Engine) {
+    use crate::federation::membership_acceptance::reply_envelope;
+    let c = bundle_v2();
+    let dir = e.federation_directory();
+    let d: &dyn FederationDirectory = dir.as_dyn_directory();
+    let head = c.object_id;
+    let (worker, owner_seed) = worker_with_owner(d, "i4314").await;
+    let worker_seed = "w-i4314";
+    let grant = land_grant(
+        d,
+        c,
+        &worker,
+        ATTEST_BUILD,
+        &head,
+        grant_instant(d).await,
+        "I4314",
+    )
+    .await;
+    // After the owner binding (stated just now); every later instant is an
+    // offset from this one.
+    let base = u64::try_from(ms_now().timestamp_millis()).expect("after 1970");
+    let at = |offset_ms: u64| {
+        DateTime::<Utc>::from_timestamp_millis(i64::try_from(base + offset_ms).expect("i64"))
+            .expect("an instant")
+    };
+    let envelope = reply_envelope(&grant, true);
+    let accept_at = |offset_ms: u64| {
+        let (envelope, worker, owner_seed) = (envelope.clone(), worker.clone(), owner_seed.clone());
+        async move {
+            let draft = e
+                .statement_draft(
+                    attestation_type::SCORES,
+                    &envelope,
+                    &e2::kid(&owner_seed),
+                    &hex::encode(e2::kid_digest(&owner_seed)),
+                    &worker,
+                    base + offset_ms,
+                    None,
+                )
+                .await
+                .expect("I4314: Engine::statement_draft drafts the acceptance");
+            let st = signed_outside(&owner_seed, &draft, "I4314");
+            let o = e
+                .submit_voice(&st)
+                .await
+                .expect("I4314: the owner's drafted acceptance is admitted");
+            assert!(o.is_seated(), "I4314: the acceptance lands: {o:?}");
+            row_of(&st).hex()
+        }
+    };
+    let accepted_at = |t: DateTime<Utc>| {
+        let g = grant.clone();
+        async move {
+            root_grant_of(d, &g, t)
+                .await
+                .expect("I4314: root_grant_of")
+                .expect("I4314: a counted root grant")
+                .accepted
+        }
+    };
+
+    let first = accept_at(0).await;
+    assert!(
+        accepted_at(at(1_000)).await,
+        "I4314 premise: accepted, conferring"
+    );
+
+    // The worker's own key drafts the withdrawal: refused.
+    let by_node = e
+        .withdraw_statement_draft(
+            &first,
+            &e2::kid(worker_seed),
+            &hex::encode(e2::kid_digest(worker_seed)),
+            base + 1_500,
+        )
+        .await
+        .expect("I4314: the draft is only bytes");
+    let err = e
+        .submit_voice(&signed_outside(worker_seed, &by_node, "I4314"))
+        .await
+        .expect_err("I4314: the grantee node's own key cannot withdraw its owner's acceptance");
+    assert_eq!(
+        err.kind(),
+        "federation_withdraws_not_admitted",
+        "I4314: refused by the withdraws rule: {err}"
+    );
+    assert!(
+        accepted_at(at(1_900)).await,
+        "I4314: the node's refused withdrawal changed nothing"
+    );
+
+    // The hardware owner withdraws the acceptance, at base + 2 s.
+    let draft = e
+        .withdraw_statement_draft(
+            &first,
+            &e2::kid(&owner_seed),
+            &hex::encode(e2::kid_digest(&owner_seed)),
+            base + 2_000,
+        )
+        .await
+        .expect("I4314: Engine::withdraw_statement_draft drafts the withdrawal");
+    let st = signed_outside(&owner_seed, &draft, "I4314");
+    let wid = row_of(&st);
+    let o = e
+        .submit_voice(&st)
+        .await
+        .expect("I4314: the owner's drafted withdrawal is admitted");
+    assert!(o.is_seated(), "I4314: the withdrawal lands: {o:?}");
+    assert_eq!(
+        held(d, &wid)
+            .await
+            .expect("I4314: the withdrawal is held")
+            .withdraws_admission_rule,
+        Some(1),
+        "I4314: the producer's own retraction (rule 1)"
+    );
+
+    // From then on, and not before.
+    assert!(
+        accepted_at(at(1_000)).await && accepted_at(at(1_999)).await,
+        "I4314: as of an instant BEFORE the withdrawal the consent stood: an act taken under \
+         the grant then still verifies"
+    );
+    assert!(
+        !accepted_at(at(2_000)).await && !accepted_at(at(3_000)).await,
+        "I4314: from the withdrawal's own instant on, no consent"
+    );
+    let before = the_grant(e, &worker, at(1_000), "I4314").await;
+    assert!(
+        before.confers && before.acceptance_row_id.as_deref() == Some(first.as_str()),
+        "I4314: Engine::root_grants_for as of before the withdrawal: {before:?}"
+    );
+    let after = the_grant(e, &worker, at(3_000), "I4314").await;
+    assert!(
+        !after.accepted && !after.confers && !after.withdrawn && after.acceptance_row_id.is_none(),
+        "I4314: after: no conferral, and the GRANT is not withdrawn: {after:?}"
+    );
+    assert!(
+        held(d, &row_of_id(&grant)).await.is_some(),
+        "I4314: the grant row still stands, as history"
+    );
+
+    // A re-acceptance at base + 4 s confers again, from its own instant.
+    let second = accept_at(4_000).await;
+    assert_ne!(second, first, "I4314: a new acceptance row");
+    assert!(
+        accepted_at(at(5_000)).await,
+        "I4314: a re-acceptance of the same standing grant confers again"
+    );
+    assert!(
+        !accepted_at(at(3_000)).await,
+        "I4314: and does not reach back over the gap"
+    );
+    let again = the_grant(e, &worker, at(5_000), "I4314").await;
+    assert!(
+        again.confers && again.acceptance_row_id.as_deref() == Some(second.as_str()),
+        "I4314: the consent is the new acceptance: {again:?}"
+    );
+}
+
+/// **I4315** (KR-fix18; CC 2.4.1.1 rule 0). The HOLDERS' consent is the
+/// counted grant, and only a count undoes it. Through the Engine verbs: a
+/// lone holder's authored withdrawal is refused; the grantee's own key and
+/// its owner's are refused (the removed door); one holder's COUNTED voice
+/// waits (`count_short`); the second lands it. Then the grant reads
+/// `withdrawn`, confers nothing, and still stands as a held row, with the
+/// grantee's acceptance untouched.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn i4315_only_the_holders_count_withdraws_the_grant(e: &crate::Engine) {
+    use super::second_signer_voice::VoiceOutcome;
+    let c = bundle_v2();
+    let dir = e.federation_directory();
+    let d: &dyn FederationDirectory = dir.as_dyn_directory();
+    let head = c.object_id;
+    let (worker, owner_seed) = worker_with_owner(d, "i4315").await;
+    let worker_seed = "w-i4315";
+    let at = grant_instant(d).await;
+    let grant = land_grant(d, c, &worker, ATTEST_BUILD, &head, at, "I4315").await;
+    let target = row_of_id(&grant);
+    let later = || ms_now() + chrono::Duration::seconds(1);
+    crate::federation::attestation_emit::emit_statement(
+        d,
+        &ts::local_signer(&owner_seed),
+        crate::federation::membership_acceptance::reply_input(&grant, true),
+        None,
+    )
+    .await
+    .expect("I4315: the owner's acceptance is admitted");
+    assert!(
+        the_grant(e, &worker, later(), "I4315").await.confers,
+        "I4315 premise: conferring"
+    );
+    let kid_of_holder = |i: usize| {
+        hex::encode(super::fixture_genesis::kid_of(
+            super::fixture_genesis::HOLDER_SEEDS[i],
+        ))
+    };
+
+    // One holder, alone, by an AUTHORED withdrawal.
+    let lone = e
+        .withdraw_statement_draft(
+            &grant.attestation_id,
+            c.holder_identity_ref(0),
+            &kid_of_holder(0),
+            at + 30_000,
+        )
+        .await
+        .expect("I4315: the draft is only bytes");
+    let err = e
+        .submit_voice(
+            &lone.assemble(
+                c.holder_key(0)
+                    .sign(&lone.sig_structure)
+                    .expect("I4315: holder 1 signs"),
+            ),
+        )
+        .await
+        .expect_err("I4315: a lone holder cannot withdraw the counted grant");
+    assert_eq!(
+        err.kind(),
+        "federation_withdraws_not_admitted",
+        "I4315: {err}"
+    );
+    // The grantee's own key, and its owner: the removed door.
+    for (who, seed) in [
+        ("the grantee's own key", worker_seed),
+        ("the grantee's owner", owner_seed.as_str()),
+    ] {
+        let err = e
+            .withdraw_statement(&ts::local_signer(seed), &grant.attestation_id)
+            .await
+            .expect_err("I4315: nobody withdraws the grant by an authored row");
+        assert_eq!(
+            err.kind(),
+            "federation_withdraws_not_admitted",
+            "I4315: {who} does not withdraw the GRANT (they withdraw the acceptance): {err}"
+        );
+    }
+    assert!(
+        the_grant(e, &worker, later(), "I4315").await.confers,
+        "I4315: three refused withdrawals changed nothing"
+    );
+
+    // The holders' COUNT: the same envelope the withdrawal verb builds, plus
+    // the bundle it is counted over (`head`), drafted per holder.
+    let mut envelope = crate::federation::membership_acceptance::withdrawal_envelope_of(&grant)
+        .expect("I4315: the withdrawal envelope");
+    let o = envelope.as_object_mut().expect("I4315: an object");
+    o.insert("head".to_owned(), serde_json::json!(hex::encode(head)));
+    o.insert(
+        "cohort_scope".to_owned(),
+        serde_json::json!(grant.cohort_scope),
+    );
+    let voice = |i: usize| {
+        let (envelope, worker, id) = (
+            envelope.clone(),
+            worker.clone(),
+            grant.attestation_id.clone(),
+        );
+        async move {
+            let draft = e
+                .statement_draft(
+                    attestation_type::WITHDRAWS,
+                    &envelope,
+                    c.holder_identity_ref(i),
+                    &kid_of_holder(i),
+                    &worker,
+                    at + 60_000,
+                    Some(id.as_str()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("I4315: holder {}'s counted draft: {e}", i + 1));
+            draft.assemble(
+                c.holder_key(i)
+                    .sign(&draft.sig_structure)
+                    .expect("I4315: a holder signs"),
+            )
+        }
+    };
+    let v0 = voice(0).await;
+    let wid = row_of(&v0);
+    assert_eq!(
+        wid,
+        row_of(&holder_withdrawal(
+            c,
+            0,
+            &worker,
+            &target,
+            &head,
+            at + 60_000
+        )),
+        "I4315: the Engine's draft is the counted withdrawal (no author, refs.head, refs.target)"
+    );
+    let o = e
+        .submit_voice(&v0)
+        .await
+        .expect("I4315: one holder's counted voice is kept");
+    assert!(
+        matches!(&o, VoiceOutcome::Waiting { reason, .. }
+            if reason == super::fold::reason::COUNT_SHORT),
+        "I4315: one voice of three is count_short: {o:?}"
+    );
+    assert!(
+        held(d, &wid).await.is_none() && the_grant(e, &worker, later(), "I4315").await.confers,
+        "I4315: one holder's voice withdraws nothing"
+    );
+    let o = e
+        .submit_voice(&voice(1).await)
+        .await
+        .expect("I4315: the second holder's voice");
+    assert!(o.is_seated(), "I4315: two of three land it: {o:?}");
+    let w = held(d, &wid)
+        .await
+        .expect("I4315: the counted withdrawal is held");
+    assert_eq!(
+        w.withdraws_admission_rule,
+        Some(crate::federation::admission::COUNT_UNDOES_COUNTED_RULE),
+        "I4315: the holders' count, stamped rule 0"
+    );
+    let g = the_grant(e, &worker, later(), "I4315").await;
+    assert!(
+        g.withdrawn && !g.confers,
+        "I4315: the holders' count withdrew the grant: {g:?}"
+    );
+    assert!(
+        g.accepted && g.acceptance_row_id.is_some(),
+        "I4315: the grantee's acceptance is its own row, untouched: {g:?}"
+    );
+    assert!(
+        held(d, &target).await.is_some(),
+        "I4315: the grant row still stands, as history"
+    );
+}
+
 #[cfg(feature = "sqlite")]
 mod sqlite {
     use crate::store::Backend as _;
@@ -2058,6 +2657,10 @@ mod sqlite {
         i4202_a_scope_outside_the_charter_is_refused
     );
     on_one!(i4204_the_end_of_a_grant_sqlite, i4204_the_end_of_a_grant);
+    on_one!(
+        i4316_the_holders_count_retires_the_grant_on_read_sqlite,
+        i4316_the_holders_count_retires_the_grant_on_read
+    );
     on_one!(
         i4219_who_gives_up_a_root_grant_sqlite,
         i4219_who_gives_up_a_root_grant
@@ -2100,6 +2703,39 @@ mod sqlite {
         .await
         .expect("I4217: a sqlite Engine");
         Box::pin(super::i4217_a_hardware_held_owner_accepts_by_draft(&e)).await;
+    }
+
+    #[tokio::test]
+    async fn i4313_the_owner_withdraws_the_acceptance_sqlite() {
+        let e = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer("i4313-engine"),
+            "sqlite::memory:",
+        )
+        .await
+        .expect("I4313: a sqlite Engine");
+        Box::pin(super::i4313_the_owner_withdraws_the_acceptance(&e)).await;
+    }
+
+    #[tokio::test]
+    async fn i4314_a_hardware_owner_withdraws_the_acceptance_by_draft_sqlite() {
+        let e = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer("i4314-engine"),
+            "sqlite::memory:",
+        )
+        .await
+        .expect("I4314: a sqlite Engine");
+        Box::pin(super::i4314_a_hardware_owner_withdraws_the_acceptance_by_draft(&e)).await;
+    }
+
+    #[tokio::test]
+    async fn i4315_only_the_holders_count_withdraws_the_grant_sqlite() {
+        let e = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer("i4315-engine"),
+            "sqlite::memory:",
+        )
+        .await
+        .expect("I4315: a sqlite Engine");
+        Box::pin(super::i4315_only_the_holders_count_withdraws_the_grant(&e)).await;
     }
 
     #[tokio::test]
@@ -2208,6 +2844,10 @@ mod postgres {
     );
     on_one!(i4204_the_end_of_a_grant_postgres, i4204_the_end_of_a_grant);
     on_one!(
+        i4316_the_holders_count_retires_the_grant_on_read_postgres,
+        i4316_the_holders_count_retires_the_grant_on_read
+    );
+    on_one!(
         i4219_who_gives_up_a_root_grant_postgres,
         i4219_who_gives_up_a_root_grant
     );
@@ -2270,6 +2910,48 @@ mod postgres {
         .await
         .expect("I4217: a postgres Engine");
         Box::pin(super::i4217_a_hardware_held_owner_accepts_by_draft(&e)).await;
+    }
+
+    #[tokio::test]
+    async fn i4313_the_owner_withdraws_the_acceptance_postgres() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            return;
+        };
+        let e = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer("i4313-engine"),
+            &dsn,
+        )
+        .await
+        .expect("I4313: a postgres Engine");
+        Box::pin(super::i4313_the_owner_withdraws_the_acceptance(&e)).await;
+    }
+
+    #[tokio::test]
+    async fn i4314_a_hardware_owner_withdraws_the_acceptance_by_draft_postgres() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            return;
+        };
+        let e = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer("i4314-engine"),
+            &dsn,
+        )
+        .await
+        .expect("I4314: a postgres Engine");
+        Box::pin(super::i4314_a_hardware_owner_withdraws_the_acceptance_by_draft(&e)).await;
+    }
+
+    #[tokio::test]
+    async fn i4315_only_the_holders_count_withdraws_the_grant_postgres() {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            return;
+        };
+        let e = crate::Engine::with_signer(
+            crate::federation::tier_ingest::test_support::local_signer("i4315-engine"),
+            &dsn,
+        )
+        .await
+        .expect("I4315: a postgres Engine");
+        Box::pin(super::i4315_only_the_holders_count_withdraws_the_grant(&e)).await;
     }
 
     #[tokio::test]

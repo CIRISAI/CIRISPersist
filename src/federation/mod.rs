@@ -446,6 +446,10 @@ pub(crate) mod serve_seat_owner_invariants;
 /// freshness floor's rules.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod touch_local_invariants;
+/// v62.0.0 (KR-fix17; CC 2.4.1.1) — I4293–I4298: a retraction is placed
+/// where its target is; a host withdraws its own row with one verb.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod withdraw_statement_invariants;
 // v62.0.0 (P13) — every item inside is test-gated; so is the module.
 #[cfg(test)]
 pub(crate) mod silo_projection_invariants;

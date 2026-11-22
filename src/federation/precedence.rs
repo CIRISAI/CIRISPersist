@@ -249,7 +249,8 @@ pub fn stamp_policy(target: &Attestation) -> StampPolicy {
 pub enum StampPolicy {
     /// No stamp entitles: only the producer retracts.
     Never,
-    /// Only rule 1 or rule 5 entitles.
+    /// Only rule 0 (a count undoing a counted row,
+    /// `admission::COUNT_UNDOES_COUNTED_RULE`), rule 1 or rule 5 entitles.
     ProducerSide,
     /// Any stamp entitles.
     Any,
@@ -275,7 +276,9 @@ pub fn stamp_entitles(g: &Attestation, policy: StampPolicy) -> bool {
     };
     match policy {
         StampPolicy::Never => false,
-        StampPolicy::ProducerSide => matches!(rule, 1 | 5),
+        StampPolicy::ProducerSide => {
+            super::attestation_query::CARVED_OUT_ADMITTING_RULES.contains(&rule)
+        }
         StampPolicy::Any => true,
     }
 }

@@ -7004,7 +7004,12 @@ impl PyEngine {
     /// Returns a JSON array, one object per held counted `trust:confers:v1`
     /// grant to `grantee_key_id`: `{row_id, grantee, scope: [str],
     /// family_key_id, bundle (hex), bundle_in_force, accepted, withdrawn,
-    /// confers}`. `confers` is `accepted and not withdrawn`. A grant still
+    /// confers, acceptance_row_id}`. `confers` is `accepted and not
+    /// withdrawn`. `withdrawn` is the ROOT's counted withdrawal only
+    /// (KR-fix18): a grantee ends the conferral by withdrawing its
+    /// ACCEPTANCE (`acceptance_row_id`, null when none stands), after which
+    /// `accepted` and `confers` read false and the grant still lists. A
+    /// later acceptance of the same grant confers again. A grant still
     /// short of its holders' count is not listed (`held_rows_for` with role
     /// `root_holder` lists it for a holder). A holder drafts a grant with
     /// `statement_draft` (row type `delegates_to`, envelope `{"dimension":

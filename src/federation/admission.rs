@@ -5203,6 +5203,62 @@ pub fn counted_group_of(row: &super::Attestation) -> Option<(String, bool)> {
         .map(|a| (a.into_owned(), true))
 }
 
+/// v62.0.0 (KR-fix18.stamp; CC 2.4.1.1 rule 0: "a quorum's act is undone only
+/// by a quorum") — **the `withdraws_admission_rule` stamp of a COUNT that
+/// undoes a counted row**: the root's counted withdrawal of a root grant
+/// (`check_root_grant_withdrawal`), a group's counted withdrawal of its
+/// counted act (`check_counted_withdrawal`), the same count for a counted
+/// `admission:unit` (`check_admission_unit_withdrawal`), a group-plane
+/// row's protocol-admitted withdrawal (`group_plane::check_cosigned_withdraws`).
+///
+/// Before, each was stamped 1 when the withdrawal's FIRST voice happened to
+/// be the signer of the target's first voice, else 4. Neither was true (a
+/// counted row has no producer, and no delegation chain was walked), and the
+/// 4 retired nothing on read against a target the subject carve-out covers
+/// (`precedence::stamp_policy`: only the producer-side stamps count there):
+/// a counted row of an adverse class, e.g. a counted licence, withdrawn by
+/// its group's count with another first voice. (A root grant is not carved
+/// out; its 4 did retire it.) A 4 was also read by the consent folds as a
+/// subject's consent event (`consent_admit`: 2..=4). 0 is honoured wherever 1 is
+/// (`precedence::stamp_entitles`, `attestation_query::CARVED_OUT_ADMITTING_RULES`).
+///
+/// APPENDED to the value set: 1 to 5 keep their numbers and meanings; rows
+/// already stamped 1 or 4 read as before. The store's CHECK is 0..=5 (V300).
+pub const COUNT_UNDOES_COUNTED_RULE: u8 = 0;
+
+/// v62.0.0 (KR-fix17 rev 3; CC 2.4.1.1 rule 0, CC 2.6.1.3) — is `row` a
+/// COUNTED row: it carries an edition-2 statement and states no `author`
+/// (act = group)? Its "attester" is only the signer of its first voice;
+/// nobody is its author, and the author's rule 1 does not reach it.
+#[must_use]
+pub fn is_counted_row(row: &super::Attestation) -> bool {
+    super::edition2::voices::carried_row_id(row).is_some()
+        && row.attestation_envelope.get("author").is_none()
+}
+
+/// v62.0.0 (KR-fix17 rev 6; CC 2.4.1.1 rule 0) — **is this counted row ONE
+/// KEY's act, not a quorum's?** The deliberate exception rule 0 must not
+/// swallow: a licence counted in form (no `author`) whose dimension names a
+/// KEY authority (no community is held under the authority id: "a key
+/// authority has no quorum", [`counted_group_of`]) and whose first voice is
+/// that authority key's. Nobody else's count exists to undo it, so it keeps
+/// the ordinary rules. `false` for every other counted row.
+///
+/// # Errors
+/// Directory reads.
+pub async fn counted_row_is_one_keys_act(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<bool, Error> {
+    let Some((authority, true)) = counted_group_of(row) else {
+        return Ok(false);
+    };
+    Ok(
+        authority == row.attesting_key_id
+            && directory.lookup_community(&authority).await?.is_none(),
+    )
+}
+
 /// v62.0.0 (wave V1b; CC 2.4.1.1) — is `row` a COUNTED act of a named
 /// group ([`counted_group_of`])?
 #[must_use]
@@ -5284,11 +5340,7 @@ async fn check_counted_withdrawal(
                 )));
             };
             if community_quorum_at_head(directory, &c, row, &head, row.asserted_at).await? {
-                return Ok(Some(if row.attesting_key_id == target.attesting_key_id {
-                    1
-                } else {
-                    4
-                }));
+                return Ok(Some(COUNT_UNDOES_COUNTED_RULE));
             }
             format!(
                 "the group {named:?}'s quorum ({:?}) at the roster head it names",
@@ -5818,56 +5870,24 @@ pub async fn signs_for_root_grantee<F: super::FederationDirectory + ?Sized>(
     Ok(consenting_person(directory, signer_key).await?.as_deref() == Some(consenter.as_str()))
 }
 
-/// v62.0.0 (KR-fix8; CC 2.4.1.1 rule 3) — **may `signer_key` give up the
-/// root grant to `grantee`, on the grantee's own rule?** Exactly two keys
-/// may, each compared by its OWN identity (`active_identity_for_occurrence`:
-/// a person's occurrence key answers by its person), never lifted to an
-/// owner:
-///
-/// - **the grantee itself**: a grantee may always give up what it was
-///   granted, a machine included (the worker node's own key);
-/// - **the grantee's consenter** ([`signs_for_root_grantee`]): the grantee's
-///   person, or a machine grantee's owner, by the owner's own key.
-///
-/// Before KR-fix8 this compared `writer_principal(signer)` with
-/// the consenter. That lifts ANY node bound to an owner to that owner, so
-/// the worker passed only by the lift, and a SIBLING node of the same owner
-/// (not the grantee) could withdraw another node's grant.
-///
-/// # Errors
-/// Directory reads.
-pub async fn may_withdraw_root_grant<F: super::FederationDirectory + ?Sized>(
-    directory: &F,
-    signer_key: &str,
-    grantee: &str,
-    at: chrono::DateTime<chrono::Utc>,
-) -> Result<bool, Error> {
-    // The grantee itself, by its raw key or as one of the grantee person's
-    // devices; a node grantee is its own key and nothing more.
-    if signer_key == grantee {
-        return Ok(true);
-    }
-    let grantee_person = directory.active_identity_for_occurrence(grantee).await?;
-    if consenting_person(directory, signer_key).await?.as_deref() == Some(grantee_person.as_str()) {
-        return Ok(true);
-    }
-    signs_for_root_grantee(directory, signer_key, grantee, at).await
-}
-
 /// v62.0.0 (KR-fix2; CC 2.4.1.1 rule 0, CC 4.5.5 "a seat stands on its own")
 /// — **the `withdraws` of a counted root grant**, decided on its own rule.
 /// `Ok(None)`: `target` is no root grant (the caller's rules apply).
 ///
-/// - the GRANTEE's own withdrawal: an authored `withdraws` signed for the
-///   grantee ([`root_grant_consenter`] at the withdrawal's instant: the
-///   grantee's person, or a machine grantee's owner): rule 3;
+/// - **NOT the grantee's** (KR-fix18; CC 2.4.1.1 rule 0, as Constitution
+///   ruled: "persist's 'grantee withdraws the grant' door goes"). The grant
+///   is the HOLDERS' consent, a counted row; only a count undoes it. The
+///   grantee's consent is their ACCEPTANCE, an authored row of theirs: they
+///   end the conferral by withdrawing THAT (rule 1;
+///   `membership_acceptance::root_grant_acceptance_at` reads it). Do not
+///   re-open a grantee arm here;
 /// - the ROOT's withdrawal: a counted `withdraws` (no `author`) whose
 ///   `refs.head` names a held Valid bundle of the same accord, at a strict
 ///   majority of THAT bundle's holders ([`root_grant_reading`] over the
 ///   withdrawal's own voices; judged against the bundle it names and by the
 ///   voices dated before its successor, as the grant is). Short, or its
 ///   bundle not held, it waits (`count_short`).
-///   Rule 1 when its first voice signed the grant's, else 4;
+///   Stamped rule 0 ([`COUNT_UNDOES_COUNTED_RULE`]);
 /// - any other `withdraws` (one holder's authored one included) is refused
 ///   [`Error::WithdrawsNotAdmitted`]: the root's act is never undone by one
 ///   key.
@@ -5890,20 +5910,9 @@ async fn check_root_grant_withdrawal(
     let counted = super::edition2::voices::carried_row_id(row).is_some()
         && row.attestation_envelope.get("author").is_none();
     if !counted {
-        // KR-fix8 — the grantee's own key, or its consenter's own key; never
-        // a key lifted to its owner (`may_withdraw_root_grant`).
-        return if may_withdraw_root_grant(
-            directory,
-            &row.attesting_key_id,
-            &target.attested_key_id,
-            row.asserted_at,
-        )
-        .await?
-        {
-            Ok(Some(3))
-        } else {
-            Err(not_admitted())
-        };
+        // KR-fix18 — an AUTHORED withdrawal of the counted grant is nobody's
+        // to make: not a lone holder's, not the grantee's, not its owner's.
+        return Err(not_admitted());
     }
     let Some(head) = edition2_named_head(row) else {
         return Err(not_admitted());
@@ -5926,11 +5935,7 @@ async fn check_root_grant_withdrawal(
         return Err(not_admitted());
     }
     if reading.count.met() {
-        return Ok(Some(if row.attesting_key_id == target.attesting_key_id {
-            1
-        } else {
-            4
-        }));
+        return Ok(Some(COUNT_UNDOES_COUNTED_RULE));
     }
     super::edition2::voices::note_short();
     Err(Error::InvalidArgument(format!(
@@ -6006,13 +6011,19 @@ pub struct RootGrantView {
     /// The grantee's consent is held (its acceptance, or a machine grantee's
     /// owner's).
     pub accepted: bool,
-    /// A withdrawal of the grant is held (the grantee's own, or the root's
-    /// counted one).
+    /// The grant itself is withdrawn: the root's counted withdrawal is held
+    /// (the holders' consent taken back; KR-fix18: never the grantee's).
     pub withdrawn: bool,
     /// `accepted && !withdrawn`: the grant confers its `scope` on the
     /// grantee, as far as the grant itself goes. Whether THIS node honours
     /// the root is the capability walk's leg.
     pub confers: bool,
+    /// KR-fix18 — the acceptance row that gives the grantee's consent now
+    /// (hex), when `accepted`: what its signer withdraws to END the conferral
+    /// (`Engine::withdraw_statement`). `None`: no standing acceptance (never
+    /// accepted, declined, or the acceptance was withdrawn).
+    #[serde(default)]
+    pub acceptance_row_id: Option<String>,
 }
 
 /// v62.0.0 (KR-fix2) — **the counted grants from the root that `grantee`
@@ -6066,6 +6077,10 @@ pub async fn root_grants_for(
             accepted: g.accepted,
             withdrawn,
             confers: g.accepted && !withdrawn,
+            acceptance_row_id: super::membership_acceptance::root_grant_acceptance_at(
+                directory, row, t,
+            )
+            .await?,
         });
     }
     Ok(out)
@@ -6121,6 +6136,55 @@ pub async fn root_grant_of(
         bundle_in_force: reading.in_force,
         accepted: super::membership_acceptance::root_grant_accepted_at(directory, grant, t).await?,
     }))
+}
+
+/// v62.0.0 (KR-fix18; CC 2.4.1.1 rule 1, CC 3.1.3.2, as Constitution ruled
+/// 2026-11-21: "a conferral is two consents … either may be taken back by
+/// the one who gave it, alone") — **the `withdraws` of a root grant's
+/// ACCEPTANCE**, decided on its own rule. `Ok(None)`: `target` is no such
+/// acceptance (the caller's rules apply).
+///
+/// The acceptance is the grantee's consent, an authored row: a person
+/// grantee's own, or the OWNER's for a node or agent grantee. It is taken
+/// back by the party that gave it and nobody else
+/// (`membership_acceptance::same_consenting_party`: the same key, or another
+/// key of the same person): rule 1. So:
+///
+/// - the grantee NODE's own key does not withdraw its owner's acceptance ("a
+///   node gives no consent", and takes none back for its owner), though the
+///   acceptance is attested to it: the subject rules 2 to 4 are not asked;
+/// - an agent grantee's own key does not either (its owner accepted);
+/// - a holder, a sibling node, a stranger: refused.
+///
+/// What the withdrawal does is read, not written:
+/// `membership_acceptance::root_grant_acceptance_at` stops counting the
+/// acceptance from the withdrawal's own instant on. The grant row is not
+/// touched.
+///
+/// # Errors
+/// [`Error::WithdrawsNotAdmitted`]; directory reads.
+async fn check_root_grant_acceptance_withdrawal(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    target: &super::Attestation,
+) -> Result<Option<u8>, Error> {
+    if !super::membership_acceptance::is_root_grant_acceptance(directory, target).await? {
+        return Ok(None);
+    }
+    if super::membership_acceptance::same_consenting_party(
+        directory,
+        &row.attesting_key_id,
+        &target.attesting_key_id,
+    )
+    .await?
+    {
+        return Ok(Some(1));
+    }
+    Err(Error::WithdrawsNotAdmitted {
+        issuer: row.attesting_key_id.clone(),
+        target_attestation_id: target.attestation_id.clone(),
+        beyond_delegation_depth_cap: false,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -6696,11 +6760,7 @@ async fn check_admission_unit_withdrawal(
             if target_group.as_deref() != Some(group.as_str()) {
                 return Err(not_admitted());
             }
-            Ok(Some(if row.attesting_key_id == target.attesting_key_id {
-                1
-            } else {
-                4
-            }))
+            Ok(Some(COUNT_UNDOES_COUNTED_RULE))
         }
         HeadCount::Short { group, detail } => {
             if group.is_some() && group != target_group {
@@ -12207,8 +12267,57 @@ pub async fn resolve_withdraws_admission_rule_at(
     target: &super::Attestation,
     depth: usize,
 ) -> Result<u8, Error> {
+    // Rule 0 (KR-fix17 rev 5, rev 6; CC 2.4.1.1: "Rules 1 to 4 do not reach
+    // T: a quorum's act is undone only by a quorum") — A COUNTED TARGET
+    // REACHES NONE OF RULES 1 TO 4. A counted row has no author: its
+    // `attesting_key_id` is only the signer of its FIRST voice, one voice of
+    // the act. So not its first signer (rule 1), not a subject it names
+    // (rule 2), not a proxy or a delegate of either (rules 3, 4) undoes it
+    // alone. What undoes a counted row is decided before this function, per
+    // kind (`check_withdraws_admission_against`): the group's COUNTED
+    // withdrawal at the same protocol (`check_counted_withdrawal`), the
+    // root's counted withdrawal over the named bundle's holders
+    // (`check_root_grant_withdrawal`), the same count for an
+    // `admission:unit` (`check_admission_unit_withdrawal`), either voice of
+    // a one-seat floor act (`check_floor_act_withdrawal`, as ruled 11-21).
+    // What a subject has is their OWN acts (their resignation, the consent
+    // they gave, each an authored row of theirs), reconsideration, and the
+    // deletion duties.
+    //
+    // THE ONE EXCEPTION, kept on purpose (`check_withdraws_admission_against`:
+    // "a licence of a KEY authority … is not a group's act and keeps the
+    // rules below"): a licence counted in FORM whose authority is a single
+    // key, signed by that key, is one key's act, not a quorum's
+    // (`counted_row_is_one_keys_act`). It keeps rules 1 to 4 as before.
+    if is_counted_row(target) && !counted_row_is_one_keys_act(directory, target).await? {
+        return Err(Error::WithdrawsNotAdmitted {
+            issuer: issuer.to_string(),
+            target_attestation_id: target.attestation_id.clone(),
+            beyond_delegation_depth_cap: false,
+        });
+    }
     // Rule 1 — producer self-revocation (no DB walk).
     if issuer == target.attesting_key_id {
+        return Ok(1);
+    }
+    // Rule 1, the same PERSON from another of their keys — v62.0.0
+    // (KR-fix17 rev 2; CC 3.3.6: a person's devices are that one person's
+    // keys; CC 3.1.3.2). The raw comparison above asks about the KEY, so a
+    // person could not retract their own row from a second device: the rule
+    // "the row's producer may withdraw it" was implemented for one key only.
+    // BOTH sides are resolved, device to person, by the one consent reading
+    // (`membership_acceptance::same_consenting_party` over
+    // `consenting_person`): it follows no owner binding, so a NODE never
+    // retracts as its owner (CC 3.1.3.2: a node gives no retraction of the
+    // person's row), and an agent is only itself. The owner retracting what
+    // their node produced is the arm below, unchanged.
+    if super::membership_acceptance::same_consenting_party(
+        directory,
+        issuer,
+        &target.attesting_key_id,
+    )
+    .await?
+    {
         return Ok(1);
     }
     // Rule 1, lifted to the producer's PRINCIPAL — v51.0.0 (CIRISPersist#941,
@@ -12860,10 +12969,16 @@ pub(crate) async fn check_withdraws_admission_against(
     if let Some(rule) = check_admission_unit_withdrawal(directory, row, target).await? {
         return Ok(Some(rule));
     }
-    // v62.0.0 (KR-fix2; CC 3.2) — a counted grant from the root is withdrawn
-    // by its grantee (or a machine grantee's owner) or by the root's counted
-    // withdrawal over the bundle in force; no other rule reaches it.
+    // v62.0.0 (KR-fix2, KR-fix18; CC 3.2, CC 2.4.1.1 rule 0) — a counted
+    // grant from the root is withdrawn by the root's counted withdrawal over
+    // the bundle it names, and by nothing else: not its grantee, not a
+    // machine grantee's owner (they withdraw their ACCEPTANCE, below).
     if let Some(rule) = check_root_grant_withdrawal(directory, row, target).await? {
+        return Ok(Some(rule));
+    }
+    // v62.0.0 (KR-fix18; CC 2.4.1.1 rule 1) — the ACCEPTANCE of a root grant
+    // is the grantee's consent, taken back only by the one who gave it.
+    if let Some(rule) = check_root_grant_acceptance_withdrawal(directory, row, target).await? {
         return Ok(Some(rule));
     }
     if let Some((group, by_dimension)) = counted_group_of(target) {

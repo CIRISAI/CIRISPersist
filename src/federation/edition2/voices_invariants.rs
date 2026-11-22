@@ -958,9 +958,27 @@ pub(crate) async fn licence_withdrawal_body(d: &dyn FederationDirectory) {
         .unwrap()
         .expect("I3297 the withdrawal is held");
     assert!(
-        matches!(landed.withdraws_admission_rule, Some(1 | 4)),
-        "I3297 the counted withdrawal is admitted with a rule: {:?}",
         landed.withdraws_admission_rule
+            == Some(crate::federation::admission::COUNT_UNDOES_COUNTED_RULE),
+        "I3297 the counted withdrawal is stamped rule 0, a count's own undoing: {:?}",
+        landed.withdraws_admission_rule
+    );
+    // KR-fix18.stamp — a licence is an adverse class (`licensure:`), so the
+    // fold honours only the producer-side stamps against it
+    // (`StampPolicy::ProducerSide`). The group's count must be one of them
+    // whoever voiced first: before, a count whose first voice was not the
+    // licence's first signer was stamped 4 and the fold did not count it.
+    assert_eq!(
+        crate::federation::precedence::stamp_policy(&held),
+        crate::federation::precedence::StampPolicy::ProducerSide,
+        "I3297 premise: a counted licence is a carved-out target"
+    );
+    assert!(
+        crate::federation::precedence::stamp_entitles(
+            &landed,
+            crate::federation::precedence::StampPolicy::ProducerSide
+        ),
+        "I3297 the group's count is honoured against a carved-out target by its STAMP (rule 0)"
     );
     assert!(
         !licence_issued(d, &holder_kid, &aff).await,

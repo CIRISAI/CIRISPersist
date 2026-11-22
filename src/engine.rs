@@ -528,6 +528,11 @@ pub struct RootStanding {
     pub through: Option<RootedThrough>,
     /// While rootless, the plane that waits ([`Self::WAITING_PLANE`]).
     pub waiting: Option<&'static str>,
+    /// v62.0.0 (GB-fix2) — set when this store holds a genesis that is NOT
+    /// the one this build bakes (nor its lineage): the stable token
+    /// `genesis_store_root_is_not_the_baked_genesis`, the held root(s) and the
+    /// baked bundle. Reported only: what the held genesis roots is unchanged.
+    pub foreign_genesis: Option<crate::federation::edition2::genesis::ForeignGenesis>,
 }
 
 /// v62.0.0 (KB-fix5) — whose acceptance edge a rooted node's chain reads
@@ -5447,6 +5452,93 @@ impl Engine {
             Some(community_id),
         )
         .await
+    }
+
+    /// v62.0.0 (KR-fix17; CC 2.4.1.1) — **withdraw a held row**: `signer`'s
+    /// `withdraws` of the row `row_id_hex`, placed where that row is (its
+    /// `cohort_scope`, its room) and about the key it is about
+    /// ([`withdrawal_envelope_of`](crate::federation::membership_acceptance::withdrawal_envelope_of)),
+    /// stated by the one composer producer and admitted through the
+    /// statement door. Returns the withdrawal's row id.
+    ///
+    /// WHO may withdraw is the door's: the row's own author (any key of the
+    /// same person), a listed subject, the proxies the withdraws rules name.
+    /// In a room, the signer's principal must be a member of the TARGET's
+    /// room. A host withdraws its own membership proposal, its own row in a
+    /// room, its own grant this way.
+    ///
+    /// # Errors
+    /// `InvalidArgument` when no row `row_id_hex` has landed here (a row
+    /// still held for a count cannot be withdrawn by this verb); the door's
+    /// refusals.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn withdraw_statement(
+        &self,
+        signer: &crate::signing::LocalSigner,
+        row_id_hex: &str,
+    ) -> Result<String, crate::federation::Error> {
+        let target = self.withdrawal_target(row_id_hex).await?;
+        let envelope = crate::federation::membership_acceptance::withdrawal_envelope_of(&target)?;
+        let mut input = crate::federation::EmitAttestationInput::with_envelope(
+            crate::federation::types::attestation_type::WITHDRAWS,
+            crate::federation::envelope::EnvelopeCore::from_value(envelope)?,
+            target.cohort_scope.clone(),
+        );
+        input.attested_key_id = Some(target.attested_key_id.clone());
+        self.emit_attestation(signer, input).await
+    }
+
+    /// v62.0.0 (KR-fix17) — [`Self::withdraw_statement`] **drafted for a
+    /// signer whose key is not in this process** (hardware): the same
+    /// envelope and placement through [`Self::statement_draft`] (the one
+    /// payload builder). The host signs `sig_structure`, assembles
+    /// (`Draft::assemble`) and submits with [`Self::submit_voice`].
+    ///
+    /// # Errors
+    /// As [`Self::withdraw_statement`] and [`Self::statement_draft`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn withdraw_statement_draft(
+        &self,
+        row_id_hex: &str,
+        signer_iss: &str,
+        signer_kid_hex: &str,
+        asserted_at_ms: u64,
+    ) -> Result<crate::federation::edition2::emit::Draft, crate::federation::Error> {
+        let target = self.withdrawal_target(row_id_hex).await?;
+        let mut envelope =
+            crate::federation::membership_acceptance::withdrawal_envelope_of(&target)?;
+        if let Some(o) = envelope.as_object_mut() {
+            o.insert(
+                "cohort_scope".to_owned(),
+                serde_json::Value::String(target.cohort_scope.clone()),
+            );
+        }
+        self.statement_draft(
+            crate::federation::types::attestation_type::WITHDRAWS,
+            &envelope,
+            signer_iss,
+            signer_kid_hex,
+            &target.attested_key_id,
+            asserted_at_ms,
+            Some(row_id_hex),
+        )
+        .await
+    }
+
+    /// The landed row a withdrawal names.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn withdrawal_target(
+        &self,
+        row_id_hex: &str,
+    ) -> Result<crate::federation::Attestation, crate::federation::Error> {
+        self.federation_directory()
+            .get_attestation(row_id_hex)
+            .await?
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "withdraw_statement: no row {row_id_hex} has landed here"
+                ))
+            })
     }
 
     /// v9.3.0 (CIRISPersist#249, CEG §3.2.3 / FSD-002 §2.2.3 withdraws) —
@@ -11288,6 +11380,10 @@ impl Engine {
                 root: None,
                 through: None,
                 waiting: Some(RootStanding::WAITING_PLANE),
+                foreign_genesis: crate::federation::edition2::genesis::foreign_genesis(
+                    dir.as_ref(),
+                )
+                .await?,
             });
         };
         let now = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0);
@@ -11305,10 +11401,13 @@ impl Engine {
             }
         });
         let waiting = root.is_none().then_some(RootStanding::WAITING_PLANE);
+        let foreign_genesis =
+            crate::federation::edition2::genesis::foreign_genesis(dir.as_ref()).await?;
         Ok(RootStanding {
             root,
             through,
             waiting,
+            foreign_genesis,
         })
     }
 

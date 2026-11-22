@@ -638,18 +638,31 @@ pub(crate) async fn composer_gate_dimension(
                 )
                 .map(str::to_owned));
             }
-            if let Some(dep) = crate::federation::edition2::fold::Dep::row_hex(&target) {
-                crate::federation::edition2::fold::reads(dep);
-            }
-            Err(crate::federation::edition2::fold::hold(
-                crate::federation::edition2::fold::reason::LINK_UNHELD,
-                crate::federation::Error::WithdrawsTargetUnheld {
-                    attestation_id: row.attestation_id.clone(),
-                    target_attestation_id: target,
-                },
-            ))
+            Err(withdraws_target_unheld(&row.attestation_id, &target))
         }
     }
+}
+
+/// v62.0.0 (PIN-fix2, KR-fix17) — **the wait of a composer whose target this
+/// node does not hold**: the target's row is declared as a read, and the row
+/// is held `link_unheld` with `WithdrawsTargetUnheld` (re-folded when the
+/// target arrives). ONE construction, for the dimension gate
+/// ([`composer_gate_dimension`]) and the placement gate
+/// (`membership_acceptance::composer_placement`).
+pub(crate) fn withdraws_target_unheld(
+    attestation_id: &str,
+    target: &str,
+) -> crate::federation::Error {
+    if let Some(dep) = crate::federation::edition2::fold::Dep::row_hex(target) {
+        crate::federation::edition2::fold::reads(dep);
+    }
+    crate::federation::edition2::fold::hold(
+        crate::federation::edition2::fold::reason::LINK_UNHELD,
+        crate::federation::Error::WithdrawsTargetUnheld {
+            attestation_id: attestation_id.to_owned(),
+            target_attestation_id: target.to_owned(),
+        },
+    )
 }
 
 async fn execute_planned<D>(

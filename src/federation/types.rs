@@ -1777,6 +1777,10 @@ pub struct Attestation {
     /// v3.7.0 (CIRISPersist#146, CEG 0.6 §3.2.3). Per-rule audit
     /// metadata: which admission rule admitted this withdraws.
     ///
+    /// `Some(0)` — v62.0.0 (KR-fix18.stamp, CC 2.4.1.1 rule 0) — a COUNT undid a
+    ///             counted row: the group's / the root's counted withdrawal
+    ///             (`admission::COUNT_UNDOES_COUNTED_RULE`). Appended; 1 to 5
+    ///             keep their meanings.
     /// `Some(1)` — producer self-revocation (`issuer.key_id == T.attesting_key_id`).
     /// `Some(2)` — subject self-revocation (`issuer.key_id ∈ T.subject_key_ids`, CEG 0.6 NEW).
     /// `Some(3)` — `delegates_to` proxy chain with `consent_revocation` scope (CEG 0.6 NEW).

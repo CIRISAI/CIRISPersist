@@ -1125,7 +1125,7 @@ mod lifecycle_predicate {
             assert!(
                 sql.contains(
                     "OR (c.withdraws_admission_rule IS NOT NULL \
-                     AND (c.withdraws_admission_rule IN (1, 5) OR NOT ((COALESCE(("
+                     AND (c.withdraws_admission_rule IN (1, 5, 0) OR NOT ((COALESCE(("
                 ),
                 "{sql}"
             );

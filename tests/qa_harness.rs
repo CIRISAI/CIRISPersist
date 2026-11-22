@@ -1163,4 +1163,17 @@ async fn ceremony_verbs_are_awaitable_in_a_spawned_task() {
     spawned!("root_grants_for", |e, a| e
         .root_grants_for(&a.node, None)
         .await);
+    // KR-fix17 — the withdrawal verbs.
+    spawned!("withdraw_statement", |e, a| {
+        let signer = LocalSigner::from_parts(
+            SigningKey::from_bytes(&[0x17u8; 32]),
+            "qa-withdraw".to_owned(),
+            None,
+            None,
+        );
+        e.withdraw_statement(&signer, &a.hex32).await
+    });
+    spawned!("withdraw_statement_draft", |e, a| e
+        .withdraw_statement_draft(&a.hex32, &a.owner, &a.hex32, 1)
+        .await);
 }
