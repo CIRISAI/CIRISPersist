@@ -5,6 +5,34 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
+## [61.4.4] - UNRELEASED
+
+Persist's LTS line moves to CIRISVerify v22.2.4. Nothing in persist's own code changes. A host that pins persist 61.4.x and wants Verify's 22.2.x fixes needs this release: Cargo treats a different git tag as a different source, so a host on Verify 22.2.4 beside a persist pinned at 22.2.0 would build two copies of Verify.
+
+### Changed
+
+- **`ciris-keyring`, `ciris-verify-core` and `ciris-crypto` are pinned at tag `v22.2.4`, were `v22.2.0`** (all seven pin lines in `Cargo.toml`, moved together). What that brings, in Verify's words:
+  - 22.2.1 drops `hickory-resolver` and takes the `rustix` and `quinn-udp` advisory fixes.
+  - 22.2.2 signs `valid_until` with millisecond precision, as `.sssZ` (CIRISPersist#659).
+  - 22.2.3 makes self-verification find Verify's module by address, and adds two serde-defaulted fields to `SelfVerificationResult`.
+  - 22.2.4 takes `url` 2.5.9.
+- **`url` is 2.5.9 in the lock, was 2.5.8** (RUSTSEC-2026-0592).
+
+### Removed
+
+- **Seventeen advisory exemptions in `deny.toml`.** They covered `hickory-proto`, which reached persist only through Verify's resolver. No hickory crate is in the dependency graph now, so `cargo deny` reported that each exemption matched nothing.
+
+### Adoption notes (CIRISEdge, CIRISServer)
+
+- Move persist to 61.4.4 and Verify to tag `v22.2.4` in the same change. Either one alone gives two Verify source trees.
+- No persist API, schema or stored format changes. No migration runs.
+- `SelfVerificationResult` gains two fields that default when absent. A consumer that builds one with a struct literal needs them; one that reads fields does not.
+
+### Tested
+
+- The full certify suite on sqlite and postgres, against the new pins.
+- `cargo deny --all-features check`: advisories, bans, licenses and sources all pass with the seventeen exemptions removed.
+
 ## [61.4.3] - 2026-11-21
 
 Read telemetry can name more callers. A host credits its reads to a caller label so that workload can be attributed and shed in an emergency; the label set held 32, CIRISEdge names 26 of them, and that left CIRISServer about 5. Reads past the cap are counted under `other`, so on a busy node most of the server's reads could not be told apart.
