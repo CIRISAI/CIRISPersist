@@ -636,6 +636,30 @@ fn bundle_payload(
     seats: &[SeatV2],
     extra_rows: &[NamedRow],
 ) -> Value {
+    bundle_payload_scoped(
+        spec,
+        version,
+        prev,
+        asserted_at_ms,
+        holders,
+        seats,
+        extra_rows,
+        &["infra:attest".to_owned(), "infra:serve".to_owned()],
+    )
+}
+
+/// [`bundle_payload`] with the charter's `scope` stated by the caller.
+#[allow(clippy::too_many_arguments)]
+fn bundle_payload_scoped(
+    spec: &CeremonySpec,
+    version: u64,
+    prev: Option<&Digest32>,
+    asserted_at_ms: u64,
+    holders: &[HolderV2],
+    seats: &[SeatV2],
+    extra_rows: &[NamedRow],
+    scope: &[String],
+) -> Value {
     super::genesis::bundle_payload(&super::genesis::BundleTerms {
         version,
         prev: prev.copied(),
@@ -654,7 +678,7 @@ fn bundle_payload(
             .iter()
             .map(|h| (h.identity_ref.clone(), h.recovery_commitment))
             .collect(),
-        scope: vec!["infra:attest".to_owned(), "infra:serve".to_owned()],
+        scope: scope.to_vec(),
         halt_fuse_secs: Some(86_400),
     })
 }
@@ -745,6 +769,50 @@ pub fn ceremony_v2(spec: &CeremonySpec) -> TestCeremonyV2 {
         &signers,
         None,
     )
+}
+
+/// v62.0.0 (KR-fix19) — [`ceremony_v2`] whose charter carries `scope`
+/// instead of the fixture's two (`infra:attest`, `infra:serve`): the same
+/// holders, seats, records and instants, so the same keys sign; only the
+/// bundle's payload (and so its object id and voices) differs. For a witness
+/// that needs what the PRODUCTION charter confers (`infra:detect`,
+/// `infra:attest_assurance`, …), with the scope list read from the baked
+/// genesis, never typed.
+///
+/// # Panics
+/// As [`ceremony_v2`].
+#[must_use]
+pub fn ceremony_v2_with_scope(spec: &CeremonySpec, scope: &[String]) -> TestCeremonyV2 {
+    let c = ceremony_v2(spec);
+    let payload = bundle_payload_scoped(
+        spec,
+        c.version,
+        c.prev.as_ref(),
+        c.asserted_at_ms,
+        &c.holders,
+        &c.seats,
+        &c.extra_rows,
+        scope,
+    );
+    let object_id = RowId::of_object(GENESIS_BUNDLE_TYP, None, &cde::encode(&payload)).0;
+    let voices = c
+        .holders
+        .iter()
+        .map(|h| {
+            voice(
+                &test_key(h.seed),
+                &h.identity_ref,
+                &payload,
+                c.asserted_at_ms,
+            )
+        })
+        .collect();
+    TestCeremonyV2 {
+        payload,
+        voices,
+        object_id,
+        ..c
+    }
 }
 
 /// v62.0.0 (C4-fix2) — one holder minted otherwise than [`ceremony_v2`]

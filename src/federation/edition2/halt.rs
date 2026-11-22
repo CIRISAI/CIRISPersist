@@ -42,11 +42,19 @@
 //! | constitutional          | **latch** (receipt)  | changes nothing (the fuse is not reset)    | changes nothing |
 //! | `confirmed` (counted)   | changes nothing      | **confirm**, if it names this halt         | changes nothing |
 //! | `active` (counted)      | changes nothing      | **resume**, if it names this halt          | **resume**, if it names this halt |
-//! | time                    | —                    | **lapses** at receipt + `halt_fuse_secs`   | never lapses    |
+//! | time                    | —                    | **lapses** once `halt_fuse_secs` are COUNTED | never lapses  |
 //!
-//! - The fuse counts from RECEIPT on this node's clock (the active halt's
-//!   `set_at`), never from the signed `asserted_at`, and its length is the
-//!   bundle in force's `halt_fuse_secs` (86400 when the charter omits it).
+//! - v62.0.0 (HALT-235; CIRISVerify 23.5.0, a SECURITY release) — the fuse
+//!   is ELAPSED time counted on this node's monotonic fuse clock from
+//!   receipt ([`halt_reading`]; Verify's `HaltLatch::advance`), never a
+//!   wall-clock deadline: a wall clock set forward no longer lapses a real
+//!   halt. The latch (its counted `elapsed_ms` and last checkpoint) is stored
+//!   whole with the halt row (`accord_active_halt.latch_json`) at every door
+//!   that judges an accord row and at [`checkpoint_fuse`]; across a process
+//!   restart nothing is counted (a new boot), so it runs long, never short.
+//!   A row stored without a latch re-derives it from the invocation it names
+//!   at zero elapsed (never un-halted). Its length is the bundle in force's
+//!   `halt_fuse_secs` (86400 when the charter omits it); `set_at` is a report.
 //! - A lapsed halt is gone before anything else is judged: a confirmation
 //!   counted after the fuse confirms nothing, and a fresh halt latches anew.
 //! - A confirmation is KEPT as the latch's state: the counted `confirmed` row
@@ -66,6 +74,9 @@ use ciris_verify_core::cde::Value;
 use ciris_verify_core::edition2::family::SelectContext;
 use ciris_verify_core::edition2::identity_ref;
 
+pub use ciris_verify_core::accord_halt_latch::{
+    ForwardRow, HaltLatch, LatchOutcome, MonotonicReading,
+};
 pub use ciris_verify_core::edition2::accord_halt::{
     named_accord_root, named_head, verify_invocation_row, verify_lifecycle_row, HaltReading,
     HaltRefusal, HaltRoster, HaltWaiting, InvocationRow, InvokeKind, LifecycleKind, LifecycleRow,
@@ -378,7 +389,9 @@ where
     put_invocation_at(dir, bytes, roster, crate::host::clock::now()).await
 }
 
-/// [`put_invocation`] received at `now` (the latch's clock).
+/// [`put_invocation`] received at `now` (the wall instant of receipt: a
+/// report, and the `valid_until` comparison; the fuse is counted on
+/// [`halt_reading`]).
 ///
 /// # Errors
 /// As [`put_invocation`].
@@ -387,6 +400,24 @@ pub async fn put_invocation_at<F>(
     bytes: &[u8],
     roster: Option<&HaltRoster>,
     now: DateTime<Utc>,
+) -> Result<InvocationOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    put_invocation_with(dir, bytes, roster, now, halt_reading()).await
+}
+
+/// v62.0.0 (HALT-235) — [`put_invocation_at`] at an explicit fuse
+/// `reading` (the witnesses' seam).
+///
+/// # Errors
+/// As [`put_invocation`].
+pub(crate) async fn put_invocation_with<F>(
+    dir: &F,
+    bytes: &[u8],
+    roster: Option<&HaltRoster>,
+    now: DateTime<Utc>,
+    reading: MonotonicReading,
 ) -> Result<InvocationOutcome, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -474,7 +505,9 @@ where
                     && constitutional.get(row).copied().unwrap_or(false)
                     && dir.get_active_halt(accord_root).await?.is_none()
                 {
-                    dir.set_active_halt(accord_root, &row.hex()).await?;
+                    // HALT-235 — no latch yet: the next read re-derives it
+                    // from this invocation (elapsed zero).
+                    dir.set_active_halt(accord_root, &row.hex(), None).await?;
                 }
             }
             _ => {}
@@ -488,12 +521,21 @@ where
             held: true,
         });
     }
-    let latched = inv.kind() == InvokeKind::Constitutional
+    let mut latched = inv.kind() == InvokeKind::Constitutional
         && new
-        && latch_allows(dir, roster, &inv, own, now).await?;
+        && latch_allows(dir, roster, &inv, own, now, reading).await?;
     if latched {
-        dir.set_active_halt(accord_root, &hex::encode(inv.row_id()))
-            .await?;
+        // v62.0.0 (HALT-235; CIRISVerify 23.5.0) — the halt latches on a
+        // clear latch at this reading: its fuse is counted from here.
+        let fuse = u64::from(roster.halt_fuse_secs());
+        let mut latch = HaltLatch::new();
+        latched = matches!(
+            latch.apply_forward(ForwardRow::Invocation(&inv), reading, ms_of(now), fuse),
+            LatchOutcome::Paused
+        );
+        if latched {
+            store_latch(dir, accord_root, &hex::encode(inv.row_id()), &latch).await?;
+        }
     }
     Ok(InvocationOutcome {
         invocation: inv,
@@ -528,7 +570,7 @@ where
 
 // ------------------------------------------------------------------ the latch
 
-/// v62.0.0 (C2-fix) — the halt in force for an accord at an instant
+/// v62.0.0 (C2-fix; HALT-235) — the halt in force for an accord
 /// ([`halt_in_force`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HaltInForce {
@@ -537,12 +579,59 @@ pub struct HaltInForce {
     /// The halt's row id; `None` for an id that is not one (a halt of the
     /// earlier form, which no edition-2 row confirms or ends).
     pub halt_row: Option<RowId>,
-    /// When THIS node received it: the fuse's origin.
+    /// When THIS node received it, on its wall clock: a REPORT. Nothing
+    /// decides on it (the fuse is the latch's counted elapsed time).
     pub received_at: DateTime<Utc>,
     /// Confirmed by a counted `confirmed` row before its fuse ran.
     pub confirmed: bool,
-    /// When it lapses: `None` once confirmed (or for an earlier-form halt).
-    pub lapses_at: Option<DateTime<Utc>>,
+    /// v62.0.0 (HALT-235) — the fuse time a lone halt has left, in
+    /// milliseconds of counted (monotonic) time; `None` once confirmed, for
+    /// an earlier-form halt, or for a latch that could not be re-derived
+    /// (which never lapses).
+    pub remaining_ms: Option<u64>,
+    /// v62.0.0 (HALT-235) — the node's latch, advanced to the reading this
+    /// answer was made at (`None` for an earlier-form halt or one that could
+    /// not be re-derived). The door stores it.
+    pub latch: Option<HaltLatch>,
+}
+
+/// v62.0.0 (HALT-235; CIRISVerify 23.5.0) — **one reading of this node's
+/// fuse clock**: the host clock seam's monotonic reading, under a boot
+/// identity drawn once per process. Persist's node profile carries no
+/// verify-core `host` tier (`FuseMeter`), so every process start is a new
+/// boot: `HaltLatch::advance` counts ZERO across a restart, which only ever
+/// extends a halt (it runs long, never short). A wall-clock change moves
+/// nothing here.
+#[must_use]
+pub fn halt_reading() -> MonotonicReading {
+    use std::sync::OnceLock;
+    static BOOT: OnceLock<[u8; 16]> = OnceLock::new();
+    let boot = *BOOT.get_or_init(|| {
+        use sha2::Digest as _;
+        let mut h = sha2::Sha256::new();
+        h.update(b"ciris.persist.fuse-boot.v1");
+        h.update(
+            crate::host::clock::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+                .to_le_bytes(),
+        );
+        h.update(
+            crate::host::clock::current()
+                .monotonic()
+                .as_nanos()
+                .to_le_bytes(),
+        );
+        let d = h.finalize();
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&d[..16]);
+        b
+    });
+    MonotonicReading {
+        monotonic_ms: u64::try_from(crate::host::clock::current().monotonic().as_millis())
+            .unwrap_or(u64::MAX),
+        boot,
+    }
 }
 
 /// The fuse in force for `accord_root`: the bundle in force's
@@ -563,6 +652,66 @@ fn row_id_of_hex(s: &str) -> Option<RowId> {
         .ok()
         .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
         .map(RowId)
+}
+
+fn ms_of(t: DateTime<Utc>) -> Option<u64> {
+    u64::try_from(t.timestamp_millis()).ok()
+}
+
+/// v62.0.0 (HALT-235; CC 4.2.1.1) — **re-derive the latch of a stored halt
+/// that carries none** (a row written before the latch was stored, or by the
+/// earlier-form host verb): the invocation the row names is read again under
+/// the roster in force and re-applied to a clear latch at `reading`, at the
+/// wall instant of its admission (`edition2_first_held_us`) when the store
+/// knows it. The halt re-latches with ZERO elapsed: an upgrade only ever
+/// extends a halt, it never comes up un-halted. Only the halt the row names
+/// is re-applied (never every held invocation: an old, long-lapsed halt
+/// would pause agents again). `None`: the invocation or the roster is not
+/// held, so it cannot be re-read (the caller keeps the halt in force).
+async fn derive_latch<F>(
+    dir: &F,
+    accord_root: &str,
+    halt_row: &RowId,
+    reading: MonotonicReading,
+    fuse: u64,
+) -> Result<Option<HaltLatch>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(roster) = roster_in_force(dir, accord_root).await? else {
+        return Ok(None);
+    };
+    let Some(bytes) = dir.edition2_voices(halt_row).await?.into_iter().next() else {
+        return Ok(None);
+    };
+    let Ok((inv, _)) = read_invocation(&bytes, &roster) else {
+        return Ok(None);
+    };
+    let received_wall_ms = dir
+        .edition2_first_held_us(halt_row)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|us| u64::try_from(us / 1000).ok());
+    let mut latch = HaltLatch::new();
+    match latch.apply_forward(
+        ForwardRow::Invocation(&inv),
+        reading,
+        received_wall_ms,
+        fuse,
+    ) {
+        LatchOutcome::Paused => Ok(Some(latch)),
+        _ => Ok(None),
+    }
+}
+
+/// The latch a stored halt carries, parsed; `None` for none or for a latch
+/// of another shape (a 23.4-shaped latch does not deserialize under 23.5.0).
+fn stored_latch(active: &crate::federation::accord_quorum::ActiveHalt) -> Option<HaltLatch> {
+    active
+        .latch_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str::<HaltLatch>(j).ok())
 }
 
 /// The leaf of a lifecycle statement's `dimension`
@@ -601,11 +750,13 @@ where
     Ok(false)
 }
 
-/// v62.0.0 (C2-fix, ceremony gap 8) — **the halt in force** for
-/// `accord_root` at `now`: the latched halt, unless it is a lone halt whose
-/// fuse has run (`received_at + halt_fuse_secs <= now`) or a counted `active`
-/// row has ended it. A read: it changes nothing (the next door that judges a
-/// row clears a lapsed halt from the table).
+/// v62.0.0 (C2-fix, ceremony gap 8; HALT-235) — **the halt in force** for
+/// `accord_root`: the latched halt, unless it is a lone halt whose fuse has
+/// run (its COUNTED elapsed time, on this node's monotonic fuse clock,
+/// reached `halt_fuse_secs`: CIRISVerify 23.5.0's `HaltLatch`; never the wall
+/// clock) or a counted `active` row has ended it. A read: it changes nothing
+/// (the next door that judges a row checkpoints the latch, or clears a
+/// lapsed halt from the table).
 ///
 /// # Errors
 /// Directory read failures.
@@ -617,6 +768,27 @@ pub async fn halt_in_force<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    halt_in_force_with(dir, accord_root, now, halt_reading()).await
+}
+
+/// v62.0.0 (HALT-235) — [`halt_in_force`] at an explicit fuse `reading`
+/// (the witnesses' seam). `now` is the wall clock and decides NOTHING here:
+/// a lone halt lapses only when its counted elapsed time reaches
+/// `halt_fuse_secs` (CIRISVerify 23.5.0's `HaltLatch`); a wall clock set
+/// forward does not lapse it.
+///
+/// # Errors
+/// Directory read failures.
+pub(crate) async fn halt_in_force_with<F>(
+    dir: &F,
+    accord_root: &str,
+    now: DateTime<Utc>,
+    reading: MonotonicReading,
+) -> Result<Option<HaltInForce>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let _ = now;
     let Some(active) = dir.get_active_halt(accord_root).await? else {
         return Ok(None);
     };
@@ -628,7 +800,8 @@ where
             halt_row: None,
             received_at: active.set_at,
             confirmed: false,
-            lapses_at: None,
+            remaining_ms: None,
+            latch: None,
         }));
     };
     if concluded_lifecycle(dir, &halt_row, LifecycleKind::Active).await? {
@@ -636,44 +809,123 @@ where
     }
     let confirmed = concluded_lifecycle(dir, &halt_row, LifecycleKind::Confirmed).await?;
     let fuse = fuse_secs(dir, accord_root).await?;
-    let lapses_at = active
-        .set_at
-        .checked_add_signed(
-            chrono::Duration::try_seconds(i64::try_from(fuse).unwrap_or(i64::MAX))
-                .unwrap_or(chrono::Duration::MAX),
-        )
-        .unwrap_or(DateTime::<Utc>::MAX_UTC);
-    if !confirmed && now >= lapses_at {
+    // The stored latch, else re-derived (an upgraded store, or a row the
+    // earlier-form verb wrote); one that cannot be re-derived keeps the halt
+    // in force and never lapses (never un-halted).
+    let latch = match stored_latch(&active) {
+        Some(l) => Some(l),
+        None => derive_latch(dir, accord_root, &halt_row, reading, fuse).await?,
+    };
+    let Some(mut latch) = latch else {
+        return Ok(Some(HaltInForce {
+            halt_id: active.active_halt_id,
+            halt_row: Some(halt_row),
+            received_at: active.set_at,
+            confirmed,
+            remaining_ms: None,
+            latch: None,
+        }));
+    };
+    // A regression signal changes nothing here: the time is not counted.
+    let _ = latch.advance(reading);
+    let names_it = latch
+        .active_halt(fuse)
+        .is_some_and(|h| h.halt_row == halt_row.0);
+    if !confirmed && !names_it {
         return Ok(None);
     }
+    let remaining_ms = if confirmed {
+        None
+    } else {
+        latch.remaining_ms(fuse)
+    };
     Ok(Some(HaltInForce {
         halt_id: active.active_halt_id,
         halt_row: Some(halt_row),
         received_at: active.set_at,
         confirmed,
-        lapses_at: (!confirmed).then_some(lapses_at),
+        remaining_ms,
+        latch: Some(latch),
     }))
 }
 
 /// Clear a halt the table still keeps but that is no longer in force at
-/// `now` (lapsed, or ended): "a lone halt whose fuse has run is gone before
-/// anything else is judged". Returns the halt in force.
+/// `reading` (lapsed, or ended): "a lone halt whose fuse has run is gone
+/// before anything else is judged". A halt in force has its advanced latch
+/// STORED (HALT-235: every door that judges an accord row checkpoints the
+/// fuse). Returns the halt in force.
 async fn settle_latch<F>(
     dir: &F,
     accord_root: &str,
     now: DateTime<Utc>,
+    reading: MonotonicReading,
 ) -> Result<Option<HaltInForce>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    let in_force = halt_in_force(dir, accord_root, now).await?;
-    if in_force.is_none() {
-        if let Some(stale) = dir.get_active_halt(accord_root).await? {
-            dir.clear_active_halt(accord_root, &stale.active_halt_id)
-                .await?;
+    let in_force = halt_in_force_with(dir, accord_root, now, reading).await?;
+    match &in_force {
+        None => {
+            if let Some(stale) = dir.get_active_halt(accord_root).await? {
+                dir.clear_active_halt(accord_root, &stale.active_halt_id)
+                    .await?;
+            }
+        }
+        Some(h) => {
+            if let Some(latch) = &h.latch {
+                store_latch(dir, accord_root, &h.halt_id, latch).await?;
+            }
         }
     }
     Ok(in_force)
+}
+
+/// v62.0.0 (HALT-235) — store the node's latch with its halt row (the whole
+/// `HaltLatch` JSON).
+async fn store_latch<F>(
+    dir: &F,
+    accord_root: &str,
+    halt_id: &str,
+    latch: &HaltLatch,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let json = serde_json::to_string(latch)
+        .map_err(|e| Error::Backend(format!("halt latch: serialize: {e}")))?;
+    dir.set_active_halt(accord_root, halt_id, Some(&json)).await
+}
+
+/// v62.0.0 (HALT-235) — **checkpoint the accord's fuse now** (the periodic
+/// store a host's tick drives): advance the latch of a halt in force to this
+/// node's reading and store it; clear a halt whose fuse has run. Without a
+/// tick the fuse is still counted at every door within one process (from
+/// the last stored checkpoint), so it runs long, never short. The halt in
+/// force.
+///
+/// # Errors
+/// Directory failures.
+pub async fn checkpoint_fuse<F>(dir: &F, accord_root: &str) -> Result<Option<HaltInForce>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    settle_latch(dir, accord_root, crate::host::clock::now(), halt_reading()).await
+}
+
+/// [`checkpoint_fuse`] at an explicit fuse `reading` (the witnesses' seam).
+///
+/// # Errors
+/// As [`checkpoint_fuse`].
+#[cfg(test)]
+pub(crate) async fn checkpoint_fuse_with<F>(
+    dir: &F,
+    accord_root: &str,
+    reading: MonotonicReading,
+) -> Result<Option<HaltInForce>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    settle_latch(dir, accord_root, crate::host::clock::now(), reading).await
 }
 
 /// May the constitutional halt `inv` latch at `now`?
@@ -683,11 +935,12 @@ async fn latch_allows<F>(
     inv: &InvocationRow,
     own: RowId,
     now: DateTime<Utc>,
+    reading: MonotonicReading,
 ) -> Result<bool, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    if settle_latch(dir, roster.accord_root(), now)
+    if settle_latch(dir, roster.accord_root(), now, reading)
         .await?
         .is_some()
     {
@@ -822,12 +1075,31 @@ where
     F: FederationDirectory + ?Sized,
 {
     super::door::require_statement_form(bytes)?;
+    let state = super::genesis::genesis_in_force(dir).await?;
+    put_lifecycle_in(dir, bytes, now, halt_reading(), &state).await
+}
+
+/// v62.0.0 (HALT-235) — [`put_lifecycle_at`] at an explicit fuse `reading`
+/// over the genesis in force `state` (the witnesses' seam).
+///
+/// # Errors
+/// As [`put_lifecycle_at`].
+pub(crate) async fn put_lifecycle_in<F>(
+    dir: &F,
+    bytes: &[u8],
+    now: DateTime<Utc>,
+    reading: MonotonicReading,
+    state: &super::genesis::GenesisInForce,
+) -> Result<LifecycleOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    super::door::require_statement_form(bytes)?;
     let head = named_head(bytes).ok_or_else(|| malformed_lifecycle("head"))?;
     let target = statement_parts(bytes)
         .and_then(|(_, p)| super::names::names_of(&p).ok())
         .and_then(|n| super::names::single(&n, "target"))
         .ok_or_else(|| malformed_lifecycle("target"))?;
-    let state = super::genesis::genesis_in_force(dir).await?;
     // v62.0.0 (HL-fix1, SECURITY; CC 4.2.1.3 "against the bundle in force")
     // — the roster is the bundle IN FORCE that `refs.head` names, never any
     // held Valid bundle: `state.valid` holds the predecessors too, so a voice
@@ -902,14 +1174,33 @@ where
         }
     };
     let accord_root = roster.accord_root();
-    let in_force = settle_latch(dir, accord_root, now).await?;
+    let in_force = settle_latch(dir, accord_root, now, reading).await?;
     let names_it = in_force
         .as_ref()
         .and_then(|h| h.halt_row)
         .is_some_and(|h| h.0 == *row.target());
     let kind = row.kind();
     let applied = match kind {
-        LifecycleKind::Confirmed => names_it && in_force.as_ref().is_some_and(|h| !h.confirmed),
+        LifecycleKind::Confirmed => {
+            let applies = names_it && in_force.as_ref().is_some_and(|h| !h.confirmed);
+            // v62.0.0 (HALT-235) — the latch records the confirmation (a
+            // confirmed halt never lapses), stored with the row.
+            if applies {
+                if let Some(h) = in_force.as_ref() {
+                    if let Some(mut latch) = h.latch.clone() {
+                        let fuse = u64::from(roster.halt_fuse_secs());
+                        let _ = latch.apply_forward(
+                            ForwardRow::Lifecycle(&row),
+                            reading,
+                            ms_of(now),
+                            fuse,
+                        );
+                        store_latch(dir, accord_root, &h.halt_id, &latch).await?;
+                    }
+                }
+            }
+            applies
+        }
         LifecycleKind::Active => {
             if names_it {
                 dir.clear_active_halt(accord_root, &target.hex()).await?;

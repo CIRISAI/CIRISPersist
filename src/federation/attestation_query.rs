@@ -846,14 +846,24 @@ pub(crate) fn lifecycle_predicate(
     // recorded at its held-equivalent settle (V214). Such a composer was
     // admitted against this row (its stamped rule), so the fold honours it as
     // it honours one naming the row's own id.
-    let (aliases, alias_target) = match dialect {
+    //
+    // TA-prod1 — sqlite: the alias is compared as `+a.alias_attestation_id`,
+    // for the reason the `c` arm compares `+outer.attestation_id` (above): a
+    // bare TEXT column applies its affinity to the expression side, the
+    // affinity-free `reference_live` index is then ineligible, and the pinned
+    // index was walked whole (`SCAN c2 USING INDEX
+    // federation_attestations_reference_live`) once per alias of every listed
+    // row. Both sides are TEXT row ids, so the set is unchanged.
+    let (aliases, alias_target, alias_id) = match dialect {
         Dialect::Sqlite => (
             "federation_cosign_aliases",
             format!("json_extract(c2.attestation_envelope, '$.{path}')"),
+            "+a.alias_attestation_id",
         ),
         Dialect::Postgres => (
             "cirislens.federation_cosign_aliases",
             format!("c2.attestation_envelope::jsonb->>'{path}'"),
+            "a.alias_attestation_id",
         ),
     };
     // v62.0.0 (v62 P8-fix14; lead ruling (a)) — **a restatement hides its
@@ -918,7 +928,7 @@ pub(crate) fn lifecycle_predicate(
                  AND EXISTS (SELECT 1 FROM {table} c2{pin} \
                    WHERE c2.attestation_type IN ({list}) \
                      AND c2.withdraws_admission_rule IS NOT NULL \
-                     AND {alias_target} = a.alias_attestation_id)) \
+                     AND {alias_target} = {alias_id})) \
              AND NOT EXISTS (SELECT 1 FROM {table} r{pin} \
                WHERE r.attestation_type = {outer}.attestation_type \
                  AND r.attestation_type IN ({list}) \

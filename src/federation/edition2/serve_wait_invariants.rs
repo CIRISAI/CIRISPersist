@@ -151,6 +151,22 @@ pub(crate) async fn body(d: &dyn FederationDirectory, tag: &str) {
         mine.len(),
         "[{tag}] I2253: rooted, the subject read"
     );
+    // TB2-prod2 — the point read's tail is the shared plan
+    // (`wire_index::point_read_planned`): rooted, the same hash it withheld
+    // above is handed out, and its bytes hash back to it (the self-heal
+    // compare). Both arms of the plan, on every backend this body runs on.
+    let served = d
+        .lookup_signed_record_by_content_hash("Attestation", &hashes[0])
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("[{tag}] I2253: rooted, the point read hands the row out"));
+    let row: crate::federation::Attestation =
+        serde_json::from_slice(&served).expect("the point read returns the row's bytes");
+    assert_eq!(
+        crate::federation::wire_index::attestation_wire_hash_hex(&row),
+        hashes[0],
+        "[{tag}] I2253: rooted, the bytes are the advertised row's"
+    );
 }
 
 /// **I2254** — a store with no node key is a node that is not rooted, in

@@ -41,6 +41,9 @@
 //!   `root_standing`): (i) a fixture lineage of another family, (ii) a fork
 //!   sibling `humanity-accord` v1; (iii) the baked lineage stays silent; the
 //!   pure rule covers a held successor of the baked bundle.
+//! - **I2476** (GB-fix5) a store holding only short voices of the BAKED
+//!   bundle is offered the bake, which completes it; a not-Valid foreign
+//!   bundle (I2472) no longer keeps the bake out: it is reported beside it.
 //! - **I2471** (sqlite, postgres) the open leg's failure: a CORRUPTED COPY
 //!   (one byte of a voice's signature flipped; the baked bytes untouched) is
 //!   refused by its token, loudly, and the store holds no bundle: the node
@@ -522,18 +525,34 @@ async fn foreign_is_reported(
     let s = e.root_standing().await.expect("root_standing reads");
     assert_eq!(
         s.foreign_genesis,
-        Some(want),
+        Some(want.clone()),
         "{what}: a host reads it on root_standing"
+    );
+    // A reopen: the same report, nothing imported.
+    assert_eq!(
+        e.import_baked_genesis_at_boot().await,
+        BootImport::Done(BakedImport::ForeignRoot(want)),
+        "{what}: a reopen reports the same and imports nothing"
+    );
+    assert_eq!(
+        super::genesis::genesis_statements(dir.as_ref())
+            .await
+            .expect("reads"),
+        before,
+        "{what}: a reopen changes nothing"
     );
 }
 
 /// **I2472** — (i) held but NOT Valid here: a fixture lineage of another
-/// family, kept short of its count (one voice of three), the same reading a
-/// production build gives a fixture store whose mock chains it does not root
-/// (a lib test build always roots the mock chains, so the not-Valid reading
-/// is reached by the count). The node is rootless; the bake is not imported.
+/// family, kept short of its count (one voice of three; a lib test build
+/// always roots the mock chains, so the not-Valid reading is reached by the
+/// count). Before the open leg it reads `held_not_valid` (rootless). GB-fix5:
+/// a not-Valid bundle is not in the fork set, so the open leg OFFERS the
+/// bake, the baked genesis is in force, and the foreign bundle is reported
+/// beside it (`beside_baked`, `valid: false`).
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) async fn i2472_held_not_valid_is_reported(dsn: &str, alias: &str) {
+    use super::genesis::{ForeignCase, HeldRoot};
     use crate::federation::tier_ingest::test_support as ts;
     let e = crate::Engine::with_signer_pre_genesis(ts::local_signer(alias), dsn)
         .await
@@ -541,9 +560,7 @@ pub(crate) async fn i2472_held_not_valid_is_reported(dsn: &str, alias: &str) {
     let spec = super::fixture_genesis::CeremonySpec {
         family_key_id: "gb2-fixture-accord".to_owned(),
         // v62.0.0 (GB-fix3) — the STANDARD (yesterday-relative) t0, never
-        // the real mint's: a fixture bundle is stated at `t0 + 12 h`, which
-        // the door's future-skew bound would refuse for 12 hours after the
-        // real mint.
+        // the real mint's: a fixture bundle is stated at `t0 + 12 h`.
         ..super::fixture_genesis::CeremonySpec::standard()
     };
     let c = super::fixture_genesis::ceremony_v2(&spec);
@@ -556,24 +573,142 @@ pub(crate) async fn i2472_held_not_valid_is_reported(dsn: &str, alias: &str) {
         .collect();
     offer.push(c.voices[0].clone());
     let _ = super::genesis::put_genesis_bundle(dir.as_ref(), &offer, Some(&c.anchor())).await;
+    let foreign = |case| super::genesis::ForeignGenesis {
+        token: super::genesis::GENESIS_STORE_ROOT_IS_NOT_THE_BAKED_GENESIS,
+        case,
+        held_roots: vec![HeldRoot {
+            object_id: hex::encode(c.object_id),
+            valid: false,
+        }],
+        baked: BAKED_GENESIS_OBJECT_ID.to_owned(),
+    };
+    assert_eq!(
+        super::genesis::foreign_genesis(dir.as_ref())
+            .await
+            .expect("reads"),
+        Some(foreign(ForeignCase::HeldNotValid)),
+        "I2472: before the open leg: held, not Valid, rootless"
+    );
+    assert_eq!(
+        e.import_baked_genesis_at_boot().await,
+        BootImport::Done(BakedImport::Imported(vec![
+            BAKED_GENESIS_OBJECT_ID.to_owned()
+        ])),
+        "I2472: a not-Valid foreign bundle does not keep the bake out"
+    );
+    let g = genesis_in_force(dir.as_ref()).await.expect("reads");
+    assert_eq!(
+        g.valid
+            .iter()
+            .map(|p| hex::encode(p.object_id))
+            .collect::<Vec<_>>(),
+        vec![BAKED_GENESIS_OBJECT_ID.to_owned()],
+        "I2472: the baked genesis alone is in force (no fork)"
+    );
+    assert_eq!(
+        e.root_standing().await.expect("reads").foreign_genesis,
+        Some(foreign(ForeignCase::BesideBaked)),
+        "I2472: the foreign bundle is reported beside it"
+    );
+    // A reopen: nothing placed, the report stands.
+    let before = super::genesis::genesis_statements(dir.as_ref())
+        .await
+        .expect("reads");
+    assert_eq!(
+        e.import_baked_genesis_at_boot().await,
+        BootImport::Done(BakedImport::AlreadyHeld),
+        "I2472: a reopen places nothing"
+    );
+    assert_eq!(
+        super::genesis::genesis_statements(dir.as_ref())
+            .await
+            .expect("reads"),
+        before,
+        "I2472: a reopen changes nothing"
+    );
+    assert_eq!(
+        e.root_standing().await.expect("reads").foreign_genesis,
+        Some(foreign(ForeignCase::BesideBaked)),
+        "I2472: still reported after a reopen"
+    );
+}
+
+/// The genesis-bundle voices `d` holds (concluded or short).
+async fn bundle_voices(d: &dyn FederationDirectory) -> Vec<Vec<u8>> {
+    d.edition2_objects("ceg-genesis-bundle/2")
+        .await
+        .expect("the bundle voices read")
+}
+
+/// **I2476** (GB-fix5) — a store holding only SHORT voices of the BAKED
+/// bundle (one voice of three, with its named rows: an interrupted import, or
+/// a voice from a peer): the open leg offers the full bake, which completes
+/// it; the baked genesis is in force and nothing is reported.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) async fn i2476_short_baked_voices_complete(dsn: &str, alias: &str, voices: usize) {
+    use crate::federation::tier_ingest::test_support as ts;
+    let tag = format!("I2476 ({voices} stray voice(s))");
+    let e = crate::Engine::with_signer_pre_genesis(ts::local_signer(alias), dsn)
+        .await
+        .expect("a fresh engine opens");
+    let dir = e.federation_directory();
+    let st = baked_statements(bytes()).expect("the bake decodes");
+    // The five rows and the first `voices` voices.
+    let short: Vec<Vec<u8>> = st[..5 + voices].to_vec();
+    let _ = super::genesis::put_genesis_bundle(dir.as_ref(), &short, Some(&baked_genesis_anchor()))
+        .await;
+    assert_eq!(
+        bundle_voices(dir.as_ref()).await.len(),
+        voices,
+        "{tag}: {voices} voice(s) of the bundle held"
+    );
     assert!(
         !genesis_in_force(dir.as_ref())
             .await
             .expect("reads")
             .is_held(),
-        "I2472: nothing reads Valid"
+        "{tag}: short of its count, nothing concludes"
     );
-    Box::pin(foreign_is_reported(
-        &e,
-        c.object_id,
-        super::genesis::ForeignCase::HeldNotValid,
-        "I2472",
-    ))
-    .await;
     assert_eq!(
-        e.root_standing().await.expect("reads").root,
+        e.import_baked_genesis_at_boot().await,
+        BootImport::Done(BakedImport::Imported(vec![
+            BAKED_GENESIS_OBJECT_ID.to_owned()
+        ])),
+        "{tag}: the open leg offers the bake and it completes"
+    );
+    // The belief, proven: the held voices and the array's dedupe to the
+    // three voices of the bundle, each held once and byte-identical.
+    let mut held = bundle_voices(dir.as_ref()).await;
+    assert_eq!(held.len(), 3, "{tag}: three voices held");
+    held.sort();
+    let mut want: Vec<Vec<u8>> = st[5..].to_vec();
+    want.sort();
+    assert_eq!(held, want, "{tag}: the three voices, once each, as baked");
+    assert_eq!(
+        genesis_in_force(dir.as_ref())
+            .await
+            .expect("reads")
+            .head
+            .map(|h| hex::encode(h.object_id))
+            .as_deref(),
+        Some(BAKED_GENESIS_OBJECT_ID),
+        "{tag}: the baked genesis is in force"
+    );
+    assert_eq!(
+        e.root_standing().await.expect("reads").foreign_genesis,
         None,
-        "I2472: rootless"
+        "{tag}: its own voices are not foreign"
+    );
+    // A reopen.
+    assert_eq!(
+        e.import_baked_genesis_at_boot().await,
+        BootImport::Done(BakedImport::AlreadyHeld),
+        "{tag}: a reopen places nothing"
+    );
+    assert_eq!(
+        bundle_voices(dir.as_ref()).await.len(),
+        3,
+        "{tag}: still three voices after a reopen"
     );
 }
 
@@ -634,10 +769,12 @@ pub(crate) async fn i2474_the_baked_lineage_is_silent(dsn: &str, alias: &str) {
     );
 }
 
-/// **I2475** (pure) — the rule: silent when nothing is held, when the baked
-/// bundle is held, or when it is the ancestor of a held successor; reported
-/// otherwise over the held FIRST bundles, each with whether it reads Valid,
-/// in case `HeldValidForeignRoot` when one does, else `HeldNotValid`.
+/// **I2475** (pure) — the rule: the foreign roots are the held FIRST
+/// bundles other than the baked one; none (nothing held, the baked bundle
+/// held concluded or short, the baked lineage with a successor): silent.
+/// Else reported, each with whether it reads Valid: `beside_baked` when the
+/// baked genesis is in force, `held_valid_foreign_root` when a foreign one
+/// is Valid, else `held_not_valid`.
 #[test]
 fn i2475_the_foreign_genesis_rule() {
     use super::genesis::{foreign_genesis_of, ForeignCase, HeldRoot};
@@ -682,6 +819,27 @@ fn i2475_the_foreign_genesis_rule() {
     let f = foreign_genesis_of(&[([0x09; 32], None)], &[], &oid).expect("I2475: reported");
     assert_eq!(f.case, ForeignCase::HeldNotValid, "I2475: none Valid");
     assert!(!f.held_roots[0].valid);
+    // GB-fix5 — the baked bundle's own voices, kept short, are not foreign.
+    assert_eq!(
+        foreign_genesis_of(&[(oid, None)], &[], &oid),
+        None,
+        "I2475: short voices of the baked bundle are its own"
+    );
+    // GB-fix5 — the baked genesis in force beside a foreign first bundle.
+    let f = foreign_genesis_of(
+        &[(oid, None), ([0x09; 32], None)],
+        std::slice::from_ref(&baked),
+        &oid,
+    )
+    .expect("I2475: reported beside");
+    assert_eq!(f.case, ForeignCase::BesideBaked);
+    assert_eq!(
+        f.held_roots,
+        vec![HeldRoot {
+            object_id: hex::encode([0x09u8; 32]),
+            valid: false
+        }]
+    );
 }
 
 #[cfg(feature = "sqlite")]
@@ -742,4 +900,37 @@ async fn i2474_postgres() {
         return;
     };
     Box::pin(i2474_the_baked_lineage_is_silent(&dsn, "gb2-iii-pg")).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2476_sqlite() {
+    for n in [1, 2] {
+        Box::pin(i2476_short_baked_voices_complete(
+            "sqlite::memory:",
+            &format!("gb5-short-sq-{n}"),
+            n,
+        ))
+        .await;
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2476_postgres() {
+    let Some(_dsn) = crate::test_pg::isolated_dsn() else {
+        eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+        return;
+    };
+    for n in [1, 2] {
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            return;
+        };
+        Box::pin(i2476_short_baked_voices_complete(
+            &dsn,
+            &format!("gb5-short-pg-{n}"),
+            n,
+        ))
+        .await;
+    }
 }

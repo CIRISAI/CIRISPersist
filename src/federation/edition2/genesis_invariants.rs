@@ -140,7 +140,7 @@ pub(crate) mod vectors {
     pub(crate) const RESEAT: &str = vendored!("genesis_reseat_v4.json");
 
     /// Each vendored file and its SHA-256. PIN-fix2 (CIRISVerify 23.4.1, PR #354
-    /// head a6eba8ae, PROVISIONAL until the tag): the v6 bundles and pools,
+    /// head a6eba8ae; the CIRISVerify tag v23.4.1, PIN-fix3): the v6 bundles and pools,
     /// hashed from the vendored bytes (bundles 82778bc1…, Verify's stated
     /// value); the re-seat v4 is unchanged. Before: at CIRISVerify 23.4.0, the TESTED
     /// rev 320d41f (VB-vectors2: the same files re-minted with i2p / kiss / ble

@@ -708,9 +708,21 @@ pub async fn put_occurrence_voice<F>(dir: &F, row: &AdmittedRow) -> Result<State
 where
     F: FederationDirectory + ?Sized,
 {
-    // S1b — a composer of this family: the proposer withdrawing its own
+    // S1b — a retraction of this family: the proposer withdrawing its own
     // open edition-2 proposal.
-    if super::ingest::COMPOSER_ROW_TYPES.contains(&row.row_type.as_str()) {
+    // v62.0.0 (PIN-fix9b; the Constitution's ruling of 2026-11-21, CC 2.4.1:
+    // "the occurrence that supersedes another (refs.target: the occurrence
+    // this one supersedes)") — ONLY a retraction
+    // (`emit::carries_no_dimension`). A `supersedes` is a REPLACEMENT
+    // OCCURRENCE: it takes every gate below a bind takes (the payload, the
+    // roster head, the X-Wing separation, the identity-set exclusion,
+    // possession by the occurrence key's own statement, the author acting for
+    // the identity, the skew bound, the self-roster gate). The occurrence
+    // table holds one row per (identity, occurrence) pair, last-signed-wins,
+    // so a newer replacement of the same pair retires the row it replaces;
+    // an OLDER one lands as history and the stored row is unchanged (newest
+    // wins). PIN-fix9b.rev2: another pair is refused below.
+    if super::emit::carries_no_dimension(&row.row_type) {
         return withdraw_proposal(dir, row).await;
     }
     super::payloads::check(&row.family, &row.payload)?;
@@ -722,6 +734,42 @@ where
         return Err(payload_invalid(
             "`refs.head` is required: the roster row the bind stands on (CC 3.3.6.4)",
         ));
+    }
+    // v62.0.0 (PIN-fix9b.rev2; the Constitution's ruling of 2026-11-22) — a
+    // `supersedes` of an occurrence is a REBIND OF THE SAME OCCURRENCE (CC
+    // 4.5.5: "Rotating the Reticulum destination (new transport identity) is
+    // a new identity_occurrence supersedes-ing the prior"; CC 3.1.3: "Rebind
+    // or renewal is a supersedes by the key itself"). Replacing one device
+    // with another is not a supersedes: it is the self-roster door (a bind and
+    // an eviction, CC 3.3.6.4). One naming another (identity, occurrence)
+    // pair than its target is refused by name. (Its target is held and
+    // concluded here: `ingest::check_composer_target` waits for it first.)
+    if row.row_type == crate::federation::types::attestation_type::SUPERSEDES {
+        if let Some(target) = super::names::single(&row.names, "target") {
+            let pair = held_bind(dir, &target).await?.map(|(_, _, p)| {
+                let text = |m: &str| p.get_text(m).and_then(Value::as_text).map(str::to_owned);
+                (text("identity_key_id"), text("occurrence_key_id"))
+            });
+            if pair
+                != Some((
+                    Some(occurrence.identity_key_id.clone()),
+                    Some(occurrence.occurrence_key_id.clone()),
+                ))
+            {
+                return Err(refuse(
+                    malformed_row::SUPERSEDES_NOT_A_REPLACEMENT,
+                    format!(
+                        "{OCCURRENCE_FAMILY}: a supersedes rebinds the SAME occurrence \
+                         ({} of {}); its target {} binds another pair: replacing a device is \
+                         the self-roster door, a bind and an eviction (CC 4.5.5, CC 3.1.3, \
+                         CC 3.3.6.4)",
+                        occurrence.occurrence_key_id,
+                        occurrence.identity_key_id,
+                        target.hex()
+                    ),
+                ));
+            }
+        }
     }
     check_xwing_in_row(dir, row).await?;
     let identity = occurrence.identity_key_id.clone();

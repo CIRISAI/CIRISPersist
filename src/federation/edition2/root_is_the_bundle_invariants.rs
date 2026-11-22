@@ -72,14 +72,10 @@ pub(crate) async fn root_is_the_bundle(d: &dyn FederationDirectory, tag: &str) {
         super::fixture_trust_root::bundle_acceptance_statement(d, &key, &node, &"00".repeat(32))
             .await
             .unwrap_or_else(|e| panic!("[{tag}] I2401: the stray edge signs: {e}"));
-    let _ = e2::put_statement(d, &stray).await;
-    let stray_id = super::group_fixtures::row_id_of(&stray);
+    // v62.0.0 (FX-fix2) — the fixture asserts the hold itself (`put_held`).
     assert_eq!(
-        super::fold::why_held(d, &stray_id)
-            .await
-            .unwrap_or_else(|e| panic!("[{tag}] why_held reads: {e}"))
-            .map(|h| h.reason),
-        Some(super::fold::reason::gc8::TRUST_ROOT_HEAD_STALE.to_owned()),
+        e2::put_held(d, &stray, &format!("[{tag}] I2401")).await,
+        super::fold::reason::gc8::TRUST_ROOT_HEAD_STALE,
         "[{tag}] I2401: an edge naming no held bundle of the lineage is held"
     );
 

@@ -409,7 +409,9 @@ pub(crate) mod bodies {
     /// another only by `refs.target`, the node-computed id of a row ALREADY
     /// HELD, and that id is computed over the named row's own bytes. So:
     /// (a) a row naming an id this node does not hold is not admitted and
-    /// nothing is stored (it waits or is refused, per the door); (b) the row
+    /// nothing is stored (it waits or is refused, per the door); a
+    /// `supersedes` naming a row that is kept but has NOT concluded waits on
+    /// it too (PIN-fix9d: a replacement needs a landed row); (b) the row
     /// that would "close" the loop is a different statement from the one
     /// first named, so its id is not the id the first row named; (c) with
     /// neither row held, the trust walk over held rows returns within a bound
@@ -469,6 +471,23 @@ pub(crate) mod bodies {
                 d.get_attestation(id).await.unwrap().is_none(),
                 "I1846: {what} is not stored"
             );
+            // v62.0.0 (PIN-fix9d) — B's target A IS kept (a held-back
+            // statement), but has not concluded: B waits on it exactly as A
+            // waits on the id nobody holds (`link_unheld`).
+            if let Ok(crate::federation::edition2::ingest::StatementOutcome::Pending {
+                row_id,
+                ..
+            }) = &out
+            {
+                let why = crate::federation::edition2::fold::why_held(d, row_id)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    why.as_ref().map(|h| h.reason.as_str()),
+                    Some(crate::federation::edition2::fold::reason::LINK_UNHELD),
+                    "I1846: {what} waits on the row it names: {why:?}"
+                );
+            }
         }
         // (c) the walk over held rows is bounded and gives no edge.
         let v = tokio::time::timeout(

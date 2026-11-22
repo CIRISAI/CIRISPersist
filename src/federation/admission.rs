@@ -2898,8 +2898,35 @@ fn names_its_key_grant_recipient(row: &super::Attestation) -> bool {
 /// `bootstrap_admission` places a stranger's row into a cohort plane through
 /// exactly that composer). Subjects are governed by the
 /// `subject_outside_audience` arm.
+///
+/// v62.0.0 (TB2-prod6) — nor to a RETRACTION (`withdraws` / `recants`, the
+/// one predicate [`emit::carries_no_dimension`](super::edition2::emit::carries_no_dimension)).
+/// A retraction is built from its target and carries the TARGET's
+/// `attested_key_id` (`fixture_switch::composer_of`, `Engine::withdraw_statement`),
+/// so under the arm no one but the target's own attested party could ever
+/// retract inside a room: rules 2–4 (the named subject, the proxies) were
+/// refused for everyone. Exempting it does not open the arm's door:
+///
+/// - who may retract is the withdraws rules' question
+///   (`check_withdraws_admission`, rules 1–4, judged by identity), asked
+///   later on the same plan;
+/// - a retraction's placement is pinned to its target's scope and room
+///   (KR-fix17: placed apart, it is refused `composer_placed_apart_from_target`),
+///   so it can enter no room its target is not already in;
+/// - it states no dimension and no content of its own family
+///   (`payloads::check_composer`: the common members and `refs.target`).
+///
+/// What a retraction CAN still carry is a common member (`body`, `reason`,
+/// `score`, `evidence_refs`, …; `payloads::COMMON`): free text riding a
+/// retraction into the target's room. The subject arm
+/// (`subject_outside_audience`) still applies to its `subject_key_ids`.
+///
+/// `supersedes` is NOT exempt: a replacement is a full statement of its
+/// family and must meet the arm (#592: a widening composer places a
+/// stranger's row otherwise).
 fn attested_party_applies(row: &super::Attestation) -> bool {
     row.attestation_type != attestation_type::DELEGATES_TO
+        && !super::edition2::emit::carries_no_dimension(&row.attestation_type)
 }
 
 /// The ONE standing comparison, parameterised over party resolution: refuse
@@ -6011,8 +6038,9 @@ pub struct RootGrantView {
     /// The grantee's consent is held (its acceptance, or a machine grantee's
     /// owner's).
     pub accepted: bool,
-    /// The grant itself is withdrawn: the root's counted withdrawal is held
-    /// (the holders' consent taken back; KR-fix18: never the grantee's).
+    /// The grant itself is withdrawn as of the instant asked: the root's
+    /// counted withdrawal is held and dated at or before it (the holders'
+    /// consent taken back; KR-fix18: never the grantee's).
     pub withdrawn: bool,
     /// `accepted && !withdrawn`: the grant confers its `scope` on the
     /// grantee, as far as the grant itself goes. Whether THIS node honours
@@ -6056,7 +6084,17 @@ pub async fn root_grants_for(
     let composers = directory
         .list_composers_referencing_any(&ids, None, None)
         .await?;
-    let refs: Vec<&super::Attestation> = rows.iter().chain(composers.iter()).collect();
+    // KR-fix19.doors rev 2 — as of `t`: the root's counted withdrawal ends
+    // the grant from its own stated instant on (the walk reads it the same
+    // way, `trust_root::live_conferral_rows`).
+    let refs: Vec<&super::Attestation> = rows
+        .iter()
+        .chain(
+            composers
+                .iter()
+                .filter(|c| !super::trust_root::root_grant_withdrawal_after(c, &rows, t)),
+        )
+        .collect();
     let retired = super::precedence::retired_ids(&refs);
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -12710,6 +12748,7 @@ pub async fn check_withdraws_admission_at(
             return withdraws_target_unheld(row, target_id);
         };
         withdraws_target_reads(&target);
+        check_retraction_not_backdated(row, &target)?;
         // v55.0.0 (#989, CC 3.3.2 rc7) — "a `withdraws` or `recants` naming a
         // `key_grant` row is refused", the sealer's own recants included: once
         // shared, always shared; forward secrecy is by rotation.
@@ -12832,10 +12871,65 @@ pub async fn check_withdraws_admission_at(
     // chain, a binding or the target changes.
     withdraws_target_reads(&target);
     fold_reads_key(&row.attesting_key_id);
+    check_retraction_not_backdated(row, &target)?;
     fold_held(
         fold::reason::WITHDRAWS_NOT_ADMITTED,
         check_withdraws_admission_against(directory, row, &target, depth).await,
     )
+}
+
+/// v62.0.0 (KR-fix19) — the token that prefixes the refusal of a `withdraws`
+/// / `recants` dated before its target ([`check_retraction_not_backdated`]).
+pub const WITHDRAWAL_BACKDATED: &str = "withdrawal_backdated";
+
+/// v62.0.0 (KR-fix19; CC 2.4.1.1, CC 2.6.7, as ruled 2026-11-21) — **a
+/// retraction dated before the row it retracts is REFUSED.** A `withdraws`
+/// or a `recants` whose signed `asserted_at` is STRICTLY BEFORE its held
+/// target's `asserted_at` is refused `withdrawal_backdated`.
+///
+/// - **A refusal, not a hold:** both instants are signed and fixed, so it
+///   can never become valid. Nothing is stamped, nothing lands.
+/// - **An EQUAL instant is admitted**, so a device whose clock is slow can
+///   still retract a fresh row by dating the retraction at the row's own
+///   instant (`Engine::withdraw_statement` does that).
+/// - **Decidable alike on every node:** it reads the two rows' own signed
+///   instants and no clock. The target is held when it is asked.
+/// - **Arrival order:** a retraction that arrives BEFORE its target waits
+///   `link_unheld` (kept). When the target lands it is judged here and
+///   refused; the kept statement then stays held under the fold's
+///   `refold_refused`, this refusal its detail (a held statement is not
+///   evicted). It concludes nothing on either order.
+///
+/// What it does NOT bound (KNOWN LIMIT of v62.0): a retraction dated after
+/// its target but before acts taken under the target. The text judges that
+/// by ancestry (CC 2.4.1.1, CC 2.7.7); the wire carries only instants (CC
+/// 2.6.7); the kernel's cut is not called; rule 6 (one say) is not built.
+///
+/// Asked for every `withdraws` / `recants` with a held target, authored or
+/// counted, before any rule decides who may retract.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] prefixed [`WITHDRAWAL_BACKDATED`].
+pub fn check_retraction_not_backdated(
+    row: &super::Attestation,
+    target: &super::Attestation,
+) -> Result<(), Error> {
+    if row.asserted_at >= target.asserted_at {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "{WITHDRAWAL_BACKDATED}: {} {} is dated {}, before its target {} ({}): a retraction \
+         cannot be dated before the row it retracts (CC 2.4.1.1, CC 2.6.7); state it again at \
+         the target's instant or later",
+        row.attestation_type,
+        row.attestation_id,
+        row.asserted_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        target.attestation_id,
+        target
+            .asserted_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    )))
 }
 
 /// v62.0.0 (wave GC1; CC 2.7.3) — a `withdraws` / `recants` whose target is
@@ -13737,11 +13831,14 @@ pub async fn check_revocation_authority(
     // configuration and stays a refusal.
     fold_reads_key(&row.revoking_key_id);
     fold_reads_key(&node);
-    let conferred = super::trust_root::capability_roots_to_trusted_root(
+    // KR-fix19 (CC 2.6.7) — judged at the revocation's own signed instant,
+    // inside W: not at this node's clock, which two nodes read differently.
+    let conferred = super::trust_root::conferred_for_act(
         directory,
         &node,
         &row.revoking_key_id,
         DELEGATION_SCOPE_SLASH,
+        row.revoked_at,
         crate::host::clock::now(),
     )
     .await?;
@@ -19109,6 +19206,11 @@ pub async fn check_trust_root_membership_steward_binding(
     check_members_steward_bound(directory, community, true).await
 }
 
+/// v62.0.0 (TB2-prod3) — the `plane` of the retryable unknown key a roster
+/// waits on when it names a member whose key record this node does not hold
+/// ([`check_community_membership_steward_binding`]).
+pub const COMMUNITY_MEMBER_PLANE: &str = "community_member";
+
 /// The per-member walk both forms share: every `node` / `agent` member needs
 /// a live steward binding, except a `node` member when `node_exempt` (the
 /// infrastructure carve-out). An agent is never exempt.
@@ -19124,11 +19226,19 @@ async fn check_members_steward_bound(
     // about that member lands or is withdrawn.
     for member in &community.members {
         fold_reads_key(&member.key_id);
-        // Resolve the member's identity_type set. An unresolved member has
-        // no node/agent standing this gate can prove — out of scope (and
-        // FK-orthogonal: put_community does not FK roster members).
+        // Resolve the member's identity_type set. v62.0.0 (TB2-prod3; CC
+        // 2.7.3: an absent row is a WAIT, never a pass) — a member whose key
+        // record this node does not hold cannot be shown to be a person, nor a
+        // steward-bound node or agent, so the record WAITS for it: HELD
+        // `link_unheld` naming the member (the retryable unknown key, plane
+        // [`COMMUNITY_MEMBER_PLANE`]), re-judged when that record lands
+        // (`key:<member>` is read above). Before this it was SKIPPED, which
+        // seated a node or agent member nobody had checked.
         let Some(rec) = directory.lookup_public_key(&member.key_id).await? else {
-            continue;
+            return Err(fold::hold(
+                fold::reason::LINK_UNHELD,
+                Error::unknown_signer(&member.key_id, COMMUNITY_MEMBER_PLANE),
+            ));
         };
         // Only node/agent members are an authority-act constraint. Report
         // `node` first when both are present (it is the stricter framing).
@@ -22723,11 +22833,13 @@ pub async fn check_reserved_prefix_admission(
             // it (or this node's trust root) changes.
             fold_reads_key(&row.attesting_key_id);
             fold_reads_key(&node);
-            let conferred = super::trust_root::capability_roots_to_trusted_root(
+            // KR-fix19 (CC 2.6.7) — at the act's own signed instant, inside W.
+            let conferred = super::trust_root::conferred_for_act(
                 directory,
                 &node,
                 &row.attesting_key_id,
                 super::types::delegation_scope::INFRA_RECORD_HARD_CASE,
+                row.asserted_at,
                 crate::host::clock::now(),
             )
             .await?;
@@ -22787,11 +22899,13 @@ pub async fn check_reserved_prefix_admission(
             // conferral is OTHER rows, so its absence is a hold.
             fold_reads_key(&row.attesting_key_id);
             fold_reads_key(&node);
-            let conferred = super::trust_root::capability_roots_to_trusted_root(
+            // KR-fix19 (CC 2.6.7) — at the act's own signed instant, inside W.
+            let conferred = super::trust_root::conferred_for_act(
                 directory,
                 &node,
                 &row.attesting_key_id,
                 scope,
+                row.asserted_at,
                 crate::host::clock::now(),
             )
             .await?;
@@ -28766,6 +28880,88 @@ pub(crate) mod steward_liveness_test_support {
 
     /// The #584 behavioural witness. Run against every backend.
     #[allow(clippy::too_many_lines)]
+    /// v62.0.0 (TB2-prod3; CC 2.7.3) — **a roster member whose key record is
+    /// not held makes the roster WAIT, never pass.** The steward-binding gate
+    /// every community door runs ([`check_community_membership_steward_binding`])
+    /// is asked about a record naming (1) a member this node holds no key
+    /// record for: held `link_unheld`, the retryable unknown key naming THAT
+    /// member (plane [`COMMUNITY_MEMBER_PLANE`]); (2) the same member once its
+    /// record lands as a person: passes; (3) an AGENT member with no steward
+    /// binding: held `unstewarded_community_member` (the existing token),
+    /// never seated. Run against every backend.
+    pub(crate) async fn exercise_unheld_member_record_waits(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::types::{Community, CommunityMember};
+        let founder = e2::kid(&format!("um-founder-{suffix}"));
+        let late_seed = format!("um-late-{suffix}");
+        let late = e2::kid(&late_seed);
+        let agent = e2::kid(&format!("um-agent-{suffix}"));
+        register(dir, &founder, &[identity_type::USER]).await;
+        register(dir, &agent, &[identity_type::AGENT]).await;
+        let now = crate::host::clock::now();
+        let record = |members: &[&str]| Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
+            community_key_id: e2::kid(&format!("um-room-{suffix}")),
+            community_name: format!("um-room-{suffix}"),
+            members: members
+                .iter()
+                .map(|k| CommunityMember {
+                    key_id: (*k).to_owned(),
+                    joined_at: now,
+                    role: None,
+                })
+                .collect(),
+            founded_at: now,
+            consensus_protocol: "quorum:2/2".to_owned(),
+            policy_blob: None,
+            persist_row_hash: String::new(),
+        };
+        // (1) the unheld record: a wait naming the member.
+        let lookup = dir.lookup_public_key(&late).await.expect("lookup");
+        assert!(
+            lookup.is_none(),
+            "({suffix}) precondition: no record for {late}"
+        );
+        match check_community_membership_steward_binding(dir, &record(&[&founder, &late])).await {
+            Err(Error::AttesterKeyUnknown {
+                attesting_key_id,
+                plane,
+            }) => {
+                assert_eq!(
+                    attesting_key_id, late,
+                    "({suffix}) the wait names the member"
+                );
+                assert_eq!(plane, COMMUNITY_MEMBER_PLANE, "({suffix})");
+            }
+            other => panic!(
+                "({suffix}) a member with no held key record must WAIT (never pass): {other:?}"
+            ),
+        }
+        // (2) the record lands (a person): the same roster passes.
+        register(dir, &late_seed, &[identity_type::USER]).await;
+        check_community_membership_steward_binding(dir, &record(&[&founder, &late]))
+            .await
+            .unwrap_or_else(|e| {
+                panic!("({suffix}) once the record lands, a person member passes: {e}")
+            });
+        // (3) an agent with no steward binding is held by the existing token.
+        match check_community_membership_steward_binding(dir, &record(&[&founder, &agent])).await {
+            Err(Error::UnstewardedCommunityMember {
+                member_key_id,
+                member_role,
+                ..
+            }) => {
+                assert_eq!(member_key_id, agent, "({suffix})");
+                assert_eq!(member_role, identity_type::AGENT, "({suffix})");
+            }
+            other => panic!("({suffix}) an unstewarded agent is never seated: {other:?}"),
+        }
+    }
+
     pub(crate) async fn exercise_steward_binding_liveness(
         dir: &dyn FederationDirectory,
         suffix: &str,

@@ -39,6 +39,18 @@
 //!   `device_class: agent` under a user are refused
 //!   `occurrence_mixes_person_and_machine`; a user's device under the user is
 //!   stored.
+//! - I2438 (PIN-fix9b; the Constitution's ruling of 2026-11-21, CC 2.4.1) — a
+//!   `supersedes` of an occurrence is a REPLACEMENT OCCURRENCE through the
+//!   bind's own gates: one that binds a machine class under a person is
+//!   refused `occurrence_mixes_person_and_machine`, as the same bind stated
+//!   as an ordinary row is; one with no statement of the occurrence key's own
+//!   binds nothing (proof of possession); a conforming one (both voices)
+//!   lands, and the pair's row is now the replacement's (the replaced bind
+//!   retired). PIN-fix9b.rev2 (CC 4.5.5, CC 3.1.3, as Constitution ruled
+//!   2026-11-22): an OLDER replacement of the same pair lands as history and
+//!   the stored row is unchanged (newest wins); a supersedes naming ANOTHER
+//!   pair is refused `supersedes_not_a_replacement`, for either voice, and
+//!   binds nothing.
 
 use ciris_crypto::composite::CompositeSigningKey;
 use ciris_verify_core::cde::Value;
@@ -583,6 +595,200 @@ fn i3026_the_vendored_model_names_the_occurrence_key_role() {
             && *p == RoleParty::Member(OCCURRENCE_KEY_MEMBER.to_owned())),
         "I3026: the occurrence key's own voice is CC's cell"
     );
+}
+
+/// A `supersedes` of the held bind `target`: [`bind`]'s payload, naming
+/// `target` by `refs.target` beside the identity's current roster head.
+#[allow(clippy::too_many_arguments)]
+async fn supersede(
+    d: &dyn FederationDirectory,
+    signer: &CompositeSigningKey,
+    iss: &str,
+    identity: &str,
+    occurrence: &str,
+    device_class: &str,
+    asserted_at: u64,
+    target: &super::names::RowId,
+) -> Vec<u8> {
+    let head = super::occurrence::current_roster_head(d, identity)
+        .await
+        .unwrap()
+        .expect("the identity's roster head is held");
+    let m = vec![
+        ("asserted_at", Value::Uint(asserted_at)),
+        ("author", Value::Text(identity.to_owned())),
+        ("identity_key_id", Value::Text(identity.to_owned())),
+        ("occurrence_key_id", Value::Text(occurrence.to_owned())),
+        ("device_class", Value::Text(device_class.to_owned())),
+        (
+            "refs",
+            map(vec![
+                ("head", ciris_verify_core::edition2::row_ref(&head.0)),
+                ("target", ciris_verify_core::edition2::row_ref(&target.0)),
+            ]),
+        ),
+    ];
+    sign_row_statement(
+        signer,
+        iss,
+        occurrence,
+        "supersedes",
+        OCCURRENCE_FAMILY,
+        &map(m),
+        vec![],
+    )
+    .unwrap()
+}
+
+/// I2438: a replacement occurrence takes the bind's gates.
+pub(crate) async fn replacement_body(d: &dyn FederationDirectory) {
+    let (user, device) = (key(80), key(81));
+    for k in [&user, &device] {
+        put(d, &key_record(k, &["user"], 0, None)).await.unwrap();
+    }
+    let (u, dv) = (iref(&user), iref(&device));
+    // The bind it replaces: the device's own statement, then the user's.
+    put(
+        d,
+        &bind(d, &device, &dv, &u, &dv, "phone", 10_000, None).await,
+    )
+    .await
+    .unwrap();
+    let by_user = bind(d, &user, &u, &u, &dv, "phone", 10_000, None).await;
+    let Ok(StatementOutcome::Row { row_id: target, .. }) = put(d, &by_user).await else {
+        panic!("I2438: the bind it replaces lands");
+    };
+    assert_eq!(bound(d, &u, &dv).await.as_deref(), Some("phone"));
+    // A machine class under the person: the bind's refusal, for either.
+    let plain = put(d, &bind(d, &user, &u, &u, &dv, "agent", 11_000, None).await)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        reason(&plain),
+        malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE,
+        "I2438 the ordinary bind: {plain}"
+    );
+    let mixed = put(
+        d,
+        &supersede(d, &user, &u, &u, &dv, "agent", 11_000, &target).await,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        reason(&mixed),
+        reason(&plain),
+        "I2438 the replacement's refusal is the bind's: {mixed}"
+    );
+    assert_eq!(
+        bound(d, &u, &dv).await.as_deref(),
+        Some("phone"),
+        "I2438 a refused replacement retires nothing"
+    );
+    // Possession: the author's statement alone binds nothing.
+    let alone = put(
+        d,
+        &supersede(d, &user, &u, &u, &dv, "laptop", 12_000, &target).await,
+    )
+    .await;
+    assert!(
+        alone.is_err(),
+        "I2438 a replacement with no statement of the occurrence key's own: {alone:?}"
+    );
+    assert_eq!(bound(d, &u, &dv).await.as_deref(), Some("phone"));
+    // A conforming replacement: both voices; the pair's row is replaced.
+    let own = supersede(d, &device, &dv, &u, &dv, "laptop", 13_000, &target).await;
+    let by_user = supersede(d, &user, &u, &u, &dv, "laptop", 13_000, &target).await;
+    let first = put(d, &own).await;
+    assert!(
+        matches!(first, Ok(StatementOutcome::Voice { .. })),
+        "I2438 the occurrence key's own statement is held: {first:?}"
+    );
+    let out = put(d, &by_user).await;
+    assert!(
+        matches!(out, Ok(StatementOutcome::Row { .. })),
+        "I2438 the conforming replacement lands: {out:?}"
+    );
+    assert_eq!(
+        bound(d, &u, &dv).await.as_deref(),
+        Some("laptop"),
+        "I2438 the pair's row is the replacement's: the replaced bind is retired"
+    );
+    // PIN-fix9b.rev2 — an OLDER replacement of the same pair lands as
+    // history; the stored row is unchanged (newest wins).
+    let own = supersede(d, &device, &dv, &u, &dv, "phone", 11_500, &target).await;
+    let by_user = supersede(d, &user, &u, &u, &dv, "phone", 11_500, &target).await;
+    put(d, &own)
+        .await
+        .expect("I2438 the older replacement's own voice");
+    let out = put(d, &by_user).await;
+    assert!(
+        matches!(out, Ok(StatementOutcome::Row { .. })),
+        "I2438 an older replacement of the same pair lands as history: {out:?}"
+    );
+    assert_eq!(
+        bound(d, &u, &dv).await.as_deref(),
+        Some("laptop"),
+        "I2438 the newer row stays: newest wins"
+    );
+    // PIN-fix9b.rev2 (CC 4.5.5, CC 3.1.3) — a supersedes naming ANOTHER pair
+    // (a new device "replacing" the old) is refused by name, for either
+    // voice; replacing a device is the self-roster door.
+    let other = key(82);
+    put(d, &key_record(&other, &["user"], 0, None))
+        .await
+        .unwrap();
+    let ov = iref(&other);
+    for (signer, iss, what) in [
+        (&other, ov.clone(), "its own voice"),
+        (&user, u.clone(), "the author's"),
+    ] {
+        let e = put(
+            d,
+            &supersede(d, signer, &iss, &u, &ov, "laptop", 14_000, &target).await,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            reason(&e),
+            malformed_row::SUPERSEDES_NOT_A_REPLACEMENT,
+            "I2438 another pair, {what}: {e}"
+        );
+    }
+    assert_eq!(
+        bound(d, &u, &ov).await,
+        None,
+        "I2438 nothing bound for the other key"
+    );
+    assert_eq!(
+        bound(d, &u, &dv).await.as_deref(),
+        Some("laptop"),
+        "I2438 and the target's pair is untouched"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2438_a_replacement_occurrence_takes_the_binds_gates_sqlite() {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(replacement_body(&b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2438_a_replacement_occurrence_takes_the_binds_gates_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::empty_dsn() else {
+        return;
+    };
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(replacement_body(&b)).await;
 }
 
 #[cfg(feature = "sqlite")]

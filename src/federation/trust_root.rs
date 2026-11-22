@@ -2916,6 +2916,105 @@ where
     ))
 }
 
+/// v62.0.0 (KR-fix19; CC 2.6.7 W, normative: "Every row whose admission walks
+/// a delegates_to chain … is judged at its signed asserted_at at the node
+/// that receives it. That instant is signer-chosen, so it is bounded.") —
+/// **the capability walk for a specific ACT**: does `signer` hold `scope`
+/// from a root `user_key_id` trusts AT THE ACT'S OWN SIGNED INSTANT
+/// `act_at`, within W of the receiving node's clock `received_at`?
+///
+/// - `Ok(Some(grant))`: conferred at `act_at`, and either `act_at` is inside
+///   W or the conferral still stands at `received_at`.
+/// - `Ok(None)`: not conferred at `act_at` (the door's own hold).
+/// - `Err(AssertedAtStale)`, a fold hold `asserted_at_stale` (plane
+///   `capability`): conferred at `act_at`, but `act_at` is more than W
+///   ([`self_roster::PAST_FRESHNESS_W_SECS`](super::self_roster::PAST_FRESHNESS_W_SECS))
+///   behind `received_at` and the conferral no longer stands now. "A
+///   withdrawn delegate keeps at most W of backdatable authority at a node
+///   that holds the withdrawal."
+///
+/// The shape is the one the other W gates have (`self_roster::check_roster_act_fresh`,
+/// the licensure door, the key_grant sealer, the consent `grant` chain):
+/// standing at the signed instant; outside W; not standing at receipt. They
+/// share the ONE reading of W (`self_roster::outside_past_freshness_window`);
+/// each keeps its own standing predicate, so the bodies are not one function.
+///
+/// Why not the node's clock alone (what these doors asked before): two nodes
+/// that receive the same act at different times then disagree about it. An
+/// act signed while the conferral stood and delivered after its end was
+/// refused on the late node and admitted on the early one.
+///
+/// The FUTURE side is the attestation door's own bound
+/// (`admission::check_instant_binding`, 300 s), asked before this.
+///
+/// What "at `act_at`" reads today (READ `live_conferral_rows`,
+/// `admission::root_grant_of`): a grant's expiry, a root grant's acceptance
+/// (asserted by `act_at`) and that acceptance's withdrawal (dated at or
+/// before `act_at`). A withdrawal of the GRANT row itself is not dated by
+/// the walk: it ends the conferral for every instant once held.
+///
+/// For a caller with NO act in hand ("is this conferral live now": serving,
+/// dialing, a host read) use [`capability_roots_to_trusted_root`] at the
+/// node's clock.
+///
+/// # Errors
+/// As above; directory reads.
+pub async fn conferred_for_act<F>(
+    directory: &F,
+    user_key_id: &str,
+    signer: &str,
+    scope: &str,
+    act_at: chrono::DateTime<chrono::Utc>,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<TrustedGrant>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(at_signed) =
+        capability_roots_to_trusted_root(directory, user_key_id, signer, scope, act_at).await?
+    else {
+        return Ok(None);
+    };
+    if super::self_roster::outside_past_freshness_window(act_at, received_at)
+        && capability_roots_to_trusted_root(directory, user_key_id, signer, scope, received_at)
+            .await?
+            .is_none()
+    {
+        return Err(fold::hold(
+            reason::ASSERTED_AT_STALE,
+            Error::AssertedAtStale {
+                author: signer.to_owned(),
+                standing_for: scope.to_owned(),
+                plane: "capability",
+                asserted_at: act_at,
+                w_secs: super::self_roster::PAST_FRESHNESS_W_SECS,
+            },
+        ));
+    }
+    Ok(Some(at_signed))
+}
+
+/// v62.0.0 (KR-fix19.doors rev 2) — is `row` a `withdraws` of a COUNTED ROOT
+/// GRANT among `slice`, dated after `t`? Such a withdrawal has not happened
+/// yet as of `t` ([`live_conferral_rows`], `admission::root_grants_for`).
+pub(crate) fn root_grant_withdrawal_after(
+    row: &Attestation,
+    slice: &[Attestation],
+    t: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if row.attestation_type != attestation_type::WITHDRAWS || row.asserted_at <= t {
+        return false;
+    }
+    let Some(target) =
+        precedence::references_attestation_id_from_envelope(&row.attestation_envelope)
+    else {
+        return false;
+    };
+    slice
+        .iter()
+        .any(|g| g.attestation_id == target && super::admission::is_counted_root_grant_row(g))
+}
+
 /// v18.3.0 (CIRISPersist#483) — the composed capability walk: does
 /// `subject_key_id` hold delegation `scope`, granted by a root that
 /// `user_key_id` trusts?
@@ -3090,7 +3189,21 @@ where
     }
     let about_subject =
         with_slice_composers(directory, conferrals, Some(subject_key_id), None).await?;
-    let about_refs: Vec<&Attestation> = about_subject.iter().collect();
+    // v62.0.0 (KR-fix19.doors rev 2; CC 2.6.7) — ONE RULE FOR BOTH ENDS OF A
+    // ROOT CONFERRAL. The grantee's end (the acceptance's withdrawal) is read
+    // at the caller's instant (`membership_acceptance::root_grant_acceptance_at`).
+    // The holders' end is the counted withdrawal of the GRANT: it too ends
+    // the conferral for instants AT OR AFTER its own stated instant, and not
+    // before. A counted withdrawal has one instant (its voices are
+    // statements over one payload, so one `asserted_at`). So a withdrawal of
+    // a counted root grant dated after `now` is not folded here: an act
+    // dated before it is judged alike by a node that receives the act before
+    // the withdrawal and one that receives it after. Every other grant's
+    // tombstone is folded as before (not dated).
+    let about_refs: Vec<&Attestation> = about_subject
+        .iter()
+        .filter(|a| !root_grant_withdrawal_after(a, &about_subject, now))
+        .collect();
     let dead = tombstoned_ids(&about_refs);
     // v62.0.0 (TR-fix1; CC 3.2 T8) — `now` is the caller's instant.
 

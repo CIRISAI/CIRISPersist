@@ -1012,7 +1012,7 @@ pub(crate) async fn ceg_key_thumbprint_takes_the_subject_rule_body(d: &dyn Feder
     );
     // Put through the door: the normal subject rule holds it (never refused
     // outright), so it is not a trust edge here.
-    let _ = e2::put_statement(d, &st_edge).await;
+    let _reason = e2::put_held(d, &st_edge, "I4056: the edge through the door").await;
     let st = unit_statement(0x58);
     let r = cose_receipt(
         receipts::ALG_COMPOSITE,

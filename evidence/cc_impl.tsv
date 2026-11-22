@@ -25,7 +25,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 3.1.8.5	CLM-nsproc-cross-attestation-prefix-distinctness-detection-distributive-access-resource-t	CIRISPersist	src/federation/admission.rs#default_reserved_prefix_rules	ciris-persist@61.4.2	f9bfc5c37dbb96bd0730228cbfca15b5aa3c7bf12bf83471244da3589e45ee5c
 3.1.9.2	CLM-nsproc-community-id-moderation-allegation-type	CIRISPersist	src/federation/admission.rs#check_delegated_duty_scores_admission	ciris-persist@61.4.2	808df128b450543425e0255bada62cbc8c262abc24aef2b76afd6e22db007e38
 3.1.9.2	CLM-nsproc-community-id-reconsideration-grounds	CIRISPersist	src/federation/admission.rs#named_moderator_holders	ciris-persist@61.4.2	8b379316cf892100b1dc4b79f36153e421310cd341393513bd9db965a6fae5d3
-3.1.9.4	CLM-nsproc-kind-kind-discriminator-hard-case-kind	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@61.4.2	5319caf79260098f2ea7aa6dff6fdfe6f313d9ab1821283d13b226aee728e0b5
+3.1.9.4	CLM-nsproc-kind-kind-discriminator-hard-case-kind	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@61.4.2	53a41cf46d1ddaae8f616a786b0ade0123c68c8be6c23824a2293ad698ce4f8e
 3.1.9.7	CLM-nsproc-meta-goal-alignment-goal-scale	CIRISPersist	src/federation/goal.rs#check_goal_row_admission	ciris-persist@61.4.2	06b78078f794518b817c9bcf943e380d46da98327402ff45759ff69d2fef079f
 3.1.9.7	CLM-nsproc-goal-scope-goal-scale	CIRISPersist	src/federation/goal.rs#GoalScope	ciris-persist@61.4.2	8b41a012ecfaf16e7970c23b077299689b1282637ea9bddaad935c6c3759f88f
 3.2	CLM-nsproc-delegated-scope-ownership	CIRISPersist	src/federation/admission.rs#check_node_agency_admission	ciris-persist@61.4.2	71d9034e8c05ae18a35386107b523e4f3af26541447fa0db68b7bae4d18f6e88
@@ -235,7 +235,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 3.2	CLM-public-community	CIRISPersist	src/federation/public_room.rs#check_public_room_conformance	ciris-persist@61.4.2	ba7f0a13bba6d353d70168dd938787e60bd8ddc82adb6f8e103176435927a3e3
 3.2	CLM-public-community	CIRISPersist	src/federation/public_room.rs#check_community_listing_admission	ciris-persist@61.4.2	b893c568aaa12559fcdb06f3b81d38cbf2aace05f3d5865d52c4577d2eaaa982
 3.2	CLM-public-community	CIRISPersist	src/federation/public_room.rs#live_standing_proposal	ciris-persist@61.4.2	94b29cc3fa54e1daa09a8fbd0f31ade0f7ca8cfd9d18f6ec492dfb43dbe06673
-3.1.9.4	CLM-composer-convergent-rank	CIRISPersist	src/federation/attestation_query.rs#lifecycle_predicate	ciris-persist@61.4.2	c9c2ec70e0b815cfa4c0bff8b28491394347bae5d46dfe2bac954ca1b3d39ba2
+3.1.9.4	CLM-composer-convergent-rank	CIRISPersist	src/federation/attestation_query.rs#lifecycle_predicate	ciris-persist@61.4.2	d89ad18116c076da0d2adce0b01344da73edd476682130b3b07600ddda133344
 4.4.3.12	CLM-affiliation-one-voice-countersign	CIRISPersist	src/federation/affiliation_config.rs#check_one_voice_countersign	ciris-persist@61.4.2	f4f41a3bcd6bf23875ed4f45ed33ae7791b8b0096244b4cc69b2d11d66e8cd42
 4.5.13	CLM-one-voice-room	CIRISPersist	src/federation/admission.rs#check_founder_only_above_family	ciris-persist@61.4.2	32b2dde573b13d495e28b128c62a7ab8777fa5a4629b468e0b872b20452dd5a9
 2.1	CLM-subject-within-audience	CIRISPersist	src/federation/admission.rs#check_cohort_standing_resolved	ciris-persist@61.4.2	9f4a0308740e255aab1c521f15ad7ea3c24f84ae7be3d3c083af299d941f0713
@@ -320,7 +320,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 3.3.3	CLM-subject_kind-subject	CIRISPersist	src/federation/location.rs#validate_location_cell	ciris-persist@61.4.2	73a20b32a116677d7a5a1b873cebc3381880247c8b96d1c264befa1cafd75de7
 3.3.4	CLM-family-subject	CIRISPersist	src/federation/admission.rs#validate_family_members	ciris-persist@61.4.2	95acab7c0bcbce82693a2cd5c158e874230128fe2c0230d8cfdfe5675e075f31
 3.3.5	CLM-consent-subject	CIRISPersist	src/federation/admission.rs#check_consent_record_admission	ciris-persist@61.4.2	bf1f3d39de1de1682e03f4b68c87c031f5ced447462ddb1bfe2296259403c298
-3.3.6	CLM-identity	CIRISPersist	src/federation/edition2/occurrence.rs#put_occurrence_voice	ciris-persist@61.4.2	fd6c7b7a7c8f4c710d96a39e9ac0154a1f3babf99a0029aeb15663712901a346
+3.3.6	CLM-identity	CIRISPersist	src/federation/edition2/occurrence.rs#put_occurrence_voice	ciris-persist@61.4.2	09dfbcd3f6d6d0cdb04c33de92f0cb010b8da6a827d2d1a0b0eb5f70f0f1afef
 3.3.6.1	CLM-encryption_pubkeys	CIRISPersist	src/federation/admission.rs#check_encryption_pubkeys	ciris-persist@61.4.2	4224641a376e8e42caad14216a9cbc5886172312413d5edeaa9736d34df670f9
 3.4.7	CLM-enforcement	CIRISPersist	src/federation/admission.rs#DimensionAdmissionPolicy::check	ciris-persist@61.4.2	108cc8e68a8372c6ab257070bb5912393af7422e6adc961430fa73b6de89f243
 3.4.7.1	CLM-identity-set	CIRISPersist	src/federation/register.rs#check_node_identity_exclusive	ciris-persist@61.4.2	7b4ff0f5d1638a4ecc01fc011fa786d3bbdf0c3cf84708a0d0e2785771763529
@@ -341,11 +341,11 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 6.1.2	CLM-noise-dominance	CIRISPersist	src/fountain/aggregation.rs#verify_for_admission	ciris-persist@61.4.2	85a5c0f15d024bb28c5eca0b7e51550416719cadda0b2752d2f0925e1d41c8b4
 2.4.1.1	CLM-withdraws	CIRISPersist	src/federation/admission.rs#resolve_withdraws_admission_rule_at	ciris-persist@61.4.2	882d424ddc291506b555efa112207a277eaf7ce138de4486e1fb753030546a9c
 2.6.7	CLM-time	CIRISPersist	src/federation/operational.rs#check_skew_bound	ciris-persist@61.4.2	ea41cd7121ca5c74ff7a372345863fc3fbfcee3b0544af27caf6f93e650da03e
-3.4.1	CLM-accord-reservation	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@61.4.2	5319caf79260098f2ea7aa6dff6fdfe6f313d9ab1821283d13b226aee728e0b5
-3.4.2	CLM-community-location	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@61.4.2	5319caf79260098f2ea7aa6dff6fdfe6f313d9ab1821283d13b226aee728e0b5
+3.4.1	CLM-accord-reservation	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@61.4.2	53a41cf46d1ddaae8f616a786b0ade0123c68c8be6c23824a2293ad698ce4f8e
+3.4.2	CLM-community-location	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@61.4.2	53a41cf46d1ddaae8f616a786b0ade0123c68c8be6c23824a2293ad698ce4f8e
 3.4.3	CLM-system	CIRISPersist	src/federation/admission.rs#default_reserved_prefix_rules	ciris-persist@61.4.2	f9bfc5c37dbb96bd0730228cbfca15b5aa3c7bf12bf83471244da3589e45ee5c
-3.4.4	CLM-family-self	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@61.4.2	5319caf79260098f2ea7aa6dff6fdfe6f313d9ab1821283d13b226aee728e0b5
-3.4.5	CLM-capacity-score	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@61.4.2	5319caf79260098f2ea7aa6dff6fdfe6f313d9ab1821283d13b226aee728e0b5
+3.4.4	CLM-family-self	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@61.4.2	53a41cf46d1ddaae8f616a786b0ade0123c68c8be6c23824a2293ad698ce4f8e
+3.4.5	CLM-capacity-score	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@61.4.2	53a41cf46d1ddaae8f616a786b0ade0123c68c8be6c23824a2293ad698ce4f8e
 3.4.8	CLM-detector-only	CIRISPersist	src/federation/admission.rs#default_reserved_prefix_rules	ciris-persist@61.4.2	f9bfc5c37dbb96bd0730228cbfca15b5aa3c7bf12bf83471244da3589e45ee5c
 3.4.10	CLM-witness-emitter	CIRISPersist	src/federation/admission.rs#default_reserved_prefix_rules	ciris-persist@61.4.2	f9bfc5c37dbb96bd0730228cbfca15b5aa3c7bf12bf83471244da3589e45ee5c
 4.4.3.29	CLM-multi-subject	CIRISPersist	src/federation/admission.rs#resolve_withdraws_admission_rule_at	ciris-persist@61.4.2	882d424ddc291506b555efa112207a277eaf7ce138de4486e1fb753030546a9c
@@ -460,7 +460,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version	span_sha256
 2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/door.rs#refuse_earlier_form	ciris-persist@61.4.2	664f52340225294dcc3ec81e455fc1b40a86d3cd82d4078fe55543bf8046c71b
 2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/door.rs#require_key_of_iss	ciris-persist@61.4.2	d81f391ae0643e35c62152737fb9c2976495ddb739cebcba822044f12fed1674
 2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/payloads.rs#check	ciris-persist@61.4.2	956ad38fb37d562442a3e52df9bf2fc0b6d8eda95a6c5ee9cca09ba23828fae6
-2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/ingest.rs#check_composer_target	ciris-persist@61.4.2	42231be6f29fd25bb278d5bff5f8e8937454313224718041493061d812c4e69f
+2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/federation/edition2/ingest.rs#check_composer_target	ciris-persist@61.4.2	99e586374101c47781a58c86769d80b4c300f40d0b0f82ad9792552be21c8933
 2.6.1	CLM-signed-object-cose-planned	CIRISPersist	src/store/edition_upgrade.rs#delete_earlier_store	ciris-persist@61.4.2	0ea0947e3360bdd2964fb6e66fb063fe7674b3fe869004488565f3d8430a18ad
 4.2.1.1	CLM-halt-one-row	CIRISPersist	src/federation/edition2/halt.rs#refusal_error	ciris-persist@61.4.2	a8d1e70a2fa2911898507279fad0d16a8146af045f4bbda3c6ea62838377f11a
 4.2.1.1	CLM-halt-one-row	CIRISPersist	src/federation/edition2/halt.rs#roster_in_force	ciris-persist@61.4.2	e4dcb36c2effbbde0a210fc293fb5274af70ba9c69a9c8f8ed8e0d6102b06328

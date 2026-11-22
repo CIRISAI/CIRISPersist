@@ -1932,12 +1932,13 @@ impl FederationDirectory for FaultInjectingDirectory {
         &self,
         family_key_id: &str,
         active_halt_id: &str,
+        latch_json: Option<&str>,
     ) -> Result<(), Error> {
         if let Some(e) = self.faulted("set_active_halt") {
             return Err(e);
         }
         self.inner
-            .set_active_halt(family_key_id, active_halt_id)
+            .set_active_halt(family_key_id, active_halt_id, latch_json)
             .await
     }
     async fn set_consent_role(

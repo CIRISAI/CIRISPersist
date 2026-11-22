@@ -239,10 +239,10 @@ async fn public_room_joiner(
 
 /// Land the owner binding over `node`: the owner's voice, then the node's.
 async fn land_binding(d: &dyn FederationDirectory, binding: &Attestation, node: &str) {
-    let _ = e2::put_signed(d, binding)
-        .await
-        .expect("I3873: the owner's voice over the binding");
+    // v62.0.0 (FX-fix2) — the owner's voice alone is HELD (count_short:
+    // the node's own voice cosigns, CC 3.2), asserted by the fixture.
     let st = e2::carried_statement(binding).expect("I3873: the binding's statement");
+    let _reason = e2::put_held(d, &st, "I3873: the owner's voice over the binding").await;
     let o = e2::put_statement(d, &e2::voice_of(&st, node))
         .await
         .expect("I3873: the node's voice over its binding");

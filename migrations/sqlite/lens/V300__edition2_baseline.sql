@@ -1125,7 +1125,8 @@ CREATE TABLE accord_decision (
 CREATE TABLE accord_active_halt (
     family_key_id        TEXT PRIMARY KEY,
     active_halt_id       TEXT NOT NULL,
-    set_at               TEXT NOT NULL             -- RFC-3339
+    set_at               TEXT NOT NULL,            -- RFC-3339
+    latch_json           TEXT CHECK (latch_json IS NULL OR json_valid(latch_json))
 );
 CREATE TABLE storage_budget_installed (
     -- The owner node this budget binds (StorageBudgetV1.node_id).

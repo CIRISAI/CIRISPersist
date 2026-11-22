@@ -2063,6 +2063,15 @@ mod storm_v61 {
             .map(|col| match col.as_str() {
                 "attestation_id" => "attestation_id || '-h' || n".to_owned(),
                 "persist_row_hash" => "persist_row_hash || '-h' || n".to_owned(),
+                // TA-prod1 — a copy is a DISTINCT claim: its restatement key
+                // (V300's plain column, P8-fix14: iss, sub, type, family and
+                // the payload minus placement, `asserted_at` included) differs
+                // as its id does. Copied verbatim, all N rows shared ONE key,
+                // and the Live filter's restatement arm (`w`) walked all N per
+                // listed row: the 130M pager fetches of the 4vq run were this
+                // fixture, not the listing (no production rows share a key
+                // but a claim's true restatements, one per scope).
+                "restatement_key" => "restatement_key || '-h' || n".to_owned(),
                 "attestation_envelope" => format!(
                     "json_set(attestation_envelope, '$.evidence_refs[0]', printf('%064d', n / 2), \
                      '$.pad', hex(zeroblob({})))",
@@ -2397,6 +2406,17 @@ mod storm_v61 {
                     .collect()
                 };
                 eprintln!("v61 Live listing {tag} plan: {plan:?}");
+                // TA-prod1 — the plan itself: every probe of the attestation
+                // table is a SEARCH. A `SCAN <alias> USING INDEX
+                // federation_attestations_*` is a correlated subquery walking
+                // a whole index per listed row (the #1252 alias arm's
+                // affinity before TA-prod1: `SCAN c2 USING INDEX
+                // federation_attestations_reference_live`).
+                assert!(
+                    plan.iter()
+                        .all(|l| !(l.starts_with("SCAN ") && l.contains("federation_attestations"))),
+                    "{tag}: a subquery walks an attestation index instead of seeking it: {plan:?}"
+                );
                 let _ = pager_fetches(&conn.lock());
                 let t0 = std::time::Instant::now();
                 let page = b

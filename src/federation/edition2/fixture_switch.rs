@@ -352,11 +352,28 @@ pub fn is_kid(s: &str) -> bool {
     is_identity_ref(s)
 }
 
+/// v62.0.0 (FX-fix2) — **the reserved literal subjects**: the names of a
+/// root or a room that are no key's seed, kept as they are by
+/// [`kid_or_keep`]. Before this the codec read "humanity-accord" as a seed
+/// and stated a row about a KEY of that name, while the put still returned
+/// Ok (I2350's door leg, I2465's withdrawal and I2410's holder row each
+/// worked round it). A new reserved `*_FAMILY_KEY_ID` / `*_COMMUNITY_KEY_ID`
+/// literal in `src/` fails `reserved_literal_subjects_round_trip` until it
+/// is listed here.
+pub const RESERVED_LITERAL_SUBJECTS: [&str; 2] = [
+    ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID,
+    crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID,
+];
+
 /// Text that names no key and is kept as it is by [`kid_or_keep`]: a 64-hex
-/// row id or digest, and a canonical-hash subject (`sha256:<hex>`,
-/// `canonical:sha256:<hex>`; CC 4.2.2).
+/// row id or digest, a canonical-hash subject (`sha256:<hex>`,
+/// `canonical:sha256:<hex>`; CC 4.2.2), and a reserved literal subject
+/// ([`RESERVED_LITERAL_SUBJECTS`]).
 fn is_not_a_key(s: &str) -> bool {
-    is_hex64(s) || s.starts_with("sha256:") || s.starts_with("canonical:")
+    is_hex64(s)
+        || s.starts_with("sha256:")
+        || s.starts_with("canonical:")
+        || RESERVED_LITERAL_SUBJECTS.contains(&s)
 }
 
 /// An identity-ref unchanged; a subject that names no key (a 64-hex id or
@@ -1468,6 +1485,21 @@ pub fn voices_of(row: &Attestation, seeds_: &[&str]) -> Vec<Vec<u8>> {
 /// `kind` is not a composer; the door refuses it.
 #[must_use]
 pub fn composer_of(kind: &str, target: &Attestation, seed: &str) -> Attestation {
+    composer_of_at(kind, target, seed, crate::host::clock::now())
+}
+
+/// [`composer_of`] at a STATED instant (KR-fix19: a retraction dated before
+/// its target, or at its instant).
+///
+/// # Panics
+/// As [`composer_of`].
+#[must_use]
+pub fn composer_of_at(
+    kind: &str,
+    target: &Attestation,
+    seed: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Attestation {
     assert!(
         COMPOSER_ROW_TYPES.contains(&kind),
         "fixture_switch: {kind} is not a composer"
@@ -1482,7 +1514,7 @@ pub fn composer_of(kind: &str, target: &Attestation, seed: &str) -> Attestation 
         .unwrap_or_else(|| family_of(target));
     let mut row = target.clone();
     row.attestation_type = kind.to_owned();
-    row.asserted_at = crate::host::clock::now();
+    row.asserted_at = at;
     row.expires_at = None;
     row.subject_key_ids = Vec::new();
     let mut envelope = serde_json::Map::new();
@@ -2300,6 +2332,61 @@ pub async fn put_statement<D: FederationDirectory + ?Sized>(
     super::ingest::put_statement(dir, statement, None, INGEST_TIER).await
 }
 
+/// v62.0.0 (FX-fix2) — **put `statement` and assert it LANDED**: a key-plane
+/// statement kept, or a row this node now holds. Opt-in: the plain
+/// [`put_statement`] answers whatever the door does. On failure the panic
+/// names the outcome and, for a held row, its hold reason. Its row id.
+///
+/// # Panics
+/// The door refuses it, or it is held (or kept only as a voice).
+pub async fn put_landed(dir: &dyn FederationDirectory, statement: &[u8], what: &str) -> RowId {
+    let id = RowId::of_statement(statement)
+        .unwrap_or_else(|| panic!("{what}: put_landed: not a row statement"));
+    let out = put_statement(dir, statement)
+        .await
+        .unwrap_or_else(|e| panic!("{what}: put_landed: refused: {e}"));
+    if matches!(out, StatementOutcome::KeyPlane { .. }) {
+        return id;
+    }
+    if dir
+        .get_attestation(&id.hex())
+        .await
+        .unwrap_or_else(|e| panic!("{what}: put_landed: get_attestation: {e}"))
+        .is_none()
+    {
+        let held = super::fold::why_held(dir, &id)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: put_landed: why_held: {e}"));
+        panic!("{what}: put_landed: not landed ({out:?}); held: {held:?}");
+    }
+    id
+}
+
+/// v62.0.0 (FX-fix2) — **put `statement` and assert it is HELD** (kept, not
+/// landed): the hold reason. Opt-in, as [`put_landed`].
+///
+/// # Panics
+/// The door refuses it, it landed, or it is neither landed nor held.
+pub async fn put_held(dir: &dyn FederationDirectory, statement: &[u8], what: &str) -> String {
+    let id = RowId::of_statement(statement)
+        .unwrap_or_else(|| panic!("{what}: put_held: not a row statement"));
+    let out = put_statement(dir, statement)
+        .await
+        .unwrap_or_else(|e| panic!("{what}: put_held: refused: {e}"));
+    assert!(
+        dir.get_attestation(&id.hex())
+            .await
+            .unwrap_or_else(|e| panic!("{what}: put_held: get_attestation: {e}"))
+            .is_none(),
+        "{what}: put_held: it LANDED ({out:?})"
+    );
+    super::fold::why_held(dir, &id)
+        .await
+        .unwrap_or_else(|e| panic!("{what}: put_held: why_held: {e}"))
+        .unwrap_or_else(|| panic!("{what}: put_held: neither landed nor held ({out:?})"))
+        .reason
+}
+
 /// Make `seed`'s key live in `dir` ([`key_record`]); its identity-ref.
 ///
 /// # Panics
@@ -2640,6 +2727,64 @@ pub async fn put_row<D: FederationDirectory + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    /// v62.0.0 (FX-fix2) — every reserved literal subject round-trips the
+    /// codec unchanged, and every `*FAMILY_KEY_ID` / `*COMMUNITY_KEY_ID`
+    /// literal in `src/` (not a key: no hex, no identity-ref) is listed in
+    /// `RESERVED_LITERAL_SUBJECTS`, so a new reserved subject fails here
+    /// until it is listed.
+    #[test]
+    fn reserved_literal_subjects_round_trip() {
+        for s in super::RESERVED_LITERAL_SUBJECTS {
+            assert_eq!(super::kid_or_keep(s), s, "{s} is kept as it is");
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root];
+        let mut found = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for line in text.lines() {
+                    let code = line.trim_start();
+                    let Some(rest) = code
+                        .strip_prefix("pub const ")
+                        .or_else(|| code.strip_prefix("const "))
+                    else {
+                        continue;
+                    };
+                    let Some((name, value)) = rest.split_once(": &str = \"") else {
+                        continue;
+                    };
+                    if !(name.ends_with("FAMILY_KEY_ID") || name.ends_with("COMMUNITY_KEY_ID")) {
+                        continue;
+                    }
+                    let Some(value) = value.strip_suffix("\";") else {
+                        continue;
+                    };
+                    if super::is_hex64(value) || super::is_identity_ref(value) {
+                        continue;
+                    }
+                    found.push((path.display().to_string(), value.to_owned()));
+                }
+            }
+        }
+        assert!(!found.is_empty(), "the scan finds the accord's id at least");
+        for (file, value) in found {
+            assert!(
+                super::RESERVED_LITERAL_SUBJECTS.contains(&value.as_str()),
+                "{file}: the literal subject {value:?} is not in RESERVED_LITERAL_SUBJECTS: the \
+                 fixture codec would read it as a seed"
+            );
+        }
+    }
+
     use super::*;
 
     fn strip_body_comments(s: &str) -> String {

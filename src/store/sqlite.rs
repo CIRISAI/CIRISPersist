@@ -4433,6 +4433,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
         let after = after_attestation_id.map(str::to_owned);
         let limit = i64::from(limit);
+        // TA-prod1 — the composer probe compares `= +a.attestation_id`: a
+        // bare TEXT column's affinity makes `composer_ref`'s expression
+        // column ineligible, so the seek stopped at (attester, type) and
+        // walked every composer of that type by that attester per candidate.
         let unplaced = crate::federation::admission::sqlite_envelope_names_no_cohort_target(
             "a.attestation_envelope",
         );
@@ -4452,7 +4456,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                                      AND s.attesting_key_id = a.attesting_key_id \
                                      AND json_extract(s.attestation_envelope, \
                                                       '$.references_attestation_id') \
-                                         = a.attestation_id) \
+                                         = +a.attestation_id) \
                    AND NOT EXISTS (SELECT 1 FROM federation_attestations e \
                                    WHERE e.tier = 'federation' \
                                      AND e.cohort_scope NOT IN ('self', 'family') \
@@ -5286,7 +5290,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let key = group_key_id.to_owned();
         let hashes = persist_row_hashes.to_vec();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
+            // TB2-prod1 (CIRISPersist#1238) — BEGIN IMMEDIATE, like every
+            // other write: the writer lock is taken at BEGIN, so busy_timeout
+            // applies and no later edit can turn it into a read-then-write.
+            let tx = write_tx(conn)?;
             for h in &hashes {
                 tx.execute(
                     "DELETE FROM federation_group_tips \
@@ -5786,17 +5793,27 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         family_key_id: &str,
         active_halt_id: &str,
+        latch_json: Option<&str>,
     ) -> Result<(), crate::federation::Error> {
         let fam = family_key_id.to_owned();
         let halt = active_halt_id.to_owned();
+        let latch = latch_json.map(str::to_owned);
         let now = crate::host::clock::now().to_rfc3339();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
+            // v62.0.0 (HALT-235) — the latch is written with the row; a
+            // re-store of the SAME halt keeps its receipt instant (`set_at`, a
+            // report: the fuse is the latch's counted `elapsed_ms`).
             conn.execute(
-                "INSERT INTO accord_active_halt (family_key_id, active_halt_id, set_at) \
-                 VALUES (?1, ?2, ?3) \
+                "INSERT INTO accord_active_halt \
+                    (family_key_id, active_halt_id, set_at, latch_json) \
+                 VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(family_key_id) DO UPDATE SET \
-                    active_halt_id = excluded.active_halt_id, set_at = excluded.set_at",
-                rusqlite::params![fam, halt, now],
+                    set_at = CASE WHEN accord_active_halt.active_halt_id = \
+                        excluded.active_halt_id THEN accord_active_halt.set_at \
+                        ELSE excluded.set_at END, \
+                    active_halt_id = excluded.active_halt_id, \
+                    latch_json = excluded.latch_json",
+                rusqlite::params![fam, halt, now, latch],
             )?;
             Ok(())
         })
@@ -5817,8 +5834,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 rusqlite::Error,
             > {
                 conn.query_row(
-                    "SELECT family_key_id, active_halt_id, set_at FROM accord_active_halt \
-                 WHERE family_key_id = ?1",
+                    "SELECT family_key_id, active_halt_id, set_at, latch_json \
+                     FROM accord_active_halt WHERE family_key_id = ?1",
                     [&fam],
                     sqlite_row_to_active_halt,
                 )
@@ -7895,28 +7912,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let Some(record_key) = record_key else {
             return Ok(None);
         };
-        // v61.3.0 (CIRISPersist#1252) — the self-check asks the write path's
-        // own derivation (`attestation_wire_hash` for an Attestation entry).
-        let reloaded =
-            crate::federation::wire_index::reload_record_hashed(self, kind, &record_key).await?;
-        let Some((bytes, recomputed)) = reloaded else {
-            return Ok(None);
-        };
-        if recomputed != content_hash {
-            tracing::warn!(
-                kind,
-                content_hash,
-                recomputed = %recomputed,
-                "signed_wire_index content-hash mismatch; self-healing (returning None)"
-            );
-            return Ok(None);
-        }
-        // v62.0.0 (RL-fix2b; CC 5.3.4) — the point read is a serve path: a
-        // row that waits on a node that is not rooted is not handed out.
-        if crate::federation::edition2::serve::point_read_waits(self, kind, &bytes).await? {
-            return Ok(None);
-        }
-        Ok(Some(bytes))
+        // v62.0.0 (TB2-prod2; #934) — the reload, the hash self-heal and the
+        // rootless serve wait are the SHARED plan; this door keeps its read.
+        crate::federation::wire_index::point_read_planned(self, kind, content_hash, &record_key)
+            .await
     }
 
     async fn rebuild_signed_wire_index(&self) -> Result<u64, crate::federation::Error> {
@@ -17761,6 +17760,7 @@ fn sqlite_row_to_active_halt(
         family_key_id: row.get("family_key_id")?,
         active_halt_id: row.get("active_halt_id")?,
         set_at: parse_rfc3339(&set_at),
+        latch_json: row.get("latch_json")?,
     })
 }
 
@@ -29095,6 +29095,18 @@ mod tests {
     /// (CIRISPersist#584) — the SQLITE leg of the shared steward-binding
     /// liveness witness (see the memory + postgres legs); all three call the
     /// SAME `admission::steward_liveness_test_support` body.
+    /// v62.0.0 (TB2-prod3) — the SQLITE leg: a roster member with no held
+    /// key record WAITS (never passes); an unstewarded agent is never seated.
+    #[tokio::test]
+    async fn unheld_member_record_waits_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::steward_liveness_test_support::exercise_unheld_member_record_waits(
+            &backend, "sq",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn steward_binding_liveness_parity_sqlite_584() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
@@ -29583,10 +29595,19 @@ mod tests {
     }
 
     /// Out-of-order delivery — a `withdraws` whose target T is not yet
-    /// locally present is admitted with `withdraws_admission_rule =
-    /// None` (deferred authority resolution), NOT rejected.
+    /// locally present WAITS on it (CC 2.7.3: another row's absence is a
+    /// wait, never a refusal and never a blind admission).
+    ///
+    /// v62.0.0 (PIN-fix7; CIRISVerify 23.4.1) — RESTATED. This test asserted
+    /// the earlier attestation door's deferred admission (stored with
+    /// `withdraws_admission_rule = None` before its target was known). Under
+    /// 23.4.1 a `withdraws` carries no dimension: its leaf, its authorship and
+    /// the dimension gate's input are its TARGET's, so the door cannot judge
+    /// it before the target lands. It now waits by name
+    /// (`federation_withdraws_target_unheld`, the statement door's
+    /// `link_unheld`), naming the target, and nothing is stored.
     #[tokio::test]
-    async fn withdraws_admission_absent_target_defers_to_none_sqlite() {
+    async fn withdraws_admission_absent_target_waits_sqlite() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         let prod = format!("prod-{}", uuid::Uuid::new_v4());
@@ -29597,16 +29618,24 @@ mod tests {
         let wid = format!("w-{}", uuid::Uuid::new_v4());
         let wid_row = e2_row(withdraws_against(&wid, &prod, &missing));
         let wid = e2::rid(&wid_row);
-        backend
+        let err = backend
             .put_attestation(SignedAttestation {
                 attestation: wid_row,
             })
             .await
-            .unwrap();
-        let got = backend.get_attestation(&wid).await.unwrap().unwrap();
+            .unwrap_err();
         assert_eq!(
-            got.withdraws_admission_rule, None,
-            "withdraws against an absent target is admitted with deferred (None) rule"
+            err.kind(),
+            "federation_withdraws_target_unheld",
+            "a withdraws of an absent target waits on it: {err}"
+        );
+        assert!(
+            err.to_string().contains(&missing),
+            "the wait names the target: {err}"
+        );
+        assert!(
+            backend.get_attestation(&wid).await.unwrap().is_none(),
+            "nothing is stored while the target is absent"
         );
     }
 

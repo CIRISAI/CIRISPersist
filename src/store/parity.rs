@@ -127,6 +127,18 @@ pub(crate) enum Class {
 ///   caller-supplied shape before anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v62.0.0 (PIN-fix2 / PIN-fix7; CIRISVerify 23.4.1 removed chrono) — the
+    // one instant boundary (`verify::utc`): a signed tree head's instant
+    // converted losslessly between chrono and Verify's `UtcDateTime`. It
+    // refuses nothing about the caller: both sides hold the same range, so it
+    // fails (`InstantOutOfRange`) only on the substrate's own terms, a stored
+    // instant neither side can represent.
+    ("to_verify", Class::Plumbing),
+    ("from_verify", Class::Plumbing),
+    // v62.0.0 (PIN-fix2) — the dimension gate's input for a `withdraws` /
+    // `recants`: the held target's dimension; a target not held HOLDS the
+    // caller's row (`link_unheld`): a statement about the caller's input.
+    ("composer_gate_dimension", Class::Gate),
     // v62.0.0 (JSON-cut slices A and F) — the one shared earlier-form
     // refusal: it refuses the caller's object by its form, before any parse.
     ("refuse_earlier_form", Class::Gate),
@@ -1009,6 +1021,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // test is a policy decision (a Gate); this node's standing, asked once
     // per serve call and passed into the SQL serve rule, is a derivation.
     ("point_read_waits", Class::Gate),
+    // v62.0.0 (TB2-prod2; #934) — the wire-index point read's shared tail
+    // (reload, hash self-heal, the serve wait): both backends run it.
+    ("point_read_planned", Class::Plan),
     ("rooted_for_serve", Class::Plumbing),
     ("fountain_manifest_row", Class::Delegates),
     ("from_manifest_bytes", Class::Plumbing),
@@ -1660,7 +1675,7 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 69] = [
+    const SHARED_PLANS: [(&str, &str); 70] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance.
         (
             "src/federation/transport_admit.rs",
@@ -1871,6 +1886,8 @@ mod tests {
             "src/federation/community_admit.rs",
             "put_community_membership_widening_planned",
         ),
+        // v62.0.0 (TB2-prod2) — the wire-index point read's tail.
+        ("src/federation/wire_index.rs", "point_read_planned"),
     ];
 
     /// v60.0.0 (CIRISPersist#934 step 4) — **the shared selections**: the
@@ -1917,7 +1934,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 75] = [
+    const SHARED_DOORS: [(&str, &str, &str); 76] = [
         // v61 (CIRISPersist#934, S4b) — the transport rows' stored provenance,
         // decoded by the row mapper both doors read through.
         (
@@ -2281,6 +2298,13 @@ mod tests {
             "FederationDirectory",
             "put_community_membership_widening",
             "put_community_membership_widening_planned",
+        ),
+        // v62.0.0 (TB2-prod2) — the point read keeps its own SELECT; its
+        // tail is the shared plan.
+        (
+            "FederationDirectory",
+            "lookup_signed_record_by_content_hash",
+            "point_read_planned",
         ),
     ];
 

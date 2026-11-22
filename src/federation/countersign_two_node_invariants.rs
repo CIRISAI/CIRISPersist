@@ -26,6 +26,11 @@
 //! - **I4164** — replication reordering: a second verdict, voiced the same
 //!   way, reaches C by B's feed applied in REVERSE (the official's voice
 //!   first): held, then landed on the seat's voice, naming the seat.
+//! - **I2440** (PIN-fix9c; the Constitution's ruling of 2026-11-21, CC
+//!   2.4.1) — the producer drafts a `supersedes` of the seat's verdict as it
+//!   drafts the verdict: COUNTED (no `author`) in the one-seat affiliation,
+//!   so the replacement waits for the official's countersign as the act it
+//!   replaces did (the seat's voice alone is held, never a row).
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -303,6 +308,117 @@ pub(crate) mod bodies {
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod replacement {
+    use crate::federation::affiliation_floor_invariants::bodies::affiliation;
+    use crate::federation::edition2::emit::draft_from_envelope_in;
+    use crate::federation::edition2::fixture_switch as e2;
+    use crate::federation::edition2::ingest::StatementOutcome;
+    use crate::federation::edition2::liveness::statement_parts;
+    use crate::federation::edition2::names::RowId;
+    use crate::federation::membership_acceptance_invariants::bodies::{
+        found_room_with_blob, id_of, reg,
+    };
+    use crate::federation::FederationDirectory;
+    use chrono::{Duration, Utc};
+
+    /// `f`'s draft of `row_type` over the verdict envelope (on `target`, if
+    /// any), signed by `f`'s own key.
+    #[allow(clippy::too_many_arguments)]
+    async fn drafted<B: FederationDirectory + Sync>(
+        a: &B,
+        f: &str,
+        accused: &str,
+        room: &str,
+        row_type: &str,
+        at_ms: u64,
+        target: Option<(&RowId, &str)>,
+    ) -> Vec<u8> {
+        let env = serde_json::json!({
+            "dimension": "slashing:proven_rogue:v1",
+            "score": 1.0,
+            "confidence": 1.0,
+            "community_id": room,
+            "subject_key_ids": [accused],
+            "cohort_scope": "federation",
+            "payload": {},
+        });
+        let draft = draft_from_envelope_in(
+            a,
+            &e2::kid_digest(f),
+            &e2::kid_or_keep(f),
+            accused,
+            row_type,
+            &env,
+            at_ms,
+            target.map(|(r, fam)| (&r.0, fam)),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("I2440: the {row_type} drafts: {e}"));
+        let sig = e2::signing_key(f)
+            .sign(&draft.sig_structure)
+            .expect("the seat's own key signs");
+        draft.assemble(sig)
+    }
+
+    pub(crate) async fn i2440_a_replacement_floor_act_is_drafted_counted<B>(a: &B, s: &str)
+    where
+        B: FederationDirectory + Sync,
+    {
+        let k = |n: &str| format!("i2440-{n}-{s}");
+        let (f, official, m, solo) = (k("f"), k("official"), k("m"), k("solo"));
+        reg(a, &[&f, &official, &m, &solo]).await;
+        let (f, official, m, solo) = (id_of(&f), id_of(&official), id_of(&m), id_of(&solo));
+        found_room_with_blob(
+            a,
+            &solo,
+            "founder_only",
+            &[&f],
+            &[],
+            Some(affiliation(Some(&official))),
+        )
+        .await
+        .expect("the seat's affiliation");
+        let at = e2::ms(Utc::now() - Duration::hours(1));
+        let verdict = drafted(a, &f, &m, &solo, "scores", at, None).await;
+        let (_, p) = statement_parts(&verdict).expect("a statement");
+        assert!(
+            p.get_text("author").is_none(),
+            "I2440: the verdict is drafted counted"
+        );
+        e2::put_statement(a, &verdict)
+            .await
+            .expect("I2440: the seat's voice is kept");
+        let rid = RowId::of_statement(&verdict).expect("a row statement");
+        let family = ciris_verify_core::namespace_match::family_id("slashing:{outcome}");
+        let replacement = drafted(
+            a,
+            &f,
+            &m,
+            &solo,
+            crate::federation::types::attestation_type::SUPERSEDES,
+            at + 60_000,
+            Some((&rid, &family)),
+        )
+        .await;
+        let (_, p) = statement_parts(&replacement).expect("a statement");
+        assert!(
+            p.get_text("author").is_none(),
+            "I2440: the replacement of a counted act is drafted counted, as the act is"
+        );
+        let out = e2::put_statement(a, &replacement).await;
+        assert!(
+            matches!(out, Ok(StatementOutcome::Pending { .. })),
+            "I2440: the seat's voice alone on the replacement is held, never a row: {out:?}"
+        );
+        let rid2 = RowId::of_statement(&replacement).expect("a row statement");
+        assert!(
+            a.get_attestation(&rid2.hex()).await.unwrap().is_none(),
+            "I2440: no row before the countersign"
+        );
+    }
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod runners {
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
@@ -358,5 +474,38 @@ mod runners {
         )
         .await;
         eprintln!("i4160 postgres: RAN");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i2440_a_replacement_floor_act_is_drafted_counted_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        crate::federation::hard_case::test_support::declare_node(&b, "tn-a").await;
+        Box::pin(
+            super::replacement::i2440_a_replacement_floor_act_is_drafted_counted(&b, &suffix()),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i2440_a_replacement_floor_act_is_drafted_counted_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        crate::federation::hard_case::test_support::declare_node(&b, "tn-a").await;
+        Box::pin(
+            super::replacement::i2440_a_replacement_floor_act_is_drafted_counted(&b, &suffix()),
+        )
+        .await;
     }
 }

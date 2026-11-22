@@ -144,6 +144,19 @@ pub(crate) const KEYS_EDITION_TWO_PG_CONSTRAINTS: &[&str] = &[
 #[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
 pub(crate) const DELIVERY_SQLITE_DDL: &str = "CREATE TABLE cirisnode_federation_delivery_attestations (\n    announcement_id              TEXT NOT NULL,\n    announcement_canonical_hash  BLOB NOT NULL\n        CHECK (length(announcement_canonical_hash) = 32),\n    peer_key_id                  TEXT NOT NULL,\n    received_at                  TEXT NOT NULL,\n    transport_id                 TEXT NOT NULL\n        CHECK (transport_id IN ('reticulum', 'tcp_tls', 'http_over_tls', 'other')),\n    signature_composite          BLOB NOT NULL\n        CHECK (length(signature_composite) = 3373),\n    inserted_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),\n    signature_verified           INTEGER NOT NULL DEFAULT 0,\n    persist_row_hash             TEXT NOT NULL,\n    PRIMARY KEY (announcement_id, peer_key_id)\n)";
 
+/// v62.0.0 (HALT-235; CIRISVerify 23.5.0) — the accord halt's stored latch:
+/// `accord_active_halt` gains `latch_json` (the whole `HaltLatch` JSON),
+/// edited in V300's edition-1 `CREATE TABLE` (V300 is unshipped; no `ALTER`).
+/// On SQLite this text replaces the frozen catalog's; on PostgreSQL the added
+/// column leaves `got`.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const HALT_LATCH_SQLITE_DDL: &str = "CREATE TABLE accord_active_halt (\n    family_key_id        TEXT PRIMARY KEY,\n    active_halt_id       TEXT NOT NULL,\n    set_at               TEXT NOT NULL,            -- RFC-3339\n    latch_json           TEXT CHECK (latch_json IS NULL OR json_valid(latch_json))\n)";
+
+/// The column [`HALT_LATCH_SQLITE_DDL`] adds, on PostgreSQL.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const HALT_LATCH_PG_COLUMN: (&str, &str) =
+    ("cirislens.accord_active_halt", "latch_json");
+
 /// The delivery-attestation table: its SQLite name, its PostgreSQL name.
 #[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
 pub(crate) const DELIVERY_TABLE: (&str, &str) = (
@@ -526,6 +539,20 @@ mod tests {
                 "the frozen edition-1 delivery DDL differs from edition 2's"
             );
             *line = format!("{head}{}", esc(super::DELIVERY_SQLITE_DDL));
+            // v62.0.0 (HALT-235) — the halt table's edition-2 DDL (the latch
+            // column), edited in V300's CREATE TABLE: its text replaces the
+            // frozen one.
+            let head = "object\ttable\taccord_active_halt\taccord_active_halt\t";
+            let line = lines
+                .iter_mut()
+                .find(|l| l.starts_with(head))
+                .expect("accord_active_halt in the fixture");
+            assert_ne!(
+                unesc(&line[head.len()..]),
+                super::HALT_LATCH_SQLITE_DDL,
+                "the frozen edition-1 halt DDL differs from edition 2's"
+            );
+            *line = format!("{head}{}", esc(super::HALT_LATCH_SQLITE_DDL));
             // v62.0.0 (P8-fix14) — the restatement index, an edition-2 object
             // on an edition-1 table.
             let (name, ddl) = super::ATTESTATIONS_RESTATEMENT_INDEX;
@@ -579,6 +606,11 @@ mod tests {
             sqlite.matches(super::DELIVERY_SQLITE_DDL).count(),
             1,
             "I1950: the delivery table's edition-2 DDL is V300's own text"
+        );
+        assert_eq!(
+            sqlite.matches(super::HALT_LATCH_SQLITE_DDL).count(),
+            1,
+            "I1950: the halt table's edition-2 DDL is V300's own text"
         );
         let pg = std::fs::read_to_string(root.join("postgres/lens/V300__edition2_baseline.sql"))
             .unwrap();
@@ -755,6 +787,17 @@ mod tests {
             "I1950: the restatement column and index are there"
         );
         let all: Vec<String> = all.into_iter().filter(|l| !restatement(l)).collect();
+        // v62.0.0 (HALT-235) — the halt latch column edition 2 adds.
+        let latch = |l: &String| {
+            l.starts_with(&format!("col\t{}\t", super::HALT_LATCH_PG_COLUMN.0))
+                && l.split('\t').nth(3) == Some(super::HALT_LATCH_PG_COLUMN.1)
+        };
+        assert_eq!(
+            all.iter().filter(|l| latch(l)).count(),
+            1,
+            "I1950: the halt latch column is there"
+        );
+        let all: Vec<String> = all.into_iter().filter(|l| !latch(l)).collect();
         let n_added = all.iter().filter(|l| added(l)).count();
         assert_eq!(
             n_added,

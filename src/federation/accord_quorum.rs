@@ -227,8 +227,15 @@ pub struct ActiveHalt {
     pub family_key_id: String,
     /// The active CONSTITUTIONAL halt id (a resume binds `sha256(this)`).
     pub active_halt_id: String,
-    /// When the halt became active.
+    /// When the halt became active (the wall instant of receipt: a report).
     pub set_at: DateTime<Utc>,
+    /// v62.0.0 (HALT-235; CIRISVerify 23.5.0) — the node's whole halt latch
+    /// (`ciris_verify_core::accord_halt_latch::HaltLatch`) as JSON: the
+    /// latched halt's counted `elapsed_ms` and the last monotonic checkpoint.
+    /// `None` on a row written before the latch was stored (or by the
+    /// earlier-form `set_active_halt` host verb): the door re-derives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latch_json: Option<String>,
 }
 
 /// v62.0.0 (VA-quorum) — the stand-ins' WIRE is Verify's: field names,

@@ -11698,18 +11698,31 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         family_key_id: &str,
         active_halt_id: &str,
+        latch_json: Option<&str>,
     ) -> Result<(), crate::federation::Error> {
         let client = self
             .get_client()
             .await
             .map_err(crate::store::Error::into_federation)?;
+        // v62.0.0 (HALT-235) — as sqlite's: the latch with the row; the same
+        // halt re-stored keeps its receipt instant.
         client
             .execute(
-                "INSERT INTO cirislens.accord_active_halt (family_key_id, active_halt_id, set_at) \
-                 VALUES ($1, $2, $3) \
+                "INSERT INTO cirislens.accord_active_halt \
+                    (family_key_id, active_halt_id, set_at, latch_json) \
+                 VALUES ($1, $2, $3, $4::text::jsonb) \
                  ON CONFLICT (family_key_id) DO UPDATE SET \
-                    active_halt_id = EXCLUDED.active_halt_id, set_at = EXCLUDED.set_at",
-                &[&family_key_id, &active_halt_id, &crate::host::clock::now()],
+                    set_at = CASE WHEN cirislens.accord_active_halt.active_halt_id = \
+                        EXCLUDED.active_halt_id THEN cirislens.accord_active_halt.set_at \
+                        ELSE EXCLUDED.set_at END, \
+                    active_halt_id = EXCLUDED.active_halt_id, \
+                    latch_json = EXCLUDED.latch_json",
+                &[
+                    &family_key_id,
+                    &active_halt_id,
+                    &crate::host::clock::now(),
+                    &latch_json,
+                ],
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("set_active_halt: {e}")))?;
@@ -11727,8 +11740,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(crate::store::Error::into_federation)?;
         let row_opt = client
             .query_opt(
-                "SELECT family_key_id, active_halt_id, set_at FROM cirislens.accord_active_halt \
-                 WHERE family_key_id = $1",
+                "SELECT family_key_id, active_halt_id, set_at, latch_json::text AS latch_json \
+                 FROM cirislens.accord_active_halt WHERE family_key_id = $1",
                 &[&family_key_id],
             )
             .await
@@ -13948,28 +13961,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             row.safe_get_with("record_key", crate::federation::Error::Backend)?;
         // v59.1.2 — the reload reads through the directory (its own clients).
         drop(client);
-        // v61.3.0 (CIRISPersist#1252) — the self-check asks the write path's
-        // own derivation (`attestation_wire_hash` for an Attestation entry).
-        let reloaded =
-            crate::federation::wire_index::reload_record_hashed(self, kind, &record_key).await?;
-        let Some((bytes, recomputed)) = reloaded else {
-            return Ok(None);
-        };
-        if recomputed != content_hash {
-            tracing::warn!(
-                kind,
-                content_hash,
-                recomputed = %recomputed,
-                "signed_wire_index content-hash mismatch; self-healing (returning None)"
-            );
-            return Ok(None);
-        }
-        // v62.0.0 (RL-fix2b; CC 5.3.4) — the point read is a serve path: a
-        // row that waits on a node that is not rooted is not handed out.
-        if crate::federation::edition2::serve::point_read_waits(self, kind, &bytes).await? {
-            return Ok(None);
-        }
-        Ok(Some(bytes))
+        // v62.0.0 (TB2-prod2; #934) — the reload, the hash self-heal and the
+        // rootless serve wait are the SHARED plan; this door keeps its read.
+        crate::federation::wire_index::point_read_planned(self, kind, content_hash, &record_key)
+            .await
     }
 
     async fn rebuild_signed_wire_index(&self) -> Result<u64, crate::federation::Error> {
@@ -22546,6 +22541,7 @@ fn pg_row_to_active_halt(
         family_key_id: row.safe_get_with("family_key_id", mk_err)?,
         active_halt_id: row.safe_get_with("active_halt_id", mk_err)?,
         set_at: row.safe_get_with("set_at", mk_err)?,
+        latch_json: row.safe_get_with("latch_json", mk_err)?,
     })
 }
 
@@ -31226,6 +31222,23 @@ mod tests {
     /// (CIRISPersist#584) — the POSTGRES leg of the shared steward-binding
     /// liveness witness (see the sqlite + memory legs); all three call the
     /// SAME `admission::steward_liveness_test_support` body.
+    /// v62.0.0 (TB2-prod3) — the POSTGRES leg (see the sqlite leg).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn unheld_member_record_waits_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::admission::steward_liveness_test_support::exercise_unheld_member_record_waits(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn steward_binding_liveness_parity_postgres_584() {

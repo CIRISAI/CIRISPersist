@@ -204,6 +204,14 @@ mod root_grant_invariants;
 // v62.0.0 (KR-fix3a) — `infra:attest:{family}` on the capability walk.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod scope_resolution_invariants;
+// v62.0.0 (KR-fix19; CC 2.6.7) — an act under a conferral is judged at its
+// own signed instant, inside W (I4319).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod conferral_act_instant_invariants;
+// v62.0.0 (KR-fix19) — under the PRODUCTION charter a root grant confers
+// what the production doors check, end to end (I4320).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod root_grant_production_charter_invariants;
 // v62.0.0 (BH-fix3) — I2125: an identity template is signed by an accord
 // holder, in its own domain.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]

@@ -379,6 +379,40 @@ pub(crate) mod bodies {
             ),
             "I1516: subject_outside_audience: {e:?}"
         );
+        // TB2-prod6 — the cohort-standing arm does not stand in for the
+        // withdraws rules: a room member who is neither the row's producer
+        // nor named by it (rules 1–4 none) is refused BY THE RULES.
+        let e = put(d, &withdraws(&moderator, &peer_row.0))
+            .await
+            .expect_err("I1516: a third party does not withdraw a peer's row");
+        assert_eq!(e.kind(), "federation_withdraws_not_admitted", "I1516: {e}");
+        // …and a `supersedes` is NOT a retraction: placed in the room and
+        // naming another party (its `attested_key_id` is the peer), it still
+        // meets the attested-party arm (#592).
+        let replacement = {
+            let room_k = e2::kid_or_keep(&room);
+            let env = serde_json::json!({
+                "dimension": PLAIN,
+                "score": crate::federation::namespace::registry::in_class_score(PLAIN),
+                "confidence": 0.9,
+                "community_id": room_k,
+                "community_key_id": room_k,
+                "references_attestation_id": e2::rid(&peer_row.0),
+            });
+            let mut r =
+                ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), &author, &member, &env);
+            r.attestation_type = attestation_type::SUPERSEDES.into();
+            r.weight = None;
+            r.cohort_scope = cohort_scope::COMMUNITY.into();
+            e2::row_of(&r, &author)
+        };
+        let e = put(d, &replacement)
+            .await
+            .expect_err("I1516: a replacement naming another party stays refused");
+        assert_eq!(e.kind(), "federation_cohort_standing_refused", "I1516: {e}");
+        // TB2-prod6 (rule 2) — the named person withdraws a peer's row about
+        // them: the retraction carries the target's party, and is judged by
+        // the withdraws rules, not by the attested-party arm.
         put(d, &withdraws(&author, &peer_row.0))
             .await
             .expect("I1516: the named person withdraws a peer's row about them");

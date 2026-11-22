@@ -284,6 +284,48 @@ pub async fn reload_record_hashed(
     Ok(Some((bytes, hash)))
 }
 
+/// v62.0.0 (TB2-prod2; CIRISPersist#934: no verdict is decided inside a
+/// per-backend door) — **the wire-index point read's shared tail**: given
+/// the `record_key` a backend's own `signed_wire_index` SELECT found for
+/// `(kind, content_hash)`, reload the record ([`reload_record_hashed`]),
+/// self-heal a hash that no longer matches (`None`, logged), and withhold a
+/// row the rootless serve wait holds back
+/// (`edition2::serve::point_read_waits`,
+/// RL-fix2b, CC 5.3.4). Both backends' `lookup_signed_record_by_content_hash`
+/// call this after their own read, so the decision exists once. Behaviour is
+/// the two doors' previous tail, moved unchanged.
+///
+/// # Errors
+///
+/// [`reload_record_hashed`]'s and the serve wait's directory reads.
+pub async fn point_read_planned(
+    dir: &dyn super::FederationDirectory,
+    kind: &str,
+    content_hash: &str,
+    record_key: &str,
+) -> Result<Option<Vec<u8>>, Error> {
+    // v61.3.0 (CIRISPersist#1252) — the self-check asks the write path's own
+    // derivation (`attestation_wire_hash` for an Attestation entry).
+    let Some((bytes, recomputed)) = reload_record_hashed(dir, kind, record_key).await? else {
+        return Ok(None);
+    };
+    if recomputed != content_hash {
+        tracing::warn!(
+            kind,
+            content_hash,
+            recomputed = %recomputed,
+            "signed_wire_index content-hash mismatch; self-healing (returning None)"
+        );
+        return Ok(None);
+    }
+    // v62.0.0 (RL-fix2b; CC 5.3.4) — the point read is a serve path: a row
+    // that waits on a node that is not rooted is not handed out.
+    if super::edition2::serve::point_read_waits(dir, kind, &bytes).await? {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
 /// v21.1.0 (CIRISPersist#507b) — the shared per-kind reload dispatcher every
 /// backend's `lookup_signed_record_by_content_hash` calls after its own
 /// `SELECT record_key FROM signed_wire_index WHERE (kind, content_hash) = ...`

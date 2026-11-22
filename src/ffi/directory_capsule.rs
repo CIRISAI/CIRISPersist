@@ -1671,6 +1671,11 @@ pub enum DirectoryOp {
         family_key_id: String,
         /// `active_halt_id`.
         active_halt_id: String,
+        /// v62.0.0 (HALT-235) — the halt latch as JSON. Defaulted, so a
+        /// consumer that sends the earlier two fields still decodes (the op
+        /// enum has no `deny_unknown_fields`, so an older persist ignores it).
+        #[serde(default)]
+        latch_json: Option<String>,
     },
     /// v61.4.2 (the capsule stub sweep) — [`FederationDirectory::set_consent_role`]; the proxy answered
     /// `Unsupported`. Result rides `Unit`. APPEND-ONLY (Growth).
@@ -4001,7 +4006,11 @@ pub async fn dispatch_directory_op(
         DirectoryOp::SetActiveHalt {
             family_key_id,
             active_halt_id,
-        } => match dir.set_active_halt(&family_key_id, &active_halt_id).await {
+            latch_json,
+        } => match dir
+            .set_active_halt(&family_key_id, &active_halt_id, latch_json.as_deref())
+            .await
+        {
             Ok(()) => DirectoryOpResult::Unit,
             Err(e) => op_err(&e),
         },
@@ -8743,12 +8752,14 @@ impl FederationDirectory for OpsDirectory {
         &self,
         family_key_id: &str,
         active_halt_id: &str,
+        latch_json: Option<&str>,
     ) -> Result<(), Error> {
         // v61.4.2 (the capsule stub sweep).
         match self
             .run_op(&DirectoryOp::SetActiveHalt {
                 family_key_id: family_key_id.to_string(),
                 active_halt_id: active_halt_id.to_string(),
+                latch_json: latch_json.map(str::to_owned),
             })
             .await?
         {
@@ -9462,9 +9473,15 @@ mod tests {
         // appended (and TR-fix2's changes). ABI stays 14 (ruled).
         // v62.0.0 (4i-regen) — re-pinned over 4i: VA-quorum's local accord
         // types (three type-path texts; the wire is identical). ABI stays 14.
+        // v62.0.0 (HALT-235) — `SetActiveHalt` gains `latch_json` under
+        // `#[serde(default)]`: an existing variant's field set changed, but
+        // the wire stays compatible both ways (an older consumer's two-field
+        // op decodes; the op enum has no `deny_unknown_fields`, so an older
+        // persist ignores the field). ABI stays 14 pending the lead's ruling
+        // (HALT-235.md).
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "0ee7ba2203666e3acfb0a72fda0e9073ffe014b3fc17962cfb4fcb2472777170",
+            "385a88dbbad9a1de7fe9af64bd286fa47c394ca9585b34b704a11b484bac13ba",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -11768,7 +11785,7 @@ mod tests {
         tag: &str,
     ) {
         let fam = format!("{tag}-halted-family");
-        rt.block_on(dir.set_active_halt(&fam, "halt-1763"))
+        rt.block_on(dir.set_active_halt(&fam, "halt-1763", None))
             .expect("set halt");
         let direct = rt.block_on(dir.get_active_halt(&fam)).expect("direct");
         assert!(direct.is_some(), "I1763 seed");
@@ -12826,11 +12843,14 @@ mod tests {
                 DirectoryOp::SetActiveHalt {
                     family_key_id: "x".into(),
                     active_halt_id: "y".into(),
+                    latch_json: None,
                 },
                 |p| {
-                    Box::pin(
-                        async move { p.set_active_halt("x", "y").await.map(|v| format!("{v:?}")) },
-                    )
+                    Box::pin(async move {
+                        p.set_active_halt("x", "y", None)
+                            .await
+                            .map(|v| format!("{v:?}"))
+                    })
                 },
             ),
             (
@@ -13580,7 +13600,7 @@ mod tests {
     ) {
         let fam = format!("{tag}-1892-family");
         let proxy = proxy_1244(rt, dir.clone());
-        rt.block_on(proxy.set_active_halt(&fam, "halt-1892"))
+        rt.block_on(proxy.set_active_halt(&fam, "halt-1892", None))
             .expect("I1892: set_active_halt routes");
         let set = rt.block_on(dir.get_active_halt(&fam)).expect("direct");
         assert_eq!(
@@ -14101,7 +14121,7 @@ mod tests {
 
         rt.block_on(async {
             concrete
-                .set_active_halt(&q.root_f, "eq-halt")
+                .set_active_halt(&q.root_f, "eq-halt", None)
                 .await
                 .unwrap();
             concrete

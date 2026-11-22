@@ -594,7 +594,11 @@ async fn served_count(d: &dyn FederationDirectory, bind: &RowId) -> usize {
 /// yet is not a fact: a rootless node withholds the device's lone voice from
 /// an anonymous reader (the second-signer withhold stands for it), and serves
 /// both voices once the identity's lands and the bind concludes.
-pub(crate) async fn i2415_a_pending_bind_stays_withheld(d: &dyn FederationDirectory, tag: &str) {
+pub(crate) async fn i2415_a_pending_bind_stays_withheld(
+    d: &dyn FederationDirectory,
+    peer: &dyn FederationDirectory,
+    tag: &str,
+) {
     let (owner, device) = (key(244), key(245));
     for k in [&owner, &device] {
         Box::pin(put_statement(
@@ -638,6 +642,16 @@ pub(crate) async fn i2415_a_pending_bind_stays_withheld(d: &dyn FederationDirect
         0,
         "[{tag}] I2415: a pending bind is no fact: withheld from an anonymous reader"
     );
+    // v62.0.0 (RL-fix23) — the same through the real feed: an anonymous peer
+    // pulling this node's feed does not receive the lone voice.
+    pull_anonymously(d, peer).await;
+    assert!(
+        peer.edition2_voices(&bind)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] the peer's voices read: {e}"))
+            .is_empty(),
+        "[{tag}] I2415: the anonymous peer never receives the lone bind voice"
+    );
     let author = bind_voice(d, &owner, &u, &k, 22_000, extra()).await;
     Box::pin(put_statement(d, &author, None, INGEST_TIER))
         .await
@@ -647,6 +661,33 @@ pub(crate) async fn i2415_a_pending_bind_stays_withheld(d: &dyn FederationDirect
         2,
         "[{tag}] I2415: once concluded, both voices of the bind are served"
     );
+    pull_anonymously(d, peer).await;
+    assert_eq!(
+        peer.edition2_voices(&bind)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] the peer's voices read: {e}"))
+            .len(),
+        2,
+        "[{tag}] I2415: once concluded, the peer receives both voices through the feed"
+    );
+}
+
+/// RL-fix23 — every statement `from` serves an ANONYMOUS reader, put into
+/// `to` (any outcome: a replay).
+async fn pull_anonymously(from: &dyn FederationDirectory, to: &dyn FederationDirectory) {
+    let mut cursor = None;
+    loop {
+        let page = statements_served_to(from, cursor.as_ref(), 256, None)
+            .await
+            .expect("the anonymous serve");
+        for st in &page.statements {
+            let _ = Box::pin(put_statement(to, &st.bytes, None, INGEST_TIER)).await;
+        }
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
 }
 
 /// **I2244** on one backend.
@@ -790,8 +831,8 @@ mod sqlite {
     /// I2415 — a pending bind stays withheld; a concluded one is served.
     #[tokio::test]
     async fn i2415_a_pending_bind_stays_withheld_sqlite() {
-        let d = fresh().await;
-        Box::pin(i2415_a_pending_bind_stays_withheld(&d, "sqlite")).await;
+        let (d, peer) = (fresh().await, fresh().await);
+        Box::pin(i2415_a_pending_bind_stays_withheld(&d, &peer, "sqlite")).await;
     }
 
     /// I2244 — agent and federation operations wait on a rootless node.
@@ -895,11 +936,11 @@ mod postgres {
 
     #[tokio::test]
     async fn i2415_a_pending_bind_stays_withheld_postgres() {
-        let Some(d) = fresh().await else {
+        let (Some(d), Some(peer)) = (fresh().await, fresh().await) else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
-        Box::pin(i2415_a_pending_bind_stays_withheld(&d, "postgres")).await;
+        Box::pin(i2415_a_pending_bind_stays_withheld(&d, &peer, "postgres")).await;
     }
 
     #[tokio::test]

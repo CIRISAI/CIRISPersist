@@ -2757,7 +2757,7 @@ pub mod test_support {
         // no trust state.
         let halt_id = format!("{tag}-halt-1");
         let before = trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
-        directory.set_active_halt(&r.root, &halt_id).await?;
+        directory.set_active_halt(&r.root, &halt_id, None).await?;
         let halted = trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
         assert!(
             halted.halt_latched == Some(true),
@@ -3319,7 +3319,7 @@ pub mod test_support {
         // shared root changes NOTHING here. Transit is a data door; a halt is
         // an agent pause.
         let halt_id = format!("{tag}-halt");
-        directory.set_active_halt(&r.root, &halt_id).await?;
+        directory.set_active_halt(&r.root, &halt_id, None).await?;
         let under_halt = resolve_transit_eligibility(directory, &node, &peer).await?;
         assert_eq!(
             under_halt, ok,

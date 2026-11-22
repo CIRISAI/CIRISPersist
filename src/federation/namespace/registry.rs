@@ -92,13 +92,16 @@ impl CcTag {
 /// untagged, so PENDING; v62.0.0 (CC-tag) moves the pin to the commit CC
 /// tagged `v1.0-rc22-pre1` (tag object `74029fc3`, commit `0774639b`) and
 /// RECORDS it. v62.0.0 (PIN-fix1): the pin moves to `v1.0-rc22-pre2` (tag
-/// object `6f56ae85`, commit `bab36531`), the SCITT charter rename. A later
+/// object `6f56ae85`, commit `bab36531`), the SCITT charter rename. v62.0.0
+/// (PIN-pre3): the pin moves to `v1.0-rc22-pre3` (tag object `ffc4a967`,
+/// commit `6c879e32`), the family model's `shape` / `descends_on_withdrawal`
+/// columns and seven signer cells; no file persist vendors moves. A later
 /// manifest-changing CC commit lands untagged again: set this back to
 /// `CcTag::Pending` until CC tags it.
 /// `scripts/check_vendored_cc.sh` and `scripts/release_ship.sh` read this
 /// line's text (`pub const VENDORED_CC_TAG: CcTag = CcTag::Pending;` or
 /// `... CcTag::Recorded("<tag>");`): keep it on one line.
-pub const VENDORED_CC_TAG: CcTag = CcTag::Recorded("v1.0-rc22-pre2");
+pub const VENDORED_CC_TAG: CcTag = CcTag::Recorded("v1.0-rc22-pre3");
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
@@ -122,6 +125,14 @@ pub const VENDORED_REGISTRY_SHA256: &str =
     "23a4e129f09532b3b896f39522da88995e8453c4b15ba9d9012da1f75e9795c4";
 
 /// The CIRISConstitution commit every vendored CC manifest was copied from.
+/// v62.0.0 (PIN-pre3): `6c879e32`, the commit the `v1.0-rc22-pre3` tag names.
+/// From pre2 no vendored file's bytes move (under `manifests/` the family
+/// model, its authorship extract (`_meta.source_sha256` only), the select
+/// vectors (`_meta` only), `transitions`, `key_roles`, the coverage table and
+/// the mesh story trace move; none is vendored here), and part 3 is
+/// byte-identical, so every pin below stands. CIRISVerify 23.4.1 still
+/// vendors pre2: the two files it reads (`namespace_registry.json`, and
+/// `family_authorship.json`'s table) are identical at pre3.
 /// v62.0.0 (PIN-fix1): `bab36531`, the commit the `v1.0-rc22-pre2` tag names.
 /// From pre1 the registry moves in `_meta.source_sha256` only (part 3 carries
 /// the SCITT charter rename; the grammar hash `VENDORED_REGISTRY_SHA256` does
@@ -148,7 +159,7 @@ pub const VENDORED_REGISTRY_SHA256: &str =
 /// `scripts/check_vendored_cc.sh` byte-compares all of them against the
 /// commit (pending) or the tag (recorded) before a persist release is tagged,
 /// and refuses the release while the tag is pending.
-pub const VENDORED_CC_COMMIT: &str = "bab36531a36473d8c29f9c4023cbe821ae16311d";
+pub const VENDORED_CC_COMMIT: &str = "6c879e324f4471c37be5056fcbb162bda6e5ba6b";
 
 /// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
 /// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).

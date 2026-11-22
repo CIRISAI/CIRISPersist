@@ -176,11 +176,37 @@ fn file() -> J {
     serde_json::from_str(FILE).unwrap()
 }
 
+/// v62.0.0 (PIN-fix6; CIRISVerify's answer, 2026-11-21) — **the
+/// reader-valid vectors persist's payload table refuses.** `row_statements_v4`
+/// is a released, sha-pinned file and stays as it is (Verify conforms these in
+/// its next set). Each statement is VALID to Verify's reader and REFUSED at
+/// persist's door by the CC payload table (`payloads::check_by_id`,
+/// `edition2_payload_invalid`), for the reason beside it. Listed, asserted
+/// refused, and counted: never a silent skip. A change in either reader
+/// re-opens the line.
+const READER_VALID_TABLE_REFUSED: &[(&str, &str)] = &[
+    (
+        "counted_with_refs",
+        "a supersedes names no refs.target (persist's door rule) and its group:roster \
+         payload carries none of the roster's members (`list`, `body`, `salt` instead)",
+    ),
+    (
+        "second_voice",
+        "the same payload as counted_with_refs: no refs.target, no group:roster members",
+    ),
+];
+
 #[test]
 fn i1901_valid_statements_pass_the_door() {
     let f = file();
     let cases = f["valid"].as_array().unwrap();
     assert_eq!(cases.len(), 5);
+    assert_eq!(
+        READER_VALID_TABLE_REFUSED.len(),
+        2,
+        "I1901 the reader-valid / table-refused list is counted"
+    );
+    let mut table_refused = 0;
     for c in cases {
         let id = c["id"].as_str().unwrap();
         assert_eq!(
@@ -188,6 +214,23 @@ fn i1901_valid_statements_pass_the_door() {
             "I1901 {id}: CC's vendored model reads it valid"
         );
         let n = u8::try_from(c["key_seed"].as_u64().unwrap()).unwrap();
+        if let Some((_, why)) = READER_VALID_TABLE_REFUSED.iter().find(|(v, _)| *v == id) {
+            let st = hx(&c["statement_hex"]);
+            assert!(
+                matches!(verify_row_statement(&st, &dir([n])), Verdict::Valid(_)),
+                "I1901 {id}: Verify's reader still reads it valid"
+            );
+            match admit_row(&st, &dir([n]), None, SelectContext::default()) {
+                Err(Error::MalformedRow { reason, .. })
+                    if reason == malformed_row::EDITION2_PAYLOAD_INVALID => {}
+                other => panic!(
+                    "I1901 {id} ({why}): persist's payload table refuses it \
+                     edition2_payload_invalid, got {other:?}"
+                ),
+            }
+            table_refused += 1;
+            continue;
+        }
         let got = admit_row(
             &hx(&c["statement_hex"]),
             &dir([n]),
@@ -216,6 +259,11 @@ fn i1901_valid_statements_pass_the_door() {
         )
         .is_ok());
     }
+    assert_eq!(
+        table_refused,
+        READER_VALID_TABLE_REFUSED.len(),
+        "I1901 every listed vector was met and refused"
+    );
 }
 
 #[test]

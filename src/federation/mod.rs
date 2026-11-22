@@ -357,6 +357,10 @@ mod affiliation_licence_invariants;
 /// the instant it is given (I950).
 #[cfg(test)]
 pub(crate) mod attestation_admit_invariants;
+/// v62.0.0 (KR-fix19; CC 2.4.1.1, CC 2.6.7) — a `withdraws` / `recants` dated
+/// before its target is refused `withdrawal_backdated` (I4317, I4318).
+#[cfg(test)]
+mod backdated_withdrawal_invariants;
 /// v62.0.0 (PIN-fix2) — the dimension gate asks a `withdraws` / `recants`
 /// its held target's dimension (I2433).
 #[cfg(test)]
@@ -9907,14 +9911,14 @@ pub trait FederationDirectory: Send + Sync {
                         Some(held) => {
                             if let Ok(addressed) = cohort::Cohort::from_token(claimed_cohort_scope)
                             {
-                                affiliation_config::check_record_is(&held, addressed).map_err(
-                                    |e| {
-                                        edition2::fold::hold(
-                                            edition2::fold::reason::WRITE_SCOPE_REFUSED,
-                                            e,
-                                        )
-                                    },
-                                )?;
+                                // v62.0.0 (TB2-prod4) — held under the token
+                                // registered for exactly this case,
+                                // `federation_affiliation_cohort_mismatch`,
+                                // through the ONE marker the cohort read uses
+                                // (`affiliation_config::hold_cohort_mismatch`),
+                                // never the generic `write_scope_refused`.
+                                affiliation_config::check_record_is(&held, addressed)
+                                    .map_err(affiliation_config::hold_cohort_mismatch)?;
                             }
                             true
                         }
@@ -11631,9 +11635,16 @@ pub trait FederationDirectory: Send + Sync {
     ) -> Result<Option<accord_quorum::StoredDecision>, Error>;
 
     /// #302 (H2) — set the active CONSTITUTIONAL halt for a family (upsert;
-    /// at most one active halt per family).
-    async fn set_active_halt(&self, family_key_id: &str, active_halt_id: &str)
-        -> Result<(), Error>;
+    /// at most one active halt per family). v62.0.0 (HALT-235) — with the
+    /// node's halt latch as JSON (`latch_json`, CIRISVerify 23.5.0's
+    /// `HaltLatch`); `None` writes a row the halt door re-derives. A re-store
+    /// of the same halt keeps its `set_at`.
+    async fn set_active_halt(
+        &self,
+        family_key_id: &str,
+        active_halt_id: &str,
+        latch_json: Option<&str>,
+    ) -> Result<(), Error>;
 
     /// #302 (H2) — the active halt for a family, or `None`.
     async fn get_active_halt(
@@ -11772,7 +11783,8 @@ pub enum Error {
         /// licensing authority (licensure), the owner or minter (key_grant),
         /// the named person (consent).
         standing_for: String,
-        /// `roster` | `licensure` | `key_grant` | `consent`.
+        /// `roster` | `licensure` | `key_grant` | `consent` | `capability`
+        /// (KR-fix19: a conferred scope, `trust_root::conferred_for_act`).
         plane: &'static str,
         /// The row's signed instant.
         asserted_at: chrono::DateTime<chrono::Utc>,
@@ -14622,6 +14634,22 @@ pub mod malformed_row {
     /// later bundle at the import door. Refused by its bytes, rooted or
     /// rootless; nothing is kept.
     pub const ACCORD_VERSION_IS_A_BUNDLE: &str = "accord_version_is_a_bundle";
+    /// v62.0.0 (PIN-fix9b.rev2 / 9c.rev2; the Constitution's rulings of
+    /// 2026-11-22) — a `supersedes` that replaces nothing it may replace:
+    /// an occurrence's names another (identity, occurrence) pair than its
+    /// target (CC 4.5.5, CC 3.1.3: a supersedes of an occurrence REBINDS the
+    /// same occurrence; replacing a device is the self-roster door, CC
+    /// 3.3.6.4), or the row is of a family that is never withdrawn and so
+    /// never replaced (CC 2.4.1.1: a cosignature, a key grant, an entity
+    /// revocation, an occurrence revocation, a `key:revocation`; a
+    /// revocation is tightened by a LATER revocation in its own right).
+    /// Refused; nothing is kept.
+    pub const SUPERSEDES_NOT_A_REPLACEMENT: &str = "supersedes_not_a_replacement";
+    /// v62.0.0 (PIN-fix9a.rev2) — a `supersedes` this version does not take:
+    /// a replacement `admission:unit` (it meets the unit's rules, but the
+    /// unit readers do not yet honour a replacement, so it would land with no
+    /// effect while looking admitted). Refused; nothing is kept.
+    pub const SUPERSEDES_UNSUPPORTED: &str = "supersedes_unsupported";
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
         NO_SIGNER,
@@ -14703,6 +14731,10 @@ pub mod malformed_row {
         HOLDER_DEVICE_SHARED,
         // v62.0.0 (DV-fix1) — HOLDER_DEVICE_UNNAMED removed: CC 4.2.3 binds
         // only "where the leaf of a holder's chain names its device".
+        // v62.0.0 (PIN-fix9a.rev2) — appended.
+        SUPERSEDES_UNSUPPORTED,
+        // v62.0.0 (PIN-fix9b.rev2) — appended.
+        SUPERSEDES_NOT_A_REPLACEMENT,
     ];
 }
 

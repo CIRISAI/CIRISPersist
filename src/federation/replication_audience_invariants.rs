@@ -1487,10 +1487,18 @@ pub(crate) mod bodies {
 
     /// **I2689** (v62.0.0, E3b round 3) — a COMPOSER over a consent grant
     /// is not a grant. In edition 2 a `withdraws` is stated in its target's
-    /// family, so it carries the grant's dimension and no grant `payload`.
-    /// The closed grant grammar (#510) judges the grant itself and never a
-    /// composer over it, so the withdraws lands. A malformed grant is still
-    /// refused at the same door (sqlite and pg through `dyn_runners`).
+    /// family with no grant `payload`. The closed grant grammar (#510) judges
+    /// the grant itself and never a withdrawal of it, so the withdraws lands.
+    /// A malformed grant is still refused at the same door (sqlite and pg
+    /// through `dyn_runners`).
+    ///
+    /// v62.0.0 (PIN-fix7; CIRISVerify 23.4.1) — the precondition is FLIPPED:
+    /// a `withdraws` now carries NO dimension (Verify refuses one; 23.4.0
+    /// needed the grant's restated). What this proves now: the withdrawal of a
+    /// grant lands (its leaf and authorship read from the held grant), and the
+    /// grammar, which keys on the row's own `dimension`, cannot misfire on it.
+    /// (PIN-fix8: the grammar's exemption is a retraction's only; a
+    /// `supersedes` of a grant is judged as a grant, I2436.)
     pub(crate) async fn i2689_a_composer_over_a_grant_is_not_a_grant(
         d: &dyn FederationDirectory,
         s: &str,
@@ -1504,8 +1512,8 @@ pub(crate) mod bodies {
         let w = crate::federation::edition2::fixture_switch::composer_of("withdraws", &g, &owner);
         assert_eq!(
             crate::federation::admission::envelope_dimension(&w.attestation_envelope),
-            Some(crate::federation::consent_grammar::GRANT_DIMENSION),
-            "I2689 precondition: the composer carries the grant's dimension"
+            None,
+            "I2689 precondition: a withdraws carries no dimension (CIRISVerify 23.4.1)"
         );
         put(d, &w)
             .await
@@ -1517,6 +1525,99 @@ pub(crate) mod bodies {
                 .is_err(),
             "I2689 a malformed grant is still refused by the grant grammar"
         );
+    }
+
+    /// A `supersedes` of `prior` by `author`: a REPLACEMENT GRANT, its own
+    /// full payload (`cohorts` as given), naming `prior` by `refs.target`.
+    /// Signed without admitting (as [`try_put_grant`]) and handed to the door.
+    async fn try_supersede_grant(
+        d: &dyn FederationDirectory,
+        author: &str,
+        for_key: Option<&str>,
+        prior: &Attestation,
+        cohorts: Option<serde_json::Value>,
+    ) -> Result<(), Error> {
+        use crate::federation::edition2::fixture_switch as e2;
+        let mut r = grant_unsealed(author, for_key, cohorts);
+        r.attestation_type = attestation_type::SUPERSEDES.into();
+        r.attestation_envelope["references_attestation_id"] = e2::rid(prior).into();
+        let st = e2::try_statement_of(&r, author).unwrap_or_else(|e| {
+            panic!(
+                "the codec cannot state this supersedes ({e}): {}",
+                r.attestation_envelope
+            )
+        });
+        e2::put_statement(d, &st).await.map(|_| ())
+    }
+
+    /// **I2436** (v62.0.0, PIN-fix8; the Constitution's ruling of
+    /// 2026-11-21, CC 2.4.1) — a `supersedes` of a consent grant is a
+    /// REPLACEMENT GRANT, judged by the closed grant grammar (#510) as the
+    /// grant itself is: one that breaks the grammar is refused by the same
+    /// refusal the original would get; a conforming one lands and governs in
+    /// place of the grant it replaces; a `withdraws` of a grant stays exempt
+    /// (sqlite and pg through `dyn_runners`).
+    pub(crate) async fn i2436_a_supersedes_of_a_grant_is_a_grant(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let (owner, laptop, a, b) = (
+            format!("i2436-o-{s}"),
+            format!("i2436-l-{s}"),
+            format!("i2436-a-{s}"),
+            format!("i2436-b-{s}"),
+        );
+        users(d, &[&owner]).await;
+        nodes(d, &[&laptop]).await;
+        claim(d, &owner, &laptop, device_class::LAPTOP).await;
+        room(d, &a, &[&owner]).await;
+        room(d, &b, &[&owner]).await;
+        let narrow = grant(&owner, Some(&laptop), Some(entries(&[(COMMUNITY, &a)])));
+        put(d, &narrow)
+            .await
+            .expect("I2436 the grant (room a only)");
+        assert!(
+            !holds(d, &laptop, COMMUNITY, Some(&b), &owner).await,
+            "I2436 before: the grant lists a only"
+        );
+        // A replacement that breaks the grammar: the same refusal as a grant.
+        let bad = serde_json::json!([{"scope":"family","target":""}]);
+        let original = try_put_grant(d, &owner, Some(&laptop), Some(bad.clone()))
+            .await
+            .expect_err("I2436 the malformed grant is refused");
+        let replacement = try_supersede_grant(d, &owner, Some(&laptop), &narrow, Some(bad))
+            .await
+            .expect_err("I2436 the malformed REPLACEMENT is refused too");
+        assert_eq!(
+            replacement.kind(),
+            original.kind(),
+            "I2436 the same refusal: {replacement}"
+        );
+        assert!(
+            replacement.to_string().contains("closed grammar"),
+            "I2436 by the grant grammar: {replacement}"
+        );
+        // A conforming replacement lands and governs in the grant's place.
+        try_supersede_grant(
+            d,
+            &owner,
+            Some(&laptop),
+            &narrow,
+            Some(entries(&[(COMMUNITY, &a), (COMMUNITY, &b)])),
+        )
+        .await
+        .expect("I2436 a conforming replacement grant lands");
+        assert!(
+            holds(d, &laptop, COMMUNITY, Some(&b), &owner).await,
+            "I2436 the replacement governs: b is in its list, and the replaced grant no \
+             longer narrows it"
+        );
+        // A withdrawal of a grant is still not judged as a grant.
+        let w =
+            crate::federation::edition2::fixture_switch::composer_of("withdraws", &narrow, &owner);
+        put(d, &w)
+            .await
+            .expect("I2436 a withdraws of a grant is exempt from the grammar");
     }
 }
 
@@ -1908,6 +2009,7 @@ mod runners {
                 case!(i398_receiver_agrees_with_the_cohort_view);
                 case!(i399_lists_intersect_until_withdrawn);
                 case!(i2689_a_composer_over_a_grant_is_not_a_grant);
+                case!(i2436_a_supersedes_of_a_grant_is_a_grant);
                 $(case!($extra);)*
             }
         };

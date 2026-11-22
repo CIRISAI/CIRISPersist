@@ -1379,6 +1379,12 @@ pub const LOCATION_PROOF_ROLE: &str = "also:cites";
 /// A composer carries its TARGET's family (header -70002,
 /// `composer_family_mismatch` otherwise) but states its OWN payload, so the
 /// target family's list never applies to it: [`check_composer`] does.
+///
+/// v62.0.0 (PIN-fix3) — NAMING: since the Constitution's 2026-11-21 ruling
+/// this list means "the rows that name a `refs.target`", NOT Verify's
+/// composers (`withdraws` / `recants`, the rows that carry no dimension:
+/// `emit::carries_no_dimension`); it decides no dimension. Its copy is
+/// `ingest::COMPOSER_ROW_TYPES`.
 pub const COMPOSER_ROW_TYPES: &[&str] = &["withdraws", "recants", "supersedes"];
 
 /// v62.0.0 (wave P1e) — **a composer's payload rule**: the common members

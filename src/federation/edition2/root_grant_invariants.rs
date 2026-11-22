@@ -1827,6 +1827,7 @@ pub(crate) async fn i4218_a_rebind_drafted_and_voiced_by_hardware_holders(e: &cr
     use super::second_signer_voice::VoiceOutcome;
     use super::transport_rebind::{REBIND_FAMILY, REBIND_ROW_TYPE, TRANSIT_MEMBER};
     use crate::federation::admission::ROOT_HOLDER_ROLE;
+    use crate::federation::transport_rebind::REBIND_DIMENSION;
     let c = bundle_v2();
     let (h1, h2) = (
         c.holder_identity_ref(0).to_owned(),
@@ -1838,8 +1839,12 @@ pub(crate) async fn i4218_a_rebind_drafted_and_voiced_by_hardware_holders(e: &cr
     rebound[1200] ^= 0x31;
     // Dated from the bundle, never the wall clock.
     let at = c.asserted_at_ms + 1_000;
+    // The DIMENSION carries its version leaf (`transport:canonical_rebind:v1`);
+    // it resolves to the family `transport:canonical_rebind`, which the direct
+    // statement below names in its header. The bare family id is no dimension
+    // (`family_for`: "resolves to no registered family").
     let envelope = serde_json::json!({
-        "dimension": REBIND_FAMILY,
+        "dimension": REBIND_DIMENSION,
         "head": hex::encode(c.object_id),
         TRANSIT_MEMBER: hex::encode(&rebound),
     });
@@ -2198,15 +2203,16 @@ pub(crate) async fn i4313_the_owner_withdraws_the_acceptance(e: &crate::Engine) 
 
     // The worker's own (node) key: a node gives no consent and takes none
     // back for its owner.
-    let err = e
-        .withdraw_statement(&ts::local_signer(worker_seed), &first)
-        .await
-        .expect_err("I4313: the grantee node's own key cannot withdraw its owner's acceptance");
-    assert_eq!(
-        err.kind(),
-        "federation_withdraws_not_admitted",
-        "I4313: refused by the withdraws rule: {err}"
-    );
+    // KR-fix21 — kept and NOT landed, held by name; the acceptance stands.
+    crate::federation::withdraw_statement_invariants::not_retracted(
+        d,
+        e.withdraw_statement(&ts::local_signer(worker_seed), &first)
+            .await,
+        &first,
+        &[crate::federation::withdraw_statement_invariants::NOT_ADMITTED],
+        "I4313: the grantee node's own key cannot withdraw its owner's acceptance",
+    )
+    .await;
     let g = the_grant(e, &worker, later(), "I4313").await;
     assert!(
         g.confers && g.acceptance_row_id.as_deref() == Some(first.as_str()),
@@ -2214,10 +2220,12 @@ pub(crate) async fn i4313_the_owner_withdraws_the_acceptance(e: &crate::Engine) 
     );
 
     // The owner takes the acceptance back.
-    let wid = e
-        .withdraw_statement(&ts::local_signer(&owner_seed), &first)
-        .await
-        .expect("I4313: the owner withdraws the acceptance they gave");
+    let wid = crate::federation::withdraw_statement_invariants::landed_id(
+        e.withdraw_statement(&ts::local_signer(&owner_seed), &first)
+            .await
+            .expect("I4313: the owner withdraws the acceptance they gave"),
+        "I4313",
+    );
     let w = d
         .get_attestation(&wid)
         .await
@@ -2366,15 +2374,16 @@ pub(crate) async fn i4314_a_hardware_owner_withdraws_the_acceptance_by_draft(e: 
         )
         .await
         .expect("I4314: the draft is only bytes");
-    let err = e
-        .submit_voice(&signed_outside(worker_seed, &by_node, "I4314"))
-        .await
-        .expect_err("I4314: the grantee node's own key cannot withdraw its owner's acceptance");
-    assert_eq!(
-        err.kind(),
-        "federation_withdraws_not_admitted",
-        "I4314: refused by the withdraws rule: {err}"
-    );
+    // KR-fix21 — kept and NOT landed, held by name.
+    crate::federation::withdraw_statement_invariants::not_retracted(
+        d,
+        e.submit_voice(&signed_outside(worker_seed, &by_node, "I4314"))
+            .await,
+        &first,
+        &[crate::federation::withdraw_statement_invariants::NOT_ADMITTED],
+        "I4314: the grantee node's own key cannot withdraw its owner's acceptance",
+    )
+    .await;
     assert!(
         accepted_at(at(1_900)).await,
         "I4314: the node's refused withdrawal changed nothing"
@@ -2497,35 +2506,36 @@ pub(crate) async fn i4315_only_the_holders_count_withdraws_the_grant(e: &crate::
         )
         .await
         .expect("I4315: the draft is only bytes");
-    let err = e
-        .submit_voice(
+    // KR-fix21 — kept and NOT landed, held by name; the grant is live.
+    crate::federation::withdraw_statement_invariants::not_retracted(
+        d,
+        e.submit_voice(
             &lone.assemble(
                 c.holder_key(0)
                     .sign(&lone.sig_structure)
                     .expect("I4315: holder 1 signs"),
             ),
         )
-        .await
-        .expect_err("I4315: a lone holder cannot withdraw the counted grant");
-    assert_eq!(
-        err.kind(),
-        "federation_withdraws_not_admitted",
-        "I4315: {err}"
-    );
+        .await,
+        &grant.attestation_id,
+        &[crate::federation::withdraw_statement_invariants::NOT_ADMITTED],
+        "I4315: a lone holder cannot withdraw the counted grant",
+    )
+    .await;
     // The grantee's own key, and its owner: the removed door.
     for (who, seed) in [
         ("the grantee's own key", worker_seed),
         ("the grantee's owner", owner_seed.as_str()),
     ] {
-        let err = e
-            .withdraw_statement(&ts::local_signer(seed), &grant.attestation_id)
-            .await
-            .expect_err("I4315: nobody withdraws the grant by an authored row");
-        assert_eq!(
-            err.kind(),
-            "federation_withdraws_not_admitted",
-            "I4315: {who} does not withdraw the GRANT (they withdraw the acceptance): {err}"
-        );
+        crate::federation::withdraw_statement_invariants::not_retracted(
+            d,
+            e.withdraw_statement(&ts::local_signer(seed), &grant.attestation_id)
+                .await,
+            &grant.attestation_id,
+            &[crate::federation::withdraw_statement_invariants::NOT_ADMITTED],
+            &format!("I4315: {who} does not withdraw the GRANT (they withdraw the acceptance)"),
+        )
+        .await;
     }
     assert!(
         the_grant(e, &worker, later(), "I4315").await.confers,

@@ -8,11 +8,17 @@
 //!   halt, which then never lapses; two `active` voices end it. The first
 //!   voice of each row arrives through `put_statement` (the routing). A
 //!   re-put of the ended halt is not a new receipt: nothing latches.
-//! - **I2343** — the fuse: a lone halt is in force until `received_at +
-//!   halt_fuse_secs` (the charter's 86400) and not from then on; a second
+//! - **I2343** — the fuse: a lone halt is in force until `halt_fuse_secs`
+//!   (the charter's 86400) are COUNTED on the fuse clock (HALT-235: explicit
+//!   readings here), and not from then on; a second
 //!   halt within the fuse changes nothing and keeps the first halt's fuse; a
 //!   confirmation counted after the fuse confirms nothing and clears the
 //!   lapsed halt; a fresh halt then latches anew.
+//! - **I2477–I2479** (HALT-235, SECURITY; CIRISVerify 23.5.0) — the fuse is
+//!   COUNTED time: a wall clock moved forward does not lapse an unconfirmed
+//!   halt (I2477); a restart resumes from the stored count and counts nothing
+//!   across the boot change (I2478); a row stored with no latch, or a
+//!   23.4-shaped one, re-latches at zero elapsed, never un-halted (I2479).
 //! - **I2344** — refusals: a lifecycle statement under a holder's key whose
 //!   `iss` names another identity is refused `iss_not_holder`; one with a
 //!   dimension that is no lifecycle kind is `accord_invocation_invalid`.
@@ -48,8 +54,9 @@ use super::door_invariants::fixture::map;
 use super::fixture_genesis::{bundle_v2, identity_ref_of, install_v2, test_key, FAMILY_KEY_ID};
 use super::genesis::genesis_in_force;
 use super::halt::{
-    halt_in_force, put_invocation_at, put_lifecycle_at, HaltRoster, LifecycleKind,
-    LifecycleOutcome, FAMILY_CONSTITUTIONAL, FAMILY_LIFECYCLE,
+    checkpoint_fuse_with, halt_in_force, halt_in_force_with, put_invocation_at,
+    put_invocation_with, put_lifecycle_at, put_lifecycle_in, HaltLatch, HaltRoster, LifecycleKind,
+    LifecycleOutcome, MonotonicReading, FAMILY_CONSTITUTIONAL, FAMILY_LIFECYCLE,
 };
 use super::ingest::{put_statement, StatementOutcome, INGEST_TIER};
 use super::names::RowId;
@@ -58,6 +65,28 @@ use crate::federation::{malformed_row, Error, FederationDirectory};
 const ACCORD: &str = FAMILY_KEY_ID;
 const HOUR_MS: u64 = 3_600_000;
 const FUSE_SECS: i64 = 86_400;
+/// The fuse in milliseconds of counted time (HALT-235).
+const FUSE_MS: u64 = 86_400_000;
+
+/// v62.0.0 (HALT-235) — the lifecycle door at an explicit fuse `reading`.
+async fn put_lifecycle_with(
+    d: &dyn FederationDirectory,
+    bytes: &[u8],
+    now: DateTime<Utc>,
+    reading: MonotonicReading,
+) -> Result<LifecycleOutcome, Error> {
+    let state = genesis_in_force(d).await?;
+    put_lifecycle_in(d, bytes, now, reading, &state).await
+}
+
+/// v62.0.0 (HALT-235) — a fuse reading on boot `boot` at `ms` (the witnesses
+/// drive the monotonic clock; the wall clock decides nothing).
+fn reading(boot: u8, ms: u64) -> MonotonicReading {
+    MonotonicReading {
+        monotonic_ms: ms,
+        boot: [boot; 16],
+    }
+}
 
 fn now_ms() -> u64 {
     u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap()
@@ -185,10 +214,13 @@ pub(crate) async fn fire_confirm_resume(d: &dyn FederationDirectory) {
         .expect("I2342: latched");
     assert_eq!(f.halt_row, Some(hid), "I2342");
     assert!(!f.confirmed, "I2342: lone");
-    assert_eq!(
-        f.lapses_at,
-        Some(f.received_at + Duration::seconds(FUSE_SECS)),
-        "I2342: the charter's fuse from receipt"
+    // HALT-235 — the charter's fuse, counted from receipt (a few ms counted
+    // so far on this process's fuse clock).
+    assert!(
+        f.remaining_ms
+            .is_some_and(|r| r <= FUSE_MS && r > FUSE_MS - 60_000),
+        "I2342: the charter's fuse from receipt: {:?}",
+        f.remaining_ms
     );
 
     // Confirm: one voice is kept and held; the second counts.
@@ -228,7 +260,7 @@ pub(crate) async fn fire_confirm_resume(d: &dyn FederationDirectory) {
         "I2342 confirm"
     );
     let f = halt_in_force(d, ACCORD, now).await.unwrap().unwrap();
-    assert!(f.confirmed && f.lapses_at.is_none(), "I2342: confirmed");
+    assert!(f.confirmed && f.remaining_ms.is_none(), "I2342: confirmed");
     let long_after = now + Duration::seconds(FUSE_SECS * 3);
     assert!(
         halt_in_force(d, ACCORD, long_after)
@@ -276,7 +308,8 @@ pub(crate) async fn fire_confirm_resume(d: &dyn FederationDirectory) {
     assert!(halt_in_force(d, ACCORD, now).await.unwrap().is_none());
 }
 
-/// I2343.
+/// I2343 (HALT-235: the fuse is counted time on the fuse clock, driven
+/// here by explicit readings on one boot).
 pub(crate) async fn the_fuse(d: &dyn FederationDirectory) {
     install_v2(d).await.unwrap();
     let r = roster(d).await;
@@ -284,39 +317,49 @@ pub(crate) async fn the_fuse(d: &dyn FederationDirectory) {
     let h = holder_halt(0, "c2-fuse-1", 0x61, at, at + 48 * HOUR_MS);
     let hid = row_of(&h);
     let now = crate::host::clock::now();
-    let out = put_invocation_at(d, &h, Some(&r), now).await.unwrap();
-    assert!(out.latched, "I2343: latched");
-    let t0 = received_at(d).await;
-    let lapse = t0 + Duration::seconds(FUSE_SECS);
-    // A second halt within the fuse changes nothing and keeps the fuse.
-    let second = holder_halt(1, "c2-fuse-2", 0x62, at + 1, at + 48 * HOUR_MS);
-    let out = put_invocation_at(d, &second, Some(&r), t0 + Duration::seconds(10))
+    let out = put_invocation_with(d, &h, Some(&r), now, reading(0x43, 1_000))
         .await
         .unwrap();
+    assert!(out.latched, "I2343: latched");
+    let t0 = received_at(d).await;
+    // A second halt within the fuse changes nothing and keeps the fuse.
+    let second = holder_halt(1, "c2-fuse-2", 0x62, at + 1, at + 48 * HOUR_MS);
+    let out = put_invocation_with(
+        d,
+        &second,
+        Some(&r),
+        t0 + Duration::seconds(10),
+        reading(0x43, 11_000),
+    )
+    .await
+    .unwrap();
     assert!(
         out.new && !out.latched && !out.held,
         "I2343 second: {out:?}"
     );
     assert_eq!(received_at(d).await, t0, "I2343: the fuse is not reset");
-    let f = halt_in_force(d, ACCORD, lapse - Duration::seconds(1))
+    let f = halt_in_force_with(d, ACCORD, now, reading(0x43, 1_000 + FUSE_MS - 1_000))
         .await
         .unwrap()
         .expect("I2343: in force before the fuse runs");
     assert_eq!(f.halt_row, Some(hid), "I2343");
     assert!(
-        halt_in_force(d, ACCORD, lapse).await.unwrap().is_none(),
-        "I2343: lapsed at receipt + halt_fuse_secs"
+        halt_in_force_with(d, ACCORD, now, reading(0x43, 1_000 + FUSE_MS))
+            .await
+            .unwrap()
+            .is_none(),
+        "I2343: lapsed once halt_fuse_secs are counted"
     );
     // A confirmation counted after the fuse confirms nothing.
-    let after = lapse + Duration::seconds(1);
+    let after = reading(0x43, 1_000 + FUSE_MS + 1_000);
     let c0 = voice(0, "confirmed", &hid.0, "c2-late-confirm", 0x63, at + 2);
     let c1 = voice(1, "confirmed", &hid.0, "c2-late-confirm", 0x63, at + 2);
     assert!(matches!(
-        put_lifecycle_at(d, &c0, after).await.unwrap(),
+        put_lifecycle_with(d, &c0, now, after).await.unwrap(),
         LifecycleOutcome::Pending { .. }
     ));
     assert_eq!(
-        put_lifecycle_at(d, &c1, after).await.unwrap(),
+        put_lifecycle_with(d, &c1, now, after).await.unwrap(),
         LifecycleOutcome::Unchanged {
             row_id: row_of(&c0),
             new: true
@@ -328,7 +371,7 @@ pub(crate) async fn the_fuse(d: &dyn FederationDirectory) {
         "I2343: the lapsed halt is cleared"
     );
     assert!(
-        halt_in_force(d, ACCORD, t0 + Duration::seconds(5))
+        halt_in_force_with(d, ACCORD, now, after)
             .await
             .unwrap()
             .is_none(),
@@ -336,9 +379,15 @@ pub(crate) async fn the_fuse(d: &dyn FederationDirectory) {
     );
     // A fresh halt latches anew.
     let fresh = holder_halt(2, "c2-fuse-3", 0x64, at + 3, at + 48 * HOUR_MS);
-    let out = put_invocation_at(d, &fresh, Some(&r), after + Duration::seconds(1))
-        .await
-        .unwrap();
+    let out = put_invocation_with(
+        d,
+        &fresh,
+        Some(&r),
+        now,
+        reading(0x43, 1_000 + FUSE_MS + 2_000),
+    )
+    .await
+    .unwrap();
     assert!(out.latched, "I2343: a fresh halt after the lapse latches");
     assert_eq!(
         d.get_active_halt(ACCORD)
@@ -349,6 +398,165 @@ pub(crate) async fn the_fuse(d: &dyn FederationDirectory) {
         row_of(&fresh).hex(),
         "I2343"
     );
+}
+
+/// The stored latch of the accord's halt.
+async fn stored(d: &dyn FederationDirectory) -> HaltLatch {
+    let row = d
+        .get_active_halt(ACCORD)
+        .await
+        .unwrap()
+        .expect("a halt is latched");
+    serde_json::from_str(row.latch_json.as_deref().expect("the latch is stored"))
+        .expect("the stored latch is 23.5.0's HaltLatch")
+}
+
+/// **I2477** (HALT-235, SECURITY; CIRISVerify 23.5.0) — a WALL clock moved
+/// forward does not lapse an unconfirmed halt: the halt latched now is still
+/// in force read three days later on the wall clock (one second counted on
+/// the fuse clock), with all but that second of its fuse left; a door judging
+/// a second halt at that wall instant changes nothing, and the first stays.
+pub(crate) async fn a_wall_clock_forward_does_not_lapse(d: &dyn FederationDirectory) {
+    install_v2(d).await.unwrap();
+    let r = roster(d).await;
+    let at = now_ms();
+    let h = holder_halt(0, "h235-wall-1", 0x81, at, at + 48 * HOUR_MS);
+    let now = crate::host::clock::now();
+    assert!(
+        put_invocation_with(d, &h, Some(&r), now, reading(0x77, 0))
+            .await
+            .unwrap()
+            .latched,
+        "I2477: latched"
+    );
+    let later = now + Duration::days(3);
+    let f = halt_in_force_with(d, ACCORD, later, reading(0x77, 1_000))
+        .await
+        .unwrap()
+        .expect("I2477: three days on the wall clock lapse nothing");
+    assert_eq!(
+        f.remaining_ms,
+        Some(FUSE_MS - 1_000),
+        "I2477: counted time only"
+    );
+    let second = holder_halt(1, "h235-wall-2", 0x82, at + 1, at + 48 * HOUR_MS);
+    let out = put_invocation_with(d, &second, Some(&r), later, reading(0x77, 2_000))
+        .await
+        .unwrap();
+    assert!(
+        !out.latched,
+        "I2477: a second halt changes nothing: {out:?}"
+    );
+    assert_eq!(
+        d.get_active_halt(ACCORD)
+            .await
+            .unwrap()
+            .unwrap()
+            .active_halt_id,
+        row_of(&h).hex(),
+        "I2477: the first halt is still the one in force"
+    );
+    assert_eq!(
+        stored(d).await.active_halt(86_400).map(|x| x.elapsed_ms),
+        Some(2_000),
+        "I2477: the door stored the counted time"
+    );
+}
+
+/// **I2478** (HALT-235) — a restart resumes: the counted time is stored with
+/// the halt; on a new boot nothing more is counted from the old checkpoint
+/// (the fuse runs long, never short), and counting resumes from the new
+/// boot's first reading until the fuse runs.
+pub(crate) async fn a_restart_resumes(d: &dyn FederationDirectory) {
+    install_v2(d).await.unwrap();
+    let r = roster(d).await;
+    let at = now_ms();
+    let h = holder_halt(0, "h235-restart-1", 0x83, at, at + 48 * HOUR_MS);
+    let now = crate::host::clock::now();
+    assert!(
+        put_invocation_with(d, &h, Some(&r), now, reading(0x01, 100))
+            .await
+            .unwrap()
+            .latched
+    );
+    checkpoint_fuse_with(d, ACCORD, reading(0x01, 100 + 5_000))
+        .await
+        .unwrap()
+        .expect("I2478: in force");
+    assert_eq!(
+        stored(d).await.active_halt(86_400).map(|x| x.elapsed_ms),
+        Some(5_000),
+        "I2478: five seconds counted and stored"
+    );
+    // A new boot: its clock reads lower; nothing is counted across it.
+    let f = checkpoint_fuse_with(d, ACCORD, reading(0x02, 10))
+        .await
+        .unwrap()
+        .expect("I2478: in force after the restart");
+    assert_eq!(
+        f.remaining_ms,
+        Some(FUSE_MS - 5_000),
+        "I2478: resumed, not reset"
+    );
+    let f = halt_in_force_with(d, ACCORD, now, reading(0x02, 10 + FUSE_MS - 5_000 - 1))
+        .await
+        .unwrap()
+        .expect("I2478: in force until the counted fuse runs");
+    assert_eq!(f.remaining_ms, Some(1), "I2478");
+    assert!(
+        halt_in_force_with(d, ACCORD, now, reading(0x02, 10 + FUSE_MS - 5_000))
+            .await
+            .unwrap()
+            .is_none(),
+        "I2478: lapsed once the whole fuse is counted"
+    );
+}
+
+/// **I2479** (HALT-235) — the upgrade re-latches: a halt row stored with NO
+/// latch (a store from before 23.5.0) and one with a 23.4-shaped latch (a
+/// `received_at` instant, no `elapsed_ms`) are re-derived from the
+/// invocation the row names, at ZERO elapsed: in force with the whole fuse
+/// left, never un-halted; the next checkpoint stores 23.5.0's latch.
+pub(crate) async fn the_upgrade_relatches(d: &dyn FederationDirectory) {
+    install_v2(d).await.unwrap();
+    let r = roster(d).await;
+    let at = now_ms();
+    let h = holder_halt(0, "h235-upgrade-1", 0x84, at, at + 48 * HOUR_MS);
+    let id = row_of(&h).hex();
+    let now = crate::host::clock::now();
+    assert!(
+        put_invocation_with(d, &h, Some(&r), now, reading(0x09, 0))
+            .await
+            .unwrap()
+            .latched
+    );
+    let legacy = format!(
+        "{{\"halt\":{{\"halt_id\":\"h235-upgrade-1\",\"received_at\":{at},\"confirmed\":false}}}}"
+    );
+    for (what, latch) in [
+        ("no latch", None),
+        ("a 23.4-shaped latch", Some(legacy.as_str())),
+    ] {
+        d.set_active_halt(ACCORD, &id, latch).await.unwrap();
+        let f = halt_in_force_with(d, ACCORD, now, reading(0x0a, 7))
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("I2479 ({what}): never un-halted"));
+        assert_eq!(
+            f.remaining_ms,
+            Some(FUSE_MS),
+            "I2479 ({what}): re-latched at zero elapsed"
+        );
+        checkpoint_fuse_with(d, ACCORD, reading(0x0a, 7))
+            .await
+            .unwrap()
+            .expect("I2479: in force");
+        assert_eq!(
+            stored(d).await.active_halt(86_400).map(|x| x.elapsed_ms),
+            Some(0),
+            "I2479 ({what}): the re-derived latch is stored"
+        );
+    }
 }
 
 /// I2344.
@@ -682,6 +890,21 @@ mod sqlite {
     async fn i2308_superseded_head_counts_nothing_sqlite() {
         Box::pin(super::superseded_head_counts_nothing(&store().await)).await;
     }
+
+    #[tokio::test]
+    async fn i2477_wall_clock_forward_sqlite() {
+        Box::pin(super::a_wall_clock_forward_does_not_lapse(&store().await)).await;
+    }
+
+    #[tokio::test]
+    async fn i2478_restart_resumes_sqlite() {
+        Box::pin(super::a_restart_resumes(&store().await)).await;
+    }
+
+    #[tokio::test]
+    async fn i2479_upgrade_relatches_sqlite() {
+        Box::pin(super::the_upgrade_relatches(&store().await)).await;
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -731,5 +954,23 @@ mod postgres {
     async fn i2308_superseded_head_counts_nothing_postgres() {
         let Some(b) = store().await else { return };
         Box::pin(super::superseded_head_counts_nothing(&b)).await;
+    }
+
+    #[tokio::test]
+    async fn i2477_wall_clock_forward_postgres() {
+        let Some(b) = store().await else { return };
+        Box::pin(super::a_wall_clock_forward_does_not_lapse(&b)).await;
+    }
+
+    #[tokio::test]
+    async fn i2478_restart_resumes_postgres() {
+        let Some(b) = store().await else { return };
+        Box::pin(super::a_restart_resumes(&b)).await;
+    }
+
+    #[tokio::test]
+    async fn i2479_upgrade_relatches_postgres() {
+        let Some(b) = store().await else { return };
+        Box::pin(super::the_upgrade_relatches(&b)).await;
     }
 }

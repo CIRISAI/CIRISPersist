@@ -91,6 +91,105 @@ async fn grows(
         .map_err(|e| rule_of(&e))
 }
 
+/// The hold a withdrawal the signer may not make is kept under.
+pub(crate) const NOT_ADMITTED: &str =
+    crate::federation::edition2::fold::reason::WITHDRAWS_NOT_ADMITTED;
+/// The hold a row written to a room by a non-member is kept under.
+pub(crate) const WRITE_SCOPE_REFUSED: &str = "write_scope_refused";
+
+/// KR-fix21 — **the withdrawal LANDED**: the verb answered `Seated`. Its row
+/// id.
+pub(crate) fn landed_id(
+    out: crate::federation::edition2::second_signer_voice::VoiceOutcome,
+    what: &str,
+) -> String {
+    assert!(out.is_seated(), "{what}: the withdrawal LANDED: {out:?}");
+    out.row_id().to_owned()
+}
+
+/// KR-fix21 — **the withdrawal was KEPT and retracts NOTHING**: what makes a
+/// forbidden-retraction witness fail if the retraction ever really lands.
+///
+/// - the verb's answer is `Waiting` under one of `reasons` (never `Seated`);
+/// - no attestation row exists under the withdrawal's id, so it carries no
+///   admission stamp (a stamp is written only on a landed row);
+/// - the target is still held and no held composer naming it is this one;
+/// - the retraction fold (`precedence::retired_ids`, what the Live listing
+///   and the conferral readers apply) does not retire the target.
+pub(crate) async fn held_not_landed(
+    d: &dyn FederationDirectory,
+    out: &crate::federation::edition2::second_signer_voice::VoiceOutcome,
+    target_id: &str,
+    reasons: &[&str],
+    what: &str,
+) {
+    use crate::federation::edition2::second_signer_voice::VoiceOutcome;
+    let VoiceOutcome::Waiting { row_id, reason, .. } = out else {
+        panic!("{what}: the withdrawal LANDED ({out:?}): a retraction nobody may make took effect");
+    };
+    assert!(
+        reasons.contains(&reason.as_str()),
+        "{what}: held under one of {reasons:?}: {out:?}"
+    );
+    assert!(
+        d.get_attestation(row_id).await.expect("reads").is_none(),
+        "{what}: no withdrawal row landed, so no admission stamp exists"
+    );
+    let target = d
+        .get_attestation(target_id)
+        .await
+        .expect("reads")
+        .unwrap_or_else(|| panic!("{what}: the target is still held"));
+    let composers = d
+        .list_attestations_referencing(target_id)
+        .await
+        .expect("reads");
+    assert!(
+        composers.iter().all(|c| &c.attestation_id != row_id),
+        "{what}: the kept withdrawal is not among the composers held against the target"
+    );
+    let rows: Vec<&Attestation> = std::iter::once(&target).chain(composers.iter()).collect();
+    assert!(
+        !crate::federation::precedence::retired_ids(&rows).contains(target_id),
+        "{what}: the target is still LIVE by the retraction fold"
+    );
+}
+
+/// KR-fix21 — **a retraction nobody may make did not take effect**: the door
+/// either REFUSED it (`Err`, nothing kept) or KEPT it without admitting it
+/// ([`held_not_landed`]); either way the target is still live.
+pub(crate) async fn not_retracted(
+    d: &dyn FederationDirectory,
+    result: Result<
+        crate::federation::edition2::second_signer_voice::VoiceOutcome,
+        crate::federation::Error,
+    >,
+    target_id: &str,
+    reasons: &[&str],
+    what: &str,
+) {
+    match result {
+        Ok(out) => held_not_landed(d, &out, target_id, reasons, what).await,
+        Err(_) => {
+            let target = d
+                .get_attestation(target_id)
+                .await
+                .expect("reads")
+                .unwrap_or_else(|| panic!("{what}: the target is still held"));
+            let composers = d
+                .list_attestations_referencing(target_id)
+                .await
+                .expect("reads");
+            let rows: Vec<&Attestation> =
+                std::iter::once(&target).chain(composers.iter()).collect();
+            assert!(
+                !crate::federation::precedence::retired_ids(&rows).contains(target_id),
+                "{what}: refused, and the target is still LIVE by the retraction fold"
+            );
+        }
+    }
+}
+
 /// **I4293.**
 pub(crate) async fn i4293_a_member_withdraws_their_own_proposal(e: &crate::Engine) {
     let dir = e.federation_directory();
@@ -98,10 +197,12 @@ pub(crate) async fn i4293_a_member_withdraws_their_own_proposal(e: &crate::Engin
     let s = suffix();
     let founder_seed = format!("i4293-f-{s}");
     let (cid, founder, m, p) = room_with_accepted_proposal(d, "i4293", &s).await;
-    let id = e
-        .withdraw_statement(&ts::local_signer(&founder_seed), &e2::rid(&p))
-        .await
-        .expect("I4293: the proposer withdraws their own proposal in the room");
+    let id = landed_id(
+        e.withdraw_statement(&ts::local_signer(&founder_seed), &e2::rid(&p))
+            .await
+            .expect("I4293: the proposer withdraws their own proposal in the room"),
+        "I4293",
+    );
     let w = d
         .get_attestation(&id)
         .await
@@ -151,9 +252,12 @@ pub(crate) async fn i4294_the_proposers_second_device_withdraws_it(e: &crate::En
         founder,
         "I4294 premise: the device is the proposer's"
     );
-    e.withdraw_statement(&ts::local_signer(&device_seed), &e2::rid(&p))
-        .await
-        .expect("I4294: the proposer's second device withdraws the proposal");
+    landed_id(
+        e.withdraw_statement(&ts::local_signer(&device_seed), &e2::rid(&p))
+            .await
+            .expect("I4294: the proposer's second device withdraws the proposal"),
+        "I4294",
+    );
     assert_eq!(
         grows(d, &cid, &founder, &m).await,
         Err(RULE_PROPOSAL_EXPIRED),
@@ -185,18 +289,31 @@ pub(crate) async fn i4295_the_proposers_node_cannot_retract_it(e: &crate::Engine
     );
     // Whatever the door answers the node's withdrawal, it is judged on WHO
     // signed it: not refused for its shape or its placement.
-    if let Err(err) = e
+    match e
         .withdraw_statement(&ts::local_signer(&node_seed), &e2::rid(&p))
         .await
     {
-        let t = err.to_string();
-        assert!(
-            !t.contains("edition2_family_invalid")
-                && !t.contains("authorship_undetermined")
-                && !t.contains(COMPOSER_PLACED_APART_FROM_TARGET),
-            "I4295: the node's withdrawal is well formed and well placed; it is refused, if at \
-             all, for who signed it: {t}"
-        );
+        Err(err) => {
+            let t = err.to_string();
+            assert!(
+                !t.contains("edition2_family_invalid")
+                    && !t.contains("authorship_undetermined")
+                    && !t.contains(COMPOSER_PLACED_APART_FROM_TARGET),
+                "I4295: the node's withdrawal is well formed and well placed; it is refused, \
+                 if at all, for who signed it: {t}"
+            );
+        }
+        // KR-fix21 — kept, it must not have landed: held for who signed it.
+        Ok(out) => {
+            held_not_landed(
+                d,
+                &out,
+                &e2::rid(&p),
+                &[NOT_ADMITTED, WRITE_SCOPE_REFUSED],
+                "I4295: the proposer's NODE",
+            )
+            .await;
+        }
     }
     assert_eq!(
         grows(d, &cid, &founder, &m).await,
@@ -220,9 +337,17 @@ pub(crate) async fn i4296_a_non_member_cannot_withdraw(e: &crate::Engine) {
         .expect("I4296: the stranger founds another room");
 
     // Through the verb: placed in the target's room, where they are no member.
-    e.withdraw_statement(&ts::local_signer(&stranger_seed), &e2::rid(&p))
-        .await
-        .expect_err("I4296: a non-member of the target's room cannot withdraw in it");
+    // KR-fix21 — the door KEEPS the statement and admits nothing (a refusal
+    // that reads other rows is a hold); the witness requires it did not land.
+    not_retracted(
+        d,
+        e.withdraw_statement(&ts::local_signer(&stranger_seed), &e2::rid(&p))
+            .await,
+        &e2::rid(&p),
+        &[WRITE_SCOPE_REFUSED, NOT_ADMITTED],
+        "I4296: a non-member of the target's room cannot withdraw in it",
+    )
+    .await;
 
     // By hand, naming THEIR room on a withdrawal of the other room's row:
     // refused by name, before membership in their own room is asked.
@@ -308,15 +433,25 @@ pub(crate) async fn i4299_a_retraction_placed_outside_any_room(e: &crate::Engine
     };
     // A third party: not the attester, not a subject, no member.
     for scope in [SELF, FEDERATION] {
-        let err = e
+        // KR-fix21 — the shared emit path answers `Ok(row id)` for a held
+        // statement too: the row's state is read back.
+        let result = match e
             .emit_attestation(&ts::local_signer(&stranger_seed), outside(scope))
             .await
-            .expect_err("I4299: a non-attester does not retract by placing outside the room");
-        assert_eq!(
-            err.kind(),
-            "federation_withdraws_not_admitted",
-            "I4299: placed at {scope}, refused by the withdraws admission rule: {err}"
-        );
+        {
+            Ok(id) => e.voice_status(&id).await,
+            Err(err) => Err(err),
+        };
+        not_retracted(
+            d,
+            result,
+            &target.attestation_id,
+            &[NOT_ADMITTED],
+            &format!(
+                "I4299: a non-attester does not retract by placing at {scope}, outside the room"
+            ),
+        )
+        .await;
     }
     assert_eq!(
         grows(d, &cid, &founder, &m).await,
@@ -475,23 +610,23 @@ pub(crate) async fn i4310_a_former_member_retracts_their_own_row(
 
     // Someone else's row: refused (the scope gate runs before the withdraws
     // admission rule, so either may name it).
-    let err = e
-        .withdraw_statement(&k_signer, &e2::rid(&theirs))
-        .await
-        .expect_err("I4310: a former member does not retract another's row");
-    let t = err.to_string();
-    assert!(
-        err.kind() == "federation_withdraws_not_admitted"
-            || matches!(err, crate::federation::Error::WriteScopeRefused(_))
-            || t.contains("write_scope"),
-        "I4310: refused for who they are in the room: {t}"
-    );
+    // KR-fix21 — kept and not landed: held for who they are in the room.
+    not_retracted(
+        d,
+        e.withdraw_statement(&k_signer, &e2::rid(&theirs)).await,
+        &e2::rid(&theirs),
+        &[WRITE_SCOPE_REFUSED, NOT_ADMITTED],
+        "I4310: a former member does not retract another's row",
+    )
+    .await;
 
     // Their OWN row: retracted, in the room.
-    let wid = e
-        .withdraw_statement(&k_signer, &e2::rid(&mine))
-        .await
-        .expect("I4310: a former member retracts their own room row");
+    let wid = landed_id(
+        e.withdraw_statement(&k_signer, &e2::rid(&mine))
+            .await
+            .expect("I4310: a former member retracts their own room row"),
+        "I4310",
+    );
     let w = d
         .get_attestation(&wid)
         .await
@@ -663,15 +798,15 @@ pub(crate) async fn i4311_one_voice_cannot_retract_a_counted_row(e: &crate::Engi
             .sign(&draft.sig_structure)
             .expect("I4311: holder 1 signs"),
     );
-    let err = e
-        .submit_voice(&statement)
-        .await
-        .expect_err("I4311: one voice of a counted row does not retract it alone");
-    assert_eq!(
-        err.kind(),
-        "federation_withdraws_not_admitted",
-        "I4311: refused by the withdraws rule: {err}"
-    );
+    // KR-fix21 — kept and not landed, by name.
+    not_retracted(
+        d,
+        e.submit_voice(&statement).await,
+        &grant_id,
+        &[NOT_ADMITTED],
+        "I4311: one voice of a counted row does not retract it alone",
+    )
+    .await;
     assert!(
         d.get_attestation(&grant_id)
             .await
@@ -781,10 +916,12 @@ pub(crate) async fn i4312_a_subject_takes_back_their_own_act(e: &crate::Engine) 
     put_e2(d, &p).await.expect("I4312: the invitation");
     let acceptance = reply(&k, &k, &p, true, now);
     put_e2(d, &acceptance).await.expect("I4312: K accepts");
-    let wid = e
-        .withdraw_statement(&ts::local_signer(&k_seed), &e2::rid(&acceptance))
-        .await
-        .expect("I4312: K takes back the consent K gave");
+    let wid = landed_id(
+        e.withdraw_statement(&ts::local_signer(&k_seed), &e2::rid(&acceptance))
+            .await
+            .expect("I4312: K takes back the consent K gave"),
+        "I4312",
+    );
     let w = d
         .get_attestation(&wid)
         .await

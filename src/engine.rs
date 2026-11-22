@@ -5459,7 +5459,22 @@ impl Engine {
     /// `cohort_scope`, its room) and about the key it is about
     /// ([`withdrawal_envelope_of`](crate::federation::membership_acceptance::withdrawal_envelope_of)),
     /// stated by the one composer producer and admitted through the
-    /// statement door. Returns the withdrawal's row id.
+    /// statement door.
+    ///
+    /// **What it returns** (KR-fix21): the door's verdict on the withdrawal,
+    /// the same type [`Self::submit_voice`] returns for a drafted one:
+    ///
+    /// - `Ok(Seated { row_id })`: the withdrawal LANDED; it retracts.
+    /// - `Ok(Waiting { row_id, reason, detail })`: the statement is KEPT and
+    ///   retracts NOTHING. `reason` names why: `withdraws_not_admitted` (the
+    ///   signer may not retract this row), `write_scope_refused` (not a
+    ///   member of the target's room), `count_short`, `link_unheld`, …
+    /// - `Err(..)`: refused; nothing is kept.
+    ///
+    /// Before KR-fix21 this returned the withdrawal's row id for the first
+    /// two alike (the shared emit path answers `Ok(row id)` for a held
+    /// statement), so a host could not tell a retraction that took effect
+    /// from one the door kept and did not admit.
     ///
     /// WHO may withdraw is the door's: the row's own author (any key of the
     /// same person), a listed subject, the proxies the withdraws rules name.
@@ -5476,7 +5491,10 @@ impl Engine {
         &self,
         signer: &crate::signing::LocalSigner,
         row_id_hex: &str,
-    ) -> Result<String, crate::federation::Error> {
+    ) -> Result<
+        crate::federation::edition2::second_signer_voice::VoiceOutcome,
+        crate::federation::Error,
+    > {
         let target = self.withdrawal_target(row_id_hex).await?;
         let envelope = crate::federation::membership_acceptance::withdrawal_envelope_of(&target)?;
         let mut input = crate::federation::EmitAttestationInput::with_envelope(
@@ -5485,7 +5503,18 @@ impl Engine {
             target.cohort_scope.clone(),
         );
         input.attested_key_id = Some(target.attested_key_id.clone());
-        self.emit_attestation(signer, input).await
+        // KR-fix19 — never dated before its target: on a host whose clock is
+        // behind the target's signed instant, the retraction states the
+        // target's own instant (the door refuses an earlier one,
+        // `withdrawal_backdated`; an equal one is admitted).
+        if crate::host::clock::now() < target.asserted_at {
+            input.attestation_envelope.asserted_at = Some(
+                crate::federation::admission::render_signed_instant(target.asserted_at),
+            );
+        }
+        let id = self.emit_attestation(signer, input).await?;
+        // KR-fix21 — landed or held: read back, never assumed from `Ok`.
+        self.voice_status(&id).await
     }
 
     /// v62.0.0 (KR-fix17) — [`Self::withdraw_statement`] **drafted for a
@@ -5505,6 +5534,17 @@ impl Engine {
         asserted_at_ms: u64,
     ) -> Result<crate::federation::edition2::emit::Draft, crate::federation::Error> {
         let target = self.withdrawal_target(row_id_hex).await?;
+        // KR-fix19 — a retraction dated BEFORE its target is refused
+        // `withdrawal_backdated` at the door: say so before the host signs
+        // it. The target's own instant is allowed.
+        let target_ms = u64::try_from(target.asserted_at.timestamp_millis()).unwrap_or(0);
+        if asserted_at_ms < target_ms {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "{}: withdraw_statement_draft: asserted_at_ms {asserted_at_ms} is before the \
+                 target's ({target_ms}); date a retraction at the target's instant or later",
+                crate::federation::admission::WITHDRAWAL_BACKDATED
+            )));
+        }
         let mut envelope =
             crate::federation::membership_acceptance::withdrawal_envelope_of(&target)?;
         if let Some(o) = envelope.as_object_mut() {
@@ -5632,9 +5672,16 @@ impl Engine {
     /// handler) is the SEPARATE node-server ingest path; this is the pure
     /// attestation emit, so no feature gate is needed here.
     ///
-    /// `duty` is currently always `moderate` for a `moderation:*` report;
-    /// it is accepted for symmetry with the §11.10 duty vocabulary
-    /// (`takedown` / `review` ride their own dimensions/paths).
+    /// `duty` must be `moderate`. v62.0.0 (TB2-prod5): any other duty is
+    /// REFUSED by name ([`FILE_MODERATION_DUTY_UNSUPPORTED`],
+    /// `Error::InvalidArgument`), before anything is signed. Until v62.0 the
+    /// argument was discarded (`let _ = duty;`, since v9.3.0), so a host that
+    /// asked for another duty silently got a `moderate` filing. A
+    /// `moderation:*` row states no duty, and the door judges it under
+    /// `moderate` by its dimension; the community duty set is OPEN (CC 4.5.4
+    /// `policy.duties`), so honouring another duty needs the row to name it:
+    /// a wire change, not in v62.0. (`takedown` / `review` ride their own
+    /// families.)
     /// `content_sha256` is routing/advisory in the envelope — the gate
     /// resolves the content's SIGNED subjects from it; `community_id` names
     /// the moderating community.
@@ -5647,7 +5694,13 @@ impl Engine {
         duty: &str,
         allegation_type: &str,
     ) -> Result<String, crate::federation::Error> {
-        let _ = duty;
+        if duty != crate::federation::admission::DELEGATION_SCOPE_MODERATE {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "{FILE_MODERATION_DUTY_UNSUPPORTED}: file_moderation files a `moderation:*` \
+                 report, which the door judges under `moderate`; duty {duty:?} is not honoured \
+                 in v62.0 (a moderation row states no duty: naming another is a wire change)"
+            )));
+        }
         // The §11.10 moderation-report image: a `scores` on the
         // `moderation:{allegation}:v1` dimension (the `:v1` segment
         // satisfies the §13.1 version gate; the allegation is the report
@@ -7616,6 +7669,29 @@ impl Engine {
     pub async fn settle_at_open(&self) {
         self.settle_instant_forms_at_boot().await;
         self.sweep_agent_routes_at_boot().await;
+        self.checkpoint_halt_latch_at_open().await;
+    }
+
+    /// v62.0.0 (HALT-235; CIRISVerify 23.5.0) — the accord halt's latch at
+    /// open: a stored halt is advanced to this process's fuse reading and
+    /// stored; a halt stored without a latch (an upgraded store) re-derives
+    /// it from the invocation it names at zero elapsed (never un-halted); a
+    /// halt whose fuse has run is cleared. Never boot-fatal.
+    async fn checkpoint_halt_latch_at_open(&self) {
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        {
+            let dir = self.federation_directory();
+            let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+            if let Err(e) =
+                crate::federation::edition2::halt::checkpoint_fuse(dir.as_ref(), accord).await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "the accord halt latch could not be checkpointed at open; the next accord \
+                     row's door does it"
+                );
+            }
+        }
     }
 
     async fn settle_instant_forms_at_boot(&self) {
@@ -13085,6 +13161,13 @@ pub enum EngineError {
 
 /// v62.0.0 (LF-fix2, P4) — the refusal token of [`EngineError::NodeKeyConflict`].
 pub const NODE_KEY_CONFLICT: &str = "node_key_conflict";
+
+/// v62.0.0 (TB2-prod5) — the refusal token of [`Engine::file_moderation`]
+/// asked for a duty other than `moderate`: the argument is honoured for
+/// `moderate` only in v62.0 (a `moderation:*` row states no duty; naming
+/// another is a wire change). An `Error::InvalidArgument` whose message
+/// starts with the token (Python `ValueError`).
+pub const FILE_MODERATION_DUTY_UNSUPPORTED: &str = "file_moderation_duty_unsupported";
 
 /// v62.0.0 (LF-fix2, P4) — **what a shared engine tells its backend** as the
 /// node key, given the key the handle `held` and this engine's composite
@@ -23087,6 +23170,30 @@ mod tests {
             "moderation:{{allegation}}:v1 dimension"
         );
         assert_eq!(row.attesting_key_id, derived, "attester == derived (#247)");
+    }
+
+    /// v62.0.0 (TB2-prod5) — `file_moderation` honours its `duty`: a duty
+    /// other than `moderate` is refused BY NAME before anything is signed
+    /// (it was silently filed as `moderate` since v9.3.0). Backend-free: the
+    /// refusal precedes every backend call, so one backend witnesses it.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn file_moderation_refuses_a_duty_it_does_not_file_sqlite() {
+        let signer = crate::federation::tier_ingest::test_support::local_signer("tb2p5-founder");
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        for duty in ["takedown", "review", "slash", "curate", ""] {
+            let err = engine
+                .file_moderation(&signer, &"a".repeat(64), "comm-tb2p5", duty, "rogue_action")
+                .await
+                .expect_err("a duty other than `moderate` is refused");
+            assert!(
+                matches!(&err, crate::federation::Error::InvalidArgument(m)
+                    if m.starts_with(FILE_MODERATION_DUTY_UNSUPPORTED)),
+                "duty {duty:?}: {err}"
+            );
+        }
     }
 
     // ── PG twins ──────────────────────────────────────────────────────

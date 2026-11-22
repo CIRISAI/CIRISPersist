@@ -372,6 +372,26 @@ pub fn pure_statement_gates(bytes: &[u8], keys: &dyn KeyDirectory) -> Result<(),
         .get_int(-70001)
         .and_then(Value::as_text)
         .unwrap_or_default();
+    // v62.0.0 (PIN-fix9c.rev2; the Constitution's ruling of 2026-11-22, CC
+    // 2.4.1.1) — a `supersedes` of a family that is never withdrawn (a
+    // `key:revocation`, an entity revocation, an occurrence revocation, a key
+    // grant, a cosignature) is refused by name, from its bytes: a row that can
+    // never be taken back cannot be replaced, and on the revocation-of-a-row
+    // and cosign planes `refs.target` already names the revoked row and the
+    // cosigned event (a supersedes there would read as a revocation of the
+    // revocation, a cosign of the cosign).
+    if row_type == crate::federation::types::attestation_type::SUPERSEDES
+        && super::typed::never_replaced(family, &payload)
+    {
+        return Err(refuse(
+            crate::federation::malformed_row::SUPERSEDES_NOT_A_REPLACEMENT,
+            format!(
+                "a `supersedes` of `{family}`: a row of this family is never withdrawn, so \
+                 never replaced; tighten a revocation by a later revocation in its own right \
+                 (CC 2.4.1.1)"
+            ),
+        ));
+    }
     // v62.0.0 (RL-fix19; CC 2.6.1.11) — a group-plane statement about the
     // accord is refused BY NAME before its shape is judged (the accord's id
     // is no identity-ref: the shape check would name it payload-invalid).
@@ -386,9 +406,14 @@ pub fn pure_statement_gates(bytes: &[u8], keys: &dyn KeyDirectory) -> Result<(),
     super::payloads::check_by_id(family, row_type, &payload)?;
     // v62.0.0 (wave P1e; CC rc21 CC 2.7.11) — the verifier's pure rules over
     // an `admission:unit` payload, each with its own token.
-    // (A composer of an admission row carries the family, not the payload.)
+    // (A retraction of an admission row carries the family, not the payload.)
+    // v62.0.0 (PIN-fix9a; the Constitution's ruling of 2026-11-21, CC 2.4.1)
+    // — ONLY a retraction is exempt (`emit::carries_no_dimension`): a
+    // `supersedes` of a unit is a REPLACEMENT UNIT, its own full payload, so
+    // it meets every rule the unit it replaces met (`capabilities`, `sub`,
+    // authored-xor-counted, the window).
     if family == super::payloads::ADMISSION_UNIT_FAMILY
-        && !super::payloads::COMPOSER_ROW_TYPES.contains(&row_type)
+        && !super::emit::carries_no_dimension(row_type)
     {
         let sub = protected
             .get_int(15)
@@ -396,6 +421,21 @@ pub fn pure_statement_gates(bytes: &[u8], keys: &dyn KeyDirectory) -> Result<(),
             .and_then(Value::as_text)
             .unwrap_or_default();
         super::payloads::check_admission_unit(sub, &payload)?;
+        // v62.0.0 (PIN-fix9a.rev2; the lead's ruling of 2026-11-22) — a
+        // replacement unit that meets every rule is still REFUSED, by name:
+        // the unit readers (`admission::is_counted_admission_unit_row`,
+        // `admission::admission_unit_statement`,
+        // `admission_unit::is_admission_unit_row_statement`) do not honour a
+        // `supersedes`, so it would land and never run or count while
+        // looking admitted. Making those readers honour a replacement is the
+        // later change.
+        if row_type == crate::federation::types::attestation_type::SUPERSEDES {
+            return Err(refuse(
+                crate::federation::malformed_row::SUPERSEDES_UNSUPPORTED,
+                "a `supersedes` of an `admission:unit` is not taken by this version: the unit \
+                 readers do not honour a replacement yet (CC 2.4.1, CC 2.7.11)",
+            ));
+        }
     }
     Ok(())
 }
@@ -771,7 +811,7 @@ pub fn second_signer_roles_with(
     let composer = protected
         .get_int(-70001)
         .and_then(Value::as_text)
-        .is_some_and(ciris_verify_core::edition2::is_composer);
+        .is_some_and(super::emit::carries_no_dimension);
     let leaf = if composer {
         target.and_then(|t| {
             ciris_verify_core::edition2::family::dimension_leaf(&t.family_id, &t.payload)

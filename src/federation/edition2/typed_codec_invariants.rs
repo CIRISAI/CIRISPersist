@@ -4,8 +4,8 @@
 //! back by the JSON form's OWN parser of the typed row, so a member the
 //! projection misnames is a parser refusal here, not a silent gap.
 //!
-//! - **I3140** each family's header id is its typed plane; a composer of it
-//!   and every other family are not.
+//! - **I3140** each family's header id is its typed plane; a retraction of
+//!   it and every other family are not; a `supersedes` of it is (PIN-fix9c).
 //! - **I3141** a custody report reads back through `parse_custody_ack` (the
 //!   gate's and the fold's parse); a family report's `family_id` is the
 //!   cohort target the gate reads (`family_key_id`).
@@ -108,13 +108,21 @@ fn i3140_each_family_is_its_typed_plane() {
             Some(plane),
             "I3140 {prefix}"
         );
-        for composer in ["withdraws", "recants", "supersedes"] {
+        for composer in ["withdraws", "recants"] {
             assert_eq!(
                 typed_plane_of(composer, &family_id(prefix)),
                 None,
                 "I3140 a {composer} of {prefix} is the attestation plane's"
             );
         }
+        // v62.0.0 (PIN-fix9c) — a `supersedes` is a REPLACEMENT: it rides
+        // its target's typed plane (the door refuses one on a plane that is
+        // never replaced: I2441).
+        assert_eq!(
+            typed_plane_of("supersedes", &family_id(prefix)),
+            Some(plane),
+            "I3140 a supersedes of {prefix} rides its plane"
+        );
     }
     for other in ["group:roster", "identity:occurrence", "key:record"] {
         assert_eq!(

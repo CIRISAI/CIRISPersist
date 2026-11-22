@@ -180,16 +180,17 @@ pub fn parse_custody_ack(row: &Attestation) -> Result<Option<CustodyAck>, Error>
     // 3.1.3.3 rule 4: the sweeper's, `evict_actor`'s, a consumer's after a
     // content miss) maps onto this dimension. A composer retracts a report;
     // it is not one, so it is no report, never a malformed one.
-    {
-        use super::types::attestation_type::{RECANTS, SUPERSEDES, WITHDRAWS};
-        if matches!(
-            row.attestation_type.as_str(),
-            WITHDRAWS | RECANTS | SUPERSEDES
-        ) {
-            return Ok(None);
-        }
+    // v62.0.0 (PIN-fix9c; the Constitution's ruling of 2026-11-21, CC 2.4.1)
+    // — ONLY a retraction (`emit::carries_no_dimension`). A `supersedes` of a
+    // report is a REPLACEMENT REPORT, its own full payload: it is read here as
+    // a report, so the admission gate (shape, cohort) and the fold judge it as
+    // they judge the report it replaces.
+    if super::edition2::emit::carries_no_dimension(&row.attestation_type) {
+        return Ok(None);
     }
-    if row.attestation_type != super::types::attestation_type::SCORES {
+    if row.attestation_type != super::types::attestation_type::SCORES
+        && row.attestation_type != super::types::attestation_type::SUPERSEDES
+    {
         return Err(malformed(format!(
             "a custody report is a `scores` row, not {:?}",
             row.attestation_type

@@ -1818,14 +1818,20 @@ pub struct HeldRoot {
 /// v62.0.0 (GB-fix2) — which of the two foreign cases a store is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForeignCase {
-    /// Every held first bundle reads NOT Valid here (a fixture store under a
-    /// production build: its holders' chains are not under this build's
-    /// attestation roots; or a bundle held short of its count). The node is
-    /// ROOTLESS and the baked genesis was NOT imported.
+    /// Every held foreign first bundle reads NOT Valid here (a fixture store
+    /// under a production build: its holders' chains are not under this
+    /// build's attestation roots; or a bundle held short of its count), and
+    /// the baked genesis is not in force: the node is ROOTLESS. (The open leg
+    /// offers the bake in this case, GB-fix5; this is what a store reads
+    /// before that, or when the bake was refused.)
     HeldNotValid,
-    /// A held first bundle reads Valid here: the node runs under a root that
-    /// is NOT the one this binary bakes.
+    /// A held foreign first bundle reads Valid here: the node runs under a
+    /// root that is NOT the one this binary bakes (the bake is never offered
+    /// beside it: two Valid first bundles fork).
     HeldValidForeignRoot,
+    /// v62.0.0 (GB-fix5) — the baked genesis IS in force, and the store also
+    /// holds foreign first bundle(s) (each with its validity).
+    BesideBaked,
 }
 
 impl ForeignCase {
@@ -1835,6 +1841,7 @@ impl ForeignCase {
         match self {
             Self::HeldNotValid => "held_not_valid",
             Self::HeldValidForeignRoot => "held_valid_foreign_root",
+            Self::BesideBaked => "beside_baked",
         }
     }
 }
@@ -1869,32 +1876,25 @@ pub fn foreign_genesis_of(
     valid: &[GenesisPlacement],
     baked: &Digest32,
 ) -> Option<ForeignGenesis> {
-    if held.is_empty()
-        || held.iter().any(|(o, _)| o == baked)
-        || valid.iter().any(|p| p.object_id == *baked)
-    {
-        return None;
-    }
-    let firsts: Vec<&Digest32> = held
+    // v62.0.0 (GB-fix5) — the foreign roots are the held FIRST bundles other
+    // than the baked one (voices of the baked bundle, concluded or short, and
+    // successors are the baked lineage, never foreign).
+    let mut held_roots: Vec<HeldRoot> = held
         .iter()
-        .filter(|(_, prev)| prev.is_none())
-        .map(|(o, _)| o)
-        .collect();
-    let named: Vec<&Digest32> = if firsts.is_empty() {
-        held.iter().map(|(o, _)| o).collect()
-    } else {
-        firsts
-    };
-    let mut held_roots: Vec<HeldRoot> = named
-        .into_iter()
-        .map(|o| HeldRoot {
+        .filter(|(o, prev)| prev.is_none() && o != baked)
+        .map(|(o, _)| HeldRoot {
             object_id: hex::encode(o),
             valid: valid.iter().any(|p| p.object_id == *o),
         })
         .collect();
+    if held_roots.is_empty() {
+        return None;
+    }
     held_roots.sort_by(|a, b| a.object_id.cmp(&b.object_id));
     held_roots.dedup();
-    let case = if held_roots.iter().any(|r| r.valid) {
+    let case = if valid.iter().any(|p| p.object_id == *baked) {
+        ForeignCase::BesideBaked
+    } else if held_roots.iter().any(|r| r.valid) {
         ForeignCase::HeldValidForeignRoot
     } else {
         ForeignCase::HeldNotValid
@@ -2016,16 +2016,31 @@ where
     if bundles.is_empty() {
         return Ok(BakedImport::NoneBaked);
     }
-    // v62.0.0 (GB-fix2) — any bundle object held (concluded, or kept short
-    // of its count): never offered; foreign to the anchored bundle, it is
-    // reported.
-    if genesis_in_force(dir).await?.held > 0 || !held_bundle_ids(dir).await?.is_empty() {
-        if let Anchor::ObjectId(baked) = anchor {
-            if let Some(f) = foreign_genesis_against(dir, baked).await? {
-                return Ok(BakedImport::ForeignRoot(f));
+    let g = genesis_in_force(dir).await?;
+    match anchor {
+        // v62.0.0 (GB-fix5) — the bake is offered unless it is already in
+        // force (concluded, or the ancestor of a held successor) or ANOTHER
+        // first bundle reads Valid (two Valid first bundles fork). A store
+        // holding only voices kept short of their count (the baked bundle's
+        // own, or a stray foreign one) or not-Valid bundles is offered it:
+        // those are not in the fork set, and the offer completes a short
+        // baked bundle (its missing voices are in the array).
+        Anchor::ObjectId(baked) => {
+            if g.valid.iter().any(|p| p.object_id == *baked) {
+                return Ok(BakedImport::AlreadyHeld);
+            }
+            if g.valid.iter().any(|p| p.prev.is_none()) {
+                return Ok(match foreign_genesis_against(dir, baked).await? {
+                    Some(f) => BakedImport::ForeignRoot(f),
+                    None => BakedImport::AlreadyHeld,
+                });
             }
         }
-        return Ok(BakedImport::AlreadyHeld);
+        Anchor::Thumbprints(_) => {
+            if g.held > 0 {
+                return Ok(BakedImport::AlreadyHeld);
+            }
+        }
     }
     let mut placed = Vec::new();
     for (name, bytes) in bundles {
@@ -2098,24 +2113,44 @@ where
     match import_genesis_bundles(dir, bundles, anchor).await {
         Ok(done) => {
             match &done {
-                BakedImport::Imported(ids) => tracing::info!(
-                    bundles = ?ids,
-                    "the baked genesis was imported at the import door (not accepted: the \
-                     node roots nothing until it accepts the root)"
-                ),
+                BakedImport::Imported(ids) => {
+                    tracing::info!(
+                        bundles = ?ids,
+                        "the baked genesis was imported at the import door (not accepted: the \
+                         node roots nothing until it accepts the root)"
+                    );
+                    // v62.0.0 (GB-fix5) — foreign bundles held beside it.
+                    if let Anchor::ObjectId(baked) = anchor {
+                        if let Ok(Some(f)) = foreign_genesis_against(dir, baked).await {
+                            tracing::error!(
+                                token = f.token,
+                                case = f.case.as_str(),
+                                held_roots = ?f.held_roots,
+                                baked = %f.baked,
+                                "THIS STORE ALSO HOLDS A GENESIS THAT IS NOT THE BAKED ONE ({}): \
+                                 {:?}; the baked genesis {} is in force",
+                                f.token,
+                                f.held_roots,
+                                f.baked
+                            );
+                        }
+                    }
+                }
                 BakedImport::ForeignRoot(f) => match f.case {
-                    ForeignCase::HeldValidForeignRoot => tracing::error!(
-                        token = f.token,
-                        case = f.case.as_str(),
-                        held_roots = ?f.held_roots,
-                        baked = %f.baked,
-                        "THIS NODE RUNS UNDER A ROOT THAT IS NOT THE ONE THIS BINARY BAKES \
-                         ({}): the store holds a first bundle that reads Valid here ({:?}); \
-                         this build bakes {}; nothing was imported",
-                        f.token,
-                        f.held_roots,
-                        f.baked
-                    ),
+                    ForeignCase::HeldValidForeignRoot | ForeignCase::BesideBaked => {
+                        tracing::error!(
+                            token = f.token,
+                            case = f.case.as_str(),
+                            held_roots = ?f.held_roots,
+                            baked = %f.baked,
+                            "THIS NODE RUNS UNDER A ROOT THAT IS NOT THE ONE THIS BINARY BAKES \
+                             ({}): the store holds a first bundle that reads Valid here ({:?}); \
+                             this build bakes {}; nothing was imported",
+                            f.token,
+                            f.held_roots,
+                            f.baked
+                        )
+                    }
                     ForeignCase::HeldNotValid => tracing::error!(
                         token = f.token,
                         case = f.case.as_str(),

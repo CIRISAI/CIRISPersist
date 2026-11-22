@@ -55,6 +55,12 @@ pub const REFERENCES_MEMBER: &str = "references_attestation_id";
 
 /// The composer row types (CC 2.4.1.1): each names its target by
 /// `refs.target` and carries the target's family.
+///
+/// v62.0.0 (PIN-fix3) — NAMING: since the Constitution's 2026-11-21 ruling
+/// this list means "the rows that name a `refs.target`", NOT Verify's
+/// composers (`withdraws` / `recants`, the rows that carry no dimension:
+/// `emit::carries_no_dimension`); it decides no dimension. Its copy is
+/// `payloads::COMPOSER_ROW_TYPES`.
 pub const COMPOSER_ROW_TYPES: [&str; 3] = ["withdraws", "recants", "supersedes"];
 
 /// v62.0.0 (JSON-cut slice A, I2105) — **a composer's target.** A
@@ -64,6 +70,15 @@ pub const COMPOSER_ROW_TYPES: [&str; 3] = ["withdraws", "recants", "supersedes"]
 /// the target's family (else `composer_family_mismatch`;
 /// CC-READING(next-edition)). The target's family is read from its own
 /// held statement.
+///
+/// v62.0.0 (PIN-fix9d; the lead's ruling of 2026-11-21 on I1846) — a
+/// `supersedes` replaces a row that has LANDED: its target must be
+/// CONCLUDED here (held, and not held back by the fold: `fold_held` is
+/// `None`), else it WAITS on the target (`link_unheld`, `Dep::Row(target)`)
+/// and is re-judged when the target concludes. Its family is then checked
+/// against that concluded row. A retraction (`withdraws` / `recants`) of a
+/// held row that has not concluded is not changed here: a signer may take
+/// back a statement before it concludes.
 ///
 /// # Errors
 /// As above; directory failures.
@@ -90,15 +105,24 @@ where
                 .map(str::to_owned)
         })
     });
-    let Some(family) = family else {
-        return Err(super::fold::hold(
+    let unheld = || {
+        super::fold::hold(
             super::fold::reason::LINK_UNHELD,
             Error::WithdrawsTargetUnheld {
                 attestation_id: row.row_id.hex(),
                 target_attestation_id: target.hex(),
             },
-        ));
+        )
     };
+    let Some(family) = family else {
+        return Err(unheld());
+    };
+    // PIN-fix9d — a replacement of a row that has not concluded has nothing
+    // to replace yet: it waits on the target, as for an unheld one.
+    if !super::emit::carries_no_dimension(&row.row_type) && dir.fold_held(&target).await?.is_some()
+    {
+        return Err(unheld());
+    }
     if family != row.family {
         // Held too: read from another row, so the verdict must not depend
         // on whether the target arrived first.

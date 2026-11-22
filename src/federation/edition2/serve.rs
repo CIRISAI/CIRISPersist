@@ -565,6 +565,46 @@ where
     .await
 }
 
+/// v62.0.0 (RL-fix23) — **is this bootstrap bind CONCLUDED?** An
+/// `identity:occurrence` bind is concluded when the occurrence it states
+/// (`identity_key_id`, `occurrence_key_id`, at its own `asserted_at`) is held
+/// in the occurrence read model, which the bind's door writes only when every
+/// voice is counted. Every other family: `false` (a second-signer row with no
+/// typed row is never inferred concluded from the absence of a hold).
+///
+/// # Errors
+/// Directory reads.
+pub(crate) async fn bootstrap_bind_concluded<F>(dir: &F, statement: &[u8]) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use ciris_verify_core::namespace_match::family_id;
+    let Some((protected, payload)) = statement_parts(statement) else {
+        return Ok(false);
+    };
+    let family = protected.get_int(-70002).and_then(Value::as_text);
+    let occ_family = super::occurrence::OCCURRENCE_FAMILY;
+    if family != Some(occ_family) && family != Some(family_id(occ_family).as_str()) {
+        return Ok(false);
+    }
+    let text = |k: &str| payload.get_text(k).and_then(Value::as_text);
+    let (Some(identity), Some(occurrence), Some(at)) = (
+        text("identity_key_id"),
+        text("occurrence_key_id"),
+        payload.get_text("asserted_at").and_then(Value::as_u64),
+    ) else {
+        return Ok(false);
+    };
+    Ok(dir
+        .list_identity_occurrences_by_occurrence_key(occurrence)
+        .await?
+        .iter()
+        .any(|o| {
+            o.identity_key_id == identity
+                && u64::try_from(o.asserted_at.timestamp_millis()).ok() == Some(at)
+        }))
+}
+
 /// **The statement's own serve rule**, before any row naming it carries
 /// its audience to it (the body [`servable_to`] had before T1-fix3).
 ///
@@ -628,14 +668,22 @@ where
         // fetch needs, served before Rooted (the 4q run's I2245: 2 of 4).
         // A concluded bind then takes the same scope rule as any statement
         // with no typed row (`servable_without_row`).
-        if !super::door::second_signer_roles(statement).is_empty() {
-            let concluded_bootstrap = match super::names::RowId::of_statement(statement) {
-                Some(id) if is_bootstrap_kind(statement) => dir.fold_held(&id).await?.is_none(),
-                _ => false,
-            };
-            if !concluded_bootstrap {
-                return Ok(false);
-            }
+        //
+        // v62.0.0 (RL-fix23; CC 5.3.4, CC 2.7.3) — "concluded" is NEVER "no
+        // fold hold": a device's lone bind voice is KEPT as a voice with no
+        // hold recorded, and was served to an anonymous reader (its
+        // `transport_destination` and transit key) before its identity had
+        // voiced it (I2415). A bind is concluded when the occurrence it
+        // states is HELD in the occurrence read model
+        // ([`bootstrap_bind_concluded`]); any other second-signer row with no
+        // typed row waits for it. Until then nobody is served it: the second
+        // signer (the identity, from its other devices) voices it from the
+        // producer's draft, never from the feed (K2-fix6).
+        if !super::door::second_signer_roles(statement).is_empty()
+            && !(is_bootstrap_kind(statement)
+                && Box::pin(bootstrap_bind_concluded(dir, statement)).await?)
+        {
+            return Ok(false);
         }
         return Box::pin(super::group_serve::servable_without_row(
             dir, statement, requester,

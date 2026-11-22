@@ -798,7 +798,10 @@ where
     F: crate::federation::FederationDirectory + ?Sized,
 {
     let family = family_for(row_type, target.map(|(_, f)| f), envelope, None)?;
-    let counted = if super::payloads::COMPOSER_ROW_TYPES.contains(&row_type) {
+    // v62.0.0 (PIN-fix9c; the Constitution's ruling of 2026-11-21, CC 2.4.1)
+    // — only a retraction skips the floor reading: a `supersedes` of a floor
+    // act IS the act again, drafted counted exactly when the act would be.
+    let counted = if carries_no_dimension(row_type) {
         None
     } else {
         floor_counted(dir, &family, envelope, iss, asserted_at_ms).await?

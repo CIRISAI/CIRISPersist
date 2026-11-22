@@ -46,6 +46,17 @@
 //! - **I3158** a custody report about another device is refused
 //!   (`custody_ack_not_self_report`).
 //! - **I3159** a custody report with `expires_at` is `edition2_payload_invalid`.
+//! - **I2439** (PIN-fix9c; the Constitution's ruling of 2026-11-21, CC
+//!   2.4.1) a `supersedes` of a custody report rides the custody plane: one
+//!   about another device is refused `custody_ack_not_self_report`, as the
+//!   report itself is, and not held; a conforming one lands in
+//!   `federation_attestations` and is READ as a custody report (its own
+//!   size) by the gate's own parse.
+//! - **I2441** (PIN-fix9c.rev2; the Constitution's ruling of 2026-11-22, CC
+//!   2.4.1.1) a `supersedes` of a cosignature, a key grant, an entity
+//!   revocation, an occurrence revocation or a `key:revocation` (a family
+//!   that is never withdrawn) is refused `supersedes_not_a_replacement` from
+//!   its bytes, and nothing is kept.
 //! - **I3160** a content key grant lands and is projected (the pending index
 //!   a grant admitted before its bytes waits in).
 //! - **I3161** a key grant with a text `wrapped_dek` is `edition2_payload_invalid`.
@@ -907,6 +918,157 @@ async fn custody_cosign_body<D: FederationDirectory + ?Sized>(d: &D) {
         d.get_attestation(&rid(&c).hex()).await.unwrap().is_none(),
         "I3165 never an attestation row"
     );
+}
+
+/// I2439: a replacement custody report is judged by the custody plane.
+async fn replacement_custody_body<D: FederationDirectory + ?Sized>(d: &D) {
+    let (dev, other) = (key(132), key(133));
+    register(d, &[&dev, &other]).await;
+    let di = iref(&dev);
+    let t = now_ms();
+    let blob = [0x5d; 32];
+    let report = |size: u64, at: u64| {
+        custody_payload(
+            &di,
+            &blob,
+            CustodyState::Here,
+            Some(size),
+            "federation",
+            None,
+            at,
+        )
+        .unwrap()
+    };
+    let original = sign(&dev, &di, CUSTODY_PREFIX, &report(4096, t));
+    assert!(
+        matches!(put(d, &original).await, Ok(StatementOutcome::Row { .. })),
+        "I2439 the report it replaces lands"
+    );
+    let replacing = |p: Value| {
+        with_member(
+            &p,
+            "refs",
+            map(vec![(
+                "target",
+                ciris_verify_core::edition2::row_ref(&rid(&original).0),
+            )]),
+        )
+    };
+    // About another device: the report's own refusal.
+    let plain = put(
+        d,
+        &sign(&dev, &iref(&other), CUSTODY_PREFIX, &report(8192, t + 1)),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        plain.to_string().contains("custody_ack_not_self_report"),
+        "I2439 the report about another device: {plain:?}"
+    );
+    let bad = sign_typed(
+        &dev,
+        "supersedes",
+        &iref(&other),
+        CUSTODY_PREFIX,
+        &replacing(report(8192, t + 1)),
+    );
+    let e = put(d, &bad).await.unwrap_err();
+    assert!(
+        e.to_string().contains("custody_ack_not_self_report"),
+        "I2439 the replacement about another device is refused as the report is: {e:?}"
+    );
+    assert!(
+        d.get_attestation(&rid(&bad).hex()).await.unwrap().is_none(),
+        "I2439 not held"
+    );
+    // A conforming replacement lands.
+    let good = sign_typed(
+        &dev,
+        "supersedes",
+        &di,
+        CUSTODY_PREFIX,
+        &replacing(report(8192, t + 2)),
+    );
+    let out = put(d, &good).await;
+    assert!(
+        matches!(out, Ok(StatementOutcome::Row { .. })),
+        "I2439 a conforming replacement lands: {out:?}"
+    );
+    let a = d
+        .get_attestation(&rid(&good).hex())
+        .await
+        .unwrap()
+        .expect("I2439 in federation_attestations");
+    let ack = parse_custody_ack(&a)
+        .unwrap()
+        .expect("I2439 the replacement is read as a custody report");
+    assert_eq!(ack.size, Some(8192), "I2439 the replacement's own size");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2439_a_replacement_custody_report_rides_the_plane_sqlite() {
+    Box::pin(replacement_custody_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2439_a_replacement_custody_report_rides_the_plane_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(replacement_custody_body(&b)).await;
+}
+
+/// I2441: a family that is never withdrawn is never replaced.
+async fn never_replaced_body<D: FederationDirectory + ?Sized>(d: &D) {
+    let (k, other) = (key(134), key(135));
+    register(d, &[&k, &other]).await;
+    let (ki, oi) = (iref(&k), iref(&other));
+    let t = now_ms();
+    let target = RowId([0x6e; 32]);
+    let p = map(vec![
+        ("asserted_at", Value::Uint(t)),
+        ("author", Value::Text(ki.clone())),
+        (
+            "refs",
+            map(vec![(
+                "target",
+                ciris_verify_core::edition2::row_ref(&target.0),
+            )]),
+        ),
+    ]);
+    for (prefix, sub) in [
+        (COSIGN_PREFIX, oi.as_str()),
+        (KEY_GRANT_PREFIX, oi.as_str()),
+        (REVOCATION_PREFIX, oi.as_str()),
+        (OCCURRENCE_REVOCATION_PREFIX, oi.as_str()),
+        ("key:revocation", oi.as_str()),
+    ] {
+        let st = sign_typed(&k, "supersedes", sub, prefix, &p);
+        let e = put(d, &st).await.unwrap_err();
+        assert_eq!(
+            reason(&e),
+            malformed_row::SUPERSEDES_NOT_A_REPLACEMENT,
+            "I2441 a supersedes of {prefix}: {e}"
+        );
+        assert!(!kept(d, &st).await, "I2441 {prefix}: nothing is kept");
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i2441_a_never_withdrawn_family_is_never_replaced_sqlite() {
+    Box::pin(never_replaced_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i2441_a_never_withdrawn_family_is_never_replaced_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(never_replaced_body(&b)).await;
 }
 
 async fn takedown_body<D: FederationDirectory + ?Sized>(d: &D) {

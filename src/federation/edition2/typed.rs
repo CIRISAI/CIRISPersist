@@ -132,17 +132,55 @@ pub const PLANES: [(&str, TypedPlane); 7] = [
 
 /// **Is this row one of the typed planes?** By its header family id
 /// (label -70002, `namespace_match::family_id` of the registry prefix). A
-/// composer (`withdraws`, `recants`, `supersedes`) carries its target's
-/// family but is the attestation plane's: `None`.
+/// retraction (`withdraws`, `recants`) carries its target's family but is
+/// the attestation plane's: `None`.
+///
+/// v62.0.0 (PIN-fix9c; the Constitution's ruling of 2026-11-21, CC 2.4.1) —
+/// ONLY a retraction (`emit::carries_no_dimension`): a `supersedes` is a
+/// REPLACEMENT of its target, its own full payload, so it rides its typed
+/// plane and that plane's door judges it as it judges the row it replaces.
 #[must_use]
 pub fn typed_plane_of(row_type: &str, family: &str) -> Option<TypedPlane> {
-    if COMPOSER_ROW_TYPES.contains(&row_type) {
+    if super::emit::carries_no_dimension(row_type) {
         return None;
     }
     PLANES
         .iter()
         .find(|(prefix, _)| namespace_match::family_id(prefix) == family)
         .map(|(_, plane)| *plane)
+}
+
+/// v62.0.0 (PIN-fix9c.rev2; the Constitution's ruling of 2026-11-22, CC
+/// 2.4.1.1: "Never withdrawn. A key:revocation:v1 row is withdrawn by
+/// nobody… An entity revocation, an occurrence revocation, a key grant and a
+/// cosignature already sent are never withdrawn either") — **is `family` (a
+/// header family id) one whose rows are never replaced?** A row that can
+/// never be taken back cannot be replaced either: a revocation is tightened
+/// by a LATER revocation in its own right (the effective bound is the
+/// minimum across them), a second row beside the first. So `refs.target`
+/// keeps ONE meaning on each of these planes (the revoked row, the
+/// cosigned event). A peer DE-ADMISSION rides the revocation family but is a
+/// retractable `scores` denial ([`typed_plane_of_row`]): not one of these.
+#[must_use]
+pub fn never_replaced(family: &str, payload: &Value) -> bool {
+    if family == super::liveness::KEY_REVOCATION_FAMILY {
+        return true;
+    }
+    let Some(plane) = PLANES
+        .iter()
+        .find(|(prefix, _)| namespace_match::family_id(prefix) == family)
+        .map(|(_, plane)| *plane)
+    else {
+        return false;
+    };
+    match plane {
+        TypedPlane::Revocation => !payload
+            .get_text("dimension")
+            .and_then(Value::as_text)
+            .is_some_and(crate::federation::admission::is_peer_deadmission_dimension),
+        TypedPlane::OccurrenceRevocation | TypedPlane::Cosign | TypedPlane::KeyGrant => true,
+        TypedPlane::Takedown | TypedPlane::Custody | TypedPlane::DeliveryReceipt => false,
+    }
 }
 
 /// v62.0.0 (P1-fix4, E3's finding) — [`typed_plane_of`] for an admitted row:
@@ -312,7 +350,7 @@ where
     if !protected
         .get_int(-70001)
         .and_then(Value::as_text)
-        .is_some_and(ciris_verify_core::edition2::is_composer)
+        .is_some_and(super::emit::carries_no_dimension)
     {
         return Ok(None);
     }

@@ -66,6 +66,14 @@
 //!   capabilities a sorted set; signed elsewhere and assembled, it is held
 //!   until a second member's voice; one naming no `head` is authored and
 //!   concludes alone.
+//! - **I2437** (PIN-fix9a; the Constitution's ruling of 2026-11-21, CC
+//!   2.4.1) — a `supersedes` of a unit is a REPLACEMENT UNIT, judged by the
+//!   verifier's pure rules as the unit is: one with no `capabilities` is
+//!   refused `admission_capability_unknown`, as the same unit stated as an
+//!   ordinary row is. PIN-fix9a.rev2: a CONFORMING one is refused
+//!   `supersedes_unsupported` (the unit readers do not honour a replacement
+//!   yet), never landed inert; the unit it names still runs. (A `withdraws`
+//!   keeps its exemption: I2157.)
 
 use ciris_verify_core::cde::{self, Value};
 
@@ -1175,4 +1183,107 @@ both!(
     i2163_the_host_side_draft_sqlite,
     i2163_the_host_side_draft_postgres,
     host_draft_body
+);
+
+/// `payload` naming `target` under `refs.target` (a `supersedes`'s payload).
+fn naming_target(payload: &Value, target: &RowId) -> Value {
+    let Value::Map(m) = payload else {
+        panic!("AU: a payload is a map")
+    };
+    let mut m: Vec<(Value, Value)> = m.iter().filter(|(k, _)| k != &t("refs")).cloned().collect();
+    m.push((
+        t("refs"),
+        det_map(vec![(
+            "target",
+            ciris_verify_core::edition2::row_ref(&target.0),
+        )]),
+    ));
+    m.sort_by_key(|(k, _)| cde::encode(k));
+    Value::Map(m)
+}
+
+fn refusal(e: &crate::federation::Error) -> &'static str {
+    match e {
+        crate::federation::Error::MalformedRow { reason, .. } => reason,
+        other => other.kind(),
+    }
+}
+
+/// I2437: a replacement unit meets the unit's rules.
+pub(crate) async fn replacement_unit_body(d: &dyn FederationDirectory) {
+    setup(d, &[]).await;
+    let at = now_ms() - 60_000;
+    let unit = 0x5c;
+    let original = authored(OWNER, unit, &["read"], "self", at);
+    assert!(landed(&put(d, &original).await), "I2437 the unit lands");
+    let target = id_of(&original);
+    // The same unit with no capabilities, as an ordinary row: refused.
+    let empty = unit_payload(unit, &[], at + 1_000, Some(OWNER), None, "self");
+    let plain = e2::put_statement(d, &sign(OWNER, unit, "scores", &empty))
+        .await
+        .expect_err("I2437 a unit with no capabilities is refused");
+    assert_eq!(
+        refusal(&plain),
+        crate::federation::malformed_row::ADMISSION_CAPABILITY_UNKNOWN,
+        "I2437 the ordinary row's refusal: {plain}"
+    );
+    // As a replacement of the held unit: the same refusal, nothing stored.
+    let bad = sign(OWNER, unit, "supersedes", &naming_target(&empty, &target));
+    let replacement = e2::put_statement(d, &bad)
+        .await
+        .expect_err("I2437 a replacement with no capabilities is refused");
+    assert_eq!(
+        refusal(&replacement),
+        refusal(&plain),
+        "I2437 the replacement's refusal is the unit's: {replacement}"
+    );
+    assert!(
+        d.get_attestation(&id_of(&bad).hex())
+            .await
+            .unwrap()
+            .is_none(),
+        "I2437 the refused replacement is not stored"
+    );
+    // A conforming replacement is refused by name, never landed inert.
+    let good = sign(
+        OWNER,
+        unit,
+        "supersedes",
+        &naming_target(
+            &unit_payload(
+                unit,
+                &["compute", "read"],
+                at + 1_000,
+                Some(OWNER),
+                None,
+                "self",
+            ),
+            &target,
+        ),
+    );
+    let e = e2::put_statement(d, &good)
+        .await
+        .expect_err("I2437 a conforming replacement unit is refused");
+    assert_eq!(
+        refusal(&e),
+        crate::federation::malformed_row::SUPERSEDES_UNSUPPORTED,
+        "I2437 refused as unsupported: {e}"
+    );
+    assert!(
+        d.get_attestation(&id_of(&good).hex())
+            .await
+            .unwrap()
+            .is_none(),
+        "I2437 the refused replacement is not stored"
+    );
+    assert!(
+        d.get_attestation(&target.hex()).await.unwrap().is_some(),
+        "I2437 the unit it names is untouched"
+    );
+}
+
+both!(
+    i2437_a_replacement_unit_meets_the_units_rules_sqlite,
+    i2437_a_replacement_unit_meets_the_units_rules_postgres,
+    replacement_unit_body
 );

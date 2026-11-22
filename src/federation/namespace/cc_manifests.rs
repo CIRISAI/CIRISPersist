@@ -1,5 +1,5 @@
 //! **The CC manifests persist vendors beside the namespace registry, pinned
-//! at the CIRISConstitution tag `v1.0-rc22-pre2` (commit `bab36531`;
+//! at the CIRISConstitution tag `v1.0-rc22-pre3` (commit `6c879e32`;
 //! [`VENDORED_CC_TAG`](super::registry::VENDORED_CC_TAG)).**
 //!
 //! v62.0.0 (4r): re-copied at rc22 commit `8c436b8b` (then untagged). Of these
@@ -11,8 +11,9 @@
 //! (CC-tag): the tag's commit `0774639b` carries every one of these files
 //! byte-identical to `8c436b8b`. v62.0.0 (PIN-fix1): at `v1.0-rc22-pre2`
 //! (`bab36531`) only `csd4_chain.json` moves, in `_meta.pins.claims_sha256`
-//! (the claims table carries the SCITT charter rename). The rc21 history
-//! follows.
+//! (the claims table carries the SCITT charter rename). v62.0.0 (PIN-pre3):
+//! at `v1.0-rc22-pre3` (`6c879e32`) every one of these files and the six
+//! traces is byte-identical to `bab36531`. The rc21 history follows.
 //!
 //! [`registry`](super::registry) carries the namespace registry and its match
 //! vectors; this module carries the other five CC `manifests/` files persist

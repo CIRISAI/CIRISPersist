@@ -127,7 +127,8 @@ COMMENT ON TABLE cirisgraph.telemetry_metrics IS 'v0.8.2 (CIRISPersist#36) — r
 CREATE TABLE cirislens.accord_active_halt (
     family_key_id text NOT NULL,
     active_halt_id text NOT NULL,
-    set_at timestamp with time zone NOT NULL
+    set_at timestamp with time zone NOT NULL,
+    latch_json jsonb
 );
 
 CREATE TABLE cirislens.accord_decision (

@@ -12098,7 +12098,7 @@ impl PyEngine {
                     self,
                     runtime,
                     b,
-                    b.set_active_halt(&fam, &halt)
+                    b.set_active_halt(&fam, &halt, None)
                         .await
                         .map_err(federation_err_to_py)
                 )
