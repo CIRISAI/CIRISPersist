@@ -5,7 +5,7 @@ All notable changes to ciris-persist, newest first. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A rule persist
 enforces cites the CIRIS Constitution section it implements, as "(CC 4.2.6)".
 
-## [61.4.4] - UNRELEASED
+## [61.4.4] - 2026-11-22
 
 Persist's LTS line moves to CIRISVerify v22.2.4. Nothing in persist's own code changes. A host that pins persist 61.4.x and wants Verify's 22.2.x fixes needs this release: Cargo treats a different git tag as a different source, so a host on Verify 22.2.4 beside a persist pinned at 22.2.0 would build two copies of Verify.
 
