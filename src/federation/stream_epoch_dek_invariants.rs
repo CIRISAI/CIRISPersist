@@ -316,9 +316,10 @@ pub(crate) mod bodies {
         ));
     }
 
-    /// Remove bob from the room on A (his own resignation). v62.0.0 (E3b):
-    /// his one `membership:removal` voice naming the room's held head (T1;
-    /// a self-removal needs no other voice), so it lands the typed row.
+    /// Remove bob from the room on A (his own resignation). v62.0.0 (E3b;
+    /// RESIGN-3): his one `membership:resignation` voice naming the room's
+    /// held head (the member's own leaf needs no other voice; CC 3.1.3.2), so
+    /// it lands the typed row.
     /// `bob_seed` is the seed `ladder` minted bob's identity-ref from
     /// (`e2::kid`); the voice is signed by that seed, never from the kid.
     async fn remove_bob<B: FederationDirectory + Sync>(a: &B, comm: &str, bob_seed: &str) {
@@ -338,12 +339,13 @@ pub(crate) mod bodies {
                 reason: None,
                 witness_set: vec![],
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Resignation,
             },
         );
         let key = e2::signing_key(bob_seed);
         match e2::put_voices(a, &e2::membership_voices(&leave, Some(&head), &[&key])).await {
             Ok(StatementOutcome::Row { .. }) => {}
-            other => panic!("bob's self-removal lands: {other:?}"),
+            other => panic!("bob's resignation lands: {other:?}"),
         }
     }
 

@@ -32,7 +32,7 @@ pub mod bodies {
 
     /// v62.0.0 (JSON cut, E7) — a dimension Verify's family matcher
     /// registers (the fixtures' `x:y` is not; an edition-2 row of it is refused).
-    const DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
+    const DIMENSION: &str = "coherence_standing:cab:v1";
 
     fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
         s.parse().expect("rfc3339")
@@ -133,6 +133,7 @@ pub mod bodies {
                 reason: None,
                 witness_set: vec![],
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Removal,
             },
         );
         for c in &signers[1..] {
@@ -832,6 +833,115 @@ pub mod bodies {
         assert!(!active(d, &e2::kid(&room)).await.contains(&e2::kid(&h3)));
     }
 
+    /// **I6929 (LINEAGE-L6b (a); CC 3.3.4, Kernel 11-24) — the founder count
+    /// is read at the head the change names.** A conformant `quorum:2/3`
+    /// infrastructure room of founders h1, h2, h3; h3 RESIGNS (its seat
+    /// still counts at the head until a counted row cites the end). A
+    /// widening of h3 as a plain member that does NOT cite the resignation
+    /// would move h3 off the founder seat it holds at that head: HELD (N
+    /// would go stale). The same widening CITING the resignation is counted
+    /// less h3, so h3 is no founder there and the change moves no founder:
+    /// it lands. Red on the instant fold (h3, resigned, read as no founder:
+    /// the uncited widening passed this gate).
+    pub async fn the_founder_count_is_read_at_the_named_head(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::edition2::group::{
+            membership_payload, MembershipRecord, MEMBERSHIP_PREFIX,
+        };
+        use crate::federation::edition2::head_rule::{with_cites, with_heads};
+        use crate::federation::membership_acceptance_invariants::bodies::{proposal, put, reply};
+        use crate::federation::resign_invariants::bodies::room_end_voices;
+        use crate::federation::types::RevocationLeaf;
+        let [h1, h2, h3] = ["h1", "h2", "h3"].map(|n| format!("{n}-{tag}"));
+        for k in [&h1, &h2, &h3] {
+            e2::put_key(d, k, &[it::USER]).await;
+        }
+        let room = format!("root-{tag}");
+        authorized_room_key(d, &room).await;
+        found(
+            d,
+            ts::sign_community(
+                &h1,
+                infra_room(
+                    &room,
+                    "quorum:2/3",
+                    vec![
+                        seat(&h1, "founder"),
+                        seat(&h2, "founder"),
+                        seat(&h3, "founder"),
+                    ],
+                ),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: conformant room: {e}"));
+        let group = e2::kid(&room);
+        let rv = room_end_voices(d, &room, &h3, &[&h3], ago(60), RevocationLeaf::Resignation).await;
+        let end = e2::row_id_of(&rv[0]);
+        let r = e2::put_voices(d, &rv).await;
+        assert!(
+            matches!(
+                r,
+                Ok(crate::federation::edition2::ingest::StatementOutcome::Row { .. })
+            ),
+            "{tag} I6929 premise: h3 resigns: {r:?}"
+        );
+        let head = e2::held_head(d, &group).await.expect("the head").0;
+        let p = proposal(
+            &h1,
+            crate::federation::types::cohort_scope::COMMUNITY,
+            &room,
+            &h3,
+            Some("member"),
+            ago(50),
+            Some(chrono::Duration::days(7)),
+        );
+        put(d, &p).await.expect("I6929: the proposal");
+        put(d, &reply(&h3, &h3, &p, true, ago(49)))
+            .await
+            .expect("I6929: the acceptance");
+        let payload = |t: chrono::DateTime<chrono::Utc>| {
+            membership_payload(
+                &MembershipRecord::CommunityWidening(CommunityMembershipWidening {
+                    community_key_id: group.clone(),
+                    member_key_id: e2::kid(&h3),
+                    joined_at: t,
+                    effective_at: t,
+                    role: Some("member".to_owned()),
+                    persist_row_hash: String::new(),
+                }),
+                None,
+            )
+            .expect("I6929: the payload")
+        };
+        let voices = |p: &ciris_verify_core::cde::Value| -> Vec<Vec<u8>> {
+            [&h1, &h2]
+                .iter()
+                .map(|k| {
+                    e2::sign_group_payload(&e2::signing_key(k), &e2::kid(&h3), MEMBERSHIP_PREFIX, p)
+                })
+                .collect()
+        };
+        let blind = with_heads(payload(ago(40)), &[head]).unwrap();
+        let r = e2::put_voices(d, &voices(&blind)).await;
+        assert!(
+            held(&r),
+            "{tag} I6929: uncited, h3 holds the founder seat at the head: the change would \
+             move it: held: {r:?}"
+        );
+        let citing = with_cites(with_heads(payload(ago(39)), &[head]).unwrap(), &[end]).unwrap();
+        let r = e2::put_voices(d, &voices(&citing)).await;
+        assert!(
+            matches!(
+                r,
+                Ok(crate::federation::edition2::ingest::StatementOutcome::Row { .. })
+            ),
+            "{tag} I6929: citing the resignation, h3 is no founder there: it lands: {r:?}"
+        );
+    }
+
     /// v62.0.0 (JSON cut, E7) — `granter` is a SEED (`signed_row` signs
     /// through the earlier-form helper, which seeds from the name); the
     /// recipient is an identity-ref. The sealed row is an edition-2 statement.
@@ -1191,6 +1301,8 @@ mod runners {
                 flipped!(moderation_walk_depth_defaults_to_five_hops);
                 flipped!(clause_a_peer_record_is_a_local_mint);
                 flipped!(infrastructure_founder_count_is_fixed_by_the_record);
+                // LINEAGE-L6b (a).
+                flipped!(the_founder_count_is_read_at_the_named_head);
                 flipped!(local_withdraws_records_its_depth);
                 // PR #921 review (Codex).
                 flipped!(f4_a_zero_depth_reports_the_cut);

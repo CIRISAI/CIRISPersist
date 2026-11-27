@@ -7,9 +7,11 @@
 //!   and lands; the node reads itself rooted under `"humanity-accord"`.
 //!   Before either, it reads rootless with the plane that waits named
 //!   (`federation_tier`).
-//! - **I2417** accept FIRST, then import: the edge names no bundle and WAITS
-//!   (`landed: false`), the node reads rootless; the import lands it with no
-//!   further act and the node reads itself rooted.
+//! - **I2417** accept FIRST, then import: v62.0.0 (R2-accept; the
+//!   Constitution's `trust-accepts` rule, "a new edge without it is
+//!   refused") the acceptance is REFUSED `trust_root_head_unnamed` (there is
+//!   no bundle to name) and nothing is put; the node reads rootless; after
+//!   the import the same act lands and the node reads itself rooted.
 //! - **I2418** I2416 for an OWNED node whose owner accepts no root: its own
 //!   acceptance is its chain (CC 3.2 T3).
 //! - **I2464** (KB-fix5, ceremony step 8) the ceremony order on the seat's
@@ -110,34 +112,41 @@ pub(crate) async fn import_then_accept(dsn: &str, alias: &str, owner: Option<&st
         .accept_root(fg::FAMILY_KEY_ID)
         .await
         .expect("I2416: the node accepts the root");
+    let tip = hex::encode(
+        super::genesis::genesis_in_force(e.federation_directory().as_ref())
+            .await
+            .expect("I2416: the genesis reads")
+            .tips()
+            .first()
+            .expect("I2416: a tip")
+            .object_id,
+    );
     assert!(
-        a.landed && a.bundle.is_some(),
-        "I2416: names the bundle and lands: {a:?}"
+        a.landed && a.bundle == tip,
+        "I2416: names the bundle in force and lands: {a:?}"
     );
     rooted(&e, "I2416").await;
 }
 
-/// I2417: accept, then import.
+/// I2417: accept (refused: no bundle to name), then import, then accept.
 pub(crate) async fn accept_then_import(dsn: &str, alias: &str) {
     let e = engine(dsn, alias).await;
+    let early = e.accept_root(fg::FAMILY_KEY_ID).await;
+    assert!(
+        matches!(
+            early,
+            Err(crate::federation::Error::TrustRootHeadUnnamed { .. })
+        ),
+        "I2417: no bundle held: the acceptance is refused by name: {early:?}"
+    );
+    rootless(&e, "I2417 refused").await;
+    import(&e).await;
+    rootless(&e, "I2417 imported: the refused act left nothing to land").await;
     let a = e
         .accept_root(fg::FAMILY_KEY_ID)
         .await
-        .expect("I2417: the acceptance is kept before its bundle");
-    assert!(
-        !a.landed && a.bundle.is_none(),
-        "I2417: no bundle held: the edge names none and waits: {a:?}"
-    );
-    rootless(&e, "I2417 waiting").await;
-    import(&e).await;
-    assert!(
-        e.federation_directory()
-            .get_attestation(&a.row_id)
-            .await
-            .expect("get_attestation reads")
-            .is_some(),
-        "I2417: the import lands the waiting edge with no further act"
-    );
+        .expect("I2417: after the import the node accepts the root");
+    assert!(a.landed, "I2417: lands: {a:?}");
     rooted(&e, "I2417").await;
 }
 

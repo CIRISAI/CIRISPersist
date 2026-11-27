@@ -107,6 +107,25 @@ pub async fn deciding_seats<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // v62.0.0 (LINEAGE-L6b (d); CC 3.3.4, Kernel 11-24) — a COUNT-side read:
+    // under an edition-2 membership change (the roster door's vouch) the
+    // seats are those at the head(s) the change NAMES, less every resigner
+    // it cites (`lineage::count_base`), never the roster folded at `at`.
+    // LIMIT (marked, L6b-d2): an ACT's callers (a slash, a takedown) pass no
+    // head yet and keep the instant fold below.
+    if let Some(heads) = super::edition2::group::vouched_heads() {
+        let at_heads = Box::pin(super::edition2::lineage::count_base(
+            dir,
+            &heads,
+            &super::edition2::group::vouched_cites(),
+        ))
+        .await?;
+        return Ok(if at_heads.founders.is_empty() {
+            at_heads.members
+        } else {
+            at_heads.founders
+        });
+    }
     let roster = Box::pin(super::authorized_community_roster_at(dir, community, at)).await?;
     let founders: BTreeSet<String> = roster
         .iter()
