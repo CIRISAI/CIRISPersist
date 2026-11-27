@@ -415,7 +415,7 @@ mod tests {
                 "id": id,
                 // v62.0.0 (E5) — the earlier form (held tests) keeps its own.
                 "dimension": if e2::emit_edition2() {
-                    "evidence:safety_battery:capture:a:b:v1"
+                    "coherence_standing:cab:v1"
                 } else {
                     "identity_binding:v1"
                 },
@@ -1050,7 +1050,7 @@ mod tests {
         att.attestation_envelope = serde_json::json!({
             "id": id,
             "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
-            "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+            "delegation_purpose": crate::federation::types::owner_binding::PURPOSE,
         });
         resign_fix(&mut att); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         att
@@ -3357,7 +3357,7 @@ mod tests {
         att.attestation_envelope = serde_json::json!({
             "id": id,
             "kind": "delegates_to",
-            "delegation_purpose": owner_binding::CC_DELEGATION_PURPOSE,
+            "delegation_purpose": owner_binding::PURPOSE,
             "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
         });
         resign_fix(&mut att);
@@ -3905,9 +3905,9 @@ mod tests {
         .await
         .expect("put_conferred_key: capability_roots_to_trusted_root");
         assert!(
-            rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
+            rooted.as_ref().is_some_and(|g| g.root_key_id == r.lineage),
             "put_conferred_key: {key_id}'s {scope} roots at {} through node {node}: {rooted:?}",
-            r.root
+            r.lineage
         );
     }
 
@@ -4405,7 +4405,7 @@ mod tests {
             // Fail-safe either way: an undeclared edge confers no custody, so a
             // host that forgets the marker gets a grant that establishes nothing
             // rather than silent stewardship.
-            "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+            "delegation_purpose": crate::federation::types::owner_binding::PURPOSE,
         });
         let obj = env.as_object_mut().unwrap();
         if let Some(l) = legit {

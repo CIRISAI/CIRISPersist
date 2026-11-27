@@ -17,9 +17,12 @@
 //! - the group-scope row is not delivered to a non-member's node (it rides
 //!   the room's content audience);
 //! - a family-scope and a federation-scope re-sign are admitted as well;
-//! - a binding naming the room from a NON-targeted placement (federation) is
-//!   an organisation's bond, not an audience: #1062's gate refuses it
-//!   (`owner_binding_affiliation_refused`; the room is no affiliation);
+//! - v62.0.0 (BIND-1; CC rc22 rule `owner-binding`) — the organisation on
+//!   the bond is the one `on_behalf_of` names, never a placement: a binding
+//!   on behalf of the room (no affiliation) is HELD
+//!   `owner_binding_not_an_affiliation` and stores nothing (the earlier leg,
+//!   "a non-targeted placement naming the room is a bond", witnessed the
+//!   retired reading and is deleted);
 //! - a second, different owner's binding of the node is held (v62.0.0,
 //!   I2844: the single-owner gate is deleted; two counted owners read as
 //!   unowned), and a `delegates_to` at community scope that names a foreign
@@ -81,10 +84,12 @@ pub(crate) mod bodies {
         }
         ts::register_hybrid_key_as(d, &node, &node, identity_type::NODE).await;
         reg(d, &[&room, &fam]).await;
-        found_community(d, &room, "quorum:1/1", &[&owner, &peer], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let room = found_community(d, &room, "quorum:1/1", &[&owner, &peer], &[])
             .await
             .unwrap();
-        found_family(d, &fam, "founder_only", &[&owner], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let fam = found_family(d, &fam, "founder_only", &[&owner], &[])
             .await
             .unwrap();
         // v62.0.0 (flip wave 2, E5) — every key and group is named by its
@@ -167,30 +172,46 @@ pub(crate) mod bodies {
             Some(owner.clone()),
             "I1511: still one owner"
         );
-        // v61 S2 — the audience reading is the TARGETED placement's alone. A
-        // binding that names the room from a non-targeted placement
-        // (federation) is an organisation's bond, judged by #1062's gate. The
-        // room is no affiliation and the bond carries one signature, so it is
-        // refused by that gate's name, and no affiliation is read off it.
+        // v62.0.0 (BIND-1; CC rc22 rule `owner-binding`) — the earlier leg
+        // here ("a binding naming the room from a non-targeted placement is
+        // an organisation's bond, refused by #1062's gate") witnessed the
+        // retired reading of a placement as accountability, and is deleted.
+        // The organisation is the one `on_behalf_of` names: on behalf of a
+        // room that is no affiliation, the binding is HELD
+        // `owner_binding_not_an_affiliation`, stores nothing, and names no
+        // affiliation on the bond.
         let bonded = k("bond-node");
         ts::register_hybrid_key_as(d, &bonded, &bonded, identity_type::NODE).await;
         let bonded = e2::kid(&bonded);
         let bond = binding_at(
             &owner,
             &bonded,
-            cohort_scope::FEDERATION,
-            Some(("community_key_id", &room)),
+            cohort_scope::SELF,
+            Some((crate::federation::admission::ON_BEHALF_OF_FIELD, &room)),
         );
-        match put(d, &bond).await {
-            Err(Error::InvalidArgument(m)) => assert!(
-                m.starts_with(crate::federation::admission::OWNER_BINDING_AFFILIATION_REFUSED),
-                "I1511: a non-group placement naming a group is an organisation's bond: {m}"
-            ),
-            other => panic!("I1511: the bond at federation must meet #1062's gate: {other:?}"),
-        }
+        let _ = e2::land_owner_binding(d, &bond, &e2::seed_of(&bonded)).await;
+        let bond_id = crate::federation::edition2::names::RowId::of_statement(
+            &e2::carried_statement(&bond).expect("I1511: the bond's statement"),
+        )
+        .expect("I1511: a row id");
+        let v = crate::federation::edition2::verdict::row_state(d, &bond_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            v.held().map(|h| h.reason.as_str()),
+            Some(crate::federation::edition2::fold::reason::gc1::OWNER_BINDING_NOT_AN_AFFILIATION),
+            "I1511: both voices in, on behalf of a room that is no affiliation: held: {v:?}"
+        );
         assert!(
             d.get_attestation(&e2::rid(&bond)).await.unwrap().is_none(),
-            "I1511: the refused bond stores nothing"
+            "I1511: a binding on behalf of a room that is no affiliation stores nothing"
+        );
+        assert_eq!(
+            crate::federation::admission::affiliation_of_binding(d, &bonded)
+                .await
+                .unwrap(),
+            None,
+            "I1511: and names no affiliation on the bond"
         );
         // v62.0.0 (kernel pass 2, I2844; KERNEL_SEAMS B1 / C557) — a different
         // owner is no longer refused at any scope: the binding is held, and

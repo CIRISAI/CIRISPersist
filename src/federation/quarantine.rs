@@ -683,6 +683,15 @@ pub fn release_envelope(
 /// Verify-before-mutation (AV-9): every gate below runs BEFORE any row is
 /// written, and a refusal writes nothing.
 ///
+/// v62.0.0 (WD-fix6) — a HOLD is not a refusal: when the final put's
+/// statement door HOLDS the row (a fold condition not yet met; WD-fix4 routes
+/// a statement-carrying row through the statement funnel), the answer is the
+/// gate's error, as before, but the statement is KEPT and concludes when what
+/// it waits for arrives. Told apart structurally by
+/// [`kept_waiting`](super::attestation_admit::kept_waiting) (the fold's held
+/// state, `fold::why_held`), never by the error's text; a re-offer is a no-op
+/// on the statement id.
+///
 /// The `slash` authority check is
 /// [`check_delegated_duty_scores_admission`](super::admission::check_delegated_duty_scores_admission)
 /// — the same gate `put_attestation` runs on all three backends. It is called
@@ -1485,7 +1494,6 @@ pub(crate) mod test_support {
         tags: &[&str],
     ) -> Vec<String> {
         use crate::federation::edition2::fixture_genesis::HOLDER_SEEDS;
-        use crate::federation::edition2::fixture_trust_root::confers_statement;
         use crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE;
         let node = e2::kid(node_seed);
         assert_eq!(
@@ -1512,18 +1520,17 @@ pub(crate) mod test_support {
                 crate::federation::types::identity_type::WITNESS,
             )
             .await;
-            let grant = confers_statement(
+            // LEAD-root1 — the grant is COUNTED over the bundle's holders and
+            // accepted by the witness (`fixture_trust_root::put_conferral`).
+            let _ = (first, i);
+            crate::federation::edition2::fixture_trust_root::put_conferral(
+                dir,
                 &r,
-                &e2::kid(&witness),
+                &witness,
                 &[INFRA_ATTEST_ASSURANCE],
-                first + i * 1_000,
-            );
-            e2::put_statement(dir, &grant)
-                .await
-                .unwrap_or_else(|e| panic!("confer_age_witness: the root's grant: {e}"));
-            e2::put_statement(dir, &e2::voice_of(&grant, &witness))
-                .await
-                .unwrap_or_else(|e| panic!("confer_age_witness: the witness's voice: {e}"));
+            )
+            .await
+            .unwrap_or_else(|e| panic!("confer_age_witness: the root's grant: {e}"));
             let rooted = crate::federation::trust_root::capability_roots_to_trusted_root(
                 dir,
                 &node,
@@ -1534,10 +1541,10 @@ pub(crate) mod test_support {
             .await
             .expect("capability_roots_to_trusted_root");
             assert!(
-                rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
+                rooted.as_ref().is_some_and(|g| g.root_key_id == r.lineage),
                 "confer_age_witness: the witness's {INFRA_ATTEST_ASSURANCE} roots at {} through \
                  this node: {rooted:?}",
-                r.root
+                r.lineage
             );
             out.push(witness);
         }
@@ -1627,7 +1634,7 @@ pub(crate) mod test_support {
             return founder_scoped_edge(founder, community_k, grantee, DELEGATION_SCOPE_SLASH, at);
         }
         let mut envelope = serde_json::json!({
-            "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+            "delegation_purpose": crate::federation::types::owner_binding::PURPOSE,
             "scope": [crate::federation::types::delegation_scope::INFRA_SERVE],
         });
         crate::federation::admission::with_test_term(&mut envelope, at);
@@ -3195,9 +3202,8 @@ pub(crate) mod test_support {
                 "community_id": community_k,
             });
             if custody {
-                envelope["delegation_purpose"] = serde_json::json!(
-                    crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE
-                );
+                envelope["delegation_purpose"] =
+                    serde_json::json!(crate::federation::types::owner_binding::PURPOSE);
             }
             crate::federation::admission::with_test_term(&mut envelope, at);
             let a = unsigned_row(

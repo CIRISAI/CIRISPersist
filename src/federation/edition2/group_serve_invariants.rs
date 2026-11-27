@@ -32,8 +32,7 @@ use ciris_verify_core::cde::Value;
 
 use super::door_invariants::fixture::{iref, key, key_record};
 use super::group::{
-    membership_payload, roster_payload, GroupRecord, MembershipRecord, GROUP_ROSTER_PREFIX,
-    MEMBERSHIP_PREFIX,
+    membership_payload, GroupRecord, MembershipRecord, GROUP_ROSTER_PREFIX, MEMBERSHIP_PREFIX,
 };
 use super::ingest::{put_statement, StatementOutcome, INGEST_TIER};
 use super::serve::servable_to;
@@ -95,7 +94,8 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
         charter_digest: String::new(),
         persist_row_hash: String::new(),
     });
-    let p = roster_payload(&record, 1, None, 2_000).unwrap();
+    // GID-fixtures-sites — founded under its DERIVED id (`gid` was its name).
+    let (gid, p) = crate::federation::edition2::group_fixtures::fixture_founding(&record, 2_000);
     let voices: Vec<Vec<u8>> = [&a, &b, &c]
         .iter()
         .map(|k| sign(k, &gid, GROUP_ROSTER_PREFIX, &p))
@@ -352,7 +352,8 @@ pub(crate) async fn invitee_body(d: &dyn FederationDirectory) {
         charter_digest: String::new(),
         persist_row_hash: String::new(),
     });
-    let p = roster_payload(&record, 1, None, 2_000).unwrap();
+    // GID-fixtures-sites — founded under its DERIVED id (`gid` was its name).
+    let (gid, p) = crate::federation::edition2::group_fixtures::fixture_founding(&record, 2_000);
     let o = put(d, &sign(&kf, &gid, GROUP_ROSTER_PREFIX, &p)).await;
     assert!(
         matches!(o, StatementOutcome::Row { .. }),
@@ -437,7 +438,8 @@ pub(crate) async fn carried_body(d: &dyn FederationDirectory) {
         charter_digest: String::new(),
         persist_row_hash: String::new(),
     });
-    let p = roster_payload(&record, 1, None, 2_000).unwrap();
+    // GID-fixtures-sites — founded under its DERIVED id (`gid` was its name).
+    let (gid, p) = crate::federation::edition2::group_fixtures::fixture_founding(&record, 2_000);
     let head_st = sign(&kf, &gid, GROUP_ROSTER_PREFIX, &p);
     let StatementOutcome::Row { row_id: head, .. } = put(d, &head_st).await else {
         panic!("I3013 founded");
@@ -569,7 +571,9 @@ pub(crate) async fn held_citer_body(dir: std::sync::Arc<dyn FederationDirectory>
         charter_digest: String::new(),
         persist_row_hash: String::new(),
     });
-    let payload = roster_payload(&record, 1, None, 2_000).unwrap();
+    // GID-fixtures-sites — founded under its DERIVED id (`gid` was its name).
+    let (gid, payload) =
+        crate::federation::edition2::group_fixtures::fixture_founding(&record, 2_000);
     let head_st = sign(&kf, &gid, GROUP_ROSTER_PREFIX, &payload);
     let StatementOutcome::Row { row_id: head, .. } = put(d, &head_st).await else {
         panic!("I2186 founded");

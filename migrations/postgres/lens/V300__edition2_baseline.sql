@@ -658,7 +658,10 @@ CREATE TABLE cirislens.federation_community_membership_revocations (
     admitted_at timestamp with time zone NOT NULL,
     cosignatures jsonb DEFAULT '[]'::jsonb NOT NULL,
     attestation_id text,
-    CONSTRAINT federation_community_membership_revocations_witness_set_check CHECK ((jsonb_typeof(witness_set) = 'array'::text))
+    record_row_id bytea CONSTRAINT federation_community_membership_revocations_record_row_id_check CHECK (octet_length(record_row_id) = 32),
+    leaf text DEFAULT 'removal'::text NOT NULL,
+    CONSTRAINT federation_community_membership_revocations_witness_set_check CHECK ((jsonb_typeof(witness_set) = 'array'::text)),
+    CONSTRAINT federation_community_membership_revocations_leaf_check CHECK ((leaf = ANY (ARRAY['removal'::text, 'resignation'::text])))
 );
 
 COMMENT ON COLUMN cirislens.federation_community_membership_revocations.admitted_at IS 'NOT NULL on both dialects since sqlite V141 (CIRISPersist#828); postgres has been NOT NULL since V130.';
@@ -675,7 +678,8 @@ CREATE TABLE cirislens.federation_community_membership_widenings (
     scrub_signature_pqc text,
     admitted_at timestamp with time zone NOT NULL,
     cosignatures jsonb DEFAULT '[]'::jsonb NOT NULL,
-    attestation_id text
+    attestation_id text,
+    record_row_id bytea CONSTRAINT federation_community_membership_widenings_record_row_id_check CHECK (octet_length(record_row_id) = 32)
 );
 
 CREATE TABLE cirislens.federation_content_kem_identity (
@@ -772,7 +776,10 @@ CREATE TABLE cirislens.federation_family_membership_revocations (
     admitted_at timestamp with time zone NOT NULL,
     cosignatures jsonb DEFAULT '[]'::jsonb NOT NULL,
     attestation_id text,
-    CONSTRAINT federation_family_membership_revocations_witness_set_check CHECK ((jsonb_typeof(witness_set) = 'array'::text))
+    record_row_id bytea CONSTRAINT federation_family_membership_revocations_record_row_id_check CHECK (octet_length(record_row_id) = 32),
+    leaf text DEFAULT 'removal'::text NOT NULL,
+    CONSTRAINT federation_family_membership_revocations_witness_set_check CHECK ((jsonb_typeof(witness_set) = 'array'::text)),
+    CONSTRAINT federation_family_membership_revocations_leaf_check CHECK ((leaf = ANY (ARRAY['removal'::text, 'resignation'::text])))
 );
 
 COMMENT ON COLUMN cirislens.federation_family_membership_revocations.admitted_at IS 'NOT NULL on both dialects since sqlite V141 (CIRISPersist#828); postgres has been NOT NULL since V130.';
@@ -789,7 +796,8 @@ CREATE TABLE cirislens.federation_family_membership_widenings (
     scrub_signature_pqc text,
     admitted_at timestamp with time zone NOT NULL,
     cosignatures jsonb DEFAULT '[]'::jsonb NOT NULL,
-    attestation_id text
+    attestation_id text,
+    record_row_id bytea CONSTRAINT federation_family_membership_widenings_record_row_id_check CHECK (octet_length(record_row_id) = 32)
 );
 
 CREATE TABLE cirislens.federation_group_versions (
@@ -3608,6 +3616,12 @@ CREATE INDEX ceg_roster_proposals_open
 ALTER TABLE cirislens.federation_attestations ADD COLUMN restatement_key text;
 CREATE INDEX federation_attestations_restatement ON cirislens.federation_attestations USING btree (attesting_key_id, restatement_key) WHERE (restatement_key IS NOT NULL);
 
+-- v62.0.0 (WD-fix1; CC 2.4.1.1, CC 6.1.5 N5): the held withdrawals in this
+-- node's admission order, the withdrawn-content sweep's read
+-- (list_withdrawals_since): bounded by the withdrawals held, not the store
+-- (store::edition_baseline::ATTESTATIONS_WITHDRAWALS_INDEX_POSTGRES).
+CREATE INDEX federation_attestations_withdrawals ON cirislens.federation_attestations USING btree (admitted_at, attestation_id) WHERE (attestation_type = ANY (ARRAY['withdraws'::text, 'recants'::text]));
+
 -- v62.0.0 (RL-fix1, lead ruling (B); CC 5.4 "carries none it cannot verify"):
 -- the accord rows a node holding no accord root skipped, as feed WATERMARKS
 -- only (no row bytes): per (plane, peer) the first position skipped, so the
@@ -3631,3 +3645,58 @@ CREATE TABLE cirislens.ceg_dial_hints (
     body            text    NOT NULL,
     recorded_at_ms  bigint  NOT NULL
 );
+
+-- v62.0.0 (PRE4-V300-a; CONTENT-V300.rev3; CC rc22 3.1.3.2 "A room's content
+-- after a member's seat ends"): the room-content series index, the RETAINED
+-- ends / keeps rows and their tip lists (insert-only; they survive a purge, the
+-- bytes-plane tombstone and a checkpoint), and the cache of
+-- ciris_kernel::content answers (store::edition_baseline::EDITION_TWO_ADDITIONS).
+CREATE TABLE cirislens.ceg_room_content (
+    row_id        bytea   NOT NULL PRIMARY KEY CHECK (octet_length(row_id) = 32),
+    room_scope    text    NOT NULL,
+    room_target   text    NOT NULL,
+    author        text    NOT NULL,
+    kid           bytea   NOT NULL CHECK (octet_length(kid) = 32),
+    head_row_id   bytea   CHECK (head_row_id IS NULL OR octet_length(head_row_id) = 32),
+    admitted_us   bigint  NOT NULL
+);
+CREATE INDEX ceg_room_content_series
+    ON cirislens.ceg_room_content (room_scope, room_target, author, admitted_us, row_id);
+
+CREATE TABLE cirislens.ceg_content_ends (
+    source_row_id  bytea   NOT NULL PRIMARY KEY CHECK (octet_length(source_row_id) = 32),
+    room_scope     text    NOT NULL,
+    room_target    text    NOT NULL,
+    member         text    NOT NULL,
+    source_kind    text    NOT NULL CHECK (source_kind IN ('removal', 'resignation', 'keeps')),
+    counted        boolean NOT NULL,
+    head_row_id    bytea   NOT NULL CHECK (octet_length(head_row_id) = 32),
+    extends_row_id bytea   CHECK (extends_row_id IS NULL OR octet_length(extends_row_id) = 32),
+    CHECK ((source_kind = 'keeps') = (extends_row_id IS NOT NULL))
+);
+CREATE INDEX ceg_content_ends_member
+    ON cirislens.ceg_content_ends (room_scope, room_target, member, source_row_id);
+
+CREATE TABLE cirislens.ceg_content_end_tips (
+    source_row_id bytea   NOT NULL CHECK (octet_length(source_row_id) = 32),
+    tip_row_id    bytea   NOT NULL CHECK (octet_length(tip_row_id) = 32),
+    PRIMARY KEY (source_row_id, tip_row_id)
+);
+CREATE INDEX ceg_content_end_tips_tip
+    ON cirislens.ceg_content_end_tips (tip_row_id, source_row_id);
+
+CREATE TABLE cirislens.ceg_content_answers (
+    row_id        bytea   NOT NULL PRIMARY KEY CHECK (octet_length(row_id) = 32),
+    room_scope    text    NOT NULL,
+    room_target   text    NOT NULL,
+    member        text    NOT NULL,
+    counted       boolean NOT NULL,
+    in_force      boolean NOT NULL,
+    rule          text    NOT NULL,
+    undecided_on  bytea   CHECK (undecided_on IS NULL OR octet_length(undecided_on) = 32),
+    CHECK ((undecided_on IS NULL) = (rule <> 'undecided'))
+);
+CREATE INDEX ceg_content_answers_member
+    ON cirislens.ceg_content_answers (room_scope, room_target, member, row_id);
+CREATE INDEX ceg_content_answers_undecided
+    ON cirislens.ceg_content_answers (undecided_on) WHERE undecided_on IS NOT NULL;

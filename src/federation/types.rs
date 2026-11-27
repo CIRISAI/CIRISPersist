@@ -778,18 +778,19 @@ pub mod owner_binding {
     /// single-owner admission gate + [`super::super::admission::owner_of`] on
     /// this exact string. Versioned (`:v1`) per the dimension gate.
     pub const DIMENSION: &str = "ownership:responsible_party:node:v1";
-    /// The owner-binding `delegation_purpose` (producer-side marker; the
-    /// substrate gate keys on [`DIMENSION`], this documents the pair).
-    pub const PURPOSE: &str = "responsible_for";
-    /// v13.3.0 (CIRISPersist#378) — the **CC 2.4.1.2 canonical** owner-binding
-    /// marker carried as `registration/attestation_envelope.delegation_purpose`.
-    /// The substrate recognizes an owner-binding by EITHER this
-    /// `delegation_purpose` value OR the internal [`DIMENSION`] (the
-    /// `steward_bind` path sets the dimension; a raw `emit_attestation_self`
-    /// `delegates_to` — the only expressible owner-binding path per CC 2.4.1.2,
-    /// and what CIRISConformance probes — carries only this). Keying on the
-    /// dimension ALONE let the raw-emit path bypass the owner fold.
-    pub const CC_DELEGATION_PURPOSE: &str = "owner_binding";
+    /// The owner-binding `delegation_purpose`: the **CC 2.4.1.2 canonical**
+    /// marker, `owner_binding`. The substrate recognizes an owner-binding by
+    /// EITHER this value OR the internal [`DIMENSION`] (a raw
+    /// `emit_attestation_self` `delegates_to` carries only this; keying on the
+    /// dimension ALONE let the raw-emit path bypass the owner fold, v13.3.0).
+    ///
+    /// v62.0.0 (BIND-1; CC rc22 462260c rule `owner-binding`:
+    /// "delegation_purpose = \"owner_binding\" always") — ONE spelling. The
+    /// producer's earlier `responsible_for` (and the second constant
+    /// `CC_DELEGATION_PURPOSE` that carried `owner_binding` beside it) are
+    /// gone: a clean break, no alias. A row a peer signed with
+    /// `responsible_for` is still read as a binding by its [`DIMENSION`].
+    pub const PURPOSE: &str = "owner_binding";
 }
 
 /// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — the reserved

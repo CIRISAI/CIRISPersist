@@ -1401,7 +1401,7 @@ pub(crate) mod bodies {
             .unwrap()
             .iter()
             .any(|w| w.recipient_key_id == p.key_b));
-        p.sa.put_identity_occurrence_revocation_local(
+        p.sa.put_identity_occurrence_revocation_edition2(
             crate::federation::types::IdentityOccurrenceRevocation {
                 identity_key_id: p.owner.clone(),
                 occurrence_key_id: p.key_b.clone(),
@@ -1411,6 +1411,7 @@ pub(crate) mod bodies {
                 witness_set: vec![p.owner.clone()],
                 persist_row_hash: String::new(),
             },
+            crate::federation::DoorToken::new(),
         )
         .await
         .unwrap();
