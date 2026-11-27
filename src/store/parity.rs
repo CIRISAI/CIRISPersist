@@ -459,7 +459,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // withdraws gate's; this fails only on storage.
     ("after_withdraws", Class::Plumbing),
     ("occurrence_withdrawal_of", Class::Plumbing),
-    ("put_identity_occurrence_revocation_local", Class::Plumbing),
+    (
+        "put_identity_occurrence_revocation_edition2",
+        Class::Plumbing,
+    ),
     ("sqlite_sync_key_record_row", Class::Plumbing),
     ("sqlite_sync_occurrence_row", Class::Plumbing),
     ("sqlite_drop_key_record_rows", Class::Plumbing),
@@ -577,6 +580,20 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // Inside the shared plan: its two same-file halves.
     ("plan_put_attestation", Class::Delegates),
     ("execute_planned", Class::Delegates),
+    // v62.0.0 (VD-fix3; WD-fix4's routing) — a row that carries its edition-2
+    // statement is admitted AS that statement: the shared plan hands it to the
+    // statement door (`put_statement_with_origin`: every gate, the fold),
+    // a same-file helper that runs gates.
+    ("route_into_statement_door", Class::Delegates),
+    // Inside it: the carried statement's hex member (a malformed member is
+    // refused by name: a Gate); the held errors' scan, the fold record's read
+    // and the one verdict's read of a voice (`verdict::row_state`): reads
+    // that fail only on the substrate's own terms; the door's own refusal
+    // of a row it holds is the statement door's (inlined above).
+    ("carried_statement", Class::Gate),
+    ("iter", Class::Plumbing),
+    ("fold_state", Class::Plumbing),
+    ("row_state", Class::Plumbing),
     // The executor's storage steps, called by the shared plan. Each is itself
     // an `AttestationStore` door, compared across backends on its own.
     ("store_planned_attestation", Class::Plumbing),
@@ -1031,10 +1048,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("from_str", Class::Plumbing),
     ("from_value", Class::Plumbing),
     ("from_wire_str", Class::Plumbing),
-    // v59.0.0 (CIRISPersist#1099) — the self-roster door: refuses (holds) a
-    // roster change one key of two or more signed.
-    ("gate_occurrence", Class::Gate),
-    ("gate_withdrawal", Class::Gate),
     ("get", Class::Plumbing),
     ("get_attestation", Class::Delegates),
     ("get_client", Class::Delegates),
@@ -1976,9 +1989,10 @@ mod tests {
             "put_identity_occurrence",
             "put_identity_occurrence_planned",
         ),
+        // v62.0.0 (WD-fix9) — the retired trusted-local write, a TEST seam.
         (
             "FederationDirectory",
-            "put_identity_occurrence_local",
+            "test_seam_put_identity_occurrence",
             "put_identity_occurrence_local_planned",
         ),
         // v61 (CIRISPersist#934, S4b) — the transport-destination writes.

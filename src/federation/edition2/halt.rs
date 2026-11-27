@@ -471,7 +471,7 @@ where
         held.iter().map(|h| (h.row, h.constitutional)).collect();
     let replays = replay_fold(held);
     for (row, family) in &family_of {
-        let was_held = dir.fold_held(row).await?.is_some();
+        let was_held = super::fold::why_held(dir, row).await?.is_some();
         match replays.get(row) {
             Some(by) if !was_held || *row == own => {
                 record_replay(
@@ -735,7 +735,10 @@ where
         let Some(state) = dir.fold_state(&row).await? else {
             continue;
         };
-        if state.family != FAMILY_LIFECYCLE || state.held.is_some() {
+        // VD-step1 — concluded is the one verdict's (`verdict::row_state`).
+        if state.family != FAMILY_LIFECYCLE
+            || !super::verdict::row_state(dir, &row).await?.is_concluded()
+        {
             continue;
         }
         let voices = dir.edition2_voices(&row).await?;

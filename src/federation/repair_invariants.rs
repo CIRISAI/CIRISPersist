@@ -114,9 +114,12 @@ pub(crate) mod bodies {
         )
         .await
         {
-            p.b.apply_replicated_key_grant(set)
-                .await
-                .expect("B applies A's row");
+            crate::federation::key_grant_invariants::two_node::deliver_key_grant_row(
+                &*p.b.federation_directory(),
+                &set,
+            )
+            .await
+            .expect("B applies A's row");
         }
         p.b.adopt_sealed_blob(
             &inline(p.sa.as_ref(), root).await,

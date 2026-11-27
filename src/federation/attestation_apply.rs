@@ -748,9 +748,10 @@ mod tests {
     use crate::federation::{FederationDirectory, SignedAttestation};
 
     /// v62.0.0 (JSON cut, E7) — a dimension Verify's family matcher registers
-    /// (`evidence:{suite}:{kind}:{cell}:{prefix}`): an edition-2 row of an
+    /// (`coherence_standing:{cohort}`; v62.0.0 FS-sig-b: an ungated claim
+    /// family, since `evidence:*` now needs `infra:attest`): an edition-2 row of an
     /// unregistered dimension (`identity_binding:v1`) is refused at the door.
-    const DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
+    const DIMENSION: &str = "coherence_standing:cab:v1";
 
     // ── Pure plan + token tests (no backend, no directory) ────────────
 
@@ -1139,11 +1140,16 @@ mod tests {
         // the producer's own retraction).
         let target = sealed_row(author, envelope(DIMENSION, serde_json::json!({})));
         let target_id = target.attestation_id.clone();
-        dir.apply_replicated_attestation(SignedAttestation {
+        let dbg = dir.apply_replicated_attestation(SignedAttestation {
             attestation: target,
         })
         .await
         .expect("target applies");
+        eprintln!("DBGAPPLY target {target_id} -> {dbg:?}");
+        {
+            let rid = crate::federation::edition2::names::RowId(<[u8; 32]>::try_from(hex::decode(&target_id).unwrap().as_slice()).unwrap());
+            eprintln!("DBGAPPLY voices={} att={:?} state={:?}", dir.edition2_voices(&rid).await.unwrap().len(), dir.get_attestation(&target_id).await.unwrap().map(|a| a.attestation_type), crate::federation::edition2::verdict::row_state(&dir, &rid).await);
+        }
 
         // v62.0.0 (JSON cut, E7) — a composer carries its target's family
         // and names it by `refs.target` (the codec maps
