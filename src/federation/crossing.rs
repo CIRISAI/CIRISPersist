@@ -560,6 +560,15 @@ pub enum MeshCrossingOutcome {
         /// The held detail, as the gate words it.
         detail: String,
     },
+    /// v62.0.0 (D2; the HEAD-4.rev2 pattern, `holding_claim::node_is_unowned`)
+    /// — the row is this node's own local `hard_case:*` record and this node
+    /// is UNOWNED: an unowned node states no report (CC 3.2), so nothing was
+    /// stated or written. The local row stays local; it crosses once an owner
+    /// binding lands. Not an error. APPENDED.
+    Unowned {
+        /// The local row that waits.
+        attestation_id: String,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────

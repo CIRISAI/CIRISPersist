@@ -1413,7 +1413,7 @@ pub struct HumanSubject {
 /// The subjects of an attestation: its `subject_key_ids` and its
 /// `attested_key_id` (the key the row is ABOUT). Not its author: an
 /// attestation's subject is who it is about.
-fn attestation_subjects(row: &Attestation) -> BTreeSet<String> {
+pub(crate) fn attestation_subjects(row: &Attestation) -> BTreeSet<String> {
     row.subject_key_ids
         .iter()
         .chain(std::iter::once(&row.attested_key_id))
@@ -2004,17 +2004,111 @@ where
         .map_err(|detail| unauth(unauthorised_reason::NOTICE_MALFORMED, detail))?;
     check_notice_window(&terms, now)?;
     let voices = super::cosign::edition2_voices(directory, notice_row).await?;
-    match super::canonical_community::trust_root_counts_voices(
-        directory,
-        &terms.claimant_key_id,
-        &voices,
-        now,
-    )
-    .await?
-    {
-        Ok(signers) => Ok((terms, signers)),
-        Err((reason, detail)) => Err(unauth(reason, detail)),
+    // LEAD-root2 (CC 2.4.1.1 "A purge is a tombstone"; CC 3.3.2; CC 3.2 T5;
+    // Constitution's derivation of 2026-11-23) — THE ROOT IS THE BUNDLE'S
+    // LINEAGE. A steward purge is a row COUNTED over the holders of the
+    // bundle it names in `refs.head`, the shape of a grant from the root
+    // (`admission::root_grant_reading`): the named bundle a Valid placement
+    // of the lineage `sub` names, every voice a holder of THAT bundle, the
+    // holders' strict majority (the one count,
+    // `trust_root_group::holders_count_at`), and no voice once a successor
+    // bundle this node holds is dated at or before the notice (the voices
+    // share the payload's `asserted_at`). The earlier form counted the
+    // founders of a root COMMUNITY at the `claimant`'s id; no community is a
+    // root.
+    let Some(head) = bundle_head_of_statement(first) else {
+        return Err(unauth(
+            unauthorised_reason::NOTICE_MALFORMED,
+            "a steward purge names the bundle it is counted over in refs.head".to_owned(),
+        ));
+    };
+    if voices.is_empty() {
+        return Err(unauth(
+            unauthorised_reason::NO_COSIGNATURE,
+            "no statement of the notice is held".to_owned(),
+        ));
     }
+    let state = super::edition2::genesis::genesis_in_force(directory).await?;
+    let placement = state.valid.iter().find(|p| p.object_id == head);
+    let Some(holders) = super::edition2::trust_root_group::bundle_holders(&state, &head) else {
+        return Err(unauth(
+            unauthorised_reason::ROOT_NOT_HELD,
+            format!(
+                "the bundle {} the notice names is not a held valid bundle of this node's lineage",
+                hex::encode(head)
+            ),
+        ));
+    };
+    if placement.map(|p| p.family_key_id.as_str()) != Some(terms.claimant_key_id.as_str()) {
+        return Err(unauth(
+            unauthorised_reason::ROOT_NOT_ROOTED,
+            format!(
+                "the bundle {} is not a bundle of the lineage {:?} the notice names",
+                hex::encode(head),
+                terms.claimant_key_id
+            ),
+        ));
+    }
+    if let Some(v) = voices.iter().find(|v| !holders.contains(v)) {
+        return Err(unauth(
+            unauthorised_reason::NOT_A_SEAT,
+            format!("voice {v:?} is no holder of the bundle the notice names"),
+        ));
+    }
+    let asserted_ms = u64::try_from(terms.asserted_at.timestamp_millis()).unwrap_or(0);
+    let counted = if state
+        .successor_instant(&head)
+        .is_some_and(|next| asserted_ms >= next)
+    {
+        BTreeSet::new()
+    } else {
+        voices
+    };
+    let count = super::edition2::trust_root_group::holders_count(&holders, &counted);
+    if count.distinct_holders < count.required {
+        return Err(unauth(
+            unauthorised_reason::QUORUM_NOT_MET,
+            format!(
+                "{} of the {} holders of the named bundle voiced the notice; {} are required",
+                count.distinct_holders, count.roster_size, count.required
+            ),
+        ));
+    }
+    // THE REACH: a node acts on the purge only for a lineage it accepts (its
+    // own, or its owner's, `trust:accepts:v1` edge onto that lineage).
+    let accepted = match directory.node_key_id() {
+        Some(node) => {
+            super::trust_root::bundle_root_accepted(directory, &node, &terms.claimant_key_id, now)
+                .await?
+        }
+        None => false,
+    };
+    if !accepted {
+        return Err(unauth(
+            unauthorised_reason::ROOT_NOT_ROOTED,
+            format!(
+                "this node does not accept the lineage {:?}: its purge moves nothing here",
+                terms.claimant_key_id
+            ),
+        ));
+    }
+    Ok((terms, counted))
+}
+
+/// The bundle a steward purge is counted over: its statement's `refs.head`.
+fn bundle_head_of_statement(statement: &[u8]) -> Option<ciris_verify_core::edition2::Digest32> {
+    let (_, names) = super::edition2::names::of_statement_names(statement)?;
+    super::edition2::names::single(&names, "head").map(|r| r.0)
+}
+
+/// The lineage a steward purge names: its statement's CWT `sub`.
+fn lineage_of_statement(statement: &[u8]) -> Option<String> {
+    let (protected, _) = super::edition2::liveness::statement_parts(statement)?;
+    protected
+        .get_int(15)?
+        .get_int(2)?
+        .as_text()
+        .map(str::to_owned)
 }
 
 /// The terms of an edition-2 steward purge notice, from its statement's
@@ -2061,9 +2155,20 @@ fn notice_terms_of_statement(statement: &[u8], notice_id: &str) -> Result<Notice
     };
     Ok(NoticeTerms {
         notice_id: notice_id.to_owned(),
-        claimant_key_id: text("claimant")
-            .ok_or_else(|| "the notice names no claimant".to_owned())?
-            .to_owned(),
+        // LEAD-root2 — a steward purge carries no `claimant` and no `author`
+        // (a counted row has no one issuer): the field holds the LINEAGE its
+        // `sub` names, which the ledger records as the claimant.
+        claimant_key_id: {
+            if payload.get_text("claimant").is_some() || payload.get_text("author").is_some() {
+                return Err(
+                    "a steward purge carries no claimant and no author: it is counted over \
+                     the holders of the bundle it names"
+                        .to_owned(),
+                );
+            }
+            lineage_of_statement(statement)
+                .ok_or_else(|| "the notice names no lineage (its sub)".to_owned())?
+        },
         selection_digest,
         selection_counts,
         asserted_at: instant("asserted_at")?,
@@ -2716,6 +2821,10 @@ pub struct FinalizeReport {
     pub trace_llm_calls_deleted: u64,
     /// Blobs evicted.
     pub blobs_evicted: u64,
+    /// v62.0.0 (WD-fix1 rev 3) — held edition-2 statements of the deleted
+    /// rows (each row statement and its voices) deleted.
+    #[serde(default)]
+    pub statements_deleted: u64,
     /// Tombstoned record ids NOT deleted because the tombstone is void: the
     /// row arrived after it and is the accountability record
     /// ([`refuse_if_tombstoned_attestation`]).
@@ -2800,6 +2909,15 @@ where
                     if directory.purge_delete_tombstoned_attestation(&r.id).await? {
                         report.attestations_deleted += 1;
                     }
+                    // v62.0.0 (WD-fix1 rev 3; the release lead's ruling) — the
+                    // row's signed statement bytes go with it, for EVERY purge
+                    // basis (a steward purge, a takedown, an erasure, a
+                    // descent): before this the statements stayed held,
+                    // withheld from serve. Asked even when the row was already
+                    // gone (a resumed finalize): the door's own gate deletes
+                    // only for a tombstoned id whose row is gone.
+                    report.statements_deleted +=
+                        directory.purge_delete_tombstoned_statements(&r.id).await?;
                 }
                 PurgePlane::Blob => {
                     if reversed {
@@ -3652,15 +3770,89 @@ pub fn person_subject_sql(fa: &str, prefix: &str) -> String {
 /// tombstone is void for it (the accountability record, a person-subject
 /// row). The rule `list_attestations_since` spells inline, for the reads that
 /// serve what it serves. `prefix` as [`person_subject_sql`].
+///
+/// v62.0.0 (WD-fix1) — the person-subject void is lifted by an admitted
+/// withdrawal's descent ([`person_void_sql`]), as at the delete door.
 #[must_use]
-pub fn served_under_purge_sql(fa: &str, prefix: &str) -> String {
+pub fn served_under_purge_sql(
+    fa: &str,
+    prefix: &str,
+    dialect: super::attestation_query::Dialect,
+) -> String {
     format!(
         "(NOT EXISTS (SELECT 1 FROM {prefix}purge_tombstones pt \
                       WHERE pt.plane = 'attestation' \
                         AND pt.record_ref = {fa}.attestation_id) \
           OR {} OR {})",
         super::migration::accountability_record_sql(&format!("{fa}.dimension")),
-        person_subject_sql(fa, prefix)
+        person_void_sql(fa, prefix, dialect)
+    )
+}
+
+/// v62.0.0 (WD-fix1; CC 2.4.1.1, CC 6.1.5 as ruled 11-21) — the purge
+/// `legal_basis` of a DESCENT: the tombstone an admitted rule 1–4
+/// `withdraws` / `recants` (the author's or a named subject's own act, by
+/// whatever hand the rule admitted) writes for the row it withdraws and the
+/// bytes that row alone bound. NEW in the vocabulary (the column is free
+/// text, not a hashed vocabulary: no position to pin). It is the only basis
+/// that lifts the INTERIM person-subject void, and only when the delete door
+/// re-derives it ([`withdrawal_descent_sql`], [`withdrawal_descent_lifts`]):
+/// the tombstone's `derived_from` names a stored, ADMITTED withdrawal (its
+/// door stamp 1–4) that names this very row. A tombstone merely CLAIMING the
+/// basis lifts nothing.
+pub const WITHDRAWAL_DESCENT_BASIS: &str = "withdrawal_descent";
+
+/// v62.0.0 (WD-fix1) — **does an admitted withdrawal's descent lift the
+/// person-subject void for `fa`?** As SQL, re-derived from stored rows only:
+/// an `attestation` tombstone on `fa` whose execution's basis is
+/// [`WITHDRAWAL_DESCENT_BASIS`], whose `derived_from` is a stored `withdraws`
+/// / `recants` carrying the admission door's stamp 1–4 (never 0, 5, or the
+/// unset stamp of a held or deferred withdrawal), and whose envelope names
+/// `fa` as its target.
+#[must_use]
+pub fn withdrawal_descent_sql(
+    fa: &str,
+    prefix: &str,
+    dialect: super::attestation_query::Dialect,
+) -> String {
+    let names = match dialect {
+        super::attestation_query::Dialect::Sqlite => {
+            "json_extract(w.attestation_envelope, '$.references_attestation_id')".to_owned()
+        }
+        super::attestation_query::Dialect::Postgres => {
+            "(w.attestation_envelope::jsonb ->> 'references_attestation_id')".to_owned()
+        }
+    };
+    format!(
+        "EXISTS (SELECT 1 FROM {prefix}purge_tombstones dt \
+                 JOIN {prefix}purge_executions de ON de.notice_id = dt.notice_id \
+                 JOIN {prefix}federation_attestations w ON w.attestation_id = dt.derived_from \
+                 WHERE dt.plane = 'attestation' \
+                   AND dt.record_ref = {fa}.attestation_id \
+                   AND de.legal_basis = '{WITHDRAWAL_DESCENT_BASIS}' \
+                   AND w.attestation_type IN ('{}', '{}') \
+                   AND w.withdraws_admission_rule IN ({rules}) \
+                   AND {names} = {fa}.attestation_id)",
+        attestation_type::WITHDRAWS,
+        attestation_type::RECANTS,
+        rules = super::withdrawn_content::descending_rules_sql(),
+    )
+}
+
+/// v62.0.0 (WD-fix1) — the INTERIM person-subject void, as SQL: a person
+/// subject ([`person_subject_sql`]) AND no admitted withdrawal's descent
+/// ([`withdrawal_descent_sql`]). Every SQL site of the void asks THIS: the
+/// serve rule ([`served_under_purge_sql`]) and each backend's delete door.
+#[must_use]
+pub fn person_void_sql(
+    fa: &str,
+    prefix: &str,
+    dialect: super::attestation_query::Dialect,
+) -> String {
+    format!(
+        "({} AND NOT {})",
+        person_subject_sql(fa, prefix),
+        withdrawal_descent_sql(fa, prefix, dialect)
     )
 }
 
@@ -3717,12 +3909,145 @@ where
         )));
     }
     if let Some(person) = person_subject_of(directory, row).await? {
+        // v62.0.0 (WD-fix1) — the ONE reason an admitted withdrawal's
+        // descent removes: the withdrawal IS the notice, and it is a row.
+        if withdrawal_descent_lifts(directory, row).await? {
+            return Ok(None);
+        }
         return Ok(Some(format!(
             "its subject {person} is a person (interim: no purge reaches a human subject until \
              the notice is a row)"
         )));
     }
     Ok(None)
+}
+
+/// v62.0.0 (WD-fix1; the release lead's ruling 11-21) — **is the
+/// person-subject void lifted for `row` by an admitted withdrawal's
+/// descent?** Re-derived from this node's own store, never from a claimed
+/// basis: a stored `withdraws` / `recants` naming `row` whose admission stamp
+/// is 1–4 ([`super::withdrawn_content::rule_descends`]), and the descent
+/// execution for exactly that withdrawal and target
+/// ([`super::subject_erasure::descent_notice_id`]) recorded with
+/// [`WITHDRAWAL_DESCENT_BASIS`] and tombstoning `row` derived from it. The
+/// Rust twin of [`withdrawal_descent_sql`].
+///
+/// # Errors
+/// Directory reads.
+pub async fn withdrawal_descent_lifts<F>(directory: &F, row: &Attestation) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let composers = directory
+        .list_composers_referencing_any(std::slice::from_ref(&row.attestation_id), None, None)
+        .await?;
+    for w in composers {
+        if !super::edition2::emit::carries_no_dimension(&w.attestation_type)
+            || super::precedence::references_attestation_id_from_envelope(&w.attestation_envelope)
+                != Some(row.attestation_id.as_str())
+            || !super::precedence::admitting_stamp(&w)
+                .is_some_and(super::withdrawn_content::rule_descends)
+        {
+            continue;
+        }
+        let notice_id =
+            super::subject_erasure::descent_notice_id(&w.attestation_id, &row.attestation_id)?;
+        let Some(e) = directory.purge_execution(&notice_id).await? else {
+            continue;
+        };
+        if e.legal_basis != WITHDRAWAL_DESCENT_BASIS {
+            continue;
+        }
+        if directory
+            .purge_tombstones_of(&notice_id)
+            .await?
+            .iter()
+            .any(|t| {
+                t.plane == PurgePlane::Attestation
+                    && t.record_ref == row.attestation_id
+                    && t.derived_from.as_deref() == Some(w.attestation_id.as_str())
+            })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// v62.0.0 (WD-fix3) — **did `row` descend here under a withdrawal whose own
+/// row a later purge removed?** The re-offer gate's second form of
+/// [`withdrawal_descent_lifts`], for the state that one cannot read: the
+/// withdrawal row is gone, so no stored stamp names `row` any more. Re-derived
+/// from this node's own store, never from a claimed basis. All of these must
+/// hold:
+///
+/// - `row` is not held here (a held row is the delete door's question, which
+///   [`withdrawal_descent_lifts`] alone answers: I4402 is unchanged);
+/// - an `attestation` tombstone on `row` whose execution is the descent
+///   [`WITHDRAWAL_DESCENT_BASIS`] for exactly `(derived_from, row)`
+///   ([`super::subject_erasure::descent_notice_id`]) and is FINALIZED (the
+///   descent deleted the row);
+/// - the withdrawal `derived_from` names is not held here and carries a
+///   standing tombstone of its own (a door purged it).
+///
+/// Without it, purging the withdrawal row let a copy of a person-subject row
+/// back in: the interim person void answered once no stored withdrawal named
+/// the row.
+///
+/// # Errors
+/// Directory reads.
+pub async fn descent_outlived_its_withdrawal<F>(
+    directory: &F,
+    row: &Attestation,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if directory
+        .get_attestation(&row.attestation_id)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    for notice_id in directory
+        .purge_tombstone_notices(PurgePlane::Attestation.as_str(), &row.attestation_id)
+        .await?
+    {
+        let Some(e) = directory.purge_execution(&notice_id).await? else {
+            continue;
+        };
+        if e.legal_basis != WITHDRAWAL_DESCENT_BASIS || e.finalized_at.is_none() {
+            continue;
+        }
+        let Some(withdraws) = directory
+            .purge_tombstones_of(&notice_id)
+            .await?
+            .into_iter()
+            .find(|t| t.plane == PurgePlane::Attestation && t.record_ref == row.attestation_id)
+            .and_then(|t| t.derived_from)
+        else {
+            continue;
+        };
+        if super::subject_erasure::descent_notice_id(&withdraws, &row.attestation_id)? != notice_id
+        {
+            continue;
+        }
+        if directory.get_attestation(&withdraws).await?.is_some() {
+            continue;
+        }
+        if super::takedown_tombstone::standing_tombstone(
+            directory.as_dyn_directory(),
+            PurgePlane::Attestation.as_str(),
+            &withdraws,
+        )
+        .await?
+        .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Is the tombstone on attestation `id` void — is the row it names held here
@@ -3826,6 +4151,16 @@ where
     // so the sender re-offers the row once the key lands and the person check
     // decides then (Codex round 4 follow-up). An unknown key still never
     // un-purges a row: it is not admitted while the key is unknown.
+    // v62.0.0 (WD-fix1) — an admitted withdrawal's descent lifts the
+    // person-subject void: a copy of a withdrawn row that arrives after its
+    // descent is refused by the tombstone, as any other tombstoned row is.
+    // v62.0.0 (WD-fix3) — and so does a descent whose withdrawal row a later
+    // purge removed: the descent's own finalized tombstone is enough.
+    if withdrawal_descent_lifts(directory, row).await?
+        || descent_outlived_its_withdrawal(directory, row).await?
+    {
+        return refuse_if_tombstoned(directory, PurgePlane::Attestation, &row.attestation_id).await;
+    }
     let mut unresolved: Option<String> = None;
     for subject in attestation_subjects(row) {
         match directory.lookup_public_key(&subject).await? {

@@ -322,11 +322,15 @@ pub mod identity_type {
     /// the substrate component"; CC 3.4.7.1: "`substrate_persist` is a key type
     /// that confers no authority. A store asserts it under its own key … Nothing
     /// is admitted on its strength, and the records a store signs mark and
-    /// never cause." A reserved-prefix rule may key on a member of this set
-    /// (the self-report families of
-    /// [`SUBSTRATE_SELF_REPORT_PREFIXES`](crate::federation::admission::SUBSTRATE_SELF_REPORT_PREFIXES)),
+    /// never cause." v62.0.0 (D1; CC 3.4.7 "No admission decision reads it to
+    /// open a reserved family"): no reserved-prefix rule keys on a member of
+    /// this set any more. The self-report families of
+    /// [`SUBSTRATE_SELF_REPORT_PREFIXES`](crate::federation::admission::SUBSTRATE_SELF_REPORT_PREFIXES)
+    /// open to a node holding `infra:attest` from its owner
+    /// ([`owner_confers_for_act`](crate::federation::admission::owner_confers_for_act)),
     /// and the row must describe its own signer
     /// ([`check_substrate_self_report_attester`](crate::federation::admission::check_substrate_self_report_attester)).
+    /// The label is a key's statement about itself and is kept as one.
     /// Disjoint from [`AUTHORITY_CONFERRING_IDENTITY_TYPES`]; no
     /// [`ConferralMode`] names a member.
     ///
@@ -778,18 +782,19 @@ pub mod owner_binding {
     /// single-owner admission gate + [`super::super::admission::owner_of`] on
     /// this exact string. Versioned (`:v1`) per the dimension gate.
     pub const DIMENSION: &str = "ownership:responsible_party:node:v1";
-    /// The owner-binding `delegation_purpose` (producer-side marker; the
-    /// substrate gate keys on [`DIMENSION`], this documents the pair).
-    pub const PURPOSE: &str = "responsible_for";
-    /// v13.3.0 (CIRISPersist#378) — the **CC 2.4.1.2 canonical** owner-binding
-    /// marker carried as `registration/attestation_envelope.delegation_purpose`.
-    /// The substrate recognizes an owner-binding by EITHER this
-    /// `delegation_purpose` value OR the internal [`DIMENSION`] (the
-    /// `steward_bind` path sets the dimension; a raw `emit_attestation_self`
-    /// `delegates_to` — the only expressible owner-binding path per CC 2.4.1.2,
-    /// and what CIRISConformance probes — carries only this). Keying on the
-    /// dimension ALONE let the raw-emit path bypass the owner fold.
-    pub const CC_DELEGATION_PURPOSE: &str = "owner_binding";
+    /// The owner-binding `delegation_purpose`: the **CC 2.4.1.2 canonical**
+    /// marker, `owner_binding`. The substrate recognizes an owner-binding by
+    /// EITHER this value OR the internal [`DIMENSION`] (a raw
+    /// `emit_attestation_self` `delegates_to` carries only this; keying on the
+    /// dimension ALONE let the raw-emit path bypass the owner fold, v13.3.0).
+    ///
+    /// v62.0.0 (BIND-1; CC rc22 462260c rule `owner-binding`:
+    /// "delegation_purpose = \"owner_binding\" always") — ONE spelling. The
+    /// producer's earlier `responsible_for` (and the second constant
+    /// `CC_DELEGATION_PURPOSE` that carried `owner_binding` beside it) are
+    /// gone: a clean break, no alias. A row a peer signed with
+    /// `responsible_for` is still read as a binding by its [`DIMENSION`].
+    pub const PURPOSE: &str = "owner_binding";
 }
 
 /// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — the reserved
@@ -832,6 +837,15 @@ pub mod delegation_scope {
     /// **assurance attestations about third parties**: the `age_assurance:` and
     /// `capacity_assurance:` rungs, and `transparency_log:cosigned:`.
     ///
+    /// v62.0.0 (D3; CC 3.4.7 "The assurance duties. An age assessor holds
+    /// `assure:age`, and a capacity assessor holds `assure:capacity`. … neither
+    /// is an `infra:*` scope.") — the two assurance ladders moved to
+    /// [`ASSURE_AGE`] / [`ASSURE_CAPACITY`] (a clean break: this scope opens
+    /// neither any more). It is left only on `transparency_log:cosigned:`, a
+    /// family CC 3.4.10 retires (the pin step's retirement deletes the rule;
+    /// the baked charter still names the scope, so it stays in [`ALL`] by
+    /// position).
+    ///
     /// The scope a `witness` must hold from a trust root before those doors
     /// open. It is deliberately NOT `infra:attest` — that scope already
     /// governs the build-manifest plane (#422), and reusing it would let an
@@ -839,6 +853,19 @@ pub mod delegation_scope {
     /// band. One name, two authorities is the fusion class this repo keeps
     /// closing.
     pub const INFRA_ATTEST_ASSURANCE: &str = "infra:attest_assurance";
+
+    /// v62.0.0 (D3; CC 3.4.7, the table: "`age_assurance:*` | an age assessor
+    /// who is not the subject | `assure:age` | a root the reader trusts") —
+    /// `assure:age`, the duty an `age_assurance:*` row's signer holds,
+    /// conferred under a root this node trusts (`trust_root::conferred_for_act`).
+    /// Not an `infra:*` scope: "A person or an institution holds these two".
+    /// The baked charter (`edition2/baked/humanity-accord-genesis-v1.cbor`,
+    /// each holder voice's payload `charter.scope`) carries it.
+    pub const ASSURE_AGE: &str = "assure:age";
+    /// v62.0.0 (D3; CC 3.4.7: "`capacity_assurance:*` | a capacity assessor who
+    /// is neither the subject nor the proposed steward | `assure:capacity` | a
+    /// root the reader trusts") — `assure:capacity`. See [`ASSURE_AGE`].
+    pub const ASSURE_CAPACITY: &str = "assure:capacity";
 
     /// v30.3.0 (CIRISPersist#607) — `infra:record_hard_case` — record a
     /// `hard_case:*` observation **about another party**.
@@ -862,6 +889,15 @@ pub mod delegation_scope {
     /// `FederationDirectory::record_hard_case` into `hard_case_events`. Persist
     /// emits no `hard_case:` attestation. The traffic this scope governs is a
     /// host's — CIRISServer's graded admin ladder.
+    ///
+    /// v62.0.0 (D2; CC 3.4.7: "A `hard_case` row whose body names another
+    /// party needs `infra:record_hard_case`, even when the row is
+    /// self-attested"; the table's conferrer column: "the node's owner, in the
+    /// owner-binding") — conferred by the node's OWNER in its owner binding's
+    /// `scope`, never by a root; and required also for a self-attested row
+    /// whose BODY names another party (`hard_case::names_another_party`),
+    /// which includes persist's own stated hard_case rows that name a
+    /// community or a removed member. The paragraph above predates both.
     pub const INFRA_RECORD_HARD_CASE: &str = "infra:record_hard_case";
 
     /// v30.3.0 (CIRISPersist#611) — `infra:publish_rating` — vouch on the
@@ -1146,6 +1182,9 @@ pub mod delegation_scope {
         SECRETS_ADMIN,
         // v62.0.0 (F0-cp5b) — APPENDED, never inserted (pinned by position).
         INFRA_PIPELINE_WRITER,
+        // v62.0.0 (D3) — the assurance duties, APPENDED (pinned by position).
+        ASSURE_AGE,
+        ASSURE_CAPACITY,
     ];
 
     /// v62.0.0 (P6; RULINGS "Planes": the secrets API is LOCAL) —
@@ -1183,6 +1222,14 @@ pub mod delegation_scope {
     /// cannot be delegated to a `node` key. A secrets caller is an agent or a
     /// user key.
     pub const SECRETS: &[&str] = &[SECRETS_READER, SECRETS_WRITER, SECRETS_ADMIN];
+
+    /// v62.0.0 (D3; CC 3.4.7 "The assurance duties … A person or an
+    /// institution holds these two, and neither is an `infra:*` scope.") — the
+    /// assurance axis: an assessor's standing to attest a THIRD PARTY's age or
+    /// capacity band, conferred under a root. Its own axis: not [`INFRA`] (no
+    /// mesh duty), not [`AGENCY`], not [`MODERATION`] (no act on a roster),
+    /// not [`RECOVERY`], not [`SECRETS`].
+    pub const ASSURANCE: &[&str] = &[ASSURE_AGE, ASSURE_CAPACITY];
 
     /// v30.7.0 (CIRISPersist#625) — the `infra:*` axis: what a key may do as
     /// INFRASTRUCTURE.
@@ -5816,6 +5863,8 @@ mod tests {
             ("MODERATION", ds::MODERATION),
             ("RECOVERY", ds::RECOVERY),
             ("SECRETS", ds::SECRETS),
+            // v62.0.0 (D3) — the sixth axis: the assurance duties.
+            ("ASSURANCE", ds::ASSURANCE),
         ] {
             for v in set {
                 assert!(
@@ -5834,7 +5883,8 @@ mod tests {
         assert!(
             missing.is_empty(),
             "scope(s) in ALL belong to no axis subset: {missing:?}. Every scope has an axis — add \
-             it to INFRA, AGENCY, MODERATION, RECOVERY or SECRETS, or say why a SIXTH axis exists."
+             it to INFRA, AGENCY, MODERATION, RECOVERY, SECRETS or ASSURANCE, or say why a \
+             SEVENTH axis exists."
         );
 
         // Non-vacuity: an empty or tiny set would satisfy everything above.
@@ -5844,6 +5894,7 @@ mod tests {
                 && ds::MODERATION.len() >= 5
                 && !ds::RECOVERY.is_empty()
                 && ds::SECRETS.len() == 3
+                && ds::ASSURANCE.len() == 2
         );
     }
 
@@ -5857,8 +5908,9 @@ mod tests {
         use super::delegation_scope as ds;
         assert_eq!(ds::INFRA_RELAY, "infra:relay");
         // v62.0.0 (P6): 25 + the three secrets scopes, appended after it;
-        // (F0-cp5b) + `infra:pipeline_writer`.
-        assert_eq!(ds::ALL.len(), 29);
+        // (F0-cp5b) + `infra:pipeline_writer`; (D3) + `assure:age`,
+        // `assure:capacity`.
+        assert_eq!(ds::ALL.len(), 31);
         assert_eq!(
             ds::ALL[24],
             ds::INFRA_RELAY,
@@ -5907,11 +5959,36 @@ mod tests {
         use super::delegation_scope as ds;
         assert_eq!(ds::INFRA_PIPELINE_WRITER, "infra:pipeline_writer");
         assert_eq!(ds::ALL[28], ds::INFRA_PIPELINE_WRITER, "I2888: ALL[28]");
-        assert_eq!(ds::ALL.len(), 29, "I2888: last in ALL");
+        // v62.0.0 (D3) — the two assurance duties are appended after it
+        // (I6606), so it is no longer last; its position is still 28.
+        assert_eq!(ds::ALL.len(), 31, "I2888: two appended after it (D3)");
         assert_eq!(ds::INFRA[13], ds::INFRA_PIPELINE_WRITER, "I2888: INFRA[13]");
         assert_eq!(ds::INFRA.len(), 14, "I2888: last in INFRA");
         assert!(ds::INFRA_PIPELINE_WRITER.starts_with(ds::INFRA_PREFIX));
         assert!(!ds::SECRETS.contains(&ds::INFRA_PIPELINE_WRITER));
+    }
+
+    /// v62.0.0 (D3) — **I6606: `assure:age` and `assure:capacity` are APPENDED
+    /// to `ALL`, last, on their own axis** (CC 3.4.7: "neither is an `infra:*`
+    /// scope"), so a node-agency gate never reads them as infrastructure.
+    #[test]
+    fn i6606_the_assurance_duties_are_appended_on_their_own_axis() {
+        use super::delegation_scope as ds;
+        assert_eq!(ds::ASSURE_AGE, "assure:age");
+        assert_eq!(ds::ASSURE_CAPACITY, "assure:capacity");
+        assert_eq!(&ds::ALL[29..31], &[ds::ASSURE_AGE, ds::ASSURE_CAPACITY]);
+        assert_eq!(ds::ALL.len(), 31, "I6606: last in ALL");
+        assert_eq!(ds::ASSURANCE, &[ds::ASSURE_AGE, ds::ASSURE_CAPACITY]);
+        for s in ds::ASSURANCE {
+            assert!(
+                !s.starts_with(ds::INFRA_PREFIX),
+                "I6606: {s} is no infra:* scope"
+            );
+            assert!(
+                !ds::INFRA.contains(s),
+                "I6606: {s} is not on the INFRA axis"
+            );
+        }
     }
 
     /// v30.7.0 (CIRISPersist#625) — **every `delegation_scope` constant is either
@@ -6144,6 +6221,7 @@ mod tests {
             ("MODERATION", ds::MODERATION),
             ("RECOVERY", ds::RECOVERY),
             ("SECRETS", ds::SECRETS),
+            ("ASSURANCE", ds::ASSURANCE),
         ] {
             for v in axis {
                 assert!(

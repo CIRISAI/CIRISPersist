@@ -462,6 +462,15 @@ pub(crate) mod bodies {
         // v62.0.0 (E5) — the node's key is an edition-2 `key:record`; the
         // composite `local_signer(alias)` signs with is `e2::signing_key(alias)`.
         let node_kid = e2::put_key(d, &alias, &[NODE]).await;
+        // v62.0.0 (D2.rev2; CC 3.4.7) — the record is a node's report under
+        // `infra:attest` from its owner (and an owned node names its binding).
+        crate::federation::admission::r2_test_support::confer_from_owner(
+            d,
+            &format!("{alias}-owner"),
+            &alias,
+            &[crate::federation::types::delegation_scope::INFRA_ATTEST],
+        )
+        .await;
         let report = run_consent_expiry_sweep(d, chrono::Utc::now(), |input| {
             let node = node.clone();
             async move {

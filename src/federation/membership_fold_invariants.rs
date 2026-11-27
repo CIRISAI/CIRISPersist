@@ -63,7 +63,8 @@ async fn room_and_proposal(d: &dyn FederationDirectory, tag: &str) -> (String, A
         format!("{tag}-k-{s}"),
     );
     reg(d, &[&cid, &founder, &k]).await;
-    found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+    // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+    let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
         .await
         .expect("GC6: the founder founds the room");
     let p = proposal(
@@ -205,7 +206,8 @@ async fn public_room_joiner(
     reg(d, &[&cid, &founder]).await;
     let _ = e2::put_key(d, &owner, &[identity_type::USER]).await;
     let _ = e2::put_key(d, &joiner, &[identity_type::NODE]).await;
-    found_public_room(
+    // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+    let cid = found_public_room(
         d,
         &cid,
         super::types::consensus_protocol::OPEN_SELF_ADMIT,

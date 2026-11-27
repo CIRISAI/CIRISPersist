@@ -351,6 +351,151 @@ where
         .map(|_| ())
 }
 
+/// v62.0.0 (WD-fix4; CC 2.7.3, CC 6.1.5 N5) — **the JSON attestation door
+/// routed into the statement door.** A row that carries its edition-2
+/// statement (`ceg_statement`) is that statement's mapping, so it is
+/// admitted through [`put_statement_with_origin`](super::edition2::ingest::put_statement_with_origin)
+/// under the call's write origin, at the row's tier: the statement's own
+/// verdict, the fold (a held row is kept, not refused), and the descent step
+/// every admission runs. The JSON row's other fields are not read: the
+/// statement is the row. `None` (the plan runs, as before) for a row that
+/// carries no statement, and for the funnel's own tail for this same row
+/// (`fold::arriving_for`: the attestation gates the statement door runs).
+///
+/// The answer in this door's terms (WD-fix4 rev 2): a statement whose row
+/// landed (or a further voice, a key-plane statement) is `Inserted` when new
+/// here, `AlreadyHeld` when not; a row the door HOLDS answers the gate's own
+/// error, exactly as before the routing, while its statement is now kept and
+/// concludes when what it waits for arrives.
+///
+/// # Errors
+/// A `ceg_statement` member that is not hex; the statement door's refusals.
+/// v62.0.0 (VD-step1e) — **the JSON door's answer for a row its statement
+/// door KEPT but did not land**: an [`Error::InvalidArgument`] (kind
+/// `federation_invalid_argument`) whose message starts with this prefix.
+/// A HELD row (`Pending`) with no gate error of its own answers
+/// `"<prefix>: <reason>: <detail>"` (with one, that error); a statement kept
+/// as a VOICE awaiting others answers `"<prefix>: voice_kept_awaiting_others"`
+/// ([`VOICE_KEPT_AWAITING_OTHERS`]). The statement is kept: do not re-submit
+/// it; it concludes when what it waits for arrives.
+pub const ROW_HELD_NOT_LANDED: &str = "the row is held, not landed";
+
+/// v62.0.0 (VD-step1e) — the reason [`ROW_HELD_NOT_LANDED`] names for a
+/// statement kept as a voice of a row that has not concluded (a lone second
+/// signer's voice, a cosign voice).
+pub const VOICE_KEPT_AWAITING_OTHERS: &str = "voice_kept_awaiting_others";
+
+async fn route_into_statement_door<D>(
+    dir: &D,
+    row: &super::Attestation,
+    origin: WriteOrigin,
+) -> Result<Option<AttestationOutcome>, Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    use super::edition2::ingest::{put_statement_with_origin, StatementOutcome, INGEST_TIER};
+    let Some(row_id) = super::edition2::voices::carried_row_id(row) else {
+        return Ok(None);
+    };
+    if super::edition2::fold::arriving_for(&row_id) {
+        return Ok(None);
+    }
+    let bytes = super::edition2::emit::carried_statement(row).ok_or_else(|| {
+        Error::malformed_row(
+            super::edition2::door::PLANE,
+            super::malformed_row::ENVELOPE_MEMBER_INVALID,
+            format!(
+                "`{}` is not lowercase hex",
+                super::edition2::ingest::STATEMENT_MEMBER
+            ),
+        )
+    })?;
+    let tier = if row.tier.is_empty() {
+        INGEST_TIER
+    } else {
+        row.tier.as_str()
+    };
+    let (out, mut held_errors) = super::edition2::fold::capturing_holds(Box::pin(
+        put_statement_with_origin(dir, &bytes, Some(&row_id.0), tier, origin),
+    ))
+    .await;
+    let out = out?;
+    let new = match &out {
+        // v62.0.0 (WD-fix4 rev 2; the lead's ruling) — a row the door HOLDS
+        // answers what this door answered before the routing: the gate's own
+        // error. What changed is that the statement is kept and folded, so it
+        // concludes when what it waits for arrives.
+        StatementOutcome::Pending { row_id: held, .. } => {
+            if let Some(i) = held_errors.iter().position(|(r, _)| r == held) {
+                return Err(held_errors.swap_remove(i).1);
+            }
+            // A plane whose hold carries no gate error (a count short on a
+            // typed plane): its recorded reason, as a refusal.
+            let reason = dir
+                .fold_state(held)
+                .await?
+                .and_then(|s| s.held)
+                .map_or_else(
+                    || super::edition2::fold::reason::COUNT_SHORT.to_owned(),
+                    |h| format!("{}: {}", h.reason, h.detail),
+                );
+            return Err(Error::InvalidArgument(format!(
+                "{ROW_HELD_NOT_LANDED}: {reason}"
+            )));
+        }
+        // v62.0.0 (VD-step1b.rev2; FINDING on the 07019e47 base) — a `Voice`
+        // is a statement KEPT, not a row landed: it answers `Inserted` /
+        // `AlreadyHeld` only when the one verdict says the row CONCLUDED (a
+        // further voice of a landed row). A voice kept awaiting others (a
+        // lone second-signer voice, a cosign voice) is answered as a row
+        // that has not landed, as `Pending` is above.
+        StatementOutcome::Voice {
+            row_id: voiced,
+            new,
+        } => {
+            if !super::edition2::verdict::row_state(dir, voiced)
+                .await?
+                .is_concluded()
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "{ROW_HELD_NOT_LANDED}: {VOICE_KEPT_AWAITING_OTHERS}"
+                )));
+            }
+            *new
+        }
+        StatementOutcome::KeyPlane { new, .. } | StatementOutcome::Row { new, .. } => *new,
+    };
+    Ok(Some(if new {
+        AttestationOutcome::Inserted
+    } else {
+        AttestationOutcome::AlreadyHeld
+    }))
+}
+
+/// v62.0.0 (WD-fix6) — **is `row` KEPT and WAITING here?** The structural
+/// test that tells a HOLD (the statement kept, folded, concluding when what
+/// it waits for arrives) from a REFUSAL (nothing kept) after the JSON door
+/// answered an error: the row carries its statement, no attestation row is
+/// stored under its id, and the fold holds it (`fold::why_held`, the fold's
+/// own held state). Never the error's text.
+///
+/// # Errors
+/// Directory reads.
+pub(crate) async fn kept_waiting<D>(dir: &D, row: &super::Attestation) -> Result<bool, Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    let Some(row_id) = super::edition2::voices::carried_row_id(row) else {
+        return Ok(false);
+    };
+    if dir.get_attestation(&row.attestation_id).await?.is_some() {
+        return Ok(false);
+    }
+    Ok(super::edition2::fold::why_held(dir, &row_id)
+        .await?
+        .is_some())
+}
+
 /// The door: every backend's `put_attestation_with_origin` is this call.
 pub(crate) async fn put_attestation_planned<D>(
     dir: &D,
@@ -361,6 +506,20 @@ where
     D: AttestationStore,
 {
     super::edition2::door::refuse_earlier_form_row("attestation", &attestation.attestation)?;
+    // v62.0.0 (WD-fix4; the lead's ruling) — a row that carries its edition-2
+    // statement is admitted AS that statement, through the one statement
+    // funnel (`edition2::ingest::put_admitted_row`: the fold, the descent,
+    // every check made there), unless this call IS that funnel's own tail
+    // for the same row.
+    if let Some(outcome) = Box::pin(route_into_statement_door(
+        dir,
+        &attestation.attestation,
+        origin.clone(),
+    ))
+    .await?
+    {
+        return Ok(outcome);
+    }
     // v58.0.0 (CIRISPersist#991, CC 3.1.3) — a key-plane row goes to its
     // family's door: proof of possession, not resolve-the-attester; the
     // object's own signature, not one over the row's envelope.
@@ -428,13 +587,6 @@ where
     let carried_revocation =
         super::occurrence_revocation_carrier::carrier_of_row(&attestation.attestation)
             .and_then(|f| f.revocation().ok());
-    // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the row as offered, for the
-    // self-roster door: an eviction of a live roster key is a proposal. The
-    // genesis key's eviction (a `withdraws` of the self pair's occurrence row
-    // by another roster key) is one of these.
-    let offered_withdrawal = occurrence_withdrawal
-        .is_some()
-        .then(|| attestation.attestation.clone());
     // v59.0.0 (CIRISPersist#1099) — a proposal or an answer to one, executed
     // after it is stored.
     // v61 (CIRISPersist#991) — a `withdraws` that may retract a roster event,
@@ -464,30 +616,11 @@ where
                 }
                 AttestationOutcome::AlreadyHeld
             }
-            AttestationPlan::Insert(planned) => {
-                if let (Some(offered), Some(revocation)) =
-                    (&offered_withdrawal, &occurrence_withdrawal)
-                {
-                    // v62.0.0 (wave GC2; CC 2.7.3) — whether the eviction lands
-                    // reads the self's roster and its proposal's answers (OTHER
-                    // rows): one that has not landed is HELD (reason
-                    // `self_roster_not_landed`, a core token) and re-folds when the
-                    // self's roster or an answer changes (`key:<identity>`).
-                    super::edition2::fold::reads(super::edition2::fold::Dep::key(
-                        &revocation.identity_key_id,
-                    ));
-                    super::self_roster::gate_withdrawal(dir, offered, revocation)
-                        .await
-                        .map_err(|e| match e {
-                            e @ Error::SelfRosterNotLanded { .. } => super::edition2::fold::hold(
-                                super::edition2::fold::reason::SELF_ROSTER_NOT_LANDED,
-                                e,
-                            ),
-                            other => other,
-                        })?;
-                }
-                execute_planned(dir, *planned).await?
-            }
+            // v62.0.0 (WD-fix7; the lead's ruling) — the earlier-form
+            // self-roster gate on a `withdraws` of an `identity:occurrence:v1`
+            // row is retired: a roster eviction is an edition-2
+            // `identity:occurrence_revocation` (`self_roster::gate_edition2`).
+            AttestationPlan::Insert(planned) => execute_planned(dir, *planned).await?,
         };
         Ok(outcome)
     }
@@ -527,8 +660,11 @@ where
             .iter()
             .any(|r| r.occurrence_key_id == revocation.occurrence_key_id);
         if !held {
-            dir.put_identity_occurrence_revocation_local(revocation)
-                .await?;
+            dir.put_identity_occurrence_revocation_edition2(
+                revocation,
+                crate::federation::DoorToken::new(),
+            )
+            .await?;
         }
     }
     outcome
@@ -1474,14 +1610,9 @@ where
     // key's identity_type (a directory read), plus the #543 finding-2
     // dimension-keyed `capacity:*` self-emission arm. Backend-symmetric
     // with SQLite + Postgres.
+    // v62.0.0 (D1) — it asks the CC 3.4.3 substrate self-report attester
+    // first, at every door (v61.1 reported a peer's row instead).
     crate::federation::admission::check_reserved_prefix_admission(dir, &row).await?;
-    // v61.1.0 (CIRISPersist#1174 item 3, as ruled) — the CC 3.4.3 substrate
-    // self-report attester: enforced for this node's own authored put,
-    // reported (admitted, logged, counted) for a peer's row until v62.
-    crate::federation::admission::check_substrate_self_report_attester_at(
-        &row,
-        crate::federation::admission::SelfReportDoor::of(origin),
-    )?;
     // v22.0.0 (CIRISConstitution#46) — CONSENT BEFORE SCORING. A
     // federation-tier `capacity:*` claim about subject S from attester P is
     // refused unless a live `analyze` consent from S covering P exists in
@@ -2016,12 +2147,10 @@ where
         }
         None => input.into_local_row(attestation_id.clone(), now),
     };
-    // v61.1.0 (CIRISPersist#1174 item 3, as ruled) — the CC 3.4.3 substrate
-    // self-report attester, enforced for this node's own write.
-    crate::federation::admission::check_substrate_self_report_attester_at(
-        &row,
-        crate::federation::admission::SelfReportDoor::Local,
-    )?;
+    // v61.1.0 (CIRISPersist#1174 item 3) — the CC 3.4.3 substrate self-report
+    // attester, enforced for this node's own write (the local tier runs no
+    // reserved-prefix gate; v62.0.0 (D1): every door enforces it).
+    crate::federation::admission::check_substrate_self_report_attester(&row)?;
     // v31.0.0 (CIRISPersist#649) — STAMP THE MIRROR AT THE LOCAL DOOR.
     // See `crate::federation::envelope::RowMirror::stamp_local_row` for the
     // decision and the transit exclusion. One helper, all three backends.

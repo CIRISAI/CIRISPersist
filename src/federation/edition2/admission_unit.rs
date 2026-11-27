@@ -265,7 +265,7 @@ fn is_admission_unit_row_statement(statement: &[u8]) -> bool {
         p.get_int(-70002).and_then(Value::as_text) == Some(super::payloads::ADMISSION_UNIT_FAMILY)
             && p.get_int(-70001)
                 .and_then(Value::as_text)
-                .is_some_and(|t| !super::payloads::COMPOSER_ROW_TYPES.contains(&t))
+                .is_some_and(|t| !super::emit::names_a_target(t))
     })
 }
 

@@ -50,14 +50,11 @@ fn score_payload(author: &str, at: u64) -> Value {
         ("author", Value::Text(author.to_owned())),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
     ])
 }
 
-const EVIDENCE_ROWS: &str = "evidence:.suite:.kind:.cell:.prefix";
+const EVIDENCE_ROWS: &str = "coherence_standing:.cohort";
 
 #[tokio::test]
 async fn i2010_sign_row_is_verifys_minter_and_the_door_admits_it() {
@@ -202,7 +199,7 @@ fn i2011_the_codec_round_trips() {
             "attestation_type": "scores",
             "asserted_at": "2026-01-02T03:04:05.678Z",
             "attestation_envelope": {
-                "dimension": "evidence:safety_battery:capture:a:b:v1",
+                "dimension": "coherence_standing:cab:v1",
                 "score": 0.75,
                 "confidence": 0.9,
             },
@@ -299,10 +296,7 @@ fn i2013_the_kernel_reads_an_edition2_rows_own_id_and_refs() {
         ("author", Value::Text(me.clone())),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
         (
             "refs",
             map(vec![(

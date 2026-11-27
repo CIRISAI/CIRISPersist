@@ -161,31 +161,55 @@ pub fn delegates_to_envelope(
 
 /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2 single-owner) — the **owner-binding**
 /// `delegates_to(user → node)` envelope: "I (user) am the single responsible
-/// steward of `node`". The ownership specialization of
-/// [`delegates_to_envelope`]: it stamps the CC 1.13.3.3 / CC 3.2 ownership
-/// [`DIMENSION`](super::types::owner_binding::DIMENSION) (what the single-owner
-/// admission gate + [`owner_of`](super::admission::owner_of) key on) plus the
-/// producer-side [`PURPOSE`](super::types::owner_binding::PURPOSE) marker
-/// (`delegation_purpose`). This is the ONE `delegates_to` shape that is
-/// single-valued (a node has at most one owner) — distinct from the general
-/// (multi-parent) act-on-behalf / hierarchy grammar `delegates_to_envelope`
-/// builds. `scope` SHOULD be `infra:*`-only (the owner-binding carries only
-/// server-class authority); `sub_delegation` is `false` (a leaf ownership
-/// binding, not a deputization). The two constants stay byte-identical to
-/// CIRISServer's `auth::ownership` shape (the wire is the contract).
-pub fn owner_binding_delegates_to_envelope(
-    node_key_id: &str,
-    infra_scopes: &[String],
-) -> serde_json::Value {
+/// steward of `node`". This is the ONE `delegates_to` shape that is
+/// single-valued (a node has at most one owner), distinct from the general
+/// (multi-parent) grammar [`delegates_to_envelope`] builds.
+///
+/// v62.0.0 (BIND-1; CC rc22 462260c rule `owner-binding`) — the members it
+/// states, and no others: the ownership
+/// [`DIMENSION`](super::types::owner_binding::DIMENSION);
+/// `delegation_purpose` = [`PURPOSE`](super::types::owner_binding::PURPOSE)
+/// (`owner_binding`, the one spelling); `scope` = the caller's `infra:*`
+/// tokens as a SET (CC 2.6.1.2: sorted, no repeat). It no longer states
+/// `kind`, `delegate_key_id` or `sub_delegation` (not members of the rule;
+/// the bound key is the statement's `sub`). The emitter adds `cohort_scope`
+/// (always), `author`, `asserted_at`, and the term
+/// (`delegation_valid_from` / `delegation_valid_until`, ms-time) where one is
+/// stated; a caller adds the placement (`community_id` / `family_id`) or
+/// `on_behalf_of` where it means one.
+pub fn owner_binding_delegates_to_envelope(infra_scopes: &[String]) -> serde_json::Value {
     use super::types::owner_binding;
     serde_json::json!({
-        "kind": "delegates_to",
         "dimension": owner_binding::DIMENSION,
         "delegation_purpose": owner_binding::PURPOSE,
-        "delegate_key_id": node_key_id,
-        "scope": infra_scopes,
-        "sub_delegation": false,
+        "scope": scope_set(infra_scopes),
     })
+}
+
+/// v62.0.0 (BIND-1b; CC 3.2 "the first binding", CC 3.1.3.2; the lead's
+/// ruling 11-23, reading (b), pending Constitution) — **the ONE place a node
+/// owner binding's placement is chosen**: `federation`, the one row a serve
+/// seat reads (`admission::serve_seat_owner_announced`). Every producer of a
+/// node's owner binding (`Engine::grant_delegation_in` / `steward_bind`,
+/// [`owner_binding_draft_envelope`]) asks this. Should CC 3.2 read "`self`
+/// on the first row", this answers `self` and the producer adds the
+/// federation re-signing as a second row.
+#[must_use]
+pub fn node_owner_binding_placement() -> &'static str {
+    super::types::cohort_scope::FEDERATION
+}
+
+/// v62.0.0 (BIND-1; CC 2.6.1.2) — `scopes` as a set: sorted by the bytewise
+/// order of their deterministic encodings (so a shorter text first), without
+/// repeats.
+#[must_use]
+pub fn scope_set(scopes: &[String]) -> Vec<String> {
+    let set: std::collections::BTreeSet<&str> = scopes.iter().map(String::as_str).collect();
+    let mut v: Vec<String> = set.into_iter().map(str::to_owned).collect();
+    v.sort_by_cached_key(|s| {
+        ciris_verify_core::cde::encode(&ciris_verify_core::cde::Value::Text(s.clone()))
+    });
+    v
 }
 
 /// v62.0.0 (KR-fix11; CC 3.2 "the first binding", CC 3.1.3.2: a serve seat's
@@ -217,13 +241,13 @@ pub fn owner_binding_draft_envelope(
         )));
     }
     let mut envelope = super::envelope::EnvelopeCore::from_value(
-        owner_binding_delegates_to_envelope(node_key_id, infra_scopes),
+        owner_binding_delegates_to_envelope(infra_scopes),
     )?
     .to_value();
     if let Some(o) = envelope.as_object_mut() {
         o.insert(
             "cohort_scope".into(),
-            serde_json::Value::String(super::types::cohort_scope::FEDERATION.to_owned()),
+            serde_json::Value::String(node_owner_binding_placement().to_owned()),
         );
         o.retain(|_, v| !v.is_null());
     }
@@ -1744,22 +1768,24 @@ mod tests {
         // ownership dimension + producer-side purpose marker (what owner_of
         // keys on), sub_delegation always false.
         use super::super::types::owner_binding;
-        let env = owner_binding_delegates_to_envelope(
-            "node-key",
-            &[
-                "infra:serve".to_string(),
-                "infra:network_presence".to_string(),
-            ],
-        );
-        assert_eq!(env["kind"], "delegates_to");
+        // v62.0.0 (BIND-1) — the rule's members only, the scope a sorted set.
+        let env = owner_binding_delegates_to_envelope(&[
+            "infra:serve".to_string(),
+            "infra:network_presence".to_string(),
+            "infra:serve".to_string(),
+        ]);
         assert_eq!(env["dimension"], owner_binding::DIMENSION);
-        assert_eq!(env["delegation_purpose"], owner_binding::PURPOSE);
-        assert_eq!(env["delegate_key_id"], "node-key");
-        assert_eq!(env["sub_delegation"], false);
-        let scope = env["scope"].as_array().unwrap();
-        assert!(scope
-            .iter()
-            .all(|v| v.as_str().unwrap().starts_with("infra:")));
+        assert_eq!(env["delegation_purpose"], "owner_binding");
+        for gone in ["kind", "delegate_key_id", "sub_delegation"] {
+            assert!(env.get(gone).is_none(), "BIND-1: {gone} is not a member");
+        }
+        // CDE order is by the ENCODED bytes, so the shorter text sorts
+        // first (its length is in the head byte).
+        assert_eq!(
+            env["scope"],
+            serde_json::json!(["infra:serve", "infra:network_presence"]),
+            "BIND-1: a set in CDE order, no repeat"
+        );
     }
 
     #[test]
@@ -2828,7 +2854,7 @@ pub(crate) mod test_support {
 
         // THE ATTACK — the trusted-local self-write on the same pair, later,
         // content-only.
-        dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
+        dir.test_seam_put_identity_occurrence(crate::federation::IdentityOccurrence {
             identity_key_id: a.clone(),
             occurrence_key_id: ph.clone(),
             device_class: PHONE.into(),
@@ -2885,7 +2911,7 @@ pub(crate) mod test_support {
             at(t(40)),
             "({suffix}) I3324: the first revocation's instant stands"
         );
-        dir.put_identity_occurrence_revocation_local(
+        dir.put_identity_occurrence_revocation_edition2(
             crate::federation::types::IdentityOccurrenceRevocation {
                 identity_key_id: a.clone(),
                 occurrence_key_id: ph.clone(),
@@ -2895,6 +2921,7 @@ pub(crate) mod test_support {
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
             },
+            crate::federation::DoorToken::new(),
         )
         .await
         .expect_err("I3324: a second local revocation of the pair is refused (#541)");

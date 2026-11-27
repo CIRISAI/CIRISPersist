@@ -645,17 +645,26 @@ pub(crate) mod engine_bodies {
     pub(crate) async fn i1180_the_engine_doors_sign_the_four_verbs(e: &Engine) {
         let dir = e.federation_directory();
         let me = e.local_derived_key_id().await.unwrap();
-        let id = e.put_goal(&input("v0")).await.expect("I1180: declare");
+        let id = e
+            .put_goal(&input("v0"))
+            .await
+            .expect("I1180: declare")
+            .into_row_id();
         let g = dir.get_goal(&id).await.unwrap().expect("projected");
         assert_eq!(
             (g.goal_id.as_str(), g.declared_by_key_id.as_str()),
             (id.as_str(), me.as_str())
         );
-        let a1 = e.amend_goal(&id, &input("v1")).await.expect("I1180: amend");
+        let a1 = e
+            .amend_goal(&id, &input("v1"))
+            .await
+            .expect("I1180: amend")
+            .into_row_id();
         let a2 = e
             .amend_goal(&id, &input("v2"))
             .await
-            .expect("I1180: amend again");
+            .expect("I1180: amend again")
+            .into_row_id();
         let g = dir.get_goal(&id).await.unwrap().unwrap();
         assert_eq!(
             (g.goal_text.as_str(), g.attestation_id.as_str()),
@@ -680,7 +689,11 @@ pub(crate) mod engine_bodies {
             Some(a1.as_str()),
             "I1180: an amendment names the current head"
         );
-        let w = e.retire_goal(&id).await.expect("I1180: retire");
+        let w = e
+            .retire_goal(&id)
+            .await
+            .expect("I1180: retire")
+            .into_row_id();
         let w_row = dir.get_attestation(&w).await.unwrap().unwrap();
         assert_eq!(w_row.attestation_type, "withdraws");
         assert_eq!(
