@@ -160,7 +160,11 @@ where
     .await;
 }
 
-/// The minter node of a seat witness: `{tag}-minter`, a NODE key.
+/// The minter node of a seat witness: `{tag}-minter`, a NODE key. Brought
+/// up UNOWNED ([`node_as`]): the room's [`seed`] owns it by alice
+/// (`own_node`). KR-fix31 (CC 3.2 single owner) — a node a runner owner had
+/// bound first would hold two owners, so alice would own nothing and the
+/// minter's seal would be refused `write_author_has_no_wrap_target`.
 async fn minter<'a, B>(backend: &'a B, tag: &str) -> (Node<'a, B>, String)
 where
     B: BlobStorage + FederationDirectory + Sync,
@@ -613,7 +617,8 @@ async fn i1807_engine_door(engine: crate::Engine, alias: &str) {
         ($b:expr) => {{
             let b = $b;
             // The minter node: `kid(alias)` as a `node` key record, signing
-            // with the engine's own LocalSigner.
+            // with the engine's own LocalSigner; unowned until the room's
+            // `seed` owns it by alice (`minter`'s note).
             let n = node_as(b, alias, NODE).await;
             assert_eq!(n.key, key, "I1807: the engine's key is the minter node");
             let room = seed(&n, alias, alias).await;

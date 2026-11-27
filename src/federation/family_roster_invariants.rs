@@ -48,6 +48,7 @@ pub mod bodies {
             effective_at,
             role: role.map(str::to_owned),
             persist_row_hash: String::new(),
+            record_row_id: None,
         }
     }
 
@@ -64,6 +65,7 @@ pub mod bodies {
             reason: None,
             witness_set: vec![],
             persist_row_hash: String::new(),
+            record_row_id: None,
         }
     }
 
@@ -287,6 +289,9 @@ pub mod bodies {
             None,
             ms_ago(30),
         );
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let fam = crate::federation::edition2::fixture_switch::room_id(&fam);
         let r = put_all(a, &founding).await;
         assert!(landed(&r), "{tag}: family {fam}: {r:?}");
         rows.push(e2::row_id_of(&founding[0]));

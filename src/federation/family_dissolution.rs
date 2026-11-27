@@ -119,7 +119,12 @@ pub fn check_dissolve_is_terminal_only(stored: &Family, offered: &Family) -> Res
     fold::reads(Dep::key(&stored.family_key_id));
     let same = stored.family_name == offered.family_name
         && stored.founded_at == offered.founded_at
-        && stored.consensus_protocol == offered.consensus_protocol
+        // v62.0.0 (KR-fix35c) — compared on base forms: a successor persist
+        // writes from a held `+escalate:` record states the base form.
+        && crate::federation::reverse_quorum::same_protocol(
+            &stored.consensus_protocol,
+            &offered.consensus_protocol,
+        )
         && stored.consensus_protocol_entrenched == offered.consensus_protocol_entrenched
         && stored.members == offered.members;
     if !same {
@@ -144,7 +149,10 @@ pub fn self_leave_member<'a>(stored: &'a Family, offered: &Family) -> Option<&'a
         || offered.dissolved_at.is_some()
         || stored.family_name != offered.family_name
         || stored.founded_at != offered.founded_at
-        || stored.consensus_protocol != offered.consensus_protocol
+        || !crate::federation::reverse_quorum::same_protocol(
+            &stored.consensus_protocol,
+            &offered.consensus_protocol,
+        )
         || stored.consensus_protocol_entrenched != offered.consensus_protocol_entrenched
         || stored.members.len() != offered.members.len() + 1
     {

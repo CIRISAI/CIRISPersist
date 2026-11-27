@@ -35,12 +35,12 @@
 //!
 //! Every signal carries its band AND the underlying typed token — never the
 //! band alone. That is the whole of what #356 asks for when it says *distinguish
-//! the zeroes*. v26.0.0 shipped
-//! [`StewardTierStanding`](super::reverse_quorum::StewardTierStanding) with
-//! three separate zeroes (`silent` / `overruled` / `no_duty_holders`) precisely
-//! because "nobody answered" and "answered no" are different facts, and a fold
-//! that mapped both to one red would have re-introduced the defect that type
-//! exists to prevent. So the rule this module follows is: **a band never
+//! the zeroes*. v26.0.0 shipped the reverse quorum's steward tier with three
+//! separate zeroes (`silent` / `overruled` / `no_duty_holders`; deleted in
+//! v62.0.0, KR-fix35) precisely because "nobody answered" and "answered no"
+//! are different facts, and a fold that mapped both to one red would have
+//! re-introduced the defect that type existed to prevent. So the rule this
+//! module follows is: **a band never
 //! replaces a token, it only accompanies one.** When two states share a band,
 //! their tokens still differ, and a consumer that needs the difference has it
 //! without a second call.
@@ -453,11 +453,8 @@ pub const TARGETED_SIGNALS: &[(&str, &str, &str)] = &[
         "a cohort and an action attestation id",
         "resolve_reverse_quorum_json",
     ),
-    (
-        "steward_tier_standing",
-        "a cohort and an action attestation id (per-objection)",
-        "resolve_reverse_quorum_json",
-    ),
+    // v62.0.0 (KR-fix35) — `steward_tier_standing` is deleted with the
+    // steward tier (a clean break, no alias).
 ];
 
 /// [`TARGETED_SIGNALS`] as the owned rows [`NodeState::targeted`] carries.
@@ -1278,12 +1275,19 @@ pub mod parity_test_support {
             "({tag}) a cohort declaring no reverse-quorum protocol is NOT_GOVERNED \
              — a distinct token from 'stood', not a silent empty answer"
         );
-        // The steward tier's three zeroes ride on `escalation[]`, and an
-        // ungoverned action has none — the arm that must not be confused with
-        // `silent`.
-        assert!(fold.escalation.is_empty(), "({tag})");
         let json = serde_json::to_string(&fold).unwrap();
         assert!(json.contains("\"not_governed\""), "({tag}) {json}");
+        // v62.0.0 (KR-fix35) — the clean break of the binding's payload: the
+        // dismissal and steward-tier members are gone.
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for gone in [
+            "dismissed_objection_ids",
+            "steward_deadline",
+            "escalation",
+            "escalated_dismissed_objection_ids",
+        ] {
+            assert!(value.get(gone).is_none(), "({tag}) {gone} is gone: {json}");
+        }
     }
 
     /// Run every #356 body against one backend, in order.

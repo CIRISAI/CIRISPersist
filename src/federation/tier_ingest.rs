@@ -173,11 +173,8 @@ where
     if super::group_plane::verify_plane_row(directory, row).await? {
         return Ok(());
     }
-    // v59.0.0 (CIRISPersist#1099) — a self-roster proposal row is minted from
-    // the signed object it carries, under the same rule.
-    if super::self_roster::verify_proposal_row(directory, row).await? {
-        return Ok(());
-    }
+    // v62.0.0 (WD-fix7) — the self-roster proposal row (minted, earlier form)
+    // is retired: no door stores one, so its signature rule went with it.
     // v61.3.0 (CIRISPersist#1252) — a cosign row is minted from the event it
     // carries; its one statement is over the event's own signing bytes.
     if super::cosign::verify_row(directory, row).await? {
@@ -2043,6 +2040,7 @@ pub mod test_support {
                     reason: None,
                     witness_set: vec![],
                     persist_row_hash: String::new(),
+                    record_row_id: None,
                 },
             )
             .await,
@@ -2154,7 +2152,7 @@ pub mod test_support {
             );
         } else {
             register_user_role_key(dir, &device).await;
-            dir.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            dir.test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: bob_observer.clone(),
                 occurrence_key_id: device.clone(),
                 device_class: crate::federation::types::device_class::SERVER.into(),
@@ -2274,7 +2272,7 @@ pub mod test_support {
                 .await
                 .unwrap_or_else(|e| panic!("({suffix}) revoke device binding: {e}"));
         } else {
-            dir.put_identity_occurrence_revocation_local(
+            dir.put_identity_occurrence_revocation_edition2(
                 crate::federation::types::IdentityOccurrenceRevocation {
                     identity_key_id: bob_observer.clone(),
                     occurrence_key_id: device.clone(),
@@ -2284,6 +2282,7 @@ pub mod test_support {
                     witness_set: vec![],
                     persist_row_hash: String::new(),
                 },
+                crate::federation::DoorToken::new(),
             )
             .await
             .unwrap_or_else(|e| panic!("({suffix}) revoke device binding: {e}"));
@@ -2452,7 +2451,7 @@ pub mod test_support {
         // owner seat reads two counted owners as unowned (v62.0.0; until then
         // the single-owner gate refused the second). Hence occurrence + one
         // custody claim.
-        dir.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+        dir.test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
             identity_key_id: other.clone(),
             occurrence_key_id: agent_ok.clone(),
             device_class: crate::federation::types::device_class::SERVER.into(),
@@ -3647,13 +3646,16 @@ pub mod test_support {
     }
 
     /// v38.2.0 — seed a community authored by its first member.
+    /// v62.0.0 (GID-fixtures-mech) — returns the room's DERIVED id (the
+    /// codec founds it under that id and records the name
+    /// `community_key_id` for it, `fixture_switch::kid`).
     pub(crate) async fn seed_two_member_community(
         dir: &dyn crate::federation::FederationDirectory,
         community_key_id: &str,
         member_a: &str,
         member_b: &str,
-    ) {
-        seed_two_member_group(dir, community_key_id, member_a, member_b, None).await;
+    ) -> String {
+        seed_two_member_group(dir, community_key_id, member_a, member_b, None).await
     }
 
     /// v54.0.0 (CIRISPersist#1034) — [`seed_two_member_community`] declaring
@@ -3664,7 +3666,7 @@ pub mod test_support {
         community_key_id: &str,
         member_a: &str,
         member_b: &str,
-    ) {
+    ) -> String {
         seed_two_member_group(
             dir,
             community_key_id,
@@ -3674,7 +3676,7 @@ pub mod test_support {
                 crate::federation::affiliation_config::POLICY_COHORT_FIELD: "affiliations"
             })),
         )
-        .await;
+        .await
     }
 
     async fn seed_two_member_group(
@@ -3683,7 +3685,7 @@ pub mod test_support {
         member_a: &str,
         member_b: &str,
         policy_blob: Option<serde_json::Value>,
-    ) {
+    ) -> String {
         let member = |k: &str| crate::federation::types::CommunityMember {
             key_id: k.to_owned(),
             joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
@@ -3715,6 +3717,7 @@ pub mod test_support {
         )
         .await
         .expect("seed community");
+        crate::federation::edition2::fixture_switch::room_id(community_key_id)
     }
 
     /// v38.2.0 (CIRISPersist#758) — **the convergent-community re-put,
@@ -3951,6 +3954,7 @@ pub mod test_support {
             effective_at: member.joined_at,
             role: member.role.clone(),
             persist_row_hash: String::new(),
+            record_row_id: None,
         };
         let (_hash, classical, pqc) = sign_envelope(authority_key_id, &widening.signing_envelope());
         crate::federation::cohort::AdmitSpec {
@@ -4011,6 +4015,7 @@ pub mod test_support {
             effective_at: member.joined_at,
             role: member.role.clone(),
             persist_row_hash: String::new(),
+            record_row_id: None,
         }
     }
 
@@ -4892,6 +4897,7 @@ pub mod test_support {
             effective_at: member.joined_at,
             role: member.role.clone(),
             persist_row_hash: String::new(),
+            record_row_id: None,
         };
         let s = sign_widening_by_consensus(directory, w).await;
         crate::federation::cohort::AdmitSpec {
@@ -5205,7 +5211,7 @@ mod tests {
                 attester,
                 attester,
                 &serde_json::json!({
-                    "dimension": "evidence:safety_battery:capture:a:b:v1",
+                    "dimension": "coherence_standing:cab:v1",
                     "score": 1.0,
                     "confidence": 0.9,
                 }),

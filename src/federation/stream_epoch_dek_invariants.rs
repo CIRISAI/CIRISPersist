@@ -338,6 +338,7 @@ pub(crate) mod bodies {
                 reason: None,
                 witness_set: vec![],
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         );
         let key = e2::signing_key(bob_seed);

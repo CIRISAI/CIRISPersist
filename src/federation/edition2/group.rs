@@ -138,9 +138,18 @@ pub enum GroupPlane {
 /// `group` is the accord's `family_key_id`). The accord's roster, seats and
 /// recovery are the genesis bundle in force and no row; a change is a later
 /// bundle at the import door. Pure (the statement's own bytes), so the
-/// statement door runs it among its pure gates BEFORE the payload's shape:
-/// the accord's id is no identity-ref, so the shape check alone would answer
-/// `edition2_payload_invalid` and this name could never be reached.
+/// statement door runs it among its pure gates BEFORE the payload's shape
+/// and the founding check: `humanity-accord` is no group-ref, so either
+/// alone would answer a generic refusal and this name could never be
+/// reached.
+///
+/// v62.0.0 (GID-prod; CIRISConstitution's answer of 2026-11-22) —
+/// `humanity-accord` is a ROOT LINEAGE NAME, not a group: the genesis
+/// bundle's `family_key_id` and `sub`, never founded by a `group:roster`
+/// first version, outside the derived-id rule (which runs on `group:roster`
+/// rows only). This refusal says so: a lineage, not a group. The baked
+/// bundle and its import proof never pass this door (they enter at the
+/// genesis import door), so neither moves.
 ///
 /// # Errors
 /// `accord_version_is_a_bundle`.
@@ -169,7 +178,7 @@ pub fn refuse_accord_group_statement(sub: &str, payload: &Value) -> Result<(), E
 /// an authored row of the attestation plane: `None`.
 #[must_use]
 pub fn group_plane_of(row_type: &str, family: &str, payload: &Value) -> Option<GroupPlane> {
-    if super::ingest::COMPOSER_ROW_TYPES.contains(&row_type) {
+    if super::emit::names_a_target(row_type) {
         return None;
     }
     if family == namespace_match::family_id(GROUP_ROSTER_PREFIX) {
@@ -1153,6 +1162,7 @@ pub fn membership_of(
                 reason: reason_of(p),
                 witness_set: identity_refs_of(p, "witness_set"),
                 persist_row_hash: String::new(),
+                record_row_id: None,
             })
         }
         (GroupPlane::Removal, GroupKind::Community) => {
@@ -1164,6 +1174,7 @@ pub fn membership_of(
                 reason: reason_of(p),
                 witness_set: identity_refs_of(p, "witness_set"),
                 persist_row_hash: String::new(),
+                record_row_id: None,
             })
         }
         (GroupPlane::Widening, GroupKind::Family) => {
@@ -1174,6 +1185,7 @@ pub fn membership_of(
                 effective_at,
                 role: text_of(p, "role").map(str::to_owned),
                 persist_row_hash: String::new(),
+                record_row_id: None,
             })
         }
         (GroupPlane::Widening, GroupKind::Community) => {
@@ -1184,6 +1196,7 @@ pub fn membership_of(
                 effective_at,
                 role: text_of(p, "role").map(str::to_owned),
                 persist_row_hash: String::new(),
+                record_row_id: None,
             })
         }
         (GroupPlane::Roster, _) => {
@@ -1305,6 +1318,16 @@ where
     // inputs of this row: a version of the group (its `sub`) re-folds it;
     // so does a membership change of any member it lists (its `sub`).
     fold::reads(Dep::key(&view.group));
+    // v62.0.0 (GID-tips) — a CONTESTED founding concludes nothing: another
+    // first version (no `refs.head`) of this group held here, held or
+    // concluded, makes every first version of it held. The read above
+    // (`Dep::key(group)`) is the dependency: a rival first version's arrival
+    // touches `key:<group>` (its `sub`), so a founding concluded before it
+    // re-folds here and un-concludes; re-delivery of the SAME first version
+    // is the same row id and no rival.
+    if view.head.is_none() {
+        check_founding_uncontested(dir, row, &view).await?;
+    }
     let MergeReading { prev, merged } = merge_reading(dir, &view, &row.row_id).await?;
     let record = record_of_roster(&view, prev.clone())?;
     if let GroupRecord::Community(c) = &record {
@@ -1318,6 +1341,54 @@ where
         drop_merged_tips(dir, &view, &offered_hash, &merged).await?;
     }
     Ok(landing)
+}
+
+/// v62.0.0 (GID-tips) — refuse-as-HELD a first version of `view.group` when
+/// another first version of it is held in the group's projection slot
+/// (`ingest::fold_plane_of`: `group:<sub>`), `group_founding_contested`.
+///
+/// # Errors
+/// The hold; directory reads.
+async fn check_founding_uncontested<F>(
+    dir: &F,
+    row: &AdmittedRow,
+    view: &RosterView,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let slot = format!("group:{}", row.sub);
+    for other in dir.fold_slot_all_rows(&slot).await? {
+        if other == row.row_id {
+            continue;
+        }
+        let Some(statement) = dir.edition2_voices(&other).await?.into_iter().next() else {
+            continue;
+        };
+        let Some((_, payload)) = statement_parts(&statement) else {
+            continue;
+        };
+        let first = payload
+            .get_text("refs")
+            .and_then(|r| r.get_text("head"))
+            .is_none();
+        if first && payload.get_text("group").and_then(Value::as_text) == Some(view.group.as_str())
+        {
+            return Err(fold::hold(
+                reason::GROUP_FOUNDING_CONTESTED,
+                Error::InvalidArgument(format!(
+                    "{}: {:?} has two first versions ({} and {}): its founders signed two \
+                     foundings, so the group concludes nothing here (CC 2.7.8); found it anew \
+                     under a new nonce",
+                    reason::GROUP_FOUNDING_CONTESTED,
+                    view.group,
+                    row.row_id.hex(),
+                    other.hex()
+                )),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The family id of a `location_proof:{version}` row (header -70002).
@@ -1701,7 +1772,17 @@ async fn put_membership<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let (view, record) = membership_of(plane, &row.sub, &row.payload)?;
+    let (view, mut record) = membership_of(plane, &row.sub, &row.payload)?;
+    // v62.0.0 (KR-fix34b; PRE4-V300-a) — the typed record carries the row id
+    // of the counted change it projects (the V300 `record_row_id` column):
+    // the id a reverse-quorum objection names in `refs.answers`.
+    let record_row_id = Some(row.row_id.0);
+    match &mut record {
+        MembershipRecord::FamilyRemoval(r) => r.record_row_id = record_row_id,
+        MembershipRecord::CommunityRemoval(r) => r.record_row_id = record_row_id,
+        MembershipRecord::FamilyWidening(w) => w.record_row_id = record_row_id,
+        MembershipRecord::CommunityWidening(w) => w.record_row_id = record_row_id,
+    }
     // v62.0.0 (wave GC5) — the group's roster planes and head, and the
     // member's own rows (its acceptance, its steward binding), are inputs.
     fold::reads(Dep::key(&view.group));
@@ -1954,6 +2035,162 @@ pub fn roster_payload(
     roster_payload_merging(record, version, head, &[], asserted_at_ms)
 }
 
+/// v62.0.0 (GID-prod.fix1) — **what a host states to found a community**:
+/// everything of its first version EXCEPT the id (derived, never passed in:
+/// a clean break, no ignored argument) and the server-computed fields.
+#[derive(Debug, Clone)]
+pub struct CommunityFounding {
+    /// The community's name (human-readable, not unique, never an id).
+    pub name: String,
+    /// The founding members (their keys derive the id).
+    pub members: Vec<crate::federation::types::CommunityMember>,
+    /// The founding instant (derives the id).
+    pub founded_at: chrono::DateTime<chrono::Utc>,
+    /// The `consensus_protocol`.
+    pub consensus_protocol: String,
+    /// The `policy_blob` (an open map).
+    pub policy_blob: Option<serde_json::Value>,
+    /// The charter in force (`trust:charter:v1` row hash), empty for none.
+    pub charter_digest: String,
+}
+
+/// v62.0.0 (GID-prod.fix1) — the family twin of [`CommunityFounding`].
+#[derive(Debug, Clone)]
+pub struct FamilyFounding {
+    /// The family's name.
+    pub name: String,
+    /// The founding members (their keys derive the id).
+    pub members: Vec<crate::federation::types::FamilyMember>,
+    /// The founding instant (derives the id).
+    pub founded_at: chrono::DateTime<chrono::Utc>,
+    /// The `consensus_protocol`.
+    pub consensus_protocol: String,
+    /// `consensus_protocol_entrenched`.
+    pub consensus_protocol_entrenched: bool,
+    /// The charter in force, empty for none.
+    pub charter_digest: String,
+}
+
+impl CommunityFounding {
+    /// The first version's record, its id still empty (set by
+    /// [`founding_payload`]).
+    #[must_use]
+    pub fn into_record(self) -> GroupRecord {
+        GroupRecord::Community(crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: self.charter_digest,
+            community_key_id: String::new(),
+            community_name: self.name,
+            members: self.members,
+            founded_at: self.founded_at,
+            consensus_protocol: self.consensus_protocol,
+            policy_blob: self.policy_blob,
+            persist_row_hash: String::new(),
+        })
+    }
+}
+
+impl FamilyFounding {
+    /// The first version's record, its id still empty (set by
+    /// [`founding_payload`]).
+    #[must_use]
+    pub fn into_record(self) -> GroupRecord {
+        GroupRecord::Family(crate::federation::types::Family {
+            family_key_id: String::new(),
+            family_name: self.name,
+            members: self.members,
+            founded_at: self.founded_at,
+            consensus_protocol: self.consensus_protocol,
+            consensus_protocol_entrenched: self.consensus_protocol_entrenched,
+            dissolved_at: None,
+            prev_head_digest: String::new(),
+            charter_digest: self.charter_digest,
+            persist_row_hash: String::new(),
+        })
+    }
+}
+
+/// v62.0.0 (KR-fix35c; Constitution's request: the protocol vocabulary has no
+/// `+escalate:` suffix) — **a persist producer never writes the suffix**: a
+/// founding persist drafts for a host whose `consensus_protocol` carries
+/// `+escalate:` is REFUSED here, never silently stripped (the host believes
+/// it asked for a steward tier, which does not exist). No wire token: a
+/// local producer error.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] naming the suffix.
+pub fn check_producer_protocol(record: &GroupRecord) -> Result<(), Error> {
+    let protocol = match record {
+        GroupRecord::Family(f) => &f.consensus_protocol,
+        GroupRecord::Community(c) => &c.consensus_protocol,
+    };
+    if crate::federation::reverse_quorum::carries_escalate_suffix(protocol) {
+        return Err(Error::InvalidArgument(format!(
+            "consensus_protocol {protocol:?} carries the `{}` steward-tier suffix, which is no \
+             part of the protocol vocabulary (v62.0.0): state its base form ({:?}); persist \
+             never writes the suffix",
+            crate::federation::reverse_quorum::ESCALATE_INFIX,
+            crate::federation::reverse_quorum::base_protocol(protocol)
+        )));
+    }
+    Ok(())
+}
+
+/// v62.0.0 (GID-prod) — what a founding verb answers: the group's DERIVED id
+/// (no caller passes one in) and the statement door's outcome.
+#[derive(Debug)]
+pub struct GroupFounding {
+    /// The id the founding derives ([`super::group_id::derive_group_id`]).
+    pub group_id: String,
+    /// The door's outcome for the first version.
+    pub outcome: super::ingest::StatementOutcome,
+}
+
+/// v62.0.0 (GID-prod; CIRISConstitution "THE DERIVED GROUP ID") — **the
+/// FIRST version's payload, under its derived id.** The id is derived from
+/// `record`'s kind, the key of EVERY member it lists, its `founded_at` and
+/// `nonce` ([`super::group_id::derive_group_id`]); `record`'s id is set to
+/// it (whatever it held), the payload is [`roster_payload`] at version 1
+/// with no head, and it carries `nonce`. The founding verbs mint the nonce
+/// ([`super::group_id::fresh_nonce`]); a fixture passes a fixed one.
+///
+/// # Errors
+/// As [`roster_payload`]; a `founded_at` before the epoch.
+pub fn founding_payload(
+    record: &mut GroupRecord,
+    nonce: &[u8; 32],
+    asserted_at_ms: u64,
+) -> Result<(String, Value), Error> {
+    let (kind, founded_at, founders): (&str, _, Vec<String>) = match &*record {
+        GroupRecord::Family(f) => (
+            "family",
+            f.founded_at,
+            f.members.iter().map(|m| m.key_id.clone()).collect(),
+        ),
+        GroupRecord::Community(c) => (
+            "community",
+            c.founded_at,
+            c.members.iter().map(|m| m.key_id.clone()).collect(),
+        ),
+    };
+    let founded_ms = ms_of("founded_at", founded_at)?
+        .as_u64()
+        .ok_or_else(|| invalid("group:roster: `founded_at` is not a uint"))?;
+    let refs: Vec<&str> = founders.iter().map(String::as_str).collect();
+    let id = super::group_id::derive_group_id(kind, &refs, founded_ms, nonce);
+    match record {
+        GroupRecord::Family(f) => f.family_key_id.clone_from(&id),
+        GroupRecord::Community(c) => c.community_key_id.clone_from(&id),
+    }
+    let mut payload = roster_payload(record, 1, None, asserted_at_ms)?;
+    let Value::Map(m) = &mut payload else {
+        return Err(invalid("group:roster: the payload is not a map"));
+    };
+    m.push((text("nonce"), Value::Bytes(nonce.to_vec())));
+    m.sort_by_key(|(k, _)| cde::encode(k));
+    Ok((id, payload))
+}
+
 /// [`roster_payload`] of a MERGE (CC 2.7.8): beside `refs.head` it names
 /// the further tips it makes one head with, `refs.further_heads` (a set,
 /// sorted by encoding, unique; CC 2.6.1.9). Empty `further` is
@@ -2047,7 +2284,20 @@ fn roster_payload_full(
         ("version", Value::Uint(version)),
         ("members", Value::Array(members)),
         ("founded_at", ms_of("founded_at", founded_at)?),
-        ("consensus_protocol", text(protocol)),
+        // v62.0.0 (KR-fix35c) — a SUCCESSOR version persist writes states the
+        // protocol's base form (a held record carrying the earlier
+        // `+escalate:` suffix is read as its base form; persist never writes
+        // the suffix). A founding (version 1) is encoded as given: persist's
+        // own founding verb refuses the suffix first
+        // ([`check_producer_protocol`]); a peer's founding is its own bytes.
+        (
+            "consensus_protocol",
+            if version > 1 {
+                text(&crate::federation::reverse_quorum::base_protocol(protocol))
+            } else {
+                text(protocol)
+            },
+        ),
     ];
     match record {
         GroupRecord::Family(f) => {
@@ -2245,4 +2495,155 @@ pub fn removal_draft(
         &payload,
     )
     .map_err(|e| super::emit::produce_error("membership", e))
+}
+
+/// v62.0.0 (HEAD-3; CC 2.4.1.1, "A count that ends a standing MAY state
+/// `lifts`, and then only the count's own receipts keep an act in force") —
+/// **[`removal_draft`] stating `lifts: true`**: the unseating is the
+/// roster's COUNT (no `author`, counted over `head`), so it may lift single
+/// receipts. `lifts` is a top-level payload member, present only as `true`
+/// (`payloads::check_lifts`); a widening is no end and is refused it.
+///
+/// # Errors
+/// As [`removal_draft`]; `edition2_payload_invalid` for a widening.
+pub fn removal_draft_lifting(
+    record: &MembershipRecord,
+    head: &RowId,
+    signer_iss: &str,
+) -> Result<super::emit::Draft, Error> {
+    let member = match record {
+        MembershipRecord::FamilyRemoval(r) => r.removed_identity_key_id.clone(),
+        MembershipRecord::CommunityRemoval(r) => r.removed_identity_key_id.clone(),
+        MembershipRecord::FamilyWidening(_) | MembershipRecord::CommunityWidening(_) => {
+            return Err(Error::InvalidArgument(
+                "edition2_payload_invalid: a widening ends no standing: it states no `lifts`"
+                    .into(),
+            ));
+        }
+    };
+    let kid = super::ingest::kid_of_identity_ref(signer_iss).ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "removal_draft_lifting: {signer_iss} is not an identity-ref"
+        ))
+    })?;
+    let payload = super::emit::with_member(
+        membership_payload(record, Some(head))?,
+        "lifts",
+        Value::Bool(true),
+    )
+    .map_err(|e| super::emit::produce_error("membership", e))?;
+    super::emit::draft_row(
+        &kid,
+        signer_iss,
+        &member,
+        "scores",
+        &ciris_verify_core::namespace_match::family_id(MEMBERSHIP_PREFIX),
+        &payload,
+    )
+    .map_err(|e| super::emit::produce_error("membership", e))
+}
+
+/// v62.0.0 (KR-fix35c) — persist never WRITES the `+escalate:` suffix.
+#[cfg(test)]
+mod kr_fix35c_tests {
+    use super::{check_producer_protocol, roster_payload, GroupRecord};
+    use crate::federation::types::{Community, CommunityMember, Family, FamilyMember};
+
+    const WITH: &str = "reverse_quorum:2/5:86400+escalate:172800:4";
+    const BASE: &str = "reverse_quorum:2/5:86400";
+
+    fn t0() -> chrono::DateTime<chrono::Utc> {
+        "2026-05-01T00:00:00Z".parse().unwrap()
+    }
+
+    fn room(protocol: &str) -> GroupRecord {
+        GroupRecord::Community(Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
+            community_key_id: "kr35c-room".into(),
+            community_name: "kr35c".into(),
+            members: vec![CommunityMember {
+                key_id: "kr35c-a".into(),
+                joined_at: t0(),
+                role: Some("founder".into()),
+            }],
+            founded_at: t0(),
+            consensus_protocol: protocol.into(),
+            policy_blob: None,
+            persist_row_hash: String::new(),
+        })
+    }
+
+    fn family(protocol: &str, dissolved: bool) -> Family {
+        Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
+            family_key_id: "kr35c-fam".into(),
+            family_name: "kr35c".into(),
+            members: vec![FamilyMember {
+                key_id: "kr35c-a".into(),
+                joined_at: t0(),
+                role: Some("founder".into()),
+            }],
+            founded_at: t0(),
+            consensus_protocol: protocol.into(),
+            consensus_protocol_entrenched: false,
+            dissolved_at: dissolved.then(t0),
+            persist_row_hash: String::new(),
+        }
+    }
+
+    fn protocol_of(p: &ciris_verify_core::cde::Value) -> String {
+        p.get_text("consensus_protocol")
+            .and_then(ciris_verify_core::cde::Value::as_text)
+            .expect("the payload states consensus_protocol")
+            .to_owned()
+    }
+
+    /// The producer refuses a founding with the suffix, by name; the base
+    /// form is admitted.
+    #[test]
+    fn persists_own_founding_with_the_suffix_is_refused() {
+        let e = check_producer_protocol(&room(WITH)).expect_err("the suffix is refused");
+        assert!(
+            matches!(&e, crate::federation::Error::InvalidArgument(m) if m.contains("+escalate:")),
+            "named: {e:?}"
+        );
+        check_producer_protocol(&room(BASE)).expect("the base form is admitted");
+    }
+
+    /// A successor version written from a held suffix record states the base
+    /// form; a founding's bytes (a peer's) are encoded as given.
+    #[test]
+    fn a_successor_is_written_in_base_form() {
+        let head = crate::federation::edition2::names::RowId([7u8; 32]);
+        let v2 = roster_payload(&room(WITH), 2, Some(&head), 1_000).expect("v2");
+        assert_eq!(protocol_of(&v2), BASE, "a successor states the base form");
+        let v1 = roster_payload(&room(WITH), 1, None, 1_000).expect("v1");
+        assert_eq!(
+            protocol_of(&v1),
+            WITH,
+            "a received founding is its own bytes"
+        );
+    }
+
+    /// Base-after-suffix is NOT a protocol change: a dissolution persist
+    /// writes in base form from a held suffix record changes nothing but
+    /// `dissolved_at`.
+    #[test]
+    fn base_after_suffix_is_no_protocol_change() {
+        crate::federation::family_dissolution::check_dissolve_is_terminal_only(
+            &family(WITH, false),
+            &family(BASE, true),
+        )
+        .expect("base after suffix is the same protocol");
+        assert!(
+            crate::federation::family_dissolution::check_dissolve_is_terminal_only(
+                &family(WITH, false),
+                &family("reverse_quorum:3/5:86400", true),
+            )
+            .is_err(),
+            "a real change is still one"
+        );
+    }
 }

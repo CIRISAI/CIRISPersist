@@ -813,7 +813,7 @@ mod sqlite {
     }
 
     /// I2242 — community roster, key grant to the peer and sealed blob cross
-    /// between two rootless nodes.
+    /// between two rootless nodes (v62.0.0 HEAD-6: two OWNED rootless nodes).
     #[tokio::test]
     async fn i2242_a_community_blob_opens_across_rootless_nodes_sqlite() {
         use crate::federation::types::identity_type::NODE;
@@ -821,6 +821,14 @@ mod sqlite {
         let a = node_as(&ba, "i2242-a", NODE).await;
         let b = node_as(&bb, "i2242-b", NODE).await;
         introduce_as(&[&a, &b], &["i2242-a", "i2242-b"], NODE).await;
+        // v62.0.0 (HEAD-6; Constitution, head cases (3)) — on OWNED nodes: an
+        // unowned node is only reachable (it signs no holding claim and no
+        // report); owned-but-rootless runs the mesh. Neither node holds a
+        // root. KR-fix31 (CC 3.2 single owner): the body's room seeding OWNS
+        // each node by its member (`seed_community_everywhere`, the owner
+        // binding through the real door), so no other owner binds it first:
+        // two owners leave the member owning nothing, and the node's seal is
+        // refused `write_author_has_no_wrap_target`.
         assert_rootless(&ba, "sqlite A").await;
         assert_rootless(&bb, "sqlite B").await;
         Box::pin(exercise_i61_end_to_end(&a, &b, "i2242-sqlite")).await;
@@ -927,6 +935,14 @@ mod postgres {
         let a = node_as(&ba, "i2242-a", NODE).await;
         let b = node_as(&bb, "i2242-b", NODE).await;
         introduce_as(&[&a, &b], &["i2242-a", "i2242-b"], NODE).await;
+        // v62.0.0 (HEAD-6; Constitution, head cases (3)) — on OWNED nodes: an
+        // unowned node is only reachable (it signs no holding claim and no
+        // report); owned-but-rootless runs the mesh. Neither node holds a
+        // root. KR-fix31 (CC 3.2 single owner): the body's room seeding OWNS
+        // each node by its member (`seed_community_everywhere`, the owner
+        // binding through the real door), so no other owner binds it first:
+        // two owners leave the member owning nothing, and the node's seal is
+        // refused `write_author_has_no_wrap_target`.
         assert_rootless(&ba, "postgres A").await;
         assert_rootless(&bb, "postgres B").await;
         Box::pin(exercise_i61_end_to_end(&a, &b, "i2242-postgres")).await;

@@ -122,7 +122,8 @@ pub(crate) mod bodies {
         let node = owned_node(d, &k, &format!("i4280-n-{s}")).await;
         let device = second_device(d, &k, &format!("i4280-d-{s}")).await;
         let (cid, founder, k) = (id_of(&cid), id_of(&founder), id_of(&k));
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .expect("I4280: the founder founds the room");
         let now = Utc::now();
@@ -174,7 +175,8 @@ pub(crate) mod bodies {
         )
         .await;
         let (cid, founder, owner) = (id_of(&cid), id_of(&founder), id_of(&owner));
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .expect("I4281: the founder founds the room");
         let now = Utc::now();
@@ -216,7 +218,8 @@ pub(crate) mod bodies {
         let node = owned_node(d, &founder, &format!("i4282-n-{s}")).await;
         let device = second_device(d, &founder, &format!("i4282-d-{s}")).await;
         let (cid, founder, m1, m2) = (id_of(&cid), id_of(&founder), id_of(&m1), id_of(&m2));
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .expect("I4282: the founder founds the room");
         let now = Utc::now();
@@ -276,7 +279,8 @@ pub(crate) mod bodies {
         let node = owned_node(d, &founder, &format!("i4283-n-{s}")).await;
         let device = second_device(d, &founder, &format!("i4283-d-{s}")).await;
         let (cid, founder) = (id_of(&cid), id_of(&founder));
-        found_public_room(d, &cid, OPEN_SELF_ADMIT, &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_public_room(d, &cid, OPEN_SELF_ADMIT, &[&founder], &[])
             .await
             .expect("I4283: the founder founds the public room");
         let at = Utc::now() - Duration::hours(1);

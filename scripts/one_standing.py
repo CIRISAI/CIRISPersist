@@ -137,7 +137,6 @@ RATCHET: dict[tuple[str, str, str], tuple[int, str]] = {
     ('bundle', 'src/ffi/pyo3.rs', 'report_genesis_at_boot'): (1, "reads the bundle's holders inline; -> standing::bundle_holders (CLEAN S1)"),
     ('bundle', 'src/ffi/pyo3.rs', 'reset_engine'): (1, "not a bundle: the Python runtime's holder count"),
     ('count-shape', 'src/federation/ownership_reclaim.rs', 'WaQuorum'): (1, 'a have/need/of result shape; -> standing::Count (CLEAN S3)'),
-    ('count-shape', 'src/federation/reverse_quorum.rs', 'DismissalQuorum'): (1, 'a have/need/of result shape; -> standing::Count (CLEAN S3)'),
     ('count-shape', 'src/federation/reverse_quorum.rs', 'ReverseQuorumFold'): (1, "the reverse-quorum fold's output (thresholds map to need(Reverse); the fold stays)"),
     ('count-shape', 'src/federation/trust_root.rs', 'SignerCount'): (1, 'a have/need/of result shape; -> standing::Count (CLEAN S3)'),
     ('count-shape', 'src/kernel/view.rs', 'SeatFields'): (1, "the kernel's seat row fields, not a tally (kept)"),
@@ -165,10 +164,8 @@ RATCHET: dict[tuple[str, str, str], tuple[int, str]] = {
     ('founder', 'src/federation/membership_acceptance.rs', 'check_standing_proposal'): (1, 'role founder compared; duty uses go with DC-fix2d-2, room authority / T7 stay (ruled)'),
     ('founder', 'src/federation/mod.rs', 'check_roster_authority_over'): (1, 'role founder compared; duty uses go with DC-fix2d-2, room authority / T7 stay (ruled)'),
     ('founder', 'src/federation/mod.rs', 'founder_candidates'): (1, 'role founder compared; duty uses go with DC-fix2d-2, room authority / T7 stay (ruled)'),
-    ('founder', 'src/federation/mod.rs', 'prepare_roster_events'): (1, 'role founder compared; duty uses go with DC-fix2d-2, room authority / T7 stay (ruled)'),
     ('founder', 'src/federation/mod.rs', 'root_authority_intervals'): (1, 'role founder compared; duty uses go with DC-fix2d-2, room authority / T7 stay (ruled)'),
     ('founder', 'src/federation/mod.rs', 'roster_event_verdict'): (2, 'role founder compared; duty uses go with DC-fix2d-2, room authority / T7 stay (ruled)'),
-    ('founder', 'src/federation/public_room.rs', 'check_community_listing_admission'): (1, 'role founder compared; duty uses go with DC-fix2d-2, room authority / T7 stay (ruled)'),
     ('founder', 'src/federation/public_room.rs', 'live_standing_proposal'): (1, 'role founder compared; duty uses go with DC-fix2d-2, room authority / T7 stay (ruled)'),
     ('founder', 'src/kernel/consensus.rs', 'ballot_rows'): (1, 'role founder compared; duty uses go with DC-fix2d-2, room authority / T7 stay (ruled)'),
     ('founder', 'src/kernel/consensus.rs', 'count_over'): (1, 'role founder compared; duty uses go with DC-fix2d-2, room authority / T7 stay (ruled)'),
@@ -188,8 +185,6 @@ RATCHET: dict[tuple[str, str, str], tuple[int, str]] = {
     ('present', 'src/federation/group_plane.rs', 'check_cosigned_withdraws'): (2, 'decision reads the roster at the host clock; -> standing::roster(G, act instant) (CLEAN S4)'),
     ('present', 'src/federation/membership_acceptance.rs', 'check_proposer_under_founder_only'): (2, 'decision reads the roster at the host clock; -> standing::roster(G, act instant) (CLEAN S4)'),
     ('present', 'src/federation/membership_acceptance.rs', 'check_standing_proposal'): (1, 'decision reads the roster at the host clock; -> standing::roster(G, act instant) (CLEAN S4)'),
-    ('present', 'src/federation/mod.rs', 'check_write_cohort_scope_for'): (2, 'decision reads the roster at the host clock; -> standing::roster(G, act instant) (CLEAN S4)'),
-    ('present', 'src/federation/public_room.rs', 'check_community_listing_admission'): (1, 'decision reads the roster at the host clock; -> standing::roster(G, act instant) (CLEAN S4)'),
     ('protocol', 'src/federation/admission.rs', 'infrastructure_quorum'): (1, 'parses quorum:M/N; -> standing::parse_protocol (CLEAN S2)'),
     ('protocol', 'src/federation/canonical_community.rs', 'check_trust_root_shape'): (1, 'parses quorum:M/N; -> standing::parse_protocol (CLEAN S2)'),
     ('protocol', 'src/federation/canonical_community.rs', 'parse_quorum'): (1, 'parses quorum:M/N; -> standing::parse_protocol (CLEAN S2)'),
@@ -215,7 +210,6 @@ RATCHET: dict[tuple[str, str, str], tuple[int, str]] = {
     ('walk', 'src/federation/admission.rs', 'scoped_delegation_reach'): (1, 'the timeless generic wrapper'),
     ('walk', 'src/federation/admission.rs', 'scoped_delegation_reach_in'): (1, 'the lens wrapper (SD-fix1 act_at)'),
     ('walk', 'src/federation/mod.rs', 'moderator_roots_at'): (1, 'holders copy 5 (roster fold); -> standing::holders (CLEAN S7)'),
-    ('walk', 'src/federation/mod.rs', 'prepare_roster_events'): (1, 'holders copy 4 (steward tier at now); -> standing::holders (CLEAN S7)'),
 }
 
 

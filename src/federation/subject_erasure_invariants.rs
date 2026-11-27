@@ -36,6 +36,9 @@
 //!   whose key digests to it, and nobody else.
 //! - **I974** — the Engine door end to end (sqlite, postgres): the producer
 //!   route through the Engine the Python surface calls.
+//! - **I4349** (v62.0.0, KR-fix41) — `withdraws_draft` names the key the
+//!   caller signs with: another key is refused `kid_not_of_iss` at the door,
+//!   the producer's own lands as its `withdraws`.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -181,9 +184,14 @@ pub(crate) mod bodies {
         .await
         .unwrap();
         let mut ev = detection(trace, &e2::kid(det));
-        ev.ts = crate::federation::admission::truncate_to_substrate_resolution(
-            chrono::Utc::now() - chrono::Duration::minutes(2),
-        );
+        // KR-fix40 — the detection is an act under the detector's conferral,
+        // judged at its own instant (KR-fix19), and the conferral stands from
+        // its acceptance's instant, the wall clock at `confer_detect`
+        // (`fixture_trust_root::put_conferral_accepted_by`). Dated two minutes
+        // BEFORE that, the detection was held for want of standing and the
+        // erasure found nothing to erase (I974 "erased" 0). Dated now, after
+        // the acceptance.
+        ev.ts = crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
         crate::derived::detection_row::state_detection(b, &ts::local_signer(det), &ev)
             .await
             .expect("the conferred detector states its detection")
@@ -311,6 +319,235 @@ pub(crate) mod bodies {
         check_projection_rebuild(b, SiloProjection::DetectionEvents)
             .await
             .expect("I965: the projection is its rows' rebuild");
+    }
+
+    /// v62.0.0 (KR-fix41) — **I4349: `withdraws_draft` names the key the
+    /// CALLER signs with.** The producer `det` drafts its rule-1 `withdraws`
+    /// of its own detection:
+    ///
+    /// - naming ANOTHER key (one `det`'s identity does not hold), signed by
+    ///   that key: the statement door refuses it `kid_not_of_iss` and keeps
+    ///   nothing (before KR-fix41 the draft named `iss`'s genesis kid whatever
+    ///   the caller held, so this draft could not be built);
+    /// - naming `det`'s own key, signed by it: it lands as `det`'s
+    ///   `withdraws` of the target.
+    pub(crate) async fn i4349_withdraws_draft_names_the_callers_kid<B>(b: &B, tag: &str)
+    where
+        B: AttestationStore + crate::derived::DerivedSchema + crate::store::Backend + Sync,
+    {
+        use crate::federation::edition2::ingest::{put_statement, INGEST_TIER};
+        use crate::federation::edition2::names::RowId;
+        let agent = format!("{tag}-agent");
+        let row_id = detected(b, tag, &agent, &format!("{tag}-trace")).await;
+        let target = b
+            .get_attestation(&row_id)
+            .await
+            .unwrap()
+            .expect("I4349: the detection is held");
+        let det = detector_seed(tag);
+        let iss = e2::kid(&det);
+        let at = e2::ms(chrono::Utc::now());
+        let stranger = role_seed("stranger", tag);
+        e2::put_key(b, &stranger, &[identity_type::AGENT]).await;
+        let wrong = se::withdraws_draft(&target, &iss, &e2::kid_digest(&stranger), at)
+            .expect("I4349: the draft builds for any stated key");
+        let st = wrong.assemble(
+            e2::signing_key(&stranger)
+                .sign(&wrong.sig_structure)
+                .expect("the stranger's key signs"),
+        );
+        let e = put_statement(b, &st, None, INGEST_TIER)
+            .await
+            .expect_err("I4349: a key not of the issuer is refused");
+        assert!(
+            matches!(
+                &e,
+                Error::MalformedRow { reason, .. }
+                    if *reason == crate::federation::malformed_row::KID_NOT_OF_ISS
+            ),
+            "I4349: refused kid_not_of_iss: {e:?}"
+        );
+        let wid = RowId::of_statement(&st).expect("a row statement");
+        assert!(
+            b.edition2_voices(&wid).await.unwrap().is_empty(),
+            "I4349: nothing of the refused statement is kept"
+        );
+        let own = se::withdraws_draft(&target, &iss, &e2::kid_digest(&det), at)
+            .expect("I4349: the producer's draft");
+        let st = own.assemble(
+            e2::signing_key(&det)
+                .sign(&own.sig_structure)
+                .expect("the producer's key signs"),
+        );
+        put_statement(b, &st, None, INGEST_TIER)
+            .await
+            .expect("I4349: the producer's own key lands");
+        let w = b
+            .get_attestation(&RowId::of_statement(&st).expect("a row statement").hex())
+            .await
+            .unwrap()
+            .expect("I4349: the withdraws is held");
+        assert_eq!(w.attestation_type, attestation_type::WITHDRAWS);
+        assert_eq!(w.attesting_key_id, iss, "I4349: the producer's withdraws");
+    }
+
+    /// v62.0.0 (KR-fix41b) — **I4349, the rotated-key and second-device
+    /// shapes** (RESIGN-6's I6816 / I6817): a PERSON producer (a `user` key,
+    /// conferred `infra:detect`) whose key ROTATED drafts its `withdraws`
+    /// naming the NEW key, signed by it: it lands as the producer's
+    /// withdraws; and the same producer's SECOND DEVICE (an occurrence bound
+    /// to its identity, O1's door) drafts naming the device key, signed by it:
+    /// it lands. The genesis kid is never what the draft names.
+    pub(crate) async fn i4349b_a_rotated_key_and_a_second_device_draft<B>(b: &B, tag: &str)
+    where
+        B: AttestationStore + crate::derived::DerivedSchema + crate::store::Backend + Sync,
+    {
+        use crate::federation::edition2::ingest::{put_statement, INGEST_TIER};
+        use crate::federation::edition2::names::RowId;
+        let land_withdraws =
+            |det: &str,
+             target: &Attestation,
+             kid: [u8; 32],
+             key: &ciris_crypto::composite::CompositeSigningKey| {
+                let draft =
+                    se::withdraws_draft(target, &e2::kid(det), &kid, e2::ms(chrono::Utc::now()))
+                        .expect("the producer's draft");
+                let st = draft.assemble(key.sign(&draft.sig_structure).expect("the pen signs"));
+                async move {
+                    put_statement(b, &st, None, INGEST_TIER)
+                        .await
+                        .map(|_| RowId::of_statement(&st).expect("a row statement").hex())
+                }
+            };
+        // (a) The rotated key.
+        let det = role_seed("person-det-a", tag);
+        e2::put_key(b, &det, &[identity_type::USER]).await;
+        let agent = format!("{tag}-agent-a");
+        let row_id = detected_by(
+            b,
+            &format!("{tag}a"),
+            &agent,
+            &format!("{tag}-trace-a"),
+            &det,
+        )
+        .await;
+        let target = b
+            .get_attestation(&row_id)
+            .await
+            .unwrap()
+            .expect("I4349b: the detection");
+        let genesis = e2::signing_key(&det);
+        let next =
+            ciris_crypto::composite::CompositeSigningKey::from_seeds(&[0x49; 32], &[0xb4; 32]);
+        let predecessor = RowId::of_statement(&e2::key_record(&det, &[identity_type::USER]))
+            .expect("the genesis record's row id");
+        let at_ms = e2::ms(chrono::Utc::now());
+        for v in [
+            rotation_voice(&genesis, &next, &e2::kid(&det), at_ms, &predecessor),
+            rotation_voice(&next, &next, &e2::kid(&det), at_ms, &predecessor),
+        ] {
+            put_statement(b, &v, None, INGEST_TIER)
+                .await
+                .expect("I4349b: a rotation voice is admitted");
+        }
+        let next_kid = ciris_verify_core::edition2::thumbprint(next.public_key());
+        let w = land_withdraws(&det, &target, next_kid, &next)
+            .await
+            .expect("I4349b (a): the rotated key's draft lands");
+        let held = b
+            .get_attestation(&w)
+            .await
+            .unwrap()
+            .expect("I4349b (a): held");
+        assert_eq!(held.attestation_type, attestation_type::WITHDRAWS);
+        assert_eq!(
+            held.attesting_key_id,
+            e2::kid(&det),
+            "I4349b (a): the producer's"
+        );
+
+        // (b) The second device.
+        let det = role_seed("person-det-b", tag);
+        e2::put_key(b, &det, &[identity_type::USER]).await;
+        let agent = format!("{tag}-agent-b");
+        let row_id = detected_by(
+            b,
+            &format!("{tag}b"),
+            &agent,
+            &format!("{tag}-trace-b"),
+            &det,
+        )
+        .await;
+        let target = b
+            .get_attestation(&row_id)
+            .await
+            .unwrap()
+            .expect("I4349b: the detection");
+        let device = role_seed("person-det-phone", tag);
+        e2::put_key(b, &device, &[identity_type::USER]).await;
+        crate::federation::occurrence_consent_invariants::bodies::put_bind(
+            b,
+            &det,
+            &device,
+            crate::federation::types::device_class::PHONE,
+            e2::ms(chrono::Utc::now() - chrono::Duration::minutes(1)),
+        )
+        .await;
+        let w = land_withdraws(
+            &det,
+            &target,
+            e2::kid_digest(&device),
+            &e2::signing_key(&device),
+        )
+        .await
+        .expect("I4349b (b): the second device's draft lands");
+        let held = b
+            .get_attestation(&w)
+            .await
+            .unwrap()
+            .expect("I4349b (b): held");
+        assert_eq!(held.attestation_type, attestation_type::WITHDRAWS);
+        assert_eq!(
+            held.attesting_key_id,
+            e2::kid(&det),
+            "I4349b (b): the producer's"
+        );
+    }
+
+    /// A `key:record` of `subject`'s key under the identity `iss`, voiced by
+    /// `voice`, naming the predecessor record `target` (a rotation, CC
+    /// 2.4.1.1): RESIGN-6's `rotation_voice` shape.
+    fn rotation_voice(
+        voice: &ciris_crypto::composite::CompositeSigningKey,
+        subject: &ciris_crypto::composite::CompositeSigningKey,
+        iss: &str,
+        at_ms: u64,
+        target: &crate::federation::edition2::names::RowId,
+    ) -> Vec<u8> {
+        use crate::federation::edition2::emit::sorted_map;
+        use ciris_verify_core::cde::Value;
+        use ciris_verify_core::edition2::{cose_key, identity_ref, row_ref, thumbprint};
+        let t = |x: &str| Value::Text(x.to_owned());
+        let m = vec![
+            (t("key"), cose_key(subject.public_key())),
+            (t("identity_type"), Value::Array(vec![t("user")])),
+            (t("asserted_at"), Value::Uint(at_ms)),
+            (t("author"), t(iss)),
+            (
+                t("refs"),
+                sorted_map(vec![(t("target"), row_ref(&target.0))]),
+            ),
+        ];
+        ciris_verify_core::edition2::sign_row_statement(
+            voice,
+            iss,
+            &identity_ref(&thumbprint(subject.public_key())),
+            "scores",
+            "key:record",
+            &sorted_map(m),
+            vec![],
+        )
+        .expect("a rotation voice signs")
     }
 
     // ── I966 ──────────────────────────────────────────────────────────────
@@ -1108,6 +1345,18 @@ mod run {
         bodies::i966_the_erasure_is_the_producers_withdraws(&b, &t).await;
     });
 
+    on_every_backend!(i4349, |b, t| {
+        let node = bodies::signing_node(&b, &t).await;
+        b.set_node_key_id(&node.id);
+        bodies::i4349_withdraws_draft_names_the_callers_kid(&b, &t).await;
+    });
+
+    on_every_backend!(i4349b, |b, t| {
+        let node = bodies::signing_node(&b, &t).await;
+        b.set_node_key_id(&node.id);
+        bodies::i4349b_a_rotated_key_and_a_second_device_draft(&b, &t).await;
+    });
+
     on_every_backend!(i967_reuse, |b, t| {
         let node = bodies::signing_node(&b, &t).await;
         b.set_node_key_id(&node.id);
@@ -1193,9 +1442,21 @@ mod run {
     #[tokio::test(flavor = "multi_thread")]
     async fn i974_sqlite() {
         let signer = crate::federation::tier_ingest::test_support::local_signer(I974_NODE);
-        let engine = crate::Engine::with_signer(signer, "sqlite::memory:")
+        let engine = crate::Engine::with_signer_pre_genesis(signer, "sqlite::memory:")
             .await
             .expect("engine");
+        // v62.0.0 (pass 13 follow-up; CC 4.4.3.19) — the fixture ceremony
+        // under the PRODUCTION charter scope (`bundle_v2_wide`), installed
+        // through the real door: the root grant this witness asks for
+        // (`infra:detect`) is outside the boot hook's fixture charter (`infra:attest`,
+        // `infra:serve`) and is refused `conferral_outside_charter_scope`
+        // there.
+        crate::federation::edition2::fixture_genesis::install_ceremony_v2(
+            engine.federation_directory().as_ref(),
+            crate::federation::edition2::fixture_genesis::bundle_v2_wide(),
+        )
+        .await
+        .expect("the production-charter ceremony");
         let b = engine.sqlite_backend().expect("sqlite").clone();
         // v62.0.0 (JSON cut, E7) — the node's key is an edition-2 record, named
         // by its identity-ref (the JSON self-registration door is shut).
@@ -1218,9 +1479,21 @@ mod run {
             return;
         };
         let signer = crate::federation::tier_ingest::test_support::local_signer(I974_NODE);
-        let engine = crate::Engine::with_signer(signer, &dsn)
+        let engine = crate::Engine::with_signer_pre_genesis(signer, &dsn)
             .await
             .expect("engine");
+        // v62.0.0 (pass 13 follow-up; CC 4.4.3.19) — the fixture ceremony
+        // under the PRODUCTION charter scope (`bundle_v2_wide`), installed
+        // through the real door: the root grant this witness asks for
+        // (`infra:detect`) is outside the boot hook's fixture charter (`infra:attest`,
+        // `infra:serve`) and is refused `conferral_outside_charter_scope`
+        // there.
+        crate::federation::edition2::fixture_genesis::install_ceremony_v2(
+            engine.federation_directory().as_ref(),
+            crate::federation::edition2::fixture_genesis::bundle_v2_wide(),
+        )
+        .await
+        .expect("the production-charter ceremony");
         let b = engine.postgres_backend().expect("postgres").clone();
         // v62.0.0 (JSON cut, E7) — the node's key is an edition-2 record, named
         // by its identity-ref (the JSON self-registration door is shut).

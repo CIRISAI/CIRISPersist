@@ -683,6 +683,15 @@ pub fn release_envelope(
 /// Verify-before-mutation (AV-9): every gate below runs BEFORE any row is
 /// written, and a refusal writes nothing.
 ///
+/// v62.0.0 (WD-fix6) — a HOLD is not a refusal: when the final put's
+/// statement door HOLDS the row (a fold condition not yet met; WD-fix4 routes
+/// a statement-carrying row through the statement funnel), the answer is the
+/// gate's error, as before, but the statement is KEPT and concludes when what
+/// it waits for arrives. Told apart structurally by
+/// [`kept_waiting`](super::attestation_admit::kept_waiting) (the fold's held
+/// state, `fold::why_held`), never by the error's text; a re-offer is a no-op
+/// on the statement id.
+///
 /// The `slash` authority check is
 /// [`check_delegated_duty_scores_admission`](super::admission::check_delegated_duty_scores_admission)
 /// — the same gate `put_attestation` runs on all three backends. It is called
@@ -1485,7 +1494,6 @@ pub(crate) mod test_support {
         tags: &[&str],
     ) -> Vec<String> {
         use crate::federation::edition2::fixture_genesis::HOLDER_SEEDS;
-        use crate::federation::edition2::fixture_trust_root::confers_statement;
         use crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE;
         let node = e2::kid(node_seed);
         assert_eq!(
@@ -1512,18 +1520,60 @@ pub(crate) mod test_support {
                 crate::federation::types::identity_type::WITNESS,
             )
             .await;
-            let grant = confers_statement(
-                &r,
-                &e2::kid(&witness),
-                &[INFRA_ATTEST_ASSURANCE],
-                first + i * 1_000,
+            // LEAD-root1 — the grant is COUNTED over the bundle's holders and
+            // accepted by the witness. KR-fix40 — BOTH are DATED from the
+            // bundle in force: the grant at its newest tip + 90 s + `i` s, the
+            // witness's acceptance 30 s after it. A grant confers from its
+            // acceptance's own instant on (`root_grant_acceptance_at`), and
+            // `fixture_trust_root::put_conferral` accepts at the wall clock,
+            // which postdates every instant of a cell timeline
+            // ([`cell_base`]); the witness's age rows were held for want of
+            // standing at their own instants.
+            let grant_at = first + i * 1_000;
+            let c = crate::federation::edition2::fixture_genesis::bundle_v2();
+            let sub = e2::kid(&witness);
+            let voices: Vec<Vec<u8>> = (0..2)
+                .map(|h| {
+                    crate::federation::edition2::fixture_trust_root::grant_voice(
+                        &c.holder_key(h),
+                        c.holder_identity_ref(h),
+                        &sub,
+                        &[INFRA_ATTEST_ASSURANCE],
+                        &r.head,
+                        grant_at,
+                    )
+                })
+                .collect();
+            for v in &voices {
+                e2::put_statement(dir, v)
+                    .await
+                    .unwrap_or_else(|e| panic!("confer_age_witness: a holder's grant voice: {e}"));
+            }
+            let grant_id = crate::federation::edition2::names::RowId::of_statement(&voices[0])
+                .expect("confer_age_witness: the grant's row id");
+            let Some(grant) = dir
+                .get_attestation(&grant_id.hex())
+                .await
+                .expect("confer_age_witness: read the grant")
+            else {
+                let why = crate::federation::edition2::fold::why_held(dir, &grant_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|h| (h.reason, h.detail));
+                panic!("confer_age_witness: the counted grant did not land; held {why:?}");
+            };
+            let acceptance = dated_acceptance(
+                &witness,
+                &grant,
+                DateTime::<Utc>::from_timestamp_millis(
+                    i64::try_from(grant_at + 30_000).expect("an instant fits i64"),
+                )
+                .expect("an instant"),
             );
-            e2::put_statement(dir, &grant)
+            e2::put_signed(dir, &acceptance)
                 .await
-                .unwrap_or_else(|e| panic!("confer_age_witness: the root's grant: {e}"));
-            e2::put_statement(dir, &e2::voice_of(&grant, &witness))
-                .await
-                .unwrap_or_else(|e| panic!("confer_age_witness: the witness's voice: {e}"));
+                .unwrap_or_else(|e| panic!("confer_age_witness: the witness's acceptance: {e}"));
             let rooted = crate::federation::trust_root::capability_roots_to_trusted_root(
                 dir,
                 &node,
@@ -1534,14 +1584,62 @@ pub(crate) mod test_support {
             .await
             .expect("capability_roots_to_trusted_root");
             assert!(
-                rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
+                rooted.as_ref().is_some_and(|g| g.root_key_id == r.lineage),
                 "confer_age_witness: the witness's {INFRA_ATTEST_ASSURANCE} roots at {} through \
                  this node: {rooted:?}",
-                r.root
+                r.lineage
             );
             out.push(witness);
         }
         out
+    }
+
+    /// v62.0.0 (KR-fix40) — `signer`'s acceptance of the root `grant`, the
+    /// root grant's reply form (`membership_acceptance::ACCEPTANCE_DIMENSION`,
+    /// naming the grant, at the federation scope, attested to the grantee),
+    /// DATED `at` and sealed by `signer`.
+    fn dated_acceptance(signer: &str, grant: &Attestation, at: DateTime<Utc>) -> Attestation {
+        use crate::federation::tier_ingest::test_support as ts;
+        let env = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "dimension": crate::federation::membership_acceptance::ACCEPTANCE_DIMENSION,
+            "references_attestation_id": grant.attestation_id,
+        });
+        let mut r = ts::bare_attestation(
+            &uuid::Uuid::new_v4().to_string(),
+            signer,
+            &grant.attested_key_id,
+            &env,
+        );
+        r.attestation_type = attestation_type::SCORES.into();
+        r.weight = None;
+        r.cohort_scope = crate::federation::types::cohort_scope::FEDERATION.into();
+        r.asserted_at = at;
+        r.scrub_timestamp = at;
+        r.expires_at = None;
+        r.subject_key_ids = Vec::new();
+        ts::seal_row_in_place(signer, &mut r);
+        r
+    }
+
+    /// v62.0.0 (KR-fix40) — **the anchor of a cell timeline**: the bundle in
+    /// force's newest tip + 5 min, after every witness grant and acceptance
+    /// [`confer_age_witnesses`] dates (tip + 90 s + 30 s + `i` s), so each
+    /// instant of the cell is an act the conferral covers at its own instant,
+    /// and inside W (the bundle is yesterday noon). Never the wall clock.
+    async fn cell_base(dir: &dyn FederationDirectory) -> DateTime<Utc> {
+        let tip = crate::federation::edition2::genesis::genesis_in_force(dir)
+            .await
+            .expect("the bundle in force")
+            .tips()
+            .iter()
+            .map(|t| t.asserted_at)
+            .max()
+            .expect("a bundle tip");
+        DateTime::<Utc>::from_timestamp_millis(
+            i64::try_from(tip + 300_000).expect("an instant fits i64"),
+        )
+        .expect("an instant")
     }
 
     /// An age row by `by` about `about` (`age_assurance:*` by a witness, or
@@ -1741,8 +1839,8 @@ pub(crate) mod test_support {
     /// seat), and `curate` in a community that does NOT declare it is never
     /// judged `minor_appointment_void`.
     ///
-    /// Dates: the founder key's window start + `OWNER_BINDING_OFFSET_DAYS`
-    /// (`late`) plus minutes / hours.
+    /// Dates (KR-fix40): `late`, five minutes after [`cell_base`] (the bundle
+    /// in force plus five minutes), plus minutes / ten-minute steps.
     pub(crate) async fn exercise_declared_duty(
         engine: &crate::Engine,
         node_seed: &str,
@@ -1761,16 +1859,15 @@ pub(crate) mod test_support {
         for x in [&founder, &member, &community, &cm, &ca, &cn] {
             register_user_key(dir, x).await;
         }
-        let base = DateTime::<Utc>::from_timestamp_millis(
-            i64::try_from(e2::key_window_start_ms(&founder)).expect("a window start fits i64"),
-        )
-        .expect("an instant");
-        let late = base
-            + chrono::Duration::days(
-                crate::federation::tier_ingest::test_support::OWNER_BINDING_OFFSET_DAYS,
-            );
+        // KR-fix40 — the cell timeline runs from the bundle in force
+        // ([`cell_base`]), after the witness's dated conferral, never from the
+        // founder's key window (150 days in was a month before the bundle, so
+        // the witness had no standing at any instant of it). `step` is ten
+        // minutes so the whole timeline (16 steps) stays in the past.
+        let base = cell_base(dir).await;
+        let late = base + chrono::Duration::minutes(5);
         let min = chrono::Duration::minutes(1);
-        let hour = chrono::Duration::hours(1);
+        let step = chrono::Duration::minutes(10);
         let witness = confer_age_witness(dir, node_seed, &k("age")).await;
         put_age_row(
             dir,
@@ -1861,7 +1958,7 @@ pub(crate) mod test_support {
             late + min * 2,
         )
         .await;
-        let d = founder_scoped_edge(&founder, &guild_k, cm, DECLARED_DUTY, late + hour);
+        let d = founder_scoped_edge(&founder, &guild_k, cm, DECLARED_DUTY, late + step);
         let out = land(d.clone(), cm.clone())
             .await
             .unwrap_or_else(|e| panic!("({suffix}) I2030 declared: kept, not refused: {e}"));
@@ -1874,7 +1971,7 @@ pub(crate) mod test_support {
             !named_curate(cm).await,
             "({suffix}) I2030: no minor holds the declared duty"
         );
-        let d = founder_scoped_edge(&founder, &guild_k, ca, DECLARED_DUTY, late + hour);
+        let d = founder_scoped_edge(&founder, &guild_k, ca, DECLARED_DUTY, late + step);
         let out = land(d, ca.clone())
             .await
             .expect("I2030: the adult's declared duty");
@@ -1882,7 +1979,7 @@ pub(crate) mod test_support {
             matches!(out, StatementOutcome::Row { .. }) && named_curate(ca).await,
             "({suffix}) I2030 control: the declared duty seats an assured adult: {out:?}"
         );
-        let d = founder_scoped_edge(&founder, &community_k, cn, DECLARED_DUTY, late + hour);
+        let d = founder_scoped_edge(&founder, &community_k, cn, DECLARED_DUTY, late + step);
         let _ = land(d.clone(), cn.clone()).await;
         assert!(
             !void_held(d).await,
@@ -1921,9 +2018,10 @@ pub(crate) mod test_support {
     /// - **I2869** (witness 9) — a pure guardianship (no duty scope) from an
     ///   assured-adult founder onto a minor still lands.
     ///
-    /// Dates: every instant is the founder key's window start +
-    /// `OWNER_BINDING_OFFSET_DAYS` (`late`) plus minutes / hours; the witness
-    /// conferral is dated `late` (`confer_scope_from_trusted_root_at`).
+    /// Dates (KR-fix40): every instant is `late`, five minutes after
+    /// [`cell_base`] (the bundle in force plus five minutes), plus minutes /
+    /// ten-minute steps; the witness conferral and its acceptance are dated
+    /// from the bundle before it ([`confer_age_witnesses`]).
     pub(crate) async fn exercise_minor_duty(engine: &crate::Engine, node_seed: &str, suffix: &str) {
         use crate::federation::admission::is_named_moderator;
         use crate::federation::age::{age_band, AgeBand};
@@ -1946,16 +2044,15 @@ pub(crate) mod test_support {
         {
             register_user_key(dir, x).await;
         }
-        let base = DateTime::<Utc>::from_timestamp_millis(
-            i64::try_from(e2::key_window_start_ms(&founder)).expect("a window start fits i64"),
-        )
-        .expect("an instant");
-        let late = base
-            + chrono::Duration::days(
-                crate::federation::tier_ingest::test_support::OWNER_BINDING_OFFSET_DAYS,
-            );
+        // KR-fix40 — the cell timeline runs from the bundle in force
+        // ([`cell_base`]), after the witness's dated conferral, never from the
+        // founder's key window (150 days in was a month before the bundle, so
+        // the witness had no standing at any instant of it). `step` is ten
+        // minutes so the whole timeline (16 steps) stays in the past.
+        let base = cell_base(dir).await;
+        let late = base + chrono::Duration::minutes(5);
         let min = chrono::Duration::minutes(1);
-        let hour = chrono::Duration::hours(1);
+        let step = chrono::Duration::minutes(10);
         let witness = confer_age_witness(dir, node_seed, &k("age")).await;
         put_age_row(
             dir,
@@ -2047,7 +2144,7 @@ pub(crate) mod test_support {
         )
         .await;
         for (n, minor) in [(0i32, sm), (1, am)] {
-            let d = edge(minor, true, late + hour * (1 + n));
+            let d = edge(minor, true, late + step * (1 + n));
             let out = land(d.clone(), minor.clone())
                 .await
                 .unwrap_or_else(|e| panic!("({suffix}) I2863: kept, not refused: {e}"));
@@ -2060,7 +2157,7 @@ pub(crate) mod test_support {
                 !marker_admitted(
                     minor.clone(),
                     d.attestation_id.clone(),
-                    late + hour * (3 + n)
+                    late + step * (3 + n)
                 )
                 .await,
                 "({suffix}) I2863: the minor's marker is not admitted"
@@ -2068,7 +2165,7 @@ pub(crate) mod test_support {
         }
 
         // ── I2864: D first (seats), then the minor row: void after re-fold.
-        let d = edge(p1, true, late + hour * 5);
+        let d = edge(p1, true, late + step * 5);
         let out = land(d.clone(), p1.clone()).await.expect("I2864: seated");
         assert!(
             matches!(out, StatementOutcome::Row { .. }),
@@ -2083,7 +2180,7 @@ pub(crate) mod test_support {
             p1,
             p1,
             "age_self_declared:band:minor:v1",
-            late + hour * 6,
+            late + step * 6,
         )
         .await;
         assert!(
@@ -2092,7 +2189,7 @@ pub(crate) mod test_support {
         );
         assert!(!named(p1).await, "({suffix}) I2864: unseated");
         assert!(
-            !marker_admitted(p1.clone(), d.attestation_id.clone(), late + hour * 7).await,
+            !marker_admitted(p1.clone(), d.attestation_id.clone(), late + step * 7).await,
             "({suffix}) I2864: the unseated minor's marker is not admitted"
         );
 
@@ -2106,14 +2203,14 @@ pub(crate) mod test_support {
             late + min * 2,
         )
         .await;
-        let d = edge(p2, true, late + hour * 8);
+        let d = edge(p2, true, late + step * 8);
         let _ = land(d.clone(), p2.clone()).await;
         put_age_row(
             dir,
             &witness,
             p2,
             "age_assurance:provider:adult:v1",
-            late + hour * 9,
+            late + step * 9,
         )
         .await;
         assert!(
@@ -2121,7 +2218,7 @@ pub(crate) mod test_support {
             "({suffix}) I2865: an appointment made during minority stays void after the \
              adult proof"
         );
-        let d2 = edge(p2, true, late + hour * 10);
+        let d2 = edge(p2, true, late + step * 10);
         let out = land(d2.clone(), p2.clone())
             .await
             .expect("I2865: re-appointed");
@@ -2159,10 +2256,10 @@ pub(crate) mod test_support {
             &witness,
             p3,
             "age_assurance:provider:adult:v1",
-            late + hour * 11,
+            late + step * 11,
         )
         .await;
-        let d = edge(p3, true, late + hour * 10);
+        let d = edge(p3, true, late + step * 10);
         let _ = land(d.clone(), p3.clone()).await;
         assert!(
             void_held(d).await && !named(p3).await,
@@ -2183,10 +2280,10 @@ pub(crate) mod test_support {
             p4,
             p4,
             "age_self_declared:band:adult:v1",
-            late + hour * 12,
+            late + step * 12,
         )
         .await;
-        let d = edge(p4, true, late + hour * 13);
+        let d = edge(p4, true, late + step * 13);
         let _ = land(d.clone(), p4.clone()).await;
         assert!(
             void_held(d).await && !named(p4).await,
@@ -2202,7 +2299,7 @@ pub(crate) mod test_support {
             late + min * 2,
         )
         .await;
-        let d = edge(p5, true, late + hour * 14);
+        let d = edge(p5, true, late + step * 14);
         let out = land(d.clone(), p5.clone()).await.expect("I2868: seated");
         assert!(
             matches!(out, StatementOutcome::Row { .. }),
@@ -2213,7 +2310,7 @@ pub(crate) mod test_support {
             p5,
             p5,
             "age_self_declared:band:minor:v1",
-            late + hour * 15,
+            late + step * 15,
         )
         .await;
         // K2-fix14 (reverses K2-fix11's I2868; CC 3.4.11 + CC 4.5.4 as ruled
@@ -2237,7 +2334,7 @@ pub(crate) mod test_support {
             late + min * 2,
         )
         .await;
-        let g = edge(ward, false, late + hour * 16);
+        let g = edge(ward, false, late + step * 16);
         let out = land(g, ward.clone())
             .await
             .expect("I2869: the guardianship");
@@ -4344,12 +4441,24 @@ mod cells_runners {
     async fn i2863_i2869_minor_appointment_void_sqlite() {
         let s = suffix();
         let seed = format!("q12-engine-{s}");
-        let engine = crate::Engine::with_signer(
+        let engine = crate::Engine::with_signer_pre_genesis(
             crate::federation::tier_ingest::test_support::local_signer(&seed),
             "sqlite::memory:",
         )
         .await
         .expect("engine");
+        // v62.0.0 (pass 13 follow-up; CC 4.4.3.19) — the fixture ceremony
+        // under the PRODUCTION charter scope (`bundle_v2_wide`), installed
+        // through the real door: the root grant this witness asks for
+        // (`infra:attest_assurance`) is outside the boot hook's fixture charter (`infra:attest`,
+        // `infra:serve`) and is refused `conferral_outside_charter_scope`
+        // there.
+        crate::federation::edition2::fixture_genesis::install_ceremony_v2(
+            engine.federation_directory().as_ref(),
+            crate::federation::edition2::fixture_genesis::bundle_v2_wide(),
+        )
+        .await
+        .expect("the production-charter ceremony");
         let node = format!("q12-node-{s}");
         engine
             .sqlite_backend()
@@ -4367,12 +4476,24 @@ mod cells_runners {
         };
         let s = suffix();
         let seed = format!("q12-engine-{s}");
-        let engine = crate::Engine::with_signer(
+        let engine = crate::Engine::with_signer_pre_genesis(
             crate::federation::tier_ingest::test_support::local_signer(&seed),
             &dsn,
         )
         .await
         .expect("pg engine");
+        // v62.0.0 (pass 13 follow-up; CC 4.4.3.19) — the fixture ceremony
+        // under the PRODUCTION charter scope (`bundle_v2_wide`), installed
+        // through the real door: the root grant this witness asks for
+        // (`infra:attest_assurance`) is outside the boot hook's fixture charter (`infra:attest`,
+        // `infra:serve`) and is refused `conferral_outside_charter_scope`
+        // there.
+        crate::federation::edition2::fixture_genesis::install_ceremony_v2(
+            engine.federation_directory().as_ref(),
+            crate::federation::edition2::fixture_genesis::bundle_v2_wide(),
+        )
+        .await
+        .expect("the production-charter ceremony");
         let node = format!("q12-node-{s}");
         engine
             .postgres_backend()
@@ -4386,12 +4507,24 @@ mod cells_runners {
     async fn i2030_declared_duty_minor_appointment_void_sqlite() {
         let s = suffix();
         let seed = format!("q13-engine-{s}");
-        let engine = crate::Engine::with_signer(
+        let engine = crate::Engine::with_signer_pre_genesis(
             crate::federation::tier_ingest::test_support::local_signer(&seed),
             "sqlite::memory:",
         )
         .await
         .expect("engine");
+        // v62.0.0 (pass 13 follow-up; CC 4.4.3.19) — the fixture ceremony
+        // under the PRODUCTION charter scope (`bundle_v2_wide`), installed
+        // through the real door: the root grant this witness asks for
+        // (`infra:attest_assurance`) is outside the boot hook's fixture charter (`infra:attest`,
+        // `infra:serve`) and is refused `conferral_outside_charter_scope`
+        // there.
+        crate::federation::edition2::fixture_genesis::install_ceremony_v2(
+            engine.federation_directory().as_ref(),
+            crate::federation::edition2::fixture_genesis::bundle_v2_wide(),
+        )
+        .await
+        .expect("the production-charter ceremony");
         let node = format!("q13-node-{s}");
         engine
             .sqlite_backend()
@@ -4412,12 +4545,24 @@ mod cells_runners {
         };
         let s = suffix();
         let seed = format!("q13-engine-{s}");
-        let engine = crate::Engine::with_signer(
+        let engine = crate::Engine::with_signer_pre_genesis(
             crate::federation::tier_ingest::test_support::local_signer(&seed),
             &dsn,
         )
         .await
         .expect("pg engine");
+        // v62.0.0 (pass 13 follow-up; CC 4.4.3.19) — the fixture ceremony
+        // under the PRODUCTION charter scope (`bundle_v2_wide`), installed
+        // through the real door: the root grant this witness asks for
+        // (`infra:attest_assurance`) is outside the boot hook's fixture charter (`infra:attest`,
+        // `infra:serve`) and is refused `conferral_outside_charter_scope`
+        // there.
+        crate::federation::edition2::fixture_genesis::install_ceremony_v2(
+            engine.federation_directory().as_ref(),
+            crate::federation::edition2::fixture_genesis::bundle_v2_wide(),
+        )
+        .await
+        .expect("the production-charter ceremony");
         let node = format!("q13-node-{s}");
         engine
             .postgres_backend()

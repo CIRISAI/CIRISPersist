@@ -14767,16 +14767,16 @@
     "path#symbol": "src/federation/reverse_quorum.rs#fold_reverse_quorum_over",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v62-f0-cp10",
-    "witness": "reverse_quorum::tests (silence_is_its_own_outcome_and_suppresses_nothing, an_upholding_ruling_closes_escalation, a_moderator_cannot_rule_on_their_own_objection, a_persons_rows_are_one_voice_or_none_and_no_instant_decides, no_permutation_of_the_rows_changes_the_count): v62.0.0 (F0-cp10) — an objection is counted by the fold over the held rows (fold_reverse_quorum_over); the earlier-form writers record_objection / record_objection_dismissal (bound-hybrid scrubs) are deleted (F0-cp9), so no earlier-form writer feeds the fold"
+    "witness": "reverse_quorum::tests (one_member_cannot_reach_the_reversal_threshold_alone, m_distinct_members_reverse_and_the_fold_names_its_evidence, a_held_dismissal_or_ballot_lifts_nothing, no_permutation_of_the_rows_changes_the_count, a_steward_tier_string_is_read_and_has_no_effect): v62.0.0 (F0-cp10) — an objection is counted by the fold over the held rows (fold_reverse_quorum_over); the earlier-form writers record_objection / record_objection_dismissal (bound-hybrid scrubs) are deleted (F0-cp9), so no earlier-form writer feeds the fold; v62.0.0 (KR-fix35) — the fold counts objections only: the dismissal, the ballots and the steward tier are deleted"
    },
    {
     "decimal_id": "3.1.9.2",
     "claim_id": "CLM-reverse-quorum-dismissal",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/reverse_quorum.rs#fold_reverse_quorum_over",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "manifest_round": "v62-f0-cp10",
-    "witness": "reverse_quorum::tests (silence_is_its_own_outcome_and_suppresses_nothing, an_upholding_ruling_closes_escalation, a_moderator_cannot_rule_on_their_own_objection, a_persons_rows_are_one_voice_or_none_and_no_instant_decides, no_permutation_of_the_rows_changes_the_count): v62.0.0 (F0-cp10) — a dismissal counts distinct roster voices in the same fold (fold_reverse_quorum_over); the earlier-form writers record_objection / record_objection_dismissal (bound-hybrid scrubs) are deleted (F0-cp9), so no earlier-form writer feeds the fold"
+    "tsv_target": "n/a",
+    "tsv_excluded": "v62.0.0 (KR-fix35; Constitution ruled objection:{state} CLOSED at assent | raised, dismissed / upheld / overruled not in this form): the dismissal is deleted with its tally arm; fold_reverse_quorum_over counts objections only and a held objection:dismissed:v1 lifts nothing (reverse_quorum::tests::a_held_dismissal_or_ballot_lifts_nothing). persist implements no dismissal, so no row cites one.",
+    "manifest_round": "v62-f0-cp10"
    },
    {
     "decimal_id": "3.4.5",
@@ -15940,7 +15940,8 @@
     "claim_id": "CLM-vote-once-per-person",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/reverse_quorum.rs#voices",
-    "tsv_target": "evidence/cc_impl.tsv",
+    "tsv_target": "n/a",
+    "tsv_excluded": "v62.0.0 (KR-fix35): the ballot fold `voices` is deleted with the ballots; the claim stays on consensus.rs#eligible and key_person.rs#PersonsAt::voice (fold_reverse_quorum_over counts objections one per person through PersonsAt::voice).",
     "manifest_round": "v61-s2-1123"
    },
    {
@@ -16982,7 +16983,7 @@
     "decimal_id": "3.3.6.4",
     "claim_id": "CLM-self-roster-two-paths",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/self_roster.rs#gate",
+    "path#symbol": "src/federation/self_roster.rs#gate_edition2",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc9-1099"
    },
@@ -17435,7 +17436,7 @@
     "decimal_id": "3.3.4",
     "claim_id": "CLM-cosign-collection-held",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/cosign.rs#hold",
+    "path#symbol": "src/federation/cosign.rs#hold_if_short",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc18-1252"
    },

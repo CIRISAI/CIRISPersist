@@ -767,18 +767,24 @@ async fn revocation_body<D: FederationDirectory + ?Sized>(d: &D) {
         .unwrap()
     };
 
-    // I3154 — another's key, no slash conferral.
+    // I3154 (KR-fix43; CC 2.4.1.1: "A revocation signed by any other key
+    // revokes nothing") — another's key: REFUSED at the door, by the one
+    // token, never held (no conferral is asked, so no root and no node
+    // identity is read: the earlier `federation_node_identity_unset` arm is
+    // gone), and nothing is kept. I1218 offers the same shape WITH a root's
+    // `slash` conferral on the revoker: refused the same.
     let st = sign(&other, &s, REVOCATION_PREFIX, &payload(&o));
     let e = put(d, &st).await.unwrap_err();
-    assert!(
-        [
-            "federation_delegated_scope_unauthorized",
-            "federation_node_identity_unset"
-        ]
-        .contains(&e.kind()),
-        "I3154 the revocation door's authority rule: {e:?}"
+    assert_eq!(
+        e.kind(),
+        "federation_delegated_scope_unauthorized",
+        "I3154 a revocation of another's key is refused: {e:?}"
     );
     assert!(!kept(d, &st).await, "I3154 not kept");
+    assert!(
+        super::fold::why_held(d, &rid(&st)).await.unwrap().is_none(),
+        "I3154 not held: nothing another row brings admits it"
+    );
 
     // I3155 — a missing member.
     let bad = sign(
@@ -1243,6 +1249,78 @@ async fn key_grant_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) {
             .any(|(id, signer)| *id == rid(&st).hex() && *signer == a),
         "I3160 projected (pending its bytes): {pending:?}"
     );
+}
+
+/// v62.0.0 (KR-fix45) — **I4348 on the backends**: a key grant's `owner`
+/// form follows its placement, at the statement door. For each placement ×
+/// each ref kind: a crossed pairing (a `self` grant naming a group; a
+/// family / community / affiliations grant naming a key) is REFUSED
+/// `edition2_payload_invalid` (`malformed:owner`) and nothing is kept; the
+/// matching pairing is never refused for its owner form (it may stop at a
+/// later rule, which this does not judge).
+async fn key_grant_owner_form_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) {
+    let (alice, phone) = (key(160), key(161));
+    register(d, &[&alice, &phone]).await;
+    let (a, ph) = (iref(&alice), iref(&phone));
+    let group = "group-k_IG4M5ZB8pUePWKPmQjxDrybcDVYQ6vlTHsUUggPNA";
+    assert!(
+        super::group_id::is_group_ref(group),
+        "I4348 premise: a group-ref"
+    );
+    let payload = |scope: &str, owner: &str| {
+        let row = KeyGrantRow {
+            axis: KeyGrantAxis::Content {
+                at_rest_sha256: hex::encode([0x63; 32]),
+                cohort_scope: scope.into(),
+                owner_key_id: owner.to_owned(),
+            },
+            wrap: GrantWrap {
+                recipient_key_id: ph.clone(),
+                wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.to_owned(),
+                wrapped_dek: "{\"v\":2,\"ct\":\"AAAA\"}".to_owned(),
+            },
+        };
+        key_grant_payload(&a, &row, now_ms()).unwrap()
+    };
+    let says_owner = |e: &Error| e.to_string().contains("malformed:owner");
+    for scope in ["self", "family", "community", "affiliations"] {
+        let (right, crossed) = if scope == "self" {
+            (a.as_str(), group)
+        } else {
+            (group, a.as_str())
+        };
+        // The crossed pairing: refused by name, nothing kept. Built from the
+        // matching payload with `owner` alone crossed, so the placement's
+        // target member (family_id / community_id) stays the group and only
+        // the owner form is wrong.
+        let st = sign(
+            &alice,
+            &ph,
+            KEY_GRANT_PREFIX,
+            &with_member(&payload(scope, right), "owner", Value::Text(crossed.into())),
+        );
+        let e = put(d, &st)
+            .await
+            .expect_err("I4348: a crossed owner form is refused");
+        assert_eq!(
+            reason(&e),
+            malformed_row::EDITION2_PAYLOAD_INVALID,
+            "I4348 {scope} × {crossed}: {e}"
+        );
+        assert!(
+            says_owner(&e),
+            "I4348 {scope} × {crossed}: malformed:owner: {e}"
+        );
+        assert!(!kept(d, &st).await, "I4348 {scope}: nothing kept");
+        // The matching pairing: never refused for its owner form.
+        let st = sign(&alice, &ph, KEY_GRANT_PREFIX, &payload(scope, right));
+        if let Err(e) = put(d, &st).await {
+            assert!(
+                !says_owner(&e),
+                "I4348 {scope} × {right}: the matching form is not an owner refusal: {e}"
+            );
+        }
+    }
 }
 
 /// I3192 (T2-fix7; E8-fix2's residual, BLOB_ENCRYPTION_AT_REST §11.5) —
@@ -2131,6 +2209,21 @@ async fn i3153_i3156_revocation_postgres() {
         return;
     };
     Box::pin(revocation_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i4348_a_key_grant_owner_form_follows_its_placement_sqlite() {
+    Box::pin(key_grant_owner_form_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i4348_a_key_grant_owner_form_follows_its_placement_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(key_grant_owner_form_body(&b)).await;
 }
 
 #[cfg(feature = "sqlite")]

@@ -31,10 +31,11 @@
 //!   `licence_audiences` is the authority's declared choice per class.
 //! - **I1217** — item 3: a re-emission to named readers carries the same
 //!   licence at the same scope, naming its readers.
-//! - **I1218** — item 5: a subject's `withdraws` against `licensure:*` /
-//!   `revocation:*` is refused; the contest path is
-//!   `reconsideration:{grounds}`, filed by the licensee, ruled by the
-//!   authority's set.
+//! - **I1218** — item 5: a subject's `withdraws` against `licensure:*` is
+//!   refused; the contest path is `reconsideration:{grounds}`, filed by the
+//!   licensee, ruled by the authority's set. v62.0.0 (KR-fix43): the
+//!   authority's `revocation:*` of the licensee's KEY is refused, even under
+//!   a root's `slash` (a key revokes only itself, CC 2.4.1.1).
 //! - **I1219** — #1062: an owner-binding that names an affiliation is
 //!   cosigned under its protocol; `affiliation_of_binding` reads it.
 //! - **I1220** — #1049: a consent row's `grant` chain is judged at its signed
@@ -1457,15 +1458,16 @@ pub mod bodies {
         .await;
         let at = base() - Duration::minutes(30);
         let named = |row: Attestation| placed(row, "federation", &[&holder]);
-        // v62.0.0 (LF-fix1; CIRISPersist#596 item 1) — the board's adverse
-        // row below is a `revocation:{entity_type}:{reason}` about a KEYED
-        // subject: the typed revocation plane, whose door asks the revoker's
-        // `slash` conferral from a root THIS node trusts
-        // (`check_revocation_authority`). So the runner gives the backend a
-        // node identity, the node holds a ROOTED trust root (W1b), and the
-        // root confers `slash` on the board with the board's own voice
-        // (`put_conferral`). Postcondition: the conferral reaches the root
-        // through this node, so a fixture that confers nothing fails here.
+        // v62.0.0 (KR-fix43; CC 2.4.1.1 "Who may revoke a key") — the board's
+        // adverse row below is a `revocation:{entity_type}:{reason}` about a
+        // KEYED subject (the holder): the typed revocation plane, where a key
+        // revokes only itself. Until KR-fix43 the door admitted it when the
+        // revoker held `slash` from a root this node trusts (LF-fix1 gave the
+        // board that conferral so the revocation concluded). That arm is
+        // deleted. The conferral is KEPT below as the adversarial
+        // precondition: even WITH a root's `slash` that reaches the root
+        // through this node, the board's revocation of the holder's key is
+        // REFUSED. Re-adding the arm turns this leg red.
         {
             use crate::federation::admission::DELEGATION_SCOPE_SLASH;
             use crate::federation::edition2::fixture_switch as e2;
@@ -1496,10 +1498,10 @@ pub mod bodies {
             .await
             .expect("capability_roots_to_trusted_root");
             assert!(
-                rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
+                rooted.as_ref().is_some_and(|g| g.root_key_id == r.lineage),
                 "[{tag}] I1218 precondition: the board's slash roots at {} through this node: \
                  {rooted:?}",
-                r.root
+                r.lineage
             );
         }
         let lic = must_put(
@@ -1512,53 +1514,52 @@ pub mod bodies {
         // carries its `revoked_at` and `effective_at` (both required, CC
         // rc21; `edition2::payloads`).
         let revoked = crate::federation::licensure_chain_invariants::bodies::rfc3339(at);
-        // v62.0.0 (LF-fix1) — a revocation about a keyed subject is the typed
-        // revocation plane's (`edition2::typed`): it lands as the
-        // [`Revocation`](crate::federation::Revocation) it states, held under
-        // the subject's key digest, and its statement; no row of the
-        // attestation plane carries its id. So the witness reads the door's
-        // outcome and the plane, not `get_attestation`.
-        let (adverse, adverse_out) = crate::federation::licensure_chain_invariants::bodies::offer(
-            d,
-            &named(with(
+        // v62.0.0 (KR-fix43) — the board's revocation about the holder's key:
+        // REFUSED by the one token, never held, and nothing lands on the
+        // revocation plane under the holder's key (before KR-fix43 it
+        // concluded there, under the board's `slash`).
+        let adverse = named(with(
+            with(
                 with(
                     with(
                         with(
-                            with(
-                                licence(&board, &holder, &board, "issued", None, at),
-                                "dimension",
-                                serde_json::json!("revocation:agent:misconduct:v1"),
-                            ),
-                            "score",
-                            serde_json::json!(-1.0),
+                            licence(&board, &holder, &board, "issued", None, at),
+                            "dimension",
+                            serde_json::json!("revocation:agent:misconduct:v1"),
                         ),
-                        "status",
-                        serde_json::Value::Null,
+                        "score",
+                        serde_json::json!(-1.0),
                     ),
-                    "revoked_at",
-                    revoked.clone(),
+                    "status",
+                    serde_json::Value::Null,
                 ),
-                "effective_at",
-                revoked,
-            )),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("[{tag}] I1218 a revocation row about the holder: {e}"));
-        if !matches!(adverse_out, Some(StatementOutcome::Row { .. })) {
-            let why = match &adverse_out {
-                Some(StatementOutcome::Pending { row_id, .. }) => {
-                    crate::federation::edition2::fold::why_held(d, row_id)
-                        .await
-                        .unwrap()
-                        .map(|h| format!("{}: {}", h.reason, h.detail))
-                }
-                _ => None,
-            };
-            panic!(
-                "[{tag}] I1218: the board's revocation must conclude (its slash is conferred): \
-                 {adverse_out:?}, held {why:?}"
-            );
-        }
+                "revoked_at",
+                revoked.clone(),
+            ),
+            "effective_at",
+            revoked,
+        ));
+        let refusal = crate::federation::licensure_chain_invariants::bodies::offer(d, &adverse)
+            .await
+            .expect_err("I1218: the board's revocation of the holder's key is refused");
+        assert_eq!(
+            refusal.kind(),
+            "federation_delegated_scope_unauthorized",
+            "[{tag}] I1218: a revocation of another's key is refused (KR-fix43): {refusal:?}"
+        );
+        let adverse_id = crate::federation::edition2::fixture_switch::rid(&adverse);
+        assert!(
+            crate::federation::edition2::fold::why_held(
+                d,
+                &crate::federation::edition2::names::RowId(
+                    crate::federation::edition2::fixture_switch::rid_digest(&adverse)
+                ),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "[{tag}] I1218: the refused revocation is not held"
+        );
         let holder_digest = {
             let rec = d
                 .lookup_public_key(&key_id(&holder))
@@ -1572,8 +1573,15 @@ pub mod bodies {
             .to_hex()
         };
         assert!(
-            revocation_held(d, &holder_digest, &adverse.attestation_id).await,
-            "[{tag}] I1218: the revocation is held on its plane, under the holder's key"
+            !revocation_held(d, &holder_digest, &adverse_id).await,
+            "[{tag}] I1218: nothing lands on the revocation plane under the holder's key"
+        );
+        assert!(
+            d.revocations_for_subject(&holder_digest)
+                .await
+                .unwrap()
+                .is_empty(),
+            "[{tag}] I1218: the holder's key is revoked by nobody"
         );
         let benign = must_put(
             d,
@@ -1593,8 +1601,10 @@ pub mod bodies {
             w.attestation_type = attestation_type::WITHDRAWS.to_owned();
             with(w, "references_attestation_id", serde_json::json!(target))
         };
-        // The subject may not withdraw a licence or a revocation about
-        // itself. Kills: the carve-out missing `licensure:` / `revocation:`.
+        // The subject may not withdraw a licence about itself. Kills: the
+        // carve-out missing `licensure:`. (KR-fix43: the `revocation:` half
+        // of the carve-out has no third-party revocation left to witness it
+        // on; see the DELETED note below.)
         // v62.0.0 (LF-fix1; wave GC1, CC 2.7.3) — the verdict over a HELD
         // target reads that other row, so the door HOLDS a withdraws its
         // issuer has no standing for (`withdraws_not_admitted`) instead of
@@ -1615,61 +1625,13 @@ pub mod bodies {
                 .is_some(),
             "[{tag}] I1218: the licence stands"
         );
-        // The revocation: its subject's withdraws concludes nothing, and the
-        // revocation stands (CC 2.4.1.1: an entity revocation is withdrawn by
-        // nobody). The typed plane holds no attestation row under the
-        // statement's id; v62.0.0 (LF-fix2, P5) the withdraws gate reads the
-        // statement store under it and SETTLES `withdraws_not_admitted` (it
-        // waited `link_unheld` forever).
-        // Strict (LF-fix2): the door's own outcome is HELD, the fold's reason
-        // is exactly `withdraws_not_admitted`, nothing concludes, and the held
-        // set (the pending sweep's input) carries it settled, never waiting.
-        {
-            use crate::federation::edition2::fold::{self, reason};
-            let (w, out) = crate::federation::licensure_chain_invariants::bodies::offer(
-                d,
-                &withdraw(&holder, &adverse.attestation_id, 20),
-            )
-            .await
-            .unwrap_or_else(|e| {
-                panic!("[{tag}] I1218: the subject's withdraws of the revocation is held: {e}")
-            });
-            let Some(StatementOutcome::Pending { row_id: wid, .. }) = out else {
-                panic!(
-                    "[{tag}] I1218: a subject's withdraws against revocation concludes nothing: \
-                     {out:?}"
-                );
-            };
-            assert_eq!(
-                fold::why_held(d, &wid).await.unwrap().map(|h| h.reason),
-                Some(reason::WITHDRAWS_NOT_ADMITTED.to_owned()),
-                "[{tag}] I1218: a subject's withdraws against revocation settles not admitted"
-            );
-            assert!(
-                d.get_attestation(&w.attestation_id)
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "[{tag}] I1218: the withdraws concludes nothing"
-            );
-            fold::refold_all(d)
-                .await
-                .unwrap_or_else(|e| panic!("[{tag}] I1218: refold_all: {e:?}"));
-            let page = fold::held_rows(d, None, fold::MAX_HELD_PAGE).await.unwrap();
-            let entry = page
-                .iter()
-                .find(|h| h.row_id == wid)
-                .unwrap_or_else(|| panic!("[{tag}] I1218: the settled withdraws is held"));
-            assert_eq!(
-                entry.reason,
-                reason::WITHDRAWS_NOT_ADMITTED,
-                "[{tag}] I1218: the held set carries the settle, never `link_unheld`"
-            );
-        }
-        assert!(
-            revocation_held(d, &holder_digest, &adverse.attestation_id).await,
-            "[{tag}] I1218: the revocation stands after its subject's withdraws"
-        );
+        // DELETED (KR-fix43): "a subject's withdraws of a revocation about
+        // itself is refused `withdraws_never_retracts`, and the revocation
+        // stands". Its premise was a THIRD party's revocation of the
+        // subject's key, which no longer lands. The only revocation of a key
+        // is the key's own, so subject and signer are one: that a revocation
+        // is withdrawn by nobody, its own signer included (CC 2.4.1.1), is
+        // I2115 (edition2/composer_invariants.rs, sqlite + postgres).
         // Control: the subject may withdraw a benign row about itself (rule 2).
         must_put(
             d,

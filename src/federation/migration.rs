@@ -605,6 +605,9 @@ impl ExclusionClass {
 /// the protective direction). It inherits the refusal from this table, on
 /// both purge doors and on the serve read, rather than from a special case in
 /// any door.
+///
+/// Replaced by the family model's `accountability_record` column when
+/// CIRISConstitution adds it (after v62.0).
 pub const ACCOUNTABILITY_RECORD_PREFIXES: &[&str] = &[
     "revocation:",
     "key:revocation",
@@ -734,16 +737,16 @@ pub fn check_purge_admission(row: &Attestation) -> Result<(), Error> {
 ///
 /// # Which rows, and what breaks
 ///
-/// The field is authority-bearing on attestation rows in four places, and every
+/// The field was authority-bearing on attestation rows in four places (one is
+/// deleted, below), and every
 /// one of them counts DISTINCT VERIFIED co-signatures through the single shared
 /// body [`count_distinct_roster_scrubs`](super::reverse_quorum):
 ///
 /// - [`trust_root::family_quorum_over`](super::trust_root) — the FAMILY CHARTER
 ///   quorum. Losing co-scrubs here means the charter no longer reaches its
 ///   threshold and the node's constitutional trust root stops validating.
-/// - [`reverse_quorum`](super::reverse_quorum) — the m-of-n UNDO half of the
-///   reverse quorum (`objection:dismissed:v1`). A dismissal below threshold is
-///   not counted, so the objection stands.
+/// - (v62.0.0, KR-fix35: deleted) the reverse quorum's m-of-n UNDO
+///   (`objection:dismissed:v1`); a held dismissal now lifts nothing.
 /// - [`ownership_reclaim`](super::ownership_reclaim) — the WA finding that
 ///   authorizes a CC 3.2 reclaim, and the node's own co-signature on the fresh
 ///   post-reclaim owner-binding.
@@ -1723,10 +1726,9 @@ mod tests {
             "d1",
             "me",
             attestation_type::SCORES,
-            env(
-                crate::federation::reverse_quorum::DIMENSION_DISMISSAL,
-                Some("obj-1"),
-            ),
+            // KR-fix35: the dismissal family is deleted from
+            // `reverse_quorum`; an earlier-form row of it is the example.
+            env("objection:dismissed:v1", Some("obj-1")),
         );
         r.additional_scrubs = vec![
             crate::federation::types::ScrubSig {

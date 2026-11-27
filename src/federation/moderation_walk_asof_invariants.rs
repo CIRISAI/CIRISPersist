@@ -402,6 +402,7 @@ pub mod bodies {
                 effective_at: at,
                 role: role.map(str::to_owned),
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         );
         let h = head(dir, here).await;
@@ -431,6 +432,7 @@ pub mod bodies {
                 reason: reason.map(str::to_owned),
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         );
         let h = head(dir, here).await;

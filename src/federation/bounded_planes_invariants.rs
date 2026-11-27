@@ -131,10 +131,7 @@ pub(crate) mod bodies {
         let _ = read_probe::take();
         crate::federation::reverse_quorum::resolve_reverse_quorum_with(
             d,
-            crate::federation::cohort::Cohort::Community,
-            &other,
             vec![],
-            None,
             None,
             &crate::federation::key_person::NO_KEY_SELVES,
             action,

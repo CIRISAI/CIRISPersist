@@ -99,6 +99,7 @@ pub(crate) mod bodies {
                 reason: None,
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         );
         for c in &signers[1..] {
@@ -156,7 +157,8 @@ pub(crate) mod bodies {
             id_of(&solo),
             id_of(&pair),
         );
-        found_room_with_blob(
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let solo = found_room_with_blob(
             d,
             &solo,
             "founder_only",
@@ -301,7 +303,8 @@ pub(crate) mod bodies {
         let k = |n: &str| format!("i1514-{n}-{s}");
         let (a, b, j, room, fam) = (k("a"), k("b"), k("j"), k("room"), k("fam"));
         reg(d, &[&a, &b, &j, &room, &fam]).await;
-        found_community(d, &room, "unanimous", &[&a, &b], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let room = found_community(d, &room, "unanimous", &[&a, &b], &[])
             .await
             .unwrap();
         let rec = record_row(d, &room, cohort_scope::COMMUNITY).await;
@@ -377,7 +380,8 @@ pub(crate) mod bodies {
         for n in [a, b] {
             reg(n, &[&f, &g, &stranger, &room]).await;
         }
-        found_community(a, &room, "unanimous", &[&f, &g], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let room = found_community(a, &room, "unanimous", &[&f, &g], &[])
             .await
             .unwrap();
         let rec = record_row(a, &room, cohort_scope::COMMUNITY).await;

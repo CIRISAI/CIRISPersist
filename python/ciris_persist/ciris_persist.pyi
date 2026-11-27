@@ -1674,27 +1674,21 @@ class Engine:
         """
 
     def resolve_reverse_quorum_json(self, cohort: str, cohort_key_id: str, action_attestation_id: str, now: str | None = None) -> str:
-        """CIRISServer#356 — **is a brake active on this action, and did the
-        duty-holders answer?**
+        """CIRISServer#356 — **is a brake active on this action?**
 
-        One call for both reverse-quorum signals, because they are already one
-        fold. The payload carries ``standing`` -- *does the action stand?*
+        The payload carries ``standing`` -- *does the action stand?*
         (``"not_governed"`` / ``"window_open"`` / ``"stood"`` /
-        ``"reversed"``), with ``distinct_objectors``, ``required``,
-        ``roster_size`` and the counted/dismissed objection ids beside it --
-        and ``escalation[]``, one record per objection, each carrying
-        ``steward``: *did the people carrying the duty answer?*
+        ``"reversed"``) -- with ``policy`` (absent when not governed),
+        ``distinct_objectors``, ``required``, ``roster_size``,
+        ``window_opens_at``, ``window_closes_at``, ``window_open`` and
+        ``counted_objection_ids`` beside it.
 
-        **``steward`` has three separate zeroes and they do not share a
-        token.** ``"silent"`` (nobody answered), ``"overruled"`` (somebody
-        answered, but the answer was an undo, and undos are never unilateral)
-        and ``"no_duty_holders"`` (there was nobody to answer) all open
-        escalation and are three different diagnoses of *why*. Mapping them to
-        one value re-introduces the defect the type was built to prevent: a
-        failing commons and a healthy one must not read identically.
-        ``"awaiting"`` is **not** a zero -- it is the healthy in-progress
-        state, and treating it as silence escalates every objection the moment
-        it is raised.
+        v62.0.0: a clean break. ``dismissed_objection_ids``,
+        ``steward_deadline``, ``escalation[]`` and
+        ``escalated_dismissed_objection_ids`` are gone with the dismissal, the
+        ballots and the steward tier. A cohort whose ``consensus_protocol``
+        still carries ``+escalate:`` is read without refusal and folds as its
+        base form; ``policy`` names the base form.
 
         ``cohort`` is ``"self"`` / ``"family"`` / ``"community"`` /
         ``"affiliations"``. An ``action_attestation_id`` this node does not
@@ -1706,9 +1700,8 @@ class Engine:
         ``json.loads`` it.
 
         ``now`` is RFC 3339, defaulting to the current instant.
-        **Clock-dependent**: the objection window and the steward deadline both
-        close on elapsed time, with no new row. Read-only -- the objected-to
-        row is never touched.
+        **Clock-dependent**: the objection window closes on elapsed time, with
+        no new row. Read-only -- the objected-to row is never touched.
         """
 
     def resolve_scoped_consent_by_principals(self, target_key_id: str, subject_key_id: str, scope: str, qualifier: str | None = None, now_iso: str | None = None) -> str:

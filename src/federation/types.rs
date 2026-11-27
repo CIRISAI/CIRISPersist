@@ -889,6 +889,12 @@ pub mod delegation_scope {
     /// `content_class:*` emitter must hold before this node will honour a
     /// WITHDRAWAL that clears a flag the emitter did not raise.
     ///
+    /// v62.0.0 (KR-fix46; Constitution's ruling on F2) — NO SUCH DUTY: no door
+    /// and no read asks this scope any more (the `content_class` fold's arm is
+    /// deleted; a flag is withdrawn by rule 1 / 2 / 0 like any row). The
+    /// constant stays in the classified scope lists (appended vocabulary,
+    /// pinned by position) until the scope vocabulary is re-cut.
+    ///
     /// The scope
     /// [`resolve_content_class_flag`](crate::federation::FederationDirectory::resolve_content_class_flag)
     /// resolves at USE, through
@@ -1363,6 +1369,38 @@ pub mod delegation_scope {
             "v60.0.0 (CIRISPersist#1036 item 3) — a REFUSAL REASON of \
              `licence_audience_refused` (a licence placed at another cohort scope than the one \
              its class is declared at), not a delegates_to scope value",
+        ),
+        (
+            "admission::CONFERRAL_OUTSIDE_CHARTER_SCOPE",
+            "v62.0.0 — a REFUSAL TOKEN (a root grant whose scope the charter of the bundle it names does not cover, CC 4.4.3.19), not a delegates_to scope value",
+        ),
+        (
+            "trust_root::CAPABILITY_SCOPE_FAMILY_UNREGISTERED",
+            "v62.0.0 — a REFUSAL TOKEN (an `infra:attest:{family}` sub-scope naming no registered family, CC 4.5.5), not a delegates_to scope value",
+        ),
+        (
+            "trust_root::CAPABILITY_SCOPE_UNCONFERRED",
+            "v62.0.0 — a HOLD REASON (a capability-scoped act whose signer holds no conferral), not a delegates_to scope value",
+        ),
+        (
+            "fold::DELEGATED_SCOPE_UNAUTHORIZED",
+            "v62.0.0 — a HOLD REASON (a duty the signer holds no chain for), not a delegates_to scope value",
+        ),
+        (
+            "fold::CUSTODY_ACK_SCOPE_MISMATCH",
+            "v62.0.0 — a HOLD REASON, the fold's name for `holding_claim::CUSTODY_ACK_SCOPE_MISMATCH` (a holding claim placed at another cohort scope than its content's), not a delegates_to scope value",
+        ),
+        (
+            "fold::MEMBERSHIP_PROPOSER_OUT_OF_SCOPE",
+            "v62.0.0 — a HOLD REASON (a proposal whose signer the held group's write scope does not admit), not a delegates_to scope value; `scope` is the group's write scope",
+        ),
+        (
+            "fold::SCOPE_MEMBERSHIP_UNRESOLVED",
+            "v62.0.0 — a HOLD REASON (a listing whose room record is not held yet), not a delegates_to scope value; `scope` is the cohort scope",
+        ),
+        (
+            "fold::WRITE_SCOPE_REFUSED",
+            "v62.0.0 — a HOLD REASON (a write outside the cohort the writer holds a seat in), not a delegates_to scope value; `scope` is the cohort scope",
         ),
     ];
 
@@ -3645,6 +3683,17 @@ pub struct FamilyMembershipRevocation {
     pub witness_set: Vec<String>,
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
     pub persist_row_hash: String,
+    /// **Node-computed, never signed.** v62.0.0 (KR-fix34b; PRE4-V300-a) —
+    /// the edition-2 ROW ID of the counted membership change this record is
+    /// the typed projection of (`ceg_statements`), the id a reverse-quorum
+    /// objection names in `refs.answers`. `None` for a record no edition-2
+    /// row concluded (the earlier form). Stored in the V300 `record_row_id`
+    /// column. Serialized when present (a proxied directory carries it; a
+    /// row id is the same on every node), and removed from both the signing
+    /// envelope and the `persist_row_hash` input
+    /// ([`compute_persist_row_hash`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_row_id: Option<[u8; 32]>,
 }
 
 impl FamilyMembershipRevocation {
@@ -3660,6 +3709,8 @@ impl FamilyMembershipRevocation {
             serde_json::to_value(self).expect("FamilyMembershipRevocation always serializes");
         if let Some(obj) = v.as_object_mut() {
             obj.remove("persist_row_hash");
+            // v62.0.0 (KR-fix34b) — node-computed, never signed.
+            obj.remove("record_row_id");
         }
         v
     }
@@ -3738,6 +3789,17 @@ pub struct CommunityMembershipRevocation {
     pub witness_set: Vec<String>,
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
     pub persist_row_hash: String,
+    /// **Node-computed, never signed.** v62.0.0 (KR-fix34b; PRE4-V300-a) —
+    /// the edition-2 ROW ID of the counted membership change this record is
+    /// the typed projection of (`ceg_statements`), the id a reverse-quorum
+    /// objection names in `refs.answers`. `None` for a record no edition-2
+    /// row concluded (the earlier form). Stored in the V300 `record_row_id`
+    /// column. Serialized when present (a proxied directory carries it; a
+    /// row id is the same on every node), and removed from both the signing
+    /// envelope and the `persist_row_hash` input
+    /// ([`compute_persist_row_hash`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_row_id: Option<[u8; 32]>,
 }
 
 impl CommunityMembershipRevocation {
@@ -3752,6 +3814,8 @@ impl CommunityMembershipRevocation {
             serde_json::to_value(self).expect("CommunityMembershipRevocation always serializes");
         if let Some(obj) = v.as_object_mut() {
             obj.remove("persist_row_hash");
+            // v62.0.0 (KR-fix34b) — node-computed, never signed.
+            obj.remove("record_row_id");
         }
         v
     }
@@ -4286,6 +4350,17 @@ pub struct CommunityMembershipWidening {
     pub role: Option<String>,
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
     pub persist_row_hash: String,
+    /// **Node-computed, never signed.** v62.0.0 (KR-fix34b; PRE4-V300-a) —
+    /// the edition-2 ROW ID of the counted membership change this record is
+    /// the typed projection of (`ceg_statements`), the id a reverse-quorum
+    /// objection names in `refs.answers`. `None` for a record no edition-2
+    /// row concluded (the earlier form). Stored in the V300 `record_row_id`
+    /// column. Serialized when present (a proxied directory carries it; a
+    /// row id is the same on every node), and removed from both the signing
+    /// envelope and the `persist_row_hash` input
+    /// ([`compute_persist_row_hash`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_row_id: Option<[u8; 32]>,
 }
 
 impl CommunityMembershipWidening {
@@ -4296,6 +4371,8 @@ impl CommunityMembershipWidening {
             serde_json::to_value(self).expect("CommunityMembershipWidening always serializes");
         if let Some(obj) = v.as_object_mut() {
             obj.remove("persist_row_hash");
+            // v62.0.0 (KR-fix34b) — node-computed, never signed.
+            obj.remove("record_row_id");
         }
         v
     }
@@ -5303,6 +5380,10 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
     if let Some(obj) = value.as_object_mut() {
         obj.remove("persist_row_hash");
         obj.remove("consent_role");
+        // v62.0.0 (KR-fix34b) — a membership record's node-computed row id
+        // (`record_row_id`) is no part of what was signed: a record hashes
+        // the same with it or without it.
+        obj.remove("record_row_id");
     }
     // v31.0.0 (CIRISPersist#646) — TRUNCATE EVERY INSTANT TO MICROSECONDS
     // BEFORE HASHING. See `truncate_instants_to_microseconds`.
@@ -6321,6 +6402,17 @@ pub struct FamilyMembershipWidening {
     pub role: Option<String>,
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
     pub persist_row_hash: String,
+    /// **Node-computed, never signed.** v62.0.0 (KR-fix34b; PRE4-V300-a) —
+    /// the edition-2 ROW ID of the counted membership change this record is
+    /// the typed projection of (`ceg_statements`), the id a reverse-quorum
+    /// objection names in `refs.answers`. `None` for a record no edition-2
+    /// row concluded (the earlier form). Stored in the V300 `record_row_id`
+    /// column. Serialized when present (a proxied directory carries it; a
+    /// row id is the same on every node), and removed from both the signing
+    /// envelope and the `persist_row_hash` input
+    /// ([`compute_persist_row_hash`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_row_id: Option<[u8; 32]>,
 }
 
 impl FamilyMembershipWidening {
@@ -6330,6 +6422,8 @@ impl FamilyMembershipWidening {
         let mut v = serde_json::to_value(self).expect("FamilyMembershipWidening always serializes");
         if let Some(obj) = v.as_object_mut() {
             obj.remove("persist_row_hash");
+            // v62.0.0 (KR-fix34b) — node-computed, never signed.
+            obj.remove("record_row_id");
         }
         v
     }

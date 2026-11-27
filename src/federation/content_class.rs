@@ -1,6 +1,16 @@
 //! v31.0.0 (CIRISPersist#612, CC 4.5.13 / CC 3.3.12 / CC 3.4.14) — the
-//! **`content_class:*` flag-plane read predicate**, and the conferral that
-//! makes its clearing arm safe to federate.
+//! **`content_class:*` flag-plane read predicate**.
+//!
+//! v62.0.0 (KR-fix46; Constitution's ruling on F2, 11-24) — `content_class:*`
+//! is an unreserved open-vocabulary family with NO duty at its door: there is
+//! no `infra:classify_content` duty. The conferral arm described below
+//! (a withdrawal clearing another emitter's flag only from a key holding
+//! `infra:classify_content` from a root this node trusts) is DELETED. A flag
+//! is withdrawn by the rules every row is withdrawn by (CC 2.4.1.1: rule 1 its
+//! author, rule 2 a subject it names, rule 0 the same count where it was a
+//! room's counted act), judged at the door when the `withdraws` / `recants`
+//! arrives and read here through the one consolidated retraction fold
+//! (`precedence::retired_ids`). The history below is kept as it was written.
 //!
 //! # The defect this closes
 //!
@@ -35,7 +45,7 @@
 //! |---|---|---|
 //! | **raise** — a `content_class:{class}` row | withhold (fail-CLOSED) | **any** emitter |
 //! | **retract own raise** — the same emitter's later `withdrawn: true` | back to status quo ante | **any** emitter |
-//! | **clear ANOTHER emitter's flag** | reveal (fail-OPEN) | only a holder of [`INFRA_CLASSIFY_CONTENT`] conferred by a root **this node** trusts |
+//! | **clear ANOTHER emitter's flag** | reveal (fail-OPEN) | v31: only a holder of `infra:classify_content` conferred by a root **this node** trusts; v62.0.0 (KR-fix46): nobody by a `withdrawn` marking: an admitted `withdraws` / `recants` under the generic rules (rule 1 / 2 / 0) |
 //!
 //! Filtering RAISES by conferral would be the fail-open mistake in reverse: an
 //! unconferred stranger's protective flag would silently vanish from the read,
@@ -64,12 +74,9 @@
 //!
 //! It does not adjudicate. CC 3.4.14 R5 puts a false or stripped marking in
 //! front of a WA quorum on the `hard_case:*` evidence floor; the substrate
-//! observes. Nor does it fold `withdraws`/`recants` **tombstones** on flag rows
-//! — only the envelope's `withdrawn` field, which is the mechanism the flag
-//! plane actually uses. Ignoring tombstones is fail-CLOSED in both directions (a
-//! tombstoned raise still reads as raised, and a stranger's tombstone on someone
-//! else's raise buys nothing), so the omission over-withholds rather than
-//! over-reveals.
+//! observes. v62.0.0 (KR-fix46): it now DOES fold `withdraws` / `recants` on
+//! flag rows, through `precedence::retired_ids` (the door admitted each under
+//! rule 1 / 2 / 0; the fold's own entitlement check drops one that is not).
 
 use std::collections::BTreeMap;
 
@@ -104,16 +111,15 @@ pub struct ContentClassFlag {
     /// Emitters whose latest live row on this dimension is a raise that has not
     /// been cleared by an authoritative withdrawal. Sorted, deduped.
     pub raised_by: Vec<String>,
-    /// The emitter whose conferred withdrawal cleared the plane (the LATEST
-    /// such, when several hold the scope), if any. `Some` with `flagged == true`
-    /// means a raise landed AFTER the clear — latest-wins, in the protective
-    /// direction.
-    pub cleared_by: Option<String>,
-    /// Emitters whose withdrawal was **not** honoured as authority over other
-    /// emitters' markings, for want of a conferred
-    /// [`INFRA_CLASSIFY_CONTENT`](super::types::delegation_scope::INFRA_CLASSIFY_CONTENT).
-    /// Such a row still cancels that emitter's OWN prior raise (per-emitter
-    /// latest-wins); what it cannot do is clear anyone else's. Sorted, deduped.
+    /// v62.0.0 (KR-fix46; replaces `cleared_by`, a clean break) — the row ids
+    /// of RAISES retired by an admitted `withdraws` / `recants` (rule 1 its
+    /// author, rule 2 a subject it names, rule 0 the same count), through the
+    /// consolidated retraction fold. Sorted, deduped.
+    pub retired_raises: Vec<String>,
+    /// Emitters whose latest row is a `withdrawn` marking while another
+    /// emitter's raise stands: it cancels that emitter's OWN prior raise
+    /// (per-emitter latest-wins) and clears nobody else's. v62.0.0 (KR-fix46):
+    /// no key holds a duty over another's flag. Sorted.
     pub refused_withdrawals: Vec<String>,
 }
 
@@ -137,10 +143,10 @@ pub fn is_withdrawal(att: &Attestation) -> bool {
 }
 
 /// v31.0.0 (CIRISPersist#612) — fold the `content_class` flag plane named by
-/// `dimension` for `subject_key_id`, honouring a cross-emitter clear only from a
-/// key holding
-/// [`INFRA_CLASSIFY_CONTENT`](super::types::delegation_scope::INFRA_CLASSIFY_CONTENT)
-/// from a trust root **this directory's own node** accepts.
+/// `dimension` for `subject_key_id`. v62.0.0 (KR-fix46): a raise stands until
+/// its emitter's own later `withdrawn` row, or until an admitted `withdraws` /
+/// `recants` retires it under the rules every row is withdrawn by; no
+/// conferral is asked (the `infra:classify_content` arm is deleted).
 ///
 /// See the [module docs](self) for the asymmetry this implements and why it is
 /// asymmetric. The backing read is
@@ -155,11 +161,6 @@ pub fn is_withdrawal(att: &Attestation) -> bool {
 ///   a caller asking this fold about `consent:state:` or a bare
 ///   `content_class:` stem is asking the wrong question, and answering it would
 ///   fuse two vocabularies.
-/// - [`Error::NodeIdentityUnset`] if the directory does not know which key it
-///   is. The conferral is resolved against **this node's** trust root, so
-///   without an identity there is no question to answer — and a silent
-///   `flagged: false` would be indistinguishable from "nothing flagged", which
-///   is the exact confusion #611 rejected for the publisher chain.
 /// - Any backend / walk error propagates. A caller that cannot complete the
 ///   fold must withhold.
 pub async fn resolve_content_class_flag<F>(
@@ -178,14 +179,6 @@ where
              would read CC 3.4.14 R1's mandatory `content_class:generated` marking as a flag."
         )));
     }
-    // Resolved against THIS node's trust root, so the directory must know who it
-    // is — the #611 decision, applied to the second read door of its class.
-    let node = directory.node_key_id().ok_or(Error::NodeIdentityUnset {
-        method: "resolve_content_class_flag",
-        needed_for: "resolving each withdrawing emitter's infra:classify_content conferral \
-                     against this node's own trust root",
-    })?;
-
     // The subject's `scores` rows on exactly this dimension: the only rows
     // the latest-wins fold below keeps.
     let mut rows = Vec::new();
@@ -197,9 +190,30 @@ where
         rows.extend(page);
     }
 
-    // Per-emitter latest-wins FIRST. An emitter speaks with one voice on one
-    // dimension: its newest live row is its statement, and a later `withdrawn`
-    // of its own is a retraction that needs no conferral (see the module docs).
+    // v62.0.0 (KR-fix46; Constitution's ruling on F2: there is no
+    // `infra:classify_content` duty) — a flag is WITHDRAWN by the rules every
+    // row is withdrawn by: rule 1 (its author), rule 2 (a subject it names),
+    // rule 0 (the same count where it was the room's counted act). The door
+    // judges each `withdraws` / `recants` under those rules when it arrives;
+    // this read retires a row only through the ONE consolidated retraction
+    // fold every other plane reads (`precedence::retired_ids`, its
+    // entitlement check included). A retired raise is not live.
+    let ids: Vec<String> = rows.iter().map(|r| r.attestation_id.clone()).collect();
+    let composers = if ids.is_empty() {
+        Vec::new()
+    } else {
+        directory
+            .list_composers_referencing_any(&ids, None, None)
+            .await?
+    };
+    let retired = {
+        let refs: Vec<&Attestation> = rows.iter().chain(composers.iter()).collect();
+        super::precedence::retired_ids(&refs)
+    };
+
+    // Per-emitter latest-wins over the live rows. An emitter speaks with one
+    // voice on one dimension: its newest live row is its statement, and a
+    // later `withdrawn` of its own is its own retraction (rule 1's reading).
     let mut latest: BTreeMap<&str, &Attestation> = BTreeMap::new();
     for att in &rows {
         if att.attestation_type != attestation_type::SCORES {
@@ -209,6 +223,9 @@ where
             continue;
         }
         if att.expires_at.is_some_and(|exp| exp <= now) {
+            continue;
+        }
+        if retired.contains(&att.attestation_id) {
             continue;
         }
         latest
@@ -221,53 +238,33 @@ where
             .or_insert(att);
     }
 
-    let mut raises: Vec<(&str, chrono::DateTime<chrono::Utc>)> = Vec::new();
-    let mut withdrawals: Vec<(&str, chrono::DateTime<chrono::Utc>)> = Vec::new();
+    let mut raised_by: Vec<String> = Vec::new();
+    let mut refused_withdrawals: Vec<String> = Vec::new();
+    let any_raise = latest.values().any(|att| !is_withdrawal(att));
     for (emitter, att) in &latest {
         if is_withdrawal(att) {
-            withdrawals.push((emitter, att.asserted_at));
+            // A `withdrawn` row by an emitter whose own raise it is not
+            // clears nothing of anyone else's: no key holds a duty over
+            // another's flag (KR-fix46). Recorded when a raise stands.
+            if any_raise {
+                refused_withdrawals.push((*emitter).to_owned());
+            }
         } else {
-            raises.push((emitter, att.asserted_at));
+            raised_by.push((*emitter).to_owned());
         }
     }
-
-    // The ONE conferral question, asked per withdrawing emitter and never
-    // cached: a conferral withdrawn between two reads must stop clearing on the
-    // second one.
-    let mut cleared_by: Option<String> = None;
-    let mut cleared_at: Option<chrono::DateTime<chrono::Utc>> = None;
-    let mut refused_withdrawals: Vec<String> = Vec::new();
-    for (emitter, at) in &withdrawals {
-        let conferred = super::trust_root::capability_roots_to_trusted_root(
-            directory,
-            &node,
-            emitter,
-            delegation_scope::INFRA_CLASSIFY_CONTENT,
-            crate::host::clock::now(),
-        )
-        .await?;
-        if conferred.is_none() {
-            refused_withdrawals.push((*emitter).to_owned());
-            continue;
-        }
-        if cleared_at.is_none_or(|prev| *at > prev) {
-            cleared_at = Some(*at);
-            cleared_by = Some((*emitter).to_owned());
-        }
-    }
-
-    // A raise NEWER than the authoritative clear stands again — latest-wins, in
-    // the protective direction.
-    let raised_by: Vec<String> = raises
+    let mut retired_raises: Vec<String> = rows
         .iter()
-        .filter(|(_, at)| cleared_at.is_none_or(|c| *at > c))
-        .map(|(emitter, _)| (*emitter).to_owned())
+        .filter(|r| retired.contains(&r.attestation_id) && !is_withdrawal(r))
+        .map(|r| r.attestation_id.clone())
         .collect();
+    retired_raises.sort();
+    retired_raises.dedup();
 
     Ok(ContentClassFlag {
         flagged: !raised_by.is_empty(),
         raised_by,
-        cleared_by,
+        retired_raises,
         refused_withdrawals,
     })
 }
@@ -302,7 +299,7 @@ pub(crate) mod parity_test_support {
         dimension: &str,
         withdrawn: bool,
         at: chrono::DateTime<chrono::Utc>,
-    ) {
+    ) -> crate::federation::Attestation {
         let id = uuid::Uuid::new_v4().to_string();
         let envelope = if withdrawn {
             serde_json::json!({
@@ -347,6 +344,7 @@ pub(crate) mod parity_test_support {
         crate::federation::edition2::fixture_switch::put_signed(dir, &att)
             .await
             .expect("an open-vocabulary content_class row admits from any emitter (#571)");
+        att
     }
 
     async fn fold(
@@ -403,7 +401,7 @@ pub(crate) mod parity_test_support {
 
         // (1) Any emitter may RAISE. An ordinary `agent`-typed key, unconferred
         // — protective, so conferral must NOT be required here.
-        emit(dir, &raiser, &subject, DIM, false, t(1)).await;
+        let first_raise = emit(dir, &raiser, &subject, DIM, false, t(1)).await;
         let raised = fold(dir, &subject, DIM).await;
         assert!(
             raised.flagged && raised.raised_by == vec![kid(&raiser)],
@@ -428,8 +426,8 @@ pub(crate) mod parity_test_support {
             "({tag}) the refusal is legible, not silent: {forged:?}"
         );
         assert!(
-            forged.cleared_by.is_none(),
-            "({tag}) nothing authoritative cleared it: {forged:?}"
+            forged.retired_raises.is_empty(),
+            "({tag}) nothing retired the raise: {forged:?}"
         );
 
         // (3) CC 3.4.14 R1's mandatory `generated` marking rides the SAME
@@ -447,8 +445,10 @@ pub(crate) mod parity_test_support {
             "({tag}) and the `generated` plane folds on its own: {generated:?}"
         );
 
-        // (4) The FEDERATED arm #612 exists for: a peer holding
-        // `infra:classify_content` from a root THIS node accepts clears it.
+        // (4) v62.0.0 (KR-fix46) — no duty clears another's flag: the deleted
+        // arm let a key holding `infra:classify_content` from a root this node
+        // trusts clear it with a `withdrawn` marking. Now a classifier holding
+        // that very conferral clears nothing that way.
         crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
             dir,
             node,
@@ -458,48 +458,66 @@ pub(crate) mod parity_test_support {
         )
         .await;
         emit(dir, &classifier, &subject, DIM, true, t(4)).await;
-        let cleared = fold(dir, &subject, DIM).await;
+        let conferred_try = fold(dir, &subject, DIM).await;
         assert!(
-            !cleared.flagged,
-            "({tag}) a conferred classifier's withdrawal clears the plane: {cleared:?}"
-        );
-        assert_eq!(
-            cleared.cleared_by,
-            Some(kid(&classifier)),
-            "({tag}) and names who cleared it: {cleared:?}"
+            conferred_try.flagged
+                && conferred_try
+                    .refused_withdrawals
+                    .contains(&kid(&classifier)),
+            "({tag}) KR-fix46: a conferred classifier's `withdrawn` marking clears nothing of \
+             another's flag: {conferred_try:?}"
         );
 
-        // (5) A raise NEWER than the authoritative clear stands again —
-        // latest-wins, in the protective direction.
-        emit(dir, &raiser, &subject, DIM, false, t(5)).await;
+        // (5) Rule 2: the SUBJECT the flag names withdraws it (`withdraws`,
+        // admitted under the generic rules); the raise is retired and the
+        // plane is clear.
+        let w = crate::federation::edition2::fixture_switch::composer_of(
+            crate::federation::types::attestation_type::WITHDRAWS,
+            &first_raise,
+            &subject,
+        );
+        crate::federation::edition2::fixture_switch::put_signed(dir, &w)
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) rule 2: the subject's withdraws is admitted: {e}"));
+        let cleared = fold(dir, &subject, DIM).await;
+        assert!(
+            !cleared.flagged && cleared.retired_raises == vec![first_raise.attestation_id.clone()],
+            "({tag}) rule 2: the subject's withdraws retires the raise: {cleared:?}"
+        );
+
+        // (6) A new raise stands again, and rule 1: its AUTHOR's own
+        // `withdraws` retires it. A stranger's `withdraws` of a third raise
+        // retires nothing (refused or held at the door; the fold's own
+        // entitlement check drops it either way).
+        let second = emit(dir, &raiser, &subject, DIM, false, t(5)).await;
         let re_raised = fold(dir, &subject, DIM).await;
         assert!(
             re_raised.flagged && re_raised.raised_by == vec![kid(&raiser)],
-            "({tag}) a raise after the clear re-flags: {re_raised:?}"
+            "({tag}) a new raise re-flags: {re_raised:?}"
         );
-
-        // (6) Scope isolation — the conferral is for THIS token. A classifier
-        // holding `infra:detect` instead could clear a child-safety flag, which
-        // is exactly the reuse #612 declined.
-        let detector = format!("cc-detector-{tag}");
-        register_hybrid_key(dir, &detector).await;
-        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
-            dir,
-            node,
-            &format!("cc-root-{tag}"),
-            &kid(&detector),
-            crate::federation::types::delegation_scope::INFRA_DETECT,
-        )
-        .await;
-        emit(dir, &detector, &subject, DIM, true, t(6)).await;
-        let detect_try = fold(dir, &subject, DIM).await;
-        assert!(
-            detect_try.flagged,
-            "({tag}) `infra:detect` is not classification authority: {detect_try:?}"
+        let own = crate::federation::edition2::fixture_switch::composer_of(
+            crate::federation::types::attestation_type::WITHDRAWS,
+            &second,
+            &raiser,
         );
+        crate::federation::edition2::fixture_switch::put_signed(dir, &own)
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) rule 1: the author's withdraws is admitted: {e}"));
         assert!(
-            detect_try.refused_withdrawals.contains(&kid(&detector)),
-            "({tag}) and the refusal is recorded: {detect_try:?}"
+            !fold(dir, &subject, DIM).await.flagged,
+            "({tag}) rule 1: the author's withdraws retires its raise"
+        );
+        let third = emit(dir, &raiser, &subject, DIM, false, t(6)).await;
+        let foreign = crate::federation::edition2::fixture_switch::composer_of(
+            crate::federation::types::attestation_type::WITHDRAWS,
+            &third,
+            &stranger,
+        );
+        let _ = crate::federation::edition2::fixture_switch::put_signed(dir, &foreign).await;
+        let stands = fold(dir, &subject, DIM).await;
+        assert!(
+            stands.flagged && !stands.retired_raises.contains(&third.attestation_id),
+            "({tag}) a stranger's withdraws retires nobody's flag: {stands:?}"
         );
 
         // (7) The family stem itself is refused — folding it would read CC

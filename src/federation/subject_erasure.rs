@@ -182,6 +182,52 @@ impl ErasureNotice {
     }
 }
 
+/// v62.0.0 (WD-fix1) — the `kind` of a DESCENT's notice: an admitted rule
+/// 1–4 withdrawal's tombstone (`withdrawn_content::descend`). The same
+/// `{kind, withdraws, target}` shape as an erasure, a different kind, so a
+/// peer never applies one as a producer's erasure: a peer descends from the
+/// withdrawal it holds itself (the Engine's sweep), never from a bundle.
+pub const DESCENT_NOTICE_KIND: &str = "withdrawal_descent";
+
+impl ErasureNotice {
+    /// The descent notice for `withdraws` withdrawing `target`.
+    #[must_use]
+    pub fn descent(withdraws_attestation_id: &str, target_attestation_id: &str) -> Self {
+        Self {
+            kind: DESCENT_NOTICE_KIND.to_owned(),
+            withdraws_attestation_id: withdraws_attestation_id.to_owned(),
+            target_attestation_id: target_attestation_id.to_owned(),
+        }
+    }
+}
+
+/// v62.0.0 (WD-fix1) — the notice id of the descent for `withdraws`
+/// withdrawing `target`: deterministic, so the delete door's re-derivation
+/// (`steward_purge::withdrawal_descent_lifts`) and the sweep's "already
+/// descended" read both find it from the two ids alone.
+///
+/// # Errors
+/// The notice does not canonicalize (unreachable for this shape).
+pub fn descent_notice_id(
+    withdraws_attestation_id: &str,
+    target_attestation_id: &str,
+) -> Result<String, Error> {
+    Ok(
+        ErasureNotice::descent(withdraws_attestation_id, target_attestation_id)
+            .jcs_and_id()?
+            .1,
+    )
+}
+
+/// v62.0.0 (WD-fix1) — is `envelope` a DESCENT notice? The Engine's
+/// replicated-bundle dispatch applies none (a peer descends from its own
+/// held withdrawal).
+#[must_use]
+pub fn is_descent_notice_envelope(envelope: &serde_json::Value) -> bool {
+    serde_json::from_value::<ErasureNotice>(envelope.clone())
+        .is_ok_and(|n| n.kind == DESCENT_NOTICE_KIND)
+}
+
 /// Is `envelope` an [`ErasureNotice`]? The Engine's replicated-bundle
 /// dispatch asks this before the steward purge's own verification.
 #[must_use]
@@ -213,15 +259,72 @@ pub fn erasure_execution(
     at: chrono::DateTime<chrono::Utc>,
     finalized_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<(PurgeExecution, PurgeTombstone), Error> {
-    let (notice_jcs, notice_id) =
-        ErasureNotice::new(&citation.withdraws.attestation_id, &citation.target).jcs_and_id()?;
-    let record_id = format!("{}:{}", PurgePlane::Attestation.as_str(), citation.target);
+    let (execution, mut tombstones) = withdrawal_execution(
+        &ErasureNotice::new(&citation.withdraws.attestation_id, &citation.target),
+        &citation.withdraws.attesting_key_id,
+        WITHDRAWS_AUTHORITY,
+        vec![(PurgePlane::Attestation, citation.target.clone(), None)],
+        executed_by,
+        origin,
+        at,
+        finalized_at,
+    )?;
+    let tombstone = tombstones
+        .pop()
+        .ok_or_else(|| Error::Backend("erasure_execution: one record, one tombstone".to_owned()))?;
+    Ok((execution, tombstone))
+}
+
+/// v62.0.0 (WD-fix1) — **the tombstone header and tombstones of a
+/// withdrawal's purge**, the ONE builder an erasure ([`erasure_execution`],
+/// basis [`WITHDRAWS_AUTHORITY`], the target row only) and a descent
+/// (`withdrawn_content::descend`, basis
+/// [`sp::WITHDRAWAL_DESCENT_BASIS`], the target row and the blobs only it
+/// bound) both build with. `records` are `(plane, record_ref, derived_from)`;
+/// each tombstone's ordinal is its record id's index in sorted (JCS) order,
+/// the selection digest is over the same order. `claimant` is the
+/// withdrawal's signer.
+///
+/// # Errors
+///
+/// The notice does not canonicalize.
+#[allow(clippy::too_many_arguments)]
+pub fn withdrawal_execution(
+    notice: &ErasureNotice,
+    claimant: &str,
+    legal_basis: &str,
+    records: Vec<(PurgePlane, String, Option<String>)>,
+    executed_by: &str,
+    origin: &str,
+    at: chrono::DateTime<chrono::Utc>,
+    finalized_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(PurgeExecution, Vec<PurgeTombstone>), Error> {
+    let (notice_jcs, notice_id) = notice.jcs_and_id()?;
+    let mut record_ids: Vec<String> = records
+        .iter()
+        .map(|(p, r, _)| format!("{}:{r}", p.as_str()))
+        .collect();
+    record_ids.sort();
+    record_ids.dedup();
+    let tombstones = records
+        .into_iter()
+        .map(|(plane, record_ref, derived_from)| {
+            let id = format!("{}:{record_ref}", plane.as_str());
+            PurgeTombstone {
+                notice_id: notice_id.clone(),
+                ordinal: record_ids.iter().position(|r| *r == id).unwrap_or(0) as u64,
+                plane,
+                record_ref,
+                derived_from,
+            }
+        })
+        .collect();
     let execution = PurgeExecution {
-        notice_id: notice_id.clone(),
-        selection_digest: sp::selection_digest(&[record_id]),
-        claimant_key_id: citation.withdraws.attesting_key_id.clone(),
-        legal_basis: WITHDRAWS_AUTHORITY.to_owned(),
-        record_count: 1,
+        notice_id,
+        selection_digest: sp::selection_digest(&record_ids),
+        claimant_key_id: claimant.to_owned(),
+        legal_basis: legal_basis.to_owned(),
+        record_count: record_ids.len() as u64,
         notice_jcs,
         cosignatures_json: "[]".to_owned(),
         executed_by: executed_by.to_owned(),
@@ -230,14 +333,7 @@ pub fn erasure_execution(
         admitted_at: at,
         finalized_at,
     };
-    let tombstone = PurgeTombstone {
-        notice_id,
-        ordinal: 0,
-        plane: PurgePlane::Attestation,
-        record_ref: citation.target.clone(),
-        derived_from: None,
-    };
-    Ok((execution, tombstone))
+    Ok((execution, tombstones))
 }
 
 /// **The authority, re-derived**: the first `withdraws` naming `target`
@@ -475,19 +571,29 @@ pub fn withdraws_statement_parts(
 /// detector) signs `sig_structure` and submits `Draft::assemble(signature)`
 /// through the statement door.
 ///
+/// v62.0.0 (KR-fix41; the rule of P/RESIGN-6.md) — the draft names
+/// `signer_kid`, **the key the caller signs with**, not the identity's
+/// genesis kid (`kid_of_identity_ref(iss)`): a producer whose key rotated,
+/// or one signing from a second device, drafts under the key it holds. The
+/// door's one check (`door::require_key_of_iss`) refuses `kid_not_of_iss`
+/// when the key is not `iss`'s. `iss` is form-checked here.
+///
 /// # Errors
 /// As [`withdraws_statement_parts`]; `iss` that is not an identity-ref.
 pub fn withdraws_draft(
     target: &Attestation,
     iss: &str,
+    signer_kid: &ciris_verify_core::edition2::Digest32,
     asserted_at_ms: u64,
 ) -> Result<super::edition2::emit::Draft, Error> {
+    if !ciris_verify_core::edition2::is_identity_ref(iss) {
+        return Err(Error::InvalidArgument(format!(
+            "withdraws_draft: {iss} is not an identity-ref"
+        )));
+    }
     let (sub, family, payload) = withdraws_statement_parts(target, iss, asserted_at_ms)?;
-    let kid = super::edition2::ingest::kid_of_identity_ref(iss).ok_or_else(|| {
-        Error::InvalidArgument(format!("withdraws_draft: {iss} is not an identity-ref"))
-    })?;
     super::edition2::emit::draft_row(
-        &kid,
+        signer_kid,
         iss,
         &sub,
         attestation_type::WITHDRAWS,
