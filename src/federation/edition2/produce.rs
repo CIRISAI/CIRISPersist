@@ -99,6 +99,9 @@ pub async fn signer_identity(signer: &LocalSigner) -> Result<(Digest32, String),
 /// `unexpected:refs`, `unexpected:also`, `malformed:<member>`,
 /// `set_order:<member>`.
 ///
+/// Replaced by a call to Verify's own refs reader once CIRISVerify exports
+/// it (asked for 23.5.1; private at 23.5.0, FS-step3).
+///
 /// # Errors
 /// The label of the first rule broken, in Verify's order.
 pub fn check_refs(v: &Value) -> Result<(), &'static str> {
@@ -127,6 +130,19 @@ pub fn check_refs(v: &Value) -> Result<(), &'static str> {
                     match role.as_text() {
                         Some("ack" | "cites") => {
                             row_ref_set_ok(set, "malformed:also", "set_order:also")?;
+                        }
+                        // v62.0.0 (HEAD-fix1; Constitution's two-standings
+                        // ruling, Verify feat/23.5.1 14a8357) — the FOURTH
+                        // `also` role: a row signed under a root grant names
+                        // the owner's acceptance of the grant, a set of
+                        // exactly one. DELETED AT THE VERIFY 23.6.0 PIN with
+                        // this interim copy (Verify's own `check_refs`
+                        // carries it).
+                        Some("stands_on") => {
+                            row_ref_set_ok(set, "malformed:also", "set_order:also")?;
+                            if set.as_array().map(<[Value]>::len) != Some(1) {
+                                return Err("malformed:also");
+                            }
                         }
                         _ => return Err("unexpected:also"),
                     }

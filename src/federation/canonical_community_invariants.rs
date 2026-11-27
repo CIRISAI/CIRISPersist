@@ -118,10 +118,11 @@ pub(crate) mod bodies {
         // 2. The one shared W1 root and its charter's row id: W1.api v1.4 —
         //    `rooted_trust_root` is idempotent per directory (a second call
         //    returns the held root and puts nothing).
-        let charter = w1::rooted_trust_root(b, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3")
-            .await
-            .charter
-            .hex();
+        // LEAD-root1 (CC 3.2 T5) — no row is a charter: the room cites none.
+        // It is under the root by its founders, holders of the bundle in
+        // force this node accepted.
+        let _ = w1::rooted_trust_root(b, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
+        let charter = String::new();
 
         // 3. The room, citing the shared root's charter. v62 (W1-fix4, after
         //    C5-fix1): a trust-root-grade room's FOUNDERS are holders of the
@@ -196,6 +197,14 @@ pub(crate) mod bodies {
         // 4. The members: the proposer's proposal, the member's acceptance,
         //    then the widening voiced by two founders (holders 1 and 2: the
         //    room's `quorum:2/3` over its founders).
+        //
+        //    v62.0.0 (KR-fix23; CC 4.4.3.19, CC 3.1.3.2) — a NODE member gives
+        //    no acceptance (KR-fix10 refuses a node's reply by name,
+        //    `node_gives_no_consent`): it is seated by the founders' count
+        //    alone, as a serve seat, which needs an announced owner first
+        //    (CIRISPersist#1101, `serve_seat_owner_announced`). So for a node
+        //    the owner binding comes BEFORE the widening and no acceptance is
+        //    signed; a person member is unchanged.
         for (i, m) in members.iter().enumerate() {
             let member = e2::kid(m);
             let now = crate::host::clock::now();
@@ -203,9 +212,22 @@ pub(crate) mod bodies {
             e2::put_signed(b, &p)
                 .await
                 .unwrap_or_else(|e| panic!("proposal of {member}: {e}"));
-            e2::put_signed(b, &acceptance_row(&member, &p, now))
+            let is_node = b
+                .lookup_public_key(&member)
                 .await
-                .unwrap_or_else(|e| panic!("acceptance by {member}: {e}"));
+                .expect("lookup the member")
+                .is_some_and(|r| {
+                    identity_type::parse_set(&r.identity_type).contains(&identity_type::NODE)
+                });
+            if is_node {
+                let owner =
+                    e2::put_key(b, &format!("{tag}-infra-owner-{i}"), &[identity_type::USER]).await;
+                ts::put_owner_binding(b as &dyn FederationDirectory, &owner, &member).await;
+            } else {
+                e2::put_signed(b, &acceptance_row(&member, &p, now))
+                    .await
+                    .unwrap_or_else(|e| panic!("acceptance by {member}: {e}"));
+            }
             let w = MembershipRecord::CommunityWidening(CommunityMembershipWidening {
                 community_key_id: room.clone(),
                 member_key_id: member.clone(),
@@ -221,18 +243,6 @@ pub(crate) mod bodies {
             )
             .await
             .unwrap_or_else(|e| panic!("widening {member} into {room}: {e}"));
-            let is_node = b
-                .lookup_public_key(&member)
-                .await
-                .expect("lookup the member")
-                .is_some_and(|r| {
-                    identity_type::parse_set(&r.identity_type).contains(&identity_type::NODE)
-                });
-            if is_node {
-                let owner =
-                    e2::put_key(b, &format!("{tag}-infra-owner-{i}"), &[identity_type::USER]).await;
-                ts::put_owner_binding(b as &dyn FederationDirectory, &owner, &member).await;
-            }
         }
         room
     }

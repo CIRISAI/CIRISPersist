@@ -50,14 +50,11 @@ fn score_payload(author: &str, at: u64) -> Value {
         ("author", Value::Text(author.to_owned())),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
     ])
 }
 
-const EVIDENCE_ROWS: &str = "evidence:.suite:.kind:.cell:.prefix";
+const EVIDENCE_ROWS: &str = "coherence_standing:.cohort";
 
 #[tokio::test]
 async fn i2010_sign_row_is_verifys_minter_and_the_door_admits_it() {
@@ -202,7 +199,7 @@ fn i2011_the_codec_round_trips() {
             "attestation_type": "scores",
             "asserted_at": "2026-01-02T03:04:05.678Z",
             "attestation_envelope": {
-                "dimension": "evidence:safety_battery:capture:a:b:v1",
+                "dimension": "coherence_standing:cab:v1",
                 "score": 0.75,
                 "confidence": 0.9,
             },
@@ -299,10 +296,7 @@ fn i2013_the_kernel_reads_an_edition2_rows_own_id_and_refs() {
         ("author", Value::Text(me.clone())),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
         (
             "refs",
             map(vec![(
@@ -428,6 +422,43 @@ fn i2632_the_producer_admits_each_refs_member() {
         check_refs(&map(vec![(member, value)]))
             .unwrap_or_else(|l| panic!("I2632: `refs.{member}` is a CDDL member, refused {l}"));
     }
+}
+
+/// **I6136** (HEAD-fix1; Constitution's two-standings ruling; Verify
+/// feat/23.5.1 `check_refs`) — the producer's INTERIM `refs` check admits
+/// the fourth `also` role, `stands_on` (the owner's acceptance a root-grant
+/// act stands on), as a set of EXACTLY ONE row-ref, beside `refs.head` and
+/// beside `ack`; a set of two, or an empty one, is refused `malformed:also`.
+/// Deleted with `produce::check_refs` at the Verify pin (Verify's reader
+/// carries the rule).
+#[test]
+fn i6136_the_producer_admits_one_stands_on() {
+    use super::door_invariants::fixture::ref2;
+    use super::produce::check_refs;
+    let set = |ds: &[u8]| Value::Array(ds.iter().map(|d| ref2(&[*d; 32])).collect());
+    let refs = |s: Value| {
+        map(vec![
+            ("head", ref2(&[0xc0; 32])),
+            ("also", map(vec![("stands_on", s)])),
+        ])
+    };
+    check_refs(&refs(set(&[0xc1])))
+        .unwrap_or_else(|l| panic!("I6136: one stands_on beside the head, refused {l}"));
+    check_refs(&map(vec![(
+        "also",
+        map(vec![("ack", set(&[0xc2])), ("stands_on", set(&[0xc3]))]),
+    )]))
+    .unwrap_or_else(|l| panic!("I6136: stands_on beside ack, refused {l}"));
+    assert_eq!(
+        check_refs(&refs(set(&[0xc1, 0xc4]))),
+        Err("malformed:also"),
+        "I6136: a row stands on exactly one acceptance"
+    );
+    assert_eq!(
+        check_refs(&refs(Value::Array(vec![]))),
+        Err("malformed:also"),
+        "I6136: an empty stands_on"
+    );
 }
 
 /// A score row of `iss` carrying `refs`.
