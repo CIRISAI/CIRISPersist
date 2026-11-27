@@ -360,8 +360,18 @@ pub const ESCALATE_INFIX: &str = "+escalate:";
 /// Envelope field names shared by the producer side and persist's fold, so
 /// the two cannot disagree about where a reference lives.
 pub mod field {
-    /// The objected-to action's `attestation_id`.
+    /// The objected-to action's `attestation_id` — the EARLIER-FORM member.
+    /// v62.0.0 (KR-fix34a) — an assent / raised vote on a ROW names it in
+    /// [`ANSWERS`] instead (stated as `refs.answers`); this member is carried
+    /// only by a reverse-quorum objection to a ROSTER EVENT (INTERIM, until
+    /// KR-fix34b carries the event's row id) and by the dismissal / ballot
+    /// rows, which KR-fix34a does not touch.
     pub const OBJECTS_TO: &str = "objects_to_attestation_id";
+    /// v62.0.0 (KR-fix34a; CC 2.6.1.3, the Constitution's ruling (a)) — the
+    /// row an `objection:assent` / `objection:raised` vote ANSWERS: stated as
+    /// `refs.answers` (`edition2::payloads::REF_MEMBERS`), read back by the
+    /// earlier gates under this envelope member, as a membership reply's is.
+    pub const ANSWERS: &str = "references_attestation_id";
     /// The objection's own `attestation_id` — on a DISMISSAL envelope, which
     /// objection is being dismissed.
     pub const DISMISSES: &str = "dismisses_objection_id";
@@ -1430,7 +1440,7 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
         if envelope_str(o, "dimension") != Some(DIMENSION_OBJECTION) {
             continue;
         }
-        if envelope_str(o, field::OBJECTS_TO) != Some(action.action_id) {
+        if objected_object(o) != Some(action.action_id) {
             continue;
         }
         let Some(person) = persons
@@ -1682,6 +1692,10 @@ fn escalate_objection(
 /// producer and this node's fold agree byte-for-byte about where the
 /// references live.
 #[must_use]
+///
+/// v62.0.0 (KR-fix34a) — the action is a ROW (an attestation, by its row id):
+/// named under [`field::ANSWERS`], stated as `refs.answers`. An objection to
+/// a ROSTER EVENT is [`objection_envelope_roster_event`] (INTERIM).
 pub fn objection_envelope(
     cohort: Cohort,
     cohort_key_id: &str,
@@ -1692,9 +1706,40 @@ pub fn objection_envelope(
         "dimension": DIMENSION_OBJECTION,
         field::COHORT: cohort.as_str(),
         field::COHORT_KEY_ID: cohort_key_id,
-        field::OBJECTS_TO: action_attestation_id,
+        field::ANSWERS: action_attestation_id,
         field::GROUNDS: grounds,
     })
+}
+
+/// v62.0.0 (KR-fix34a) — **INTERIM, removed by KR-fix34b**: the envelope of
+/// an objection to a ROSTER EVENT (a widening or a removal), named as today
+/// by the typed record's `persist_row_hash` in [`field::OBJECTS_TO`]. No
+/// digest that is not a row id ever goes in `refs.answers`; KR-fix34b carries
+/// the event's statement row id (`record_row_id`, P/KR-fix34-V300.sql) and
+/// moves these to [`objection_envelope`]'s shape.
+#[must_use]
+pub fn objection_envelope_roster_event(
+    cohort: Cohort,
+    cohort_key_id: &str,
+    roster_event_hash: &str,
+    grounds: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "dimension": DIMENSION_OBJECTION,
+        field::COHORT: cohort.as_str(),
+        field::COHORT_KEY_ID: cohort_key_id,
+        field::OBJECTS_TO: roster_event_hash,
+        field::GROUNDS: grounds,
+    })
+}
+
+/// v62.0.0 (KR-fix34a) — **the object an assent / raised vote names**: the
+/// row it answers ([`field::ANSWERS`], from `refs.answers`), else, INTERIM
+/// until KR-fix34b, a reverse-quorum objection's roster event in
+/// [`field::OBJECTS_TO`]. The one reader every fold asks.
+#[must_use]
+pub fn objected_object(row: &Attestation) -> Option<&str> {
+    envelope_str(row, field::ANSWERS).or_else(|| envelope_str(row, field::OBJECTS_TO))
 }
 
 /// Build the canonical envelope of a **dismissal**. Every co-signer signs
@@ -1864,7 +1909,7 @@ where
 #[must_use]
 pub(crate) fn objection_action(row: &Attestation) -> Option<String> {
     (envelope_str(row, "dimension") == Some(DIMENSION_OBJECTION) && is_vote_row(row))
-        .then(|| envelope_str(row, field::OBJECTS_TO).map(str::to_owned))
+        .then(|| objected_object(row).map(str::to_owned))
         .flatten()
 }
 
@@ -1930,7 +1975,17 @@ where
                         | DIMENSION_UPHELD
                         | DIMENSION_OVERRULED
                 )
-            ) && envelope_str(r, field::OBJECTS_TO) == Some(action.action_id)
+            ) && {
+                // v62.0.0 (KR-fix34a) — an objection names its object through
+                // `objected_object`; the dismissal and ballot rows still name
+                // the act in the earlier member (KR-fix34a leaves them).
+                let object = if envelope_str(r, "dimension") == Some(DIMENSION_OBJECTION) {
+                    objected_object(r)
+                } else {
+                    envelope_str(r, field::OBJECTS_TO)
+                };
+                object == Some(action.action_id)
+            }
         })
         .collect())
 }

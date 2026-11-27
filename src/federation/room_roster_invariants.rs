@@ -206,6 +206,9 @@ pub mod bodies {
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I163: the family: {e}"));
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let fam = crate::federation::edition2::fixture_switch::room_id(&fam);
         let (head, _) = e2::held_head(b, &fam)
             .await
             .expect("I163: the family's head");
@@ -580,6 +583,9 @@ pub mod bodies {
         )
         .await
         .unwrap_or_else(|e| panic!("{tag}: room: {e}"));
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let room = crate::federation::edition2::fixture_switch::room_id(&room);
         let record = d.lookup_community(&room).await.unwrap().unwrap();
         check_no_moderator_federate_admission(d, &record)
             .await

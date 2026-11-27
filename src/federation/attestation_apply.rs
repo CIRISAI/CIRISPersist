@@ -748,9 +748,10 @@ mod tests {
     use crate::federation::{FederationDirectory, SignedAttestation};
 
     /// v62.0.0 (JSON cut, E7) — a dimension Verify's family matcher registers
-    /// (`evidence:{suite}:{kind}:{cell}:{prefix}`): an edition-2 row of an
+    /// (`coherence_standing:{cohort}`; v62.0.0 FS-sig-b: an ungated claim
+    /// family, since `evidence:*` now needs `infra:attest`): an edition-2 row of an
     /// unregistered dimension (`identity_binding:v1`) is refused at the door.
-    const DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
+    const DIMENSION: &str = "coherence_standing:cab:v1";
 
     // ── Pure plan + token tests (no backend, no directory) ────────────
 

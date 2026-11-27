@@ -288,7 +288,7 @@ async fn i1482_occurrence_doors_complete_on_one_connection() {
     };
     within_bound(
         "I1482 put_identity_occurrence_local",
-        b.put_identity_occurrence_local(row),
+        b.test_seam_put_identity_occurrence(row),
     )
     .await
     .expect("I1482 the local occurrence lands and projects its route");

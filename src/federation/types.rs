@@ -1364,6 +1364,38 @@ pub mod delegation_scope {
              `licence_audience_refused` (a licence placed at another cohort scope than the one \
              its class is declared at), not a delegates_to scope value",
         ),
+        (
+            "admission::CONFERRAL_OUTSIDE_CHARTER_SCOPE",
+            "v62.0.0 — a REFUSAL TOKEN (a root grant whose scope the charter of the bundle it names does not cover, CC 4.4.3.19), not a delegates_to scope value",
+        ),
+        (
+            "trust_root::CAPABILITY_SCOPE_FAMILY_UNREGISTERED",
+            "v62.0.0 — a REFUSAL TOKEN (an `infra:attest:{family}` sub-scope naming no registered family, CC 4.5.5), not a delegates_to scope value",
+        ),
+        (
+            "trust_root::CAPABILITY_SCOPE_UNCONFERRED",
+            "v62.0.0 — a HOLD REASON (a capability-scoped act whose signer holds no conferral), not a delegates_to scope value",
+        ),
+        (
+            "fold::DELEGATED_SCOPE_UNAUTHORIZED",
+            "v62.0.0 — a HOLD REASON (a duty the signer holds no chain for), not a delegates_to scope value",
+        ),
+        (
+            "fold::CUSTODY_ACK_SCOPE_MISMATCH",
+            "v62.0.0 — a HOLD REASON, the fold's name for `holding_claim::CUSTODY_ACK_SCOPE_MISMATCH` (a holding claim placed at another cohort scope than its content's), not a delegates_to scope value",
+        ),
+        (
+            "fold::MEMBERSHIP_PROPOSER_OUT_OF_SCOPE",
+            "v62.0.0 — a HOLD REASON (a proposal whose signer the held group's write scope does not admit), not a delegates_to scope value; `scope` is the group's write scope",
+        ),
+        (
+            "fold::SCOPE_MEMBERSHIP_UNRESOLVED",
+            "v62.0.0 — a HOLD REASON (a listing whose room record is not held yet), not a delegates_to scope value; `scope` is the cohort scope",
+        ),
+        (
+            "fold::WRITE_SCOPE_REFUSED",
+            "v62.0.0 — a HOLD REASON (a write outside the cohort the writer holds a seat in), not a delegates_to scope value; `scope` is the cohort scope",
+        ),
     ];
 
     /// CC 3.4.7.3 — the legacy **unprefixed** agency kinds (the pre-split
