@@ -20,7 +20,7 @@
 #   I1570 and the #1166 gate.
 #
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
-tests: test(/accord|location_proof|touch_claim|wholeness|witness_corpus|erasure|dsar|delete_traces|fountain|aggregat|scores|attestation_log|registration_history|derived_hex|rendition|peer_record|add_peer|known_wire|wire_hash|purge_put|revoke_trust|trust_revocation|chunk|stream_sth|delivery_receipt|holding_claim|stream_dek|adopt_sealed|seal_stream|dag_manifest|put_blob|store_blob_local|tombstone|one_connection_pool|pool_checkout_gate|^store::parity::|blob_surface_gates::|doors_takedown_invariants::|media_source_invariants::|holder_claim_index_invariants::|row_type_invariants::|scores_read_audit::/)
+tests: test(/accord|location_proof|touch_claim|wholeness|witness_corpus|erasure|dsar|delete_traces|fountain|aggregat|scores|attestation_log|registration_history|derived_hex|rendition|peer_record|add_peer|known_wire|wire_hash|purge_put|revoke_trust|trust_revocation|chunk|stream_sth|delivery_ack|holding_claim|stream_dek|adopt_sealed|seal_stream|dag_manifest|put_blob|store_blob_local|tombstone|one_connection_pool|pool_checkout_gate|^store::parity::|blob_surface_gates::|doors_takedown_invariants::|media_source_invariants::|holder_claim_index_invariants::|row_type_invariants::|scores_read_audit::/)
 features: postgres,sqlite,server,cirisaudit
 
 src/federation/evidence_admit.rs

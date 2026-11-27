@@ -2146,7 +2146,7 @@ class Engine:
     def ledger_record_fork_evidence(self, evidence_json: str) -> str:
         """(derived) testimonial — CC 3.3.10.1 L8 — record a proven fork (JSON ForkEvidence) for the adjudication plane. Returns the content-derived evidence_id (idempotent: one fork... [build-conditional: #[cfg(feature = "ledgers")]]"""
 
-    def list_delivery_receipts_for(self, stream_id: str, limit: int) -> str:
+    def list_delivery_acks_for(self, stream_id: str, limit: int) -> str:
         """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C4) — list stored delivery receipts for stream_id, ascending (k, subscriber_key_id), bounded by limit. Returns a JSON a..."""
 
     def list_witness_equivocations_json(self, peer_id: str) -> str:
@@ -2197,8 +2197,8 @@ class Engine:
     def put_custody_ack(self, at_rest_sha256_hex: str, state: str, cohort_scope: str | None = None, cohort_target: str | None = None, aad_b64: str | None = None) -> str:
         """(derived) testimonial — v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — this node's custody report for one blob: state is "here" or "none". here needs the bytes on this no..."""
 
-    def put_delivery_receipt(self, receipt_json: str) -> None:
-        """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C4, CEG §10.5.4) — store a subscriber delivery receipt (receipt_json is a serialized DeliveryReceipt). Runs the JOIN-ag..."""
+    def put_delivery_ack(self, receipt_json: str) -> None:
+        """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C4, CEG §10.5.4) — store a subscriber delivery receipt (receipt_json is a serialized DeliveryAck). Runs the JOIN-ag..."""
 
     def put_stream_sth(self, sth_json: str, producer_key_id: str) -> None:
         """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C1b) — store a producer-signed Signed Tree Head for a stream's transparency log (CEG §10.5.1)."""

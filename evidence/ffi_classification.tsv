@@ -628,7 +628,7 @@ testimonial	binding	40	Engine	latest_stream_sth	log_commitment
 testimonial	binding	40	Engine	ledger_list_fork_evidence	equivocation_evidence
 testimonial	binding	40	Engine	ledger_put_checkpoint	log_commitment
 testimonial	binding	40	Engine	ledger_record_fork_evidence	equivocation_evidence
-testimonial	binding	40	Engine	list_delivery_receipts_for	delivery_event
+testimonial	binding	40	Engine	list_delivery_acks_for	delivery_event
 testimonial	binding	40	Engine	list_witness_equivocations_json	equivocation_evidence
 testimonial	binding	40	Engine	lookup_signed_record_by_content_hash	upstream_attestation
 testimonial	binding	40	Engine	maintenance_archive_expired	erasure_effect
@@ -637,7 +637,7 @@ testimonial	binding	40	Engine	next_sequence	self_audit
 testimonial	binding	40	Engine	peek_sequence	self_audit
 testimonial	binding	40	Engine	provenance_chain	self_audit
 testimonial	binding	40	Engine	put_custody_ack	self_audit
-testimonial	binding	40	Engine	put_delivery_receipt	delivery_event
+testimonial	binding	40	Engine	put_delivery_ack	delivery_event
 testimonial	binding	40	Engine	put_stream_sth	log_commitment
 testimonial	binding	40	Engine	put_wholeness_witness_json	equivocation_evidence
 testimonial	binding	40	Engine	rebuild_signed_wire_index	upstream_attestation

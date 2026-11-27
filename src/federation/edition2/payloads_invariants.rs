@@ -347,11 +347,7 @@ fn i2102_check_reads_the_member_lists() {
         "unsorted",
     );
     // A family the module does not map passes.
-    check(
-        "evidence:.suite:.kind:.cell:.prefix",
-        &map(vec![("x", ms(1))]),
-    )
-    .unwrap();
+    check("coherence_standing:.cohort", &map(vec![("x", ms(1))])).unwrap();
 }
 
 // ---- group:roster ------------------------------------------------------
@@ -1024,7 +1020,7 @@ fn i2911_a_key_grant() {
 
 /// I2912: the chunk index is `k`; no inner signature member.
 #[test]
-fn i2912_a_delivery_receipt() {
+fn i2912_a_delivery_ack() {
     let fam = "delivery_receipt:{stream_id}";
     let r = map(vec![
         ("asserted_at", ms(1_000)),
@@ -1876,7 +1872,7 @@ mod door {
         let e = put_statement(
             &dir,
             &signed(
-                "evidence:.suite:.kind:.cell:.prefix",
+                "coherence_standing:.cohort",
                 &map(vec![("asserted_at", ms(1_000)), ("anything", ms(1))]),
             ),
             None,
@@ -2147,11 +2143,11 @@ fn i2926_a_composer_is_checked_by_the_composer_rule() {
         check_by_id(&occ, "scores", &composer()).is_err(),
         "I2926 a non-composer is the family's list"
     );
-    // One list of composer types.
-    assert_eq!(
-        super::payloads::COMPOSER_ROW_TYPES,
-        &super::ingest::COMPOSER_ROW_TYPES[..],
-        "I2926 the door's composer types are ingest's"
+    // One predicate for the rows that name a target (FS-step1:
+    // `emit::names_a_target`, no list): the door's payload rule asks it.
+    assert!(
+        super::emit::names_a_target("supersedes") && super::emit::names_a_target("withdraws"),
+        "I2926 the door's composer types are the one predicate's"
     );
 }
 
@@ -2669,7 +2665,7 @@ fn i3996_a_non_normalised_decimal_is_refused() {
         ("asserted_at", ms(1_000)),
         ("body", map(vec![("ratio", tag4(-1, 50))])),
     ]);
-    let e = check_by_id("evidence:.suite:.kind:.cell:.prefix", "scores", &p).unwrap_err();
+    let e = check_by_id("coherence_standing:.cohort", "scores", &p).unwrap_err();
     assert_eq!(
         reason(&e),
         malformed_row::EDITION2_PAYLOAD_INVALID,
@@ -2679,7 +2675,7 @@ fn i3996_a_non_normalised_decimal_is_refused() {
         ("asserted_at", ms(1_000)),
         ("body", map(vec![("ratio", tag4(-1, 5))])),
     ]);
-    check_by_id("evidence:.suite:.kind:.cell:.prefix", "scores", &ok_p).expect("I3996 ok");
+    check_by_id("coherence_standing:.cohort", "scores", &ok_p).expect("I3996 ok");
 }
 
 /// I3997: the pair room is `community_id` (FINAL, CC).
@@ -2809,7 +2805,7 @@ fn i3999_a_decimal_reads_back_exactly() {
     // The mapping reads a body's decimal as a JSON number.
     let a = super::ingest::attestation_of(
         &admitted(
-            "evidence:.suite:.kind:.cell:.prefix",
+            "coherence_standing:.cohort",
             map(vec![
                 ("asserted_at", ms(1_000)),
                 ("body", map(vec![("ratio", tag4(-2, 125))])),
@@ -2823,15 +2819,9 @@ fn i3999_a_decimal_reads_back_exactly() {
         "1.25",
         "I3999 the mapping's body number"
     );
-    assert!(is_body_member(
-        "evidence:.suite:.kind:.cell:.prefix",
-        "body"
-    ));
+    assert!(is_body_member("coherence_standing:.cohort", "body"));
     assert!(is_body_member(&family_id("hard_case:{kind}"), "hard_case"));
-    assert!(!is_body_member(
-        "evidence:.suite:.kind:.cell:.prefix",
-        "hard_case"
-    ));
+    assert!(!is_body_member("coherence_standing:.cohort", "hard_case"));
     assert!(!is_body_member(&family_id("hard_case:{kind}"), "score"));
 }
 

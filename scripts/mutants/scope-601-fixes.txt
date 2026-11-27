@@ -22,14 +22,14 @@
 #   `purge_withheld_lifting`, `ReversedTakedowns::absorb`, `TombstoneFloor`'s
 #   `new` / `plane`). Witnesses I1366, I1367 and I1369 (sqlite, postgres).
 # - #1006: `received` ordered by the subscriber-signed instant
-#   (`signed_receipt_at`, `delivery_receipt_dimension`, `signed_receipts_of`;
+#   (`signed_receipt_at`, `delivery_ack_dimension`, `signed_receipts_of`;
 #   `custody_view`'s older stream-binding arms are I513's, not this slice's).
 #   Witnesses I1407 and I513 (sqlite, postgres).
 # - #1132 (slice C): the delivery receipt's length rule (`length_prefix`, the
 #   one place a length is judged to fit u32) and the refusing builder
 #   (`try_receipt_signing_bytes`). Witness I1411 (unit, allocation-free).
 #   I1412 (sqlite, postgres) is left OUT of the filter on purpose: it puts a
-#   4 GiB zero-page field through `put_delivery_receipt`, and under a
+#   4 GiB zero-page field through `put_delivery_ack`, and under a
 #   surviving mutant the builder would COPY it (4 GiB resident per witness on
 #   the shared box). I1411 judges the same predicate without the field.
 # - Left OUT: `steward_purge::bytes_tombstone_lock_key` (any constant key
@@ -47,7 +47,7 @@ src/federation/chunk_dag_cascade.rs holds_this_dek dek_eq_constant_time already_
 src/engine.rs purge_finalize purge_evict_blob evict_one_on
 src/federation/takedown_tombstone.rs already_recorded takedown_tombstone apply_replicated_takedown
 src/federation/steward_purge.rs refuse_tombstoned_at_write from standing_notice refuse_tombstoned_bytes purge_withheld_lifting absorb new plane
-src/federation/custody_ack.rs signed_receipt_at delivery_receipt_dimension signed_receipts_of
+src/federation/custody_ack.rs signed_receipt_at delivery_ack_dimension signed_receipts_of
 src/federation/stream_receipt.rs length_prefix try_receipt_signing_bytes
 src/store/sqlite.rs sqlite_tombstone_at_write sqlite_refuse_tombstoned_at_write sqlite_purged_at_write
 src/store/postgres.rs pg_lock_bytes_tombstones pg_lock_bytes_tombstones_exclusive pg_tombstone_at_write pg_refuse_tombstoned_at_write

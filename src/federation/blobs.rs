@@ -1474,6 +1474,34 @@ pub fn stream_epoch_closed_refusal(stream_id: &str, epoch: u64) -> BlobError {
     ))
 }
 
+/// v62.0.0 (KR-fix31; CC 5.2 "a write its own author cannot open is
+/// refused") — the token a community sealer answers a write with when its
+/// AUTHOR holds no wrap target in the fan-out it is about to seal for: no
+/// current occurrence of the author, and no node the author owns by a live
+/// two-voice binding (CC 3.2), carries usable content-KEM keys and a grant.
+/// `InvalidArgument`, prefixed by the token (the [`STREAM_COUNTER_MOVED`]
+/// convention). The sealer's own local decision: no receiving door repeats
+/// it, and it is no verdict about any row.
+pub const WRITE_AUTHOR_HAS_NO_WRAP_TARGET: &str = "write_author_has_no_wrap_target";
+
+/// v62.0.0 (KR-fix31) — the one spelling of [`WRITE_AUTHOR_HAS_NO_WRAP_TARGET`].
+/// Names the caller's own inputs (the community it named, the author key it
+/// writes as), never a roster member.
+#[must_use]
+pub fn write_author_has_no_wrap_target_refusal(
+    group_key_id: &str,
+    author_key_id: &str,
+) -> BlobError {
+    // v62.0.0 (KR-fix31c) — every seal path's one spelling: `group_key_id` is
+    // the community, family or self owner the write is sealed for.
+    BlobError::InvalidArgument(format!(
+        "{WRITE_AUTHOR_HAS_NO_WRAP_TARGET}: the author {author_key_id:?} holds no wrap target \
+         among the recipients of {group_key_id:?}: no current occurrence of the author and no \
+         node it owns is granted a wrap; nothing was sealed or stored — publish the node's self \
+         pair with its keys and have the node voice its owner binding (CC 5.2, CC 3.2)"
+    ))
+}
+
 /// #832 (§12.3) — an epoch binding the chunk / manifest floor must write
 /// IN THE SAME TRANSACTION as the row, conditional on the epoch still
 /// being the community's current enabled one (I17). A refused bind rolls
@@ -2324,6 +2352,25 @@ pub trait BlobStorage: Send + Sync {
         limit: u32,
     ) -> impl Future<Output = Result<Vec<[u8; 32]>, BlobError>> + Send;
 
+    /// v62.0.0 (HEAD-6, bounded by HEAD-7; Constitution, head cases (3)) —
+    /// **one window of the claim backlog**: the next `limit` blobs this node
+    /// stores (`federation_blobs`, sha order after `after`), each with
+    /// whether `holder` has ever stated a custody report about it (a
+    /// `custody:ack:v1` row it signed citing the blob, any state, retired or
+    /// not). ONE statement per backend: the window seeks the blob table's
+    /// primary key and stops at `limit`; each blob's report is one seek of a
+    /// citation index (`federation_attestations_attester_dimension_citation`
+    /// on sqlite; a citation index on postgres, `LIMIT 1` per row). It never
+    /// walks the holder's custody history. The re-ack sweep's claim pass
+    /// ([`reack_own_claims`](crate::federation::holding_claim::reack_own_claims))
+    /// pages through it once per process after the node is owned.
+    fn held_blob_claim_window(
+        &self,
+        after: Option<[u8; 32]>,
+        limit: u32,
+        holder: &str,
+    ) -> impl Future<Output = Result<Vec<([u8; 32], bool)>, BlobError>> + Send;
+
     /// v54.0.0 (CIRISPersist#994) — write the V176 relation of `manifest_sha`
     /// IFF the stream `stream_id` holds EXACTLY `chunks` (the manifest's own
     /// `(seq, sha)` list): the same rows, at the same seqs, with the same shas,
@@ -2602,31 +2649,30 @@ pub trait BlobStorage: Send + Sync {
     /// a DIFFERENT `chunk_root` → reject; identical → idempotent. Persist
     /// validates, never adjudicates — no "delivered" verdict, no
     /// membership enforcement (§1.4 / consumer policy).
-    fn put_delivery_receipt(
+    fn put_delivery_ack(
         &self,
-        receipt: crate::federation::stream_receipt::DeliveryReceipt,
+        receipt: crate::federation::stream_receipt::DeliveryAck,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
     /// v4.1 (CIRISPersist#142, Cut C4) — list stored delivery receipts
     /// for `stream_id`, ascending `(k, subscriber_key_id)`, bounded by
     /// `limit`.
-    fn list_delivery_receipts_for(
+    fn list_delivery_acks_for(
         &self,
         stream_id: &str,
         limit: i64,
-    ) -> impl Future<
-        Output = Result<Vec<crate::federation::stream_receipt::DeliveryReceipt>, BlobError>,
-    > + Send;
+    ) -> impl Future<Output = Result<Vec<crate::federation::stream_receipt::DeliveryAck>, BlobError>>
+           + Send;
 
     /// v52.0.0 (CIRISPersist#953) — the same listing, each receipt with the
-    /// `received_at` this node stored it at. [`Self::list_delivery_receipts_for`]
+    /// `received_at` this node stored it at. [`Self::list_delivery_acks_for`]
     /// is this listing with the instants dropped.
-    fn list_stored_delivery_receipts_for(
+    fn list_stored_delivery_acks_for(
         &self,
         stream_id: &str,
         limit: i64,
     ) -> impl Future<
-        Output = Result<Vec<crate::federation::stream_receipt::StoredDeliveryReceipt>, BlobError>,
+        Output = Result<Vec<crate::federation::stream_receipt::StoredDeliveryAck>, BlobError>,
     > + Send;
 
     /// Read a blob by its SHA-256.

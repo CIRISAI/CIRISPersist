@@ -16670,7 +16670,7 @@
     "decimal_id": "5.3.3.11",
     "claim_id": "CLM-delivery",
     "repo": "CIRISPersist",
-    "path#symbol": "src/store/sqlite.rs#put_delivery_receipt",
+    "path#symbol": "src/store/sqlite.rs#put_delivery_ack",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc8-1091"
    },
@@ -16982,7 +16982,7 @@
     "decimal_id": "3.3.6.4",
     "claim_id": "CLM-self-roster-two-paths",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/self_roster.rs#gate",
+    "path#symbol": "src/federation/self_roster.rs#gate_edition2",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc9-1099"
    },
@@ -17435,7 +17435,7 @@
     "decimal_id": "3.3.4",
     "claim_id": "CLM-cosign-collection-held",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/cosign.rs#hold",
+    "path#symbol": "src/federation/cosign.rs#hold_if_short",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc18-1252"
    },

@@ -92,6 +92,11 @@ mod sqlite {
         for t in crate::store::edition_baseline::EDITION_TWO_ADDITIONS {
             c.execute_batch(&format!("DROP TABLE {t};")).unwrap();
         }
+        // v62.0.0 (PRE4-V300-f) — edition 1 named the delivery-ack table
+        // by its earlier name.
+        let (was, now) = crate::store::edition_baseline::DELIVERY_ACK_RENAME;
+        c.execute_batch(&format!("ALTER TABLE {now} RENAME TO {was};"))
+            .unwrap();
         c.execute_batch("DELETE FROM refinery_schema_history;")
             .unwrap();
         for (v, n, sum) in crate::store::migration_runner::edition_one_history("sqlite") {
@@ -472,6 +477,12 @@ mod postgres {
                 .await
                 .unwrap();
         }
+        // v62.0.0 (PRE4-V300-f) — edition 1 named the delivery-ack table
+        // by its earlier name (EDITION_ONE_PG_RELATIONS lists that name).
+        let (was, now) = crate::store::edition_baseline::DELIVERY_ACK_RENAME;
+        c.batch_execute(&format!("ALTER TABLE cirislens.{now} RENAME TO {was};"))
+            .await
+            .unwrap();
         c.batch_execute("DELETE FROM ciris_persist_schema_history;")
             .await
             .unwrap();

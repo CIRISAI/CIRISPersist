@@ -391,7 +391,9 @@ async fn displacement_body(d: &dyn FederationDirectory) {
         }),
         persist_row_hash: String::new(),
     };
-    d.put_identity_occurrence_local(occ.clone()).await.unwrap();
+    d.test_seam_put_identity_occurrence(occ.clone())
+        .await
+        .unwrap();
     let stale = occ
         .transport_binding
         .as_ref()

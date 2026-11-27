@@ -252,7 +252,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("adopt_sealed_chunk_planned", Class::Plan),
     ("adopt_sealed_chunks_planned", Class::Plan),
     ("put_stream_sth_planned", Class::Plan),
-    ("put_delivery_receipt_planned", Class::Plan),
+    ("put_delivery_ack_planned", Class::Plan),
     ("stream_dek_insert_planned", Class::Plan),
     ("stream_dek_put_grants_planned", Class::Plan),
     // The stream claim's verdict (#837 / I41, #954), re-asked by the chunk executor inside its transaction against the row it just read.
@@ -459,7 +459,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // withdraws gate's; this fails only on storage.
     ("after_withdraws", Class::Plumbing),
     ("occurrence_withdrawal_of", Class::Plumbing),
-    ("put_identity_occurrence_revocation_local", Class::Plumbing),
+    (
+        "put_identity_occurrence_revocation_edition2",
+        Class::Plumbing,
+    ),
     ("sqlite_sync_key_record_row", Class::Plumbing),
     ("sqlite_sync_occurrence_row", Class::Plumbing),
     ("sqlite_drop_key_record_rows", Class::Plumbing),
@@ -784,7 +787,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("inline_blob_of_stream_id", Class::Plumbing),
     // v52.0.0 (#953) — Delegates: the plain receipt listing is the stored
     // listing with the instants dropped.
-    ("list_stored_delivery_receipts_for", Class::Delegates),
+    ("list_stored_delivery_acks_for", Class::Delegates),
     // v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — Gate: refuses a dimension whose
     // segment breaks its manifest-declared case class. A statement about the
     // caller's input.
@@ -1031,10 +1034,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("from_str", Class::Plumbing),
     ("from_value", Class::Plumbing),
     ("from_wire_str", Class::Plumbing),
-    // v59.0.0 (CIRISPersist#1099) — the self-roster door: refuses (holds) a
-    // roster change one key of two or more signed.
-    ("gate_occurrence", Class::Gate),
-    ("gate_withdrawal", Class::Gate),
     ("get", Class::Plumbing),
     ("get_attestation", Class::Delegates),
     ("get_client", Class::Delegates),
@@ -1740,10 +1739,7 @@ mod tests {
             "adopt_sealed_chunks_planned",
         ),
         ("src/federation/blob_admit.rs", "put_stream_sth_planned"),
-        (
-            "src/federation/blob_admit.rs",
-            "put_delivery_receipt_planned",
-        ),
+        ("src/federation/blob_admit.rs", "put_delivery_ack_planned"),
         ("src/federation/blob_admit.rs", "stream_dek_insert_planned"),
         (
             "src/federation/blob_admit.rs",
@@ -1976,9 +1972,10 @@ mod tests {
             "put_identity_occurrence",
             "put_identity_occurrence_planned",
         ),
+        // v62.0.0 (WD-fix9) — the retired trusted-local write, a TEST seam.
         (
             "FederationDirectory",
-            "put_identity_occurrence_local",
+            "test_seam_put_identity_occurrence",
             "put_identity_occurrence_local_planned",
         ),
         // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
@@ -2040,8 +2037,8 @@ mod tests {
         ("BlobStorage", "put_stream_sth", "put_stream_sth_planned"),
         (
             "BlobStorage",
-            "put_delivery_receipt",
-            "put_delivery_receipt_planned",
+            "put_delivery_ack",
+            "put_delivery_ack_planned",
         ),
         (
             "BlobStorage",

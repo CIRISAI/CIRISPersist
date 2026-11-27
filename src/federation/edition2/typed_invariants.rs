@@ -64,7 +64,7 @@
 //!   publication (v62.0.0 wave GC7, CC 2.7.3): kept, `Pending`, held with
 //!   reason `receipt_root_unpublished`, and no receipt row.
 //! - **I3163** against a published root it lands in
-//!   `federation_stream_delivery_receipts` and as its signed row.
+//!   `federation_stream_delivery_acks` and as its signed row.
 //! - **I3164** a second root at the same `k` is kept and concludes nothing
 //!   (held, `receipt_equivocation`; v62.0.0 wave GC7), the first receipt
 //!   standing.
@@ -132,7 +132,7 @@ use super::names::RowId;
 use super::typed::{
     cosign_payload,
     custody_payload,
-    delivery_receipt_payload,
+    delivery_ack_payload,
     key_grant_payload,
     occurrence_revocation_payload,
     revocation_payload,
@@ -143,7 +143,7 @@ use super::typed::{
     NoticeText,
     COSIGN_PREFIX,
     CUSTODY_PREFIX,
-    DELIVERY_RECEIPT_PREFIX,
+    DELIVERY_ACK_PREFIX,
     KEY_GRANT_PREFIX,
     OCCURRENCE_REVOCATION_PREFIX,
     REVOCATION_PREFIX,
@@ -1920,8 +1920,8 @@ async fn receipt_refused_body<B: FederationDirectory + BlobStorage + Sync>(d: &B
     let st = sign(
         &s,
         &si,
-        DELIVERY_RECEIPT_PREFIX,
-        &delivery_receipt_payload(&si, STREAM, 0, 2, &ROOT, now_ms()),
+        DELIVERY_ACK_PREFIX,
+        &delivery_ack_payload(&si, STREAM, 0, 2, &ROOT, now_ms()),
     );
     let out = put(d, &st).await;
     assert!(
@@ -1938,7 +1938,7 @@ async fn receipt_refused_body<B: FederationDirectory + BlobStorage + Sync>(d: &B
     );
     assert!(kept(d, &st).await, "I3162 kept");
     assert!(
-        d.list_delivery_receipts_for(STREAM, 10)
+        d.list_delivery_acks_for(STREAM, 10)
             .await
             .unwrap()
             .is_empty(),
@@ -1954,15 +1954,15 @@ async fn receipt_lands_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) 
     let st = sign(
         &s,
         &si,
-        DELIVERY_RECEIPT_PREFIX,
-        &delivery_receipt_payload(&si, STREAM, 0, 2, &ROOT, now_ms()),
+        DELIVERY_ACK_PREFIX,
+        &delivery_ack_payload(&si, STREAM, 0, 2, &ROOT, now_ms()),
     );
     let out = put(d, &st).await.unwrap();
     assert!(
         matches!(out, StatementOutcome::Row { new: true, .. }),
         "I3163 {out:?}"
     );
-    let listed = d.list_delivery_receipts_for(STREAM, 10).await.unwrap();
+    let listed = d.list_delivery_acks_for(STREAM, 10).await.unwrap();
     assert_eq!(listed.len(), 1, "I3163");
     assert_eq!(listed[0].chunk_root, ROOT, "I3163");
     assert_eq!(listed[0].subscriber_key_id, si, "I3163");
@@ -2005,10 +2005,7 @@ async fn receipt_lands_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) 
         )
         .await
         .unwrap_or_else(|e| panic!("I2128: verifies as a composite under the key record: {e}"));
-        let stored = d
-            .list_stored_delivery_receipts_for(STREAM, 10)
-            .await
-            .unwrap();
+        let stored = d.list_stored_delivery_acks_for(STREAM, 10).await.unwrap();
         assert_eq!(
             stored[0].receipt.composite_signature, listed[0].composite_signature,
             "I2128: stored as the composite"
@@ -2027,8 +2024,8 @@ async fn receipt_lands_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) 
     let equivocal = sign(
         &s,
         &si,
-        DELIVERY_RECEIPT_PREFIX,
-        &delivery_receipt_payload(&si, STREAM, 0, 2, &ROOT_B, now_ms()),
+        DELIVERY_ACK_PREFIX,
+        &delivery_ack_payload(&si, STREAM, 0, 2, &ROOT_B, now_ms()),
     );
     let out = put(d, &equivocal).await;
     assert!(
@@ -2044,7 +2041,7 @@ async fn receipt_lands_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) 
         "I3164 held, reason receipt_equivocation"
     );
     assert!(kept(d, &equivocal).await, "I3164 kept");
-    let listed = d.list_delivery_receipts_for(STREAM, 10).await.unwrap();
+    let listed = d.list_delivery_acks_for(STREAM, 10).await.unwrap();
     assert_eq!(listed.len(), 1, "I3164 the first receipt stands alone");
     assert_eq!(listed[0].chunk_root, ROOT, "I3164");
 }
@@ -2215,7 +2212,7 @@ async fn i3160_i3161_key_grant_postgres() {
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-async fn i3162_i3164_delivery_receipt_sqlite() {
+async fn i3162_i3164_delivery_ack_sqlite() {
     let b = sqlite().await;
     Box::pin(receipt_refused_body(&b)).await;
     sqlite_publish(&b, 3, ROOT);
@@ -2225,7 +2222,7 @@ async fn i3162_i3164_delivery_receipt_sqlite() {
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
-async fn i3162_i3164_delivery_receipt_postgres() {
+async fn i3162_i3164_delivery_ack_postgres() {
     let Some(b) = postgres().await else {
         return;
     };
