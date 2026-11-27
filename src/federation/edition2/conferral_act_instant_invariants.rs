@@ -132,12 +132,17 @@ pub(crate) async fn i4319_an_act_is_judged_at_its_own_instant_within_w(
             .await
             .unwrap_or_else(|e| panic!("I4319 {who}: the owner's withdrawal: {e}"));
         for (what, row) in [("the acceptance", &acc), ("the withdrawal", &w)] {
+            let rid = RowId(e2::rid_digest(row));
+            // KR-fix29 — on a red, name where the row went (held, and why;
+            // or no fold record at all).
             assert!(
                 d.get_attestation(&e2::rid(row))
                     .await
                     .expect("I4319: reads")
                     .is_some(),
-                "I4319 {who}: {what} LANDED"
+                "I4319 {who}: {what} LANDED; fold state {:?}; held {:?}",
+                d.fold_state(&rid).await,
+                fold::why_held(d, &rid).await
             );
         }
     }

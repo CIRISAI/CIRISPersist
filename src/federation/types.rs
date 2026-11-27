@@ -790,6 +790,12 @@ pub mod owner_binding {
     /// and what CIRISConformance probes — carries only this). Keying on the
     /// dimension ALONE let the raw-emit path bypass the owner fold.
     pub const CC_DELEGATION_PURPOSE: &str = "owner_binding";
+    /// v62.0.0 (VD-agentaff1; Constitution's ruling of 2026-11-22, CC 3.2 "An
+    /// organisation's agent") — an AGENT's owner-binding `dimension`
+    /// (`edition2::occurrence::state_agent_owner_binding`'s). One naming an
+    /// affiliation (`community_id`) is the organisation's agent: counted
+    /// under that affiliation's protocol, as [`DIMENSION`] is.
+    pub const AGENT_DIMENSION: &str = "ownership:responsible_party:agent:v1";
 }
 
 /// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — the reserved

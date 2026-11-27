@@ -21,7 +21,7 @@
 pub(crate) mod bodies {
     use crate::federation::adopt_cascade::{adopt_sealed_blob, AdoptDisposition};
     use crate::federation::at_rest_cascade::blob_invariants::hold_ctx;
-    use crate::federation::key_grant_invariants::two_node::node_as;
+    use crate::federation::key_grant_invariants::two_node::node_owned_as;
     use crate::federation::replication::hold::BlobProvenance;
     use crate::federation::types::cohort_scope::{CryptoTier, FEDERATION};
     use crate::federation::types::identity_type::NODE;
@@ -94,7 +94,7 @@ pub(crate) mod bodies {
             + Sync
             + crate::federation::edition2::serve_wait_invariants::test_support::SetsNodeKey,
     {
-        let n = node_as(b, &format!("i113-holder-{s}"), NODE).await;
+        let n = node_owned_as(b, &format!("i113-holder-{s}"), NODE).await;
         // v62.0.0 (RL-fix2c) — THIS node (the holder) rooted: its FEDERATION
         // claim is advertised and served (the serve wait, CC 5.3.4).
         crate::federation::edition2::serve_wait_invariants::test_support::root_the_serving_node(
@@ -132,8 +132,8 @@ pub(crate) mod bodies {
         use crate::federation::at_rest_cascade::{fresh_dek, seal};
         use crate::federation::key_grant_invariants::two_node::seed_community_everywhere;
         use crate::federation::types::cohort_scope::COMMUNITY;
-        let author = node_as(b, &format!("i113b-author-{s}"), NODE).await;
-        let adopter = node_as(b, &format!("i113b-adopter-{s}"), NODE).await;
+        let author = node_owned_as(b, &format!("i113b-author-{s}"), NODE).await;
+        let adopter = node_owned_as(b, &format!("i113b-adopter-{s}"), NODE).await;
         let comm_s = format!("i113b-comm-{s}");
         let member = format!("i113b-member-{s}");
         // v62.0.0 (JSON cut, E7) — E6's flipped helper takes SEEDS; the room
@@ -294,8 +294,8 @@ pub(crate) mod bodies {
             introduce_as, seed_community_everywhere,
         };
         use crate::federation::types::cohort_scope::COMMUNITY;
-        let na = node_as(a, &format!("i113c-a-{s}"), NODE).await;
-        let nb = node_as(b, &format!("i113c-b-{s}"), NODE).await;
+        let na = node_owned_as(a, &format!("i113c-a-{s}"), NODE).await;
+        let nb = node_owned_as(b, &format!("i113c-b-{s}"), NODE).await;
         introduce_as(
             &[&na, &nb],
             &[&format!("i113c-a-{s}"), &format!("i113c-b-{s}")],

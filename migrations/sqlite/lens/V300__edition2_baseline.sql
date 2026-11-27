@@ -2881,6 +2881,13 @@ CREATE INDEX ceg_roster_proposals_open
 ALTER TABLE federation_attestations ADD COLUMN restatement_key TEXT;
 CREATE INDEX federation_attestations_restatement ON federation_attestations (attesting_key_id, restatement_key) WHERE restatement_key IS NOT NULL;
 
+-- v62.0.0 (WD-fix1; CC 2.4.1.1, CC 6.1.5 N5): the held withdrawals in this
+-- node's admission order, the withdrawn-content sweep's read
+-- (list_withdrawals_since): bounded by the withdrawals held, not the store.
+-- An edition-2 object on an edition-1 table
+-- (store::edition_baseline::ATTESTATIONS_WITHDRAWALS_INDEX).
+CREATE INDEX federation_attestations_withdrawals ON federation_attestations (admitted_at, attestation_id) WHERE attestation_type IN ('withdraws', 'recants');
+
 -- v62.0.0 (RL-fix1, lead ruling (B); CC 5.4 "carries none it cannot verify"):
 -- the accord rows a node holding no accord root skipped, as feed WATERMARKS
 -- only (no row bytes): per (plane, peer) the first position skipped, so the

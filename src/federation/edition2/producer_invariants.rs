@@ -155,7 +155,8 @@ pub(crate) mod bodies {
         let rid = a
             .emit_attestation_self(scores("observation:reachability:v1"))
             .await
-            .expect("I2203: A emits");
+            .expect("I2203: A emits")
+            .into_row_id();
         let st = statement_of_row(&a, &rid).await;
         assert_eq!(
             family_of_statement(&st),
@@ -308,7 +309,8 @@ pub(crate) mod bodies {
         let target = a
             .emit_attestation_self(scores("observation:reachability:v1"))
             .await
-            .unwrap();
+            .unwrap()
+            .into_row_id();
         let mut input = EmitAttestationInput::with_envelope(
             attestation_type::WITHDRAWS,
             crate::federation::envelope::EnvelopeCore::from_value(
@@ -324,7 +326,8 @@ pub(crate) mod bodies {
         let w = a
             .emit_attestation_self(input)
             .await
-            .expect("I2205: the withdraws is emitted");
+            .expect("I2205: the withdraws is emitted")
+            .into_row_id();
         let st = statement_of_row(&a, &w).await;
         assert_eq!(
             family_of_statement(&st),
@@ -366,7 +369,8 @@ pub(crate) mod bodies {
         let target = a
             .emit_attestation_self(scores("observation:reachability:v1"))
             .await
-            .unwrap();
+            .unwrap()
+            .into_row_id();
         let w = a
             .emit_attestation_self({
                 let mut i = EmitAttestationInput::with_envelope(
@@ -384,7 +388,8 @@ pub(crate) mod bodies {
                 i
             })
             .await
-            .unwrap();
+            .unwrap()
+            .into_row_id();
         let row = a
             .federation_directory()
             .get_attestation(&w)
@@ -466,7 +471,8 @@ pub(crate) mod serving_bodies {
                 crate::federation::types::cohort_scope::FEDERATION,
             ))
             .await
-            .unwrap();
+            .unwrap()
+            .into_row_id();
         let dir = a.federation_directory();
         let all = served(&a).await;
         let ids = dir
@@ -563,11 +569,13 @@ pub(crate) mod filter_bodies {
         let private = a
             .emit_attestation_self(input(cohort_scope::SELF))
             .await
-            .expect("I2210: a private (self) row is admitted");
+            .expect("I2210: a private (self) row is admitted")
+            .into_row_id();
         let commons = a
             .emit_attestation_self(input(cohort_scope::FEDERATION))
             .await
-            .unwrap();
+            .unwrap()
+            .into_row_id();
         let dir = a.federation_directory();
         let st = |rid: String| {
             let dir = dir.clone();
