@@ -159,7 +159,7 @@ pub(crate) mod bodies {
     }
 
     async fn claim_earlier(d: &dyn FederationDirectory, owner: &str, node: &str, class: &str) {
-        d.put_identity_occurrence_local(IdentityOccurrence {
+        d.test_seam_put_identity_occurrence(IdentityOccurrence {
             identity_key_id: owner.to_owned(),
             occurrence_key_id: node.to_owned(),
             device_class: class.to_owned(),
@@ -185,15 +185,18 @@ pub(crate) mod bodies {
     }
 
     async fn unclaim_earlier(d: &dyn FederationDirectory, owner: &str, node: &str) {
-        d.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-            identity_key_id: owner.to_owned(),
-            occurrence_key_id: node.to_owned(),
-            revoked_at: ago(1),
-            effective_at: ago(1),
-            reason: None,
-            witness_set: vec![owner.to_owned()],
-            persist_row_hash: String::new(),
-        })
+        d.put_identity_occurrence_revocation_edition2(
+            IdentityOccurrenceRevocation {
+                identity_key_id: owner.to_owned(),
+                occurrence_key_id: node.to_owned(),
+                revoked_at: ago(1),
+                effective_at: ago(1),
+                reason: None,
+                witness_set: vec![owner.to_owned()],
+                persist_row_hash: String::new(),
+            },
+            crate::federation::DoorToken::new(),
+        )
         .await
         .unwrap_or_else(|e| panic!("unclaim {owner} → {node}: {e}"));
     }
@@ -1665,21 +1668,39 @@ pub(crate) mod key_bodies {
         super::bodies::claim_with(b as &dyn FederationDirectory, owner, node, class, &opts).await;
     }
 
-    async fn minter<B: FederationDirectory + Sync>(b: &B, s: &str) -> String {
-        crate::federation::at_rest_cascade::blob_invariants::node_signer(b, &format!("mint-{s}"))
-            .await
-            .derived_key_id()
+    /// The room writes' minter (their author). v62.0.0 (KR-fix31b; CC 5.2 "a
+    /// write its own author cannot open is refused") — a NODE key the room's
+    /// member `owner` owns and keys ([`keyed_claim`], this file's owned-device
+    /// shape), so the author holds a wrap target; it is one more device of
+    /// `owner`'s with no allow list. Before: a USER key no member owned.
+    async fn minter<B: FederationDirectory + Sync>(b: &B, s: &str, owner: &str) -> String {
+        let name = format!("mint-{s}");
+        nodes(b as &dyn FederationDirectory, &[&name]).await;
+        keyed_claim(b, owner, &name, device_class::LAPTOP).await;
+        kr(&name)
     }
 
     /// The recipients of a seal at `scope` / `group` (a seed; read as `kr`).
-    async fn self_family_granted<B>(b: &B, scope: &str, group: &str) -> Vec<String>
+    /// v62.0.0 (KR-fix31d; CC 5.2) — written by `author`, one of the
+    /// owner's / family's devices (a self / family write's author must hold a
+    /// wrap target; before, the write named none and the node, no member's
+    /// device, was its author).
+    async fn self_family_granted<B>(b: &B, scope: &str, group: &str, author: &str) -> Vec<String>
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
-        encrypt_and_cascade(b, scope, &kr(group), b"i39x content", None, None, None)
-            .await
-            .unwrap_or_else(|e| panic!("seal at {scope}: {e}"))
-            .granted
+        encrypt_and_cascade(
+            b,
+            scope,
+            &kr(group),
+            b"i39x content",
+            None,
+            None,
+            Some(author),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seal at {scope}: {e}"))
+        .granted
     }
 
     /// The room epoch a seal used, and that epoch's wrap recipients
@@ -1728,7 +1749,8 @@ pub(crate) mod key_bodies {
         .await
         .unwrap();
         let (lk, pk) = (kr(&laptop), kr(&phone));
-        let fg = self_family_granted(b, FAMILY, &fam).await;
+        let m = minter(b, s, &owner).await;
+        let fg = self_family_granted(b, FAMILY, &fam, &m).await;
         assert!(
             fg.contains(&pk) && !fg.contains(&lk),
             "I393b family wraps: {fg:?}"
@@ -1736,12 +1758,11 @@ pub(crate) mod key_bodies {
         // v62 (P5c update 5, CC rc21 3.3.7): a present allow list without
         // the literal `"self"` entry excludes `self` for every class; the
         // laptop's list names only `work`.
-        let sg = self_family_granted(b, SELF, &owner).await;
+        let sg = self_family_granted(b, SELF, &owner, &m).await;
         assert!(
             sg.contains(&pk) && !sg.contains(&lk),
             "I393b a list without \"self\" excludes self: {sg:?}"
         );
-        let m = minter(b, s).await;
         let (_, ar) = room_epoch(b, &adult, &m).await;
         assert!(
             ar.contains(&pk) && !ar.contains(&lk),
@@ -1781,17 +1802,18 @@ pub(crate) mod key_bodies {
         // v62 (P5c update 4): an `agent`-class device its owner OWNS is
         // `OwnedAgent`: within its owner's `self` (no list), no `family` by
         // default. The server class gets neither.
-        let g = self_family_granted(b, SELF, &owner).await;
+        let m = minter(b, s, &owner).await;
+        let g = self_family_granted(b, SELF, &owner, &m).await;
         assert!(
             g.contains(&lk) && g.contains(&ak) && !g.contains(&sk),
             "I394b self: the laptop and the owned agent, not the server: {g:?}"
         );
-        let g = self_family_granted(b, FAMILY, &fam).await;
+        let g = self_family_granted(b, FAMILY, &fam, &m).await;
         assert!(
             g.contains(&lk) && !g.contains(&ak) && !g.contains(&sk),
             "I394b family: no key for the server class or the owned agent: {g:?}"
         );
-        let (_, r) = room_epoch(b, &cid, &minter(b, s).await).await;
+        let (_, r) = room_epoch(b, &cid, &m).await;
         assert!(
             r.contains(&ak) && r.contains(&sk) && r.contains(&lk),
             "I394b the room key reaches every class: {r:?}"
@@ -1816,7 +1838,7 @@ pub(crate) mod key_bodies {
         keyed_claim(b, &owner, &laptop, device_class::LAPTOP).await;
         keyed_claim(b, &owner, &phone, device_class::PHONE).await;
         room(d, &cid, &[&owner]).await;
-        let m = minter(b, s).await;
+        let m = minter(b, s, &owner).await;
         let (lk, pk) = (kr(&laptop), kr(&phone));
         let (e0, r0) = room_epoch(b, &cid, &m).await;
         assert!(
@@ -1881,7 +1903,7 @@ pub(crate) mod key_bodies {
         keyed_claim(b, &owner, &phone, device_class::PHONE).await;
         room(d, &cid, &[&owner]).await;
         family(d, &fam, &[&owner]).await;
-        let m = minter(b, s).await;
+        let m = minter(b, s, &owner).await;
         set_node(b, m.clone());
         let (lk, pk) = (kr(&laptop), kr(&phone));
         let deny = deny_all(b, &owner, &laptop).await;
@@ -1941,7 +1963,7 @@ pub(crate) mod key_bodies {
         keyed_claim(b, &owner, &phone, device_class::PHONE).await;
         room(d, &cid, &[&owner]).await;
         family(d, &fam, &[&owner]).await;
-        let m = minter(b, s).await;
+        let m = minter(b, s, &owner).await;
         set_node(b, m.clone());
         let (lk, pk) = (kr(&laptop), kr(&phone));
         let (e0, r0) = room_epoch(b, &cid, &m).await;

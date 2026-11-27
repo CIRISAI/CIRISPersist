@@ -362,7 +362,7 @@ fn read_case(f: &J, c: &J, roots: &TrustAnchorStore) -> (LineageReading, Genesis
         anchor: a.as_ref(),
         attestation_roots: roots,
     });
-    let in_force = in_force_of(&reading, &all_rows);
+    let in_force = in_force_of(&reading, &all_rows, super::genesis::RootChoice::Every);
     (reading, in_force)
 }
 

@@ -288,9 +288,22 @@ where
     {
         return Ok(true);
     }
-    // The members at the named head.
-    if let Some(h) = head {
-        if let Some(st) = dir.edition2_voices(&h).await?.first() {
+    // The members at the named head. VD-step1 — only a CONCLUDED version
+    // lists members ([`super::verdict::row_state`]): a version kept short of
+    // its count (or a lone voice of one) is no version yet, and its listed
+    // members are no party of the rows that name it.
+    if let Some(named) = head {
+        // v62.0.0 (LINEAGE-L2; interim until members_at(head), LINEAGE-L3)
+        // — a counted widening or removal as the head stands on its
+        // restating version, whose listed members are the party.
+        let h = super::lineage::restating_version(dir, &named).await?;
+        let concluded = super::verdict::row_state(dir, &h).await?.is_concluded();
+        // v62.0.0 (LINEAGE-L4) — at a change, the members SEATED there are
+        // the party too (the version's list is the base).
+        if h != named {
+            party.extend(super::lineage::members_at(dir, &[named]).await?.members);
+        }
+        if let Some(st) = dir.edition2_voices(&h).await?.first().filter(|_| concluded) {
             if let Ok(v) = roster_view_of_statement(st) {
                 if v.group == group && v.kind == kind {
                     party.extend(listed_members(&v.payload));
@@ -553,7 +566,8 @@ where
 /// row's audience." For each held row `C` that names this statement's row
 /// (under any [`NAMING_ROLES`] role, from `ceg_row_names`):
 ///
-/// - `C` is concluded: no fold hold is recorded for it (`fold_held`);
+/// - `C` is concluded ([`super::verdict::row_state`]; VD-step1: not merely
+///   "no fold hold is recorded");
 /// - `C` sits in the same room ([`room_of`]);
 /// - `C`'s signer is in this statement's audience by its own rule
 ///   (`serve::servable_by_own_rule` with the signer as the party);
@@ -588,7 +602,10 @@ where
             if !seen.insert(citer) {
                 continue;
             }
-            if dir.fold_held(&citer).await?.is_some() {
+            // VD-step1 — "concluded" is the one verdict's, never "no fold
+            // hold": a citer kept as a lone voice (or never folded here) has
+            // no hold and concludes nothing, so carries nothing.
+            if !super::verdict::row_state(dir, &citer).await?.is_concluded() {
                 continue;
             }
             let voices = dir.edition2_voices(&citer).await?;

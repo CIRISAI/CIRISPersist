@@ -120,6 +120,15 @@ impl VoiceOutcome {
         }
     }
 
+    /// v62.0.0 (VD-step2) — the row id (hex), owned: for a caller that
+    /// keeps only the id. Whether the row LANDED is [`Self::is_seated`].
+    #[must_use]
+    pub fn into_row_id(self) -> String {
+        match self {
+            Self::Seated { row_id } | Self::Waiting { row_id, .. } => row_id,
+        }
+    }
+
     /// Did the row land?
     #[must_use]
     pub fn is_seated(&self) -> bool {
@@ -147,13 +156,17 @@ impl VoiceOutcome {
     }
 }
 
-/// **The state of row `row_id`**: `Seated` when the attestation plane holds
-/// it, else `Waiting` with its held reason (`fold::why_held_listed`), else
-/// `Waiting` with an empty reason (nothing under the id has arrived). A seat
-/// re-bind (never an attestation row) is `Seated` when it reaches its count
-/// now and `Waiting` otherwise, recomputed from the held lineage and its
-/// voices' signed instants: two nodes that hold the same rows answer alike,
-/// whichever arrived first (KR-fix2 rev 5).
+/// **The state of row `row_id`** as a host reads it: `Seated` when it is
+/// CONCLUDED here, `Waiting` with its held reason when the fold holds it,
+/// else `Waiting` with an empty reason (a voice kept awaiting others, or
+/// nothing under the id has arrived).
+///
+/// v62.0.0 (VD-step2) — read from the one row-state verdict
+/// ([`super::verdict::row_state`]), so every plane answers alike: before, a
+/// row concluded on a plane with no attestation row (an occurrence bind, a
+/// group version, a key-plane statement, a typed-final row) answered
+/// `Waiting`. A seat re-bind is `Seated` when it reaches its count NOW,
+/// recomputed (KR-fix2 rev 5; the verdict's first rule).
 ///
 /// # Errors
 /// Directory reads.
@@ -161,23 +174,16 @@ pub async fn row_status<F>(dir: &F, row_id: &RowId) -> Result<VoiceOutcome, Erro
 where
     F: FederationDirectory + ?Sized,
 {
+    use super::verdict::RowState;
     let hex = row_id.hex();
-    if dir.get_attestation(&hex).await?.is_some() {
-        return Ok(VoiceOutcome::Seated { row_id: hex });
-    }
-    // KR-fix2 rev 5 — a seat re-bind never has an attestation row: it is
-    // `Seated` when it reaches its count NOW, recomputed
-    // (`transport_rebind::rebind_counted`), never by the fold's stored state.
-    if super::transport_rebind::rebind_counted(dir, row_id).await? == Some(true) {
-        return Ok(VoiceOutcome::Seated { row_id: hex });
-    }
-    Ok(match super::fold::why_held_listed(dir, row_id).await? {
-        Some(h) => VoiceOutcome::Waiting {
+    Ok(match super::verdict::row_state(dir, row_id).await? {
+        RowState::Concluded => VoiceOutcome::Seated { row_id: hex },
+        RowState::Held(h) => VoiceOutcome::Waiting {
             row_id: hex,
             reason: h.reason,
             detail: h.detail,
         },
-        None => VoiceOutcome::Waiting {
+        RowState::KeptUnconcluded | RowState::Absent => VoiceOutcome::Waiting {
             row_id: hex,
             reason: String::new(),
             detail: String::new(),

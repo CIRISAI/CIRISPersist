@@ -138,9 +138,18 @@ pub enum GroupPlane {
 /// `group` is the accord's `family_key_id`). The accord's roster, seats and
 /// recovery are the genesis bundle in force and no row; a change is a later
 /// bundle at the import door. Pure (the statement's own bytes), so the
-/// statement door runs it among its pure gates BEFORE the payload's shape:
-/// the accord's id is no identity-ref, so the shape check alone would answer
-/// `edition2_payload_invalid` and this name could never be reached.
+/// statement door runs it among its pure gates BEFORE the payload's shape
+/// and the founding check: `humanity-accord` is no group-ref, so either
+/// alone would answer a generic refusal and this name could never be
+/// reached.
+///
+/// v62.0.0 (GID-prod; CIRISConstitution's answer of 2026-11-22) —
+/// `humanity-accord` is a ROOT LINEAGE NAME, not a group: the genesis
+/// bundle's `family_key_id` and `sub`, never founded by a `group:roster`
+/// first version, outside the derived-id rule (which runs on `group:roster`
+/// rows only). This refusal says so: a lineage, not a group. The baked
+/// bundle and its import proof never pass this door (they enter at the
+/// genesis import door), so neither moves.
 ///
 /// # Errors
 /// `accord_version_is_a_bundle`.
@@ -169,7 +178,7 @@ pub fn refuse_accord_group_statement(sub: &str, payload: &Value) -> Result<(), E
 /// an authored row of the attestation plane: `None`.
 #[must_use]
 pub fn group_plane_of(row_type: &str, family: &str, payload: &Value) -> Option<GroupPlane> {
-    if super::ingest::COMPOSER_ROW_TYPES.contains(&row_type) {
+    if super::emit::names_a_target(row_type) {
         return None;
     }
     if family == namespace_match::family_id(GROUP_ROSTER_PREFIX) {
@@ -241,6 +250,11 @@ pub(crate) struct Vouch {
     change_envelope: Option<serde_json::Value>,
     /// Set by the door that found the voices short of the protocol.
     short: AtomicBool,
+    /// v62.0.0 (LINEAGE-L3; CC 3.3.4) — the heads a counted membership
+    /// change names (`refs.head`, `refs.further_heads`): the typed door
+    /// counts its voices over the members seated there
+    /// ([`vouched_heads`]). Empty for any other row.
+    heads: Vec<RowId>,
 }
 
 tokio::task_local! {
@@ -265,6 +279,7 @@ impl Vouch {
             voices,
             change_envelope: None,
             short: AtomicBool::new(false),
+            heads: Vec::new(),
         })
     }
 }
@@ -343,6 +358,7 @@ where
             .collect(),
         change_envelope: Some(change_envelope),
         short: AtomicBool::new(false),
+        heads: Vec::new(),
     };
     VOUCH.scope(Arc::new(vouch), fut).await
 }
@@ -373,6 +389,19 @@ pub(crate) fn vouched_signers_for(envelope: &serde_json::Value) -> Option<BTreeS
     let hash = envelope_hash(envelope).ok()?;
     VOUCH
         .try_with(|v| (v.envelope_hash == hash).then(|| v.voices.keys().cloned().collect()))
+        .ok()
+        .flatten()
+}
+
+/// v62.0.0 (LINEAGE-L3; CC 3.3.4) — **the heads the vouched membership
+/// change names**, when one is running the typed door in this task: the
+/// roster authority counts its voices over the members seated there
+/// (`lineage::members_at`). `None` outside a vouch, or for a row that names
+/// none (a roster version, a typed plane's row).
+#[must_use]
+pub(crate) fn vouched_heads() -> Option<Vec<RowId>> {
+    VOUCH
+        .try_with(|v| (!v.heads.is_empty()).then(|| v.heads.clone()))
         .ok()
         .flatten()
 }
@@ -751,12 +780,21 @@ where
     }
     let mut root = view.clone();
     let mut steps = 0usize;
-    while let Some(h) = root.head {
+    while let Some(named) = root.head {
         steps += 1;
         if steps > MAX_ROSTER_CHAIN {
             return Ok(None);
         }
-        fold::reads(Dep::Row(h));
+        fold::reads(Dep::Row(named));
+        // v62.0.0 (LINEAGE-L2) — a widening or removal named as the head
+        // stands on its restating version; the walk is over versions.
+        let Some(h) = super::lineage::nearest_versions(dir, &[named])
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
         let Some(st) = dir.edition2_voices(&h).await?.into_iter().next() else {
             return Ok(None);
         };
@@ -920,10 +958,14 @@ where
 /// the head (or held as the head before the merge superseded it), so the
 /// supersede executor reads the merge as extending the head; when no named
 /// version is in the lineage, `refs.head`'s.
-fn chosen_prev(view: &RosterView, chain: &Chain, lineage: &BTreeSet<String>) -> String {
-    let parents = view.parents();
+///
+/// v62.0.0 (LINEAGE-L2; CC 3.3.4) — `parents` are the RESTATING versions the
+/// version stands on ([`super::lineage::nearest_versions`] of what it
+/// names): a version extending a widening or removal stands on that
+/// change's base, the record the typed table holds.
+fn chosen_prev(parents: &[RowId], chain: &Chain, lineage: &BTreeSet<String>) -> String {
     let hash = |id: &RowId| chain.get(id).map(|(_, h)| h.clone()).unwrap_or_default();
-    if view.is_merge() {
+    if parents.len() > 1 {
         if let Some(h) = parents.iter().map(hash).find(|h| lineage.contains(h)) {
             return h;
         }
@@ -968,6 +1010,25 @@ where
             let Some(st) = held.first() else {
                 return Err(unheld(row_id, &id));
             };
+            // v62.0.0 (LINEAGE-L2) — a named widening or removal that is no
+            // node yet (not concluded here: `nearest_versions` maps a node to
+            // its base) WAITS like an unheld version; of another group, it
+            // concludes nothing.
+            if let Some(n) = super::lineage::node_of_statement(st) {
+                if n.head_of != super::lineage::HeadOf::Roster {
+                    if n.group != view.group || n.group_kind != view.kind {
+                        return Err(fold::hold(
+                            reason::NAMES_ANOTHER_GROUP,
+                            invalid(format!(
+                                "group:roster: {} names a change of another group ({:?})",
+                                row_id.hex(),
+                                n.group
+                            )),
+                        ));
+                    }
+                    return Err(unheld(row_id, &id));
+                }
+            }
             let mut v = roster_view_of_statement(st)?;
             // v62.0.0 (wave GC5; ruling (b)) — one charter for the chain.
             v.geographic_charter = view.geographic_charter;
@@ -983,15 +1044,18 @@ where
             }
             read.insert(id, v);
         }
-        let v = &read[&id];
-        let missing: Vec<RowId> = v
-            .parents()
-            .into_iter()
+        // v62.0.0 (LINEAGE-L2) — a version may extend a widening or a
+        // removal: it stands on that change's restating version.
+        let parents = super::lineage::nearest_versions(dir, &read[&id].parents()).await?;
+        let missing: Vec<RowId> = parents
+            .iter()
+            .copied()
             .filter(|p| !chain.contains_key(p))
             .collect();
         if missing.is_empty() {
             let v = read.remove(&id).expect("read above");
-            let hash = record_of_roster(&v, chosen_prev(&v, chain, lineage))?.persist_row_hash()?;
+            let hash =
+                record_of_roster(&v, chosen_prev(&parents, chain, lineage))?.persist_row_hash()?;
             chain.insert(id, (v, hash));
             stack.pop();
         } else {
@@ -1049,7 +1113,6 @@ pub async fn merge_reading<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let parents = view.parents();
     if view.head.is_none() {
         if view.is_merge() {
             return Err(invalid(
@@ -1067,6 +1130,10 @@ where
             merged: Vec::new(),
         });
     }
+    // v62.0.0 (LINEAGE-L2; CC 3.3.4) — what it names may be a widening or a
+    // removal (a version of the lineage too): the version stands on its
+    // restating version, and its number follows that one's.
+    let parents = super::lineage::nearest_versions(dir, &view.parents()).await?;
     let lineage = held_lineage(dir, view).await?;
     let mut chain = Chain::new();
     load_chain(dir, view, row_id, &parents, &lineage, &mut chain).await?;
@@ -1086,7 +1153,7 @@ where
             )),
         ));
     }
-    let prev = chosen_prev(view, &chain, &lineage);
+    let prev = chosen_prev(&parents, &chain, &lineage);
     let merged = parents
         .iter()
         .filter_map(|p| chain.get(p).map(|(_, h)| h.clone()))
@@ -1265,6 +1332,13 @@ where
         }
     };
     let new = dir.put_edition2_statement(row).await?;
+    // v62.0.0 (LINEAGE-L1; CC 2.7.8, CC 3.3.4) — a landed roster version or
+    // counted widening / removal is a node of the group's lineage (the one
+    // predicate, `lineage::is_head_row`). The group plane is final, so the
+    // node is never taken out.
+    if matches!(landing, Landing::Landed) {
+        super::lineage::record_landed(dir, row).await?;
+    }
     Ok(match landing {
         Landing::Landed => StatementOutcome::Row {
             row_id: row.row_id,
@@ -1305,6 +1379,16 @@ where
     // inputs of this row: a version of the group (its `sub`) re-folds it;
     // so does a membership change of any member it lists (its `sub`).
     fold::reads(Dep::key(&view.group));
+    // v62.0.0 (GID-tips) — a CONTESTED founding concludes nothing: another
+    // first version (no `refs.head`) of this group held here, held or
+    // concluded, makes every first version of it held. The read above
+    // (`Dep::key(group)`) is the dependency: a rival first version's arrival
+    // touches `key:<group>` (its `sub`), so a founding concluded before it
+    // re-folds here and un-concludes; re-delivery of the SAME first version
+    // is the same row id and no rival.
+    if view.head.is_none() {
+        check_founding_uncontested(dir, row, &view).await?;
+    }
     let MergeReading { prev, merged } = merge_reading(dir, &view, &row.row_id).await?;
     let record = record_of_roster(&view, prev.clone())?;
     if let GroupRecord::Community(c) = &record {
@@ -1318,6 +1402,54 @@ where
         drop_merged_tips(dir, &view, &offered_hash, &merged).await?;
     }
     Ok(landing)
+}
+
+/// v62.0.0 (GID-tips) — refuse-as-HELD a first version of `view.group` when
+/// another first version of it is held in the group's projection slot
+/// (`ingest::fold_plane_of`: `group:<sub>`), `group_founding_contested`.
+///
+/// # Errors
+/// The hold; directory reads.
+async fn check_founding_uncontested<F>(
+    dir: &F,
+    row: &AdmittedRow,
+    view: &RosterView,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let slot = format!("group:{}", row.sub);
+    for other in dir.fold_slot_all_rows(&slot).await? {
+        if other == row.row_id {
+            continue;
+        }
+        let Some(statement) = dir.edition2_voices(&other).await?.into_iter().next() else {
+            continue;
+        };
+        let Some((_, payload)) = statement_parts(&statement) else {
+            continue;
+        };
+        let first = payload
+            .get_text("refs")
+            .and_then(|r| r.get_text("head"))
+            .is_none();
+        if first && payload.get_text("group").and_then(Value::as_text) == Some(view.group.as_str())
+        {
+            return Err(fold::hold(
+                reason::GROUP_FOUNDING_CONTESTED,
+                Error::InvalidArgument(format!(
+                    "{}: {:?} has two first versions ({} and {}): its founders signed two \
+                     foundings, so the group concludes nothing here (CC 2.7.8); found it anew \
+                     under a new nonce",
+                    reason::GROUP_FOUNDING_CONTESTED,
+                    view.group,
+                    row.row_id.hex(),
+                    other.hex()
+                )),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The family id of a `location_proof:{version}` row (header -70002).
@@ -1364,7 +1496,7 @@ where
     };
     // The members the versions it extends already list.
     let mut prior: BTreeSet<String> = BTreeSet::new();
-    for parent in view.parents() {
+    for parent in super::lineage::nearest_versions(dir, &view.parents()).await? {
         fold::reads(Dep::Row(parent));
         if let Some(st) = dir.edition2_voices(&parent).await?.first() {
             let pv = roster_view_of_statement(st)?;
@@ -1509,6 +1641,7 @@ where
                 voices,
                 change_envelope: proof.as_ref().map(|p| p.change_envelope.clone()),
                 short: AtomicBool::new(false),
+                heads: Vec::new(),
             };
             let signed = SignedFamily {
                 family,
@@ -1576,6 +1709,7 @@ where
                 voices,
                 change_envelope: proof.as_ref().map(|p| p.change_envelope.clone()),
                 short: AtomicBool::new(false),
+                heads: Vec::new(),
             };
             let signed = SignedCommunity {
                 community,
@@ -1654,8 +1788,11 @@ where
     })
 }
 
-/// The roster version a membership change names by `refs.head` must be a
-/// held `group:roster` row of the same group (an unheld one waits).
+/// The heads a membership change names (`refs.head` and each of
+/// `refs.further_heads`) must each be a head of the same group's lineage
+/// (CC 3.3.4: a roster version, or a counted widening or removal): one not
+/// held, or held and not concluded yet, WAITS; one of another group, or a
+/// row of no lineage, concludes nothing.
 async fn check_membership_head<F>(
     dir: &F,
     row: &AdmittedRow,
@@ -1664,27 +1801,56 @@ async fn check_membership_head<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let Some(head) = view.head else {
+    if view.head.is_none() {
         return Ok(());
-    };
-    // v62.0.0 (wave GC5; CC 2.7.3) — the named roster version is an input:
-    // unheld, the change WAITS (held); of another group, it concludes
-    // nothing.
-    fold::reads(Dep::Row(head));
-    let held = dir.edition2_voices(&head).await?;
-    let Some(st) = held.first() else {
-        return Err(unheld(&row.row_id, &head));
-    };
-    let roster = roster_view_of_statement(st)?;
-    if roster.group != view.group || roster.kind != view.kind {
-        return Err(fold::hold(
-            reason::NAMES_ANOTHER_GROUP,
-            invalid(format!(
-                "membership: refs.head of {} names a roster of another group ({:?})",
-                row.row_id.hex(),
-                roster.group
-            )),
-        ));
+    }
+    let named: Vec<RowId> = row
+        .names
+        .iter()
+        .filter(|n| n.role == HEAD_ROLE || n.role == FURTHER_HEADS_ROLE)
+        .map(|n| n.row)
+        .collect();
+    for head in named {
+        // v62.0.0 (wave GC5; CC 2.7.3) — the named head is an input: unheld,
+        // the change WAITS (held); of another group, it concludes nothing.
+        fold::reads(Dep::Row(head));
+        let held = dir.edition2_voices(&head).await?;
+        let Some(st) = held.first() else {
+            return Err(unheld(&row.row_id, &head));
+        };
+        // v62.0.0 (LINEAGE-L2; CC 3.3.4) — a head is a lineage node: a
+        // roster version or a counted widening / removal, once concluded.
+        let node = match dir.group_lineage_node(&head).await? {
+            Some(n) => n,
+            None => match super::lineage::node_of_statement(st) {
+                // A head-kind row of this group not concluded yet: WAITS.
+                Some(n) if n.group == view.group && n.group_kind == view.kind => {
+                    return Err(unheld(&row.row_id, &head));
+                }
+                _ => {
+                    return Err(fold::hold(
+                        reason::NAMES_ANOTHER_GROUP,
+                        invalid(format!(
+                            "membership: {} names {} as a head, which is no head of {:?}'s \
+                             lineage",
+                            row.row_id.hex(),
+                            head.hex(),
+                            view.group
+                        )),
+                    ));
+                }
+            },
+        };
+        if node.group != view.group || node.group_kind != view.kind {
+            return Err(fold::hold(
+                reason::NAMES_ANOTHER_GROUP,
+                invalid(format!(
+                    "membership: refs.head of {} names a head of another group ({:?})",
+                    row.row_id.hex(),
+                    node.group
+                )),
+            ));
+        }
     }
     Ok(())
 }
@@ -1721,6 +1887,14 @@ where
         voices,
         change_envelope: None,
         short: AtomicBool::new(false),
+        // v62.0.0 (LINEAGE-L3) — counted over the members at the heads it
+        // names, never at its instant.
+        heads: row
+            .names
+            .iter()
+            .filter(|n| n.role == HEAD_ROLE || n.role == FURTHER_HEADS_ROLE)
+            .map(|n| n.row)
+            .collect(),
     };
     let pqc = Some(marker.clone());
     let door = async move {
@@ -1952,6 +2126,136 @@ pub fn roster_payload(
     asserted_at_ms: u64,
 ) -> Result<Value, Error> {
     roster_payload_merging(record, version, head, &[], asserted_at_ms)
+}
+
+/// v62.0.0 (GID-prod.fix1) — **what a host states to found a community**:
+/// everything of its first version EXCEPT the id (derived, never passed in:
+/// a clean break, no ignored argument) and the server-computed fields.
+#[derive(Debug, Clone)]
+pub struct CommunityFounding {
+    /// The community's name (human-readable, not unique, never an id).
+    pub name: String,
+    /// The founding members (their keys derive the id).
+    pub members: Vec<crate::federation::types::CommunityMember>,
+    /// The founding instant (derives the id).
+    pub founded_at: chrono::DateTime<chrono::Utc>,
+    /// The `consensus_protocol`.
+    pub consensus_protocol: String,
+    /// The `policy_blob` (an open map).
+    pub policy_blob: Option<serde_json::Value>,
+    /// The charter in force (`trust:charter:v1` row hash), empty for none.
+    pub charter_digest: String,
+}
+
+/// v62.0.0 (GID-prod.fix1) — the family twin of [`CommunityFounding`].
+#[derive(Debug, Clone)]
+pub struct FamilyFounding {
+    /// The family's name.
+    pub name: String,
+    /// The founding members (their keys derive the id).
+    pub members: Vec<crate::federation::types::FamilyMember>,
+    /// The founding instant (derives the id).
+    pub founded_at: chrono::DateTime<chrono::Utc>,
+    /// The `consensus_protocol`.
+    pub consensus_protocol: String,
+    /// `consensus_protocol_entrenched`.
+    pub consensus_protocol_entrenched: bool,
+    /// The charter in force, empty for none.
+    pub charter_digest: String,
+}
+
+impl CommunityFounding {
+    /// The first version's record, its id still empty (set by
+    /// [`founding_payload`]).
+    #[must_use]
+    pub fn into_record(self) -> GroupRecord {
+        GroupRecord::Community(crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: self.charter_digest,
+            community_key_id: String::new(),
+            community_name: self.name,
+            members: self.members,
+            founded_at: self.founded_at,
+            consensus_protocol: self.consensus_protocol,
+            policy_blob: self.policy_blob,
+            persist_row_hash: String::new(),
+        })
+    }
+}
+
+impl FamilyFounding {
+    /// The first version's record, its id still empty (set by
+    /// [`founding_payload`]).
+    #[must_use]
+    pub fn into_record(self) -> GroupRecord {
+        GroupRecord::Family(crate::federation::types::Family {
+            family_key_id: String::new(),
+            family_name: self.name,
+            members: self.members,
+            founded_at: self.founded_at,
+            consensus_protocol: self.consensus_protocol,
+            consensus_protocol_entrenched: self.consensus_protocol_entrenched,
+            dissolved_at: None,
+            prev_head_digest: String::new(),
+            charter_digest: self.charter_digest,
+            persist_row_hash: String::new(),
+        })
+    }
+}
+
+/// v62.0.0 (GID-prod) — what a founding verb answers: the group's DERIVED id
+/// (no caller passes one in) and the statement door's outcome.
+#[derive(Debug)]
+pub struct GroupFounding {
+    /// The id the founding derives ([`super::group_id::derive_group_id`]).
+    pub group_id: String,
+    /// The door's outcome for the first version.
+    pub outcome: super::ingest::StatementOutcome,
+}
+
+/// v62.0.0 (GID-prod; CIRISConstitution "THE DERIVED GROUP ID") — **the
+/// FIRST version's payload, under its derived id.** The id is derived from
+/// `record`'s kind, the key of EVERY member it lists, its `founded_at` and
+/// `nonce` ([`super::group_id::derive_group_id`]); `record`'s id is set to
+/// it (whatever it held), the payload is [`roster_payload`] at version 1
+/// with no head, and it carries `nonce`. The founding verbs mint the nonce
+/// ([`super::group_id::fresh_nonce`]); a fixture passes a fixed one.
+///
+/// # Errors
+/// As [`roster_payload`]; a `founded_at` before the epoch.
+pub fn founding_payload(
+    record: &mut GroupRecord,
+    nonce: &[u8; 32],
+    asserted_at_ms: u64,
+) -> Result<(String, Value), Error> {
+    let (kind, founded_at, founders): (&str, _, Vec<String>) = match &*record {
+        GroupRecord::Family(f) => (
+            "family",
+            f.founded_at,
+            f.members.iter().map(|m| m.key_id.clone()).collect(),
+        ),
+        GroupRecord::Community(c) => (
+            "community",
+            c.founded_at,
+            c.members.iter().map(|m| m.key_id.clone()).collect(),
+        ),
+    };
+    let founded_ms = ms_of("founded_at", founded_at)?
+        .as_u64()
+        .ok_or_else(|| invalid("group:roster: `founded_at` is not a uint"))?;
+    let refs: Vec<&str> = founders.iter().map(String::as_str).collect();
+    let id = super::group_id::derive_group_id(kind, &refs, founded_ms, nonce);
+    match record {
+        GroupRecord::Family(f) => f.family_key_id.clone_from(&id),
+        GroupRecord::Community(c) => c.community_key_id.clone_from(&id),
+    }
+    let mut payload = roster_payload(record, 1, None, asserted_at_ms)?;
+    let Value::Map(m) = &mut payload else {
+        return Err(invalid("group:roster: the payload is not a map"));
+    };
+    m.push((text("nonce"), Value::Bytes(nonce.to_vec())));
+    m.sort_by_key(|(k, _)| cde::encode(k));
+    Ok((id, payload))
 }
 
 /// [`roster_payload`] of a MERGE (CC 2.7.8): beside `refs.head` it names
@@ -2236,6 +2540,52 @@ pub fn removal_draft(
         ))
     })?;
     let payload = membership_payload(record, Some(head))?;
+    super::emit::draft_row(
+        &kid,
+        signer_iss,
+        &member,
+        "scores",
+        &ciris_verify_core::namespace_match::family_id(MEMBERSHIP_PREFIX),
+        &payload,
+    )
+    .map_err(|e| super::emit::produce_error("membership", e))
+}
+
+/// v62.0.0 (HEAD-3; CC 2.4.1.1, "A count that ends a standing MAY state
+/// `lifts`, and then only the count's own receipts keep an act in force") —
+/// **[`removal_draft`] stating `lifts: true`**: the unseating is the
+/// roster's COUNT (no `author`, counted over `head`), so it may lift single
+/// receipts. `lifts` is a top-level payload member, present only as `true`
+/// (`payloads::check_lifts`); a widening is no end and is refused it.
+///
+/// # Errors
+/// As [`removal_draft`]; `edition2_payload_invalid` for a widening.
+pub fn removal_draft_lifting(
+    record: &MembershipRecord,
+    head: &RowId,
+    signer_iss: &str,
+) -> Result<super::emit::Draft, Error> {
+    let member = match record {
+        MembershipRecord::FamilyRemoval(r) => r.removed_identity_key_id.clone(),
+        MembershipRecord::CommunityRemoval(r) => r.removed_identity_key_id.clone(),
+        MembershipRecord::FamilyWidening(_) | MembershipRecord::CommunityWidening(_) => {
+            return Err(Error::InvalidArgument(
+                "edition2_payload_invalid: a widening ends no standing: it states no `lifts`"
+                    .into(),
+            ));
+        }
+    };
+    let kid = super::ingest::kid_of_identity_ref(signer_iss).ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "removal_draft_lifting: {signer_iss} is not an identity-ref"
+        ))
+    })?;
+    let payload = super::emit::with_member(
+        membership_payload(record, Some(head))?,
+        "lifts",
+        Value::Bool(true),
+    )
+    .map_err(|e| super::emit::produce_error("membership", e))?;
     super::emit::draft_row(
         &kid,
         signer_iss,
