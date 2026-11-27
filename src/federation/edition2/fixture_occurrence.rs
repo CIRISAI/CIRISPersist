@@ -15,11 +15,10 @@
 //! takes them; [`put_bind`] offers them through `ingest::put_statement`.
 
 use ciris_verify_core::cde::{self, Value};
-use ciris_verify_core::edition2::family::SelectContext;
 use ciris_verify_core::edition2::sign_row_statement;
 
 use super::fixture_switch::{kid, signing_key};
-use super::ingest::{held_keys_for, put_statement, StatementOutcome, INGEST_TIER};
+use super::ingest::{put_statement, StatementOutcome, INGEST_TIER};
 use super::occurrence::OCCURRENCE_FAMILY;
 use crate::federation::{Error, FederationDirectory};
 
@@ -162,11 +161,13 @@ pub async fn put_bind<D: FederationDirectory + ?Sized>(
 /// **An agent's owner binding**, held as edition-2 statements:
 /// `delegates_to(owner → agent)` at `ownership:responsible_party:agent:v1`
 /// (family `ownership:{relation}:{target_kind}:{version}`), the owner's
-/// statement and the agent's own (`bound_node`), each admitted by the door
-/// and stored ([`crate::federation::admission::agent_owner_of`] reads them).
+/// statement and the agent's own (`bound_node`), each put through the
+/// statement door (VD-step1c: before, they were stored
+/// directly and never concluded; [`crate::federation::admission::agent_owner_of`]
+/// now counts only a concluded binding).
 ///
 /// # Panics
-/// The door refuses a voice; the store refuses it.
+/// The door refuses a voice, or the binding does not conclude.
 pub async fn put_agent_owner_binding<D: FederationDirectory + ?Sized>(
     dir: &D,
     owner: &str,
@@ -185,6 +186,7 @@ pub async fn put_agent_owner_binding<D: FederationDirectory + ?Sized>(
             Value::Text("ownership:responsible_party:agent:v1".into()),
         ),
     ]);
+    let mut last = None;
     for seed in [owner, agent] {
         let st = sign_row_statement(
             &signing_key(seed),
@@ -196,13 +198,18 @@ pub async fn put_agent_owner_binding<D: FederationDirectory + ?Sized>(
             vec![],
         )
         .expect("fixture_occurrence: sign an owner binding voice");
-        let keys = held_keys_for(dir, &st)
-            .await
-            .unwrap_or_else(|e| panic!("fixture_occurrence: keys for {seed}: {e}"));
-        let admitted = super::door::admit_row(&st, &keys, None, SelectContext::default())
-            .unwrap_or_else(|e| panic!("fixture_occurrence: owner binding voice of {seed}: {e}"));
-        dir.put_edition2_statement(&admitted)
-            .await
-            .unwrap_or_else(|e| panic!("fixture_occurrence: store {seed}'s voice: {e}"));
+        last = Some(
+            Box::pin(put_statement(dir, &st, None, INGEST_TIER))
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("fixture_occurrence: owner binding voice of {seed}: {e}")
+                }),
+        );
     }
+    // v62.0.0 (VD-step1c, F9) — the binding must CONCLUDE: `agent_owner_of`
+    // counts a concluded binding only, never kept voices.
+    assert!(
+        matches!(last, Some(StatementOutcome::Row { .. })),
+        "fixture_occurrence: the owner binding {owner} -> {agent} did not conclude: {last:?}"
+    );
 }

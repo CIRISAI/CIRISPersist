@@ -41,7 +41,7 @@ pub(crate) mod bodies {
     fn target_row(by: &str, n: usize) -> Attestation {
         let id = uuid::Uuid::new_v4().to_string();
         let env = serde_json::json!({
-            "dimension": format!("evidence:safety_battery:capture:b{n}:c:v1"),
+            "dimension": format!("coherence_standing:cb{n}c:v1"),
             "id": id,
         });
         let mut r = ts::bare_attestation(&id, by, by, &env);

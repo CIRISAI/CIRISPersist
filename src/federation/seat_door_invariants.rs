@@ -43,7 +43,7 @@ use crate::federation::community_dek::orchestrate::{
 use crate::federation::edition2::fixture_switch as e2;
 use crate::federation::key_grant::emit_epoch_key_grant_with_local_signer;
 use crate::federation::key_grant_fold_invariants::{found_room, leave, occurrence, own_node};
-use crate::federation::key_grant_invariants::two_node::{node_as, Node};
+use crate::federation::key_grant_invariants::two_node::{node_owned_as, Node};
 use crate::federation::tier_ingest::test_support as ts;
 use crate::federation::types::identity_type::{NODE, USER};
 use crate::federation::{BlobStorage, DekKeyState, FederationDirectory, GrantWrap};
@@ -166,7 +166,7 @@ where
     B: BlobStorage + FederationDirectory + Sync,
 {
     let alias = format!("{tag}-minter");
-    (node_as(backend, &alias, NODE).await, alias)
+    (node_owned_as(backend, &alias, NODE).await, alias)
 }
 
 async fn recipients<B: BlobStorage + Sync>(
@@ -614,7 +614,7 @@ async fn i1807_engine_door(engine: crate::Engine, alias: &str) {
             let b = $b;
             // The minter node: `kid(alias)` as a `node` key record, signing
             // with the engine's own LocalSigner.
-            let n = node_as(b, alias, NODE).await;
+            let n = node_owned_as(b, alias, NODE).await;
             assert_eq!(n.key, key, "I1807: the engine's key is the minter node");
             let room = seed(&n, alias, alias).await;
             engine

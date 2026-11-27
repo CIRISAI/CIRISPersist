@@ -64,7 +64,7 @@
 //!   publication (v62.0.0 wave GC7, CC 2.7.3): kept, `Pending`, held with
 //!   reason `receipt_root_unpublished`, and no receipt row.
 //! - **I3163** against a published root it lands in
-//!   `federation_stream_delivery_receipts` and as its signed row.
+//!   `federation_stream_delivery_acks` and as its signed row.
 //! - **I3164** a second root at the same `k` is kept and concludes nothing
 //!   (held, `receipt_equivocation`; v62.0.0 wave GC7), the first receipt
 //!   standing.

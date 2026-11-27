@@ -184,6 +184,7 @@ pub(crate) mod bodies {
         // (a) Each member's own row admits; a non-member's is refused.
         let (a_row, b_row) = (call_row(&alice), call_row(&bob));
         let (a_id, b_id) = (a_row.attestation_id.clone(), b_row.attestation_id.clone());
+        let a_copy = a_row.clone();
         for r in [a_row, b_row] {
             crate::federation::edition2::fixture_switch::put_signed(d, &r)
                 .await
@@ -260,10 +261,38 @@ pub(crate) mod bodies {
                 .is_empty(),
             "I1363 (c): the withdrawn row is no longer live"
         );
-        assert_eq!(
-            read(bob.clone(), alice.clone(), LifecycleView::IncludeWithdrawn).await,
-            vec![a_id.clone()],
-            "I1363 (c): the row is retracted, not destroyed"
+        // v62.0.0 (WD-fix5; CC 6.1.5 N5, the lead's ruling) — an admitted
+        // author withdrawal of CONTENT (`chat:*`) descends it at the door: the
+        // row is gone, its id a tombstone, a later copy refused.
+        assert!(
+            read(bob.clone(), alice.clone(), LifecycleView::IncludeWithdrawn)
+                .await
+                .is_empty(),
+            "I1363 (c): the withdrawn call row descended: no lifecycle lists it"
+        );
+        assert!(
+            d.get_attestation(&a_id).await.unwrap().is_none(),
+            "I1363 (c): the row is gone"
+        );
+        assert!(
+            matches!(
+                crate::federation::withdrawn_content::held_row_state(d, &a_id)
+                    .await
+                    .unwrap(),
+                crate::federation::withdrawn_content::HeldRowState::Withdrawn { .. }
+            ),
+            "I1363 (c): its id reads Withdrawn"
+        );
+        let late = d
+            .put_attestation(SignedAttestation {
+                attestation: a_copy,
+            })
+            .await
+            .expect_err("I1363 (c): a later copy is refused");
+        assert!(
+            late.to_string()
+                .contains(crate::federation::steward_purge::token::TOMBSTONED),
+            "I1363 (c): by the tombstone: {late}"
         );
         assert_eq!(
             read(alice.clone(), bob.clone(), LifecycleView::Live).await,
@@ -504,7 +533,7 @@ pub(crate) mod bodies {
         // or, when that key has no owner binding, of the agent.
         let occurrence_of = |identity: String, occ: String| async move {
             // v62 (E3): a trusted-local bind keyed by identity-refs.
-            d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            d.test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: e2::kid(&identity),
                 occurrence_key_id: e2::kid(&occ),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
