@@ -550,31 +550,21 @@ pub fn test_pre_rotation_commitment(key_ids: &[String]) -> Result<String, Error>
 /// structurally different objects, and naming the axis is what keeps this from
 /// becoming one verdict with two silent value spaces (the #532 fusion class —
 /// compare [`ConferralPlane`], added for the same reason).
+///
+/// v62.0.0 (R2-valid; CC 3.2 T5, "There is no other kind of root") — ONE kind.
+/// The `Key` kind (a key that chartered itself) and the `Community` kind (a
+/// room whose chain did not root) are deleted with their arms: a key that
+/// signs a charter about itself is no root, and a room gives room standing
+/// only. Clean break, no alias.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RootKind {
-    /// A single `federation_keys` key id — the root that chartered itself.
-    /// **Still fully valid**: 1-of-1 is a legitimate quorum for a root you
-    /// alone own, and a solo operator's personal mesh has exactly one seat.
-    /// Portability is unchanged by #557; the family arm is *additional*
-    /// expressiveness, not a replacement.
+    /// The lineage of a genesis bundle, named by its `family_key_id`
+    /// (`humanity-accord` in the bake). It holds no key — which is the point:
+    /// there is no seat to compromise, so the identifier is the durable name
+    /// of the root while the AUTHORITY is re-derived from the holders of the
+    /// bundle in force.
     #[default]
-    Key,
-    /// A KEYLESS constitutional family id (`humanity-accord` in the bake). The
-    /// family holds no key — which is the point: there is no seat to
-    /// compromise, so the identifier can be the durable name of the root while
-    /// the AUTHORITY is re-derived from the family's roster and threshold.
     Family,
-    /// v50.0.0 (CIRISPersist#926) — a trust-root `infrastructure` community
-    /// (`ciris-canonical`): the user's edge names the community, and the
-    /// charter, halt, drill and holder-hardware legs are its accord FAMILY's.
-    /// Valid iff that family root is valid AND the community row is still
-    /// accord-rooted and conformant.
-    ///
-    /// v62.0.0 (KB-fix1; CC 3.2 at `87abd2d`) — a room is no root: this arm
-    /// is deleted, and the kind is produced only for the NOT-valid verdict of
-    /// a keyed id whose room's chain does not root (`not_rooted`). The bundle
-    /// root reports [`RootKind::Family`].
-    Community,
 }
 
 /// v24.0.0 (CIRISPersist#557) — the signer count of ONE signed act over a
@@ -901,8 +891,8 @@ pub struct TrustRootVerdict {
     /// commitment). Neither the drill, the halt latch nor holder custody is a
     /// leg (v62.0.0 TR-fix1; CC rc21 3.2 T8 l.1255).
     pub valid: bool,
-    /// v24.0.0 (CIRISPersist#557) — which arm produced this verdict. `#[serde(default)]`
-    /// = [`RootKind::Key`], so payloads from pre-v24 producers deserialize unchanged.
+    /// v24.0.0 (CIRISPersist#557) — which arm produced this verdict.
+    /// v62.0.0 (R2-valid): there is one, [`RootKind::Family`] (the default).
     #[serde(default)]
     pub root_kind: RootKind,
     /// v24.0.0 (CIRISPersist#557) — the charter-quorum accounting, present only
@@ -949,10 +939,10 @@ pub struct TrustRootVerdict {
     /// byte-identically to before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bounded_until: Option<chrono::DateTime<chrono::Utc>>,
-    /// v62.0.0 (wave W1b; E9 finding 3, CC 2.7) — why an id that holds a
-    /// trust-root COMMUNITY record is not valid: its community chain does not
-    /// root (a short birth count, a founder that no longer counts). Such an
-    /// id never takes the key arm. `None` otherwise.
+    /// v62.0.0 (R2-valid; CC 3.2 T5) — why the id asked about is no root:
+    /// it is not the lineage of a genesis bundle in force at this node (a key,
+    /// a room, the asking user's own id). `None` for the lineage itself,
+    /// valid or not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_rooted: Option<String>,
 }
@@ -989,12 +979,12 @@ where
     )))
 }
 
-/// v62.0.0 (wave W1b; E9 finding 3) — the verdict for an id that holds a
-/// trust-root COMMUNITY record whose chain does not root: not valid, by name,
-/// every leg unestablished. The root's identity-ref is also a key with a
-/// charter self-edge, so the KEY arm at the same id would read it as a 1-of-1
-/// key root and defeat the founders' threshold: it is never taken.
-fn community_not_rooted_verdict(reason: String) -> TrustRootVerdict {
+/// v62.0.0 (R2-valid; CC 3.2 T5, "There is no other kind of root") — the
+/// verdict for an id that is not the lineage of a genesis bundle in force: no
+/// root, by name, every leg unestablished. A key (the asking user's own
+/// included), a room and an earlier-form family record all read so; the KEY
+/// and FAMILY arms and the room guard that chose between them are deleted.
+fn not_a_root_verdict(root_ref: &str) -> TrustRootVerdict {
     TrustRootVerdict {
         edge_exists: false,
         root_self_declares: false,
@@ -1003,49 +993,16 @@ fn community_not_rooted_verdict(reason: String) -> TrustRootVerdict {
         drill_freshness: DrillFreshness::Red,
         halt_latched: None,
         valid: false,
-        root_kind: RootKind::Community,
+        root_kind: RootKind::Family,
         signer_count: None,
         holders_hardware: Vec::new(),
         holders_hardware_attested: false,
         bounded_until: None,
-        not_rooted: Some(reason),
+        not_rooted: Some(format!(
+            "{root_ref:?} is not the lineage of a genesis bundle in force at this node: the \
+             root is the bundle's lineage, and there is no other kind of root (CC 3.2 T5)"
+        )),
     }
-}
-
-/// v62.0.0 (wave W1b; E9 finding 3) — `Some(reason)` when `root_ref` holds a
-/// trust-root COMMUNITY record (trust-root grade) whose chain does not root
-/// now; the caller must not take the key arm. `None` when no such record is
-/// held.
-async fn community_record_not_rooted<F>(
-    directory: &F,
-    root_ref: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<String>, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let Some(c) = directory.lookup_community(root_ref).await? else {
-        return Ok(None);
-    };
-    if !super::canonical_community::is_trust_root_grade(&c) {
-        return Ok(None);
-    }
-    use super::canonical_community::StoredStanding;
-    let why = match super::canonical_community::chain_standing_at(directory, root_ref, now).await? {
-        StoredStanding::NotRooted { reason } => reason,
-        StoredStanding::Absent => "no community row".to_owned(),
-        // v62.0.0 (KB-fix1; CC 3.2 at `87abd2d`) — a room is no root: one
-        // whose chain roots gives ROOM standing only, and the key at the same
-        // id stands or falls as a keyed root on its own self-charter. A room
-        // whose chain does NOT root still vetoes that key (E9 finding 3,
-        // kept until the keyed-root question is ruled).
-        StoredStanding::Rooted(_) | StoredStanding::Stalled { .. } => return Ok(None),
-    };
-    Ok(Some(format!(
-        "{root_ref:?} holds a trust-root community record whose chain does not root: {why}. \
-         Its validity comes only from that chain; the key at the same id is never a root \
-         (CC 2.7)"
-    )))
 }
 
 /// v24.1.0 (CIRISPersist#561) — the EARLIER of two expiry bounds, treating
@@ -1262,26 +1219,15 @@ pub(crate) fn tombstoned_ids(rows: &[&Attestation]) -> std::collections::HashSet
     precedence::retired_ids(rows)
 }
 
-/// v24.0.0 (CIRISPersist#557) — does `root_ref` name a constitutional family
-/// this node has stored?
-///
-/// The ONE place the two arms of [`trust_root_valid`] are chosen between, so
-/// they can never be selected by two different rules. v62.0.0 (PX-fix3) — a
-/// directory that cannot answer (`Unsupported`) propagates; it no longer reads
-/// as "no family" (I2190).
-/// `pub(crate)` since v28.3.0 — [`crate::federation::mesh_config`] asks the
-/// same question (KEY root or FAMILY root?) to decide what "the root's own
-/// quorum" means for a durable config row, and asking it a second way is how
-/// two call sites come to disagree about which arm a root is on.
-pub(crate) async fn resolve_family_root<F>(
-    directory: &F,
-    root_ref: &str,
-) -> Result<Option<super::types::Family>, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    directory.lookup_family(root_ref).await
-}
+// v62.0.0 (R2-rest; CC 3.2 T5, lead's ruling 1) — the earlier-form FAMILY
+// record as a root is DELETED: `resolve_family_root` (the one arm chooser), the
+// family m-of-n over a row (`family_quorum_over`, `family_quorum_holders_over`,
+// `_envelope`, `_envelope_at`, `_roster`) and their readers (the
+// capability walk's `FamilyQuorum` plane, the family-charter quorum leg,
+// mesh_config's family arm, `accord_quorum_at`'s family fallback). A family
+// is no root; the root's own quorum is counted over the holders of the bundle
+// in force (`edition2::voices::counted_roster_signers`, the accord's
+// threshold).
 
 /// v24.0.0 (CIRISPersist#557) — the threshold this node's OWN state demands of
 /// a family, given its stored `consensus_protocol` and its OWN active roster.
@@ -1344,163 +1290,6 @@ pub(crate) fn family_charter_threshold(family: &super::types::Family, roster_siz
         }
     };
     policy.max(floor)
-}
-
-/// v24.0.0 (CIRISPersist#557) — how many DISTINCT seated holders of `family`
-/// really signed `row`?
-///
-/// The row's FULL scrub set ([`Attestation::scrubs`] — the base
-/// `scrub_key_id`/`scrub_signature_*` plus every `additional_scrubs` entry, all
-/// over the SAME canonical envelope) is intersected with the family's OWN active
-/// roster, and each survivor is hybrid-verified through
-/// `verify_envelope_hybrid_signature` (deleted v62.0.0, F0-cp8)
-/// — the same primitive federation-tier ingest runs, against pubkeys resolved
-/// from THIS node's directory. Never the roster a caller passed, never pubkeys
-/// carried on the row: authority is re-derived from the node's own verified
-/// state (the #377 rule).
-///
-/// A scrub that is not a seated holder, or that does not verify, simply does not
-/// COUNT — it is not an error. That is the m-of-n discipline the key plane
-/// already uses (`verify_quorum_policy` counts valid founder signatures and
-/// ignores the rest), and it means a stray co-signature degrades the evidence
-/// rather than destroying the row.
-/// `pub(crate)` since v28.3.0 — [`crate::federation::mesh_config`] uses this
-/// EXACT accounting for "the root's own quorum ratifying" (CC 4.2.1 rule 3) on
-/// a durable config row. One implementation of m-of-n-over-a-row, two callers;
-/// a second one written for the config plane would be free to count differently
-/// from the one that charters roots.
-pub(crate) async fn family_quorum_over<F>(
-    directory: &F,
-    row: &Attestation,
-    family: &super::types::Family,
-) -> Result<SignerCount, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    family_quorum_holders_over(directory, row, family)
-        .await
-        .map(|(q, _)| q)
-}
-
-/// v47.3.0 (CIRISPersist#901) — [`family_quorum_over`] with the counted SET
-/// beside the count: the distinct seated holders whose scrub verified, which
-/// is exactly the holder set the hardware leg of [`trust_root_valid`] judges.
-/// One fold decides both "quorate" and "who" (rule #9 — one predicate).
-pub(crate) async fn family_quorum_holders_over<F>(
-    directory: &F,
-    row: &Attestation,
-    family: &super::types::Family,
-) -> Result<(SignerCount, std::collections::BTreeSet<String>), Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    // v62.0.0 (wave V1, I3280) — a row carrying its edition-2 statement is
-    // counted by its VOICES (the separate statements over its payload, held
-    // in `ceg_statements`), never by an `additional_scrubs` set it does not
-    // have. The roster, threshold and counted set are read as before; only
-    // the "who signed" step changes. An earlier-form row keeps the scrub
-    // count behind the earlier-form switch (`edition2::voices`).
-    if super::edition2::voices::carried_row_id(row).is_some()
-        || super::edition2::door::earlier_form_doors_shut()
-    {
-        let roster: Vec<String> = match directory.active_family_members(&family.family_key_id).await
-        {
-            Ok(members) => members.into_iter().map(|m| m.key_id).collect(),
-            Err(e) => return Err(e),
-        };
-        let counted =
-            super::edition2::voices::counted_roster_signers(directory, row, &roster).await?;
-        let quorum = SignerCount {
-            distinct_holders: counted.len(),
-            required: family_charter_threshold(family, roster.len()),
-            roster_size: roster.len(),
-        };
-        return Ok((quorum, counted));
-    }
-    family_quorum_holders_over_envelope(directory, &row.attestation_envelope, &row.scrubs(), family)
-        .await
-}
-
-/// v50.0.0 (CIRISPersist#926) — [`family_quorum_holders_over`] over any signed
-/// envelope and its scrub set, not only an [`Attestation`]'s. The
-/// `ciris-canonical` community row is admitted under the accord's quorum
-/// counted by THIS body (the row's authority signature plus its
-/// co-signatures, over [`Community::signing_envelope`](super::types::Community::signing_envelope)):
-/// one m-of-n accounting for charters, config rows and the trust-root
-/// community, never a second copy free to count differently.
-pub(crate) async fn family_quorum_holders_over_envelope<F>(
-    directory: &F,
-    envelope: &serde_json::Value,
-    scrubs: &[super::types::ScrubSig],
-    family: &super::types::Family,
-) -> Result<(SignerCount, std::collections::BTreeSet<String>), Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    // The roster is the REVOCATION-FOLDED active seat set, not the raw member
-    // list: a holder removed from the family stops counting toward its quorum
-    // immediately, and a charter that once reached the threshold stops reaching
-    // it — which is exactly why the count is re-derived at READ time instead of
-    // being frozen at admission.
-    let roster: Vec<String> = match directory.active_family_members(&family.family_key_id).await {
-        Ok(members) => members.into_iter().map(|m| m.key_id).collect(),
-        Err(e) => return Err(e),
-    };
-    Ok(family_quorum_holders_over_roster(directory, envelope, scrubs, family, roster).await)
-}
-
-/// v50.0.0 (CIRISPersist#926 round 9) — [`family_quorum_holders_over_envelope`]
-/// with the family's revocation-folded roster taken at `as_of`
-/// ([`authorized_family_roster_at`](super::authorized_family_roster_at), the
-/// fold `active_family_members` runs at the wall clock) instead of at the wall
-/// clock: the trust-root standing is judged at an explicit instant, so its
-/// cache can say how long the verdict holds.
-pub(crate) async fn family_quorum_holders_over_envelope_at<F>(
-    directory: &F,
-    envelope: &serde_json::Value,
-    scrubs: &[super::types::ScrubSig],
-    family: &super::types::Family,
-    as_of: chrono::DateTime<chrono::Utc>,
-) -> Result<(SignerCount, std::collections::BTreeSet<String>), Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let roster: Vec<String> =
-        match super::authorized_family_roster_at(directory, family, as_of).await {
-            Ok(members) => members.into_iter().map(|m| m.key_id).collect(),
-            Err(e) => return Err(e),
-        };
-    Ok(family_quorum_holders_over_roster(directory, envelope, scrubs, family, roster).await)
-}
-
-/// The one count body behind both roster readings above.
-async fn family_quorum_holders_over_roster<F>(
-    directory: &F,
-    envelope: &serde_json::Value,
-    scrubs: &[super::types::ScrubSig],
-    family: &super::types::Family,
-    roster: Vec<String>,
-) -> (SignerCount, std::collections::BTreeSet<String>)
-where
-    F: FederationDirectory + ?Sized,
-{
-    let required = family_charter_threshold(family, roster.len());
-
-    // v24.3.0 (CIRISPersist#574) — the count itself lives in
-    // [`super::reverse_quorum::count_distinct_roster_scrubs`]. It was lifted
-    // out of this function so the charter plane and the commons' m-of-n undo
-    // door run the SAME body: "a distinct verified co-signature" must mean one
-    // thing in this repo, and two copies of it is the two-lists-that-disagree
-    // class (rule #9 — one predicate, one implementation).
-    let counted =
-        super::reverse_quorum::count_distinct_roster_scrubs(directory, envelope, scrubs, &roster)
-            .await;
-    let quorum = SignerCount {
-        distinct_holders: counted.len(),
-        required,
-        roster_size: roster.len(),
-    };
-    (quorum, counted)
 }
 
 /// v18.2.0 (CIRISPersist#481) — the trust-root graph predicate.
@@ -2204,67 +1993,26 @@ async fn trust_root_valid_body<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    // A self-root is the immutable BASE, never a valid EXTERNAL root (the
-    // FSD's gate demands a SHARED external root).
-    if user_key_id == root_ref {
-        return Ok(TrustRootVerdict {
-            edge_exists: false,
-            root_self_declares: false,
-            charter_has_recovery: false,
-            // Nothing was read on this path, so nothing is claimed: no
-            // drill found, banded Red. Consistent with every other leg
-            // reporting "not established" here.
-            last_drill_at: None,
-            drill_freshness: DrillFreshness::Red,
-            halt_latched: None,
-            valid: false,
-            root_kind: RootKind::Key,
-            signer_count: None,
-            holders_hardware: Vec::new(),
-            holders_hardware_attested: false,
-            bounded_until: None,
-            not_rooted: None,
-        });
-    }
-
-    // v24.0.0 (CIRISPersist#557) — WHICH ARM. Resolved once, from the node's own
-    // stored state, before any leg is evaluated.
-    // v62.0.0 (KB-fix1; CC 3.2 at rc22 `87abd2d`) — WHICH ARM. The root a
-    // node accepts is the lineage of a genesis bundle, named by its
-    // `family_key_id` ([`bundle_root_holders`]): its charter is the bundle's
-    // `charter`, its conferring roster the holders in force. A KEYED root
-    // (a self-charter signed by the root's key) is the other arm, kept until
-    // the keyed-root question is ruled. A trust-root COMMUNITY (a room,
-    // ciris-canonical included) is no root: the community arm that read a
-    // room's legs as the root's (v50.0.0 #926, W1b) is deleted; a room gives
-    // room standing only.
-    let bundle_holders = bundle_root_holders(directory, root_ref).await?;
-    let family = if bundle_holders.is_some() {
-        None
-    } else {
-        resolve_family_root(directory, root_ref).await?
-    };
-    let root_kind = if bundle_holders.is_some() || family.is_some() {
-        RootKind::Family
-    } else {
-        RootKind::Key
+    // v62.0.0 (R2-valid; CC 3.2 T5, "The root is the bundle's lineage") — ONE
+    // arm. The root a node accepts is the lineage of a genesis bundle, named
+    // by its `family_key_id` ([`bundle_root_holders`]): its charter is the
+    // bundle's `charter` (Verify placed it, recovery commitments REQUIRED),
+    // its holders are the holders in force. "There is no other kind of root.
+    // A key that signs a charter about itself is no root." The KEYED arm (a
+    // `trust:charter:v1` self-edge at a key, `RootKind::Key`), the
+    // earlier-form FAMILY-record arm (`resolve_family_root`, a charter
+    // co-scrubbed to the family's quorum) and the room guard
+    // (`community_record_not_rooted`, `RootKind::Community`) are deleted: any
+    // id that is not the lineage of a bundle in force, the user's own id
+    // included, is no root, by name.
+    let Some(bundle_holders) = bundle_root_holders(directory, root_ref).await? else {
+        return Ok(not_a_root_verdict(root_ref));
     };
     let legs_ref = root_ref;
-    // v62.0.0 (wave W1b; E9 finding 3, security) — an id that holds a
-    // trust-root COMMUNITY record never takes the KEY arm: its validity comes
-    // only from its community chain, and a chain that does not root is not
-    // valid, by name. Else a community whose founders' count went short would
-    // read valid as the 1-of-1 key root at its own identity-ref.
-    if root_kind == RootKind::Key {
-        if let Some(reason) = community_record_not_rooted(directory, root_ref, now).await? {
-            return Ok(community_not_rooted_verdict(reason));
-        }
-    }
 
     // One read per authority: the user's edges (+ their tombstones — a
-    // withdraws on your own edge is attested by YOU), the root's
-    // self-declarations, and the rows about the root a leg can pick — the
-    // family arm's charters and the drills — each with its tombstones.
+    // withdraws on your own edge is attested by YOU) and the drills about
+    // the root, each with its tombstones.
     // v53.1.7 — the slices bounded to what the legs below select (CIRISServer's
     // OOM probe: a per-peer trust walk every anti-entropy round, the accord
     // family attested-to by every user's trust edge). Each leg's predicate is
@@ -2280,33 +2028,12 @@ where
         user_edges.extend(page);
     }
     let by_user = with_slice_composers(directory, user_edges, None, Some(user_key_id)).await?;
-    let charter_jobs = jobs_other_than(TRUST_CHARTER_DIMENSION);
-    let mut root_charters = Vec::new();
-    let mut pages = AttestationQuery::by(legs_ref, FOLD_PAGE)
-        .types(&[attestation_type::DELEGATES_TO])
-        .excluding_dimensions(&charter_jobs)
-        .pages();
-    while let Some(page) = pages.next(directory).await? {
-        root_charters.extend(page);
-    }
-    let by_root = with_slice_composers(directory, root_charters, None, Some(legs_ref)).await?;
     let mut about_selected = Vec::new();
     let mut pages = AttestationQuery::to(legs_ref, FOLD_PAGE)
         .dimension_prefix(ACCORD_HEARTBEAT_DIMENSION)
         .pages();
     while let Some(page) = pages.next(directory).await? {
         about_selected.extend(page);
-    }
-    // Only the family arm reads charters from the about-slice.
-    if family.is_some() {
-        let mut pages = AttestationQuery::to(legs_ref, FOLD_PAGE)
-            .types(&[attestation_type::DELEGATES_TO])
-            .excluding_dimensions(&charter_jobs)
-            .pages();
-        while let Some(page) = pages.next(directory).await? {
-            about_selected.extend(page);
-        }
-        about_selected.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
     }
     let about_root = with_slice_composers(directory, about_selected, Some(legs_ref), None).await?;
 
@@ -2364,163 +2091,23 @@ where
         );
     }
 
-    // 2. Charter.
-    //
-    // KEY ROOT — live delegates_to(root → root) carrying BOTH infra:serve AND
-    // infra:attest (v19.0.0 #488 — the RC3 AND-minimum; extra charter scopes
-    // tolerated). The self-loop IS what makes a key a root.
-    //
-    // FAMILY ROOT (v24.0.0, CIRISPersist#557) — a family is KEYLESS, so it
-    // cannot sign a self-loop and the self-loop shape is structurally
-    // unavailable. Its analogue is `delegates_to(holder → family)` labelled
-    // `trust:charter:v1`, carried in the ABOUT set rather than the BY set, and
-    // it counts as a charter only when its FULL scrub set reaches the family's
-    // own threshold. That is the whole of #557: *the roster charters the
-    // family*, so no single seat can declare itself the mesh's root.
-    //
-    // The recovery leg (#488 delta 1) reads the SAME live charter rows on both
-    // arms: any live charter with a well-formed pre-rotation commitment
-    // satisfies it. Pre-rotation still protects individual SEATS; the family
-    // root additionally survives losing one without any ceremony at all.
-    let root_refs: Vec<&Attestation> = by_root.iter().collect();
-    let root_dead = tombstoned_ids(&root_refs);
+    // 2. Charter: the bundle's (KB-fix1). No row is a charter; the bundle in
+    // force declares the root by its placement (its tips share a holder) and
+    // carries its recovery commitments (Verify-placed). Its holders in force
+    // are the charter's holders.
     let about_refs: Vec<&Attestation> = about_root.iter().collect();
     let about_dead = tombstoned_ids(&about_refs);
-
-    // #973 (CC 3.2 T4a) — "… and is no charter": an unlabelled row toward the
-    // root is a charter only where its direction reading stands.
-    let charter_denied = direction_denied_ids(
-        directory,
-        by_root
-            .iter()
-            .chain(about_root.iter())
-            .filter(|a| a.attested_key_id == legs_ref),
-    )
-    .await?;
-    let charter_shaped = |a: &&Attestation, dead: &std::collections::HashSet<String>| {
-        a.attestation_type == attestation_type::DELEGATES_TO
-            && a.attested_key_id == legs_ref
-            && !dead.contains(&a.attestation_id)
-            && !is_expired(a, now)
-            && counts_in_capability_walk(a)
-            && job_dimension_admits(&a.attestation_envelope, TRUST_CHARTER_DIMENSION)
-            && !charter_denied.contains(&a.attestation_id)
-            && scope_contains(&a.attestation_envelope, INFRA_SERVE_SCOPE)
-            && scope_contains(&a.attestation_envelope, INFRA_ATTEST_SCOPE)
-    };
-
-    // v47.3.0 (CIRISPersist#901) — the charter HOLDERS ride out of the same
-    // fold that decides the charter leg: on the key arm the self-charter's
-    // signer; on the family arm the union of the verified seated scrubs of
-    // every quorate charter (the #557 count's own set, not the roster and not
-    // the `about_root` attesters — a co-signature that did not count is not a
-    // holder).
-    let mut charter_holders: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    // v62.0.0 (KB-fix1) — the bundle root: no charter row; the bundle's
-    // `charter` is its charter (Verify placed it, recovery commitments
-    // REQUIRED), and its holders in force are its charter holders.
-    let (live_charters, signer_count): (Vec<&Attestation>, Option<SignerCount>) =
-        if let Some(holders) = bundle_holders.as_ref() {
-            charter_holders.extend(holders.iter().cloned());
-            (Vec::new(), None)
-        } else {
-            match family.as_ref() {
-                None => {
-                    let self_charters: Vec<&Attestation> = by_root
-                        .iter()
-                        .filter(|a| charter_shaped(a, &root_dead) && a.attesting_key_id == legs_ref)
-                        .collect();
-                    charter_holders
-                        .extend(self_charters.iter().map(|a| a.attesting_key_id.clone()));
-                    (self_charters, None)
-                }
-                Some(fam) => {
-                    let mut quorate: Vec<&Attestation> = Vec::new();
-                    // Reported even when nothing reaches the bar: the SHORTFALL is
-                    // the finding a human acts on ("1 of 2 required distinct
-                    // holders"), so the best candidate's count is carried out.
-                    let mut best: Option<SignerCount> = None;
-                    // v53.0.0 (CC 3.2 T6) — only the charter the family's HEAD names
-                    // is in force: a re-scrub no version names confers nothing, and
-                    // the charter the head names stands until a new version names
-                    // another (`canonical_community::charter_in_force`, the one
-                    // answer every charter reader shares).
-                    let (_, head) =
-                        super::canonical_community::charter_in_force(directory, &fam.family_key_id)
-                            .await?;
-                    for candidate in about_root
-                        .iter()
-                        .filter(|a| charter_shaped(a, &about_dead) && head.admits(a))
-                    {
-                        let (q, signers) =
-                            family_quorum_holders_over(directory, candidate, fam).await?;
-                        if q.met() {
-                            quorate.push(candidate);
-                            charter_holders.extend(signers);
-                        }
-                        if best.is_none_or(|b| q.distinct_holders > b.distinct_holders) {
-                            best = Some(q);
-                        }
-                    }
-                    // No charter-shaped row at all still deserves an honest number:
-                    // 0 of whatever this node requires.
-                    let reported = match best {
-                        Some(q) => q,
-                        None => {
-                            let roster_size =
-                                match directory.active_family_members(&fam.family_key_id).await {
-                                    Ok(m) => m.len(),
-                                    Err(e) => return Err(e),
-                                };
-                            SignerCount {
-                                distinct_holders: 0,
-                                required: family_charter_threshold(fam, roster_size),
-                                roster_size,
-                            }
-                        }
-                    };
-                    (quorate, Some(reported))
-                }
-            }
-        };
-    // v62.0.0 (KB-fix1) — the bundle root declares itself by its placement:
-    // a bundle in force whose tips share a holder.
-    let root_self_declares = bundle_holders
-        .as_ref()
-        .map_or(!live_charters.is_empty(), |h| !h.is_empty());
-    // v24.1.0 (CIRISPersist#561) — the recovery-carrying subset, collected for
-    // the same reason `live_edges` is: `valid` needs BOTH charter legs, so the
-    // set that actually holds the conjunction up is this one, and it is the one
-    // whose expiry bounds the verdict.
-    let recovery_charters: Vec<&Attestation> = live_charters
-        .iter()
-        .copied()
-        .filter(|a| charter_commitment_well_formed(&a.attestation_envelope))
-        .collect();
-    let charter_has_recovery =
-        (root_self_declares && bundle_holders.is_some()) || !recovery_charters.is_empty();
+    let charter_holders: std::collections::BTreeSet<String> =
+        bundle_holders.iter().cloned().collect();
+    let root_self_declares = !bundle_holders.is_empty();
+    let charter_has_recovery = root_self_declares;
 
     // 2b. v47.3.0 (CIRISPersist#901) — a root is as attested as its holders:
-    // every charter holder's key record, as THIS node holds it, through the
-    // policy's structural legs (Layer A, no clock) and the chain walk for any
-    // class this node pins a root for (Layer B). Evaluated where the root is
+    // every holder's key record, as THIS node holds it, through the policy's
+    // structural legs (Layer A, no clock) and the chain walk for any class
+    // this node pins a root for (Layer B). Evaluated where the root is
     // judged, from the node's own records — never from a payload the caller
-    // carried.
-    // v62.0.0 (wave W1b; CC 4.2.2.1) — an EDITION-2 trust root (the
-    // community arm with no family: the root is its own root) is as attested
-    // as its FOUNDERS: the holders it seats, each judged on its key record's
-    // custody evidence, not the root's own key that signs its charter.
-    // v62.0.0 (KB-fix1) — the community arm is deleted; a KEYED root whose
-    // id also holds a room keeps that room's founders as its holders here
-    // (W1b's custody reading), until the keyed-root question is ruled.
-    if bundle_holders.is_none() && family.is_none() {
-        if let Some(c) = directory.lookup_community(legs_ref).await? {
-            charter_holders = super::canonical_community::founders(&c)
-                .into_iter()
-                .map(str::to_owned)
-                .collect();
-        }
-    }
+    // carried. REPORTED only (TR-fix1, below).
     let policy = directory.hardware_attestation_policy();
     let mut holders_hardware: Vec<HolderHardware> = Vec::with_capacity(charter_holders.len());
     for holder in &charter_holders {
@@ -2598,12 +2185,9 @@ where
     // wins). Reported only for a verdict that currently holds: "when does this
     // stop being true" is not a question about something already false, and a
     // TTL attached to a refusal would invite a caller to cache it.
-    let bounded_until = valid.then(|| {
-        earlier_bound(
-            latest_bound(live_edges.iter().copied()),
-            latest_bound(recovery_charters.iter().copied()),
-        )
-    });
+    // v62.0.0 (R2-valid) — the charter is the bundle's: no charter row
+    // bounds the verdict, so its lapse is the edge leg's.
+    let bounded_until = valid.then(|| latest_bound(live_edges.iter().copied()));
 
     Ok(TrustRootVerdict {
         edge_exists,
@@ -2613,8 +2197,8 @@ where
         drill_freshness,
         halt_latched,
         valid,
-        root_kind,
-        signer_count,
+        root_kind: RootKind::Family,
+        signer_count: None,
         holders_hardware,
         holders_hardware_attested,
         bounded_until: bounded_until.flatten(),
@@ -2632,12 +2216,9 @@ pub struct TrustedGrant {
     /// [`Self::conferral_plane`] for HOW) and (b) passes
     /// [`trust_root_valid`] from the asking user's records.
     ///
-    /// v24.0.0 (CIRISPersist#557) — for a [`ConferralPlane::FamilyQuorum`] grant
-    /// this carries the FAMILY id, which is not a key. The wire name is kept
-    /// (renaming it would break every downstream deserializer for a cosmetic
-    /// gain); what disambiguates it is [`TrustRootVerdict::root_kind`] on
-    /// [`Self::verdict`], which NAMES the axis rather than leaving one field
-    /// with two silent value spaces.
+    /// For a [`ConferralPlane::BundleRoot`] grant this carries the lineage's
+    /// `family_key_id`, which is not a key. The wire name is kept (renaming it
+    /// would break every downstream deserializer for a cosmetic gain).
     pub root_key_id: String,
     /// Which row carried the conferral. Its meaning is keyed by
     /// [`Self::conferral_plane`] — the two planes confer through different
@@ -2656,9 +2237,8 @@ pub struct TrustedGrant {
     /// candidate. `#[serde(default)]` = `Delegation`, so payloads from
     /// pre-#548 producers deserialize unchanged.
     ///
-    /// v50.0.0 (CIRISPersist#927) — three wire values, TWO CC planes: see
-    /// [`ConferralPlane`]. `AccordCoScrub` and `FamilyQuorum` are both the
-    /// CC 3.2 T2 ceremony plane; a consumer grouping by CC plane folds them.
+    /// v50.0.0 (CIRISPersist#927) — see [`ConferralPlane`] (v62.0.0 R2-rest:
+    /// the `FamilyQuorum` value is deleted).
     #[serde(default)]
     pub conferral_plane: ConferralPlane,
 }
@@ -2685,14 +2265,10 @@ pub struct TrustedGrant {
 /// |-----------------|---------------------------------|
 /// | `Delegation`    | delegation                      |
 /// | `AccordCoScrub` | ceremony (the shipped instance) |
-/// | `FamilyQuorum`  | **ceremony plane, family form** |
+/// | `BundleRoot`    | the root's counted grant        |
 ///
-/// `FamilyQuorum` is not a third plane; it is the ceremony plane's general
-/// form, kept as its own value because it names a different root kind (a
-/// family, not the subject key) and renaming a serialized variant buys nothing
-/// but broken deserializers. It is named by the scrub set exactly as the text
-/// requires: [`family_quorum_over`] derives the family from the row's verified
-/// signers against this node's own rosters.
+/// v62.0.0 (R2-rest) — the `FamilyQuorum` value (the ceremony plane's family
+/// form) is deleted: a family is no root.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ConferralPlane {
     /// A live `delegates_to(root → subject)` grant carried the scope.
@@ -2705,32 +2281,9 @@ pub enum ConferralPlane {
     /// asking user's own trust chain to it (edge, charter, heartbeat, halt)
     /// is still required in full via [`trust_root_valid`].
     AccordCoScrub,
-    /// v24.0.0 (CIRISPersist#557) — a live `delegates_to(holder → subject)`
-    /// grant carried the scope AND its own scrub set reached the QUORUM of a
-    /// constitutional family the granter sits in. The candidate root is that
-    /// FAMILY, not the holder who signed.
-    ///
-    /// v50.0.0 (CIRISPersist#927) — **the ceremony plane, family form** (CC
-    /// 3.2 T2 rc5); see the type-level table.
-    ///
-    /// # The granter semantic, chosen and written down
-    ///
-    /// #557 asks whether the walk should accept a grant whose granter is the
-    /// family id itself, or one from a quorum-covered holder acting for it.
-    /// **It is the second, and the code leaves no real choice**: a
-    /// constitutional family is KEYLESS by doctrine, so a row with
-    /// `attesting_key_id = <family id>` could never be signed and could never
-    /// pass federation-tier ingest, which verifies the attester's REGISTERED
-    /// pubkeys. A grant that merely *named* the family in its envelope while
-    /// carrying one seat's signature would be worse than the status quo — it
-    /// would let A1 alone re-grant under the accord's name, which is exactly
-    /// the authority #557 exists to take away from any single seat.
-    ///
-    /// So the family a grant acts for is **derived, never asserted**: from the
-    /// grant's own verified signer set, intersected with the node's OWN family
-    /// rosters. There is no `on_behalf_of` field to forge, and adding one seat's
-    /// signature to a grant buys nothing until the threshold is met.
-    FamilyQuorum,
+    // v62.0.0 (R2-rest; CC 3.2 T5) — `FamilyQuorum` (a grant co-signed to a
+    // family's quorum, the family as its root) is DELETED: a family is no root.
+    // Clean break; the wire names of the other values are unchanged.
     /// v62.0.0 (KR-fix3a; CC 3.2 as ruled 2026-11-21, CC 4.4.3.19) — the
     /// ROOT's counted grant: a `trust:confers:v1` row with no `author`,
     /// counted over the holders of the genesis bundle its `refs.head` names
@@ -3345,56 +2898,8 @@ where
             }));
         }
     }
-    // ── FAMILY-QUORUM plane (v24.0.0 / CIRISPersist#557) ─────────────────
-    // The same conferral rows, read for a different root: a grant signed by
-    // ENOUGH distinct seated holders of a family is a grant BY THAT FAMILY, and
-    // the candidate root is the family id.
-    //
-    // The family is DERIVED from the grant's own verified signer set against
-    // this node's OWN rosters — see [`ConferralPlane::FamilyQuorum`] for why
-    // that, and not a granter field naming the family, is the only safe reading.
-    // Runs AFTER the plain delegation loop (a single-key root costs no quorum
-    // crypto) and BEFORE the ceremony arm, matching the cheapest-first ordering
-    // this walk has always used.
-    let mut family_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // v62.0.0 (KR-fix3a) — a counted root grant is the bundle-root arm's
-    // alone: read here it would confer without its acceptance.
-    for grant in live
-        .iter()
-        .copied()
-        .filter(|a| !super::admission::is_counted_root_grant_row(a))
-    {
-        let families = match directory
-            .list_families_for_member(&grant.attesting_key_id)
-            .await
-        {
-            Ok(f) => f,
-            // v62.0.0 (PX-fix3) — `Unsupported` propagates (I2190).
-            Err(e) => return Err(e),
-        };
-        for family in families {
-            if !family_seen.insert(format!(
-                "{}\u{1f}{}",
-                family.family_key_id, grant.attestation_id
-            )) {
-                continue;
-            }
-            let quorum = family_quorum_over(directory, grant, &family).await?;
-            if !quorum.met() {
-                continue;
-            }
-            let verdict =
-                trust_root_valid(directory, user_key_id, &family.family_key_id, now).await?;
-            if verdict.valid {
-                return Ok(Some(TrustedGrant {
-                    root_key_id: family.family_key_id,
-                    grant_attestation_id: grant.attestation_id.clone(),
-                    verdict,
-                    conferral_plane: ConferralPlane::FamilyQuorum,
-                }));
-            }
-        }
-    }
+    // ── FAMILY-QUORUM plane — DELETED (v62.0.0 R2-rest; CC 3.2 T5): a family
+    // is no root, so a grant its seats co-sign confers nothing as the family.
     // ── CEREMONY-PLANE fallback (v22.1.0 / CIRISPersist#548) ─────────────
     // The baked genesis seed carries its conferral as a strict-majority accord
     // co-scrub on the subject's OWN key record — roles inside the
@@ -3666,101 +3171,78 @@ pub(crate) fn transit_candidate_roots(
         })
         .collect()
 }
-/// v36.2.0 (CIRISPersist#713) — **the active roster of an arbitrary trust
-/// root**, revocation-folded.
+/// v62.0.0 (RELAY-1; CC Part 5 "the accord's rows and tombstones": "A node
+/// carries an accord row only when its signature verifies as a seated
+/// holder's of the roster the row names, and carries none it cannot
+/// verify"; CC 4.2.1.1: `accord_root` "picks the bundle in force the row is
+/// verified against") — **is the accord row `statement`, under the lineage
+/// `root_ref`, signed by a seated holder of the roster it names?** On the
+/// bundle model the accord's roster is a BUNDLE of its lineage (CC 3.2 T5),
+/// never a family record (v62's R2 deleted the family roots, so the earlier
+/// `active_roster_of(root_ref)` read a roster that does not exist and
+/// answered "cannot judge" for every accord row):
 ///
-/// Every roster-parameterized resolver in this module
-/// ([`capability_roots_to_trusted_root_over_roster`],
-/// [`resolve_transit_eligibility_over_roster`],
-/// [`has_accord_conferred_role_over_roster`](super::admission::has_accord_conferred_role_over_roster))
-/// takes `accord_roster_key_ids` as a CALLER-SUPPLIED parameter, and the
-/// production convenience wrappers fill it from
-/// [`accord_holder_roster`](super::admission::accord_holder_roster)
-/// — the node's OWN genesis-baked holders. That is correct for this node's own
-/// accord and answers nothing about anyone else's.
+/// - a row naming a head (`accord:human_dignity`, `accord:lifecycle`: an
+///   accord holder's act names the bundle in force) — the signer is a holder
+///   of THE BUNDLE ITS `refs.head` NAMES ([`genesis::named_bundle`], the one
+///   reader of a named bundle's holders), whatever bundle is in force now;
+/// - an invocation (`accord:invoke:{constitutional, drill, notify}`: no head,
+///   it fires at each node on receipt) — the signer is a holder of the
+///   bundle in force HERE ([`genesis::GenesisInForce::is_holder`]);
 ///
-/// CC 4.2.3 is explicit that the accord roster is an INSTANCE PARAMETER:
-/// *"another instantiation of this form names its own three"*, and CC 4.2.6
-/// makes it a growable M-of-N family whose seats change through the same
-/// membership-change `supersedes` machinery as any other family. So "the
-/// roster" is not one baked list — it is a question asked OF A ROOT.
+/// `None` ("cannot judge"): the statement does not verify over this node's
+/// key plane; it names a head that is no bundle this node holds, or a bundle
+/// of another lineage; a non-invocation names no head; or no bundle of
+/// `root_ref` is in force here for an invocation.
 ///
-/// A root's roster is the family it charters: a `trust_charter` names its
-/// family in `attested_key_id`, so the roster is exactly
-/// [`active_family_members`](FederationDirectory::active_family_members) of
-/// that id — already revocation-folded, so a removed seat is gone here without
-/// this function re-deriving the fold (one implementation of "who is seated",
-/// per #686's lesson).
-///
-/// `Ok(None)` when this node holds no family under `root_ref` — the honest
-/// answer for a root whose roster this node cannot see, and distinct from
-/// `Ok(Some(vec![]))`, which would mean *"the roster is empty"*. A caller must
-/// not collapse those: the first is "I cannot judge", the second is "there is
-/// nobody to judge".
-pub async fn active_roster_of<F>(
+/// [`genesis::named_bundle`]: super::edition2::genesis::named_bundle
+/// [`genesis::GenesisInForce::is_holder`]: super::edition2::genesis::GenesisInForce::is_holder
+async fn accord_signer_seated<F>(
     directory: &F,
+    statement: &[u8],
     root_ref: &str,
-) -> Result<Option<Vec<String>>, Error>
+) -> Result<Option<bool>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    if directory.lookup_family(root_ref).await?.is_none() {
-        return Ok(None);
+    use super::edition2::names::names_of;
+    // An invocation: the ONE invocation reader (`halt::read_invocation`, the
+    // store door's) against the bundle in force here; it names no head.
+    if super::edition2::halt::is_invocation(statement) {
+        let Some(roster) = super::edition2::halt::roster_in_force(directory, root_ref).await?
+        else {
+            return Ok(None);
+        };
+        return match super::edition2::halt::read_invocation(statement, &roster) {
+            Ok(_) => Ok(Some(true)),
+            Err(Error::MalformedRow { reason, .. })
+                if reason == super::malformed_row::ISS_NOT_HOLDER =>
+            {
+                Ok(Some(false))
+            }
+            Err(_) => Ok(None),
+        };
     }
-    let members = directory.active_family_members(root_ref).await?;
-    Ok(Some(members.into_iter().map(|m| m.key_id).collect()))
-}
-
-/// v36.2.0 (CIRISPersist#713) — **may THIS node relay an `accord:*` object
-/// signed by `signer_key_id` under `root_ref`?**
-///
-/// Both legs, decided together and fail-closed:
-///
-/// 1. **The signer is seated.** `signer_key_id` is in
-///    [`active_roster_of`]`(root_ref)` — a live seat, revocation-folded.
-/// 2. **This node granted the root.** A live `delegates_to(self → root)`
-///    exists ([`trust_root_valid`]'s `edge_exists`).
-///
-/// Leg 2 is the substrate half of CC 4.2.1's *"Reach is consent-scoped
-/// (normative)"*: the accord's reach is *"exactly those holding a live
-/// `delegates_to(user → accord)`"*, and *"a node that never trusted the
-/// accord, or has already cut the edge, is simply not reached."* The
-/// Constitution's own framing is that the accord is **a** trust root, not
-/// **the** trust root — *"an emergency brake they granted, not a power imposed
-/// on everyone"* — so a node with no edge has no business carrying its
-/// traffic, and one that cut the edge has un-granted it.
-///
-/// # What this deliberately does NOT answer
-///
-/// **Whether this node is BOUND by a halt.** That is a different question with
-/// a different clock: CC 4.2.1 requires binding to resolve against the edge
-/// set pinned at the invocation's `asserted_at`, because *"exit is
-/// prospective, never retroactive"* — severing after the brake is pulled must
-/// not release you. This predicate is about CARRIAGE and reads LIVE state, so
-/// a node that cuts its edge stops relaying immediately while remaining bound
-/// by any halt already invoked. Fusing the two would be an axis fusion: one
-/// name, two clocks.
-pub async fn may_relay_accord_object<F>(
-    directory: &F,
-    self_key_id: &str,
-    signer_key_id: &str,
-    root_ref: &str,
-) -> Result<RelayVerdict, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let roster = active_roster_of(directory, root_ref).await?;
-    let signer_seated = roster
-        .as_ref()
-        .is_some_and(|r| r.iter().any(|k| k == signer_key_id));
-    let edge_exists = trust_root_valid(directory, self_key_id, root_ref, crate::host::clock::now())
+    // Any other accord row names the bundle it acts under.
+    let keys = super::edition2::ingest::held_keys_for(directory, statement).await?;
+    let Ok(admitted) = super::edition2::door::admit_row(
+        statement,
+        &keys,
+        None,
+        ciris_verify_core::edition2::family::SelectContext::default(),
+    ) else {
+        return Ok(None);
+    };
+    let Ok(names) = names_of(&admitted.payload) else {
+        return Ok(None);
+    };
+    let Some(head) = super::edition2::names::single(&names, "head") else {
+        return Ok(None);
+    };
+    Ok(super::edition2::genesis::named_bundle(directory, &head.0)
         .await?
-        .edge_exists;
-    Ok(RelayVerdict {
-        roster_resolvable: roster.is_some(),
-        signer_seated,
-        edge_exists,
-    })
+        .filter(|b| b.family_key_id == root_ref)
+        .map(|b| b.holders.iter().any(|x| *x == admitted.iss)))
 }
 
 /// v37.0.0 (CIRISPersist#733) — **which accord does this row claim to belong
@@ -3780,8 +3262,9 @@ pub enum AccordRootClaim {
     NotAccord,
     /// Exactly one root is named, and [`AccordRootSource`] says by what.
     Named {
-        /// The accord's root ref — a constitutional family id, or a key id on
-        /// the key arm. The argument [`may_relay_accord_object`] takes.
+        /// The accord's root ref: the lineage's `family_key_id` (v62.0.0
+        /// RELAY-1: the bundle lineage [`may_relay_accord_attestation`]
+        /// judges the row's signer against).
         root_ref: String,
         /// Which signal supplied it.
         source: AccordRootSource,
@@ -4059,8 +3542,10 @@ pub fn check_accord_root_binding(row: &Attestation) -> Result<(), Error> {
 ///
 /// The root comes from [`accord_root_claim`] — the signed
 /// [`accord_root`](super::envelope::paths::ACCORD_ROOT) key, falling back to
-/// the drill-dimension rule — and the two legs are then
-/// [`may_relay_accord_object`]'s, reused rather than re-derived here.
+/// the drill-dimension rule. v62.0.0 (RELAY-1) — then the two legs: (a) the
+/// row's signer is a seated holder of the bundle the row names (a head) or
+/// of the bundle in force here (an invocation), and (b) this node accepts
+/// the lineage (`bundle_root_accepted`).
 ///
 /// Everything else yields `roster_resolvable: false` and refuses:
 ///
@@ -4094,28 +3579,45 @@ where
     let AccordRootClaim::Named { root_ref, .. } = accord_root_claim(attestation) else {
         return Ok(UNJUDGEABLE);
     };
-    may_relay_accord_object(
+    // v62.0.0 (RELAY-1) — the ROW is judged, by the statement it carries
+    // ([`may_relay_accord_statement`]); an earlier-form row carries none and
+    // is not judgeable, nor is one whose statement names another lineage.
+    let Some(statement) = super::edition2::emit::carried_statement(attestation) else {
+        return Ok(UNJUDGEABLE);
+    };
+    let verdict = Box::pin(may_relay_accord_statement(
         directory,
         self_key_id,
-        &attestation.attesting_key_id,
-        &root_ref,
-    )
-    .await
+        &statement,
+    ))
+    .await?;
+    let named = super::edition2::liveness::statement_parts(&statement).and_then(|(_, p)| {
+        p.get_text("accord_root")
+            .and_then(ciris_verify_core::cde::Value::as_text)
+            .map(str::to_owned)
+    });
+    if named.is_some_and(|n| n != root_ref) {
+        return Ok(UNJUDGEABLE);
+    }
+    Ok(verdict)
 }
 
 /// v36.2.0 (CIRISPersist#713) — the typed verdict of
-/// [`may_relay_accord_object`]. A bool would collapse three distinct
+/// [`may_relay_accord_attestation`]. A bool would collapse three distinct
 /// operator-facing situations into one word; each field below is a different
 /// thing to go fix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayVerdict {
-    /// This node holds a family under `root_ref`, so the roster question was
-    /// answerable at all. `false` means *"I cannot judge"* — NOT *"the signer
-    /// is not seated"*.
+    /// The roster question was answerable at all: v62.0.0 (RELAY-1) the row
+    /// verifies here and names a bundle of the lineage this node holds (or,
+    /// an invocation, a bundle of the lineage is in force here). `false`
+    /// means *"I cannot judge"* — NOT *"the signer is not seated"*.
     pub roster_resolvable: bool,
-    /// The signer holds a live seat on that roster (revocation-folded).
+    /// The signer is a holder of that bundle (RELAY-1: the bundle the row's
+    /// `refs.head` names; the bundle in force here for an invocation).
     pub signer_seated: bool,
-    /// A live `delegates_to(self → root)` — this node granted the root.
+    /// This node (or its governing owner) accepts the lineage now
+    /// (RELAY-1: `bundle_root_accepted`, CC 3.2 T3).
     pub edge_exists: bool,
 }
 
@@ -4720,6 +4222,12 @@ pub fn check_charter_witness_quorum(envelope: &serde_json::Value) -> Result<(), 
 /// that names a constitutional family must be signed by that family's QUORUM,
 /// and it is refused at the write chokepoint if it is not.
 ///
+/// **v62.0.0 (R2-rest; CC 3.2 T5) — what is left:** a `trust:charter:v1` row
+/// naming the ACCORD is refused by its bytes (`accord_charter_is_the_bundle`)
+/// and the charter witness-quorum shape check runs; the FAMILY-quorum leg the
+/// rest of this doc describes is DELETED with the family root (a family is no
+/// root, so a charter naming one is stored and inert).
+///
 /// # Why a second gate rather than a wider first one
 ///
 /// [`check_trust_charter_admission`] is handed an envelope, not a row, because
@@ -4795,59 +4303,13 @@ where
     if row.attesting_key_id == row.attested_key_id {
         return Ok(());
     }
-    let refuse = |detail: String| Err(Error::CharterInvalid { detail });
     check_charter_witness_quorum(&row.attestation_envelope)?;
 
-    // v62.0.0 (wave GC6; CC 2.7.3) — everything below reads the family this
-    // charter names (its record, roster, protocol): declared on every path,
-    // the "not a family" one too, so the charter re-folds when the family
-    // lands, and the verdict does not depend on which arrived first.
-    fold::reads(Dep::key(&row.attested_key_id));
-
-    // Not a family ⇒ a MISLABELED key-plane row. Stored and inert, per #551
-    // item 2 — see the type-level doc.
-    let Some(family) = resolve_family_root(directory, &row.attested_key_id).await? else {
-        // v62.0.0 (RL-fix7) — the accord's own case is refused by its bytes
-        // above; any other subject no family answers writes the row and
-        // leaves the walk to refuse it (#551 item 2).
-        return Ok(());
-    };
-    fold::reads(Dep::key(&family.family_key_id));
-
-    // v62.0.0 (wave GC6) — whether this rule applies at all was decided by a
-    // read of another row (the family), so a miss is a fold condition: held,
-    // and the same held answer whichever of the charter and the family came
-    // first (the accord's own case was refused by its bytes above).
-    if !charter_commitment_well_formed(&row.attestation_envelope) {
-        return Err(fold::hold(
-            reason::FAMILY_CHARTER_COMMITMENT_MALFORMED,
-            Error::CharterInvalid {
-                detail: format!(
-                    "family charter for {} must carry a well-formed \
-                     \"{CHARTER_PRE_ROTATION_FIELD}\" (64 lowercase hex — sha256 of the \
-                     pre-committed successor key set); a quorum-rooted family survives losing \
-                     a seat, but the seats themselves still rotate",
-                    family.family_key_id
-                ),
-            },
-        ));
-    }
-
-    let quorum = family_quorum_over(directory, row, &family).await?;
-    if !quorum.met() {
-        // v62.0.0 (wave V1b) — short of the family's quorum: an edition-2
-        // charter waits for its holders' voices (`Pending`).
-        super::edition2::voices::note_short();
-        return refuse(format!(
-            "family charter for {} is signed by {} — the accord's own \
-             consensus_protocol {:?} makes this root a threshold, not a seat, and a \
-             charter below it would hand one holder the authority that grants \
-             everything",
-            family.family_key_id,
-            quorum.describe(),
-            family.consensus_protocol
-        ));
-    }
+    // v62.0.0 (R2-rest; CC 3.2 T5) — the family-QUORUM leg (a charter naming
+    // a family must carry that family's quorum) is DELETED with the family
+    // root: no row is a charter, and a family is no root, so a
+    // `trust:charter:v1` naming one is stored and inert. The accord's own case
+    // is refused by its bytes above.
     Ok(())
 }
 
@@ -5864,752 +5326,5 @@ mod charter_threshold_tests {
             );
             assert_eq!(family_charter_threshold(&family(cp), 5), 5, "{cp:?}");
         }
-    }
-}
-
-/// v53.1.7 — **I547's oracles**: the trust-root walks as v53.1.6 shipped them,
-/// VERBATIM (each reads its key's whole slice), with only the recursion into
-/// `trust_root_valid` pointed at its own oracle and `super::` spelled from the
-/// crate root. Held to the bounded walks by
-/// `bounded_reads_invariants::bodies::i547_trust_root_walks_read_what_they_select`.
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-pub(crate) mod v53_1_6_reference {
-    use super::*;
-
-    pub(crate) async fn trusted_roots_of_reference<F>(
-        directory: &F,
-        node_key_id: &str,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<String>, Error>
-    where
-        F: FederationDirectory + ?Sized,
-    {
-        use crate::federation::attestation_query::test_support::AllAttestations as _;
-        let by_node = match directory.all_attestations_by(node_key_id).await {
-            Ok(rows) => rows,
-            Err(Error::Unsupported { .. }) => Vec::new(),
-            Err(e) => return Err(e),
-        };
-        let refs: Vec<&Attestation> = by_node.iter().collect();
-        let dead = tombstoned_ids(&refs);
-        // v53.0.0 (CC 3.2 T2) — the same rotation rule as `trust_root_valid`'s
-        // edge leg: a superseded edge is not a subscription, its successor is.
-        let shaped: Vec<&Attestation> = by_node
-            .iter()
-            .filter(|a| {
-                (a.attestation_type == attestation_type::DELEGATES_TO
-                    || a.attestation_type == attestation_type::SUPERSEDES)
-                    && a.attested_key_id != node_key_id
-                    && !dead.contains(&a.attestation_id)
-                    && !is_expired(a, now)
-                    && counts_in_capability_walk(a)
-                    && job_dimension_admits(&a.attestation_envelope, TRUST_ACCEPTS_DIMENSION)
-            })
-            .collect();
-        let candidates = live_conferrals(directory, shaped).await?;
-        // #973 — an unlabelled edge is an acceptance edge only where its
-        // direction reading stands (held, or a pinned-bundle row).
-        let denied = direction_denied_ids(directory, candidates.iter().copied()).await?;
-        let mut roots: Vec<String> = candidates
-            .into_iter()
-            .filter(|a| !denied.contains(&a.attestation_id))
-            .map(|a| a.attested_key_id.clone())
-            .collect();
-        roots.sort();
-        roots.dedup();
-        Ok(roots)
-    }
-    pub(crate) async fn trust_root_valid_reference<F>(
-        directory: &F,
-        user_key_id: &str,
-        root_ref: &str,
-    ) -> Result<TrustRootVerdict, Error>
-    where
-        F: FederationDirectory + ?Sized,
-    {
-        use crate::federation::attestation_query::test_support::AllAttestations as _;
-        // A self-root is the immutable BASE, never a valid EXTERNAL root (the
-        // FSD's gate demands a SHARED external root).
-        if user_key_id == root_ref {
-            return Ok(TrustRootVerdict {
-                edge_exists: false,
-                root_self_declares: false,
-                charter_has_recovery: false,
-                // Nothing was read on this path, so nothing is claimed: no
-                // drill found, banded Red. Consistent with every other leg
-                // reporting "not established" here.
-                last_drill_at: None,
-                drill_freshness: DrillFreshness::Red,
-                halt_latched: None,
-                valid: false,
-                root_kind: RootKind::Key,
-                signer_count: None,
-                holders_hardware: Vec::new(),
-                holders_hardware_attested: false,
-                bounded_until: None,
-                not_rooted: None,
-            });
-        }
-
-        // v24.0.0 (CIRISPersist#557) — WHICH ARM. Resolved once, from the node's own
-        // stored state, before any leg is evaluated.
-        // v62.0.0 (KB-fix1; CC 3.2 at rc22 `87abd2d`) — WHICH ARM. The root a
-        // node accepts is the lineage of a genesis bundle, named by its
-        // `family_key_id` ([`bundle_root_holders`]): its charter is the bundle's
-        // `charter`, its conferring roster the holders in force. A KEYED root
-        // (a self-charter signed by the root's key) is the other arm, kept until
-        // the keyed-root question is ruled. A trust-root COMMUNITY (a room,
-        // ciris-canonical included) is no root: the community arm that read a
-        // room's legs as the root's (v50.0.0 #926, W1b) is deleted; a room gives
-        // room standing only.
-        let bundle_holders = bundle_root_holders(directory, root_ref).await?;
-        let family = if bundle_holders.is_some() {
-            None
-        } else {
-            resolve_family_root(directory, root_ref).await?
-        };
-        let root_kind = if bundle_holders.is_some() || family.is_some() {
-            RootKind::Family
-        } else {
-            RootKind::Key
-        };
-        let legs_ref = root_ref;
-        // v62.0.0 (wave W1b; E9 finding 3, security) — an id that holds a
-        // trust-root COMMUNITY record never takes the KEY arm: its validity comes
-        // only from its community chain, and a chain that does not root is not
-        // valid, by name. Else a community whose founders' count went short would
-        // read valid as the 1-of-1 key root at its own identity-ref.
-        if root_kind == RootKind::Key {
-            if let Some(reason) =
-                community_record_not_rooted(directory, root_ref, chrono::Utc::now()).await?
-            {
-                return Ok(community_not_rooted_verdict(reason));
-            }
-        }
-
-        // One read per authority: everything the user attested (edges + their
-        // tombstones — a withdraws on your own edge is attested by YOU), and
-        // everything attested about/by the root (self-declaration + its
-        // tombstones + lifecycle rows).
-        let by_user = directory.all_attestations_by(user_key_id).await?;
-        let by_root = directory.all_attestations_by(legs_ref).await?;
-        let about_root = directory.all_attestations_for(legs_ref).await?;
-
-        let now = chrono::Utc::now();
-
-        // 1. Edge: live (non-tombstoned, non-expired) delegates_to(user → root).
-        // v23.0.0 (#551 item 2): the row may NAME itself `trust:accepts:v1`; one
-        // claiming a different job is refused here (see `job_dimension_admits`).
-        let user_refs: Vec<&Attestation> = by_user.iter().collect();
-        let user_dead = tombstoned_ids(&user_refs);
-        // v24.1.0 (CIRISPersist#561) — collected rather than `.any()`-ed, so the
-        // SAME predicate that decides `edge_exists` also supplies the edge leg's
-        // expiry bound. One predicate, one pass; a second filter written to compute
-        // the TTL is a second answer free to disagree with the first.
-        //
-        // v53.0.0 (CC 3.2 T2) — an acceptance edge rotates the way a grant does:
-        // the user's own `supersedes` on it is the live edge and the edge it
-        // replaced is not. The SAME [`live_conferrals`] the capability walk reads
-        // grants through, so "is this edge live" has one answer on both reads.
-        let shaped_edges: Vec<&Attestation> = by_user
-            .iter()
-            .filter(|a| {
-                (a.attestation_type == attestation_type::DELEGATES_TO
-                    || a.attestation_type == attestation_type::SUPERSEDES)
-                    && a.attested_key_id == root_ref
-                    && !user_dead.contains(&a.attestation_id)
-                    && !is_expired(a, now)
-                    && counts_in_capability_walk(a)
-                    && job_dimension_admits(&a.attestation_envelope, TRUST_ACCEPTS_DIMENSION)
-            })
-            .collect();
-        let live_edges = live_conferrals(directory, shaped_edges).await?;
-        // #973 (CC 3.2 T4a) — "a new row with no `trust:{job}` label gives no
-        // acceptance": an unlabelled edge counts only where its direction reading
-        // stands (held when the rule arrived, or a pinned-bundle row).
-        let edge_denied = direction_denied_ids(directory, live_edges.iter().copied()).await?;
-        let live_edges: Vec<&Attestation> = live_edges
-            .into_iter()
-            .filter(|a| !edge_denied.contains(&a.attestation_id))
-            .collect();
-        let edge_exists = !live_edges.is_empty();
-
-        // 2. Charter.
-        //
-        // KEY ROOT — live delegates_to(root → root) carrying BOTH infra:serve AND
-        // infra:attest (v19.0.0 #488 — the RC3 AND-minimum; extra charter scopes
-        // tolerated). The self-loop IS what makes a key a root.
-        //
-        // FAMILY ROOT (v24.0.0, CIRISPersist#557) — a family is KEYLESS, so it
-        // cannot sign a self-loop and the self-loop shape is structurally
-        // unavailable. Its analogue is `delegates_to(holder → family)` labelled
-        // `trust:charter:v1`, carried in the ABOUT set rather than the BY set, and
-        // it counts as a charter only when its FULL scrub set reaches the family's
-        // own threshold. That is the whole of #557: *the roster charters the
-        // family*, so no single seat can declare itself the mesh's root.
-        //
-        // The recovery leg (#488 delta 1) reads the SAME live charter rows on both
-        // arms: any live charter with a well-formed pre-rotation commitment
-        // satisfies it. Pre-rotation still protects individual SEATS; the family
-        // root additionally survives losing one without any ceremony at all.
-        let root_refs: Vec<&Attestation> = by_root.iter().collect();
-        let root_dead = tombstoned_ids(&root_refs);
-        let about_refs: Vec<&Attestation> = about_root.iter().collect();
-        let about_dead = tombstoned_ids(&about_refs);
-
-        // #973 (CC 3.2 T4a) — "… and is no charter": an unlabelled row toward the
-        // root is a charter only where its direction reading stands.
-        let charter_denied = direction_denied_ids(
-            directory,
-            by_root
-                .iter()
-                .chain(about_root.iter())
-                .filter(|a| a.attested_key_id == legs_ref),
-        )
-        .await?;
-        let charter_shaped = |a: &&Attestation, dead: &std::collections::HashSet<String>| {
-            a.attestation_type == attestation_type::DELEGATES_TO
-                && a.attested_key_id == legs_ref
-                && !dead.contains(&a.attestation_id)
-                && !is_expired(a, now)
-                && counts_in_capability_walk(a)
-                && job_dimension_admits(&a.attestation_envelope, TRUST_CHARTER_DIMENSION)
-                && !charter_denied.contains(&a.attestation_id)
-                && scope_contains(&a.attestation_envelope, INFRA_SERVE_SCOPE)
-                && scope_contains(&a.attestation_envelope, INFRA_ATTEST_SCOPE)
-        };
-
-        // v47.3.0 (CIRISPersist#901) — the charter HOLDERS ride out of the same
-        // fold that decides the charter leg: on the key arm the self-charter's
-        // signer; on the family arm the union of the verified seated scrubs of
-        // every quorate charter (the #557 count's own set, not the roster and not
-        // the `about_root` attesters — a co-signature that did not count is not a
-        // holder).
-        let mut charter_holders: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        // v62.0.0 (KB-fix1) — the bundle root: no charter row; the bundle's
-        // `charter` is its charter (Verify placed it, recovery commitments
-        // REQUIRED), and its holders in force are its charter holders.
-        let (live_charters, signer_count): (Vec<&Attestation>, Option<SignerCount>) =
-            if let Some(holders) = bundle_holders.as_ref() {
-                charter_holders.extend(holders.iter().cloned());
-                (Vec::new(), None)
-            } else {
-                match family.as_ref() {
-                    None => {
-                        let self_charters: Vec<&Attestation> = by_root
-                            .iter()
-                            .filter(|a| {
-                                charter_shaped(a, &root_dead) && a.attesting_key_id == legs_ref
-                            })
-                            .collect();
-                        charter_holders
-                            .extend(self_charters.iter().map(|a| a.attesting_key_id.clone()));
-                        (self_charters, None)
-                    }
-                    Some(fam) => {
-                        let mut quorate: Vec<&Attestation> = Vec::new();
-                        // Reported even when nothing reaches the bar: the SHORTFALL is
-                        // the finding a human acts on ("1 of 2 required distinct
-                        // holders"), so the best candidate's count is carried out.
-                        let mut best: Option<SignerCount> = None;
-                        // v53.0.0 (CC 3.2 T6) — only the charter the family's HEAD names
-                        // is in force: a re-scrub no version names confers nothing, and
-                        // the charter the head names stands until a new version names
-                        // another (`canonical_community::charter_in_force`, the one
-                        // answer every charter reader shares).
-                        let (_, head) = crate::federation::canonical_community::charter_in_force(
-                            directory,
-                            &fam.family_key_id,
-                        )
-                        .await?;
-                        for candidate in about_root
-                            .iter()
-                            .filter(|a| charter_shaped(a, &about_dead) && head.admits(a))
-                        {
-                            let (q, signers) =
-                                family_quorum_holders_over(directory, candidate, fam).await?;
-                            if q.met() {
-                                quorate.push(candidate);
-                                charter_holders.extend(signers);
-                            }
-                            if best.is_none_or(|b| q.distinct_holders > b.distinct_holders) {
-                                best = Some(q);
-                            }
-                        }
-                        // No charter-shaped row at all still deserves an honest number:
-                        // 0 of whatever this node requires.
-                        let reported = match best {
-                            Some(q) => q,
-                            None => {
-                                let roster_size =
-                                    match directory.active_family_members(&fam.family_key_id).await
-                                    {
-                                        Ok(m) => m.len(),
-                                        Err(Error::Unsupported { .. }) => 0,
-                                        Err(e) => return Err(e),
-                                    };
-                                SignerCount {
-                                    distinct_holders: 0,
-                                    required: family_charter_threshold(fam, roster_size),
-                                    roster_size,
-                                }
-                            }
-                        };
-                        (quorate, Some(reported))
-                    }
-                }
-            };
-        // v62.0.0 (KB-fix1) — the bundle root declares itself by its placement:
-        // a bundle in force whose tips share a holder.
-        let root_self_declares = bundle_holders
-            .as_ref()
-            .map_or(!live_charters.is_empty(), |h| !h.is_empty());
-        // v24.1.0 (CIRISPersist#561) — the recovery-carrying subset, collected for
-        // the same reason `live_edges` is: `valid` needs BOTH charter legs, so the
-        // set that actually holds the conjunction up is this one, and it is the one
-        // whose expiry bounds the verdict.
-        let recovery_charters: Vec<&Attestation> = live_charters
-            .iter()
-            .copied()
-            .filter(|a| charter_commitment_well_formed(&a.attestation_envelope))
-            .collect();
-        let charter_has_recovery =
-            (root_self_declares && bundle_holders.is_some()) || !recovery_charters.is_empty();
-
-        // 2b. v47.3.0 (CIRISPersist#901) — a root is as attested as its holders:
-        // every charter holder's key record, as THIS node holds it, through the
-        // policy's structural legs (Layer A, no clock) and the chain walk for any
-        // class this node pins a root for (Layer B). Evaluated where the root is
-        // judged, from the node's own records — never from a payload the caller
-        // carried.
-        // v62.0.0 (wave W1b; CC 4.2.2.1) — an EDITION-2 trust root (the
-        // community arm with no family: the root is its own root) is as attested
-        // as its FOUNDERS: the holders it seats, each judged on its key record's
-        // custody evidence, not the root's own key that signs its charter.
-        // v62.0.0 (KB-fix1) — the community arm is deleted; a KEYED root whose
-        // id also holds a room keeps that room's founders as its holders here
-        // (W1b's custody reading), until the keyed-root question is ruled.
-        if bundle_holders.is_none() && family.is_none() {
-            if let Some(c) = directory.lookup_community(legs_ref).await? {
-                charter_holders = crate::federation::canonical_community::founders(&c)
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect();
-            }
-        }
-        let policy = directory.hardware_attestation_policy();
-        let mut holders_hardware: Vec<HolderHardware> = Vec::with_capacity(charter_holders.len());
-        for holder in &charter_holders {
-            holders_hardware.push(holder_hardware(directory, &policy, holder).await?);
-        }
-        let holders_hardware_attested = holders_hardware.iter().all(HolderHardware::attested);
-
-        // 3. Drill SIGNAL (v23.0.0, #551 item 4 — no longer a gate): the NEWEST
-        // live drill about the root, reported with its age banded. No freshness
-        // filter in the fold any more — an old drill is still a drill, and
-        // "when was it" is exactly the fact being reported. Tombstones for
-        // rows-about-root can come from their own attesters; fold over the
-        // about-set (composers reference the target id and carry the same
-        // attested key). A tombstoned / expired / local-tier row is still not a
-        // drill: those legs are unchanged.
-        //
-        // v24.0.0 (CIRISPersist#557) — unchanged for a FAMILY root too, and
-        // deliberately so: `list_attestations_for(family_id)` is already "drills
-        // about the family", which is the only shape the drill can take once the
-        // root is the family rather than a seat. A drill naming an individual
-        // holder is a drill about that holder, not about the accord.
-        let last_drill_at = about_root
-            .iter()
-            .filter(|a| {
-                a.attestation_type == attestation_type::SCORES
-                    && crate::federation::admission::envelope_dimension(&a.attestation_envelope)
-                        == Some(ACCORD_HEARTBEAT_DIMENSION)
-                    && !about_dead.contains(&a.attestation_id)
-                    && !is_expired(a, now)
-                    && counts_in_capability_walk(a)
-            })
-            .map(|a| a.asserted_at)
-            .max();
-        let drill_freshness =
-            DrillFreshness::of(last_drill_at.map(|t| now.signed_duration_since(t)));
-
-        // 4. Halt latch (kill-switch state), REPORTED ONLY. Unsupported backends
-        // report None — honestly unknown, never guessed.
-        // v24.0.0 (CIRISPersist#557) — on the FAMILY arm this argument is finally
-        // the kind of id the halt table is keyed by (`accord_active_halt` has
-        // `family_key_id` as its PRIMARY KEY), so the accord's strict-majority kill switch
-        // now latches against the root it was always meant to stop. On the key arm
-        // it stays a key id and, as before, resolves to "no halt".
-        let halt_latched = match directory.get_active_halt(legs_ref).await {
-            Ok(v) => Some(v.is_some()),
-            Err(Error::Unsupported { .. }) => None,
-            Err(e) => return Err(e),
-        };
-
-        // v23.0.0 (#551 item 4) — `drill_freshness` is DELIBERATELY absent from
-        // this conjunction. The hard gates are the ones that answer "may this
-        // root act": a consensual edge, a real charter, a recovery commitment.
-        // The drill answers "is anyone still minding it", which is reported
-        // beside the verdict, not enforced inside it.
-        // v47.3.0 (#901) — and every holder attested (FSD §2).
-        // v58.0.0 (CIRISPersist#1094; CC 3.2 T3/T8 + 4.2.1.1 as ruled 2026-10-15)
-        // — `halt_latched` is DELIBERATELY absent too. A constitutional halt is
-        // an agent pause: the agent's act gate is its only GATE. Folding it into
-        // `valid` made every consumer of this verdict (the conferral walk, the
-        // transit walk, and through them six write/serve doors) fail closed
-        // under a halt, which CC 4.2.1.1 names as a breaker. The latch is still
-        // READ and reported beside the verdict — a halt must be observable —
-        // exactly as the drill is.
-        // TR-fix1 — the reference mirrors the verdict: custody is not a leg.
-        let valid = edge_exists && root_self_declares && charter_has_recovery;
-
-        // v24.1.0 (CIRISPersist#561) — when this verdict can first lapse on time.
-        // Each leg survives while ANY of its rows is live (latest expiry wins,
-        // `None` = never); the VERDICT lapses when its first leg does (earliest
-        // wins). Reported only for a verdict that currently holds: "when does this
-        // stop being true" is not a question about something already false, and a
-        // TTL attached to a refusal would invite a caller to cache it.
-        let bounded_until = valid.then(|| {
-            earlier_bound(
-                latest_bound(live_edges.iter().copied()),
-                latest_bound(recovery_charters.iter().copied()),
-            )
-        });
-
-        Ok(TrustRootVerdict {
-            edge_exists,
-            root_self_declares,
-            charter_has_recovery,
-            last_drill_at,
-            drill_freshness,
-            halt_latched,
-            valid,
-            root_kind,
-            signer_count,
-            holders_hardware,
-            holders_hardware_attested,
-            bounded_until: bounded_until.flatten(),
-            not_rooted: None,
-        })
-    }
-    pub(crate) async fn capability_roots_to_trusted_root_over_roster_reference<F>(
-        directory: &F,
-        user_key_id: &str,
-        subject_key_id: &str,
-        scope: &str,
-        accord_roster_key_ids: &[String],
-    ) -> Result<Option<TrustedGrant>, Error>
-    where
-        F: FederationDirectory + ?Sized,
-    {
-        use crate::federation::attestation_query::test_support::AllAttestations as _;
-        // Every grant ABOUT the subject (delegates_to(* → subject)) plus its
-        // tombstones — a withdraws/recants on a grant is attested about the
-        // same subject, so the one about-read carries both.
-        let about_subject = directory.all_attestations_for(subject_key_id).await?;
-        let about_refs: Vec<&Attestation> = about_subject.iter().collect();
-        let dead = tombstoned_ids(&about_refs);
-        let now = chrono::Utc::now();
-
-        // Candidate roots: distinct granters of a live (non-tombstoned,
-        // non-expired — #488 delta 3) scoped delegates_to edge to the subject
-        // (excluding a self-grant). Dedup so a root that granted twice is
-        // walked once.
-        // v53.0.0 (CC 3.2 T2) — a successor grant is a `supersedes` carrying the
-        // conferral body; it is conferral-shaped too, and `live_conferrals` below
-        // admits it only when it rotates its own root's grant.
-        let conferral_shaped = |a: &&Attestation| {
-            (a.attestation_type == attestation_type::DELEGATES_TO
-                || a.attestation_type == attestation_type::SUPERSEDES)
-                && a.attested_key_id == subject_key_id
-                && a.attesting_key_id != subject_key_id
-                && !dead.contains(&a.attestation_id)
-                && !is_expired(a, now)
-                && counts_in_capability_walk(a)
-                // v23.0.0 (#551 item 2) — this loop reads CONFERRALS
-                // (R → subject); a row here labeled charter or trust-edge is
-                // pointing the other way and does not confer.
-                && job_dimension_admits(&a.attestation_envelope, TRUST_CONFERS_DIMENSION)
-                // RL-fix14 — an owner binding is no conferral (as above).
-                && !crate::federation::admission::is_owner_binding_envelope(&a.attestation_envelope)
-                && scope_contains(&a.attestation_envelope, scope)
-        };
-
-        // v53.0.0 (CC 3.2 T2, steward ruling 2026-10-01) — rotation is a
-        // `supersedes`, compromise is a `withdraws`. This walk answers "does the
-        // subject hold `scope` NOW", so the head of a grant's `supersedes` chain
-        // is the live candidate and every grant it superseded is not; a withdrawn
-        // link (`dead`) confers nothing and revives nothing. See
-        // [`live_conferrals`].
-        let shaped: Vec<&Attestation> = about_subject.iter().filter(conferral_shaped).collect();
-        let live = live_conferrals(directory, shaped).await?;
-
-        let mut seen = std::collections::HashSet::new();
-        let candidates: Vec<(&str, &str)> = live
-            .iter()
-            .copied()
-            .filter(|a| seen.insert(a.attesting_key_id.clone()))
-            .map(|a| (a.attesting_key_id.as_str(), a.attestation_id.as_str()))
-            .collect();
-
-        // First candidate root the user actually trusts wins.
-        for (root_key_id, grant_id) in candidates {
-            let verdict = trust_root_valid_reference(directory, user_key_id, root_key_id).await?;
-            if verdict.valid {
-                return Ok(Some(TrustedGrant {
-                    root_key_id: root_key_id.to_owned(),
-                    grant_attestation_id: grant_id.to_owned(),
-                    verdict,
-                    conferral_plane: ConferralPlane::Delegation,
-                }));
-            }
-        }
-
-        // ── FAMILY-QUORUM plane (v24.0.0 / CIRISPersist#557) ─────────────────
-        // The same conferral rows, read for a different root: a grant signed by
-        // ENOUGH distinct seated holders of a family is a grant BY THAT FAMILY, and
-        // the candidate root is the family id.
-        //
-        // The family is DERIVED from the grant's own verified signer set against
-        // this node's OWN rosters — see [`ConferralPlane::FamilyQuorum`] for why
-        // that, and not a granter field naming the family, is the only safe reading.
-        // Runs AFTER the plain delegation loop (a single-key root costs no quorum
-        // crypto) and BEFORE the ceremony arm, matching the cheapest-first ordering
-        // this walk has always used.
-        let mut family_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for grant in live.iter().copied() {
-            let families = match directory
-                .list_families_for_member(&grant.attesting_key_id)
-                .await
-            {
-                Ok(f) => f,
-                // Honestly unknown, never guessed — same treatment the halt leg
-                // gives a backend that cannot answer.
-                Err(Error::Unsupported { .. }) => Vec::new(),
-                Err(e) => return Err(e),
-            };
-            for family in families {
-                if !family_seen.insert(format!(
-                    "{}\u{1f}{}",
-                    family.family_key_id, grant.attestation_id
-                )) {
-                    continue;
-                }
-                let quorum = family_quorum_over(directory, grant, &family).await?;
-                if !quorum.met() {
-                    continue;
-                }
-                let verdict =
-                    trust_root_valid_reference(directory, user_key_id, &family.family_key_id)
-                        .await?;
-                if verdict.valid {
-                    return Ok(Some(TrustedGrant {
-                        root_key_id: family.family_key_id,
-                        grant_attestation_id: grant.attestation_id.clone(),
-                        verdict,
-                        conferral_plane: ConferralPlane::FamilyQuorum,
-                    }));
-                }
-            }
-        }
-        // ── CEREMONY-PLANE fallback (v22.1.0 / CIRISPersist#548) ─────────────
-        // The baked genesis seed carries its conferral as a strict-majority accord
-        // co-scrub on the subject's OWN key record — roles inside the
-        // scrub-signed registration_envelope, zero `delegates_to` rows. That is
-        // the ceremony encoding: the accord blesses the identity, and the
-        // blessing is what MAKES the subject a root. Before this arm, the
-        // `AccordCoScrub` read (`has_accord_conferred_role`) consulted that plane
-        // while this walk read only `Delegation` — so a fully accord-blessed
-        // canonical rooted to nothing and the trace plane stayed dark on a
-        // production-seeded node. (v23.0.0 / CIRISPersist#551 item 3: this used
-        // to be written "leg A" and "leg B", names that recorded the ORDER two
-        // checks run in and not the PLANE each consults — which is why #548's
-        // first proposed remedy would have deleted the operator's un-trust
-        // lever. The planes have names; use them.)
-        //
-        // The check IS the `AccordCoScrub` plane, by call —
-        // `has_accord_conferred_role_over_roster`
-        // (claims_role + verify_accord_family_coscrub against THIS node's
-        // effective roster), never a re-implementation: one predicate, one impl.
-        // A portable root minted by a DIFFERENT trio does not verify against our
-        // roster and does not need to — its mint already carries the delegation
-        // plane (charter + grant), which the loop above serves.
-        //
-        // HALF 2 IS UNTOUCHED, deliberately (the corrected #548 ask): the
-        // candidate still walks `trust_root_valid_reference(user, subject-as-root)` in
-        // full — the user's OWN `delegates_to(user → subject)` edge, the
-        // subject's self-charter with a recovery commitment, a fresh
-        // heartbeat witness, no halt latched. So the operator's un-trust
-        // lever survives exactly as designed: delete the one edge row and the
-        // verdict goes false, the walk returns None, the serve gate withholds,
-        // agent capabilities gate off, manifests stop — all emergent, nothing
-        // special-cased. A ceremony arm that skipped half 2 would have deleted
-        // that lever, which is strictly worse than the bug it fixes.
-        //
-        // Runs AFTER the delegation loop: delegation grants are the specific,
-        // cheap path (no quorum crypto); the ceremony check costs a strict-majority
-        // hybrid verification, so cheapest-first ordering holds here too.
-        if crate::federation::admission::has_accord_conferred_role_over_roster(
-            directory,
-            subject_key_id,
-            scope,
-            accord_roster_key_ids,
-        )
-        .await?
-        {
-            let verdict =
-                trust_root_valid_reference(directory, user_key_id, subject_key_id).await?;
-            if verdict.valid {
-                return Ok(Some(TrustedGrant {
-                    root_key_id: subject_key_id.to_owned(),
-                    // Keyed by `conferral_plane`: the conferral lives ON the
-                    // co-scrubbed KeyRecord, which has no attestation id.
-                    grant_attestation_id: subject_key_id.to_owned(),
-                    verdict,
-                    conferral_plane: ConferralPlane::AccordCoScrub,
-                }));
-            }
-        }
-        Ok(None)
-    }
-    pub(crate) async fn transit_eligibility_walk_reference(
-        directory: &dyn FederationDirectory,
-        user_key_id: &str,
-        peer_key_id: &str,
-    ) -> Result<(TransitEligibility, usize), Error> {
-        use crate::federation::attestation_query::test_support::AllAttestations as _;
-        use crate::federation::types::{delegation_scope, identity_type};
-
-        // A node is not its own hop. Short-circuited before any read: the
-        // shared-root rule needs two parties, and `trust_root_valid` already
-        // refuses a self-root as the immutable base rather than an external root.
-        if user_key_id == peer_key_id {
-            return Ok((TransitEligibility::denied(), 0));
-        }
-
-        // (A) directory presence.
-        let Some(peer) = directory.lookup_public_key(peer_key_id).await? else {
-            return Ok((TransitEligibility::denied(), 0));
-        };
-
-        // (B) it is a NODE.
-        //
-        // Read as SET MEMBERSHIP, not string equality. `identity_type` is a
-        // scalar-or-comma-joined set (#441 — `claims_role` reads it the same way),
-        // and the canonical serve node in the genesis bake carries
-        // `identity_type = "canonical,node"`. `== "node"` would deny exactly the
-        // production nodes most likely to be asked to relay, which is a denial
-        // with no security content: (B) is a self-claim either way, and the bar
-        // that does the work is (D).
-        if !identity_type::set_contains(&peer.identity_type, identity_type::NODE) {
-            return Ok((TransitEligibility::denied(), 0));
-        }
-
-        // (C) it self-offers transport.
-        // v62.0.0 (wave W1b; CC 3.3.6.2 "a node that relays carries one transit
-        // public key `transit_xwing_pubkey` on this `transport_destination`
-        // binding") — in edition 2 a key record carries no roles: the offer is a
-        // live transit key (its occurrence binding, or a seat's bundle binding or
-        // counted re-bind). The earlier form's `infra:transport` role claim is read
-        // only while the earlier-form doors are open.
-        let offers_transport =
-            crate::federation::self_at_login::transit_xwing_pubkey_for(directory, peer_key_id)
-                .await?
-                .is_some()
-                || (!crate::federation::edition2::door::earlier_form_doors_shut()
-                    && peer.claims_role(delegation_scope::INFRA_TRANSPORT));
-        if !offers_transport {
-            return Ok((TransitEligibility::denied(), 0));
-        }
-
-        // (D) shared root. Candidates come from the USER's own edges — see
-        // `transit_candidate_roots` for why that boundary is the anti-inflation
-        // property and not merely an optimization.
-        let now = chrono::Utc::now();
-        let by_user = directory.all_attestations_by(user_key_id).await?;
-        let mut roots_walked = 0usize;
-        for candidate in transit_candidate_roots(&by_user, user_key_id, now) {
-            roots_walked += 1;
-            let ours =
-                trust_root_valid_reference(directory, user_key_id, &candidate.root_ref).await?;
-            if !ours.valid {
-                continue;
-            }
-            // Only now is the peer's side worth reading: a root WE do not validly
-            // trust cannot be a SHARED root however the peer feels about it, and
-            // checking us first keeps the per-candidate cost on our own records.
-            let theirs =
-                trust_root_valid_reference(directory, peer_key_id, &candidate.root_ref).await?;
-            if !theirs.valid {
-                continue;
-            }
-
-            // The TTL: the earliest bound across everything the walk counted. Each
-            // verdict's `bounded_until` already folds that side's trust edge and
-            // charter at persist's own `is_expired` reference time; the peer's key
-            // record contributes its own validity window.
-            let valid_until = earlier_bound(
-                earlier_bound(peer.valid_until, ours.bounded_until),
-                theirs.bounded_until,
-            );
-            // A bound already in the past means the walk counted something whose
-            // window has closed — in practice the peer's own `valid_until`, since
-            // every graph row the legs counted was liveness-filtered at `now`. An
-            // expired key is not an eligible hop, and reporting `eligible: true`
-            // beside an elapsed TTL would be a fail-OPEN dressed as a fresh answer.
-            if valid_until.is_some_and(|t| t <= now) {
-                return Ok((TransitEligibility::denied(), roots_walked));
-            }
-            return Ok((
-                TransitEligibility {
-                    eligible: true,
-                    valid_until,
-                    via_root: Some(candidate.root_ref),
-                    arm: Some(TransitArm::OnionRoot),
-                    refusal: None,
-                },
-                roots_walked,
-            ));
-        }
-        Ok((TransitEligibility::denied(), roots_walked))
-    }
-    pub(crate) async fn owner_granted_scope_reference<F>(
-        directory: &F,
-        subject_key_id: &str,
-        granter_key_id: &str,
-        scope: &str,
-    ) -> Result<bool, Error>
-    where
-        F: FederationDirectory + ?Sized,
-    {
-        use crate::federation::attestation_query::test_support::AllAttestations as _;
-        let about_subject = directory.all_attestations_for(subject_key_id).await?;
-        let about_refs: Vec<&Attestation> = about_subject.iter().collect();
-        let dead = tombstoned_ids(&about_refs);
-        let now = chrono::Utc::now();
-
-        Ok(about_subject.iter().any(|a| {
-            a.attestation_type == attestation_type::DELEGATES_TO
-                && a.attested_key_id == subject_key_id
-                && a.attesting_key_id == granter_key_id
-                // A self-grant is skipped exactly as the root walk skips it: a key
-                // that grants itself serve standing has conferred nothing, and an
-                // owner that IS the subject is that same degenerate case.
-                && a.attesting_key_id != subject_key_id
-                && !dead.contains(&a.attestation_id)
-                && !is_expired(a, now)
-                // #788 review — the ROW's `expires_at` is not the only temporal
-                // limit. The authoritative owner-binding fold also rejects a
-                // lapsed ENVELOPE-level `valid_until`, so checking `expires_at`
-                // alone let this resolver keep returning `MeshServer` after the
-                // serve grant had ended: two reads of "is this grant live"
-                // disagreeing, which is the two-lists class. The SAME predicate,
-                // not a second spelling of it.
-                && !crate::federation::admission::delegation_valid_until_lapsed(&a.attestation_envelope, now)
-                && counts_in_capability_walk(a)
-                && job_dimension_admits(&a.attestation_envelope, TRUST_CONFERS_DIMENSION)
-                && scope_contains(&a.attestation_envelope, scope)
-        }))
     }
 }

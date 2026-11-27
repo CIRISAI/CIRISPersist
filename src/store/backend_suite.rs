@@ -247,7 +247,11 @@ mod tests {
                         x if x == r::STEWARD_UNPROVEN => {
                             "federation_user_target_steward_binding_forbidden".to_owned()
                         }
-                        x if x == r::gc1::RESERVED_PREFIX_EMITTER_MISMATCH => {
+                        // v62.0.0 (D1, D4) — a reserved family's duty not
+                        // held: the text's token, the same error kind.
+                        x if x == r::gc1::RESERVED_PREFIX_EMITTER_MISMATCH
+                            || x == r::gc1::RESERVED_FAMILY_UNSEATED =>
+                        {
                             "federation_reserved_prefix_emitter_mismatch".to_owned()
                         }
                         x if x == r::gc6::CHARTER_SUCCESSOR_UNHELD
@@ -415,7 +419,7 @@ mod tests {
                 "id": id,
                 // v62.0.0 (E5) — the earlier form (held tests) keeps its own.
                 "dimension": if e2::emit_edition2() {
-                    "evidence:safety_battery:capture:a:b:v1"
+                    "coherence_standing:cab:v1"
                 } else {
                     "identity_binding:v1"
                 },
@@ -1050,7 +1054,7 @@ mod tests {
         att.attestation_envelope = serde_json::json!({
             "id": id,
             "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
-            "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+            "delegation_purpose": crate::federation::types::owner_binding::PURPOSE,
         });
         resign_fix(&mut att); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         att
@@ -1484,11 +1488,14 @@ mod tests {
     /// accord heartbeat about a fixture root (its signer needs accord
     /// standing); the drill's band is #551's witness below and the edition-2
     /// "undrilled ⇒ Red, still valid" is `operational`'s ceremony walk.
+    ///
+    /// v62.0.0 (R2-fixture; CC 3.2 T5) — the root is the bundle's LINEAGE
+    /// (`fixture_genesis::install_v2`): "the root charters itself" is the
+    /// bundle's `charter` member, and the user's edge is its acceptance of the
+    /// lineage (`accept_lineage_e2`).
     #[tokio::test]
     async fn trust_root_walk_and_tombstone_481() {
-        use crate::federation::operational::test_support::{
-            accept_e2_root, stand_up_e2_root, withdraw_e2,
-        };
+        use crate::federation::operational::test_support::{accept_lineage_e2, withdraw_e2};
         use crate::federation::trust_root::{trust_root_valid, TrustRootVerdict};
         let backend = test_backend();
         let user = put_e2_key(&backend, "tr-user", "user").await;
@@ -1501,17 +1508,18 @@ mod tests {
         .await
         .expect("(1) self-root attestation(user→user) must admit");
 
-        // Ask 2 — the root charters itself; the user's own edge.
-        let r = stand_up_e2_root(&backend, "tr-root")
+        // Ask 2 — the bundle in force (its charter); the user's own edge.
+        crate::federation::edition2::fixture_genesis::install_v2(&backend)
             .await
-            .expect("(2) the root stands up and charters itself");
-        let edge = accept_e2_root(&backend, "tr-user", &r.root)
+            .expect("(2) the bundle in force");
+        let root = crate::federation::edition2::fixture_genesis::FAMILY_KEY_ID;
+        let edge = accept_lineage_e2(&backend, "tr-user")
             .await
             .expect("the user's trust edge must admit");
 
         // Ask 3 — the walk: every hard leg green.
         let v: TrustRootVerdict =
-            trust_root_valid(&backend, &user, &r.root, crate::host::clock::now())
+            trust_root_valid(&backend, &user, root, crate::host::clock::now())
                 .await
                 .expect("walk");
         assert!(v.edge_exists, "(3) live user→root edge: {v:?}");
@@ -1530,10 +1538,10 @@ mod tests {
 
         // Ask 4 — nuclear un-trust: withdraw the edge; the walk folds it
         // ABSENT. The root's own declaration stands.
-        withdraw_e2(&backend, "tr-user", &r.root, &edge)
+        withdraw_e2(&backend, "tr-user", root, &edge)
             .await
             .expect("(4) withdraws on own edge must admit");
-        let v2 = trust_root_valid(&backend, &user, &r.root, crate::host::clock::now())
+        let v2 = trust_root_valid(&backend, &user, root, crate::host::clock::now())
             .await
             .expect("walk post-tombstone");
         assert!(!v2.edge_exists, "(4) tombstoned edge is ABSENT to the walk");
@@ -1554,23 +1562,24 @@ mod tests {
     /// the root from a signer with accord standing, which no edition-2 fixture
     /// produces for a fixture root (the banding itself is the private
     /// `DrillFreshness::of`).
+    ///
+    /// v62.0.0 (R2-fixture; CC 3.2 T5) — the root is the bundle's lineage.
     #[tokio::test]
     async fn drill_freshness_is_a_signal_not_a_gate_551() {
-        use crate::federation::operational::test_support::{
-            accept_e2_root, stand_up_e2_root, withdraw_e2,
-        };
+        use crate::federation::operational::test_support::{accept_lineage_e2, withdraw_e2};
         use crate::federation::trust_root::{trust_root_valid, DrillFreshness};
         let backend = test_backend();
         let user = put_e2_key(&backend, "drill-user", "user").await;
-        let r = stand_up_e2_root(&backend, "drill-never")
+        crate::federation::edition2::fixture_genesis::install_v2(&backend)
             .await
-            .expect("the root stands up");
-        let edge = accept_e2_root(&backend, "drill-user", &r.root)
+            .expect("the bundle in force");
+        let root = crate::federation::edition2::fixture_genesis::FAMILY_KEY_ID;
+        let edge = accept_lineage_e2(&backend, "drill-user")
             .await
             .expect("the user's edge");
 
         // Never drilled: valid, and RED.
-        let never = trust_root_valid(&backend, &user, &r.root, crate::host::clock::now())
+        let never = trust_root_valid(&backend, &user, root, crate::host::clock::now())
             .await
             .unwrap();
         assert!(
@@ -1581,10 +1590,10 @@ mod tests {
         assert_eq!(never.last_drill_at, None, "never drilled, and it says so");
 
         // The HARD gate still works: the user un-trusts → invalid.
-        withdraw_e2(&backend, "drill-user", &r.root, &edge)
+        withdraw_e2(&backend, "drill-user", root, &edge)
             .await
             .expect("the user withdraws its edge");
-        let unrooted = trust_root_valid(&backend, &user, &r.root, crate::host::clock::now())
+        let unrooted = trust_root_valid(&backend, &user, root, crate::host::clock::now())
             .await
             .unwrap();
         assert!(
@@ -1666,8 +1675,8 @@ mod tests {
     /// (1) CRITICAL: a charter without a pre-rotation commitment REFUSES at
     /// admission; a recovery declaration must BIND to the predecessor's
     /// pre-committed successor set; (2) serve∧attest AND-minimum — a
-    /// serve-only self-loop is not a root; (3) an EXPIRED trust edge is as
-    /// dead to the walk as a tombstoned one.
+    /// serve-only self-loop is not a root (v62.0.0 R2-valid: no key is); (3)
+    /// an EXPIRED trust edge is as dead to the walk as a tombstoned one.
     #[tokio::test]
     async fn rc3_charter_deltas_488() {
         use crate::federation::trust_root::{test_pre_rotation_commitment, trust_root_valid};
@@ -1737,33 +1746,40 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(v.edge_exists);
+        // v62.0.0 (R2-valid; CC 3.2 T5) — a key is no root whatever its
+        // self-loop carries (the serve∧attest minimum was the KEYED root's):
+        // not valid, by name.
         assert!(
-            !v.root_self_declares && !v.valid,
-            "(2) serve-only self-loop is NOT a root (serve∧attest minimum)"
+            !v.root_self_declares && !v.valid && v.not_rooted.is_some(),
+            "(2) a serve-only self-loop at a key is NOT a root: {v:?}"
         );
 
-        // (3) an expired edge is dead to the walk.
-        let mut expired = fix_delegates_to(
-            "rc-expired-edge",
+        // (3) an expired edge is dead to the walk. v62.0.0 (R2-valid) — the
+        // edge is the user's acceptance of the bundle's LINEAGE, its
+        // `valid_until` passed.
+        crate::federation::operational::test_support::ensure_e2_genesis(&backend)
+            .await
+            .expect("(3) the bundle in force");
+        let now = crate::host::clock::now();
+        crate::federation::operational::test_support::accept_lineage_e2_at(
+            &backend,
             "rc-user",
-            "rc-root",
-            serde_json::json!(["infra:serve"]),
-        );
-        expired.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
-        resign_fix(&mut expired);
-        put_voiced(&backend, &expired).await.unwrap();
+            e2::ms(now - chrono::Duration::minutes(10)),
+            Some(e2::ms(now - chrono::Duration::minutes(5))),
+        )
+        .await
+        .expect("(3) the expired acceptance is stored");
         let v3 = trust_root_valid(
             &backend,
             &e2::kid("rc-user"),
-            &e2::kid("rc-root"),
+            crate::federation::edition2::fixture_genesis::FAMILY_KEY_ID,
             crate::host::clock::now(),
         )
         .await
         .unwrap();
         assert!(
-            !v3.edge_exists,
-            "(3) expired delegates_to is ABSENT to the walk"
+            !v3.edge_exists && !v3.valid && v3.root_self_declares,
+            "(3) an expired acceptance is ABSENT to the walk: {v3:?}"
         );
 
         // (1b) recovery binding: predecessor charter pre-commits to a
@@ -1829,29 +1845,31 @@ mod tests {
     /// edge#386's trace-serve gate: serve only under a COMMON valid root.
     #[tokio::test]
     async fn capability_roots_to_trusted_root_483() {
-        // E5-fix2 (round 6; CP2) — PORTED to an edition-2 trust root (E9's
-        // twins, `operational::test_support`): a key-arm root hand-chartered by
-        // a fixture key is never valid under edition 2 (its holder's custody
-        // evidence, CC 4.2.2.1), so the walk this test exists for could not
-        // start. The root is founded by the bundle's holders and chartered
-        // (`stand_up_e2_root`); the USER's own `trust:accepts` edge is its
-        // row; the root confers on the peer with the peer's voice
-        // (`confer_e2`); the user un-trusts with its own `withdraws`.
-        use crate::federation::operational::test_support::{
-            accept_e2_root, confer_e2, stand_up_e2_root, withdraw_e2,
-        };
+        // v62.0.0 (R2-fixture; CC 3.2 T5) — the root is the bundle's LINEAGE
+        // (`fixture_trust_root::rooted_trust_root`, with this node's own
+        // acceptance); the USER's own `trust:accepts` edge is its acceptance of
+        // the lineage (`accept_lineage_e2`); the root's grant to the peer is
+        // COUNTED over the bundle's holders (`put_conferral`, with the peer's
+        // acceptance); the user un-trusts with its own `withdraws`. The peer is
+        // a `user` key: a machine grantee's grant also waits on its bound
+        // owner's voice (CC 4.4.3.19), which is not this witness's question.
+        use crate::federation::operational::test_support::{accept_lineage_e2, withdraw_e2};
         use crate::federation::trust_root::{capability_roots_to_trusted_root, trust_root_valid};
         let backend = test_backend();
+        backend.set_node_key_id(put_e2_key(&backend, "cr-node", "node").await);
         let user = put_e2_key(&backend, "cr-user", "user").await;
-        let peer = put_e2_key(&backend, "cr-peer", "node").await;
-        let r = stand_up_e2_root(&backend, "cr-root")
-            .await
-            .expect("the edition-2 root stands up");
-        let edge = accept_e2_root(&backend, "cr-user", &r.root)
+        let peer = put_e2_key(&backend, "cr-peer", "user").await;
+        let r = e2::rooted_trust_root(
+            &backend,
+            &crate::federation::edition2::fixture_genesis::HOLDER_SEEDS,
+            "quorum:2/3",
+        )
+        .await;
+        let edge = accept_lineage_e2(&backend, "cr-user")
             .await
             .expect("the user accepts the root");
         assert!(
-            trust_root_valid(&backend, &user, &r.root, crate::host::clock::now())
+            trust_root_valid(&backend, &user, &r.lineage, crate::host::clock::now())
                 .await
                 .unwrap()
                 .valid,
@@ -1859,9 +1877,14 @@ mod tests {
         );
 
         // The root grants the PEER infra:serve.
-        let granted = confer_e2(&backend, "cr-root", "cr-peer", &["infra:serve"])
-            .await
-            .expect("the root confers on the peer");
+        let granted = crate::federation::edition2::fixture_trust_root::put_conferral(
+            &backend,
+            &r,
+            "cr-peer",
+            &["infra:serve"],
+        )
+        .await
+        .expect("the root confers on the peer");
 
         // #483 — the peer's infra:serve roots to a root the user trusts.
         let grant = capability_roots_to_trusted_root(
@@ -1874,7 +1897,7 @@ mod tests {
         .await
         .expect("walk")
         .expect("peer serves under a root the user trusts");
-        assert_eq!(grant.root_key_id, r.root);
+        assert_eq!(grant.root_key_id, r.lineage);
         assert_eq!(grant.grant_attestation_id, granted.hex());
         assert!(grant.verdict.valid);
 
@@ -1894,7 +1917,7 @@ mod tests {
         );
 
         // Un-trust the root: the peer's grant now roots to nothing.
-        withdraw_e2(&backend, "cr-user", &r.root, &edge)
+        withdraw_e2(&backend, "cr-user", &r.lineage, &edge)
             .await
             .expect("the user withdraws its edge");
         assert!(
@@ -3235,6 +3258,7 @@ mod tests {
                         reason: Some("storage-only membership op stays ungated".into()),
                         witness_set: Vec::new(),
                         persist_row_hash: String::new(),
+                        leaf: crate::federation::types::RevocationLeaf::Resignation,
                     },
                 );
             let head = gf::held_head(&b, &no).await.map(|(h, _)| h);
@@ -3357,7 +3381,7 @@ mod tests {
         att.attestation_envelope = serde_json::json!({
             "id": id,
             "kind": "delegates_to",
-            "delegation_purpose": owner_binding::CC_DELEGATION_PURPOSE,
+            "delegation_purpose": owner_binding::PURPOSE,
             "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
         });
         resign_fix(&mut att);
@@ -3575,8 +3599,9 @@ mod tests {
 
     /// #288 (CC 3.4.1/3.4.3/3.4.5) — reserved-prefix admission on the
     /// attestation_TYPE, keyed on the attesting key's identity_type:
-    /// `accord:*`→accord_holder, `system:*`→substrate_persist,
-    /// `hard_case:*`→substrate_persist, `capacity:*`→no self-emission.
+    /// `accord:*`→accord_holder, `system:*`→a node holding its owner's
+    /// `infra:attest` (v62.0.0, D1; until then the `substrate_persist` label),
+    /// `hard_case:*`→a node holding its owner's `infra:attest` (D2), `capacity:*`→no self-emission.
     /// Reproduces the issue's three repro cases + the authorized contrast.
     #[tokio::test]
     async fn check_reserved_prefix_admission_enforces_cc_3_4_x_288() {
@@ -3640,26 +3665,39 @@ mod tests {
         .await
         .expect("non-self capacity:* is allowed");
 
-        // system:* — agent REJECTED (CC 3.4.3), substrate_persist OK.
-        let e = check_reserved_prefix_admission(
+        // system:* — agent REJECTED (CC 3.4.3). v62.0.0 (D1; CC 3.4.7): the
+        // `substrate_persist` label opens nothing (refused like the agent);
+        // a NODE holding `infra:attest` from its owner may emit it (rootless:
+        // no root is built here).
+        for signer in ["rp-agent", "rp-substrate"] {
+            let e = check_reserved_prefix_admission(
+                &backend,
+                &row("system:audit_chain:hash_continuity", signer, signer),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                e.kind(),
+                "federation_reserved_prefix_emitter_mismatch",
+                "{signer}: {e}"
+            );
+        }
+        put_e2_key(&backend, "rp-node", "node").await;
+        crate::federation::admission::r2_test_support::confer_from_owner(
             &backend,
-            &row("system:audit_chain:hash_continuity", "rp-agent", "rp-agent"),
+            "rp-node-owner",
+            "rp-node",
+            &[crate::federation::types::delegation_scope::INFRA_ATTEST],
         )
-        .await
-        .unwrap_err();
-        assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
+        .await;
         check_reserved_prefix_admission(
             &backend,
-            &row(
-                "system:audit_chain:hash_continuity",
-                "rp-substrate",
-                "rp-substrate",
-            ),
+            &row("system:audit_chain:hash_continuity", "rp-node", "rp-node"),
         )
         .await
-        .expect("substrate_persist may emit system:*");
+        .expect("a node holding its owner's infra:attest may emit system:*");
 
-        // hard_case:* — agent REJECTED, substrate_persist OK.
+        // hard_case:* — agent REJECTED (D2: and the substrate_persist label).
         let e = check_reserved_prefix_admission(
             &backend,
             &row("hard_case:promotion_overdue", "rp-agent", "rp-agent"),
@@ -3667,7 +3705,9 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
-        check_reserved_prefix_admission(
+        // v62.0.0 (D2; CC 3.4.7) — the label opens nothing; the node holding
+        // its owner's `infra:attest` may emit its own hard_case row.
+        let e = check_reserved_prefix_admission(
             &backend,
             &row(
                 "hard_case:promotion_overdue",
@@ -3676,7 +3716,14 @@ mod tests {
             ),
         )
         .await
-        .expect("substrate_persist may emit hard_case:*");
+        .unwrap_err();
+        assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
+        check_reserved_prefix_admission(
+            &backend,
+            &row("hard_case:promotion_overdue", "rp-node", "rp-node"),
+        )
+        .await
+        .expect("a node holding its owner's infra:attest may emit its own hard_case:*");
 
         // Non-reserved types fast-exit OK regardless of identity_type.
         check_reserved_prefix_admission(&backend, &row("scores", "rp-agent", "rp-agent"))
@@ -3840,7 +3887,7 @@ mod tests {
         .await;
         let msg = err.to_string();
         assert!(
-            msg.contains("infra:attest_assurance"),
+            msg.contains("assure:age"),
             "the refusal must name the missing conferral so an operator knows what to obtain; \
              got: {msg}"
         );
@@ -3858,7 +3905,7 @@ mod tests {
     ///
     /// The negative case (claim present, conferral absent) is
     /// `a_self_asserted_witness_is_refused_607`.
-    async fn put_conferred_key(backend: &SqliteBackend, key_id: &str, it: &str, scope: &str) {
+    async fn put_conferred_key(backend: &SqliteBackend, key_id: &str, it: &str, scopes: &[&str]) {
         // E5-fix2 (round 6; CP2) — PORTED to an edition-2 trust root. The
         // earlier fixture chartered a KEY root (`n607-root`) by hand; under
         // edition 2 a key-arm root is as attested as its holder's custody
@@ -3882,33 +3929,31 @@ mod tests {
             "quorum:2/3",
         )
         .await;
-        crate::federation::edition2::fixture_trust_root::put_conferral(
-            backend,
-            &r,
-            key_id,
-            &[scope],
-        )
-        .await
-        .unwrap_or_else(|e| panic!("the root confers {scope} on {key_id}: {e}"));
+        crate::federation::edition2::fixture_trust_root::put_conferral(backend, &r, key_id, scopes)
+            .await
+            .unwrap_or_else(|e| panic!("the root confers {scopes:?} on {key_id}: {e}"));
         // RT-fix1 — the postcondition (the K2-fix13 pattern): the grant
         // reaches the root through THIS node, so a conferral that confers
         // nothing stops here and not at a later band / row assert.
         let node = crate::federation::FederationDirectory::node_key_id(backend)
             .expect("put_conferred_key: the node key is set above");
-        let rooted = crate::federation::trust_root::capability_roots_to_trusted_root(
-            backend,
-            &node,
-            &e2::kid(key_id),
-            scope,
-            crate::host::clock::now(),
-        )
-        .await
-        .expect("put_conferred_key: capability_roots_to_trusted_root");
-        assert!(
-            rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
-            "put_conferred_key: {key_id}'s {scope} roots at {} through node {node}: {rooted:?}",
-            r.root
-        );
+        for scope in scopes {
+            let rooted = crate::federation::trust_root::capability_roots_to_trusted_root(
+                backend,
+                &node,
+                &e2::kid(key_id),
+                scope,
+                crate::host::clock::now(),
+            )
+            .await
+            .expect("put_conferred_key: capability_roots_to_trusted_root");
+            assert!(
+                rooted.as_ref().is_some_and(|g| g.root_key_id == r.lineage),
+                "put_conferred_key: {key_id}'s {scope} roots at {} through node {node}: \
+                 {rooted:?}",
+                r.lineage
+            );
+        }
     }
 
     /// Register a key with a chosen `identity_type` (e.g. `user` / `witness` /
@@ -3945,7 +3990,7 @@ mod tests {
             &backend,
             "ab-witness",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_AGE],
         )
         .await;
         put_typed_key(&backend, "ab-subj", "user").await;
@@ -4026,7 +4071,7 @@ mod tests {
             &backend,
             "abe-witness",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_AGE],
         )
         .await;
         put_typed_key(&backend, "abe-subj", "user").await;
@@ -4083,7 +4128,7 @@ mod tests {
             &backend,
             "ut-witness",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_AGE],
         )
         .await;
         put_typed_key(&backend, "ut-S", "user").await;
@@ -4150,7 +4195,7 @@ mod tests {
             &backend,
             "ug-witness",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_AGE],
         )
         .await;
         put_typed_key(&backend, "ug-U", "user").await; // unknown-age user (granter)
@@ -4220,7 +4265,7 @@ mod tests {
             &backend,
             "wts-witness",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_AGE],
         )
         .await;
         put_typed_key(&backend, "wts-T", "user").await; // the subject
@@ -4331,7 +4376,7 @@ mod tests {
             &backend,
             "pg-witness",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_AGE],
         )
         .await;
         put_typed_key(&backend, "pg-T", "user").await;
@@ -4405,7 +4450,7 @@ mod tests {
             // Fail-safe either way: an undeclared edge confers no custody, so a
             // host that forgets the marker gets a grant that establishes nothing
             // rather than silent stewardship.
-            "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+            "delegation_purpose": crate::federation::types::owner_binding::PURPOSE,
         });
         let obj = env.as_object_mut().unwrap();
         if let Some(l) = legit {
@@ -4442,7 +4487,10 @@ mod tests {
             backend,
             &format!("{p}-assessor"),
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[
+                crate::federation::types::delegation_scope::ASSURE_AGE,
+                crate::federation::types::delegation_scope::ASSURE_CAPACITY,
+            ],
         )
         .await;
         put_typed_key(backend, &format!("{p}-S"), "user").await;
@@ -4485,7 +4533,7 @@ mod tests {
             &backend,
             "cap-assessor",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_CAPACITY],
         )
         .await;
         put_typed_key(&backend, "cap-user", "user").await;
@@ -4528,7 +4576,7 @@ mod tests {
             &backend,
             "cap-selfwit",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_CAPACITY],
         )
         .await;
         let e = NotLanded::of(
@@ -4930,7 +4978,7 @@ mod tests {
             &backend,
             "ml-witness",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_AGE],
         )
         .await;
         put_typed_key(&backend, "ml-S", "user").await; // adult-user steward

@@ -32,7 +32,7 @@ pub mod bodies {
 
     /// v62.0.0 (JSON cut, E7) — a dimension Verify's family matcher
     /// registers (the fixtures' `x:y` is not; an edition-2 row of it is refused).
-    const DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
+    const DIMENSION: &str = "coherence_standing:cab:v1";
 
     fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
         s.parse().expect("rfc3339")
@@ -133,11 +133,38 @@ pub mod bodies {
                 reason: None,
                 witness_set: vec![],
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Removal,
             },
         );
         for c in &signers[1..] {
             ts::cosign_community_membership_revocation(&mut r, c);
         }
+        let head = e2::held_head(d, &e2::kid(room)).await.map(|(h, _)| h);
+        e2::put_voices(d, &e2::community_revocation_voices(&r, head.as_ref())).await
+    }
+
+    /// v62.0.0 (RESIGN-port) — `member`'s own resignation from `room` at
+    /// `t` (the authored `membership:resignation` leaf, signed by the
+    /// member alone), naming the room's held head.
+    async fn resign_voiced(
+        d: &dyn FederationDirectory,
+        room: &str,
+        member: &str,
+        t: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::edition2::ingest::StatementOutcome, Error> {
+        let r = ts::sign_community_membership_revocation(
+            member,
+            crate::federation::types::CommunityMembershipRevocation {
+                community_key_id: room.to_owned(),
+                removed_identity_key_id: member.to_owned(),
+                removed_at: t,
+                effective_at: t,
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Resignation,
+            },
+        );
         let head = e2::held_head(d, &e2::kid(room)).await.map(|(h, _)| h);
         e2::put_voices(d, &e2::community_revocation_voices(&r, head.as_ref())).await
     }
@@ -782,7 +809,8 @@ pub mod bodies {
     ///   refused (`INFRA_RULE_QUORUM_N_NOT_FOUNDERS`);
     /// - a plain member is admitted;
     /// - two founders removing the third is refused;
-    /// - the third founder leaving on their OWN signature is admitted (v49's
+    /// - the third founder leaving by their OWN resignation (the
+    ///   `membership:resignation` leaf; v62.0.0 RESIGN-3) is admitted (v49's
     ///   consent floor, ruled 2026-09-27): N is the founder count AS ADMITTED.
     pub async fn infrastructure_founder_count_is_fixed_by_the_record(
         d: &dyn FederationDirectory,
@@ -826,9 +854,13 @@ pub mod bodies {
             held(&r),
             "other founders removing a founder would leave N stale (held): {r:?}"
         );
-        remove_voiced(d, &room, &[&h3], &h3, ago(10))
+        // v62.0.0 (RESIGN-port; RESIGN-3, the Constitution's ruling "the LEAF
+        // decides") — a founder leaves by their own RESIGNATION, the authored
+        // `membership:resignation` leaf; a removal voiced by its subject alone
+        // is a COUNT, never a leaving (here 1 of 3 under quorum:2/3: short).
+        resign_voiced(d, &room, &h3, ago(10))
             .await
-            .unwrap_or_else(|e| panic!("{tag}: a founder may leave on their own signature: {e}"));
+            .unwrap_or_else(|e| panic!("{tag}: a founder may leave by their own resignation: {e}"));
         assert!(!active(d, &e2::kid(&room)).await.contains(&e2::kid(&h3)));
     }
 

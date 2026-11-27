@@ -256,19 +256,19 @@ pub mod bodies {
             .unwrap_or_default();
         // v62.0.0 (wave V1b, CC 3.2 / C557): an owner binding lands only with
         // the bound node's own voice; without it the door holds it Pending.
-        // One that names an affiliation (`community_id`) is COUNTED (CC ruling
-        // (a), V1b `check_owner_binding_counted`): it names the affiliation's
-        // held roster version as `refs.head`, and the members' voices count
-        // over it at the affiliation's protocol.
+        // One on behalf of an affiliation is COUNTED (CC ruling (a), V1b
+        // `check_owner_binding_counted`): it names the affiliation's held
+        // roster version as `refs.head`, and the members' voices count over
+        // it at the affiliation's protocol. v62.0.0 (BIND-1; CC rc22 rule
+        // `owner-binding`) — the affiliation is the one `on_behalf_of` names;
+        // a placement (`community_id`) is counted by nobody.
         let mut row = row.clone();
         if row.attestation_type == attestation_type::DELEGATES_TO
             && crate::federation::admission::is_owner_binding_envelope(&row.attestation_envelope)
         {
-            let named = row
-                .attestation_envelope
-                .get("community_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
+            let named =
+                crate::federation::admission::owner_binding_on_behalf_of(&row.attestation_envelope)
+                    .map(str::to_owned);
             // v62.0.0 (E2-fix3; K2.api) — a plain owner binding (no
             // affiliation, no further cosigner) lands through K2's shared
             // helper: the owner's statement, then the bound key's voice.
@@ -910,6 +910,7 @@ pub mod bodies {
                 reason: None,
                 witness_set: vec![],
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Resignation,
             },
         ))
         .await

@@ -155,14 +155,21 @@ pub(crate) enum Door {
 }
 
 async fn put_at(d: &dyn FederationDirectory, st: &[u8], door: Door) {
+    let _ = put_answer(d, st, door).await;
+}
+
+/// The door's answer to `st` at `door`.
+async fn put_answer(
+    d: &dyn FederationDirectory,
+    st: &[u8],
+    door: Door,
+) -> Result<super::ingest::StatementOutcome, crate::federation::Error> {
     use crate::federation::replication::admission::WriteOrigin;
     let origin = match door {
         Door::Authored => WriteOrigin::Authored,
         Door::Wire => WriteOrigin::Wire,
     };
-    let _ =
-        super::ingest::put_statement_with_origin(d, st, None, super::ingest::INGEST_TIER, origin)
-            .await;
+    super::ingest::put_statement_with_origin(d, st, None, super::ingest::INGEST_TIER, origin).await
 }
 
 async fn edge_of(d: &dyn FederationDirectory, seed: &str, head: Option<&str>) -> Vec<u8> {
@@ -197,8 +204,12 @@ async fn held_reason(d: &dyn FederationDirectory, st: &[u8]) -> Option<String> {
 /// **I2460–I2463 (RL-fix15)** — the bundle-root acceptance table at `door`:
 /// `none` a fresh directory, `held` another (the bundle installed there).
 ///
-/// - **I2460 (a)** names no bundle, none held: held, then lands at import;
-/// - **I2461 (b)** names no bundle, the lineage held: lands (audit-only id);
+/// - **I2460 (a)** names no bundle, none held: held, and never lands, the
+///   import included (R2-accept: at the import its re-fold is (b));
+/// - **I2461 (b)** names no bundle, the lineage held: REFUSED
+///   `trust_root_head_unnamed`, never held, never landed (R2-accept; the
+///   Constitution's `trust-accepts` rule: "a new edge without it is
+///   refused");
 /// - **I2462 (c)** names the held tip: lands;
 /// - **I2463 (d)** names a bundle not held: HELD `trust_root_head_stale`,
 ///   never landed, at the wire door as at the authored one.
@@ -220,8 +231,8 @@ pub(crate) async fn attach_table(
     );
     fg::install_v2(none).await.expect("the ceremony installs");
     assert!(
-        landed(none, &a).await,
-        "[{tag} {door:?}] I2460: the import lands it"
+        !landed(none, &a).await,
+        "[{tag} {door:?}] I2460: the import does not land an edge naming no bundle"
     );
     // (b), (c), (d)
     fg::install_v2(held).await.expect("the ceremony installs");
@@ -235,10 +246,17 @@ pub(crate) async fn attach_table(
             .object_id,
     );
     let b = edge_of(held, &format!("rl15b-{tag}"), None).await;
-    put_at(held, &b, door).await;
+    let answer = put_answer(held, &b, door).await;
     assert!(
-        landed(held, &b).await,
-        "[{tag} {door:?}] I2461: no bundle named, the lineage held: lands"
+        matches!(
+            answer,
+            Err(crate::federation::Error::TrustRootHeadUnnamed { .. })
+        ),
+        "[{tag} {door:?}] I2461: no bundle named, the lineage held: refused by name: {answer:?}"
+    );
+    assert!(
+        !landed(held, &b).await && held_reason(held, &b).await.is_none(),
+        "[{tag} {door:?}] I2461: refused: neither landed nor held"
     );
     let c = edge_of(held, &format!("rl15c-{tag}"), Some(&tip)).await;
     put_at(held, &c, door).await;

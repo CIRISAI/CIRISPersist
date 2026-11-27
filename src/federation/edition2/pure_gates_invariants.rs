@@ -112,10 +112,7 @@ fn statement(
         ("author", Value::Text(iref(k))),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
     ];
     m.extend(extra);
     sign_row_statement(
@@ -123,7 +120,7 @@ fn statement(
         &iref(k),
         &iref(k),
         "scores",
-        "evidence:.suite:.kind:.cell:.prefix",
+        "coherence_standing:.cohort",
         &map(m),
         vec![],
     )
@@ -449,10 +446,7 @@ fn malformed(
         ("author", Value::Text(iref(k))),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
     ];
     m.retain(|(name, _)| *name != member);
     m.push((member, value));
@@ -465,7 +459,7 @@ fn digest_of(n: u8, len: usize) -> Value {
 
 /// The malformed shapes: `(family, member, value, what)`.
 fn malformed_cases() -> Vec<(&'static str, &'static str, Value, &'static str)> {
-    let ev = "evidence:.suite:.kind:.cell:.prefix";
+    let ev = "coherence_standing:.cohort";
     vec![
         (
             ev,

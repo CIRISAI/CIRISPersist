@@ -675,6 +675,7 @@ impl RevokeSpec {
             reason: self.reason.clone(),
             witness_set: self.witness_set.clone(),
             persist_row_hash: String::new(),
+            leaf: crate::federation::types::RevocationLeaf::Removal,
         }
     }
 
@@ -694,6 +695,7 @@ impl RevokeSpec {
             reason: self.reason.clone(),
             witness_set: self.witness_set.clone(),
             persist_row_hash: String::new(),
+            leaf: crate::federation::types::RevocationLeaf::Removal,
         }
     }
 

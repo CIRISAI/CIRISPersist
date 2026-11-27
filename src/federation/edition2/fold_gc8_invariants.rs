@@ -24,9 +24,8 @@
 //!   minter and holds no `grant` delegation is held `signer_not_minter`; the
 //!   minter itself over a community this node does not hold is held
 //!   `signer_not_active_member`. Reads name the signer, minter and community.
-//! - **I3953** the trust-root count over voices: a root not held here answers
-//!   `root_not_held` and marks the attempt with the same token, reading
-//!   `key:<root>`.
+//! - **I3953** — DELETED (v62.0.0 R2-rooms): the room-head voice count it
+//!   read is gone (the note at its site).
 //! - **I3954** membership-change structure: a member with no held key record
 //!   marks `member_not_in_directory`; two members on one held key mark
 //!   `duplicate_founder_key`; a change whose `supersedes` names another prior
@@ -225,37 +224,11 @@ pub(crate) async fn sealer_epoch_body(d: &dyn FederationDirectory) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-//  I3953 — the trust-root count
+//  I3953 — DELETED (v62.0.0 R2-rooms; CC 3.2 T5): it witnessed the voice
+//  count over a trust-root ROOM's head (`trust_root_counts_voices`), deleted
+//  with it; the steward purge counts over the bundle's holders
+//  (`steward_purge_invariants` I650).
 // ─────────────────────────────────────────────────────────────────────────
-
-/// I3953.
-pub(crate) async fn trust_root_count_body(d: &dyn FederationDirectory) {
-    let root = "gc8-absent-root";
-    let voices: std::collections::BTreeSet<String> = [e2::kid("gc8-voice")].into_iter().collect();
-    let now = chrono::Utc::now();
-    let (out, att) = Box::pin(fold::attempt(
-        rid(0x55),
-        None,
-        crate::federation::canonical_community::trust_root_counts_voices(d, root, &voices, now),
-    ))
-    .await;
-    let refusal = out.expect("I3953: a read, not a failure");
-    assert_eq!(
-        refusal.as_ref().err().map(|(t, _)| *t),
-        Some(crate::federation::steward_purge::unauthorised_reason::ROOT_NOT_HELD),
-        "I3953: the count answers its refusal pair"
-    );
-    assert_eq!(
-        att.held.as_ref().map(|(r, _)| r.as_str()),
-        Some(reason::gc8::ROOT_NOT_HELD),
-        "I3953: and marks the attempt with the same token"
-    );
-    assert!(
-        att.reads.contains(&Dep::key(root).read_key()),
-        "I3953: key:<root> is declared read: {:?}",
-        att.reads
-    );
-}
 
 // ─────────────────────────────────────────────────────────────────────────
 //  I3954 — membership-change structure (pure)
@@ -606,11 +579,6 @@ both!(
     i3952_sealer_epoch_arm_is_held_sqlite,
     i3952_sealer_epoch_arm_is_held_postgres,
     sealer_epoch_body
-);
-both!(
-    i3953_trust_root_count_marks_its_token_sqlite,
-    i3953_trust_root_count_marks_its_token_postgres,
-    trust_root_count_body
 );
 both!(
     i3955_replicated_row_first_held_concludes_unconcludes_sqlite,

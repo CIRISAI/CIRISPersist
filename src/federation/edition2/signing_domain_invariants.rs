@@ -16,7 +16,7 @@ use super::composite_verify::{
 use super::fixture_genesis;
 use super::fixture_switch as e2;
 use super::signing_domain::{
-    accord_manifest_v2_message, domain_preimage, signer_standing, verify_accord_manifest_v2,
+    accord_manifest_v2_message, domain_preimage, signer_standing_now, verify_accord_manifest_v2,
     verify_domain_composite_via_directory, SignerStanding, SigningDomain,
     ACCORD_MANIFEST_SIGNER_NOT_HOLDER,
 };
@@ -193,7 +193,7 @@ async fn body(d: &dyn FederationDirectory) {
     let st = |who: &str, of: &str, b: Option<&str>| {
         let (who, of, b) = (who.to_owned(), of.to_owned(), b.map(str::to_owned));
         async move {
-            signer_standing(d, &who, &of, b.as_deref(), at)
+            signer_standing_now(d, &who, &of, b.as_deref(), at)
                 .await
                 .unwrap_or_else(|e| panic!("I2062: standing of {who}: {e}"))
         }

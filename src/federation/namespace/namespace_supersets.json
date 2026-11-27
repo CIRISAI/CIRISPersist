@@ -15022,7 +15022,7 @@
     "decimal_id": "3.2",
     "claim_id": "CLM-family-root-charter",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/trust_root.rs#family_quorum_over",
+    "path#symbol": "src/federation/trust_root.rs#bundle_root_holders",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "backfill-1052"
    },
@@ -16115,10 +16115,10 @@
     "decimal_id": "3.3.2",
     "claim_id": "CLM-steward-purge-authorisation",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/canonical_community.rs#trust_root_counts_voices",
+    "path#symbol": "src/federation/steward_purge.rs#authorise_edition2_at",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc8-1059",
-    "witness": "I3165-I3169 (edition2::typed_invariants, sqlite + postgres); the edition-2 legs of steward_purge_invariants (BH-fix1: the earlier cosigned-notice count is deleted)"
+    "witness": "I3165-I3169 (edition2::typed_invariants, sqlite + postgres); the edition-2 legs of steward_purge_invariants (BH-fix1: the earlier cosigned-notice count is deleted; R2-rooms: the room-head count trust_root_counts_voices is deleted, the count is over the holders of the bundle in force)"
    },
    {
     "decimal_id": "4.5.3",
@@ -16982,7 +16982,7 @@
     "decimal_id": "3.3.6.4",
     "claim_id": "CLM-self-roster-two-paths",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/self_roster.rs#gate",
+    "path#symbol": "src/federation/self_roster.rs#gate_edition2",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc9-1099"
    },
@@ -17435,7 +17435,7 @@
     "decimal_id": "3.3.4",
     "claim_id": "CLM-cosign-collection-held",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/cosign.rs#hold",
+    "path#symbol": "src/federation/cosign.rs#hold_if_short",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc18-1252"
    },

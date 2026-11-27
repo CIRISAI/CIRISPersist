@@ -244,8 +244,14 @@ async fn i1481_a_starved_pool_is_a_typed_error_not_a_hang() {
         .expect("I1481 the pool recovers");
 }
 
-/// **I1482** — the occurrence doors: the route projection and the re-index
-/// each check out their own client after the occurrence lands.
+/// **I1482** — the occurrence door: the route projection and the re-index
+/// each check out their own client after the occurrence lands. v62.0.0
+/// (WD-fix15; CC 3.3.6 as ruled 11-22) — through the EDITION-2 door, the one
+/// occurrence door left: a NODE's self pair (author = identity = occurrence,
+/// one pen, `server`) carrying a transport binding, stated by the signed
+/// seeding helper. (Before, an UNOWNED agent's occurrence written by the
+/// retired trusted-local door; an unowned agent has no occurrence by ruling,
+/// and the door the witness timed no longer exists.)
 #[tokio::test(flavor = "multi_thread")]
 async fn i1482_occurrence_doors_complete_on_one_connection() {
     use crate::federation::types::{device_class, OccurrenceTransportBinding};
@@ -255,24 +261,14 @@ async fn i1482_occurrence_doors_complete_on_one_connection() {
     };
     let d = &b as &dyn FederationDirectory;
     let tag = suffix();
-    let (identity, occ) = (format!("i1482-id-{tag}"), format!("i1482-occ-{tag}"));
-    // v62.0.0 (P1-fix4; CC rc21 3.3.6) — an agent's occurrence binds the
-    // AGENT's own identity (a machine key is never an occurrence of a
-    // person): identity and occurrence are both agent keys.
-    let _ = e2::put_key(
-        d,
-        &identity,
-        &[crate::federation::types::identity_type::AGENT],
-    )
-    .await;
-    // v61 (CIRISPersist#1122) — an agent's occurrence projects no route.
-    let _ = e2::put_key(d, &occ, &[crate::federation::types::identity_type::AGENT]).await;
-    let (identity, occ) = (e2::kid(&identity), e2::kid(&occ));
+    let node = format!("i1482-node-{tag}");
+    let _ = e2::put_key(d, &node, &[crate::federation::types::identity_type::NODE]).await;
+    let node = e2::kid(&node);
     let b64 = base64::engine::general_purpose::STANDARD;
     let row = crate::federation::IdentityOccurrence {
-        identity_key_id: identity.clone(),
-        occurrence_key_id: occ.clone(),
-        device_class: device_class::AGENT.into(),
+        identity_key_id: node.clone(),
+        occurrence_key_id: node.clone(),
+        device_class: device_class::SERVER.into(),
         hardware_attestation: None,
         asserted_at: chrono::Utc::now(),
         valid_until: None,
@@ -287,13 +283,16 @@ async fn i1482_occurrence_doors_complete_on_one_connection() {
         persist_row_hash: String::new(),
     };
     within_bound(
-        "I1482 put_identity_occurrence_local",
-        b.put_identity_occurrence_local(row),
+        "I1482 the edition-2 occurrence door",
+        crate::federation::edition2::fixture_occurrence::put_occurrence_signed(d, row),
     )
     .await
-    .expect("I1482 the local occurrence lands and projects its route");
+    .expect("I1482 the node's self pair lands and projects its route");
     assert_eq!(
-        b.list_transport_destinations_for(&occ).await.unwrap().len(),
+        b.list_transport_destinations_for(&node)
+            .await
+            .unwrap()
+            .len(),
         1,
         "I1482 the route projection ran"
     );

@@ -588,10 +588,7 @@ async fn i2849_body(d: &dyn FederationDirectory, s: &str) {
         ("author", Value::Text(pk.clone())),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
         (
             "refs",
             map(vec![(
@@ -605,7 +602,7 @@ async fn i2849_body(d: &dyn FederationDirectory, s: &str) {
         &pk,
         &pk,
         "scores",
-        "evidence:.suite:.kind:.cell:.prefix",
+        "coherence_standing:.cohort",
         &payload,
         vec![],
     )

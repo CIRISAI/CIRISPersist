@@ -459,7 +459,36 @@ where
         ),
     )
     .await;
-    match (out, att.held) {
+    // v62.0.0 (KR-fix33; FINDING: I5711 on built pass 9, "the door answered
+    // Row { new: true }; held: None", and no attestation row) — the gates'
+    // `Ok` is a landing only when the row IS stored: the door never answers
+    // `Row` for a row no reader can find. An `Ok` with a hold marked on the
+    // attempt and nothing stored is that hold (a gate that marked it and
+    // whose caller swallowed the error); an `Ok` with no mark and nothing
+    // stored is refused by name, naming what the attestation door answered,
+    // so the two readers cannot disagree silently.
+    let (out, held) = match (out, att.held) {
+        (Ok(o), held) if dir.get_attestation(&admitted.row_id.hex()).await?.is_none() => match held
+        {
+            Some((reason, detail)) => (
+                Err(Error::InvalidArgument(format!(
+                    "{reason}: the attestation door answered {o:?} and stored nothing, \
+                         with this hold marked: {detail}"
+                ))),
+                Some((reason, detail)),
+            ),
+            None => {
+                return Err(Error::Backend(format!(
+                    "row_reported_landed_not_stored: {} ({}): the attestation door \
+                         answered {o:?} and no attestation row is held under the row id",
+                    admitted.row_id.hex(),
+                    admitted.family
+                )));
+            }
+        },
+        other => other,
+    };
+    match (out, held) {
         (Ok(_), _) => {
             if primary.statement_id != admitted.statement_id {
                 dir.put_edition2_statement(&primary).await?;
@@ -502,6 +531,9 @@ where
                 att.reads,
             )
             .await?;
+            // v62.0.0 (WD-fix4 rev 2) — the gate's own error, for a door that
+            // answers a held row with it (the routed JSON door).
+            super::fold::keep_hold_error(admitted.row_id, e);
             Ok(StatementOutcome::Pending {
                 row_id: admitted.row_id,
                 new,

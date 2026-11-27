@@ -61,7 +61,7 @@ pub(crate) mod directory {
     }
 
     async fn occurrence<D: FederationDirectory + ?Sized>(d: &D, identity: &str, occ: &str) {
-        d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+        d.test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
             identity_key_id: identity.to_owned(),
             occurrence_key_id: occ.to_owned(),
             device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -486,6 +486,7 @@ pub(crate) mod two_nodes {
                 reason: None,
                 witness_set: vec![],
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Resignation,
             },
         );
         let head = e2::held_head(a.backend, &comm).await.map(|(h, _)| h);
@@ -526,7 +527,7 @@ pub(crate) mod two_nodes {
     #[cfg(feature = "sqlite")]
     mod sqlite {
         use super::*;
-        use crate::federation::key_grant_invariants::two_node::{introduce_as, node_as};
+        use crate::federation::key_grant_invariants::two_node::{introduce_as, node_owned_as};
         use crate::store::sqlite::SqliteBackend;
         use crate::store::Backend as _;
 
@@ -539,10 +540,14 @@ pub(crate) mod two_nodes {
         #[tokio::test]
         async fn i743_sqlite() {
             let (ba, bb, bc, bo) = (fresh().await, fresh().await, fresh().await, fresh().await);
-            let a = node_as(&ba, "i743-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i743-b", crate::federation::types::identity_type::NODE).await;
-            let c = node_as(&bc, "i743-c", crate::federation::types::identity_type::NODE).await;
-            let o = node_as(&bo, "i743-o", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i743-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i743-b", crate::federation::types::identity_type::NODE).await;
+            let c =
+                node_owned_as(&bc, "i743-c", crate::federation::types::identity_type::NODE).await;
+            let o =
+                node_owned_as(&bo, "i743-o", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b, &c, &o],
                 &["i743-a", "i743-b", "i743-c", "i743-o"],
@@ -555,8 +560,10 @@ pub(crate) mod two_nodes {
         #[tokio::test]
         async fn i744_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node_as(&ba, "i744-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i744-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i744-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i744-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i744-a", "i744-b"],
@@ -570,7 +577,7 @@ pub(crate) mod two_nodes {
     #[cfg(feature = "postgres")]
     mod postgres {
         use super::*;
-        use crate::federation::key_grant_invariants::two_node::{introduce_as, node_as};
+        use crate::federation::key_grant_invariants::two_node::{introduce_as, node_owned_as};
         use crate::store::postgres::PostgresBackend;
         use crate::store::Backend as _;
 
@@ -589,10 +596,14 @@ pub(crate) mod two_nodes {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i743-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i743-b", crate::federation::types::identity_type::NODE).await;
-            let c = node_as(&bc, "i743-c", crate::federation::types::identity_type::NODE).await;
-            let o = node_as(&bo, "i743-o", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i743-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i743-b", crate::federation::types::identity_type::NODE).await;
+            let c =
+                node_owned_as(&bc, "i743-c", crate::federation::types::identity_type::NODE).await;
+            let o =
+                node_owned_as(&bo, "i743-o", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b, &c, &o],
                 &["i743-a", "i743-b", "i743-c", "i743-o"],
@@ -608,8 +619,10 @@ pub(crate) mod two_nodes {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i744-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i744-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i744-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i744-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i744-a", "i744-b"],

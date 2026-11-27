@@ -46,6 +46,21 @@ pub(crate) mod bodies {
         }
     }
 
+    /// v62.0.0 (D2; CC 3.2, CC 3.4.7) — `alias`'s node is OWNED, its owner
+    /// binding carrying `infra:attest` (the duty its own `hard_case` rows need):
+    /// an unowned node states no report (`hard_case::state_hard_case` answers
+    /// `None`). Rootless: no root is built. The one fixture,
+    /// `r2_test_support::confer_from_owner`.
+    async fn own(engine: &crate::Engine, alias: &str) {
+        crate::federation::admission::r2_test_support::confer_from_owner(
+            engine.federation_directory().as_ref(),
+            &format!("{alias}-owner"),
+            alias,
+            &[crate::federation::types::delegation_scope::INFRA_ATTEST],
+        )
+        .await;
+    }
+
     /// I3055 / I3056.
     pub(crate) async fn i3055_a_hard_case_reaches_a_second_node(
         a_dsn: &str,
@@ -58,6 +73,7 @@ pub(crate) mod bodies {
             .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .expect("I3055: A registers");
+        own(&a, &format!("{tag}-3055-a")).await;
         // B holds A's key record before A's rows reach it.
         let mut cursor = None;
         deliver(&a, &b, &mut cursor).await;
@@ -66,7 +82,8 @@ pub(crate) mod bodies {
         let rid = a
             .record_hard_case(ev.clone())
             .await
-            .expect("I3055: A records the hard_case");
+            .expect("I3055: A records the hard_case")
+            .expect("I3055: A is owned, so it states the row");
         let row = a
             .federation_directory()
             .get_attestation(&rid)
@@ -91,7 +108,11 @@ pub(crate) mod bodies {
             .record_hard_case(ev.clone())
             .await
             .expect("I3056: a re-record is admitted");
-        assert_eq!(again, rid, "I3056: a re-record names the same row");
+        assert_eq!(
+            again.as_deref(),
+            Some(rid.as_str()),
+            "I3056: a re-record names the same row"
+        );
 
         // Delivered through the planes to B.
         let delivered = deliver(&a, &b, &mut cursor).await;
@@ -158,6 +179,7 @@ pub(crate) mod bodies {
             .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .expect("I3058: A registers");
+        own(&a, &format!("{tag}-3058-a")).await;
         let mut cursor = None;
         deliver(&a, &b, &mut cursor).await;
 
@@ -256,12 +278,14 @@ pub(crate) mod bodies {
         a.register_self_federation_key(identity_type::NODE, None, None)
             .await
             .expect("I3059: A registers");
+        own(&a, &format!("{tag}-3059-a")).await;
         let mut ev = event(&format!("{tag}-3059-ev"));
         ev.emitted_at -= chrono::Duration::days(1);
         let rid = a
             .record_hard_case(ev.clone())
             .await
-            .expect("I3059: an event older than the key is stated");
+            .expect("I3059: an event older than the key is stated")
+            .expect("I3059: A is owned, so it states the row");
         let row = a
             .federation_directory()
             .get_attestation(&rid)
@@ -282,7 +306,7 @@ pub(crate) mod bodies {
         );
         assert_eq!(
             a.record_hard_case(ev).await.expect("I3059: re-record"),
-            rid,
+            Some(rid),
             "I3059: deterministic per signing key"
         );
     }

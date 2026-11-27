@@ -70,7 +70,7 @@ pub enum SigningDomain {
     /// exception): signed by a person's own composite key — the agent's
     /// owner, a Wise Authority or an accord holder (ROOT) — verified by
     /// identity-ref through the directory; the authority is the signer's
-    /// standing ([`signer_standing`]), never a key list.
+    /// standing ([`signer_standing_now`]), never a key list.
     EmergencyShutdown,
 }
 
@@ -469,6 +469,12 @@ impl SignerStanding {
     }
 }
 
+/// v62.0.0 (SIGN-1; the lead's ruling of 2026-11-24) — **a READING, never
+/// a verdict**: no door may call it (`P/tools/act_not_reading.py` lists it).
+/// It answers "now" for a host holding a signed ARTEFACT (the emergency
+/// shutdown), which names no head; a row's standing is judged by what the
+/// row names, never here.
+///
 /// **The signer's standing over `agent_ref`, at `at_ms`** — built on the
 /// existing reads, no new rule, first match wins:
 ///
@@ -493,7 +499,7 @@ impl SignerStanding {
 ///
 /// # Errors
 /// Directory reads.
-pub async fn signer_standing<F>(
+pub async fn signer_standing_now<F>(
     dir: &F,
     identity_ref: &str,
     agent_ref: &str,

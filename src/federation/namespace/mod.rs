@@ -25,6 +25,9 @@
 
 pub mod cc_manifests;
 pub mod conformance;
+// v62.0.0 (FS-step1) — the one family table, read from the vendored family
+// model (CC 3.1).
+pub mod family_table;
 // v62 (CC rc21, CC 3.1) — a key written into a family name is its bare
 // thumbprint segment; the one encoder/decoder and its admission gate.
 pub mod key_segment;
@@ -627,8 +630,9 @@ pub fn projection_for(
             // the bytes so the quorum can assemble across an unknown cohort
             // span; whether a given node may CARRY a particular object is a
             // per-node relational question no cohort value can express, and it
-            // is answered by `trust_root::may_relay_accord_object` — seated
-            // signer AND a live `delegates_to(self -> root)`. Without that
+            // is answered by `trust_root::may_relay_accord_attestation` — a
+            // signer seated as a holder of the bundle the row names (v62.0.0
+            // RELAY-1) AND this node accepting the lineage. Without that
             // predicate this row WOULD over-deliver and the clause would be
             // violated; with it, Global is the widest the substrate offers and
             // the relay gate is what narrows it to those who granted the root.
@@ -1420,13 +1424,34 @@ pub fn visibility_for(
 /// node with no owner, and CC 5.4.6 says such a node "does not serve under
 /// the seat", so its corpus does not get trust-root reach until its owner
 /// announces it, and loses it again when the announcement is withdrawn.
+///
+/// # A pipeline's standing is read on either plane (v62.0.0, KR-fix25)
+///
+/// The build-signing leg is
+/// [`pipeline_has_infra_attest_standing`](crate::federation::admission::pipeline_has_infra_attest_standing)
+/// at this node's clock, for the build-manifest family
+/// (`infra:attest:provenance:build_manifest`, which a held `infra:attest`
+/// also covers): a live root grant of it accepted by the grantee's owner
+/// (CC 3.1.2.1; KR-fix27: `trust:blessing` is retired into the one grant
+/// family, so the grant walk is the whole reading). Before KR-fix25 only the
+/// key record's role (`is_infra_attest_effective`) was read, which no v62
+/// path can set.
 pub async fn is_trust_root(
     directory: &dyn crate::federation::FederationDirectory,
     key_id: &str,
 ) -> Result<bool, crate::federation::Error> {
+    // v62.0.0 (KR-fix25; CC 3.1.2.1) — a build-signing pipeline's standing
+    // is read on EITHER plane (the accord's conferral, or a root grant of
+    // `infra:attest`), at this node's clock: there is no act in hand.
     Ok(
         crate::federation::admission::seat_serve_standing(directory, key_id).await?
-            || crate::federation::admission::is_infra_attest_effective(directory, key_id).await?,
+            || crate::federation::admission::pipeline_has_infra_attest_standing(
+                directory,
+                key_id,
+                crate::federation::admission::BUILD_MANIFEST_STANDING_DIMENSION,
+                crate::host::clock::now(),
+            )
+            .await?,
     )
 }
 
@@ -1600,8 +1625,8 @@ impl RecipientVerdict {
 ///   caller-nominated [`Projection`]. A caller that nominates the wrong cell
 ///   gets a confidently wrong answer in the permissive direction — the exact
 ///   shape #731 removed one plane over
-///   ([`may_relay_accord_object`](crate::federation::trust_root::may_relay_accord_object)
-///   taking a caller-supplied `root_ref`). The caller already holds both
+///   (the retired `trust_root::may_relay_accord_object`, which took a
+///   caller-supplied `root_ref`). The caller already holds both
 ///   values, because it already had to call [`projection_for`].
 /// - the verdict is [`RecipientVerdict`], not `bool`, so *"I cannot judge"*
 ///   stays distinguishable from *"resolved, not a member"*.
@@ -1681,9 +1706,8 @@ pub async fn resolve_projection_recipients(
     // unknown identity resolves `Ok(vec![])` there rather than an error — the
     // one place "cannot judge" would silently become "resolved, empty" if this
     // existence check were dropped.
-    // [`active_roster_of`](crate::federation::trust_root::active_roster_of)
-    // draws the same line (`Ok(None)` vs `Ok(Some(vec![]))`) for the same
-    // reason.
+    // The accord relay verb draws the same line ("cannot judge" vs a
+    // resolved verdict) for the same reason.
     // v38.0.0 (CIRISPersist#746) — a scope-address-table id is the WRONG ID
     // SPACE for this verb, and it is refused BY NAME before any roster read:
     // feeding it through active_members would yield a confident

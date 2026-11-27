@@ -71,6 +71,20 @@ impl Seat {
     }
 }
 
+/// v62.0.0 (LINEAGE-L3c) — **is `role` the founder role?** The roster
+/// lineage reads a seat's role through this, the one founder reader
+/// ([`Seat::is_founder`]), and names the role word nowhere else
+/// (`scripts/one_standing.py`, rule `founder`).
+#[must_use]
+pub(crate) fn is_founder_role(role: Option<&str>) -> bool {
+    Seat {
+        key_id: String::new(),
+        role: role.map(str::to_owned),
+        node_bearing: false,
+    }
+    .is_founder()
+}
+
 /// Everything [`evaluate`] reads. Borrowed, so a fold can evaluate thousands of
 /// events without cloning the roster.
 #[derive(Debug, Clone, Copy)]

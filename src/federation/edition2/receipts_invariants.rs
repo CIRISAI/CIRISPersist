@@ -326,14 +326,7 @@ fn edge_statement(
     member: Option<Value>,
 ) -> Vec<u8> {
     let classes: Vec<String> = classes.iter().map(|c| (*c).to_owned()).collect();
-    let p = super::typed::trust_accepts_payload(
-        &e2::kid(granter),
-        &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
-        &classes,
-        None,
-        scope,
-        now_ms(),
-    );
+    let p = super::typed::trust_accepts_payload(&e2::kid(granter), &classes, None, scope, now_ms());
     let p = match (p, member) {
         (Value::Map(mut m), Some(v)) => {
             m.push((t(receipts::SERVICE_KEY_MEMBER), v));

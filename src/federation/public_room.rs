@@ -25,7 +25,7 @@
 //!    that seats them is the joiner's own signature (`membership_acceptance`,
 //!    [`super::consensus`]). A removal takes two voices (CC 4.5.13).
 //! 3. **Discovery.** `community:listing:v1` is the room's own `scores` row at
-//!    `federation`, by its founder or a current `moderate`-holder, carrying
+//!    `federation`, by a current `moderate`-holder, carrying
 //!    the name, description, `cohort_subkind`, admission policy, named
 //!    moderator and `community_key_id` ([`check_community_listing_admission`]).
 //!    "One live row per community" is a READ rule ([`live_listing`]): two
@@ -84,8 +84,8 @@ pub const LISTING_MALFORMED: &str = "community_listing_malformed";
 /// Refusal token: a listing for a room that is not `public`.
 pub const LISTING_ROOM_NOT_PUBLIC: &str = "community_listing_room_not_public";
 
-/// Refusal token: a listing signed by a key that is neither a founder nor a
-/// current `moderate`-holder of the room it names.
+/// Refusal token: a listing signed by a key that is not a current
+/// `moderate`-holder of the room it names.
 pub const LISTING_SIGNER_NOT_AUTHORIZED: &str = "community_listing_signer_not_authorized";
 
 /// Is `community` a `public` room (CC 3.2)? The one predicate the tier
@@ -227,9 +227,11 @@ pub fn listing_community(row: &Attestation) -> Option<&str> {
     env_str(row, "community_key_id").filter(|s| !s.is_empty())
 }
 
-/// **The `community:listing:v1` door** (CC 3.2, the registry's reserved rule:
-/// "founder- or moderate-holder-signed for the community it names; one live
-/// row per community; federation scope"). A no-op off the leaf. Refuses:
+/// **The `community:listing:v1` door** (CC 3.2, the registry's reserved rule
+/// at CIRISConstitution v1.0-rc22-pre3: "moderate-holder-signed for the
+/// community it names; one live row per community; federation scope"; CC
+/// 3.4.7: "a holder of the community's `moderate` duty"). A no-op off the
+/// leaf. Refuses:
 ///
 /// - a row not placed at `federation` ([`LISTING_NOT_FEDERATION`]);
 /// - a row naming no `community_key_id` or no `moderator`
@@ -238,8 +240,12 @@ pub fn listing_community(row: &Attestation) -> Option<&str> {
 /// Where this node HOLDS the room's record it also refuses a room that is not
 /// `public` ([`LISTING_ROOM_NOT_PUBLIC`]), a `cohort_subkind` or `admission`
 /// member that is not the record's ([`LISTING_MALFORMED`]), and a signer that
-/// is neither a founder on the room's effective roster nor a current named
-/// `moderate`-holder ([`LISTING_SIGNER_NOT_AUTHORIZED`]). Where it does not
+/// is not a current named `moderate`-holder ([`LISTING_SIGNER_NOT_AUTHORIZED`]).
+/// v62.0.0 (FS-sig-a) — a founder signs as a `moderate`-holder only: a
+/// steward-bound founder roots the room's duties
+/// ([`super::admission::is_named_moderator`], zero hop), so the founder
+/// short-circuit this door kept (any founder on the roster, steward-bound or
+/// not) is gone. Where it does not
 /// hold the record YET, the signer's authority cannot be asked, so the row is
 /// refused RETRYABLY — [`Error::WriteScopeRefused`] with
 /// `ScopeRefusalReason::MembershipUnresolved` (`scope_membership_unresolved`)
@@ -336,23 +342,15 @@ pub async fn check_community_listing_admission(
             ),
         ));
     }
-    // KR-fix10 (CC 3.1.3.2) — a founder's standing is its own key's: the
+    // KR-fix10 (CC 3.1.3.2) — a holder's standing is its own key's: the
     // signer's person, or the signing key itself (a member in its own right);
     // never the signer's owner.
     let signer = super::admission::consenting_person(directory, &row.attesting_key_id)
         .await?
         .unwrap_or_else(|| row.attesting_key_id.clone());
     fold::reads(Dep::key(&signer));
-    let founder = super::effective_roster(directory, &room)
-        .await?
-        .iter()
-        .any(|m| {
-            m.role.as_deref() == Some(super::admission::MEMBER_ROLE_FOUNDER)
-                && (m.key_id == signer || m.key_id == row.attesting_key_id)
-        });
-    if founder {
-        return Ok(());
-    }
+    // v62.0.0 (FS-sig-a; CC 3.4.7) — the `moderate` duty alone; a founder
+    // holds it as a steward-bound duty root, never by its roster role.
     for k in [row.attesting_key_id.as_str(), signer.as_str()] {
         if super::admission::is_named_moderator(
             directory,
@@ -372,8 +370,7 @@ pub async fn check_community_listing_admission(
         listing_refusal(
             LISTING_SIGNER_NOT_AUTHORIZED,
             format!(
-                "{:?} is neither a founder of {community_key_id:?} nor a current \
-                 `moderate`-holder",
+                "{:?} is not a current `moderate`-holder of {community_key_id:?} (CC 3.4.7)",
                 row.attesting_key_id
             ),
         ),
