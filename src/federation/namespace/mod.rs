@@ -25,6 +25,9 @@
 
 pub mod cc_manifests;
 pub mod conformance;
+// v62.0.0 (FS-step1) — the one family table, read from the vendored family
+// model (CC 3.1).
+pub mod family_table;
 // v62 (CC rc21, CC 3.1) — a key written into a family name is its bare
 // thumbprint segment; the one encoder/decoder and its admission gate.
 pub mod key_segment;
@@ -1420,13 +1423,34 @@ pub fn visibility_for(
 /// node with no owner, and CC 5.4.6 says such a node "does not serve under
 /// the seat", so its corpus does not get trust-root reach until its owner
 /// announces it, and loses it again when the announcement is withdrawn.
+///
+/// # A pipeline's standing is read on either plane (v62.0.0, KR-fix25)
+///
+/// The build-signing leg is
+/// [`pipeline_has_infra_attest_standing`](crate::federation::admission::pipeline_has_infra_attest_standing)
+/// at this node's clock, for the build-manifest family
+/// (`infra:attest:provenance:build_manifest`, which a held `infra:attest`
+/// also covers): a live root grant of it accepted by the grantee's owner
+/// (CC 3.1.2.1; KR-fix27: `trust:blessing` is retired into the one grant
+/// family, so the grant walk is the whole reading). Before KR-fix25 only the
+/// key record's role (`is_infra_attest_effective`) was read, which no v62
+/// path can set.
 pub async fn is_trust_root(
     directory: &dyn crate::federation::FederationDirectory,
     key_id: &str,
 ) -> Result<bool, crate::federation::Error> {
+    // v62.0.0 (KR-fix25; CC 3.1.2.1) — a build-signing pipeline's standing
+    // is read on EITHER plane (the accord's conferral, or a root grant of
+    // `infra:attest`), at this node's clock: there is no act in hand.
     Ok(
         crate::federation::admission::seat_serve_standing(directory, key_id).await?
-            || crate::federation::admission::is_infra_attest_effective(directory, key_id).await?,
+            || crate::federation::admission::pipeline_has_infra_attest_standing(
+                directory,
+                key_id,
+                crate::federation::admission::BUILD_MANIFEST_STANDING_DIMENSION,
+                crate::host::clock::now(),
+            )
+            .await?,
     )
 }
 

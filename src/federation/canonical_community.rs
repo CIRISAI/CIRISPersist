@@ -3673,7 +3673,9 @@ where
 /// already un-counts the key). The planes admit and remove MEMBERS only.
 ///
 /// One exception, the consent floor (#926 re-check): a founder's OWN
-/// revocation, signed by that founder alone, is admitted as a RESIGNATION. It
+/// end is admitted as a RESIGNATION. v62.0.0 (RESIGN-3; CC 3.1.3.2) — that
+/// end is the `resignation` leaf (`change`), never a removal the founder
+/// alone voiced, which is a founder-seat change on the plane like any other. It
 /// does not move the record: from its `effective_at` the founder stops
 /// counting (and stops being a seat) in every link and in the row's standing,
 /// so the row stalls until the other founders amend the seat out — or, if the
@@ -3687,14 +3689,14 @@ where
 pub async fn check_trust_root_roster_change<F>(
     directory: &F,
     community: &Community,
-    signers: &std::collections::BTreeSet<String>,
     incoming: &super::types::CommunityMember,
-    is_revocation: bool,
+    change: super::RosterChange,
     effective_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error>
 where
     F: FederationDirectory + ?Sized,
 {
+    let is_revocation = change.is_revocation();
     let founder = super::admission::MEMBER_ROLE_FOUNDER;
     // v62.0.0 (wave GC8; CC 2.7.3) — the held head, its roster fold and its
     // liveness are other rows: each leg that reads them is a fold
@@ -3720,10 +3722,10 @@ where
         .iter()
         .any(|m| m.key_id == incoming.key_id && m.role.as_deref() == Some(founder));
     let seats_founder = !is_revocation && incoming.role.as_deref() == Some(founder);
-    let resignation = is_revocation
-        && (recorded || folded)
-        && signers.len() == 1
-        && signers.contains(&incoming.key_id);
+    // v62.0.0 (RESIGN-3; CC 3.1.3.2) — a founder's resignation is the
+    // `resignation` leaf, never a removal its subject voiced alone (that is
+    // a removal of a founder seat on the plane, below).
+    let resignation = change.is_resignation() && (recorded || folded);
     if resignation {
         // Review MEDIUM-R (a): a resignation dated at or before the stored
         // head's instant would un-count a link the founder co-signed and

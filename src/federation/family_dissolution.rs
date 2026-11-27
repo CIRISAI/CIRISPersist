@@ -15,11 +15,11 @@
 //!   write naming it — supersede, widening, revocation, a row placed at it, a
 //!   membership reply — is refused [`Error::GroupDissolved`].
 //! - **Leave.** Leaving is the member's own act and needs no quorum
-//!   (CIRISConstitution#133: forward-only, by the member alone). An amendment
-//!   whose ONLY change is removing one member from the record — every other
-//!   seat byte-identical, name, founding instant, protocol and entrenchment
-//!   unchanged, not a dissolution — is admitted on THAT member's signature
-//!   over the change envelope alone, on the local door and on apply.
+//!   (CIRISConstitution#133: forward-only, by the member alone). v62.0.0
+//!   (RESIGN-3; CC 3.1.3.2) — that act is the `membership:resignation`
+//!   leaf, and nothing else. The v52 arm that admitted an amendment dropping
+//!   only its signer on that signer's voice alone is RETIRED: a version is
+//!   the group's counted row, judged by its quorum like any other.
 //!
 //! Every check re-derives from the receiving node's own held record.
 
@@ -131,96 +131,6 @@ pub fn check_dissolve_is_terminal_only(stored: &Family, offered: &Family) -> Res
                 offered.family_key_id
             )),
         ));
-    }
-    Ok(())
-}
-
-/// The member an amendment removes when that removal is its ONLY change:
-/// every other seat identical and in order, name, founding instant, protocol
-/// and entrenchment unchanged, neither record dissolved. `None` otherwise.
-#[must_use]
-pub fn self_leave_member<'a>(stored: &'a Family, offered: &Family) -> Option<&'a str> {
-    if stored.dissolved_at.is_some()
-        || offered.dissolved_at.is_some()
-        || stored.family_name != offered.family_name
-        || stored.founded_at != offered.founded_at
-        || stored.consensus_protocol != offered.consensus_protocol
-        || stored.consensus_protocol_entrenched != offered.consensus_protocol_entrenched
-        || stored.members.len() != offered.members.len() + 1
-    {
-        return None;
-    }
-    let leaver = stored
-        .members
-        .iter()
-        .find(|m| !offered.members.iter().any(|o| o.key_id == m.key_id))?;
-    let rest: Vec<_> = stored
-        .members
-        .iter()
-        .filter(|m| m.key_id != leaver.key_id)
-        .collect();
-    (rest.len() == offered.members.len() && rest.iter().zip(&offered.members).all(|(a, b)| *a == b))
-        .then_some(leaver.key_id.as_str())
-}
-
-/// The leaver's own voice over the change envelope, and nothing else, is
-/// the authority for a self-leave. The envelope must name the held roster in
-/// `supersedes.prior_member_key_ids` (anti-replay, as the quorum path) and
-/// must not carry a dissolution.
-///
-/// v62.0.0 (BH-fix1; RULINGS "composite signatures only") — the leaver signs
-/// with ONE composite statement, verified at the edition-2 door; the door
-/// vouches for exactly this change envelope
-/// (`edition2::group::vouched_quorum_signers`),
-/// and the leaver must be among the vouched voices. The earlier form (a
-/// separate Ed25519 + ML-DSA-65 pair in the proof's `quorum_signatures`,
-/// verified against the leaver's component halves) is deleted: outside a
-/// vouch nobody has signed.
-///
-/// # Errors
-/// [`Error::InvalidArgument`] for each refusal (a dissolution, a missing
-/// `supersedes`, an unvouched leaver); the prior-roster mismatch holds under
-/// a fold attempt.
-pub fn verify_self_leave_signature(
-    stored: &Family,
-    change_envelope: &serde_json::Value,
-    leaver: &str,
-) -> Result<(), Error> {
-    let refuse = |detail: &str| {
-        Error::InvalidArgument(format!(
-            "self-leave from family {}: {detail} (CIRISPersist#956)",
-            stored.family_key_id
-        ))
-    };
-    if !matches!(
-        change_envelope.get(DISSOLVED_AT_MEMBER),
-        None | Some(serde_json::Value::Null)
-    ) {
-        return Err(refuse("a self-leave does not dissolve"));
-    }
-    let claimed_prior: Vec<&str> = change_envelope
-        .get("supersedes")
-        .and_then(|s| s.get("prior_member_key_ids"))
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-        .ok_or_else(|| refuse("the change envelope is missing `supersedes`"))?;
-    // v62.0.0 (wave GC7; CC 2.7.3) — the claimed prior roster is compared
-    // with the HELD head (another row): it holds under a fold attempt and
-    // re-folds when the family or the leaver's key changes. The envelope's
-    // own shape and the voice stay refusals.
-    fold::reads(Dep::key(&stored.family_key_id));
-    fold::reads(Dep::key(leaver));
-    let held: Vec<&str> = stored.members.iter().map(|m| m.key_id.as_str()).collect();
-    if claimed_prior != held {
-        return Err(fold::hold(
-            reason::PRIOR_ROSTER_MISMATCH,
-            refuse("supersedes.prior_member_key_ids does not match the held roster"),
-        ));
-    }
-    let voiced = super::edition2::group::vouched_quorum_signers(change_envelope)
-        .is_some_and(|signers| signers.contains(leaver));
-    if !voiced {
-        return Err(refuse("the leaver did not sign"));
     }
     Ok(())
 }

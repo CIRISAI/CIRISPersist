@@ -346,7 +346,11 @@ where
     }
 
     async fn emit_own(&self, input: super::EmitAttestationInput) -> Result<String, Error> {
-        self.engine.emit_attestation_self(input).await
+        self.engine
+            .emit_attestation_self(input)
+            .await
+            // VD-step2b: this verb still answers the row id alone.
+            .map(crate::federation::edition2::second_signer_voice::VoiceOutcome::into_row_id)
     }
 
     async fn set_aside(

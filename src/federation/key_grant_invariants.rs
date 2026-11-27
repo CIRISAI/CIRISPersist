@@ -121,6 +121,44 @@ pub mod two_node {
         }
     }
 
+    /// v62.0.0 (HEAD-6; Constitution, head cases (3): "owned-but-rootless
+    /// runs the mesh; unowned is only reachable") — **own `n`**: the person
+    /// `owner_alias` binds the node `alias` (a [`node_as`] `NODE`) through the
+    /// real owner-binding door (`fixture_switch::land_owner_binding`: the
+    /// owner's statement, then the node's own voice), on the node's own
+    /// backend. From then on its reports and holding claims name the binding.
+    ///
+    /// # Panics
+    /// The binding does not land.
+    pub async fn own<B>(n: &Node<'_, B>, alias: &str, owner_alias: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        e2::put_key(n.backend, owner_alias, &[USER]).await;
+        let binding = ts::owner_binding_attestation(
+            &format!("own-{alias}-{owner_alias}"),
+            owner_alias,
+            &n.key,
+        );
+        e2::land_owner_binding(n.backend, &binding, alias)
+            .await
+            .unwrap_or_else(|e| panic!("own({alias}): the owner binding lands: {e:?}"));
+    }
+
+    /// v62.0.0 (HEAD-7; Constitution, head cases (3)) — [`node_as`], then
+    /// [`own`]: a `role` node OWNED by the person `{alias}-owner` through the
+    /// real owner-binding door. The fixture for a node that is to sign reports
+    /// and holding claims; [`node_as`] stays the fixture for a test about an
+    /// unowned node, or one that binds the node itself.
+    pub async fn node_owned_as<'a, B>(backend: &'a B, alias: &str, role: &str) -> Node<'a, B>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let n = node_as(backend, alias, role).await;
+        own(&n, alias, &format!("{alias}-owner")).await;
+        n
+    }
+
     /// Every node learns every other node's key — the ONE piece of shared
     /// knowledge two real nodes have after a key-record exchange: each
     /// alias's edition-2 `key:record` (`kid(alias)`), registered as a USER
@@ -286,7 +324,7 @@ pub mod two_node {
         // v62.0.0 (P1-fix10) — the node's record before its self-occurrence
         // and its owner binding.
         key_live(d, node_seed).await;
-        d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+        d.test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
             identity_key_id: node.to_owned(),
             occurrence_key_id: node.to_owned(),
             device_class: device_class.to_owned(),
@@ -405,6 +443,7 @@ pub mod two_node {
                 reason: None,
                 witness_set: vec![],
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Removal,
             },
         );
         let keys: Vec<_> = signers
@@ -573,7 +612,7 @@ pub mod two_node {
             persist_row_hash: String::new(),
         };
         if !machine {
-            dir.put_identity_occurrence_local(occurrence(member))
+            dir.test_seam_put_identity_occurrence(occurrence(member))
                 .await
                 .unwrap_or_else(|e| panic!("occurrence {device} of {member}: {e}"));
             return;
@@ -587,7 +626,7 @@ pub mod two_node {
                 .await
                 .unwrap_or_else(|e| panic!("{member}'s owner binding of the node {device}: {e}"));
         }
-        dir.put_identity_occurrence_local(occurrence(device))
+        dir.test_seam_put_identity_occurrence(occurrence(device))
             .await
             .unwrap_or_else(|e| panic!("the node {device}'s own occurrence: {e}"));
     }
@@ -1033,6 +1072,9 @@ pub mod two_node {
         let alice = e2::kid(&format!("{tag}-alice-{run}"));
         let bob = e2::kid(&format!("{tag}-bob-{run}"));
         seed_community_everywhere(&[a, b], &comm, &[(&alice, Some(a)), (&bob, Some(b))]).await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
 
         // Mallory: a registered key on BOTH nodes, a member of nothing.
         let mallory_alias = format!("{tag}-mallory-{run}");
@@ -1184,6 +1226,9 @@ pub mod two_node {
         let alice = e2::kid(&format!("{tag}-alice-{run}"));
         let bob = e2::kid(&format!("{tag}-bob-{run}"));
         seed_community_everywhere(&[a, b], &comm, &[(&alice, Some(a)), (&bob, Some(b))]).await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
 
         // A seals under (C, A, 0) — the fan-out wraps to B's occurrence
         // with B's OWN content-KEM pubkeys, which only B can open.
@@ -1347,6 +1392,9 @@ pub mod two_node {
         let alice = e2::kid(&format!("{tag}-alice-{run}"));
         let bob = e2::kid(&format!("{tag}-bob-{run}"));
         seed_community_everywhere(&[a, b], &comm, &[(&alice, Some(a)), (&bob, Some(b))]).await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         let sealed = encrypt_and_cascade_community(a.backend, &comm, b"v1", None, Some(&a.key))
             .await
             .unwrap();
@@ -1472,6 +1520,9 @@ pub mod two_node {
             &[(&alice, Some(a)), (&bob, Some(b)), (&xavier, None)],
         )
         .await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         // Give X an occurrence with keys on both nodes so B wraps to it.
         let x_occ = e2::kid(&format!("{tag}-x-occ-{run}"));
         for n in [a, b] {
@@ -1592,6 +1643,9 @@ pub mod two_node {
             &[(&alice, Some(a)), (&bob, Some(b)), (&carol, Some(c))],
         )
         .await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         // Both A and C advance their OWN counters to 3.
         for n in [a, c] {
             for _ in 0..3 {
@@ -1707,7 +1761,7 @@ pub mod two_node {
         };
         for n in [a, b] {
             n.backend
-                .put_identity_occurrence_local(occurrence(n))
+                .test_seam_put_identity_occurrence(occurrence(n))
                 .await
                 .unwrap_or_else(|e| panic!("{tag} I1519: occurrence of A on a node: {e}"));
         }
@@ -1827,17 +1881,19 @@ pub mod two_node {
             ts::register_hybrid_key_as(n.backend, &owner, &owner, USER).await;
             for dev in [a, a2] {
                 n.backend
-                    .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                        identity_key_id: owner.clone(),
-                        occurrence_key_id: dev.key.clone(),
-                        device_class: crate::federation::types::device_class::LAPTOP.into(),
-                        hardware_attestation: None,
-                        asserted_at: chrono::Utc::now(),
-                        valid_until: None,
-                        encryption_pubkeys: Some(dev.kem.clone()),
-                        transport_binding: None,
-                        persist_row_hash: String::new(),
-                    })
+                    .test_seam_put_identity_occurrence(
+                        crate::federation::types::IdentityOccurrence {
+                            identity_key_id: owner.clone(),
+                            occurrence_key_id: dev.key.clone(),
+                            device_class: crate::federation::types::device_class::LAPTOP.into(),
+                            hardware_attestation: None,
+                            asserted_at: chrono::Utc::now(),
+                            valid_until: None,
+                            encryption_pubkeys: Some(dev.kem.clone()),
+                            transport_binding: None,
+                            persist_row_hash: String::new(),
+                        },
+                    )
                     .await
                     .unwrap();
             }
@@ -1872,7 +1928,7 @@ pub mod two_node {
         let lost = node_signer(a2.backend, &format!("{tag}-lost-{run}")).await;
         let lost_key = lost.federation_id().await;
         a2.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner.clone(),
                 occurrence_key_id: lost_key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -1887,7 +1943,7 @@ pub mod two_node {
             .unwrap();
         let revoked_at = chrono::Utc::now();
         a2.backend
-            .put_identity_occurrence_revocation_local(
+            .put_identity_occurrence_revocation_edition2(
                 crate::federation::types::IdentityOccurrenceRevocation {
                     identity_key_id: owner.clone(),
                     occurrence_key_id: lost_key.clone(),
@@ -1897,6 +1953,7 @@ pub mod two_node {
                     witness_set: vec![],
                     persist_row_hash: String::new(),
                 },
+                crate::federation::DoorToken::new(),
             )
             .await
             .unwrap_or_else(|e| panic!("{tag} I65: the lost device's occurrence is revoked: {e}"));
@@ -2054,7 +2111,7 @@ pub mod two_node {
         let dev3 = e2::kid(&format!("{tag}-dev3-{run}"));
         ts::register_hybrid_key_as(a2.backend, &dev3, &dev3, USER).await;
         a2.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner.clone(),
                 occurrence_key_id: dev3.clone(),
                 device_class: crate::federation::types::device_class::SERVER.into(),
@@ -2110,17 +2167,19 @@ pub mod two_node {
             ts::register_hybrid_key_as(n.backend, &owner, &owner, USER).await;
             for dev in [a, a2] {
                 n.backend
-                    .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                        identity_key_id: owner.clone(),
-                        occurrence_key_id: dev.key.clone(),
-                        device_class: crate::federation::types::device_class::LAPTOP.into(),
-                        hardware_attestation: None,
-                        asserted_at: chrono::Utc::now(),
-                        valid_until: None,
-                        encryption_pubkeys: Some(dev.kem.clone()),
-                        transport_binding: None,
-                        persist_row_hash: String::new(),
-                    })
+                    .test_seam_put_identity_occurrence(
+                        crate::federation::types::IdentityOccurrence {
+                            identity_key_id: owner.clone(),
+                            occurrence_key_id: dev.key.clone(),
+                            device_class: crate::federation::types::device_class::LAPTOP.into(),
+                            hardware_attestation: None,
+                            asserted_at: chrono::Utc::now(),
+                            valid_until: None,
+                            encryption_pubkeys: Some(dev.kem.clone()),
+                            transport_binding: None,
+                            persist_row_hash: String::new(),
+                        },
+                    )
                     .await
                     .unwrap();
             }
@@ -2229,17 +2288,19 @@ pub mod two_node {
                 // v53.0.0 (#963, CC 3.3.7) — a member's PERSONAL device: a
                 // server-class occurrence holds no family content by default.
                 n.backend
-                    .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                        identity_key_id: ident.clone(),
-                        occurrence_key_id: dev.key.clone(),
-                        device_class: crate::federation::types::device_class::LAPTOP.into(),
-                        hardware_attestation: None,
-                        asserted_at: chrono::Utc::now(),
-                        valid_until: None,
-                        encryption_pubkeys: Some(dev.kem.clone()),
-                        transport_binding: None,
-                        persist_row_hash: String::new(),
-                    })
+                    .test_seam_put_identity_occurrence(
+                        crate::federation::types::IdentityOccurrence {
+                            identity_key_id: ident.clone(),
+                            occurrence_key_id: dev.key.clone(),
+                            device_class: crate::federation::types::device_class::LAPTOP.into(),
+                            hardware_attestation: None,
+                            asserted_at: chrono::Utc::now(),
+                            valid_until: None,
+                            encryption_pubkeys: Some(dev.kem.clone()),
+                            transport_binding: None,
+                            persist_row_hash: String::new(),
+                        },
+                    )
                     .await
                     .unwrap_or_else(|e| panic!("{tag} I199: occurrence of {ident}: {e}"));
             }
@@ -2249,6 +2310,9 @@ pub mod two_node {
                 .await
                 .unwrap_or_else(|e| panic!("{tag} I199: seed family: {e}"));
         }
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let fam = crate::federation::edition2::fixture_switch::room_id(&fam);
         let sealed = encrypt_and_cascade(
             a.backend,
             FAMILY,
@@ -2367,6 +2431,9 @@ pub mod two_node {
             &[(&alice, Some(a)), (&bob, Some(b)), (&xavier, None)],
         )
         .await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         let x_occ = e2::kid(&format!("{tag}-x-occ-{run}"));
         for n in [a, b] {
             ts::register_hybrid_key_as(n.backend, &x_occ, &x_occ, USER).await;
@@ -2502,6 +2569,9 @@ pub mod two_node {
                 .await
                 .unwrap_or_else(|e| panic!("{tag} I77: seed community: {e}"));
         }
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         let local_occurrence =
             |identity: &str,
              occurrence: &str,
@@ -2659,7 +2729,7 @@ pub mod two_node {
             )
             .await;
             let err = c
-                .put_identity_occurrence_local(local_occurrence(
+                .test_seam_put_identity_occurrence(local_occurrence(
                     &alice,
                     &a.key,
                     &a.kem,
@@ -2721,7 +2791,7 @@ pub mod two_node {
                 "{tag} I77 (7): {err}"
             );
             let err = e
-                .put_identity_occurrence_local(local_occurrence(
+                .test_seam_put_identity_occurrence(local_occurrence(
                     &carol,
                     &a.key,
                     &a.kem,
@@ -2888,7 +2958,7 @@ pub mod two_node {
         // I78: a trusted-local row is never advertised.
         let local_occ = e2::put_key(n.backend, &format!("{tag}-local-{run}"), &[USER]).await;
         n.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: alice.clone(),
                 occurrence_key_id: local_occ.clone(),
                 device_class: SERVER.into(),
@@ -3146,6 +3216,9 @@ pub mod two_node {
         let alice = e2::kid(&format!("{tag}-alice-{run}"));
         let bob = e2::kid(&format!("{tag}-bob-{run}"));
         seed_community_everywhere(&[a, b], &comm, &[(&alice, Some(a)), (&bob, Some(b))]).await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         encrypt_and_cascade_community(a.backend, &comm, b"while active", None, Some(&a.key))
             .await
             .unwrap_or_else(|e| panic!("{tag} I60b: A seals: {e}"));
@@ -3557,8 +3630,10 @@ mod tests {
         #[tokio::test]
         async fn i60_forged_set_refused_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node_as(&ba, "i60-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i60-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i60-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i60-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i60-a", "i60-b"],
@@ -3571,8 +3646,10 @@ mod tests {
         #[tokio::test]
         async fn i60b_delayed_set_survives_a_later_occurrence_revocation_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node_as(&ba, "i60b-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i60b-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i60b-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i60b-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i60b-a", "i60b-b"],
@@ -3603,8 +3680,10 @@ mod tests {
         #[tokio::test]
         async fn i71_rotation_keys_on_effective_at_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node_as(&ba, "i71-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i71-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i71-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i71-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i71-a", "i71-b"],
@@ -3617,8 +3696,10 @@ mod tests {
         #[tokio::test]
         async fn i61_end_to_end_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node_as(&ba, "i61-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i61-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i61-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i61-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i61-a", "i61-b"],
@@ -3631,8 +3712,10 @@ mod tests {
         #[tokio::test]
         async fn i62_union_order_independent_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node_as(&ba, "i62-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i62-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i62-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i62-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i62-a", "i62-b"],
@@ -3645,8 +3728,10 @@ mod tests {
         #[tokio::test]
         async fn i63_rotation_on_admitted_removal_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node_as(&ba, "i63-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i63-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i63-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i63-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i63-a", "i63-b"],
@@ -3659,9 +3744,12 @@ mod tests {
         #[tokio::test]
         async fn i64_two_minters_same_epoch_sqlite() {
             let (ba, bb, bc) = (fresh().await, fresh().await, fresh().await);
-            let a = node_as(&ba, "i64-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i64-b", crate::federation::types::identity_type::NODE).await;
-            let c = node_as(&bc, "i64-c", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i64-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i64-b", crate::federation::types::identity_type::NODE).await;
+            let c =
+                node_owned_as(&bc, "i64-c", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b, &c],
                 &["i64-a", "i64-b", "i64-c"],
@@ -3756,7 +3844,7 @@ mod tests {
                     transport_binding: None,
                     persist_row_hash: String::new(),
                 };
-            sq.put_identity_occurrence_local(occurrence(
+            sq.test_seam_put_identity_occurrence(occurrence(
                 &me,
                 kem(sq.load_or_init_content_kem_identity().await.unwrap()),
             ))
@@ -3796,7 +3884,7 @@ mod tests {
             let other = fresh().await;
             let dev2 = e2::kid(&format!("i68-dev2-{run}"));
             ts::register_hybrid_key_as(sq.as_ref(), &dev2, &dev2, USER).await;
-            sq.put_identity_occurrence_local(occurrence(
+            sq.test_seam_put_identity_occurrence(occurrence(
                 &dev2,
                 kem(other.load_or_init_content_kem_identity().await.unwrap()),
             ))
@@ -4326,39 +4414,58 @@ mod tests {
             let outcome_c = engine_c
                 .self_at_login(input(None))
                 .await
-                .expect("I92: self_at_login without a signer still lands (local)");
-            assert!(outcome_c.occurrences_published.is_empty(), "{outcome_c:?}");
-            assert_eq!(outcome_c.occurrences_local_only.len(), 2, "{outcome_c:?}");
-            let plane_c: Vec<String> =
-                FederationDirectory::list_signed_identity_occurrences_for(sc.as_ref(), &identity)
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .map(|s| s.identity_occurrence.occurrence_key_id)
-                    .collect();
+                .expect("I92: self_at_login without the identity's signer still completes");
+            // v62.0.0 (WD-fix9; the lead's ruling) — no unsigned occurrence
+            // is written. WD-fix9b (the Constitution's ruling of 2026-11-22,
+            // CC 3.3.6: "an UNOWNED agent has no occurrence") — the AGENT is
+            // unowned here (no owner pen, no binding held), so NOTHING is
+            // stated for it: it is pending with no draft. The APP's bind
+            // needs the login identity's voice: its own voice is kept and the
+            // identity's is DRAFTED.
             assert!(
-                !plane_c.contains(&app_key) && !plane_c.contains(&agent_key),
-                "I92: a trusted-local row is never on the plane: {plane_c:?}"
+                outcome_c.occurrences_published.is_empty(),
+                "I92: nothing concludes without the identity's pen: {outcome_c:?}"
             );
-            // But they ARE stored locally, so the node's own cascade sees them.
-            let local_c =
+            let mut pending = outcome_c.occurrences_pending.clone();
+            pending.sort();
+            let mut expected = vec![app_key.clone(), agent_key.clone()];
+            expected.sort();
+            assert_eq!(
+                pending, expected,
+                "I92: the app waits for the identity's voice, the unowned agent for an owner: \
+                 {outcome_c:?}"
+            );
+            assert!(
+                outcome_c.bind_drafts.iter().any(|(k, _)| k == &app_key),
+                "I92: the identity's part of the app's bind is returned as a draft: {outcome_c:?}"
+            );
+            assert!(
+                !outcome_c.bind_drafts.iter().any(|(k, _)| k == &agent_key),
+                "I92: the unowned agent's bind is not drafted (there is no author): {outcome_c:?}"
+            );
+            // First login leaves NO unsigned occurrence row: nothing under the
+            // login identity until the identity's voice lands.
+            assert!(
                 FederationDirectory::list_identity_occurrences_for(sc.as_ref(), &identity)
                     .await
-                    .unwrap();
-            // v62.0.0 (P8 §3) — the login identity lists the APP only; the
-            // agent's occurrence is under the agent's own identity.
-            assert_eq!(
-                local_c.len(),
-                1,
-                "I92: the app, stored locally: {local_c:?}"
+                    .unwrap()
+                    .is_empty(),
+                "I92: no unsigned occurrence row under the identity"
             );
+            // And none for the unowned agent: no row, signed or not.
             assert!(
                 FederationDirectory::list_identity_occurrences_for(sc.as_ref(), &agent_key)
                     .await
                     .unwrap()
-                    .iter()
-                    .any(|o| o.occurrence_key_id == agent_key),
-                "I92: the agent's occurrence, stored locally under the agent"
+                    .is_empty()
+                    && FederationDirectory::list_signed_identity_occurrences_for(
+                        sc.as_ref(),
+                        &agent_key
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "I92: an unowned agent has no occurrence"
             );
         }
 
@@ -4445,8 +4552,10 @@ mod tests {
                 vec![app_key.clone()],
                 "{outcome:?}"
             );
+            // v62.0.0 (WD-fix9) — the agent's bind did not land (no pen of its
+            // own here): pending, drafted, and nothing unsigned written.
             assert_eq!(
-                outcome.occurrences_local_only,
+                outcome.occurrences_pending,
                 vec![agent_key.clone()],
                 "{outcome:?}"
             );
@@ -4661,7 +4770,10 @@ mod tests {
             );
             seed_community_everywhere(&[&node], &comm, &[(&alice, Some(&node)), (&bob, None)])
                 .await;
-            sq.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+            // panics if it was not).
+            let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
+            sq.test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: bob.clone(),
                 occurrence_key_id: member_occ.clone(),
                 device_class: crate::federation::types::device_class::SERVER.into(),
@@ -4745,7 +4857,7 @@ mod tests {
             for k in [&comm2, &bob2, &member_occ2] {
                 ts::register_hybrid_key_as(sq.as_ref(), k, k, USER).await;
             }
-            sq.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            sq.test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: bob2.clone(),
                 occurrence_key_id: member_occ2.clone(),
                 device_class: crate::federation::types::device_class::SERVER.into(),
@@ -4767,6 +4879,9 @@ mod tests {
             )
             .await
             .unwrap();
+            // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+            // panics if it was not).
+            let comm2 = crate::federation::edition2::fixture_switch::room_id(&comm2);
             encrypt_and_cascade_community(sq.as_ref(), &comm2, b"crashed", None, Some(&me))
                 .await
                 .unwrap();
@@ -4854,6 +4969,9 @@ mod tests {
             );
             seed_community_everywhere(&[&a, &b], &comm, &[(&alice, Some(&a)), (&bob, Some(&b))])
                 .await;
+            // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+            // panics if it was not).
+            let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
 
             // A writes through THE door; the set is emitted by the door.
             let r = engine_a
@@ -4970,8 +5088,10 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i61-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i61-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i61-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i61-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i61-a", "i61-b"],
@@ -4997,8 +5117,10 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i60-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i60-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i60-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i60-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i60-a", "i60-b"],
@@ -5014,8 +5136,10 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i60b-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i60b-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i60b-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i60b-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i60b-a", "i60b-b"],
@@ -5052,8 +5176,10 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i71-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i71-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i71-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i71-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i71-a", "i71-b"],
@@ -5069,8 +5195,10 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i62-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i62-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i62-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i62-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i62-a", "i62-b"],
@@ -5086,8 +5214,10 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i63-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i63-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i63-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i63-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i63-a", "i63-b"],
@@ -5104,9 +5234,12 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i64-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i64-b", crate::federation::types::identity_type::NODE).await;
-            let c = node_as(&bc, "i64-c", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i64-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i64-b", crate::federation::types::identity_type::NODE).await;
+            let c =
+                node_owned_as(&bc, "i64-c", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b, &c],
                 &["i64-a", "i64-b", "i64-c"],

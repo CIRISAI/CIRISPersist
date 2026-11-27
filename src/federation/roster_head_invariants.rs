@@ -228,8 +228,10 @@ pub(crate) mod bodies {
         next_version(d, GroupRecord::Family(next), signers).await
     }
 
-    /// `who` leaves `fam` on their own voice, effective `at` (a self-removal
-    /// needs no one else's: `roster_event_standing`).
+    /// `who` leaves `fam` on their own voice, effective `at`: v62.0.0
+    /// (RESIGN-3) the `membership:resignation` leaf, which needs no one
+    /// else's (`roster_event_standing`); a removal its subject alone voices is
+    /// a counted row.
     async fn leave(
         d: &dyn FederationDirectory,
         fam: &str,
@@ -246,6 +248,7 @@ pub(crate) mod bodies {
             reason: None,
             witness_set: vec![],
             persist_row_hash: String::new(),
+            leaf: crate::federation::types::RevocationLeaf::Resignation,
         });
         let k = keys_of(&[who]);
         let refs: Vec<&CompositeSigningKey> = k.iter().collect();
@@ -335,10 +338,9 @@ pub(crate) mod bodies {
     }
 
     /// v62.0.0 (E13 fix2) — the voices of a version that drops ONE member:
-    /// a family amendment whose only change removes one member is the
-    /// member's own leave (`family_dissolution::self_leave_member`), which
-    /// `admit_amendment` authorizes by the LEAVER's signature, not the quorum.
-    /// So the leaver voices it too, beside the two holders.
+    /// the two holders who meet the quorum, and the leaver beside them.
+    /// v62.0.0 (RESIGN-3) — the leaver's own-voice arm is retired (a version
+    /// is counted by its quorum), so the leaver's voice is one more voice.
     fn with_leaver(keys: &[String]) -> [&str; 3] {
         [keys[0].as_str(), keys[1].as_str(), keys[2].as_str()]
     }
@@ -477,6 +479,7 @@ pub(crate) mod bodies {
             reason: None,
             witness_set: vec![],
             persist_row_hash: String::new(),
+            leaf: crate::federation::types::RevocationLeaf::Resignation,
         });
         let k2 = keys_of(&[keys[2].as_str()]);
         let r2: Vec<&CompositeSigningKey> = k2.iter().collect();
@@ -824,6 +827,7 @@ pub(crate) mod backdated {
             reason: None,
             witness_set: vec![],
             persist_row_hash: String::new(),
+            leaf: crate::federation::types::RevocationLeaf::Removal,
         });
         let keys = founder_keys();
         let refs: Vec<&CompositeSigningKey> = keys.iter().collect();
