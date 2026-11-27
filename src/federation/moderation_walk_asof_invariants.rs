@@ -431,6 +431,7 @@ pub mod bodies {
                 reason: reason.map(str::to_owned),
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Removal,
             },
         );
         let h = head(dir, here).await;

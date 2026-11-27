@@ -666,7 +666,8 @@ pub(crate) async fn voice_listing_body(d: &dyn FederationDirectory) {
         ),
         "I2158 not for the member who voiced it"
     );
-    let draft = super::second_signer_voice::voice_draft(&st, &e2::kid(m2)).expect("I2158 a draft");
+    let draft =
+        super::second_signer_voice::voice_draft(&st, &e2::kid(m2), None).expect("I2158 a draft");
     let sig = e2::signing_key(m2)
         .sign(&draft.sig_structure)
         .expect("I2158 sign the draft");

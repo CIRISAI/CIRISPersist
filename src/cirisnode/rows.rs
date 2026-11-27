@@ -912,7 +912,11 @@ impl crate::Engine {
     /// Sign `row` with this engine's own composed hybrid signer and put it
     /// through the plane's door. Returns the row's `attestation_id`.
     async fn cirisnode_emit(&self, row: EmitAttestationInput) -> Result<String, Error> {
-        self.emit_attestation_self(row).await.map_err(Error::from)
+        // VD-step2b: this verb still answers the row id alone.
+        self.emit_attestation_self(row)
+            .await
+            .map(crate::federation::edition2::second_signer_voice::VoiceOutcome::into_row_id)
+            .map_err(Error::from)
     }
 
     async fn cirisnode_signer_key_id(&self) -> Result<String, Error> {

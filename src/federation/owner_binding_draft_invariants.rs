@@ -110,7 +110,7 @@ pub(crate) async fn i4285_an_owner_binding_signed_outside_the_engine(e: &crate::
         .expect("I4285: Engine::held_rows_for");
     assert_eq!(rows.len(), 1, "I4285: the node finds its binding: {rows:?}");
     let d2 = e
-        .voice_draft(&rows[0].row_id, &node)
+        .voice_draft(&rows[0].row_id, &node, None)
         .await
         .expect("I4285: Engine::voice_draft");
     let voice = d2.assemble(
@@ -784,7 +784,7 @@ pub(crate) async fn i4288_the_node_is_this_engine(
             err.to_string().contains(&id.hex()),
             "I4288: host {tag}: the refusal names the row: {err}"
         );
-        e.voice_draft(&id.hex(), &node)
+        e.voice_draft(&id.hex(), &node, None)
             .await
             .expect_err("I4288: no statement to draft a voice from");
         let seated = if one_act {

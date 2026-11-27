@@ -60,6 +60,9 @@ pub mod accord_rescan;
 // v62.0.0 (RL-fix2) — first contact by node code: the local dial hint, the
 // checked pre-seal admission and the post-seal owner check.
 pub mod contact;
+// v62.0.0 (CONTENT-A2) — I6703–I6705: the room-content door.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod content_door_invariants;
 pub mod fold;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod fold_invariants;
@@ -115,8 +118,22 @@ pub mod genesis;
 pub mod group;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod group_fixtures;
+// v62.0.0 (GID-prod) — the derived group id: one module, swapped for Verify
+// 23.5.1's export at the pin step.
+pub mod group_id;
 pub mod group_serve;
+// v62.0.0 (GID-tips) — I5717, I5718: a contested founding concludes nothing.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod group_tips_invariants;
+// v62.0.0 (ACK-1, ACK-2; CC pre4 3.1.3, 2.4.1.1) — the `act:ack` receipt:
+// its door rules and its draft.
+pub mod act_ack;
 pub mod halt;
+// v62.0.0 (HEAD-1; CC 2.4.1.1) — the head rule: which head a row names.
+pub mod head_rule;
+// v62.0.0 (HEAD-2) — the head rule at the statement door (sqlite + pg).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod head_rule_invariants;
 pub mod ingest;
 pub mod liveness;
 pub mod names;
@@ -127,6 +144,9 @@ pub mod peer_rooting;
 pub mod produce;
 pub mod projection;
 pub mod recovery_signer;
+// v62.0.0 (CONTENT-A3) — which rows are a room's content (R1): one
+// predicate, a constant list until the family table carries the column.
+pub mod room_content;
 // v62.0.0 (P10; CC rc21 2.7.11) — SCITT receipts (RFC 9942, label 394) held
 // with their statements; the receipt leg of running admitted code.
 pub mod receipts;
@@ -159,6 +179,11 @@ pub mod trust_root_group;
 pub mod typed;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod typed_fixtures;
+// v62.0.0 (VD-step1) — the one row-state verdict: "is this row concluded".
+pub mod verdict;
+// v62.0.0 (VD-step1b) — I6300–I6305: the one row-state verdict's findings.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod verdict_invariants;
 pub mod voices;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod voices_invariants;

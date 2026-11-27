@@ -910,6 +910,7 @@ pub mod bodies {
                 reason: None,
                 witness_set: vec![],
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Resignation,
             },
         ))
         .await

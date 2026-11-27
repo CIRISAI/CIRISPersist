@@ -15,6 +15,7 @@
 //! | [`trust`] | a user's acceptance edges | `derived::fold_default`, `trust::reaches` |
 //! | [`head`] | a group's held head and an offered version | `head::Entry`, `graph::Graph::frontier` |
 //! | [`key_end`] | an edition-2 key's records and its own revocations | `key_end::KeyEndRow`, `well_formed`, `conclude_rule`, `live`, `ended` |
+//! | [`receipts`] | an `act:ack` receipt, one row per act it acknowledges at its own scope | `conferral::ConferralRow` (`Kind::Receipt`, `of`) |
 //!
 //! Every answer carries the rows it rests on, the dependency keys it read
 //! and the rule that gave it ([`Answer`], KERNEL_SEAMS §5.3's `Answer`: its
@@ -26,6 +27,8 @@ pub mod head;
 pub mod key_end;
 pub mod law;
 pub mod owner;
+// v62.0.0 (ACK-3) — an `act:ack` receipt presented to `ciris_kernel::conferral`.
+pub mod receipts;
 pub mod trust;
 pub mod view;
 

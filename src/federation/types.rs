@@ -3622,6 +3622,62 @@ impl IdentityOccurrenceRevocation {
     }
 }
 
+/// v62.0.0 (RESIGN-1; CC 3.1.3.2, the Constitution's ruling "the LEAF
+/// decides") — **which leaf of `membership:{stage}` ended a member's seat.**
+/// A `removal` is the group's COUNTED end (cosigned under its
+/// `consensus_protocol`); a `resignation` is the member's own AUTHORED end
+/// (signed by the leaving member). Persisted beside the revocation (the
+/// `leaf` column of `federation_{family,community}_membership_revocations`),
+/// so no reader re-derives the kind of end from who voiced the row.
+///
+/// Omitted from the record's JSON when it is [`RevocationLeaf::Removal`], so
+/// a removal's `persist_row_hash` and `signing_envelope()` are byte-identical
+/// to the form before the column existed; a resignation's carry
+/// `"leaf": "resignation"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevocationLeaf {
+    /// `membership:removal`: the group's counted end.
+    #[default]
+    Removal,
+    /// `membership:resignation`: the member's own end.
+    Resignation,
+}
+
+impl RevocationLeaf {
+    /// The leaf's token: the `membership:{stage}` leaf and the stored column.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Removal => "removal",
+            Self::Resignation => "resignation",
+        }
+    }
+
+    /// The leaf a stored token names; `None` outside the closed set.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "removal" => Some(Self::Removal),
+            "resignation" => Some(Self::Resignation),
+            _ => None,
+        }
+    }
+
+    /// Is this the removal leaf (the serde skip predicate)?
+    #[must_use]
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn is_removal(&self) -> bool {
+        *self == Self::Removal
+    }
+
+    /// Is this the member's own end?
+    #[must_use]
+    pub const fn is_resignation(self) -> bool {
+        matches!(self, Self::Resignation)
+    }
+}
+
 /// Removes one identity from a V059 family roster. The family's
 /// `members` roster is left intact; the active-membership read filters
 /// against this table.
@@ -3643,11 +3699,23 @@ pub struct FamilyMembershipRevocation {
     /// (Registry-validated, CIRISRegistry#52 Ask 2).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub witness_set: Vec<String>,
+    /// v62.0.0 (RESIGN-1) — which leaf ended the seat ([`RevocationLeaf`]);
+    /// omitted when it is the removal, so a removal's bytes are unchanged.
+    #[serde(default, skip_serializing_if = "RevocationLeaf::is_removal")]
+    pub leaf: RevocationLeaf,
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
     pub persist_row_hash: String,
 }
 
 impl FamilyMembershipRevocation {
+    /// v62.0.0 (RESIGN-3) — this revocation under the `resignation` leaf:
+    /// the member's own end (CC 3.1.3.2).
+    #[must_use]
+    pub fn as_resignation(mut self) -> Self {
+        self.leaf = RevocationLeaf::Resignation;
+        self
+    }
+
     /// v21.0.0 (CIRISPersist#502 E4) — the canonical envelope an authority
     /// signs to admit this removal: this record's own JSON with
     /// `persist_row_hash` stripped. Synthesized (no pre-existing envelope
@@ -3736,11 +3804,23 @@ pub struct CommunityMembershipRevocation {
     /// Vouch set — multi-vouch per the community's `consensus_protocol`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub witness_set: Vec<String>,
+    /// v62.0.0 (RESIGN-1) — which leaf ended the seat ([`RevocationLeaf`]);
+    /// omitted when it is the removal, so a removal's bytes are unchanged.
+    #[serde(default, skip_serializing_if = "RevocationLeaf::is_removal")]
+    pub leaf: RevocationLeaf,
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
     pub persist_row_hash: String,
 }
 
 impl CommunityMembershipRevocation {
+    /// v62.0.0 (RESIGN-3) — this revocation under the `resignation` leaf:
+    /// the member's own end (CC 3.1.3.2).
+    #[must_use]
+    pub fn as_resignation(mut self) -> Self {
+        self.leaf = RevocationLeaf::Resignation;
+        self
+    }
+
     /// v21.0.0 (CIRISPersist#502 E4) — the canonical envelope an authority
     /// signs to admit this removal. Synthesized, same construction as
     /// [`FamilyMembershipRevocation::signing_envelope`]. THE worst-case E4

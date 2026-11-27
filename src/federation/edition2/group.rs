@@ -91,7 +91,7 @@ use crate::federation::group_plane::GroupKind;
 use crate::federation::types::{
     Community, CommunityMember, CommunityMembershipRevocation, CommunityMembershipWidening, Family,
     FamilyMember, FamilyMembershipRevocation, FamilyMembershipWidening, GroupSupersedeProof,
-    RosterCosignature, SignedCommunity, SignedCommunityMembershipRevocation,
+    RevocationLeaf, RosterCosignature, SignedCommunity, SignedCommunityMembershipRevocation,
     SignedCommunityMembershipWidening, SignedFamily, SignedFamilyMembershipRevocation,
     SignedFamilyMembershipWidening,
 };
@@ -109,6 +109,25 @@ pub const MEMBERSHIP_PREFIX: &str = "membership:{stage}";
 pub const WIDENING_LEAF: &str = "widening";
 /// The membership leaf a removal is.
 pub const REMOVAL_LEAF: &str = "removal";
+/// v62.0.0 (CONTENT-A2; the Constitution's room-content rule, R6) — the
+/// membership leaf of a COUNTED row adding tips to an end of a member's
+/// seat (`membership:keeps:v1`): `refs.also.cites` the end,
+/// `refs.trusted_through` the further tips, counted over `refs.head`. It is
+/// no group plane ([`group_plane_of`]): it lands on the attestation plane,
+/// counted by `admission::check_membership_keeps_counted`.
+pub const KEEPS_LEAF: &str = "keeps";
+/// v62.0.0 (CONTENT-A2; CC 3.1.3.2, "a resignation is signed by the leaving
+/// member") — the membership leaf of a member's OWN end of its seat
+/// (authored). The leaf decides: a [`REMOVAL_LEAF`] row is the group's
+/// counted end, never read as a resignation, whoever voiced it. A `keeps`
+/// row may cite either. (The resignation leaf's builder, door and fold are
+/// v62-resign's; this is only its one spelling.)
+pub const RESIGNATION_LEAF: &str = "resignation";
+/// v62.0.0 (RESIGN-2; CC 3.1.3.2 "The tips") — the `refs` role an end of a
+/// member's seat names that member's content tips under (a row-ref-set, 1..64;
+/// gathered by the content lane, carried here unread). An end never waits on
+/// a row it names there (CC 2.7.3).
+pub const TRUSTED_THROUGH_ROLE: &str = "trusted_through";
 /// The `refs` role a later roster version names the version it extends by,
 /// and the one a membership change names the roster it is counted over by.
 pub const HEAD_ROLE: &str = "head";
@@ -130,6 +149,10 @@ pub enum GroupPlane {
     Widening,
     /// `membership:{stage}`, leaf `removal`: a member removed.
     Removal,
+    /// v62.0.0 (RESIGN-2) — `membership:{stage}`, leaf `resignation`: a
+    /// member's own leaving. Lands in the same typed table as a removal, with
+    /// its leaf persisted ([`RevocationLeaf::Resignation`]).
+    Resignation,
 }
 
 /// v62.0.0 (RL-fix7, RL-fix19; CC 2.6.1.11, CC 4.2.6) — **a group-plane
@@ -138,9 +161,18 @@ pub enum GroupPlane {
 /// `group` is the accord's `family_key_id`). The accord's roster, seats and
 /// recovery are the genesis bundle in force and no row; a change is a later
 /// bundle at the import door. Pure (the statement's own bytes), so the
-/// statement door runs it among its pure gates BEFORE the payload's shape:
-/// the accord's id is no identity-ref, so the shape check alone would answer
-/// `edition2_payload_invalid` and this name could never be reached.
+/// statement door runs it among its pure gates BEFORE the payload's shape
+/// and the founding check: `humanity-accord` is no group-ref, so either
+/// alone would answer a generic refusal and this name could never be
+/// reached.
+///
+/// v62.0.0 (GID-prod; CIRISConstitution's answer of 2026-11-22) —
+/// `humanity-accord` is a ROOT LINEAGE NAME, not a group: the genesis
+/// bundle's `family_key_id` and `sub`, never founded by a `group:roster`
+/// first version, outside the derived-id rule (which runs on `group:roster`
+/// rows only). This refusal says so: a lineage, not a group. The baked
+/// bundle and its import proof never pass this door (they enter at the
+/// genesis import door), so neither moves.
 ///
 /// # Errors
 /// `accord_version_is_a_bundle`.
@@ -163,13 +195,14 @@ pub fn refuse_accord_group_statement(sub: &str, payload: &Value) -> Result<(), E
 
 /// **Is this row a group plane's?** `group:roster`, or `membership:{stage}`
 /// at a counted leaf (`widening`, `removal`; Verify's matcher binds the
-/// leaf from `dimension`). A composer (`withdraws`, `recants`,
+/// leaf from `dimension`), or v62.0.0 (RESIGN-2) at the authored
+/// `resignation` leaf: a roster end like a removal, its own door. A composer (`withdraws`, `recants`,
 /// `supersedes`) carries its target's family but is not the target's plane:
 /// `None`. Every other membership stage (`proposal`, `acceptance`, ...) is
 /// an authored row of the attestation plane: `None`.
 #[must_use]
 pub fn group_plane_of(row_type: &str, family: &str, payload: &Value) -> Option<GroupPlane> {
-    if super::ingest::COMPOSER_ROW_TYPES.contains(&row_type) {
+    if super::emit::names_a_target(row_type) {
         return None;
     }
     if family == namespace_match::family_id(GROUP_ROSTER_PREFIX) {
@@ -184,6 +217,7 @@ pub fn group_plane_of(row_type: &str, family: &str, payload: &Value) -> Option<G
     match leaf.as_str() {
         WIDENING_LEAF => Some(GroupPlane::Widening),
         REMOVAL_LEAF => Some(GroupPlane::Removal),
+        RESIGNATION_LEAF => Some(GroupPlane::Resignation),
         _ => None,
     }
 }
@@ -320,31 +354,6 @@ pub(crate) fn vouched_envelope(
     } else {
         Err(super::door::earlier_form_signature(plane))
     }
-}
-
-/// v62.0.0 (BH-fix1) — run `fut` under a vouch for `change_envelope` whose
-/// voices are `signers`, as the edition-2 door's `put_roster_record` does
-/// once it has verified each voice's composite statement. Test code only:
-/// the witnesses of the vouch-only quorum counts (I2120, I2121).
-#[cfg(test)]
-pub(crate) async fn with_quorum_vouch<Fut>(
-    change_envelope: serde_json::Value,
-    signers: &[&str],
-    fut: Fut,
-) -> Fut::Output
-where
-    Fut: std::future::Future,
-{
-    let vouch = Vouch {
-        envelope_hash: String::new(),
-        voices: signers
-            .iter()
-            .map(|s| ((*s).to_owned(), String::new()))
-            .collect(),
-        change_envelope: Some(change_envelope),
-        short: AtomicBool::new(false),
-    };
-    VOUCH.scope(Arc::new(vouch), fut).await
 }
 
 /// **The supersede quorum's vouch**: the voices' signers, when the vouch in
@@ -1143,8 +1152,15 @@ pub fn membership_of(
     }
     let names = names_of(p).map_err(|e| invalid(format!("membership: refs: {e:?}")))?;
     let effective_at = req_ms(p, "effective_at")?;
+    // v62.0.0 (RESIGN-2) — the LEAF names the kind of end, persisted with
+    // the typed record; never re-derived from who voiced it.
+    let leaf = if plane == GroupPlane::Resignation {
+        RevocationLeaf::Resignation
+    } else {
+        RevocationLeaf::Removal
+    };
     let record = match (plane, kind) {
-        (GroupPlane::Removal, GroupKind::Family) => {
+        (GroupPlane::Removal | GroupPlane::Resignation, GroupKind::Family) => {
             MembershipRecord::FamilyRemoval(FamilyMembershipRevocation {
                 family_key_id: group.clone(),
                 removed_identity_key_id: member.clone(),
@@ -1153,9 +1169,10 @@ pub fn membership_of(
                 reason: reason_of(p),
                 witness_set: identity_refs_of(p, "witness_set"),
                 persist_row_hash: String::new(),
+                leaf,
             })
         }
-        (GroupPlane::Removal, GroupKind::Community) => {
+        (GroupPlane::Removal | GroupPlane::Resignation, GroupKind::Community) => {
             MembershipRecord::CommunityRemoval(CommunityMembershipRevocation {
                 community_key_id: group.clone(),
                 removed_identity_key_id: member.clone(),
@@ -1164,6 +1181,7 @@ pub fn membership_of(
                 reason: reason_of(p),
                 witness_set: identity_refs_of(p, "witness_set"),
                 persist_row_hash: String::new(),
+                leaf,
             })
         }
         (GroupPlane::Widening, GroupKind::Family) => {
@@ -1260,7 +1278,7 @@ where
     // (`Pending`). An unmarked refusal stays a refusal.
     let landing = match plane {
         GroupPlane::Roster => Box::pin(put_roster(dir, row, voices)).await?,
-        GroupPlane::Widening | GroupPlane::Removal => {
+        GroupPlane::Widening | GroupPlane::Removal | GroupPlane::Resignation => {
             Box::pin(put_membership(dir, row, plane, voices, replicated)).await?
         }
     };
@@ -1305,6 +1323,16 @@ where
     // inputs of this row: a version of the group (its `sub`) re-folds it;
     // so does a membership change of any member it lists (its `sub`).
     fold::reads(Dep::key(&view.group));
+    // v62.0.0 (GID-tips) — a CONTESTED founding concludes nothing: another
+    // first version (no `refs.head`) of this group held here, held or
+    // concluded, makes every first version of it held. The read above
+    // (`Dep::key(group)`) is the dependency: a rival first version's arrival
+    // touches `key:<group>` (its `sub`), so a founding concluded before it
+    // re-folds here and un-concludes; re-delivery of the SAME first version
+    // is the same row id and no rival.
+    if view.head.is_none() {
+        check_founding_uncontested(dir, row, &view).await?;
+    }
     let MergeReading { prev, merged } = merge_reading(dir, &view, &row.row_id).await?;
     let record = record_of_roster(&view, prev.clone())?;
     if let GroupRecord::Community(c) = &record {
@@ -1318,6 +1346,54 @@ where
         drop_merged_tips(dir, &view, &offered_hash, &merged).await?;
     }
     Ok(landing)
+}
+
+/// v62.0.0 (GID-tips) — refuse-as-HELD a first version of `view.group` when
+/// another first version of it is held in the group's projection slot
+/// (`ingest::fold_plane_of`: `group:<sub>`), `group_founding_contested`.
+///
+/// # Errors
+/// The hold; directory reads.
+async fn check_founding_uncontested<F>(
+    dir: &F,
+    row: &AdmittedRow,
+    view: &RosterView,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let slot = format!("group:{}", row.sub);
+    for other in dir.fold_slot_all_rows(&slot).await? {
+        if other == row.row_id {
+            continue;
+        }
+        let Some(statement) = dir.edition2_voices(&other).await?.into_iter().next() else {
+            continue;
+        };
+        let Some((_, payload)) = statement_parts(&statement) else {
+            continue;
+        };
+        let first = payload
+            .get_text("refs")
+            .and_then(|r| r.get_text("head"))
+            .is_none();
+        if first && payload.get_text("group").and_then(Value::as_text) == Some(view.group.as_str())
+        {
+            return Err(fold::hold(
+                reason::GROUP_FOUNDING_CONTESTED,
+                Error::InvalidArgument(format!(
+                    "{}: {:?} has two first versions ({} and {}): its founders signed two \
+                     foundings, so the group concludes nothing here (CC 2.7.8); found it anew \
+                     under a new nonce",
+                    reason::GROUP_FOUNDING_CONTESTED,
+                    view.group,
+                    row.row_id.hex(),
+                    other.hex()
+                )),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The family id of a `location_proof:{version}` row (header -70002).
@@ -1689,6 +1765,108 @@ where
     Ok(())
 }
 
+/// v62.0.0 (RESIGN-2; CC 3.1.3.2 "a resignation is signed by the leaving
+/// member") — **the resignation's signer is the member it ends**: the
+/// statement's `iss` and its `author` are the `member` (= `sub`), whichever
+/// key of that identity signed (the door already tied the key to `iss`, CC
+/// 2.6.1.7). Anyone else's resignation of a member is refused from the
+/// row alone: a member is ended by another only through the group's counted
+/// `removal`.
+///
+/// # Errors
+/// `federation_malformed_row` /
+/// [`malformed_row::RESIGNATION_NOT_BY_MEMBER`].
+fn check_resignation_signer(row: &AdmittedRow, view: &MembershipView) -> Result<(), Error> {
+    if row.iss == view.member && row.author.as_deref() == Some(view.member.as_str()) {
+        return Ok(());
+    }
+    Err(Error::malformed_row(
+        PLANE,
+        malformed_row::RESIGNATION_NOT_BY_MEMBER,
+        format!(
+            "{}: resignation {} of {} is signed by {} (author {:?}): a resignation is the \
+             leaving member's own act; another ends a member only by the group's counted \
+             `membership:removal` (CC 3.1.3.2)",
+            malformed_row::RESIGNATION_NOT_BY_MEMBER,
+            row.row_id.hex(),
+            view.member,
+            row.iss,
+            row.author
+        ),
+    ))
+}
+
+/// v62.0.0 (RESIGN-2; CC 2.4.1.1 "An end names the head it acts from") —
+/// **the resigning member sits in the group**: an ACTIVE member of the
+/// group's authorized roster immediately before the resignation's
+/// `effective_at`, the same
+/// fold every roster end is judged over. The named `refs.head` is checked
+/// to be a held roster of the same group ([`check_membership_head`]); the
+/// seat is read from the fold, since a member seated by a widening is not
+/// listed in the version that widening names. Another row's state, so a fold
+/// condition (CC 2.7.3): held, re-folded when the group's planes change.
+///
+/// # Errors
+/// Held [`malformed_row::RESIGNATION_NOT_A_MEMBER_AT_HEAD`]; directory reads.
+async fn check_resignation_seat<F>(
+    dir: &F,
+    row: &AdmittedRow,
+    view: &MembershipView,
+    record: &MembershipRecord,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let at = match record {
+        MembershipRecord::FamilyRemoval(r) => r.effective_at,
+        MembershipRecord::CommunityRemoval(r) => r.effective_at,
+        MembershipRecord::FamilyWidening(_) | MembershipRecord::CommunityWidening(_) => {
+            return Err(invalid("a resignation maps to a revocation"));
+        }
+    };
+    // The roster IMMEDIATELY BEFORE the end (as every roster event is
+    // judged, `roster_event_verdict`): the fold is inclusive of its instant,
+    // and a re-run after this resignation landed must not read its own end.
+    let at = at - chrono::Duration::microseconds(1);
+    fold::reads(Dep::key(&view.group));
+    fold::reads(Dep::key(&view.member));
+    let seated = match view.kind {
+        GroupKind::Family => match dir.lookup_family(&view.group).await? {
+            // An unheld group: the typed door's own wait answers it.
+            None => return Ok(()),
+            Some(f) => crate::federation::authorized_family_roster_at(dir, &f, at)
+                .await?
+                .iter()
+                .any(|m| m.key_id == view.member),
+        },
+        GroupKind::Community => match dir.lookup_community(&view.group).await? {
+            None => return Ok(()),
+            Some(c) => crate::federation::authorized_community_roster_at(dir, &c, at)
+                .await?
+                .iter()
+                .any(|m| m.key_id == view.member),
+        },
+    };
+    if seated {
+        return Ok(());
+    }
+    Err(fold::hold(
+        malformed_row::RESIGNATION_NOT_A_MEMBER_AT_HEAD,
+        Error::malformed_row(
+            PLANE,
+            malformed_row::RESIGNATION_NOT_A_MEMBER_AT_HEAD,
+            format!(
+                "{}: resignation {} ends {} in {}, who holds no seat there at {at}: a \
+                 resignation ends the leaving member's own seat (CC 3.1.3.2)",
+                malformed_row::RESIGNATION_NOT_A_MEMBER_AT_HEAD,
+                row.row_id.hex(),
+                view.member,
+                view.group
+            ),
+        ),
+    ))
+}
+
 /// A counted membership change: the typed membership door, under the vouch
 /// (and the replicated marker on the replicated door).
 async fn put_membership<F>(
@@ -1707,6 +1885,14 @@ where
     fold::reads(Dep::key(&view.group));
     fold::reads(Dep::key(&view.member));
     check_membership_head(dir, row, &view).await?;
+    // v62.0.0 (RESIGN-2; CC 3.1.3.2) — a resignation is the leaving member's
+    // own authored act: its signer is that member, and that member sits in
+    // the group it leaves. It is never counted (no `consensus_protocol`
+    // applies); a removal's count is the typed door's, unchanged.
+    if plane == GroupPlane::Resignation {
+        check_resignation_signer(row, &view)?;
+        Box::pin(check_resignation_seat(dir, row, &view, &record)).await?;
+    }
     // A membership change is proposed by a member, never by the group key:
     // the primary is the first signer in order.
     let (primary, marker, cosignatures) = signature_columns(&voices, "");
@@ -1954,6 +2140,136 @@ pub fn roster_payload(
     roster_payload_merging(record, version, head, &[], asserted_at_ms)
 }
 
+/// v62.0.0 (GID-prod.fix1) — **what a host states to found a community**:
+/// everything of its first version EXCEPT the id (derived, never passed in:
+/// a clean break, no ignored argument) and the server-computed fields.
+#[derive(Debug, Clone)]
+pub struct CommunityFounding {
+    /// The community's name (human-readable, not unique, never an id).
+    pub name: String,
+    /// The founding members (their keys derive the id).
+    pub members: Vec<crate::federation::types::CommunityMember>,
+    /// The founding instant (derives the id).
+    pub founded_at: chrono::DateTime<chrono::Utc>,
+    /// The `consensus_protocol`.
+    pub consensus_protocol: String,
+    /// The `policy_blob` (an open map).
+    pub policy_blob: Option<serde_json::Value>,
+    /// The charter in force (`trust:charter:v1` row hash), empty for none.
+    pub charter_digest: String,
+}
+
+/// v62.0.0 (GID-prod.fix1) — the family twin of [`CommunityFounding`].
+#[derive(Debug, Clone)]
+pub struct FamilyFounding {
+    /// The family's name.
+    pub name: String,
+    /// The founding members (their keys derive the id).
+    pub members: Vec<crate::federation::types::FamilyMember>,
+    /// The founding instant (derives the id).
+    pub founded_at: chrono::DateTime<chrono::Utc>,
+    /// The `consensus_protocol`.
+    pub consensus_protocol: String,
+    /// `consensus_protocol_entrenched`.
+    pub consensus_protocol_entrenched: bool,
+    /// The charter in force, empty for none.
+    pub charter_digest: String,
+}
+
+impl CommunityFounding {
+    /// The first version's record, its id still empty (set by
+    /// [`founding_payload`]).
+    #[must_use]
+    pub fn into_record(self) -> GroupRecord {
+        GroupRecord::Community(crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: self.charter_digest,
+            community_key_id: String::new(),
+            community_name: self.name,
+            members: self.members,
+            founded_at: self.founded_at,
+            consensus_protocol: self.consensus_protocol,
+            policy_blob: self.policy_blob,
+            persist_row_hash: String::new(),
+        })
+    }
+}
+
+impl FamilyFounding {
+    /// The first version's record, its id still empty (set by
+    /// [`founding_payload`]).
+    #[must_use]
+    pub fn into_record(self) -> GroupRecord {
+        GroupRecord::Family(crate::federation::types::Family {
+            family_key_id: String::new(),
+            family_name: self.name,
+            members: self.members,
+            founded_at: self.founded_at,
+            consensus_protocol: self.consensus_protocol,
+            consensus_protocol_entrenched: self.consensus_protocol_entrenched,
+            dissolved_at: None,
+            prev_head_digest: String::new(),
+            charter_digest: self.charter_digest,
+            persist_row_hash: String::new(),
+        })
+    }
+}
+
+/// v62.0.0 (GID-prod) — what a founding verb answers: the group's DERIVED id
+/// (no caller passes one in) and the statement door's outcome.
+#[derive(Debug)]
+pub struct GroupFounding {
+    /// The id the founding derives ([`super::group_id::derive_group_id`]).
+    pub group_id: String,
+    /// The door's outcome for the first version.
+    pub outcome: super::ingest::StatementOutcome,
+}
+
+/// v62.0.0 (GID-prod; CIRISConstitution "THE DERIVED GROUP ID") — **the
+/// FIRST version's payload, under its derived id.** The id is derived from
+/// `record`'s kind, the key of EVERY member it lists, its `founded_at` and
+/// `nonce` ([`super::group_id::derive_group_id`]); `record`'s id is set to
+/// it (whatever it held), the payload is [`roster_payload`] at version 1
+/// with no head, and it carries `nonce`. The founding verbs mint the nonce
+/// ([`super::group_id::fresh_nonce`]); a fixture passes a fixed one.
+///
+/// # Errors
+/// As [`roster_payload`]; a `founded_at` before the epoch.
+pub fn founding_payload(
+    record: &mut GroupRecord,
+    nonce: &[u8; 32],
+    asserted_at_ms: u64,
+) -> Result<(String, Value), Error> {
+    let (kind, founded_at, founders): (&str, _, Vec<String>) = match &*record {
+        GroupRecord::Family(f) => (
+            "family",
+            f.founded_at,
+            f.members.iter().map(|m| m.key_id.clone()).collect(),
+        ),
+        GroupRecord::Community(c) => (
+            "community",
+            c.founded_at,
+            c.members.iter().map(|m| m.key_id.clone()).collect(),
+        ),
+    };
+    let founded_ms = ms_of("founded_at", founded_at)?
+        .as_u64()
+        .ok_or_else(|| invalid("group:roster: `founded_at` is not a uint"))?;
+    let refs: Vec<&str> = founders.iter().map(String::as_str).collect();
+    let id = super::group_id::derive_group_id(kind, &refs, founded_ms, nonce);
+    match record {
+        GroupRecord::Family(f) => f.family_key_id.clone_from(&id),
+        GroupRecord::Community(c) => c.community_key_id.clone_from(&id),
+    }
+    let mut payload = roster_payload(record, 1, None, asserted_at_ms)?;
+    let Value::Map(m) = &mut payload else {
+        return Err(invalid("group:roster: the payload is not a map"));
+    };
+    m.push((text("nonce"), Value::Bytes(nonce.to_vec())));
+    m.sort_by_key(|(k, _)| cde::encode(k));
+    Ok((id, payload))
+}
+
 /// [`roster_payload`] of a MERGE (CC 2.7.8): beside `refs.head` it names
 /// the further tips it makes one head with, `refs.further_heads` (a set,
 /// sorted by encoding, unique; CC 2.6.1.9). Empty `further` is
@@ -2119,17 +2435,37 @@ fn roster_payload_full(
 /// # Errors
 /// An instant before the epoch.
 pub fn membership_payload(record: &MembershipRecord, head: Option<&RowId>) -> Result<Value, Error> {
+    membership_payload_naming(record, head, &[])
+}
+
+/// v62.0.0 (RESIGN-2) — the stage a revocation's persisted leaf names.
+const fn revocation_stage(leaf: RevocationLeaf) -> &'static str {
+    match leaf {
+        RevocationLeaf::Removal => REMOVAL_LEAF,
+        RevocationLeaf::Resignation => RESIGNATION_LEAF,
+    }
+}
+
+/// [`membership_payload`], naming `trusted_through` (the ending member's
+/// content tips, CC 3.1.3.2 "The tips"; empty names none). A revocation
+/// whose leaf is [`RevocationLeaf::Resignation`] is the AUTHORED
+/// `membership:resignation:v1` row: it states `author` = the member.
+fn membership_payload_naming(
+    record: &MembershipRecord,
+    head: Option<&RowId>,
+    trusted_through: &[RowId],
+) -> Result<Value, Error> {
     let mut p: Vec<(&str, Value)> = Vec::new();
     let (stage, kind, group, member, effective_at) = match record {
         MembershipRecord::FamilyRemoval(r) => (
-            REMOVAL_LEAF,
+            revocation_stage(r.leaf),
             "family",
             &r.family_key_id,
             &r.removed_identity_key_id,
             r.effective_at,
         ),
         MembershipRecord::CommunityRemoval(r) => (
-            REMOVAL_LEAF,
+            revocation_stage(r.leaf),
             "community",
             &r.community_key_id,
             &r.removed_identity_key_id,
@@ -2151,6 +2487,11 @@ pub fn membership_payload(record: &MembershipRecord, head: Option<&RowId>) -> Re
         ),
     };
     p.push(("asserted_at", ms_of("effective_at", effective_at)?));
+    // v62.0.0 (RESIGN-2; CC 2.6.1.3) — a resignation is authored by the
+    // leaving member; a removal and a widening are counted (no `author`).
+    if stage == RESIGNATION_LEAF {
+        p.push(("author", text(member)));
+    }
     p.push(("dimension", text(&format!("membership:{stage}:v1"))));
     p.push(("group_kind", text(kind)));
     p.push(("group", text(group)));
@@ -2197,22 +2538,56 @@ pub fn membership_payload(record: &MembershipRecord, head: Option<&RowId>) -> Re
             }
         }
     }
+    let mut refs: Vec<(&str, Value)> = Vec::new();
     if let Some(h) = head {
-        p.push((
-            "refs",
-            det_map(vec![(
-                HEAD_ROLE,
-                ciris_verify_core::edition2::row_ref(&h.0),
-            )]),
-        ));
+        refs.push((HEAD_ROLE, ciris_verify_core::edition2::row_ref(&h.0)));
+    }
+    if !trusted_through.is_empty() {
+        // A row-ref-set: sorted by encoding, no duplicate (CC 2.6.1.3).
+        let mut tips: Vec<Value> = trusted_through
+            .iter()
+            .map(|t| ciris_verify_core::edition2::row_ref(&t.0))
+            .collect();
+        tips.sort_by_key(cde::encode);
+        tips.dedup();
+        refs.push((TRUSTED_THROUGH_ROLE, Value::Array(tips)));
+    }
+    if !refs.is_empty() {
+        p.push(("refs", det_map(refs)));
     }
     Ok(det_map(p))
+}
+
+/// v62.0.0 (RESIGN-6) — **the key a membership draft names: the one its
+/// signer will sign with**, stated by the caller as `statement_draft`'s
+/// `signer_kid_hex` is (the Engine's one rule for a pen elsewhere; no
+/// second resolver). Never the identity's GENESIS kid derived from
+/// `signer_iss`: a member whose key rotated, or who signs from another
+/// device (an occurrence of the identity), would get a draft naming a key it
+/// does not hold. Whether `signer_kid` is a key of `signer_iss` is the door's
+/// one check (`door::require_key_of_iss`, `kid_not_of_iss`) when the
+/// statement arrives.
+///
+/// # Errors
+/// `InvalidArgument` for a `signer_iss` that is not an identity-ref.
+fn drafting_kid(
+    what: &str,
+    signer_iss: &str,
+    signer_kid: &super::Digest32,
+) -> Result<super::Digest32, Error> {
+    if super::ingest::kid_of_identity_ref(signer_iss).is_none() {
+        return Err(Error::InvalidArgument(format!(
+            "{what}: {signer_iss} is not an identity-ref"
+        )));
+    }
+    Ok(*signer_kid)
 }
 
 /// v62.0.0 (v62 P8) — **one voice of a counted removal (or widening),
 /// drafted for a roster member's pen**: the [`membership_payload`] over the
 /// roster version `head`, under `sub` = the member it changes, in family
-/// [`MEMBERSHIP_PREFIX`], for the signer `signer_iss`. The member signs the
+/// [`MEMBERSHIP_PREFIX`], for the signer `signer_iss` signing with the key
+/// `signer_kid` (v62.0.0 RESIGN-6: the key it will use, [`drafting_kid`]). The member signs the
 /// draft's `sig_structure` and submits `Draft::assemble(signature)` (to
 /// `at_rest_cascade::orchestrate::rekey_community_member_revoke_voices`, or
 /// the statement door).
@@ -2223,19 +2598,155 @@ pub fn removal_draft(
     record: &MembershipRecord,
     head: &RowId,
     signer_iss: &str,
+    signer_kid: &super::Digest32,
 ) -> Result<super::emit::Draft, Error> {
+    if record_leaf(record).is_resignation() {
+        return Err(Error::InvalidArgument(
+            "removal_draft: a resignation is the member's own authored row: draft it with \
+             `resignation_draft` (CC 3.1.3.2)"
+                .into(),
+        ));
+    }
     let member = match record {
         MembershipRecord::FamilyRemoval(r) => r.removed_identity_key_id.clone(),
         MembershipRecord::CommunityRemoval(r) => r.removed_identity_key_id.clone(),
         MembershipRecord::FamilyWidening(w) => w.member_key_id.clone(),
         MembershipRecord::CommunityWidening(w) => w.member_key_id.clone(),
     };
-    let kid = super::ingest::kid_of_identity_ref(signer_iss).ok_or_else(|| {
-        Error::InvalidArgument(format!(
-            "removal_draft: {signer_iss} is not an identity-ref"
-        ))
-    })?;
+    let kid = drafting_kid("removal_draft", signer_iss, signer_kid)?;
     let payload = membership_payload(record, Some(head))?;
+    super::emit::draft_row(
+        &kid,
+        signer_iss,
+        &member,
+        "scores",
+        &ciris_verify_core::namespace_match::family_id(MEMBERSHIP_PREFIX),
+        &payload,
+    )
+    .map_err(|e| super::emit::produce_error("membership", e))
+}
+
+/// v62.0.0 (HEAD-3; CC 2.4.1.1, "A count that ends a standing MAY state
+/// `lifts`, and then only the count's own receipts keep an act in force") —
+/// **[`removal_draft`] stating `lifts: true`**: the unseating is the
+/// roster's COUNT (no `author`, counted over `head`), so it may lift single
+/// receipts. `lifts` is a top-level payload member, present only as `true`
+/// (`payloads::check_lifts`); a widening is no end and is refused it.
+///
+/// # Errors
+/// As [`removal_draft`]; `edition2_payload_invalid` for a widening.
+pub fn removal_draft_lifting(
+    record: &MembershipRecord,
+    head: &RowId,
+    signer_iss: &str,
+    signer_kid: &super::Digest32,
+) -> Result<super::emit::Draft, Error> {
+    if record_leaf(record).is_resignation() {
+        return Err(Error::InvalidArgument(
+            "edition2_payload_invalid: a resignation is no count: it states no `lifts` \
+             (CC 2.4.1.1)"
+                .into(),
+        ));
+    }
+    let member = match record {
+        MembershipRecord::FamilyRemoval(r) => r.removed_identity_key_id.clone(),
+        MembershipRecord::CommunityRemoval(r) => r.removed_identity_key_id.clone(),
+        MembershipRecord::FamilyWidening(_) | MembershipRecord::CommunityWidening(_) => {
+            return Err(Error::InvalidArgument(
+                "edition2_payload_invalid: a widening ends no standing: it states no `lifts`"
+                    .into(),
+            ));
+        }
+    };
+    let kid = drafting_kid("removal_draft_lifting", signer_iss, signer_kid)?;
+    let payload = super::emit::with_member(
+        membership_payload(record, Some(head))?,
+        "lifts",
+        Value::Bool(true),
+    )
+    .map_err(|e| super::emit::produce_error("membership", e))?;
+    super::emit::draft_row(
+        &kid,
+        signer_iss,
+        &member,
+        "scores",
+        &ciris_verify_core::namespace_match::family_id(MEMBERSHIP_PREFIX),
+        &payload,
+    )
+    .map_err(|e| super::emit::produce_error("membership", e))
+}
+
+/// v62.0.0 (RESIGN-2) — the leaf a membership record ends a seat by (a
+/// widening ends none: [`RevocationLeaf::Removal`] is never read for it).
+fn record_leaf(record: &MembershipRecord) -> RevocationLeaf {
+    match record {
+        MembershipRecord::FamilyRemoval(r) => r.leaf,
+        MembershipRecord::CommunityRemoval(r) => r.leaf,
+        MembershipRecord::FamilyWidening(_) | MembershipRecord::CommunityWidening(_) => {
+            RevocationLeaf::Removal
+        }
+    }
+}
+
+/// v62.0.0 (RESIGN-2; CC 3.1.3.2 "a resignation is signed by the leaving
+/// member") — **a member's own leaving, drafted for that member's pen**: the
+/// AUTHORED `membership:resignation:v1` row of the revocation `record` (its
+/// leaf set to [`RevocationLeaf::Resignation`] here), `author` = `sub` =
+/// the member, acting from the roster head `head` (`refs.head`, CC 2.4.1.1),
+/// naming the member's content tips `trusted_through` (`refs.trusted_through`,
+/// a set of 1..64 rows; empty names none; gathered by the caller, never
+/// waited on). `signer_iss` must be the member, and `signer_kid` the key it
+/// signs with: any key of that identity (a rotated key, a second device's
+/// occurrence key; v62.0.0 RESIGN-6, [`drafting_kid`]). The member signs the draft's `sig_structure`
+/// and submits `Draft::assemble(signature)` to the statement door (or to
+/// `at_rest_cascade::orchestrate::rekey_community_member_revoke_voices` as
+/// its one voice). Hosts reach the same bytes through the generic
+/// `statement_draft`.
+///
+/// # Errors
+/// `InvalidArgument` for a widening, a `signer_iss` that is not the member
+/// or not an identity-ref; as [`membership_payload`].
+pub fn resignation_draft(
+    record: &MembershipRecord,
+    head: &RowId,
+    trusted_through: &[RowId],
+    signer_iss: &str,
+    signer_kid: &super::Digest32,
+) -> Result<super::emit::Draft, Error> {
+    let record = match record {
+        MembershipRecord::FamilyRemoval(r) => {
+            MembershipRecord::FamilyRemoval(FamilyMembershipRevocation {
+                leaf: RevocationLeaf::Resignation,
+                ..r.clone()
+            })
+        }
+        MembershipRecord::CommunityRemoval(r) => {
+            MembershipRecord::CommunityRemoval(CommunityMembershipRevocation {
+                leaf: RevocationLeaf::Resignation,
+                ..r.clone()
+            })
+        }
+        MembershipRecord::FamilyWidening(_) | MembershipRecord::CommunityWidening(_) => {
+            return Err(Error::InvalidArgument(
+                "resignation_draft: a widening is no resignation".into(),
+            ));
+        }
+    };
+    let member = match &record {
+        MembershipRecord::FamilyRemoval(r) => r.removed_identity_key_id.clone(),
+        MembershipRecord::CommunityRemoval(r) => r.removed_identity_key_id.clone(),
+        MembershipRecord::FamilyWidening(_) | MembershipRecord::CommunityWidening(_) => {
+            unreachable!("mapped above")
+        }
+    };
+    if signer_iss != member {
+        return Err(Error::InvalidArgument(format!(
+            "{}: resignation_draft: {signer_iss} is not the leaving member {member} (CC 3.1.3.2)",
+            malformed_row::RESIGNATION_NOT_BY_MEMBER
+        )));
+    }
+    let kid = drafting_kid("resignation_draft", signer_iss, signer_kid)?;
+    let payload = membership_payload_naming(&record, Some(head), trusted_through)?;
     super::emit::draft_row(
         &kid,
         signer_iss,
