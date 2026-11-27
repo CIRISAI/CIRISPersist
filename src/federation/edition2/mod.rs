@@ -115,8 +115,19 @@ pub mod genesis;
 pub mod group;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod group_fixtures;
+// v62.0.0 (GID-prod) — the derived group id: one module, swapped for Verify
+// 23.5.1's export at the pin step.
+pub mod group_id;
 pub mod group_serve;
+// v62.0.0 (GID-tips) — I5717, I5718: a contested founding concludes nothing.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod group_tips_invariants;
 pub mod halt;
+// v62.0.0 (HEAD-1; CC 2.4.1.1) — the head rule: which head a row names.
+pub mod head_rule;
+// v62.0.0 (HEAD-2) — the head rule at the statement door (sqlite + pg).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod head_rule_invariants;
 pub mod ingest;
 pub mod liveness;
 pub mod names;
@@ -127,6 +138,44 @@ pub mod peer_rooting;
 pub mod produce;
 pub mod projection;
 pub mod recovery_signer;
+// v62.0.0 (ROOMKEY-1; CC 3.1.3.2) — I7000–I7003: a community's `membership`
+// (its seating), stated by the founding, read, and written back top-level.
+#[cfg(test)]
+mod roomkey_invariants;
+// v62.0.0 (ROOMKEY-1c) — I7012–I7014: `cohort_subkind` and
+// `cohort_subkind_payload` written top-level, read in either form.
+#[cfg(test)]
+mod roomkey_1c_invariants;
+// v62.0.0 (ROOMKEY-3; CC 3.1.3.2) — the node-local room keys and bindings
+// (PRE4-V300-e's two tables): no secret, never replicated or served.
+pub mod room_keys;
+// v62.0.0 (ROOMKEY-3) — I7004, I7005: the two tables on sqlite and postgres;
+// nothing outside this module reads or writes them.
+#[cfg(test)]
+mod room_keys_invariants;
+// v62.0.0 (ROOMKEY-5; CC 3.1.3.2) — the room-key members of a key record
+// (`room`, `kem_xwing_pubkey`, `seat_commitment`), read from the key plane.
+pub mod room_key_record;
+// v62.0.0 (ROOMKEY-5) — I7006–I7008.
+#[cfg(test)]
+mod room_key_record_invariants;
+// v62.0.0 (ROOMKEY-6; CC 3.1.3.2) — the names the private-room commit owes,
+// held as `None` until it comes (two FINAL spellings).
+pub mod roomkey_names;
+// v62.0.0 (ROOMKEY-7) — a voice of a private room: its keys at a named head,
+// and the adapter's decision (the door arms come at the Verify 23.7.0 pin).
+pub mod voice;
+// v62.0.0 (ROOMKEY-7) — I7018, I7019: the voice's keys and the adapter, pure
+// and over held rows.
+#[cfg(test)]
+mod voice_invariants;
+// v62.0.0 (ROOMKEY-6) — I7009, I7010: `room_binding_xwing_pubkey` on the occurrence.
+#[cfg(test)]
+mod room_binding_key_invariants;
+// v62.0.0 (ROOMKEY-4) — I7011: a node is party to a room by a seated room key
+// it holds (`replication::hold::seated_room_key_rooms`).
+#[cfg(test)]
+mod room_key_audience_invariants;
 // v62.0.0 (P10; CC rc21 2.7.11) — SCITT receipts (RFC 9942, label 394) held
 // with their statements; the receipt leg of running admitted code.
 pub mod receipts;
@@ -159,6 +208,11 @@ pub mod trust_root_group;
 pub mod typed;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod typed_fixtures;
+// v62.0.0 (VD-step1) — the one row-state verdict: "is this row concluded".
+pub mod verdict;
+// v62.0.0 (VD-step1b) — I6300–I6305: the one row-state verdict's findings.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod verdict_invariants;
 pub mod voices;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod voices_invariants;

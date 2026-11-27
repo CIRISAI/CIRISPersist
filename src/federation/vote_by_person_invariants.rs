@@ -117,15 +117,18 @@ pub(crate) mod bodies {
     async fn evict(d: &dyn FederationDirectory, f: &str, device: &str) {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let at = ms(Utc::now());
-        d.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-            identity_key_id: e2::kid(f),
-            occurrence_key_id: e2::kid(device),
-            revoked_at: at,
-            effective_at: at,
-            reason: None,
-            witness_set: Vec::new(),
-            persist_row_hash: String::new(),
-        })
+        d.put_identity_occurrence_revocation_edition2(
+            IdentityOccurrenceRevocation {
+                identity_key_id: e2::kid(f),
+                occurrence_key_id: e2::kid(device),
+                revoked_at: at,
+                effective_at: at,
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+            crate::federation::DoorToken::new(),
+        )
         .await
         .unwrap_or_else(|e| panic!("evict {device}: {e}"));
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -388,7 +391,8 @@ pub(crate) mod bodies {
         // one of its voices, and the removal of one seat needs nobody of theirs.
         let open2 = format!("{tag}-open2");
         reg(d, &[&open2]).await;
-        found_public_room(d, &open2, OPEN_SELF_ADMIT, &[&p, &pd, &f1, &f2], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let open2 = found_public_room(d, &open2, OPEN_SELF_ADMIT, &[&p, &pd, &f1, &f2], &[])
             .await
             .unwrap();
         let w = remove(d, &open2, &pd, &[&p, &f1]).await;
@@ -416,7 +420,8 @@ pub(crate) mod bodies {
         // is v+1 naming the held head, one voice per signer).
         let fam2 = format!("{tag}-fam2");
         reg(d, &[&fam2]).await;
-        found_family(d, &fam2, MAJORITY, &[&p, &pd, &q], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let fam2 = found_family(d, &fam2, MAJORITY, &[&p, &pd, &q], &[])
             .await
             .unwrap();
         let (h, version) = e2::held_head(d, &e2::kid(&fam2))

@@ -138,6 +138,9 @@ pub(crate) mod bodies {
             ms(founded),
         );
         e2::put_voices(d, &record).await.expect("the family lands");
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let fam = crate::federation::edition2::fixture_switch::room_id(&fam);
         let (head, _) = e2::held_head(d, &fam).await.expect("the roster's head");
         let mut r = ts::sign_family_membership_revocation(
             &ann,

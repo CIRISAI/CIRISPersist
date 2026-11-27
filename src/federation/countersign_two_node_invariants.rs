@@ -190,7 +190,8 @@ pub(crate) mod bodies {
         let (f, official, m, solo) = (k("f"), k("official"), k("m"), k("solo"));
         reg(a, &[&f, &official, &m, &solo]).await;
         let (f, official, m, solo) = (id_of(&f), id_of(&official), id_of(&m), id_of(&solo));
-        found_room_with_blob(
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let solo = found_room_with_blob(
             a,
             &solo,
             "founder_only",
@@ -368,7 +369,8 @@ pub(crate) mod replacement {
         let (f, official, m, solo) = (k("f"), k("official"), k("m"), k("solo"));
         reg(a, &[&f, &official, &m, &solo]).await;
         let (f, official, m, solo) = (id_of(&f), id_of(&official), id_of(&m), id_of(&solo));
-        found_room_with_blob(
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let solo = found_room_with_blob(
             a,
             &solo,
             "founder_only",

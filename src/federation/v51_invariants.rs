@@ -573,7 +573,7 @@ pub(crate) mod owner_withdraw {
 
     /// v62.0.0 (JSON cut, E7) — a registered dimension (the fixtures' `x:y`
     /// is not).
-    const DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
+    const DIMENSION: &str = "coherence_standing:cab:v1";
 
     /// v62.0.0 (JSON cut, E7) — `owner` binds `node` at `at` (NOW-relative:
     /// the node's voice is a node-key row, CC 2.4.1.1), optionally expiring:

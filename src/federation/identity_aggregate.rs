@@ -217,11 +217,27 @@ pub struct ContentKemIdentity {
 /// to the in-process read door that opens a wrap addressed to this node's
 /// own occurrence. Never serialized, never crosses the FFI; the `Debug` impl
 /// prints nothing of the material.
+///
+/// v62.0.0 (ROOMKEY-Z1; the custody ruling's first condition) — both PRIVATE
+/// halves are [`zeroize::Zeroizing`]: scrubbed when the value drops, on every
+/// path (an early return, a panic unwinding). The type is not `Clone` and
+/// not `Copy`; the halves leave it only by reference. I7016 fails to compile
+/// if either field stops being `Zeroizing`.
+///
+/// **Custody, stated plainly** (the ruling's third condition): the halves are
+/// stored SEALED under the node's content master
+/// (`federation_content_kem_identity`). When that master is `software`
+/// (`federation_content_master.key_kind = 'software'`, no TPM / Keystore /
+/// Secure Enclave reachable at its first write), the master itself is raw
+/// bytes in the SAME database (`master_key_b64`). Whoever can read that
+/// database can then unseal every content-KEM secret, and every room-key and
+/// room-binding KEM secret sealed the same way (`ceg_room_kem_secrets`). Only a
+/// `hardware` master keeps the key out of the database.
 pub struct ContentKemPrivate {
-    /// X25519 private key (32 raw bytes).
-    pub x25519_priv: [u8; 32],
-    /// ML-KEM-768 private key (raw bytes).
-    pub ml_kem_768_priv: Vec<u8>,
+    /// X25519 private key (32 raw bytes), scrubbed on drop.
+    pub x25519_priv: zeroize::Zeroizing<[u8; 32]>,
+    /// ML-KEM-768 private key (raw bytes), scrubbed on drop.
+    pub ml_kem_768_priv: zeroize::Zeroizing<Vec<u8>>,
     /// ML-KEM-768 public key (raw bytes) — `ciris_crypto`'s decapsulation
     /// takes it beside the private half.
     pub ml_kem_768_pub: Vec<u8>,
@@ -235,10 +251,12 @@ impl std::fmt::Debug for ContentKemPrivate {
 
 /// #848 — unseal a content-KEM private half sealed by
 /// [`seal_content_kem_private`] (base64 of `nonce(12) ‖ aes256_gcm(master, sk)`).
+/// v62.0.0 (ROOMKEY-Z1) — the plaintext is [`zeroize::Zeroizing`] from the
+/// moment it is decrypted.
 pub fn unseal_content_kem_private(
     content_master: &[u8; 32],
     sealed_b64: &str,
-) -> Result<Vec<u8>, crate::federation::BlobError> {
+) -> Result<zeroize::Zeroizing<Vec<u8>>, crate::federation::BlobError> {
     use crate::federation::at_rest_cascade::NONCE_LEN;
     let raw = B64.decode(sealed_b64).map_err(|e| {
         crate::federation::BlobError::Backend(format!("content-kem unseal base64: {e}"))
@@ -251,6 +269,7 @@ pub fn unseal_content_kem_private(
     let mut nonce = [0u8; NONCE_LEN];
     nonce.copy_from_slice(&raw[..NONCE_LEN]);
     ciris_crypto::aes_gcm::decrypt(content_master, &nonce, &raw[NONCE_LEN..])
+        .map(zeroize::Zeroizing::new)
         .map_err(|e| crate::federation::BlobError::Backend(format!("content-kem unseal: {e}")))
 }
 
@@ -314,16 +333,30 @@ pub fn validate_transport_pubkeys(
 /// signing key (§5.6.8.8.2). The backend `load_or_init_*` impls call
 /// this on the first-write path and seal the two privates under the
 /// content master before persisting.
+///
+/// v62.0.0 (ROOMKEY-Z1b; the custody ruling's first condition) — the two
+/// PRIVATE halves are returned [`zeroize::Zeroizing`], wrapped the moment
+/// `ciris_crypto` hands them over, so a caller holds no bare copy and both are
+/// scrubbed on drop. (`ciris_crypto`'s own keygen returns them bare; that
+/// first, transient copy is Verify's signature, not persist's.)
 #[allow(clippy::type_complexity)]
-pub fn mint_content_kem_keypair(
-) -> Result<([u8; 32], [u8; 32], Vec<u8>, Vec<u8>), crate::federation::BlobError> {
+pub fn mint_content_kem_keypair() -> Result<
+    (
+        zeroize::Zeroizing<[u8; 32]>,
+        [u8; 32],
+        zeroize::Zeroizing<Vec<u8>>,
+        Vec<u8>,
+    ),
+    crate::federation::BlobError,
+> {
     let (x_priv, x_pub) = ciris_crypto::x25519::generate_ephemeral_keypair().map_err(|e| {
         crate::federation::BlobError::Backend(format!("content-kem x25519 keygen: {e}"))
     })?;
+    let x_priv = zeroize::Zeroizing::new(x_priv);
     let (ml_priv, ml_pub) = ciris_crypto::ml_kem::generate_keypair().map_err(|e| {
         crate::federation::BlobError::Backend(format!("content-kem ml-kem keygen: {e}"))
     })?;
-    Ok((x_priv, x_pub, ml_priv, ml_pub))
+    Ok((x_priv, x_pub, zeroize::Zeroizing::new(ml_priv), ml_pub))
 }
 
 /// Seal a content-KEM private half under the content master, mirroring
@@ -352,6 +385,44 @@ pub fn seal_content_kem_private(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v62.0.0 (ROOMKEY-Z1) — **I7016**: both private halves of
+    /// [`ContentKemPrivate`], and what [`unseal_content_kem_private`] answers,
+    /// are `zeroize::Zeroizing`, scrubbed on drop. This does not COMPILE if
+    /// either field, or the unseal's answer, stops being `Zeroizing`: that is
+    /// the gate. The round trip shows the unsealed plaintext is the secret.
+    #[test]
+    fn i7016_the_content_kem_private_halves_are_scrubbed_on_drop() {
+        fn scrubbed_array(_: &zeroize::Zeroizing<[u8; 32]>) {}
+        fn scrubbed_vec(_: &zeroize::Zeroizing<Vec<u8>>) {}
+        let p = ContentKemPrivate {
+            x25519_priv: zeroize::Zeroizing::new([0x07; 32]),
+            ml_kem_768_priv: zeroize::Zeroizing::new(vec![0x08; 64]),
+            ml_kem_768_pub: vec![0x09; 1184],
+        };
+        scrubbed_array(&p.x25519_priv);
+        scrubbed_vec(&p.ml_kem_768_priv);
+        assert_eq!(
+            format!("{p:?}"),
+            "ContentKemPrivate { .. }",
+            "I7016 Debug prints nothing"
+        );
+
+        let master = [0x42u8; 32];
+        let sealed = seal_content_kem_private(&master, &[0x0a; 32]).unwrap();
+        let back = unseal_content_kem_private(&master, &sealed).unwrap();
+        scrubbed_vec(&back);
+        assert_eq!(
+            back.as_slice(),
+            &[0x0a; 32],
+            "I7016 the unsealed plaintext is the secret"
+        );
+
+        // ROOMKEY-Z1b — the mint's private halves are `Zeroizing` too.
+        let (x_priv, _, ml_priv, _) = mint_content_kem_keypair().unwrap();
+        scrubbed_array(&x_priv);
+        scrubbed_vec(&ml_priv);
+    }
 
     #[test]
     fn mint_content_kem_keypair_is_independent_and_well_sized() {

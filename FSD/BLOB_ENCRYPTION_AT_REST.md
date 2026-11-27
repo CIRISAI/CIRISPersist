@@ -877,6 +877,21 @@ honest about it (`SecretsError::HardwareKeyUnavailable` discipline, MISSION
 §1.6). The persisted `federation_content_master` row records which root this
 node uses (`key_kind`), and the row wins thereafter (§11.7).
 
+**What a software root means, stated plainly** (v62.0.0, ROOMKEY-Z1; the custody
+ruling of 11-24). On a `software` row the content master is 32 raw bytes in
+`federation_content_master.master_key_b64`, in the SAME database as everything it
+seals:
+- the blobs' DEK wraps;
+- the content-KEM private halves (`federation_content_kem_identity`);
+- from v62.0, the room-key and room-binding X-Wing KEM secrets
+  (`ceg_room_kem_secrets`) and a binding exchange's pending shared secret
+  (`ceg_room_binding_exchanges.ss_sealed_b64`).
+
+Whoever can read that database file can unseal all of them. Only a `hardware` row
+keeps the key out of the database. The secrets are never stored in the clear, and
+no SIGNING key is ever stored here. Once unsealed in the process, the content-KEM
+halves are `zeroize::Zeroizing` and are scrubbed on drop (`ContentKemPrivate`).
+
 The root precedes every mint: a blob sealed before the root exists would have
 to be re-wrapped after, O(corpus).
 
