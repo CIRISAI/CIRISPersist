@@ -79,17 +79,14 @@ pub(crate) fn row_as(k: &CompositeSigningKey, iss: &str, at: u64) -> Vec<u8> {
         ("author", Value::Text(iss.to_owned())),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
     ];
     sign_row_statement(
         k,
         iss,
         iss,
         "scores",
-        "evidence:.suite:.kind:.cell:.prefix",
+        "coherence_standing:.cohort",
         &map(m),
         vec![],
     )

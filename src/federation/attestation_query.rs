@@ -55,6 +55,13 @@ use crate::ceg::list::federation::AttestationCursor;
 /// can spell "every row" as one huge page.
 pub const MAX_PAGE: u32 = 10_000;
 
+/// v62.0.0 (QUERY-1, CIRISPersist#1278) — the placements a query may be
+/// pinned on by its target alone: the ones that name a target (`self` and
+/// the broad tiers name none). Served by PRE4-V300-b's
+/// `federation_attestations_room_dimension (cohort_target, cohort_scope,
+/// dimension, asserted_at, attestation_id)`.
+pub const TARGET_PINNED_SCOPES: &[&str] = &["community", "affiliations", "family"];
+
 /// A `const` [`NonZeroU32`] page size. Panics at compile time on `0` (the
 /// only use is in `const` items).
 #[must_use]
@@ -258,6 +265,30 @@ impl AttestationQuery {
         Self::pinned(None, Some(attested_key_id.to_owned()), limit)
     }
 
+    /// v62.0.0 (QUERY-1, CIRISPersist#1278) — **the rows placed in one
+    /// room**: `cohort_scope` (one of [`TARGET_PINNED_SCOPES`]) and its
+    /// `cohort_target`, `limit` per page, pinned on the target alone (no `by`,
+    /// no `to`). Served by the `(cohort_scope, cohort_target)` index the
+    /// targeted read (`list_targeted_by_dimension_prefix`) uses; narrow it
+    /// with [`Self::dimension_prefix`] / [`Self::dimension`], page it with
+    /// [`Self::after`], read only what is new with [`Self::oldest_first`] and
+    /// a high-water cursor. The host reads its own store: what a PEER is
+    /// served of these rows is `edition2::serve`'s, unchanged.
+    #[must_use]
+    pub fn in_room(cohort_scope: &str, cohort_target: &str, limit: NonZeroU32) -> Self {
+        Self::pinned(None, None, limit).scope(cohort_scope, Some(cohort_target))
+    }
+
+    /// v62.0.0 (QUERY-1) — the target a query is pinned on when it pins no
+    /// key: a scope that names its target.
+    #[must_use]
+    pub fn pinned_target(&self) -> Option<&str> {
+        if self.by.is_some() || self.to.is_some() {
+            return None;
+        }
+        self.scope.as_ref().and_then(|s| s.cohort_target.as_deref())
+    }
+
     /// Also pin the attester.
     #[must_use]
     pub fn authored_by(mut self, attesting_key_id: &str) -> Self {
@@ -383,7 +414,10 @@ impl AttestationQuery {
     /// query it is a filter on the attester's walk, like an exclusion.
     #[must_use]
     pub fn seeks_narrow_index(&self) -> bool {
-        !self.types.is_empty()
+        // v62.0.0 (QUERY-1) — a target-pinned query seeks the
+        // `(cohort_scope, cohort_target)` index.
+        self.pinned_target().is_some()
+            || !self.types.is_empty()
             || self.type_prefix.is_some()
             || self.dimension != DimensionFilter::Any
             || (self.scope.is_some() && self.to.is_some())
@@ -412,6 +446,10 @@ impl AttestationQuery {
         if self.tier == QueryTier::Local {
             return "list_local_tier_attestations";
         }
+        // v62.0.0 (QUERY-1) — the targeted read's shape.
+        if self.pinned_target().is_some() {
+            return "list_targeted_by_dimension_prefix";
+        }
         let to = self.to.is_some();
         let dim = self.dimension != DimensionFilter::Any;
         if self.type_prefix.is_some() && !dim {
@@ -437,7 +475,11 @@ impl AttestationQuery {
     /// attested key.
     #[must_use]
     pub fn key(&self) -> &str {
-        self.by.as_deref().or(self.to.as_deref()).unwrap_or("*")
+        self.by
+            .as_deref()
+            .or(self.to.as_deref())
+            .or(self.pinned_target())
+            .unwrap_or("*")
     }
 
     /// Refuse a query no backend may run: no pinned key, a page above
@@ -448,9 +490,28 @@ impl AttestationQuery {
     /// [`Error::InvalidArgument`] naming the defect.
     pub fn validate(&self) -> Result<(), Error> {
         if self.by.is_none() && self.to.is_none() {
-            return Err(Error::InvalidArgument(
-                "AttestationQuery pins no key (by or to)".to_owned(),
-            ));
+            // v62.0.0 (QUERY-1) — or a room: a scope that names its target,
+            // at a placement that has targets (the index's closed set).
+            match &self.scope {
+                Some(ScopeFilter {
+                    cohort_scope,
+                    cohort_target: Some(t),
+                }) if !t.is_empty() => {
+                    if !TARGET_PINNED_SCOPES.contains(&cohort_scope.as_str()) {
+                        return Err(Error::InvalidArgument(format!(
+                            "AttestationQuery pinned on a target at cohort_scope \
+                             {cohort_scope:?}: one of {TARGET_PINNED_SCOPES:?}"
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(Error::InvalidArgument(
+                        "AttestationQuery pins no key (by or to) and no room (a scope with its \
+                         target)"
+                            .to_owned(),
+                    ));
+                }
+            }
         }
         if self.limit.get() > MAX_PAGE {
             return Err(Error::InvalidArgument(format!(

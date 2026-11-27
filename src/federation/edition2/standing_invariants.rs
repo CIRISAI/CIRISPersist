@@ -216,21 +216,8 @@ pub(crate) async fn conferred_detector_body(d: &dyn FederationDirectory) {
     )
     .expect("I3081: an instant");
     crate::federation::admission::r2_test_support::bind_owner_if_machine(d, det, at_instant).await;
-    let grant = super::fixture_trust_root::confers_statement(
-        &r,
-        &e2::kid(det),
-        &[crate::federation::types::delegation_scope::INFRA_DETECT],
-        at,
-    );
-    e2::put_statement(d, &grant)
-        .await
-        .expect("I3081: the root's grant");
-    // Verify's `confers` rule asks the delegate for a second voice
-    // (`delegate: sub`, CC 2.6.1.9).
-    e2::put_statement(d, &e2::voice_of(&grant, det))
-        .await
-        .expect("I3081: the detector's own voice on its conferral");
-    // ... and the machine delegate's owner for a third.
+    // LEAD-root1 — the grant is COUNTED over the bundle's holders; the
+    // machine detector's OWNER accepts it.
     let owner = crate::federation::admission::r2_test_support::machine_owner_of(
         d,
         &e2::kid(det),
@@ -238,10 +225,15 @@ pub(crate) async fn conferred_detector_body(d: &dyn FederationDirectory) {
     )
     .await
     .expect("I3081: the detector's owner is bound");
-    e2::put_statement(d, &e2::voice_of(&grant, &owner))
-        .await
-        .expect("I3081: the owner's voice on the detector's conferral");
-    let grant_id = RowId::of_statement(&grant).expect("I3081: the grant's row id");
+    let grant_id = super::fixture_trust_root::put_conferral_accepted_by(
+        d,
+        &r,
+        det,
+        &[crate::federation::types::delegation_scope::INFRA_DETECT],
+        &e2::seed_of(&owner),
+    )
+    .await
+    .expect("I3081: the root's grant and its acceptance");
     assert!(
         d.get_attestation(&grant_id.hex()).await.unwrap().is_some(),
         "I3081: the conferral concludes; held {:?}",
@@ -262,9 +254,9 @@ pub(crate) async fn conferred_detector_body(d: &dyn FederationDirectory) {
     .await
     .expect("I3081: capability_roots_to_trusted_root");
     assert!(
-        rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
+        rooted.as_ref().is_some_and(|g| g.root_key_id == r.lineage),
         "I3081: the detector's infra:detect roots at {} through this node: {rooted:?}",
-        r.root
+        r.lineage
     );
     let instant = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
         i64::try_from(at + 60_000).expect("I3081: an instant"),

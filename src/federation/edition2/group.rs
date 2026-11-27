@@ -109,6 +109,20 @@ pub const MEMBERSHIP_PREFIX: &str = "membership:{stage}";
 pub const WIDENING_LEAF: &str = "widening";
 /// The membership leaf a removal is.
 pub const REMOVAL_LEAF: &str = "removal";
+/// v62.0.0 (CONTENT-A2; the Constitution's room-content rule, R6) — the
+/// membership leaf of a COUNTED row adding tips to an end of a member's
+/// seat (`membership:keeps:v1`): `refs.also.cites` the end,
+/// `refs.trusted_through` the further tips, counted over `refs.head`. It is
+/// no group plane ([`group_plane_of`]): it lands on the attestation plane,
+/// counted by `admission::check_membership_keeps_counted`.
+pub const KEEPS_LEAF: &str = "keeps";
+/// v62.0.0 (CONTENT-A2; CC 3.1.3.2, "a resignation is signed by the leaving
+/// member") — the membership leaf of a member's OWN end of its seat
+/// (authored). The leaf decides: a [`REMOVAL_LEAF`] row is the group's
+/// counted end, never read as a resignation, whoever voiced it. A `keeps`
+/// row may cite either. (The resignation leaf's builder, door and fold are
+/// v62-resign's; this is only its one spelling.)
+pub const RESIGNATION_LEAF: &str = "resignation";
 /// The `refs` role a later roster version names the version it extends by,
 /// and the one a membership change names the roster it is counted over by.
 pub const HEAD_ROLE: &str = "head";
@@ -138,9 +152,18 @@ pub enum GroupPlane {
 /// `group` is the accord's `family_key_id`). The accord's roster, seats and
 /// recovery are the genesis bundle in force and no row; a change is a later
 /// bundle at the import door. Pure (the statement's own bytes), so the
-/// statement door runs it among its pure gates BEFORE the payload's shape:
-/// the accord's id is no identity-ref, so the shape check alone would answer
-/// `edition2_payload_invalid` and this name could never be reached.
+/// statement door runs it among its pure gates BEFORE the payload's shape
+/// and the founding check: `humanity-accord` is no group-ref, so either
+/// alone would answer a generic refusal and this name could never be
+/// reached.
+///
+/// v62.0.0 (GID-prod; CIRISConstitution's answer of 2026-11-22) —
+/// `humanity-accord` is a ROOT LINEAGE NAME, not a group: the genesis
+/// bundle's `family_key_id` and `sub`, never founded by a `group:roster`
+/// first version, outside the derived-id rule (which runs on `group:roster`
+/// rows only). This refusal says so: a lineage, not a group. The baked
+/// bundle and its import proof never pass this door (they enter at the
+/// genesis import door), so neither moves.
 ///
 /// # Errors
 /// `accord_version_is_a_bundle`.
@@ -169,7 +192,7 @@ pub fn refuse_accord_group_statement(sub: &str, payload: &Value) -> Result<(), E
 /// an authored row of the attestation plane: `None`.
 #[must_use]
 pub fn group_plane_of(row_type: &str, family: &str, payload: &Value) -> Option<GroupPlane> {
-    if super::ingest::COMPOSER_ROW_TYPES.contains(&row_type) {
+    if super::emit::names_a_target(row_type) {
         return None;
     }
     if family == namespace_match::family_id(GROUP_ROSTER_PREFIX) {
@@ -1305,6 +1328,16 @@ where
     // inputs of this row: a version of the group (its `sub`) re-folds it;
     // so does a membership change of any member it lists (its `sub`).
     fold::reads(Dep::key(&view.group));
+    // v62.0.0 (GID-tips) — a CONTESTED founding concludes nothing: another
+    // first version (no `refs.head`) of this group held here, held or
+    // concluded, makes every first version of it held. The read above
+    // (`Dep::key(group)`) is the dependency: a rival first version's arrival
+    // touches `key:<group>` (its `sub`), so a founding concluded before it
+    // re-folds here and un-concludes; re-delivery of the SAME first version
+    // is the same row id and no rival.
+    if view.head.is_none() {
+        check_founding_uncontested(dir, row, &view).await?;
+    }
     let MergeReading { prev, merged } = merge_reading(dir, &view, &row.row_id).await?;
     let record = record_of_roster(&view, prev.clone())?;
     if let GroupRecord::Community(c) = &record {
@@ -1318,6 +1351,54 @@ where
         drop_merged_tips(dir, &view, &offered_hash, &merged).await?;
     }
     Ok(landing)
+}
+
+/// v62.0.0 (GID-tips) — refuse-as-HELD a first version of `view.group` when
+/// another first version of it is held in the group's projection slot
+/// (`ingest::fold_plane_of`: `group:<sub>`), `group_founding_contested`.
+///
+/// # Errors
+/// The hold; directory reads.
+async fn check_founding_uncontested<F>(
+    dir: &F,
+    row: &AdmittedRow,
+    view: &RosterView,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let slot = format!("group:{}", row.sub);
+    for other in dir.fold_slot_all_rows(&slot).await? {
+        if other == row.row_id {
+            continue;
+        }
+        let Some(statement) = dir.edition2_voices(&other).await?.into_iter().next() else {
+            continue;
+        };
+        let Some((_, payload)) = statement_parts(&statement) else {
+            continue;
+        };
+        let first = payload
+            .get_text("refs")
+            .and_then(|r| r.get_text("head"))
+            .is_none();
+        if first && payload.get_text("group").and_then(Value::as_text) == Some(view.group.as_str())
+        {
+            return Err(fold::hold(
+                reason::GROUP_FOUNDING_CONTESTED,
+                Error::InvalidArgument(format!(
+                    "{}: {:?} has two first versions ({} and {}): its founders signed two \
+                     foundings, so the group concludes nothing here (CC 2.7.8); found it anew \
+                     under a new nonce",
+                    reason::GROUP_FOUNDING_CONTESTED,
+                    view.group,
+                    row.row_id.hex(),
+                    other.hex()
+                )),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The family id of a `location_proof:{version}` row (header -70002).
@@ -1954,6 +2035,136 @@ pub fn roster_payload(
     roster_payload_merging(record, version, head, &[], asserted_at_ms)
 }
 
+/// v62.0.0 (GID-prod.fix1) — **what a host states to found a community**:
+/// everything of its first version EXCEPT the id (derived, never passed in:
+/// a clean break, no ignored argument) and the server-computed fields.
+#[derive(Debug, Clone)]
+pub struct CommunityFounding {
+    /// The community's name (human-readable, not unique, never an id).
+    pub name: String,
+    /// The founding members (their keys derive the id).
+    pub members: Vec<crate::federation::types::CommunityMember>,
+    /// The founding instant (derives the id).
+    pub founded_at: chrono::DateTime<chrono::Utc>,
+    /// The `consensus_protocol`.
+    pub consensus_protocol: String,
+    /// The `policy_blob` (an open map).
+    pub policy_blob: Option<serde_json::Value>,
+    /// The charter in force (`trust:charter:v1` row hash), empty for none.
+    pub charter_digest: String,
+}
+
+/// v62.0.0 (GID-prod.fix1) — the family twin of [`CommunityFounding`].
+#[derive(Debug, Clone)]
+pub struct FamilyFounding {
+    /// The family's name.
+    pub name: String,
+    /// The founding members (their keys derive the id).
+    pub members: Vec<crate::federation::types::FamilyMember>,
+    /// The founding instant (derives the id).
+    pub founded_at: chrono::DateTime<chrono::Utc>,
+    /// The `consensus_protocol`.
+    pub consensus_protocol: String,
+    /// `consensus_protocol_entrenched`.
+    pub consensus_protocol_entrenched: bool,
+    /// The charter in force, empty for none.
+    pub charter_digest: String,
+}
+
+impl CommunityFounding {
+    /// The first version's record, its id still empty (set by
+    /// [`founding_payload`]).
+    #[must_use]
+    pub fn into_record(self) -> GroupRecord {
+        GroupRecord::Community(crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: self.charter_digest,
+            community_key_id: String::new(),
+            community_name: self.name,
+            members: self.members,
+            founded_at: self.founded_at,
+            consensus_protocol: self.consensus_protocol,
+            policy_blob: self.policy_blob,
+            persist_row_hash: String::new(),
+        })
+    }
+}
+
+impl FamilyFounding {
+    /// The first version's record, its id still empty (set by
+    /// [`founding_payload`]).
+    #[must_use]
+    pub fn into_record(self) -> GroupRecord {
+        GroupRecord::Family(crate::federation::types::Family {
+            family_key_id: String::new(),
+            family_name: self.name,
+            members: self.members,
+            founded_at: self.founded_at,
+            consensus_protocol: self.consensus_protocol,
+            consensus_protocol_entrenched: self.consensus_protocol_entrenched,
+            dissolved_at: None,
+            prev_head_digest: String::new(),
+            charter_digest: self.charter_digest,
+            persist_row_hash: String::new(),
+        })
+    }
+}
+
+/// v62.0.0 (GID-prod) — what a founding verb answers: the group's DERIVED id
+/// (no caller passes one in) and the statement door's outcome.
+#[derive(Debug)]
+pub struct GroupFounding {
+    /// The id the founding derives ([`super::group_id::derive_group_id`]).
+    pub group_id: String,
+    /// The door's outcome for the first version.
+    pub outcome: super::ingest::StatementOutcome,
+}
+
+/// v62.0.0 (GID-prod; CIRISConstitution "THE DERIVED GROUP ID") — **the
+/// FIRST version's payload, under its derived id.** The id is derived from
+/// `record`'s kind, the key of EVERY member it lists, its `founded_at` and
+/// `nonce` ([`super::group_id::derive_group_id`]); `record`'s id is set to
+/// it (whatever it held), the payload is [`roster_payload`] at version 1
+/// with no head, and it carries `nonce`. The founding verbs mint the nonce
+/// ([`super::group_id::fresh_nonce`]); a fixture passes a fixed one.
+///
+/// # Errors
+/// As [`roster_payload`]; a `founded_at` before the epoch.
+pub fn founding_payload(
+    record: &mut GroupRecord,
+    nonce: &[u8; 32],
+    asserted_at_ms: u64,
+) -> Result<(String, Value), Error> {
+    let (kind, founded_at, founders): (&str, _, Vec<String>) = match &*record {
+        GroupRecord::Family(f) => (
+            "family",
+            f.founded_at,
+            f.members.iter().map(|m| m.key_id.clone()).collect(),
+        ),
+        GroupRecord::Community(c) => (
+            "community",
+            c.founded_at,
+            c.members.iter().map(|m| m.key_id.clone()).collect(),
+        ),
+    };
+    let founded_ms = ms_of("founded_at", founded_at)?
+        .as_u64()
+        .ok_or_else(|| invalid("group:roster: `founded_at` is not a uint"))?;
+    let refs: Vec<&str> = founders.iter().map(String::as_str).collect();
+    let id = super::group_id::derive_group_id(kind, &refs, founded_ms, nonce);
+    match record {
+        GroupRecord::Family(f) => f.family_key_id.clone_from(&id),
+        GroupRecord::Community(c) => c.community_key_id.clone_from(&id),
+    }
+    let mut payload = roster_payload(record, 1, None, asserted_at_ms)?;
+    let Value::Map(m) = &mut payload else {
+        return Err(invalid("group:roster: the payload is not a map"));
+    };
+    m.push((text("nonce"), Value::Bytes(nonce.to_vec())));
+    m.sort_by_key(|(k, _)| cde::encode(k));
+    Ok((id, payload))
+}
+
 /// [`roster_payload`] of a MERGE (CC 2.7.8): beside `refs.head` it names
 /// the further tips it makes one head with, `refs.further_heads` (a set,
 /// sorted by encoding, unique; CC 2.6.1.9). Empty `further` is
@@ -2236,6 +2447,171 @@ pub fn removal_draft(
         ))
     })?;
     let payload = membership_payload(record, Some(head))?;
+    super::emit::draft_row(
+        &kid,
+        signer_iss,
+        &member,
+        "scores",
+        &ciris_verify_core::namespace_match::family_id(MEMBERSHIP_PREFIX),
+        &payload,
+    )
+    .map_err(|e| super::emit::produce_error("membership", e))
+}
+
+/// v62.0.0 (CONTENT-A5; CC rc22 3.1.3.2) — **[`removal_draft`] naming the
+/// removed member's tips** in `refs.trusted_through`: the rows of the member
+/// the removers hold good (`content_prev::member_tips`, newest first). No
+/// tips: exactly [`removal_draft`]. Tips past 64 go on [`keeps_draft`] rows.
+///
+/// # Errors
+/// As [`removal_draft`]; `trusted_through_too_many` past 64 tips.
+pub fn removal_draft_naming_tips(
+    record: &MembershipRecord,
+    head: &RowId,
+    signer_iss: &str,
+    tips: &[RowId],
+) -> Result<super::emit::Draft, Error> {
+    if tips.is_empty() {
+        return removal_draft(record, head, signer_iss);
+    }
+    check_tip_count(tips)?;
+    let member = match record {
+        MembershipRecord::FamilyRemoval(r) => r.removed_identity_key_id.clone(),
+        MembershipRecord::CommunityRemoval(r) => r.removed_identity_key_id.clone(),
+        MembershipRecord::FamilyWidening(_) | MembershipRecord::CommunityWidening(_) => {
+            return Err(Error::InvalidArgument(
+                "edition2_payload_invalid: a widening ends no seat: it names no tips".into(),
+            ));
+        }
+    };
+    let kid = super::ingest::kid_of_identity_ref(signer_iss).ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "removal_draft_naming_tips: {signer_iss} is not an identity-ref"
+        ))
+    })?;
+    let payload = super::content_prev::with_refs(
+        membership_payload(record, Some(head))?,
+        vec![("trusted_through", super::content_prev::row_ref_set(tips))],
+    )?;
+    super::emit::draft_row(
+        &kid,
+        signer_iss,
+        &member,
+        "scores",
+        &ciris_verify_core::namespace_match::family_id(MEMBERSHIP_PREFIX),
+        &payload,
+    )
+    .map_err(|e| super::emit::produce_error("membership", e))
+}
+
+fn check_tip_count(tips: &[RowId]) -> Result<(), Error> {
+    if tips.len() > super::produce::TRUSTED_THROUGH_MAX {
+        return Err(Error::InvalidArgument(format!(
+            "{}: {} tips; at most {} on one row (the rest on `keeps` rows)",
+            super::produce::TRUSTED_THROUGH_TOO_MANY,
+            tips.len(),
+            super::produce::TRUSTED_THROUGH_MAX
+        )));
+    }
+    Ok(())
+}
+
+/// v62.0.0 (CONTENT-A5; CC rc22 3.1.3.2, the `keeps` stage) — **one voice of
+/// a counted `membership:keeps:v1` row, drafted for a roster member's pen**:
+/// further tips (`refs.trusted_through`, 1 to 64) for `member`'s seat in
+/// `group`, citing the end it adds to (`refs.also.cites`, exactly one),
+/// counted over the roster head `head`. COUNTED: no `author` (the family
+/// table's `authorship` reads it authored until the pre4 re-vendor; the row
+/// is counted regardless, Constitution). `sub` = the member.
+///
+/// # Errors
+/// No tips or more than 64 (`trusted_through_too_many`); `signer_iss` that is
+/// not an identity-ref; an instant the payload cannot carry.
+#[allow(clippy::too_many_arguments)]
+pub fn keeps_draft(
+    group_kind: &str,
+    group: &str,
+    member: &str,
+    head: &RowId,
+    end: &RowId,
+    tips: &[RowId],
+    asserted_at_ms: u64,
+    signer_iss: &str,
+) -> Result<super::emit::Draft, Error> {
+    if tips.is_empty() {
+        return Err(Error::InvalidArgument(
+            "edition2_payload_invalid: a keeps row names at least one tip".into(),
+        ));
+    }
+    check_tip_count(tips)?;
+    let kid = super::ingest::kid_of_identity_ref(signer_iss).ok_or_else(|| {
+        Error::InvalidArgument(format!("keeps_draft: {signer_iss} is not an identity-ref"))
+    })?;
+    let refs = det_map(vec![
+        (HEAD_ROLE, ciris_verify_core::edition2::row_ref(&head.0)),
+        (
+            "also",
+            det_map(vec![(
+                "cites",
+                Value::Array(vec![ciris_verify_core::edition2::row_ref(&end.0)]),
+            )]),
+        ),
+        ("trusted_through", super::content_prev::row_ref_set(tips)),
+    ]);
+    let payload = det_map(vec![
+        ("asserted_at", Value::Uint(asserted_at_ms)),
+        ("dimension", text(&format!("membership:{KEEPS_LEAF}:v1"))),
+        ("group_kind", text(group_kind)),
+        ("group", text(group)),
+        ("member", text(member)),
+        ("refs", refs),
+    ]);
+    super::emit::draft_row(
+        &kid,
+        signer_iss,
+        member,
+        "scores",
+        &ciris_verify_core::namespace_match::family_id(MEMBERSHIP_PREFIX),
+        &payload,
+    )
+    .map_err(|e| super::emit::produce_error("membership", e))
+}
+
+/// v62.0.0 (HEAD-3; CC 2.4.1.1, "A count that ends a standing MAY state
+/// `lifts`, and then only the count's own receipts keep an act in force") —
+/// **[`removal_draft`] stating `lifts: true`**: the unseating is the
+/// roster's COUNT (no `author`, counted over `head`), so it may lift single
+/// receipts. `lifts` is a top-level payload member, present only as `true`
+/// (`payloads::check_lifts`); a widening is no end and is refused it.
+///
+/// # Errors
+/// As [`removal_draft`]; `edition2_payload_invalid` for a widening.
+pub fn removal_draft_lifting(
+    record: &MembershipRecord,
+    head: &RowId,
+    signer_iss: &str,
+) -> Result<super::emit::Draft, Error> {
+    let member = match record {
+        MembershipRecord::FamilyRemoval(r) => r.removed_identity_key_id.clone(),
+        MembershipRecord::CommunityRemoval(r) => r.removed_identity_key_id.clone(),
+        MembershipRecord::FamilyWidening(_) | MembershipRecord::CommunityWidening(_) => {
+            return Err(Error::InvalidArgument(
+                "edition2_payload_invalid: a widening ends no standing: it states no `lifts`"
+                    .into(),
+            ));
+        }
+    };
+    let kid = super::ingest::kid_of_identity_ref(signer_iss).ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "removal_draft_lifting: {signer_iss} is not an identity-ref"
+        ))
+    })?;
+    let payload = super::emit::with_member(
+        membership_payload(record, Some(head))?,
+        "lifts",
+        Value::Bool(true),
+    )
+    .map_err(|e| super::emit::produce_error("membership", e))?;
     super::emit::draft_row(
         &kid,
         signer_iss,
