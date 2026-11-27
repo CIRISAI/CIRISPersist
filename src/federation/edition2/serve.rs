@@ -572,6 +572,9 @@ where
 /// voice is counted. Every other family: `false` (a second-signer row with no
 /// typed row is never inferred concluded from the absence of a hold).
 ///
+/// VD-step1 — the conclusion is the one verdict's
+/// ([`super::verdict::row_state`]); this keeps RL-fix23's family scope.
+///
 /// # Errors
 /// Directory reads.
 pub(crate) async fn bootstrap_bind_concluded<F>(dir: &F, statement: &[u8]) -> Result<bool, Error>
@@ -579,7 +582,7 @@ where
     F: FederationDirectory + ?Sized,
 {
     use ciris_verify_core::namespace_match::family_id;
-    let Some((protected, payload)) = statement_parts(statement) else {
+    let Some((protected, _)) = statement_parts(statement) else {
         return Ok(false);
     };
     let family = protected.get_int(-70002).and_then(Value::as_text);
@@ -587,22 +590,10 @@ where
     if family != Some(occ_family) && family != Some(family_id(occ_family).as_str()) {
         return Ok(false);
     }
-    let text = |k: &str| payload.get_text(k).and_then(Value::as_text);
-    let (Some(identity), Some(occurrence), Some(at)) = (
-        text("identity_key_id"),
-        text("occurrence_key_id"),
-        payload.get_text("asserted_at").and_then(Value::as_u64),
-    ) else {
+    let Some(rid) = super::names::RowId::of_statement(statement) else {
         return Ok(false);
     };
-    Ok(dir
-        .list_identity_occurrences_by_occurrence_key(occurrence)
-        .await?
-        .iter()
-        .any(|o| {
-            o.identity_key_id == identity
-                && u64::try_from(o.asserted_at.timestamp_millis()).ok() == Some(at)
-        }))
+    Ok(super::verdict::row_state(dir, &rid).await?.is_concluded())
 }
 
 /// **The statement's own serve rule**, before any row naming it carries

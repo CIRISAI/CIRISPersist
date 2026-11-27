@@ -173,7 +173,7 @@ pub(crate) mod bodies {
     where
         B: FederationDirectory + Sync,
     {
-        b.put_identity_occurrence_local(IdentityOccurrence {
+        b.test_seam_put_identity_occurrence(IdentityOccurrence {
             identity_key_id: identity.to_owned(),
             occurrence_key_id: occurrence.to_owned(),
             device_class: device_class::SERVER.to_owned(),
@@ -1119,7 +1119,7 @@ pub(crate) mod two_node {
         d: &Device,
     ) {
         backend
-            .put_identity_occurrence_local(IdentityOccurrence {
+            .test_seam_put_identity_occurrence(IdentityOccurrence {
                 identity_key_id: d.key.clone(),
                 occurrence_key_id: d.key.clone(),
                 device_class: device_class::SERVER.to_owned(),

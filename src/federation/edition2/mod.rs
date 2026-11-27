@@ -115,8 +115,19 @@ pub mod genesis;
 pub mod group;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod group_fixtures;
+// v62.0.0 (GID-prod) — the derived group id: one module, swapped for Verify
+// 23.5.1's export at the pin step.
+pub mod group_id;
 pub mod group_serve;
+// v62.0.0 (GID-tips) — I5717, I5718: a contested founding concludes nothing.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod group_tips_invariants;
 pub mod halt;
+// v62.0.0 (HEAD-1; CC 2.4.1.1) — the head rule: which head a row names.
+pub mod head_rule;
+// v62.0.0 (HEAD-2) — the head rule at the statement door (sqlite + pg).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod head_rule_invariants;
 pub mod ingest;
 pub mod liveness;
 pub mod names;
@@ -159,6 +170,11 @@ pub mod trust_root_group;
 pub mod typed;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod typed_fixtures;
+// v62.0.0 (VD-step1) — the one row-state verdict: "is this row concluded".
+pub mod verdict;
+// v62.0.0 (VD-step1b) — I6300–I6305: the one row-state verdict's findings.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod verdict_invariants;
 pub mod voices;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod voices_invariants;

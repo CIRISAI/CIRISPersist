@@ -54,6 +54,17 @@ pub(crate) mod bodies {
                 machine,
             )
             .await;
+            // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — the agent's OWN binding (the
+            // `agent` relation, from its key's window start): the head every
+            // act it signs names. The steward binding above is the marker
+            // `steward_bindings_of` counts.
+            e2::put_agent_owner_binding(
+                d,
+                &steward_seed,
+                machine,
+                e2::key_window_start_ms(&e2::seed_of(machine)),
+            )
+            .await;
         }
         assert_eq!(
             crate::federation::admission::steward_bindings_of(d, &p.agent)

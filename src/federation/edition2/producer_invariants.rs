@@ -152,10 +152,19 @@ pub(crate) mod bodies {
             .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .expect("I2203: A registers");
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — a machine acts under its owner
+        // binding; an unowned one signs nothing. The fixture machine is owned.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            &*a.federation_directory(),
+            &a_id,
+            crate::host::clock::now(),
+        )
+        .await;
         let rid = a
             .emit_attestation_self(scores("observation:reachability:v1"))
             .await
-            .expect("I2203: A emits");
+            .expect("I2203: A emits")
+            .into_row_id();
         let st = statement_of_row(&a, &rid).await;
         assert_eq!(
             family_of_statement(&st),
@@ -213,6 +222,14 @@ pub(crate) mod bodies {
             .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .unwrap();
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — a machine acts under its owner
+        // binding; an unowned one signs nothing. The fixture machine is owned.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            &*a.federation_directory(),
+            &a_id,
+            crate::host::clock::now(),
+        )
+        .await;
         let (_u, u_id) = user(u_dsn, &format!("{tag}-2204-u"), &[&a, &b]).await;
         let u_signer = signer(&format!("{tag}-2204-u"), &format!("{tag}-2204-u"));
 
@@ -227,7 +244,8 @@ pub(crate) mod bodies {
                 crate::federation::admission::DelegationTermBounds::default(),
             )
             .await
-            .expect("I2204: the owner binding");
+            .expect("I2204: the owner binding")
+            .into_row_id();
         let st = statement_of_row(&a, &binding).await;
         assert_eq!(
             family_of_statement(&st).map(|(f, _)| f).as_deref(),
@@ -265,7 +283,8 @@ pub(crate) mod bodies {
                 None,
                 crate::federation::admission::DelegationTermBounds::default(),
             )
-            .await;
+            .await
+            .map(crate::federation::edition2::second_signer_voice::VoiceOutcome::into_row_id);
         if let Ok(grant) = grant {
             let st = statement_of_row(&a, &grant).await;
             assert_eq!(
@@ -302,13 +321,23 @@ pub(crate) mod bodies {
     ) {
         let a = node(a_dsn, &format!("{tag}-2205-a")).await;
         let b = node(b_dsn, &format!("{tag}-2205-b")).await;
-        a.register_self_federation_key(identity_type::NODE, None, None)
+        let a_self_id = a
+            .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .unwrap();
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — a machine acts under its owner
+        // binding; an unowned one signs nothing. The fixture machine is owned.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            &*a.federation_directory(),
+            &a_self_id,
+            crate::host::clock::now(),
+        )
+        .await;
         let target = a
             .emit_attestation_self(scores("observation:reachability:v1"))
             .await
-            .unwrap();
+            .unwrap()
+            .into_row_id();
         let mut input = EmitAttestationInput::with_envelope(
             attestation_type::WITHDRAWS,
             crate::federation::envelope::EnvelopeCore::from_value(
@@ -324,7 +353,8 @@ pub(crate) mod bodies {
         let w = a
             .emit_attestation_self(input)
             .await
-            .expect("I2205: the withdraws is emitted");
+            .expect("I2205: the withdraws is emitted")
+            .into_row_id();
         let st = statement_of_row(&a, &w).await;
         assert_eq!(
             family_of_statement(&st),
@@ -360,13 +390,23 @@ pub(crate) mod bodies {
     /// `refs.target`, on both nodes.
     pub(crate) async fn i2205_effect_the_target_is_withdrawn(a_dsn: &str, tag: &str) {
         let a = node(a_dsn, &format!("{tag}-2205e-a")).await;
-        a.register_self_federation_key(identity_type::NODE, None, None)
+        let a_self_id = a
+            .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .unwrap();
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — a machine acts under its owner
+        // binding; an unowned one signs nothing. The fixture machine is owned.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            &*a.federation_directory(),
+            &a_self_id,
+            crate::host::clock::now(),
+        )
+        .await;
         let target = a
             .emit_attestation_self(scores("observation:reachability:v1"))
             .await
-            .unwrap();
+            .unwrap()
+            .into_row_id();
         let w = a
             .emit_attestation_self({
                 let mut i = EmitAttestationInput::with_envelope(
@@ -384,7 +424,8 @@ pub(crate) mod bodies {
                 i
             })
             .await
-            .unwrap();
+            .unwrap()
+            .into_row_id();
         let row = a
             .federation_directory()
             .get_attestation(&w)
@@ -406,9 +447,18 @@ pub(crate) mod bodies {
         let alias = format!("{tag}-2206-a");
         let a = node(a_dsn, &alias).await;
         let b = node(b_dsn, &format!("{tag}-2206-b")).await;
-        a.register_self_federation_key(identity_type::NODE, None, None)
+        let a_self_id = a
+            .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .unwrap();
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — a machine acts under its owner
+        // binding; an unowned one signs nothing. The fixture machine is owned.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            &*a.federation_directory(),
+            &a_self_id,
+            crate::host::clock::now(),
+        )
+        .await;
         let local = signer(&alias, &alias);
         let dir = a.federation_directory();
         let e = crate::federation::attestation_emit::emit_with_local_signer(
@@ -452,9 +502,18 @@ pub(crate) mod serving_bodies {
 
     pub(crate) async fn i2209_served_by_statement_and_row_id(dsn: &str, tag: &str) {
         let a = node(dsn, &format!("{tag}-2209-a")).await;
-        a.register_self_federation_key(identity_type::NODE, None, None)
+        let a_self_id = a
+            .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .unwrap();
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — a machine acts under its owner
+        // binding; an unowned one signs nothing. The fixture machine is owned.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            &*a.federation_directory(),
+            &a_self_id,
+            crate::host::clock::now(),
+        )
+        .await;
         let rid = a
             .emit_attestation_self(crate::federation::EmitAttestationInput::with_envelope(
                 "scores",
@@ -466,7 +525,8 @@ pub(crate) mod serving_bodies {
                 crate::federation::types::cohort_scope::FEDERATION,
             ))
             .await
-            .unwrap();
+            .unwrap()
+            .into_row_id();
         let dir = a.federation_directory();
         let all = served(&a).await;
         let ids = dir
@@ -563,11 +623,13 @@ pub(crate) mod filter_bodies {
         let private = a
             .emit_attestation_self(input(cohort_scope::SELF))
             .await
-            .expect("I2210: a private (self) row is admitted");
+            .expect("I2210: a private (self) row is admitted")
+            .into_row_id();
         let commons = a
             .emit_attestation_self(input(cohort_scope::FEDERATION))
             .await
-            .unwrap();
+            .unwrap()
+            .into_row_id();
         let dir = a.federation_directory();
         let st = |rid: String| {
             let dir = dir.clone();
@@ -690,9 +752,18 @@ pub(crate) mod digest_bodies {
     pub(crate) async fn i2208_a_digest_member_round_trips(a_dsn: &str, b_dsn: &str, tag: &str) {
         let a = node(a_dsn, &format!("{tag}-2208-a")).await;
         let b = node(b_dsn, &format!("{tag}-2208-b")).await;
-        a.register_self_federation_key(identity_type::NODE, None, None)
+        let a_self_id = a
+            .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .unwrap();
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — a machine acts under its owner
+        // binding; an unowned one signs nothing. The fixture machine is owned.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            &*a.federation_directory(),
+            &a_self_id,
+            crate::host::clock::now(),
+        )
+        .await;
         let put = a
             .put_blob_scoped(
                 crate::federation::types::cohort_scope::FEDERATION,

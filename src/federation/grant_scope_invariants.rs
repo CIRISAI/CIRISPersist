@@ -297,6 +297,9 @@ pub mod bodies {
     }
 
     async fn put(d: &dyn FederationDirectory, a: Attestation) -> Result<(), Error> {
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — the row names its head, as its
+        // producer states it, so the door reaches the gate this asks about.
+        let a = e2::headed_row(d, &a).await?;
         d.put_attestation(SignedAttestation { attestation: a })
             .await
             .map(|_| ())
@@ -529,7 +532,7 @@ pub mod key_grant_arms {
         ts::register_hybrid_key_as(n.backend, recipient, recipient, USER).await;
         let recipient = e2::kid(recipient);
         n.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: e2::kid_or_keep(identity),
                 occurrence_key_id: recipient.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -558,7 +561,7 @@ pub mod key_grant_arms {
         // identity-ref.
         let owner_k = e2::kid(&owner);
         a.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner_k.clone(),
                 occurrence_key_id: a.key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -686,7 +689,7 @@ pub mod key_grant_arms {
         // identity-ref.
         let owner_k = e2::kid(&owner);
         a.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner_k.clone(),
                 occurrence_key_id: a.key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -829,7 +832,7 @@ pub mod key_grant_arms {
         // identity-ref.
         let owner_k = e2::kid(&owner);
         a.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner_k.clone(),
                 occurrence_key_id: a.key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),

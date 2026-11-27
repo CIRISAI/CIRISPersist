@@ -72,7 +72,9 @@ pub(crate) trait OccurrenceStore: FederationDirectory + Sized {
     ) -> Result<OccurrenceWrite, Error>;
 
     /// In ONE transaction: the trusted-local upsert, which never mutates a
-    /// SIGNED row (#541), and its #930 history row.
+    /// SIGNED row (#541), and its #930 history row. v62.0.0 (WD-fix9): the
+    /// storage of the TEST seam only (the trusted-local verb is retired).
+    #[cfg_attr(not(any(test, feature = "test-anchor")), allow(dead_code))]
     async fn store_planned_local_occurrence(&self, planned: PlannedOccurrence)
         -> Result<(), Error>;
 
@@ -145,7 +147,22 @@ pub(crate) async fn put_identity_occurrence_planned<D: OccurrenceStore>(
     dir: &D,
     occurrence: SignedIdentityOccurrence,
 ) -> Result<(), Error> {
-    super::edition2::door::refuse_earlier_form("identity_occurrence")?;
+    // v62.0.0 (WD-fix7) — refused by name, pointing at the edition-2 path:
+    // a device joins or leaves a self's roster only by its edition-2
+    // statement (the earlier-form roster gate and its proposal row are
+    // retired).
+    super::edition2::door::refuse_earlier_form("identity_occurrence").map_err(|_| {
+        Error::malformed_row(
+            "identity_occurrence",
+            super::edition2::token::EARLIER_FORM_OBJECT,
+            "a signed identity_occurrence object (the earlier form, CC 8.11): a node of this \
+             form binds or evicts a device only by its edition-2 statement, an \
+             `identity:occurrence` bind or an `identity:occurrence_revocation`, put through \
+             the statement door (`Engine::put_edition2_statement`, or a hardware signer's \
+             `Engine::statement_draft` + `Engine::submit_voice`); CC 2.6.1.12, 3.3.6.4"
+                .to_owned(),
+        )
+    })?;
     // v62.0.0 (wave O1) — the identity-set exclusion on every occurrence
     // door: no machine key under a person, no person key under a machine
     // (`occurrence_mixes_person_and_machine`), as the edition-2 door.
@@ -160,9 +177,9 @@ pub(crate) async fn put_identity_occurrence_planned<D: OccurrenceStore>(
     // producer envelope, the signer's authority and §5.6.8.8.2 C4 key
     // separation, BEFORE any write. One gate for HTTP and the wire.
     super::admission::verify_signed_identity_occurrence(dir, &occurrence).await?;
-    // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — a roster change lands by the
-    // two-path door or is held as a proposal.
-    super::self_roster::gate_occurrence(dir, &occurrence).await?;
+    // v62.0.0 (WD-fix7) — the earlier-form roster gate is retired with the
+    // door above it: a roster change is an edition-2 `identity:occurrence`
+    // bind (`self_roster::gate_edition2`).
     let SignedIdentityOccurrence {
         identity_occurrence: row,
         attesting_key_id,
@@ -198,9 +215,10 @@ pub(crate) async fn put_identity_occurrence_planned<D: OccurrenceStore>(
     Ok(())
 }
 
-/// The door: every backend's `put_identity_occurrence_local` (#418, the
-/// grandfathered trusted-local write: no signature gate, signed columns
-/// NULL, engine-internal self-writes only).
+/// The storage of every backend's `test_seam_put_identity_occurrence`
+/// (v62.0.0 WD-fix9: the retired #418 trusted-local write, kept for tests
+/// only: no signature gate, signed columns NULL).
+#[cfg_attr(not(any(test, feature = "test-anchor")), allow(dead_code))]
 pub(crate) async fn put_identity_occurrence_local_planned<D: OccurrenceStore>(
     dir: &D,
     occurrence: IdentityOccurrence,

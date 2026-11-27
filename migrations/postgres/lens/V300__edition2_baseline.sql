@@ -3608,6 +3608,12 @@ CREATE INDEX ceg_roster_proposals_open
 ALTER TABLE cirislens.federation_attestations ADD COLUMN restatement_key text;
 CREATE INDEX federation_attestations_restatement ON cirislens.federation_attestations USING btree (attesting_key_id, restatement_key) WHERE (restatement_key IS NOT NULL);
 
+-- v62.0.0 (WD-fix1; CC 2.4.1.1, CC 6.1.5 N5): the held withdrawals in this
+-- node's admission order, the withdrawn-content sweep's read
+-- (list_withdrawals_since): bounded by the withdrawals held, not the store
+-- (store::edition_baseline::ATTESTATIONS_WITHDRAWALS_INDEX_POSTGRES).
+CREATE INDEX federation_attestations_withdrawals ON cirislens.federation_attestations USING btree (admitted_at, attestation_id) WHERE (attestation_type = ANY (ARRAY['withdraws'::text, 'recants'::text]));
+
 -- v62.0.0 (RL-fix1, lead ruling (B); CC 5.4 "carries none it cannot verify"):
 -- the accord rows a node holding no accord root skipped, as feed WATERMARKS
 -- only (no row bytes): per (plane, peer) the first position skipped, so the

@@ -96,6 +96,17 @@ pub(crate) const ATTESTATIONS_EDITION_TWO_POSTGRES: &[&str] = &[
     "ALTER TABLE cirislens.federation_attestations ADD COLUMN restatement_key text;",
     "CREATE INDEX federation_attestations_restatement ON cirislens.federation_attestations USING btree (attesting_key_id, restatement_key) WHERE (restatement_key IS NOT NULL);",
 ];
+/// v62.0.0 (WD-fix1) — the withdrawn-content sweep's index, an edition-2
+/// object on an edition-1 table (P8-fix14's restatement index is the
+/// precedent): `(name, SQLite DDL as sqlite_schema stores it)`.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const ATTESTATIONS_WITHDRAWALS_INDEX: (&str, &str) = (
+    "federation_attestations_withdrawals",
+    "CREATE INDEX federation_attestations_withdrawals ON federation_attestations (admitted_at, attestation_id) WHERE attestation_type IN ('withdraws', 'recants')",
+);
+/// Its PostgreSQL DDL, as V300 states it.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const ATTESTATIONS_WITHDRAWALS_INDEX_POSTGRES: &str = "CREATE INDEX federation_attestations_withdrawals ON cirislens.federation_attestations USING btree (admitted_at, attestation_id) WHERE (attestation_type = ANY (ARRAY['withdraws'::text, 'recants'::text]));";
 /// The column [`ATTESTATIONS_EDITION_TWO_POSTGRES`] adds.
 #[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
 pub(crate) const ATTESTATIONS_EDITION_TWO_COLUMNS: &[&str] = &["restatement_key"];
@@ -555,11 +566,16 @@ mod tests {
             *line = format!("{head}{}", esc(super::HALT_LATCH_SQLITE_DDL));
             // v62.0.0 (P8-fix14) — the restatement index, an edition-2 object
             // on an edition-1 table.
-            let (name, ddl) = super::ATTESTATIONS_RESTATEMENT_INDEX;
-            lines.push(format!(
-                "object\tindex\t{name}\tfederation_attestations\t{}",
-                esc(ddl)
-            ));
+            // v62.0.0 (WD-fix1) — and the withdrawals index beside it.
+            for (name, ddl) in [
+                super::ATTESTATIONS_RESTATEMENT_INDEX,
+                super::ATTESTATIONS_WITHDRAWALS_INDEX,
+            ] {
+                lines.push(format!(
+                    "object\tindex\t{name}\tfederation_attestations\t{}",
+                    esc(ddl)
+                ));
+            }
             lines.sort();
         }
         lines
@@ -629,6 +645,20 @@ mod tests {
         for a in super::ATTESTATIONS_EDITION_TWO_POSTGRES {
             assert_eq!(pg.matches(a).count(), 1, "I1950: {a}");
         }
+        // v62.0.0 (WD-fix1) — the withdrawals index, verbatim, both dialects.
+        assert_eq!(
+            sqlite
+                .matches(&format!("{};", super::ATTESTATIONS_WITHDRAWALS_INDEX.1))
+                .count(),
+            1,
+            "I1950: the withdrawals index is V300's own text"
+        );
+        assert_eq!(
+            pg.matches(super::ATTESTATIONS_WITHDRAWALS_INDEX_POSTGRES)
+                .count(),
+            1,
+            "I1950: the withdrawals index is V300's own text (postgres)"
+        );
         // The PostgreSQL delivery table carries the composite, not the
         // earlier columns (its edition-1 DDL edited in place).
         let at = pg
@@ -776,15 +806,22 @@ mod tests {
                     .iter()
                     .any(|col| l.split('\t').nth(3) == Some(col)))
                 || (l.starts_with("idx\t")
-                    && l.contains(&format!(
-                        "INDEX {} ON cirislens.federation_attestations",
-                        super::ATTESTATIONS_RESTATEMENT_INDEX.0
-                    )))
+                    && [
+                        super::ATTESTATIONS_RESTATEMENT_INDEX.0,
+                        super::ATTESTATIONS_WITHDRAWALS_INDEX.0,
+                    ]
+                    .iter()
+                    .any(|name| {
+                        l.contains(&format!(
+                            "INDEX {name} ON cirislens.federation_attestations"
+                        ))
+                    }))
         };
+        // v62.0.0 (WD-fix1) — the restatement index and the withdrawals index.
         assert_eq!(
             all.iter().filter(|l| restatement(l)).count(),
-            super::ATTESTATIONS_EDITION_TWO_COLUMNS.len() + 1,
-            "I1950: the restatement column and index are there"
+            super::ATTESTATIONS_EDITION_TWO_COLUMNS.len() + 2,
+            "I1950: the restatement column and the two edition-2 indexes are there"
         );
         let all: Vec<String> = all.into_iter().filter(|l| !restatement(l)).collect();
         // v62.0.0 (HALT-235) — the halt latch column edition 2 adds.

@@ -126,12 +126,17 @@ pub mod test_support {
         // attester == attested. Pre-#543 this was ADMITTED.
         let err = dir
             .put_attestation(SignedAttestation {
-                attestation: scores_row(
-                    &uuid::Uuid::new_v4().to_string(),
-                    &sybil,
-                    &sybil,
-                    "capacity:core_identity:v1",
-                ),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*dir,
+                    &scores_row(
+                        &uuid::Uuid::new_v4().to_string(),
+                        &sybil,
+                        &sybil,
+                        "capacity:core_identity:v1",
+                    ),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect_err(
@@ -157,28 +162,38 @@ pub mod test_support {
         // green B1 that actually proves B5). The grant makes the ONE variable
         // under test attester-vs-attested, as it was.
         dir.put_attestation(SignedAttestation {
-            attestation: consent_scope_row(
-                &uuid::Uuid::new_v4().to_string(),
-                &sybil,
-                &scorer,
-                &format!(
-                    "{}:v1",
-                    crate::federation::consent::consent_dimension::STATE_GRANTED_PREFIX
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &consent_scope_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &sybil,
+                    &scorer,
+                    &format!(
+                        "{}:v1",
+                        crate::federation::consent::consent_dimension::STATE_GRANTED_PREFIX
+                    ),
+                    &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
+                    crate::host::clock::now() - chrono::Duration::seconds(60),
                 ),
-                &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
-                crate::host::clock::now() - chrono::Duration::seconds(60),
-            ),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) B1: the subject's analyze grant admits");
 
         dir.put_attestation(SignedAttestation {
-            attestation: scores_row(
-                &uuid::Uuid::new_v4().to_string(),
-                &scorer,
-                &sybil,
-                "capacity:core_identity:v1",
-            ),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &scores_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &scorer,
+                    &sybil,
+                    "capacity:core_identity:v1",
+                ),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) B1: a THIRD-PARTY capacity score is still admitted");
@@ -386,7 +401,12 @@ pub mod test_support {
         // Under RC2 this is ADMITTED; under CC#46 it is the whole point.
         let err = dir
             .put_attestation(SignedAttestation {
-                attestation: capacity(),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*dir,
+                    &capacity(),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect_err(
@@ -425,20 +445,30 @@ pub mod test_support {
         // (b) THE GRANT — S authorizes P to analyze. `analyze` is CC 3.3.1's
         // canonical kind for "derive features / scores / classifications".
         dir.put_attestation(SignedAttestation {
-            attestation: consent_scope_row(
-                &uuid::Uuid::new_v4().to_string(),
-                &subject,
-                &attester,
-                &format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX),
-                &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
-                t0,
-            ),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &consent_scope_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &subject,
+                    &attester,
+                    &format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX),
+                    &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
+                    t0,
+                ),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) B5: a subject's own analyze grant is admissible");
 
         dir.put_attestation(SignedAttestation {
-            attestation: capacity(),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &capacity(),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) B5: with a live analyze grant covering P, the score admits");
@@ -447,21 +477,31 @@ pub mod test_support {
         // gate again. Strictly LATER than the grant: the fold is latest-wins on
         // `asserted_at`, so a tie would make this arm decide nothing.
         dir.put_attestation(SignedAttestation {
-            attestation: consent_scope_row(
-                &uuid::Uuid::new_v4().to_string(),
-                &subject,
-                &attester,
-                &format!("{}:v1", consent_dimension::STATE_REVOKED_PREFIX),
-                &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
-                t0 + chrono::Duration::seconds(60),
-            ),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &consent_scope_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &subject,
+                    &attester,
+                    &format!("{}:v1", consent_dimension::STATE_REVOKED_PREFIX),
+                    &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
+                    t0 + chrono::Duration::seconds(60),
+                ),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) B5: a subject's own revocation is admissible");
 
         let err = dir
             .put_attestation(SignedAttestation {
-                attestation: capacity(),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*dir,
+                    &capacity(),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect_err("({tag}) B5: once S revokes, P's capacity scores are refused again");
@@ -475,12 +515,17 @@ pub mod test_support {
         // untouched. CC#46 is a rule about `capacity:*`, and a gate that took
         // the whole `scores` plane down with it would be an outage.
         dir.put_attestation(SignedAttestation {
-            attestation: scores_row(
-                &uuid::Uuid::new_v4().to_string(),
-                &attester,
-                &subject,
-                "trust:demo:v1",
-            ),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &scores_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &attester,
+                    &subject,
+                    "trust:demo:v1",
+                ),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) B5: a non-capacity scores row is not consent-gated");
@@ -677,7 +722,12 @@ pub mod test_support {
                  per-family disposition before re-pointing it."
             );
             dir.put_attestation(SignedAttestation {
-                attestation: signal(dimension),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*dir,
+                    &signal(dimension),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap_or_else(|e| {
@@ -697,12 +747,17 @@ pub mod test_support {
         // the CONSENT gate is not the thing refusing it.
         if let Err(e) = dir
             .put_attestation(SignedAttestation {
-                attestation: typed_family_row(
-                    &uuid::Uuid::new_v4().to_string(),
-                    &attester,
-                    &subject,
-                    "cert_validity:probe",
-                ),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*dir,
+                    &typed_family_row(
+                        &uuid::Uuid::new_v4().to_string(),
+                        &attester,
+                        &subject,
+                        "cert_validity:probe",
+                    ),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
         {
@@ -720,7 +775,12 @@ pub mod test_support {
         const CAPACITY: &str = "capacity:core_identity:v1";
         let err = dir
             .put_attestation(SignedAttestation {
-                attestation: signal(CAPACITY),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*dir,
+                    &signal(CAPACITY),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect_err(
@@ -738,20 +798,30 @@ pub mod test_support {
         // claim admits. CC 3.4.5's reciprocity clause is a real choice in both
         // directions, so the gate must be a door and not a wall.
         dir.put_attestation(SignedAttestation {
-            attestation: consent_scope_row(
-                &uuid::Uuid::new_v4().to_string(),
-                &subject,
-                &attester,
-                &format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX),
-                &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
-                t0,
-            ),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &consent_scope_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &subject,
+                    &attester,
+                    &format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX),
+                    &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
+                    t0,
+                ),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) B7: a subject's own analyze grant is admissible");
 
         dir.put_attestation(SignedAttestation {
-            attestation: signal(CAPACITY),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &signal(CAPACITY),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) B7: with the subject's live analyze grant, the capacity score admits");
@@ -821,7 +891,12 @@ pub mod test_support {
         // (a) THE HAZARD: a typo'd mode must be refused, loudly, at the wire.
         let err = dir
             .put_attestation(SignedAttestation {
-                attestation: with_mode(serde_json::json!("manditory")),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*dir,
+                    &with_mode(serde_json::json!("manditory")),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect_err("({tag}) B6: a typo'd delivery_mode must be REFUSED, not silently demoted");
@@ -838,19 +913,34 @@ pub mod test_support {
 
         // (b) junk shape (non-string) — same silent-demotion hazard, refused.
         dir.put_attestation(SignedAttestation {
-            attestation: with_mode(serde_json::json!(7)),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &with_mode(serde_json::json!(7)),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect_err("({tag}) B6: a non-string delivery_mode is refused");
 
         // (c) the two LEGAL states still admit.
         dir.put_attestation(SignedAttestation {
-            attestation: with_mode(serde_json::Value::Null), // absent
-        })
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &with_mode(serde_json::Value::Null),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
+        }) // absent
         .await
         .expect("({tag}) B6: absent delivery_mode (BestEffort) admits");
         dir.put_attestation(SignedAttestation {
-            attestation: with_mode(serde_json::json!("mandatory")),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &with_mode(serde_json::json!("mandatory")),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) B6: delivery_mode=mandatory admits");
@@ -887,19 +977,29 @@ pub mod test_support {
 
         // (a) BEFORE — the abuser's writes are admitted like anyone's.
         dir.put_attestation(SignedAttestation {
-            attestation: write(&abuser),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &write(&abuser),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) AV-77: pre-de-admission writes are admitted");
 
         // (b) THE ACT — this node de-admits the abuser from its OWN corpus.
         dir.put_attestation(SignedAttestation {
-            attestation: scores_row(
-                &uuid::Uuid::new_v4().to_string(),
-                self_key_id,
-                &abuser,
-                PEER_DEADMISSION_DIMENSION,
-            ),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &scores_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    self_key_id,
+                    &abuser,
+                    PEER_DEADMISSION_DIMENSION,
+                ),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) AV-77: a node may always author its own de-admission");
@@ -909,7 +1009,12 @@ pub mod test_support {
         // injection.
         let err = dir
             .put_attestation(SignedAttestation {
-                attestation: write(&abuser),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*dir,
+                    &write(&abuser),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect_err("({tag}) AV-77: a de-admitted peer's writes must be REFUSED");
@@ -921,7 +1026,12 @@ pub mod test_support {
         // (d) SCOPED — an innocent third party is untouched. De-admission is a
         // judgement about ONE peer, not a general lockdown.
         dir.put_attestation(SignedAttestation {
-            attestation: write(&innocent),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &write(&innocent),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) AV-77: de-admitting one peer must not affect another");
@@ -945,7 +1055,11 @@ pub mod test_support {
         let smuggled_id = smuggled.attestation_id.clone();
         let err = dir
             .put_attestation(SignedAttestation {
-                attestation: smuggled,
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*dir, &smuggled,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect_err(
@@ -1022,7 +1136,12 @@ pub mod test_support {
         // (a)
         let err = dir
             .put_attestation(SignedAttestation {
-                attestation: local_row(&uuid::Uuid::new_v4().to_string(), DIM, None),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*dir,
+                    &local_row(&uuid::Uuid::new_v4().to_string(), DIM, None),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect_err(
@@ -1042,11 +1161,16 @@ pub mod test_support {
         );
         // (b)
         dir.put_attestation(SignedAttestation {
-            attestation: local_row(
-                &uuid::Uuid::new_v4().to_string(),
-                "trust:demo:v1",
-                Some("capacity:composite"),
-            ),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &local_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    "trust:demo:v1",
+                    Some("capacity:composite"),
+                ),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect_err(
@@ -1056,7 +1180,12 @@ pub mod test_support {
         // (c)
         let ok_id = uuid::Uuid::new_v4().to_string();
         dir.put_attestation(SignedAttestation {
-            attestation: local_row(&ok_id, "trust:demo:v1", None),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &local_row(&ok_id, "trust:demo:v1", None),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) B8: an ordinary local row still admits");
@@ -1083,7 +1212,12 @@ pub mod test_support {
         // (d)
         let doomed_id = uuid::Uuid::new_v4().to_string();
         dir.put_attestation(SignedAttestation {
-            attestation: local_row(&doomed_id, "trust:demo:v1", None),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &local_row(&doomed_id, "trust:demo:v1", None),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) B8: the local write lands while the author is in good standing");
@@ -1095,12 +1229,17 @@ pub mod test_support {
             .expect("read")
             .expect("row");
         dir.put_attestation(SignedAttestation {
-            attestation: scores_row(
-                &uuid::Uuid::new_v4().to_string(),
-                self_key_id,
-                &attester,
-                PEER_DEADMISSION_DIMENSION,
-            ),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &scores_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    self_key_id,
+                    &attester,
+                    PEER_DEADMISSION_DIMENSION,
+                ),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) B8: a node may always author its own de-admission");
@@ -1138,7 +1277,9 @@ pub mod test_support {
         self_row.cohort_scope = cohort_scope::SELF.to_owned();
         ts::reseal(&mut self_row);
         dir.put_attestation(SignedAttestation {
-            attestation: self_row,
+            attestation: crate::federation::edition2::fixture_switch::headed_row(&*dir, &self_row)
+                .await
+                .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) B8: arm (e)'s local row admits");
@@ -1185,17 +1326,22 @@ pub mod test_support {
             "({tag}) B8: and the refusal names the CAPACITY consent rule: {err:?}"
         );
         dir.put_attestation(SignedAttestation {
-            attestation: consent_scope_row(
-                &uuid::Uuid::new_v4().to_string(),
-                &subject,
-                &bystander,
-                &format!(
-                    "{}:v1",
-                    crate::federation::consent::consent_dimension::STATE_GRANTED_PREFIX
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &consent_scope_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &subject,
+                    &bystander,
+                    &format!(
+                        "{}:v1",
+                        crate::federation::consent::consent_dimension::STATE_GRANTED_PREFIX
+                    ),
+                    &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
+                    crate::host::clock::now() - chrono::Duration::seconds(60),
                 ),
-                &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
-                crate::host::clock::now() - chrono::Duration::seconds(60),
-            ),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("({tag}) B8: the subject's own analyze grant admits");
@@ -1322,9 +1468,15 @@ pub mod test_support {
                 row.cohort_scope = cohort_scope::SELF.to_owned();
                 ts::reseal(&mut row);
                 let id = row.attestation_id.clone();
-                dir.put_attestation(SignedAttestation { attestation: row })
+                dir.put_attestation(SignedAttestation {
+                    attestation: crate::federation::edition2::fixture_switch::headed_row(
+                        &*dir, &row,
+                    )
                     .await
-                    .expect("B9: the local write itself is admissible");
+                    .expect("HEAD-fix1: the row names its head"),
+                })
+                .await
+                .expect("B9: the local write itself is admissible");
                 let local = dir.get_attestation(&id).await.expect("read").expect("row");
                 let ci = ts::describe_own(&local, CrossingBasis::ProducerAuthority);
                 dir.enter_mesh(&id, &ci, &ts::actor_reseal(&local))
@@ -1398,9 +1550,13 @@ pub mod test_support {
                 "trust:demo:v1",
             );
             let id = third.attestation_id.clone();
-            dir.put_attestation(SignedAttestation { attestation: third })
-                .await
-                .expect("({tag}) B9: the federation-tier third-party row admits");
+            dir.put_attestation(SignedAttestation {
+                attestation: crate::federation::edition2::fixture_switch::headed_row(&*dir, &third)
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
+            })
+            .await
+            .expect("({tag}) B9: the federation-tier third-party row admits");
             let prior = dir.get_attestation(&id).await.expect("read").expect("row");
             // v47.0.0 (CIRISPersist#897) — a third-party row BORN at
             // `affiliations` is refused like one born at `community`: the
@@ -1424,7 +1580,11 @@ pub mod test_support {
             let nid = narrower.attestation_id.clone();
             let err = dir
                 .put_attestation(SignedAttestation {
-                    attestation: narrower,
+                    attestation: crate::federation::edition2::fixture_switch::headed_row(
+                        &*dir, &narrower,
+                    )
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
                 })
                 .await
                 .expect_err("({tag}) B9: an affiliations-tier third-party row is refused");
@@ -1486,9 +1646,13 @@ pub mod test_support {
         sup.attestation_envelope[crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID] =
             serde_json::json!(b1.clone());
         ts::reseal(&mut sup);
-        dir.put_attestation(SignedAttestation { attestation: sup })
-            .await
-            .expect("b renews");
+        dir.put_attestation(SignedAttestation {
+            attestation: crate::federation::edition2::fixture_switch::headed_row(&*dir, &sup)
+                .await
+                .expect("HEAD-fix1: the row names its head"),
+        })
+        .await
+        .expect("b renews");
 
         let got = distinct_self_reporting_subjects(
             dir,
@@ -1573,11 +1737,15 @@ pub mod test_support {
         sup.attestation_envelope[crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID] =
             serde_json::json!(first.clone());
         ts::reseal(&mut sup);
-        dir.put_attestation(SignedAttestation { attestation: sup })
-            .await
-            .unwrap_or_else(|e| {
-                panic!("({tag}) #814: a supersedes IS the renewal and must admit: {e}")
-            });
+        dir.put_attestation(SignedAttestation {
+            attestation: crate::federation::edition2::fixture_switch::headed_row(&*dir, &sup)
+                .await
+                .expect("HEAD-fix1: the row names its head"),
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!("({tag}) #814: a supersedes IS the renewal and must admit: {e}")
+        });
 
         // (4) a different LEAF admits — the rule is per (subject, scope, leaf),
         // not "one config row per node".
@@ -1646,9 +1814,13 @@ pub mod test_support {
         let mine = uuid::Uuid::new_v4().to_string();
         let mut r = scores_row(&mine, &occurrence, &occurrence, "session:claim:v1");
         lease(&mut r, now, 3_600);
-        dir.put_attestation(SignedAttestation { attestation: r })
-            .await
-            .unwrap_or_else(|e| panic!("({tag}) #814: a self-report session claim admits: {e}"));
+        dir.put_attestation(SignedAttestation {
+            attestation: crate::federation::edition2::fixture_switch::headed_row(&*dir, &r)
+                .await
+                .expect("HEAD-fix1: the row names its head"),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #814: a self-report session claim admits: {e}"));
 
         // A stranger claiming about that occurrence is REFUSED and NOT STORED.
         // v52.0.0 (CIRISPersist#946; CC 3.1.3.1) — the lease is bounded, read
@@ -1662,7 +1834,11 @@ pub mod test_support {
             let mut r = scores_row(&id, &occurrence, &occurrence, "session:claim:v1");
             lease(&mut r, from, secs);
             let err = dir
-                .put_attestation(SignedAttestation { attestation: r })
+                .put_attestation(SignedAttestation {
+                    attestation: crate::federation::edition2::fixture_switch::headed_row(&*dir, &r)
+                        .await
+                        .expect("HEAD-fix1: the row names its head"),
+                })
                 .await
                 .expect_err(label);
             // v62.0.0 (E0 fix 9) — under edition 2 a backwards lease is a
@@ -1685,7 +1861,11 @@ pub mod test_support {
                 serde_json::json!(crate::federation::admission::render_signed_instant(now));
             ts::reseal(&mut r);
             let err = dir
-                .put_attestation(SignedAttestation { attestation: r })
+                .put_attestation(SignedAttestation {
+                    attestation: crate::federation::edition2::fixture_switch::headed_row(&*dir, &r)
+                        .await
+                        .expect("HEAD-fix1: the row names its head"),
+                })
                 .await
                 .expect_err("no valid_until");
             assert!(
@@ -1767,7 +1947,11 @@ pub mod test_support {
         let mut bad = scores_row(&theirs, &stranger, &occurrence, "session:claim:v1");
         lease(&mut bad, now, 3_600);
         let err = dir
-            .put_attestation(SignedAttestation { attestation: bad })
+            .put_attestation(SignedAttestation {
+                attestation: crate::federation::edition2::fixture_switch::headed_row(&*dir, &bad)
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
+            })
             .await
             .expect_err("a third party's session claim must be refused at the door");
         assert!(
@@ -1922,7 +2106,12 @@ pub mod test_support {
         permission.cohort_scope = cohort_scope::FEDERATION.to_owned();
         ts::reseal(&mut permission);
         dir.put_attestation(SignedAttestation {
-            attestation: permission,
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &permission,
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .unwrap_or_else(|e| panic!("({tag}) #814: the permission admits: {e}"));
@@ -1998,7 +2187,9 @@ pub mod test_support {
         narrow.cohort_scope = cohort_scope::SELF.to_owned();
         ts::reseal(&mut narrow);
         dir.put_attestation(SignedAttestation {
-            attestation: narrow,
+            attestation: crate::federation::edition2::fixture_switch::headed_row(&*dir, &narrow)
+                .await
+                .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .unwrap_or_else(|e| panic!("({tag}) #814: the narrow permission admits: {e}"));
@@ -2042,9 +2233,13 @@ pub mod test_support {
         mid.cohort_scope = cohort_scope::AFFILIATIONS.to_owned();
         mid.attestation_envelope["community_key_id"] = serde_json::json!(aff);
         ts::reseal(&mut mid);
-        dir.put_attestation(SignedAttestation { attestation: mid })
-            .await
-            .unwrap_or_else(|e| panic!("({tag}) #814: the affiliations permission admits: {e}"));
+        dir.put_attestation(SignedAttestation {
+            attestation: crate::federation::edition2::fixture_switch::headed_row(&*dir, &mid)
+                .await
+                .expect("HEAD-fix1: the row names its head"),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #814: the affiliations permission admits: {e}"));
         let id5 = uuid::Uuid::new_v4().to_string();
         let e5 = dir
             .put_attestation(duty(
@@ -2085,9 +2280,13 @@ pub mod test_support {
         owned.attestation_envelope["references_attestation_id"] =
             serde_json::json!(permission_id.clone());
         ts::reseal(&mut owned);
-        dir.put_attestation(SignedAttestation { attestation: owned })
-            .await
-            .unwrap_or_else(|e| panic!("({tag}) #814 (6): the subject-bearing duty admits: {e}"));
+        dir.put_attestation(SignedAttestation {
+            attestation: crate::federation::edition2::fixture_switch::headed_row(&*dir, &owned)
+                .await
+                .expect("HEAD-fix1: the row names its head"),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) #814 (6): the subject-bearing duty admits: {e}"));
 
         let retraction = uuid::Uuid::new_v4().to_string();
         let mut w = scores_row(&retraction, &subject, &subject, "duty:attribute:v1");
@@ -2095,15 +2294,19 @@ pub mod test_support {
         w.cohort_scope = cohort_scope::SELF.to_owned();
         w.attestation_envelope["references_attestation_id"] = serde_json::json!(owned_id.clone());
         ts::reseal(&mut w);
-        dir.put_attestation(SignedAttestation { attestation: w })
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "({tag}) #814 (6): the SUBJECT named in a duty may retract it \
+        dir.put_attestation(SignedAttestation {
+            attestation: crate::federation::edition2::fixture_switch::headed_row(&*dir, &w)
+                .await
+                .expect("HEAD-fix1: the row names its head"),
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "({tag}) #814 (6): the SUBJECT named in a duty may retract it \
                      (CEG §3.2.3 rule 2) — a duty retractable only by its author is a \
                      duty nobody can get out from under: {e}"
-                )
-            });
+            )
+        });
 
         // The honest path still works: same attester, same-or-narrower reach.
         let ok_id = uuid::Uuid::new_v4().to_string();
@@ -2145,7 +2348,11 @@ pub mod test_support {
         w2.attestation_envelope["references_attestation_id"] = serde_json::json!(base_id.clone());
         ts::reseal(&mut w2);
         let e7 = dir
-            .put_attestation(SignedAttestation { attestation: w2 })
+            .put_attestation(SignedAttestation {
+                attestation: crate::federation::edition2::fixture_switch::headed_row(&*dir, &w2)
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
+            })
             .await
             .expect_err(
                 "a supersedes must not widen a duty past the permission its target \
@@ -2184,7 +2391,11 @@ pub mod test_support {
         w3.attestation_envelope["references_attestation_id"] = serde_json::json!(base2.clone());
         ts::reseal(&mut w3);
         let e8 = dir
-            .put_attestation(SignedAttestation { attestation: w3 })
+            .put_attestation(SignedAttestation {
+                attestation: crate::federation::edition2::fixture_switch::headed_row(&*dir, &w3)
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
+            })
             .await
             .expect_err(
                 "a supersedes gossips at the tombstone ceiling, so it out-reaches a \
@@ -2462,21 +2673,31 @@ pub mod test_support {
             t1,
         );
         dir.put_attestation(SignedAttestation {
-            attestation: grant.clone(),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &grant.clone(),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .unwrap_or_else(|e| panic!("({tag}) B10-a: the subject's own grant admits: {e}"));
 
         // (b) the revocation at t2 > t1 — the fold closes.
         dir.put_attestation(SignedAttestation {
-            attestation: consent_scope_row(
-                &uuid::Uuid::new_v4().to_string(),
-                &subject,
-                &attester,
-                &format!("{}:v1", consent_dimension::STATE_REVOKED_PREFIX),
-                &[analyze],
-                t2,
-            ),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &consent_scope_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &subject,
+                    &attester,
+                    &format!("{}:v1", consent_dimension::STATE_REVOKED_PREFIX),
+                    &[analyze],
+                    t2,
+                ),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .unwrap_or_else(|e| panic!("({tag}) B10-a: the subject's own revocation admits: {e}"));
@@ -2494,7 +2715,12 @@ pub mod test_support {
             "({tag}) B10-a: after the revoke the fold must read Revoked"
         );
         dir.put_attestation(SignedAttestation {
-            attestation: capacity_claim(&attester, &subject),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &capacity_claim(&attester, &subject),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect_err("({tag}) B10-a: with consent revoked, a capacity:* claim about S is refused");
@@ -2522,7 +2748,11 @@ pub mod test_support {
         );
         let err = dir
             .put_attestation(SignedAttestation {
-                attestation: replay,
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*dir, &replay,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect_err(
@@ -2557,7 +2787,11 @@ pub mod test_support {
         fresh_id.attestation_id = uuid::Uuid::new_v4().to_string();
         let err = dir
             .put_attestation(SignedAttestation {
-                attestation: fresh_id,
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*dir, &fresh_id,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect_err(
@@ -2593,7 +2827,12 @@ pub mod test_support {
         );
         let err = dir
             .put_attestation(SignedAttestation {
-                attestation: capacity_claim(&attester, &subject),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*dir,
+                    &capacity_claim(&attester, &subject),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect_err(
@@ -2678,13 +2917,19 @@ pub mod test_support {
                     &mut swapped_revoke.asserted_at,
                 );
                 for (row, what) in [(swapped_grant, "grant"), (swapped_revoke, "revoke")] {
-                    dir.put_attestation(SignedAttestation { attestation: row })
+                    dir.put_attestation(SignedAttestation {
+                        attestation: crate::federation::edition2::fixture_switch::headed_row(
+                            &*dir, &row,
+                        )
                         .await
-                        .expect_err(&format!(
-                            "({tag}) B10-b: replica b's {what} carries a column its own signed \
+                        .expect("HEAD-fix1: the row names its head"),
+                    })
+                    .await
+                    .expect_err(&format!(
+                        "({tag}) B10-b: replica b's {what} carries a column its own signed \
                              envelope does not agree with and must be REFUSED \
                              (CIRISPersist#598)"
-                        ));
+                    ));
                 }
                 // While B holds ONLY the swapped feed it must not have been
                 // talked into a grant. Pre-#598 this read Granted while A read
@@ -2707,11 +2952,17 @@ pub mod test_support {
             // envelopes THEMSELVES state — for A that is the only feed it ever
             // saw; for B it is the honest relay of the same signed bytes.
             for (row, what) in [(grant, "grant"), (revoke, "revoke")] {
-                dir.put_attestation(SignedAttestation { attestation: row })
+                dir.put_attestation(SignedAttestation {
+                    attestation: crate::federation::edition2::fixture_switch::headed_row(
+                        &*dir, &row,
+                    )
                     .await
-                    .unwrap_or_else(|e| {
-                        panic!("({tag}) B10-b/{replica}: the bound {what} admits: {e}")
-                    });
+                    .expect("HEAD-fix1: the row names its head"),
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("({tag}) B10-b/{replica}: the bound {what} admits: {e}")
+                });
             }
             verdicts.push(
                 dir.resolve_scoped_consent(
@@ -2799,9 +3050,13 @@ pub mod test_support {
             (subject, attester)
         }
         let put = |row: Attestation, what: &'static str| async move {
-            dir.put_attestation(SignedAttestation { attestation: row })
-                .await
-                .unwrap_or_else(|e| panic!("B12: {what} must admit: {e}"));
+            dir.put_attestation(SignedAttestation {
+                attestation: crate::federation::edition2::fixture_switch::headed_row(&*dir, &row)
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("B12: {what} must admit: {e}"));
         };
 
         // ── A — THE WITNESS ──────────────────────────────────────────────
@@ -2861,7 +3116,12 @@ pub mod test_support {
         }
         // …and the verdict reaches the gate a consumer actually feels.
         dir.put_attestation(SignedAttestation {
-            attestation: capacity_claim(&attester, &subject),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &capacity_claim(&attester, &subject),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect_err(&format!(
@@ -3156,7 +3416,12 @@ pub mod test_support {
              plane existed — the edge orders history, it does not freeze it"
         );
         dir.put_attestation(SignedAttestation {
-            attestation: capacity_claim(&attester, &subject),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &capacity_claim(&attester, &subject),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .unwrap_or_else(|e| panic!("({tag}) B12-F: …and the gate re-opens with it: {e}"));
@@ -3318,11 +3583,15 @@ pub mod test_support {
                 [mk(&lo, &revoked), mk(&hi, &granted)]
             };
             for row in pair {
-                dir.put_attestation(SignedAttestation { attestation: row })
+                dir.put_attestation(SignedAttestation {
+                    attestation: crate::federation::edition2::fixture_switch::headed_row(
+                        &*dir, &row,
+                    )
                     .await
-                    .unwrap_or_else(|e| {
-                        panic!("({tag}) B10-c/{order}: both tied stances admit: {e}")
-                    });
+                    .expect("HEAD-fix1: the row names its head"),
+                })
+                .await
+                .unwrap_or_else(|e| panic!("({tag}) B10-c/{order}: both tied stances admit: {e}"));
             }
             assert_eq!(
                 dir.resolve_scoped_consent(
@@ -3342,7 +3611,12 @@ pub mod test_support {
             // The gate inside persist must agree with the fold — the tie-break
             // is only worth anything if it reaches the consumer.
             dir.put_attestation(SignedAttestation {
-                attestation: capacity_claim(&attester, &subject),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*dir,
+                    &capacity_claim(&attester, &subject),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect_err(&format!(

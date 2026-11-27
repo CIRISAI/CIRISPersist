@@ -58,6 +58,14 @@ pub(crate) mod bodies {
             .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .expect("I3055: A registers");
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — a machine acts under its owner
+        // binding; an unowned one signs nothing. The fixture machine is owned.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            &*a.federation_directory(),
+            &a_id,
+            crate::host::clock::now(),
+        )
+        .await;
         // B holds A's key record before A's rows reach it.
         let mut cursor = None;
         deliver(&a, &b, &mut cursor).await;
@@ -158,6 +166,14 @@ pub(crate) mod bodies {
             .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .expect("I3058: A registers");
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — a machine acts under its owner
+        // binding; an unowned one signs nothing. The fixture machine is owned.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            &*a.federation_directory(),
+            &a_id,
+            crate::host::clock::now(),
+        )
+        .await;
         let mut cursor = None;
         deliver(&a, &b, &mut cursor).await;
 
@@ -253,9 +269,18 @@ pub(crate) mod bodies {
     /// re-record is the same row (deterministic per signing key).
     pub(crate) async fn i3059_an_event_older_than_the_key_is_covered(dsn: &str, tag: &str) {
         let a = node(dsn, &format!("{tag}-3059-a")).await;
-        a.register_self_federation_key(identity_type::NODE, None, None)
+        let a_self_id = a
+            .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .expect("I3059: A registers");
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — a machine acts under its owner
+        // binding; an unowned one signs nothing. The fixture machine is owned.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            &*a.federation_directory(),
+            &a_self_id,
+            crate::host::clock::now(),
+        )
+        .await;
         let mut ev = event(&format!("{tag}-3059-ev"));
         ev.emitted_at -= chrono::Duration::days(1);
         let rid = a

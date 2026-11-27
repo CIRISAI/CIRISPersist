@@ -163,9 +163,13 @@ pub mod bodies {
                 .unwrap_or_else(|e| panic!("I186: put {id}: {e}"));
             return;
         }
-        d.put_attestation(SignedAttestation { attestation: a })
-            .await
-            .unwrap_or_else(|e| panic!("I186: put {id}: {e}"));
+        d.put_attestation(SignedAttestation {
+            attestation: crate::federation::edition2::fixture_switch::headed_row(&*d, &a)
+                .await
+                .expect("HEAD-fix1: the row names its head"),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("I186: put {id}: {e}"));
     }
 
     /// The fixture's row names, in the order (a)…(c). Every PLACED row names
@@ -629,7 +633,8 @@ mod run {
                         serde_json::json!({}),
                     ))
                     .await
-                    .expect("I186: a self-room file row"),
+                    .expect("I186: a self-room file row")
+                    .into_row_id(),
             );
         }
         let room_chat = engine
@@ -639,7 +644,8 @@ mod run {
                 in_room.clone(),
             ))
             .await
-            .expect("I186: the self-room KeyPackage");
+            .expect("I186: the self-room KeyPackage")
+            .into_row_id();
         placed.push(room_chat.clone());
         // …and one placed row that is still LOCAL: the sweep's pass 1 enters
         // it into the mesh and would widen it right after, from the local
@@ -675,7 +681,8 @@ mod run {
                 serde_json::json!({ "family_key_id": fam }),
             ))
             .await
-            .expect("I186: the family row");
+            .expect("I186: the family row")
+            .into_row_id();
         placed.push(family_row.clone());
         // (c) the stranded row: a self file row naming NO target.
         let stranded = engine
@@ -685,7 +692,8 @@ mod run {
                 serde_json::json!({}),
             ))
             .await
-            .expect("I186: the stranded row");
+            .expect("I186: the stranded row")
+            .into_row_id();
 
         let mut before = Vec::new();
         for id in &placed {

@@ -1478,6 +1478,24 @@ fn is_restatement_placement_member(member: &str) -> bool {
     member == row_paths::COHORT_SCOPE || admission::COHORT_TARGET_ENVELOPE_FIELDS.contains(&member)
 }
 
+/// v62.0.0 (HEAD-fix1; CC 2.4.1.1) — `refs` without its `head`: the head an
+/// act names is its PLACEMENT's (a room's roster version at a room; none for
+/// a person's own row), so a restatement at a new placement names the new
+/// placement's head ([`widen_by_restatement`] states it) and the widening
+/// check compares the rest of `refs`. `None` when nothing else is named.
+fn refs_without_head(
+    refs: Option<&ciris_verify_core::cde::Value>,
+) -> Option<ciris_verify_core::cde::Value> {
+    use ciris_verify_core::cde::Value;
+    let m = refs?.as_map()?;
+    let rest: Vec<(Value, Value)> = m
+        .iter()
+        .filter(|(k, _)| k.as_text() != Some("head"))
+        .cloned()
+        .collect();
+    (!rest.is_empty()).then_some(Value::Map(rest))
+}
+
 /// The payload member a placement's cohort target rides in on an edition-2
 /// row: `community_id` for a room (a common member, CC 2.6.1.4) and
 /// `family_key_id` for a family (the alias the cohort-target read takes).
@@ -1574,6 +1592,15 @@ pub fn restate_at_audience(
     let mut m: Vec<(Value, Value)> = members
         .into_iter()
         .filter(|(k, _)| !k.as_text().is_some_and(is_restatement_placement_member))
+        .filter_map(|(k, v)| {
+            // v62.0.0 (HEAD-fix1) — the prior placement's head is not carried:
+            // the restatement names its own placement's head.
+            if k.as_text() == Some("refs") {
+                refs_without_head(Some(&v)).map(|r| (k, r))
+            } else {
+                Some((k, v))
+            }
+        })
         .collect();
     m.push((
         Value::Text(row_paths::COHORT_SCOPE.to_owned()),
@@ -1683,14 +1710,27 @@ pub fn check_restated_widening(
         if is_restatement_placement_member(name) {
             continue;
         }
+        if name == "refs" {
+            if refs_without_head(Some(v)) != refs_without_head(signed_p.get_text(name)) {
+                return Err(reauthors(name));
+            }
+            continue;
+        }
         match signed_p.get_text(name) {
             Some(nv) if nv == v => {}
             None | Some(_) if stripped(name) => {}
             _ => return Err(reauthors(name)),
         }
     }
-    for (k, _) in signed_m {
+    for (k, v) in signed_m {
         let name = k.as_text().unwrap_or("");
+        if name == "refs" {
+            // Only its head is new: compared above when the prior has refs.
+            if prior_p.get_text(name).is_none() && refs_without_head(Some(v)).is_some() {
+                return Err(reauthors(name));
+            }
+            continue;
+        }
         if !is_restatement_placement_member(name) && prior_p.get_text(name).is_none() {
             return Err(reauthors(name));
         }
@@ -1762,12 +1802,26 @@ where
     D: FederationDirectory + Sync + ?Sized,
 {
     let restated = restate_at_audience(prior, &ci.recipient_see, strip)?;
+    // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — the restatement is the actor's act:
+    // it keeps the head the prior names, and states one when the prior named
+    // none (a prior admitted before the head rule), as every producer does.
+    let (_, signer_iss) = super::edition2::produce::signer_identity(signer)
+        .await
+        .map_err(|e| Error::InvalidArgument(format!("widen_audience: the signer: {e}")))?;
+    let payload = super::edition2::head_rule::state_head(
+        dir,
+        &restated.row_type,
+        &restated.family,
+        &signer_iss,
+        restated.payload.clone(),
+    )
+    .await?;
     let statement = super::edition2::produce::sign_row(
         signer,
         &prior.attested_key_id,
         &restated.row_type,
         &restated.family,
-        &restated.payload,
+        &payload,
     )
     .await
     .map_err(|e| super::edition2::emit::produce_error("widen_audience", e))?;

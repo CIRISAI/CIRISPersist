@@ -52,12 +52,33 @@ pub(crate) mod bodies {
         e2::row_of(&r, by)
     }
 
+    /// v62.0.0 (HEAD-fix1; CC 2.4.1.1) — the row as its producer signs it: an
+    /// act in a room names the room's roster head (`e2::with_head_resolved`),
+    /// then the same door as before; read back by [`held`].
     async fn put(d: &dyn FederationDirectory, r: &Attestation) -> Result<(), Error> {
+        let headed = e2::with_head_resolved(
+            d,
+            &e2::carried_statement(r).expect("an edition-2 row"),
+            None,
+        )
+        .await?;
+        let tier = if r.tier.is_empty() {
+            crate::federation::types::attestation_tier::FEDERATION
+        } else {
+            r.tier.as_str()
+        };
         d.put_attestation(SignedAttestation {
-            attestation: r.clone(),
+            attestation: e2::row_of_statement(&headed, tier),
         })
         .await
         .map(|_| ())
+    }
+
+    /// The row `r` is held under (its head stated, `e2::held_row_id`).
+    async fn held(d: &dyn FederationDirectory, r: &Attestation) -> Option<Attestation> {
+        d.get_attestation(&e2::held_row_id(&r.attestation_id))
+            .await
+            .unwrap()
     }
 
     /// **I1512** — CC's moderation shape at community scope.
@@ -88,7 +109,7 @@ pub(crate) mod bodies {
             .await
             .expect("I1512: the moderator's moderation act");
         for r in [&flag, &mod_act] {
-            let held = d.get_attestation(&r.attestation_id).await.unwrap().unwrap();
+            let held = held(d, r).await.unwrap();
             assert_eq!(
                 held.attested_key_id,
                 e2::kid(&moderator),
@@ -296,7 +317,7 @@ pub(crate) mod bodies {
         subject: &str,
         room: &str,
         cosigner: Option<&str>,
-    ) -> (Attestation, Option<Vec<u8>>) {
+    ) -> (Attestation, Option<String>) {
         let room = e2::kid_or_keep(room);
         let env = serde_json::json!({
             "dimension": dimension,
@@ -310,20 +331,29 @@ pub(crate) mod bodies {
         r.weight = None;
         r.cohort_scope = cohort_scope::COMMUNITY.into();
         r.subject_key_ids = vec![e2::kid_or_keep(subject)];
-        let r = e2::row_of(&r, by);
-        let voice = cosigner
-            .map(|c| e2::voice_of(&e2::carried_statement(&r).expect("an edition-2 row"), c));
-        (r, voice)
+        (e2::row_of(&r, by), cosigner.map(str::to_owned))
     }
 
-    /// Put `about`'s row, then its further voice if any.
+    /// Put `about`'s row, then its cosigner's voice if any.
+    ///
+    /// v62.0.0 (HEAD-fix1; CC 2.4.1.1) — the further voice signs the payload
+    /// the author's statement states (its room's roster head stated,
+    /// `e2::with_head_resolved`), so both voices are one row.
     async fn put_about(
         d: &dyn FederationDirectory,
-        a: &(Attestation, Option<Vec<u8>>),
+        a: &(Attestation, Option<String>),
     ) -> Result<(), Error> {
         put(d, &a.0).await?;
-        if let Some(v) = &a.1 {
-            e2::put_statement(d, v).await.map(|_| ())?;
+        if let Some(c) = &a.1 {
+            let headed = e2::with_head_resolved(
+                d,
+                &e2::carried_statement(&a.0).expect("an edition-2 row"),
+                None,
+            )
+            .await?;
+            e2::put_statement(d, &e2::voice_of(&headed, c))
+                .await
+                .map(|_| ())?;
         }
         Ok(())
     }
@@ -357,7 +387,8 @@ pub(crate) mod bodies {
             e2::put_key(d, u, &[identity_type::USER]).await;
         }
         reg(d, &[&room]).await;
-        found_community(d, &room, "quorum:1/1", &[&moderator, &author, &member], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let room = found_community(d, &room, "quorum:1/1", &[&moderator, &author, &member], &[])
             .await
             .unwrap();
         const PLAIN: &str = "expertise:cardiology:en:v1";
