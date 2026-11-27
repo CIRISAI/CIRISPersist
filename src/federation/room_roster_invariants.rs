@@ -111,6 +111,7 @@ pub mod bodies {
             reason: None,
             witness_set: Vec::new(),
             persist_row_hash: String::new(),
+            record_row_id: None,
         }
     }
 
@@ -206,6 +207,9 @@ pub mod bodies {
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I163: the family: {e}"));
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let fam = crate::federation::edition2::fixture_switch::room_id(&fam);
         let (head, _) = e2::held_head(b, &fam)
             .await
             .expect("I163: the family's head");
@@ -220,6 +224,7 @@ pub mod bodies {
                 reason: None,
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         )
         .await;
@@ -254,6 +259,7 @@ pub mod bodies {
             effective_at,
             role: None,
             persist_row_hash: String::new(),
+            record_row_id: None,
         }
     }
 
@@ -580,6 +586,9 @@ pub mod bodies {
         )
         .await
         .unwrap_or_else(|e| panic!("{tag}: room: {e}"));
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let room = crate::federation::edition2::fixture_switch::room_id(&room);
         let record = d.lookup_community(&room).await.unwrap().unwrap();
         check_no_moderator_federate_admission(d, &record)
             .await
@@ -594,6 +603,7 @@ pub mod bodies {
                 effective_at: at("2026-03-01T00:00:00Z"),
                 role: Some(MEMBER_ROLE_FOUNDER.into()),
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         )
         .await

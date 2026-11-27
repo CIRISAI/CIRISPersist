@@ -59,6 +59,24 @@
 //! - **I4207** — a ROOTLESS node: a holder's voice is not a landed row (its
 //!   key is no key this node holds: the door's retryable wait, or a hold);
 //!   after the bundle is imported the same two voices land the grant.
+//! - **I4322** (KR-fix20; the count always wins) — a holder's AUTHORED
+//!   withdrawal of the counted grant, the first voice's or the second's, is
+//!   refused `withdraws_never_retracts` with the grant held, or dropped when
+//!   it waited for the grant: two nodes, both orders, nothing kept, the grant
+//!   live; the holders' count still ends it.
+//! - **I4323** (KR-fix24; CC 3.3.4) — a grant short of its count lapses on
+//!   this node at first-held + 72 h (not before), its voice dropped, nothing
+//!   refused; offered again it is held with a fresh window; a counted grant is
+//!   never lapsed; the host verb's sweep does it at the node's clock.
+//! - **I4328** (KR-fix28; CC 3.2) — a node re-bound from P1 to P2: an act
+//!   under P1's binding stays under P1's acceptance; an act under P2's is
+//!   not until P2 accepts; P1's later withdrawal changes nothing under P2.
+//! - **I4329** (KR-fix27, KR-fix27b) — a Valid first bundle of ANOTHER
+//!   family is another root (`other_roots`), not a fork; the root family is
+//!   the PINNED anchor's whichever arrived first; with no pinned bundle among
+//!   two families nothing is in force; the same family is a fork.
+//! - **I4324** (KR-fix24) — two nodes that first held the voice at different
+//!   instants lapse it at different instants.
 
 use chrono::{DateTime, Utc};
 use ciris_crypto::composite::CompositeSigningKey;
@@ -80,7 +98,7 @@ use crate::federation::{Attestation, FederationDirectory};
 
 /// The scope a CI worker is granted: a sub-scope of the charter's
 /// `infra:attest`.
-const ATTEST_BUILD: &str = "infra:attest:build_manifest";
+const ATTEST_BUILD: &str = "infra:attest:provenance:build_manifest";
 /// A second sub-scope of `infra:attest` (a second grant, a second row id).
 const ATTEST_EVIDENCE: &str = "infra:attest:safety_battery";
 /// An `infra:*` scope the fixture charter (`infra:attest`, `infra:serve`)
@@ -223,7 +241,6 @@ fn acceptance(signer: &str, grant: &Attestation) -> Attestation {
         "id": uuid::Uuid::new_v4().to_string(),
         "dimension": crate::federation::membership_acceptance::ACCEPTANCE_DIMENSION,
         "references_attestation_id": grant.attestation_id,
-        "proposal_hash": grant.original_content_hash,
     });
     let mut r = ts::bare_attestation(
         &uuid::Uuid::new_v4().to_string(),
@@ -967,6 +984,8 @@ pub(crate) async fn i4208_host_verbs_across_four_nodes(
         "dimension": crate::federation::trust_root::TRUST_CONFERS_DIMENSION,
         "scope": [ATTEST_BUILD],
         "head": hex::encode(head),
+        // HEAD-4.rev2 — counted by its `author` (none), never by its head.
+        "author": null,
     });
     let draft = super::emit::draft_from_envelope_in(
         n1,
@@ -1709,6 +1728,8 @@ pub(crate) async fn i4211_the_engine_verbs(e: &crate::Engine) {
         "dimension": crate::federation::trust_root::TRUST_CONFERS_DIMENSION,
         "scope": [ATTEST_BUILD],
         "head": hex::encode(head),
+        // HEAD-4.rev2 — counted by its `author` (none), never by its head.
+        "author": null,
     });
     let draft = e
         .statement_draft(
@@ -2000,12 +2021,21 @@ pub(crate) async fn i4217_a_hardware_held_owner_accepts_by_draft(e: &crate::Engi
     let owner_seed: &'static str = Box::leak(owner_seed.into_boxed_str());
     let reply = drafted(owner_seed).await;
     let (_, payload) = super::liveness::statement_parts(&reply).expect("I4217: the reply reads");
+    // v62.0.0 (KR-fix32; the Constitution's ruling (A)) — a reply names the
+    // row it answers in refs.answers; refs.target is the composers' alone.
+    let named = super::names::names_of(&payload).expect("I4217: the reply's names");
     assert_eq!(
-        super::names::names_of(&payload)
-            .ok()
-            .and_then(|n| super::names::single(&n, "target")),
+        super::names::single(&named, "answers"),
         Some(row_of_id(&grant)),
-        "I4217: the drafted reply names the grant in refs.target"
+        "I4217: the drafted reply names the grant in refs.answers"
+    );
+    assert!(
+        super::names::single(&named, "target").is_none(),
+        "I4217: and not in refs.target"
+    );
+    assert!(
+        payload.get_text("proposal_hash").is_none(),
+        "I4217: and carries no proposal_hash"
     );
     let o = e
         .submit_voice(&reply)
@@ -2123,6 +2153,693 @@ pub(crate) async fn i4316_the_holders_count_retires_the_grant_on_read(d: &dyn Fe
         held(d, &target).await.is_some(),
         "I4316: the grant row still stands, as history"
     );
+}
+
+/// Holder `i` of `c`'s own AUTHORED withdrawal of `target` (one key's
+/// statement, signed with its bundle key: no count).
+fn holder_authored_withdrawal(
+    c: &TestCeremonyV2,
+    i: usize,
+    grantee: &str,
+    target: &RowId,
+    at_ms: u64,
+) -> Vec<u8> {
+    let iss = c.holder_identity_ref(i).to_owned();
+    sign_row_statement(
+        &c.holder_key(i),
+        &iss,
+        grantee,
+        attestation_type::WITHDRAWS,
+        &trust_family(),
+        &map(vec![
+            ("asserted_at", Value::Uint(at_ms)),
+            ("author", Value::Text(iss.clone())),
+            ("refs", map(vec![("target", row_ref(&target.0))])),
+        ]),
+        vec![],
+    )
+    .expect("sign a holder's authored withdrawal")
+}
+
+/// Put each of `voices` through the statement door, in order.
+async fn put_voices_in_order(d: &dyn FederationDirectory, voices: &[Vec<u8>], what: &str) {
+    for (i, v) in voices.iter().enumerate() {
+        put_statement(d, v, None, INGEST_TIER)
+            .await
+            .unwrap_or_else(|e| panic!("{what} ({}): {e}", i + 1));
+    }
+}
+
+/// The refusal [`i4322_a_withdrawal_that_is_no_count_is_refused_in_either_order`]
+/// expects: `withdraws_never_retracts`, by the error's variant and token.
+fn never_retracts(out: Result<StatementOutcome, crate::federation::Error>, what: &str) {
+    match out {
+        Err(crate::federation::Error::MalformedRow { plane, reason, .. }) => {
+            assert_eq!(
+                (plane, reason),
+                (
+                    crate::federation::admission::WITHDRAWS_PLANE,
+                    crate::federation::malformed_row::WITHDRAWS_NEVER_RETRACTS
+                ),
+                "{what}: refused by name"
+            );
+        }
+        other => panic!("{what}: refused withdraws_never_retracts, got {other:?}"),
+    }
+}
+
+/// **I4322** (KR-fix20; CC 2.4.1.1 rule 0, CC 3.1.3; the Constitution's
+/// ruling of 2026-11-22: "the count always wins"). A counted grant from the
+/// root is reached only by a count, and a voice is never withdrawn: holder 1
+/// (who signed the grant's FIRST voice) and holder 2 (its second) each sign
+/// an AUTHORED withdrawal of it. Two nodes, opposite arrival orders:
+///
+/// - node A holds the grant first: each withdrawal is REFUSED at the door
+///   (`withdraws_never_retracts`) and nothing is kept;
+/// - node B holds the withdrawals first: each waits `link_unheld`; when the
+///   grant lands it is refused on its re-fold and DROPPED (no statement, no
+///   fold record).
+///
+/// The same answer on both: no statement of either withdrawal is held, no
+/// fold record names it, the grant stands and is not withdrawn on read. A
+/// re-offer is refused on both. Then the holders' COUNT still ends the grant
+/// on both nodes (a count ending a count, stamped rule 0).
+pub(crate) async fn i4322_a_withdrawal_that_is_no_count_is_refused_in_either_order(
+    a: &dyn FederationDirectory,
+    b: &dyn FederationDirectory,
+) {
+    let c = bundle_v2();
+    let head = install_v2(a)
+        .await
+        .expect("I4322: the bundle installs on A")
+        .object_id;
+    install_v2(b)
+        .await
+        .expect("I4322: the bundle installs on B");
+    let at = grant_instant(a).await;
+    let (worker, _) = worker_with_owner(a, "i4322").await;
+    let (worker_b, _) = worker_with_owner(b, "i4322").await;
+    assert_eq!(worker, worker_b, "I4322 premise: one worker on both nodes");
+    let voices = [
+        holder_grant(c, 0, &worker, ATTEST_BUILD, &head, at),
+        holder_grant(c, 1, &worker, ATTEST_BUILD, &head, at),
+    ];
+    let target = row_of(&voices[0]);
+    let lone = [
+        holder_authored_withdrawal(c, 0, &worker, &target, at + 60_000),
+        holder_authored_withdrawal(c, 1, &worker, &target, at + 60_000),
+    ];
+
+    // Node A: the grant first, then each withdrawal: refused, nothing kept.
+    put_voices_in_order(a, &voices, "I4322 A: a holder's grant voice").await;
+    assert!(held(a, &target).await.is_some(), "I4322 A: the grant lands");
+    for (i, w) in lone.iter().enumerate() {
+        never_retracts(
+            put_statement(a, w, None, INGEST_TIER).await,
+            &format!(
+                "I4322 A: holder {}'s authored withdrawal, grant held",
+                i + 1
+            ),
+        );
+    }
+
+    // Node B: each withdrawal first: it waits for its target.
+    for (i, w) in lone.iter().enumerate() {
+        let o = put_statement(b, w, None, INGEST_TIER)
+            .await
+            .unwrap_or_else(|e| panic!("I4322 B: holder {}'s withdrawal waits: {e}", i + 1));
+        assert!(pending(&o), "I4322 B: held, the grant unheld: {o:?}");
+        assert_eq!(
+            why(b, &row_of(w)).await.as_deref(),
+            Some(super::fold::reason::LINK_UNHELD),
+            "I4322 B: holder {}'s withdrawal waits link_unheld",
+            i + 1
+        );
+    }
+    put_voices_in_order(b, &voices, "I4322 B: a holder's grant voice").await;
+
+    // The same answer on both nodes.
+    let later = || ms_now() + chrono::Duration::seconds(1);
+    for (node, d) in [("A", a), ("B", b)] {
+        for (i, w) in lone.iter().enumerate() {
+            let wid = row_of(w);
+            let what = format!("I4322 {node}: holder {}'s authored withdrawal", i + 1);
+            assert!(held(d, &wid).await.is_none(), "{what}: no row landed");
+            assert!(
+                d.fold_state(&wid).await.expect("fold_state").is_none(),
+                "{what}: no fold record (refused, or dropped when the grant arrived)"
+            );
+            assert!(
+                d.edition2_voices(&wid)
+                    .await
+                    .expect("edition2_voices")
+                    .is_empty(),
+                "{what}: no statement kept"
+            );
+            never_retracts(
+                put_statement(d, w, None, INGEST_TIER).await,
+                &format!("{what}, offered again"),
+            );
+        }
+        assert!(
+            held(d, &target).await.is_some(),
+            "I4322 {node}: the grant stands"
+        );
+        let v = crate::federation::admission::root_grants_for(d, &worker, later())
+            .await
+            .expect("I4322: root_grants_for");
+        assert!(
+            v.len() == 1 && !v[0].withdrawn,
+            "I4322 {node}: the grant is not withdrawn on read: {v:?}"
+        );
+    }
+
+    // Control: the holders' COUNT ends it on both nodes.
+    let count = [
+        holder_withdrawal(c, 0, &worker, &target, &head, at + 90_000),
+        holder_withdrawal(c, 2, &worker, &target, &head, at + 90_000),
+    ];
+    let cid = row_of(&count[0]);
+    for (node, d) in [("A", a), ("B", b)] {
+        for v in &count {
+            put_statement(d, v, None, INGEST_TIER)
+                .await
+                .unwrap_or_else(|e| panic!("I4322 {node}: a holder's counted voice: {e}"));
+        }
+        assert_eq!(
+            held(d, &cid)
+                .await
+                .unwrap_or_else(|| panic!("I4322 {node}: the holders' count lands"))
+                .withdraws_admission_rule,
+            Some(crate::federation::admission::COUNT_UNDOES_COUNTED_RULE),
+            "I4322 {node}: a count ends a count, stamped rule 0"
+        );
+    }
+}
+
+/// The instant `us` (POSIX µs) as a wall instant.
+fn at_us(us: i64) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp_micros(us).expect("an instant")
+}
+
+/// The earliest `first_held_us` of `row` on `d` (KR-fix24's "first held").
+async fn first_held(d: &dyn FederationDirectory, row: &RowId) -> i64 {
+    d.edition2_first_held_us(row)
+        .await
+        .expect("edition2_first_held_us")
+        .expect("a voice of the row is held")
+}
+
+/// Does `d` keep any voice of `row`?
+async fn kept(d: &dyn FederationDirectory, row: &RowId) -> bool {
+    !d.edition2_voices(row)
+        .await
+        .expect("edition2_voices")
+        .is_empty()
+}
+
+/// **I4323** (KR-fix24; CC 3.3.4 as ruled 2026-11-22). A counted root grant
+/// SHORT of its count (one holder's voice, `count_short`) lapses on this node
+/// when its hold window (72 h: the charter states none) has run since this
+/// node first held its first voice: not a microsecond before, and at the
+/// instant it does. Its kept voice, names and fold record are dropped and
+/// nothing is refused: the same voice offered again is held anew, with a
+/// fresh first-held instant and a fresh window. A grant that reached its
+/// count is never touched. The host verb's body (`cosign::execute_due`,
+/// what `Engine::execute_cosign_due` runs) lapses it through the clock seam.
+pub(crate) async fn i4323_a_short_counted_row_lapses_at_its_window(d: &dyn FederationDirectory) {
+    use super::fold::{hold_window_secs, lapse_short_counted_rows, DEFAULT_HOLD_WINDOW_SECS};
+    let c = bundle_v2();
+    let head = install_v2(d)
+        .await
+        .expect("I4323: the bundle installs")
+        .object_id;
+    let at = grant_instant(d).await;
+    let (worker, _) = worker_with_owner(d, "i4323").await;
+    let v0 = holder_grant(c, 0, &worker, ATTEST_BUILD, &head, at);
+    let row = row_of(&v0);
+    let o = put_statement(d, &v0, None, INGEST_TIER)
+        .await
+        .expect("I4323: one holder's voice is kept");
+    assert!(pending(&o), "I4323 premise: short of its count: {o:?}");
+    assert_eq!(
+        why(d, &row).await.as_deref(),
+        Some(super::fold::reason::COUNT_SHORT),
+        "I4323 premise: held count_short"
+    );
+    // A grant that reached its count, beside it.
+    let counted = row_of_id(&land_grant(d, c, &worker, ATTEST_EVIDENCE, &head, at, "I4323").await);
+
+    let plane = d
+        .fold_state(&row)
+        .await
+        .expect("fold_state")
+        .expect("I4323: the row's fold record")
+        .plane;
+    let window = hold_window_secs(d, &row, &plane)
+        .await
+        .expect("I4323: the window");
+    assert_eq!(
+        window, DEFAULT_HOLD_WINDOW_SECS,
+        "I4323: a root grant's window is the 72 h standing class"
+    );
+    assert_eq!(DEFAULT_HOLD_WINDOW_SECS, 259_200, "I4323: 72 hours");
+    let first = first_held(d, &row).await;
+    let due = first + window * 1_000_000;
+
+    // One microsecond before the window has run: kept.
+    let r = lapse_short_counted_rows(d, at_us(due - 1))
+        .await
+        .expect("I4323: the sweep");
+    assert!(
+        !r.lapsed.contains(&row),
+        "I4323: it does not lapse early: {r:?}"
+    );
+    assert!(
+        kept(d, &row).await,
+        "I4323: the voice is kept before the window"
+    );
+    // At the window: dropped, nothing refused.
+    let r = lapse_short_counted_rows(d, at_us(due))
+        .await
+        .expect("I4323: the sweep");
+    assert!(
+        r.lapsed.contains(&row),
+        "I4323: the short row lapses at its window: {r:?}"
+    );
+    assert!(r.statements >= 1, "I4323: its voice is deleted: {r:?}");
+    assert!(!kept(d, &row).await, "I4323: no voice kept");
+    assert!(
+        d.fold_state(&row).await.expect("fold_state").is_none(),
+        "I4323: no fold record"
+    );
+    // The counted grant: untouched, at any instant.
+    let r = lapse_short_counted_rows(d, at_us(due + 10 * window * 1_000_000))
+        .await
+        .expect("I4323: the sweep");
+    assert!(
+        !r.lapsed.contains(&counted)
+            && held(d, &counted).await.is_some()
+            && kept(d, &counted).await,
+        "I4323: a row that reached its count is never lapsed"
+    );
+
+    // Offered again: held anew, a fresh first-held instant and window.
+    let o = put_statement(d, &v0, None, INGEST_TIER)
+        .await
+        .expect("I4323: the lapse refused nothing: the voice is held again");
+    assert!(pending(&o), "I4323: short again: {o:?}");
+    let again = first_held(d, &row).await;
+    assert!(
+        again > first,
+        "I4323: first_held_us is written anew ({again} > {first})"
+    );
+    let r = lapse_short_counted_rows(d, at_us(again + window * 1_000_000 - 1))
+        .await
+        .expect("I4323: the sweep");
+    assert!(
+        !r.lapsed.contains(&row) && kept(d, &row).await,
+        "I4323: the fresh window has not run"
+    );
+
+    // The host verb's body, through the clock seam (nextest runs each test
+    // in its own process; the clock is uninstalled on the way out).
+    let fixed = std::sync::Arc::new(crate::host::clock::FixedClock::new(at_us(
+        again + window * 1_000_000,
+    )));
+    crate::host::clock::install(fixed);
+    let swept = crate::federation::cosign::execute_due(d).await;
+    crate::host::clock::uninstall();
+    swept.expect("I4323: the cosign sweep");
+    assert!(
+        !kept(d, &row).await,
+        "I4323: Engine::execute_cosign_due's sweep lapses it at the node's clock"
+    );
+}
+
+/// **I4324** (KR-fix24; CC 3.3.4: "each node counts from when IT first held
+/// the pending row"). Two nodes hold the same short voice, B a little later
+/// than A: at A's window A drops it and B keeps it; at B's window B drops it
+/// too. Each decides only what it keeps.
+pub(crate) async fn i4324_two_nodes_lapse_at_their_own_first_hold(
+    a: &dyn FederationDirectory,
+    b: &dyn FederationDirectory,
+) {
+    use super::fold::{lapse_short_counted_rows, DEFAULT_HOLD_WINDOW_SECS};
+    let c = bundle_v2();
+    let head = install_v2(a)
+        .await
+        .expect("I4324: the bundle installs on A")
+        .object_id;
+    install_v2(b)
+        .await
+        .expect("I4324: the bundle installs on B");
+    let at = grant_instant(a).await;
+    let (worker, _) = worker_with_owner(a, "i4324").await;
+    worker_with_owner(b, "i4324").await;
+    let v0 = holder_grant(c, 0, &worker, ATTEST_BUILD, &head, at);
+    let row = row_of(&v0);
+    put_statement(a, &v0, None, INGEST_TIER)
+        .await
+        .expect("I4324: A holds the voice");
+    let fa = first_held(a, &row).await;
+    // B first holds it strictly later (its own clock, its own admission).
+    while u64::try_from(crate::host::clock::now().timestamp_micros()).unwrap()
+        <= u64::try_from(fa).unwrap() + 1_000
+    {
+        tokio::task::yield_now().await;
+    }
+    put_statement(b, &v0, None, INGEST_TIER)
+        .await
+        .expect("I4324: B holds the voice");
+    let fb = first_held(b, &row).await;
+    assert!(
+        fb > fa,
+        "I4324 premise: B first held it later ({fb} > {fa})"
+    );
+    let w = DEFAULT_HOLD_WINDOW_SECS * 1_000_000;
+
+    let t = at_us(fa + w);
+    for (node, d, lapses) in [("A", a, true), ("B", b, false)] {
+        let r = lapse_short_counted_rows(d, t)
+            .await
+            .expect("I4324: the sweep");
+        assert_eq!(
+            r.lapsed.contains(&row),
+            lapses,
+            "I4324 {node}: at A's window only A drops it: {r:?}"
+        );
+        assert_eq!(kept(d, &row).await, !lapses, "I4324 {node}: what it keeps");
+    }
+    let r = lapse_short_counted_rows(b, at_us(fb + w))
+        .await
+        .expect("I4324: the sweep");
+    assert!(
+        r.lapsed.contains(&row),
+        "I4324 B: at its own window B drops it: {r:?}"
+    );
+    assert!(!kept(b, &row).await, "I4324 B: nothing kept");
+}
+
+/// **I4328** (KR-fix28; CC 3.2, as the Constitution ruled 2026-11-22: a
+/// machine grantee's acceptance is its owner's consent "as bound at the
+/// acceptance's own instant"; a re-binding is a new owner-binding row, and
+/// rows under it stand on the new owner, who has consented to nothing). A
+/// node owned by P1; P1 accepts the counted root grant; the node is re-bound
+/// to P2 (P1 withdraws its binding, P2 binds):
+///
+/// - an act dated between the acceptance and the re-binding is under the
+///   grant (the acceptance is P1's, P1 was the owner then);
+/// - an act dated after the re-binding is NOT: P1's acceptance does not
+///   carry over, P2 has accepted nothing;
+/// - P2 accepts the grant: a later act is under it again;
+/// - P1 withdraws its old acceptance after the re-binding: nothing changes
+///   for acts under P2, and the act under P1's binding keeps its standing.
+///
+/// "The binding an act names" is the binding in force at the act's instant
+/// until the head rule is in this base (then the act's `refs.head`).
+pub(crate) async fn i4328_a_rebound_node_needs_its_new_owners_acceptance(
+    d: &dyn FederationDirectory,
+) {
+    use crate::federation::admission::{machine_owner_binding_at, root_grant_of, MachineOwner};
+    let c = bundle_v2();
+    let head = install_v2(d)
+        .await
+        .expect("I4328: the bundle installs")
+        .object_id;
+    let at = grant_instant(d).await;
+    let (worker, p1) = worker_with_owner(d, "i4328").await;
+    let worker_seed = "w-i4328";
+    let p2 = "o2-i4328";
+    e2::put_key(d, p2, &["user"]).await;
+    let grant = land_grant(d, c, &worker, ATTEST_BUILD, &head, at, "I4328").await;
+    let under = |t: DateTime<Utc>| {
+        let g = grant.clone();
+        async move {
+            root_grant_of(d, &g, t)
+                .await
+                .expect("root_grant_of")
+                .expect("I4328: a counted root grant")
+                .accepted
+        }
+    };
+    let ms = |m: i64| chrono::Duration::milliseconds(m);
+
+    // P1 accepts.
+    let acc1 = acceptance(&p1, &grant);
+    e2::put_signed(d, &acc1)
+        .await
+        .expect("I4328: P1's acceptance is admitted");
+    let acc1 = d
+        .get_attestation(&e2::rid(&acc1))
+        .await
+        .expect("reads")
+        .expect("I4328: P1's acceptance landed");
+    let t_acc = acc1.asserted_at;
+    let binding1 = match machine_owner_binding_at(d, &worker, t_acc)
+        .await
+        .expect("I4328: the binding reads")
+    {
+        MachineOwner::Bound { owner, bindings } => {
+            assert_eq!(owner, e2::kid(&p1), "I4328 premise: P1 owns the node");
+            bindings
+        }
+        other => panic!("I4328 premise: the node is bound: {other:?}"),
+    };
+    let t_mid = t_acc + ms(1);
+    assert!(
+        under(t_mid).await,
+        "I4328: an act under P1's binding counts"
+    );
+
+    // Re-bind to P2: P1 withdraws its binding, then P2 binds, at stated instants.
+    let b1 = d
+        .get_attestation(&binding1[0])
+        .await
+        .expect("reads")
+        .expect("I4328: P1's binding row");
+    let t_w = t_acc + ms(2);
+    let t_b2 = t_acc + ms(3);
+    let t_after = t_acc + ms(4);
+    let w = e2::composer_of_at(attestation_type::WITHDRAWS, &b1, &p1, t_w);
+    e2::put_signed(d, &w)
+        .await
+        .expect("I4328: P1 withdraws its binding");
+    assert!(
+        d.get_attestation(&e2::rid(&w))
+            .await
+            .expect("reads")
+            .is_some(),
+        "I4328 premise: P1's withdrawal of its binding landed"
+    );
+    let mut b2 = ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), p2, worker_seed);
+    b2.asserted_at = t_b2;
+    b2.scrub_timestamp = t_b2;
+    ts::seal_row_in_place(p2, &mut b2);
+    ts::put_sealed_owner_binding(d, &b2, worker_seed)
+        .await
+        .expect("I4328: P2 binds the node");
+    match machine_owner_binding_at(d, &worker, t_after)
+        .await
+        .expect("I4328: the binding reads")
+    {
+        MachineOwner::Bound { owner, bindings } => {
+            assert_eq!(owner, e2::kid(p2), "I4328 premise: P2 owns the node now");
+            assert_ne!(bindings, binding1, "I4328 premise: a new binding row");
+        }
+        other => panic!("I4328 premise: the node is re-bound: {other:?}"),
+    }
+    assert!(
+        !under(t_after).await,
+        "I4328: an act under P2's binding is not under the grant: P2 accepted nothing"
+    );
+    assert!(
+        under(t_mid).await,
+        "I4328: the act under P1's binding keeps its standing"
+    );
+
+    // P2 accepts; a later act counts again.
+    while crate::host::clock::now() <= t_after {
+        tokio::task::yield_now().await;
+    }
+    let acc2 = acceptance(p2, &grant);
+    e2::put_signed(d, &acc2)
+        .await
+        .expect("I4328: P2's acceptance is admitted");
+    let acc2 = d
+        .get_attestation(&e2::rid(&acc2))
+        .await
+        .expect("reads")
+        .expect("I4328: P2's acceptance landed");
+    assert!(
+        under(acc2.asserted_at + ms(1)).await,
+        "I4328: once P2 accepts, an act under P2's binding is under the grant"
+    );
+
+    // P1 withdraws its old acceptance after the re-binding.
+    let t_l = acc2.asserted_at + ms(2);
+    let wa = e2::composer_of_at(attestation_type::WITHDRAWS, &acc1, &p1, t_l);
+    e2::put_signed(d, &wa)
+        .await
+        .expect("I4328: P1 withdraws its old acceptance");
+    assert!(
+        under(t_l + ms(1)).await,
+        "I4328: P1's withdrawal changes nothing for acts under P2"
+    );
+    assert!(
+        under(t_mid).await,
+        "I4328: and the act under P1's binding still counts as of its instant"
+    );
+}
+
+/// Offer the ceremony `c`'s bundle at the import door, under its anchor.
+async fn offer_bundle(
+    d: &dyn FederationDirectory,
+    c: &TestCeremonyV2,
+) -> Result<super::genesis::GenesisAdmission, crate::federation::Error> {
+    super::genesis::add_test_attestation_root(super::fixture_genesis::mock_attestation_root_der());
+    let mut statements: Vec<Vec<u8>> = c
+        .rows_in_put_order()
+        .into_iter()
+        .map(|r| r.statement.clone())
+        .collect();
+    statements.extend(c.voices.iter().cloned());
+    super::genesis::put_genesis_bundle(d, &statements, Some(&c.anchor())).await
+}
+
+/// The baked genesis offered at the import door under its PINNED anchor
+/// (`genesis::baked_genesis_anchor`), whatever the store already holds (the
+/// boot import, `import_baked_genesis`, offers it only to an empty store).
+async fn offer_baked(d: &dyn FederationDirectory) {
+    let (name, bytes) = super::genesis::BAKED_BUNDLES
+        .first()
+        .expect("I4329: a baked bundle");
+    let statements = super::genesis::baked_statements(bytes)
+        .unwrap_or_else(|| panic!("I4329: the baked bundle {name} decodes"));
+    super::genesis::put_genesis_bundle(
+        d,
+        &statements,
+        Some(&super::genesis::baked_genesis_anchor()),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("I4329: the baked bundle is placed: {e:?}"));
+}
+
+/// The pinned (baked) bundle's object id.
+fn pinned_oid() -> Digest32 {
+    let mut oid = [0u8; 32];
+    hex::decode_to_slice(super::genesis::BAKED_GENESIS_OBJECT_ID, &mut oid).expect("64 hex");
+    oid
+}
+
+/// **I4329** (KR-fix27, KR-fix27b; the Constitution's ruling of 2026-11-22:
+/// one lineage per store is a v62.0 limit, and "a first bundle with a
+/// DIFFERENT `family_key_id` is ANOTHER ROOT, not a fork"; the lead's
+/// correction: the root family is the PINNED ANCHOR's, never arrival order).
+///
+/// - **Both orders converge:** store A holds a Valid first bundle of ANOTHER
+///   family (`kr-i4329-another-root`) BEFORE the pinned baked genesis; store
+///   B holds the baked genesis first, then the other. Both root in the
+///   baked bundle's family, its bundle is the head, there is no fork, and
+///   the other is `other_roots` and out of `valid`.
+/// - **No pinned bundle, two families:** store C holds the fixture root and
+///   the other family's bundle: no family is the root, nothing is in force
+///   (no head, nothing `valid`), both are `other_roots`, no fork.
+/// - **Control (unchanged):** store D, two first bundles of the SAME family:
+///   a fork of the genesis (no head, `Fork::Genesis`), no other root.
+pub(crate) async fn i4329_another_family_is_another_root_not_a_fork(
+    a: &dyn FederationDirectory,
+    b: &dyn FederationDirectory,
+    c_store: &dyn FederationDirectory,
+    control: &dyn FederationDirectory,
+) {
+    use super::fixture_genesis::{ceremony_v2, CeremonySpec};
+    let c = bundle_v2();
+    let spec = CeremonySpec {
+        family_key_id: "kr-i4329-another-root".to_owned(),
+        ..c.spec.clone()
+    };
+    let other = ceremony_v2(&spec);
+    let pinned = pinned_oid();
+    assert_ne!(other.object_id, pinned, "I4329 premise: another bundle");
+
+    // A: the other family FIRST, then the pinned bundle. B: the reverse.
+    offer_bundle(a, &other)
+        .await
+        .expect("I4329 A: the other family's bundle is not refused");
+    offer_baked(a).await;
+    offer_baked(b).await;
+    offer_bundle(b, &other)
+        .await
+        .expect("I4329 B: the other family's bundle is not refused");
+    let mut families = Vec::new();
+    for (node, d) in [("A", a), ("B", b)] {
+        let g = genesis_in_force(d)
+            .await
+            .expect("I4329: the genesis in force");
+        assert!(g.forks.is_empty(), "I4329 {node}: no fork: {:?}", g.forks);
+        assert_eq!(
+            g.head.as_ref().map(|h| h.object_id),
+            Some(pinned),
+            "I4329 {node}: the head is the pinned anchor's bundle, whichever arrived first"
+        );
+        assert_eq!(
+            g.other_roots,
+            vec![other.object_id],
+            "I4329 {node}: the other family's first bundle is \"not a root this store holds\""
+        );
+        assert!(
+            g.valid.iter().all(|p| p.object_id != other.object_id),
+            "I4329 {node}: and is not in the store's Valid lineage"
+        );
+        families.push(g.family_key_id().map(str::to_owned));
+    }
+    assert_eq!(
+        families[0], families[1],
+        "I4329: both orders converge on one root family"
+    );
+
+    // C: two families, neither the pinned bundle: no root, nothing in force.
+    install_v2(c_store)
+        .await
+        .expect("I4329 C: the fixture root installs");
+    offer_bundle(c_store, &other)
+        .await
+        .expect("I4329 C: the other family's bundle is not refused");
+    let g = genesis_in_force(c_store)
+        .await
+        .expect("I4329 C: the genesis in force");
+    let mut both = vec![c.object_id, other.object_id];
+    both.sort();
+    assert!(
+        g.head.is_none() && g.valid.is_empty() && g.forks.is_empty(),
+        "I4329 C: no pinned bundle among two families: nothing in force, no fork: {g:?}"
+    );
+    assert_eq!(g.other_roots, both, "I4329 C: both are other roots");
+
+    // D (control): the SAME family, another first bundle: a fork.
+    install_v2(control)
+        .await
+        .expect("I4329 control: the fixture root installs");
+    let sibling = ceremony_v2(&CeremonySpec::at(c.spec.t0_ms - 86_400_000));
+    assert_ne!(sibling.object_id, c.object_id, "I4329 control premise");
+    let _ = offer_bundle(control, &sibling).await;
+    let g = genesis_in_force(control)
+        .await
+        .expect("I4329 control: the genesis in force");
+    assert!(
+        g.valid.iter().any(|p| p.object_id == sibling.object_id),
+        "I4329 control: the same-family sibling is placed Valid: {g:?}"
+    );
+    assert!(
+        g.head.is_none()
+            && g.forks
+                .iter()
+                .any(|f| matches!(f, super::genesis::Fork::Genesis { .. })),
+        "I4329 control: two first bundles of ONE family are a fork: {:?}",
+        g.forks
+    );
+    assert!(g.other_roots.is_empty(), "I4329 control: no other root");
 }
 
 /// The statement `seed` signs outside the Engine over a draft.
@@ -2272,9 +2989,20 @@ pub(crate) async fn i4313_the_owner_withdraws_the_acceptance(e: &crate::Engine) 
         .await
         .expect("I4313: the owner's second acceptance is admitted");
     let g = the_grant(e, &worker, later(), "I4313").await;
+    let first_rid = RowId(
+        hex::decode(&first)
+            .expect("a hex row id")
+            .try_into()
+            .expect("32 bytes"),
+    );
+    // KR-fix29 — on a red, name the first acceptance's fold state (the
+    // build of 01ba09cb lost it; see P/KR-red-4vt.md).
     assert!(
         g.accepted && g.confers,
-        "I4313: a re-acceptance of the same grant confers again: {g:?}"
+        "I4313: a re-acceptance of the same grant confers again: {g:?}; the first acceptance: \
+         row {:?}, fold state {:?}",
+        d.get_attestation(&first).await.map(|r| r.is_some()),
+        d.fold_state(&first_rid).await
     );
     let second = g.acceptance_row_id.expect("I4313: the second acceptance");
     assert_ne!(
@@ -2416,10 +3144,19 @@ pub(crate) async fn i4314_a_hardware_owner_withdraws_the_acceptance_by_draft(e: 
     );
 
     // From then on, and not before.
+    let first_rid = RowId(
+        hex::decode(&first)
+            .expect("a hex row id")
+            .try_into()
+            .expect("32 bytes"),
+    );
+    // KR-fix29 — on a red, name the acceptance's fold state.
     assert!(
         accepted_at(at(1_000)).await && accepted_at(at(1_999)).await,
         "I4314: as of an instant BEFORE the withdrawal the consent stood: an act taken under \
-         the grant then still verifies"
+         the grant then still verifies; the acceptance: row {:?}, fold state {:?}",
+        d.get_attestation(&first).await.map(|r| r.is_some()),
+        d.fold_state(&first_rid).await
     );
     assert!(
         !accepted_at(at(2_000)).await && !accepted_at(at(3_000)).await,
@@ -2548,6 +3285,8 @@ pub(crate) async fn i4315_only_the_holders_count_withdraws_the_grant(e: &crate::
         .expect("I4315: the withdrawal envelope");
     let o = envelope.as_object_mut().expect("I4315: an object");
     o.insert("head".to_owned(), serde_json::json!(hex::encode(head)));
+    // HEAD-4.rev2 — the holders' count states no `author`.
+    o.insert("author".to_owned(), serde_json::Value::Null);
     o.insert(
         "cohort_scope".to_owned(),
         serde_json::json!(grant.cohort_scope),
@@ -2580,18 +3319,30 @@ pub(crate) async fn i4315_only_the_holders_count_withdraws_the_grant(e: &crate::
     };
     let v0 = voice(0).await;
     let wid = row_of(&v0);
-    assert_eq!(
-        wid,
-        row_of(&holder_withdrawal(
-            c,
-            0,
-            &worker,
-            &target,
-            &head,
-            at + 60_000
-        )),
-        "I4315: the Engine's draft is the counted withdrawal (no author, refs.head, refs.target)"
-    );
+    // KR-fix29 — the draft is judged by its SHAPE (no author, refs.head =
+    // the bundle, refs.target = the grant), not against the fixture's bytes:
+    // the Engine's withdrawal envelope carries members the fixture's
+    // two-member payload does not, so the row ids differ without either
+    // being wrong (the build of 01ba09cb: 20d166fc… against f66c62c3…).
+    {
+        let (_, payload) =
+            super::liveness::statement_parts(&v0).expect("I4315: the draft is a statement");
+        let names = super::names::names_of(&payload).expect("I4315: the draft's names");
+        assert!(
+            payload.get_text("author").is_none(),
+            "I4315: the Engine's draft is COUNTED (no author)"
+        );
+        assert_eq!(
+            super::names::single(&names, "head").map(|h| h.0),
+            Some(head),
+            "I4315: the draft names the bundle as refs.head"
+        );
+        assert_eq!(
+            super::names::single(&names, "target"),
+            Some(target),
+            "I4315: the draft names the grant as refs.target"
+        );
+    }
     let o = e
         .submit_voice(&v0)
         .await
@@ -2633,6 +3384,301 @@ pub(crate) async fn i4315_only_the_holders_count_withdraws_the_grant(e: &crate::
     );
 }
 
+/// **I4340** (KR-fix32; the Constitution's ruling (A) of 2026-11-22, CC
+/// 2.6.1.3; CC 3.2 "a conferral is two consents"). The grantee node's OWNER
+/// DECLINES a counted root grant through the one reply builder
+/// (`membership_acceptance::reply_input`, emitted through the statement
+/// door): the decline lands naming the grant in `refs.answers` (no
+/// `refs.target`, no `proposal_hash`); the grant never confers; a later
+/// acceptance by the same owner is held `membership_reply_conflict` and the
+/// grant still does not confer. The first witness of a decline of a grant.
+pub(crate) async fn i4340_the_owner_declines_a_root_grant(d: &dyn FederationDirectory) {
+    use super::second_signer_voice::VoiceOutcome;
+    use crate::federation::attestation_emit::emit_statement;
+    use crate::federation::membership_acceptance::reply_input;
+    let c = bundle_v2();
+    let head = install_v2(d)
+        .await
+        .expect("I4340: the bundle installs")
+        .object_id;
+    let (worker, owner) = worker_with_owner(d, "i4340").await;
+    let grant = land_grant(
+        d,
+        c,
+        &worker,
+        ATTEST_BUILD,
+        &head,
+        grant_instant(d).await,
+        "I4340",
+    )
+    .await;
+    let declined = emit_statement(
+        d,
+        &ts::local_signer(&owner),
+        reply_input(&grant, false),
+        None,
+    )
+    .await
+    .expect("I4340: the owner's decline is admitted");
+    assert!(
+        matches!(declined.outcome, VoiceOutcome::Seated { .. }),
+        "I4340: the decline lands: {:?}",
+        declined.outcome
+    );
+    let row = d
+        .get_attestation(&declined.attestation_id)
+        .await
+        .expect("I4340: read the decline")
+        .expect("I4340: the decline is held");
+    let st = e2::carried_statement(&row).expect("I4340: the decline carries its statement");
+    let (_, payload) = super::liveness::statement_parts(&st).expect("I4340: a statement");
+    let named = super::names::names_of(&payload).expect("I4340: the decline's names");
+    assert_eq!(
+        super::names::single(&named, "answers"),
+        Some(row_of_id(&grant)),
+        "I4340: the decline names the grant in refs.answers"
+    );
+    assert!(
+        super::names::single(&named, "target").is_none(),
+        "I4340: and not in refs.target"
+    );
+    assert!(
+        payload.get_text("proposal_hash").is_none(),
+        "I4340: and carries no proposal_hash"
+    );
+    let later = || ms_now() + chrono::Duration::seconds(1);
+    let accepted = || async {
+        root_grant_of(d, &grant, later())
+            .await
+            .expect("root_grant_of")
+            .expect("I4340: a counted root grant")
+            .accepted
+    };
+    assert!(!accepted().await, "I4340: a declined grant does not confer");
+    match emit_statement(
+        d,
+        &ts::local_signer(&owner),
+        reply_input(&grant, true),
+        None,
+    )
+    .await
+    {
+        Ok(e) => match e.outcome {
+            VoiceOutcome::Waiting { reason, .. } => assert_eq!(
+                reason,
+                super::fold::reason::MEMBERSHIP_REPLY_CONFLICT,
+                "I4340: the later acceptance is held by name"
+            ),
+            other => panic!("I4340: an acceptance after the decline must not land: {other:?}"),
+        },
+        Err(e) => assert!(
+            e.to_string()
+                .contains(super::fold::reason::MEMBERSHIP_REPLY_CONFLICT),
+            "I4340: refused as a reply conflict: {e}"
+        ),
+    }
+    assert!(
+        !accepted().await,
+        "I4340: still no conferral after the conflicting acceptance"
+    );
+}
+
+/// **I4341** (KR-fix32). A membership reply that names its grant in
+/// `refs.target` (the composer role) in place of `refs.answers` is REFUSED at
+/// the statement door, `edition2_payload_invalid` … `malformed:refs`, and
+/// nothing is kept: the door never reads a `target` as the answered row.
+pub(crate) async fn i4341_a_reply_naming_its_grant_as_target_is_refused(
+    d: &dyn FederationDirectory,
+) {
+    let c = bundle_v2();
+    let head = install_v2(d)
+        .await
+        .expect("I4341: the bundle installs")
+        .object_id;
+    let (worker, owner) = worker_with_owner(d, "i4341").await;
+    let grant = land_grant(
+        d,
+        c,
+        &worker,
+        ATTEST_BUILD,
+        &head,
+        grant_instant(d).await,
+        "I4341",
+    )
+    .await;
+    let iss = e2::kid(&owner);
+    let at = u64::try_from(ms_now().timestamp_millis()).expect("after 1970");
+    let payload = map(vec![
+        ("asserted_at", Value::Uint(at)),
+        ("author", Value::Text(iss.clone())),
+        (
+            "dimension",
+            Value::Text(crate::federation::membership_acceptance::ACCEPTANCE_DIMENSION.into()),
+        ),
+        ("refs", map(vec![("target", row_ref(&row_of_id(&grant).0))])),
+    ]);
+    let st = sign_row_statement(
+        &e2::signing_key(&owner),
+        &iss,
+        &worker,
+        attestation_type::SCORES,
+        &namespace_match::family_id("membership:{stage}"),
+        &payload,
+        vec![],
+    )
+    .expect("I4341: sign the faulty reply");
+    let out = put_statement(d, &st, None, INGEST_TIER).await;
+    match &out {
+        Err(e) => assert!(
+            e.to_string().contains("malformed:refs"),
+            "I4341: refused by the malformed-refs label: {e}"
+        ),
+        Ok(o) => panic!("I4341: a reply naming its grant as refs.target must be refused: {o:?}"),
+    }
+    assert!(
+        held(d, &row_of(&st)).await.is_none(),
+        "I4341: nothing is kept"
+    );
+}
+
+/// **I4342** (KR-fix32b; the Constitution's ruling of 2026-11-22). A reply
+/// that names its grant correctly in `refs.answers` but CARRIES
+/// `proposal_hash` (a member of the earlier form) is REFUSED at the statement
+/// door, `edition2_payload_invalid` … `malformed:proposal_hash` (the member
+/// named), and nothing is kept.
+pub(crate) async fn i4342_a_reply_carrying_proposal_hash_is_refused(d: &dyn FederationDirectory) {
+    let c = bundle_v2();
+    let head = install_v2(d)
+        .await
+        .expect("I4342: the bundle installs")
+        .object_id;
+    let (worker, owner) = worker_with_owner(d, "i4342").await;
+    let grant = land_grant(
+        d,
+        c,
+        &worker,
+        ATTEST_BUILD,
+        &head,
+        grant_instant(d).await,
+        "I4342",
+    )
+    .await;
+    let iss = e2::kid(&owner);
+    let at = u64::try_from(ms_now().timestamp_millis()).expect("after 1970");
+    let payload = map(vec![
+        ("asserted_at", Value::Uint(at)),
+        ("author", Value::Text(iss.clone())),
+        (
+            "dimension",
+            Value::Text(crate::federation::membership_acceptance::ACCEPTANCE_DIMENSION.into()),
+        ),
+        ("proposal_hash", Value::Text(grant.attestation_id.clone())),
+        (
+            "refs",
+            map(vec![("answers", row_ref(&row_of_id(&grant).0))]),
+        ),
+    ]);
+    let st = sign_row_statement(
+        &e2::signing_key(&owner),
+        &iss,
+        &worker,
+        attestation_type::SCORES,
+        &namespace_match::family_id("membership:{stage}"),
+        &payload,
+        vec![],
+    )
+    .expect("I4342: sign the faulty reply");
+    match put_statement(d, &st, None, INGEST_TIER).await {
+        Err(e) => assert!(
+            e.to_string().contains("malformed:proposal_hash"),
+            "I4342: refused naming the member: {e}"
+        ),
+        Ok(o) => panic!("I4342: a reply carrying proposal_hash must be refused: {o:?}"),
+    }
+    assert!(
+        held(d, &row_of(&st)).await.is_none(),
+        "I4342: nothing is kept"
+    );
+}
+
+/// **I4343** (KR-fix32's composer guard; the Constitution's ruling (A)). The
+/// acceptor's OWN withdrawal of its acceptance (the envelope
+/// `Engine::withdraw_statement` builds, `withdrawal_envelope_of`, through the
+/// one producer) states its target in `refs.target`, the acceptance, and
+/// carries NO `refs.answers`: a composer's `references_attestation_id` is
+/// never read through the reply's `answers` entry of its family. The same
+/// guard covers a `deferral:response` composer, whose family has the same
+/// `answers` entry.
+pub(crate) async fn i4343_the_acceptors_withdrawal_targets_the_acceptance(
+    d: &dyn FederationDirectory,
+) {
+    use super::second_signer_voice::VoiceOutcome;
+    use crate::federation::attestation_emit::emit_statement;
+    use crate::federation::membership_acceptance::{reply_input, withdrawal_envelope_of};
+    let c = bundle_v2();
+    let head = install_v2(d)
+        .await
+        .expect("I4343: the bundle installs")
+        .object_id;
+    let (worker, owner) = worker_with_owner(d, "i4343").await;
+    let grant = land_grant(
+        d,
+        c,
+        &worker,
+        ATTEST_BUILD,
+        &head,
+        grant_instant(d).await,
+        "I4343",
+    )
+    .await;
+    let acc = emit_statement(
+        d,
+        &ts::local_signer(&owner),
+        reply_input(&grant, true),
+        None,
+    )
+    .await
+    .expect("I4343: the owner's acceptance is admitted");
+    let acc_row = d
+        .get_attestation(&acc.attestation_id)
+        .await
+        .expect("I4343: read the acceptance")
+        .expect("I4343: the acceptance is held");
+    let envelope = withdrawal_envelope_of(&acc_row).expect("I4343: the withdrawal envelope");
+    let mut input = crate::federation::EmitAttestationInput::with_envelope(
+        attestation_type::WITHDRAWS,
+        crate::federation::envelope::EnvelopeCore::from_value(envelope)
+            .expect("I4343: an envelope core"),
+        acc_row.cohort_scope.clone(),
+    );
+    input.attested_key_id = Some(acc_row.attested_key_id.clone());
+    let w = emit_statement(d, &ts::local_signer(&owner), input, None)
+        .await
+        .expect("I4343: the owner withdraws the acceptance");
+    assert!(
+        matches!(w.outcome, VoiceOutcome::Seated { .. }),
+        "I4343: the withdrawal lands: {:?}",
+        w.outcome
+    );
+    let w_row = d
+        .get_attestation(&w.attestation_id)
+        .await
+        .expect("I4343: read the withdrawal")
+        .expect("I4343: the withdrawal is held");
+    let st = e2::carried_statement(&w_row).expect("I4343: the withdrawal's statement");
+    let (_, payload) = super::liveness::statement_parts(&st).expect("I4343: a statement");
+    let named = super::names::names_of(&payload).expect("I4343: the withdrawal's names");
+    assert_eq!(
+        super::names::single(&named, "target"),
+        Some(row_of_id(&acc_row)),
+        "I4343: the withdrawal names the ACCEPTANCE in refs.target"
+    );
+    assert!(
+        super::names::single(&named, "answers").is_none(),
+        "I4343: and carries no refs.answers"
+    );
+}
+
 #[cfg(feature = "sqlite")]
 mod sqlite {
     use crate::store::Backend as _;
@@ -2657,6 +3703,22 @@ mod sqlite {
     on_one!(
         i4200_two_holders_confer_on_a_node_worker_sqlite,
         i4200_two_holders_confer_on_a_node_worker
+    );
+    on_one!(
+        i4340_the_owner_declines_a_root_grant_sqlite,
+        i4340_the_owner_declines_a_root_grant
+    );
+    on_one!(
+        i4341_a_reply_naming_its_grant_as_target_is_refused_sqlite,
+        i4341_a_reply_naming_its_grant_as_target_is_refused
+    );
+    on_one!(
+        i4342_a_reply_carrying_proposal_hash_is_refused_sqlite,
+        i4342_a_reply_carrying_proposal_hash_is_refused
+    );
+    on_one!(
+        i4343_the_acceptors_withdrawal_targets_the_acceptance_sqlite,
+        i4343_the_acceptors_withdrawal_targets_the_acceptance
     );
     on_one!(
         i4201_either_order_of_holders_sqlite,
@@ -2815,6 +3877,46 @@ mod sqlite {
         ))
         .await;
     }
+
+    #[tokio::test]
+    async fn i4329_another_family_is_another_root_not_a_fork_sqlite() {
+        Box::pin(super::i4329_another_family_is_another_root_not_a_fork(
+            &store().await,
+            &store().await,
+            &store().await,
+            &store().await,
+        ))
+        .await;
+    }
+
+    on_one!(
+        i4328_a_rebound_node_needs_its_new_owners_acceptance_sqlite,
+        i4328_a_rebound_node_needs_its_new_owners_acceptance
+    );
+    on_one!(
+        i4323_a_short_counted_row_lapses_at_its_window_sqlite,
+        i4323_a_short_counted_row_lapses_at_its_window
+    );
+
+    #[tokio::test]
+    async fn i4324_two_nodes_lapse_at_their_own_first_hold_sqlite() {
+        Box::pin(super::i4324_two_nodes_lapse_at_their_own_first_hold(
+            &store().await,
+            &store().await,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn i4322_a_withdrawal_that_is_no_count_is_refused_in_either_order_sqlite() {
+        Box::pin(
+            super::i4322_a_withdrawal_that_is_no_count_is_refused_in_either_order(
+                &store().await,
+                &store().await,
+            ),
+        )
+        .await;
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -2843,6 +3945,22 @@ mod postgres {
     on_one!(
         i4200_two_holders_confer_on_a_node_worker_postgres,
         i4200_two_holders_confer_on_a_node_worker
+    );
+    on_one!(
+        i4340_the_owner_declines_a_root_grant_postgres,
+        i4340_the_owner_declines_a_root_grant
+    );
+    on_one!(
+        i4341_a_reply_naming_its_grant_as_target_is_refused_postgres,
+        i4341_a_reply_naming_its_grant_as_target_is_refused
+    );
+    on_one!(
+        i4342_a_reply_carrying_proposal_hash_is_refused_postgres,
+        i4342_a_reply_carrying_proposal_hash_is_refused
+    );
+    on_one!(
+        i4343_the_acceptors_withdrawal_targets_the_acceptance_postgres,
+        i4343_the_acceptors_withdrawal_targets_the_acceptance
     );
     on_one!(
         i4201_either_order_of_holders_postgres,
@@ -3017,5 +4135,44 @@ mod postgres {
             return;
         };
         Box::pin(super::i4203_two_nodes_one_verdict(&a, &b)).await;
+    }
+
+    #[tokio::test]
+    async fn i4329_another_family_is_another_root_not_a_fork_postgres() {
+        let (Some(a), Some(b), Some(c), Some(d)) =
+            (store().await, store().await, store().await, store().await)
+        else {
+            return;
+        };
+        Box::pin(super::i4329_another_family_is_another_root_not_a_fork(
+            &a, &b, &c, &d,
+        ))
+        .await;
+    }
+
+    on_one!(
+        i4328_a_rebound_node_needs_its_new_owners_acceptance_postgres,
+        i4328_a_rebound_node_needs_its_new_owners_acceptance
+    );
+    on_one!(
+        i4323_a_short_counted_row_lapses_at_its_window_postgres,
+        i4323_a_short_counted_row_lapses_at_its_window
+    );
+
+    #[tokio::test]
+    async fn i4324_two_nodes_lapse_at_their_own_first_hold_postgres() {
+        let (Some(a), Some(b)) = (store().await, store().await) else {
+            return;
+        };
+        Box::pin(super::i4324_two_nodes_lapse_at_their_own_first_hold(&a, &b)).await;
+    }
+
+    #[tokio::test]
+    async fn i4322_a_withdrawal_that_is_no_count_is_refused_in_either_order_postgres() {
+        let (Some(a), Some(b)) = (store().await, store().await) else {
+            return;
+        };
+        Box::pin(super::i4322_a_withdrawal_that_is_no_count_is_refused_in_either_order(&a, &b))
+            .await;
     }
 }

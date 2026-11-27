@@ -415,7 +415,7 @@ mod tests {
                 "id": id,
                 // v62.0.0 (E5) — the earlier form (held tests) keeps its own.
                 "dimension": if e2::emit_edition2() {
-                    "evidence:safety_battery:capture:a:b:v1"
+                    "coherence_standing:cab:v1"
                 } else {
                     "identity_binding:v1"
                 },
@@ -3235,6 +3235,7 @@ mod tests {
                         reason: Some("storage-only membership op stays ungated".into()),
                         witness_set: Vec::new(),
                         persist_row_hash: String::new(),
+                        record_row_id: None,
                     },
                 );
             let head = gf::held_head(&b, &no).await.map(|(h, _)| h);
@@ -3905,9 +3906,9 @@ mod tests {
         .await
         .expect("put_conferred_key: capability_roots_to_trusted_root");
         assert!(
-            rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
+            rooted.as_ref().is_some_and(|g| g.root_key_id == r.lineage),
             "put_conferred_key: {key_id}'s {scope} roots at {} through node {node}: {rooted:?}",
-            r.root
+            r.lineage
         );
     }
 

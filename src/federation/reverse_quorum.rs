@@ -360,8 +360,18 @@ pub const ESCALATE_INFIX: &str = "+escalate:";
 /// Envelope field names shared by the producer side and persist's fold, so
 /// the two cannot disagree about where a reference lives.
 pub mod field {
-    /// The objected-to action's `attestation_id`.
+    /// The objected-to action's `attestation_id` — the EARLIER-FORM member.
+    /// v62.0.0 (KR-fix34a; KR-fix34b) — every assent / raised vote names its
+    /// object in [`ANSWERS`] (stated as `refs.answers`), a roster event by
+    /// its record's row id; the door REFUSES this member on them
+    /// (`malformed:objects_to_attestation_id`). Only the dismissal / ballot
+    /// rows still carry it, which KR-fix35 deletes.
     pub const OBJECTS_TO: &str = "objects_to_attestation_id";
+    /// v62.0.0 (KR-fix34a; CC 2.6.1.3, the Constitution's ruling (a)) — the
+    /// row an `objection:assent` / `objection:raised` vote ANSWERS: stated as
+    /// `refs.answers` (`edition2::payloads::REF_MEMBERS`), read back by the
+    /// earlier gates under this envelope member, as a membership reply's is.
+    pub const ANSWERS: &str = "references_attestation_id";
     /// The objection's own `attestation_id` — on a DISMISSAL envelope, which
     /// objection is being dismissed.
     pub const DISMISSES: &str = "dismisses_objection_id";
@@ -1430,7 +1440,7 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
         if envelope_str(o, "dimension") != Some(DIMENSION_OBJECTION) {
             continue;
         }
-        if envelope_str(o, field::OBJECTS_TO) != Some(action.action_id) {
+        if objected_object(o) != Some(action.action_id) {
             continue;
         }
         let Some(person) = persons
@@ -1682,6 +1692,11 @@ fn escalate_objection(
 /// producer and this node's fold agree byte-for-byte about where the
 /// references live.
 #[must_use]
+///
+/// v62.0.0 (KR-fix34a; KR-fix34b) — the action is a ROW, by its row id: an
+/// attestation's, or a ROSTER EVENT's (the counted change its typed record
+/// projects, `record_row_id`). Named under [`field::ANSWERS`], stated as
+/// `refs.answers`.
 pub fn objection_envelope(
     cohort: Cohort,
     cohort_key_id: &str,
@@ -1692,9 +1707,18 @@ pub fn objection_envelope(
         "dimension": DIMENSION_OBJECTION,
         field::COHORT: cohort.as_str(),
         field::COHORT_KEY_ID: cohort_key_id,
-        field::OBJECTS_TO: action_attestation_id,
+        field::ANSWERS: action_attestation_id,
         field::GROUNDS: grounds,
     })
+}
+
+/// v62.0.0 (KR-fix34a; KR-fix34b) — **the object an assent / raised vote
+/// names**: the row it answers ([`field::ANSWERS`], from `refs.answers`). An
+/// attestation and a roster event alike are named by their ROW ID (a roster
+/// event's is its record's `record_row_id`). The one reader every fold asks.
+#[must_use]
+pub fn objected_object(row: &Attestation) -> Option<&str> {
+    envelope_str(row, field::ANSWERS)
 }
 
 /// Build the canonical envelope of a **dismissal**. Every co-signer signs
@@ -1864,7 +1888,7 @@ where
 #[must_use]
 pub(crate) fn objection_action(row: &Attestation) -> Option<String> {
     (envelope_str(row, "dimension") == Some(DIMENSION_OBJECTION) && is_vote_row(row))
-        .then(|| envelope_str(row, field::OBJECTS_TO).map(str::to_owned))
+        .then(|| objected_object(row).map(str::to_owned))
         .flatten()
 }
 
@@ -1930,7 +1954,17 @@ where
                         | DIMENSION_UPHELD
                         | DIMENSION_OVERRULED
                 )
-            ) && envelope_str(r, field::OBJECTS_TO) == Some(action.action_id)
+            ) && {
+                // v62.0.0 (KR-fix34a) — an objection names its object through
+                // `objected_object`; the dismissal and ballot rows still name
+                // the act in the earlier member (KR-fix34a leaves them).
+                let object = if envelope_str(r, "dimension") == Some(DIMENSION_OBJECTION) {
+                    objected_object(r)
+                } else {
+                    envelope_str(r, field::OBJECTS_TO)
+                };
+                object == Some(action.action_id)
+            }
         })
         .collect())
 }

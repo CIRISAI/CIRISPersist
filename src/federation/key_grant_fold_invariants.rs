@@ -78,7 +78,7 @@ where
 {
     ts::register_hybrid_key_as(n.backend, occ, occ, USER).await;
     n.backend
-        .put_identity_occurrence_local(IdentityOccurrence {
+        .test_seam_put_identity_occurrence(IdentityOccurrence {
             identity_key_id: e2::kid(ident),
             occurrence_key_id: e2::kid(occ),
             device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -327,17 +327,20 @@ where
     );
     leave(n, &comm, &rex, removed_at, &[&rex, &alice, &bob, &eve]).await;
     n.backend
-        .put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-            identity_key_id: e2::kid(&eve),
-            occurrence_key_id: e1.clone(),
-            // After the occurrence was asserted (a revocation older than the
-            // occurrence it names is re-established past), in effect now.
-            revoked_at: chrono::Utc::now(),
-            effective_at: chrono::Utc::now(),
-            reason: None,
-            witness_set: vec![e2::kid(&eve)],
-            persist_row_hash: String::new(),
-        })
+        .put_identity_occurrence_revocation_edition2(
+            IdentityOccurrenceRevocation {
+                identity_key_id: e2::kid(&eve),
+                occurrence_key_id: e1.clone(),
+                // After the occurrence was asserted (a revocation older than the
+                // occurrence it names is re-established past), in effect now.
+                revoked_at: chrono::Utc::now(),
+                effective_at: chrono::Utc::now(),
+                reason: None,
+                witness_set: vec![e2::kid(&eve)],
+                persist_row_hash: String::new(),
+            },
+            crate::federation::DoorToken::new(),
+        )
         .await
         .unwrap_or_else(|e| panic!("{tag}: eve revokes d1: {e}"));
     Room {

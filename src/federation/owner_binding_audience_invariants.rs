@@ -81,10 +81,12 @@ pub(crate) mod bodies {
         }
         ts::register_hybrid_key_as(d, &node, &node, identity_type::NODE).await;
         reg(d, &[&room, &fam]).await;
-        found_community(d, &room, "quorum:1/1", &[&owner, &peer], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let room = found_community(d, &room, "quorum:1/1", &[&owner, &peer], &[])
             .await
             .unwrap();
-        found_family(d, &fam, "founder_only", &[&owner], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let fam = found_family(d, &fam, "founder_only", &[&owner], &[])
             .await
             .unwrap();
         // v62.0.0 (flip wave 2, E5) — every key and group is named by its

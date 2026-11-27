@@ -12,6 +12,11 @@
 //!   `W_self`, and lands after it on `self_roster::execute_for`.
 //! - I3048–I3049 (S1b, `eviction_body`): an edition-2 eviction through the
 //!   two paths; a proposer's own withdrawal; the deterministic proposer.
+//! - I4325 (KR-fix24): the counted rows' hold-window sweep does not age a
+//!   held self-roster addition (CC 3.3.6.4 gives it its own course).
+//! - I4327 (KR-fix20b): the proposer withdraws an OPEN proposal, an eviction
+//!   or an addition, in either order; a landed revocation is never
+//!   withdrawn.
 //! - I3047 (objection): a strict majority of the OTHER roster keys objecting
 //!   (`objection:raised` statements naming the bind's row id) keeps the lone
 //!   path shut after the window.
@@ -209,7 +214,8 @@ async fn open(d: &dyn FederationDirectory, u: &str) -> Vec<String> {
 }
 
 /// `voter`'s objection to the proposal `row` of the self `u`: an
-/// `objection:raised:v1` statement (CC 3.1.9.2), its `vote_envelope` members.
+/// `objection:raised:v1` statement (CC 3.1.9.2), its `vote_envelope` members
+/// (the proposal in `refs.answers`, KR-fix34a).
 fn objection(voter: &CompositeSigningKey, u: &str, row: &RowId, at: u64) -> Vec<u8> {
     let v = iref(voter);
     let payload = map(vec![
@@ -221,7 +227,15 @@ fn objection(voter: &CompositeSigningKey, u: &str, row: &RowId, at: u64) -> Vec<
         ("confidence", Value::Uint(1_000_000)),
         ("cohort", Value::Text("self".to_owned())),
         ("cohort_key_id", Value::Text(u.to_owned())),
-        ("objects_to_attestation_id", Value::Text(row.hex())),
+        // v62.0.0 (KR-fix34a; CC 2.6.1.3) — the proposal it answers, in
+        // `refs.answers` (the earlier `objects_to_attestation_id` is gone).
+        (
+            "refs",
+            map(vec![(
+                "answers",
+                ciris_verify_core::edition2::row_ref(&row.0),
+            )]),
+        ),
         ("grounds", Value::Text(String::new())),
     ]);
     sign_row_statement(
@@ -321,6 +335,354 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
         !active(d, &u, &iref(&d4)).await,
         "I3047: a majority of the others objecting shuts the lone path"
     );
+}
+
+/// **I4325** (KR-fix24; CC 3.3.6.4, as ruled 2026-11-22: "the self-roster
+/// bind is NOT aged by this rule"). A self-roster addition held for its
+/// second roster key (one voice, the self's) is not dropped by the counted
+/// rows' hold-window sweep, even long after 72 hours and after the lone
+/// path's own window: its course is the self-roster door's
+/// (`self_roster::execute_due`), not CC 3.3.4's.
+pub(crate) async fn lone_bind_not_aged_body(d: &dyn FederationDirectory) {
+    let (user, d1, d2) = (key(135), key(136), key(137));
+    for k in [&user, &d1, &d2] {
+        put(d, &key_record(k, &["user"], 0, None)).await.unwrap();
+    }
+    let u = iref(&user);
+    let t = now_ms() - 3_600_000;
+    let (out, _) = propose(d, &u, &user, &d1, t).await;
+    assert!(
+        matches!(out, StatementOutcome::Row { .. }),
+        "I4325 premise: one key lands"
+    );
+    let (out, row) = propose(d, &u, &user, &d2, t + 1).await;
+    assert!(
+        matches!(out, StatementOutcome::Pending { .. }),
+        "I4325 premise: at two keys the add is held: {out:?}"
+    );
+    let late = crate::host::clock::now()
+        + chrono::Duration::seconds(super::fold::DEFAULT_HOLD_WINDOW_SECS + sr::W_SELF_SECS + 60);
+    let r = super::fold::lapse_short_counted_rows(d, late)
+        .await
+        .expect("I4325: the sweep");
+    assert!(
+        !r.lapsed.contains(&row),
+        "I4325: the self-roster bind is not aged by the counted rows' window: {r:?}"
+    );
+    assert!(
+        !d.edition2_voices(&row).await.unwrap().is_empty(),
+        "I4325: its voices are kept"
+    );
+    assert_eq!(
+        open(d, &u).await,
+        vec![row.hex()],
+        "I4325: the proposal is still open on this node"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i4325_sqlite() {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(lone_bind_not_aged_body(&b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i4325_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::empty_dsn() else {
+        return;
+    };
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(lone_bind_not_aged_body(&b)).await;
+}
+
+/// The proposer `u`'s `withdraws` of the proposal `target` (a row of
+/// `family`, about `sub`), authored, at `at`.
+fn proposer_withdraws(u: &str, family: &str, sub: &str, target: &RowId, at: u64) -> Vec<u8> {
+    use super::fixture_switch as e2;
+    let uk = e2::kid(u);
+    sign_row_statement(
+        &e2::signing_key(u),
+        &uk,
+        sub,
+        "withdraws",
+        family,
+        &map(vec![
+            ("asserted_at", Value::Uint(at)),
+            ("author", Value::Text(uk.clone())),
+            (
+                "refs",
+                map(vec![(
+                    "target",
+                    ciris_verify_core::edition2::row_ref(&target.0),
+                )]),
+            ),
+        ]),
+        vec![],
+    )
+    .unwrap()
+}
+
+/// The shared roster of I4327's nodes: user `u` with `d1` bound (two keys).
+async fn i4327_roster(d: &dyn FederationDirectory, u: &str, d1: &str, d2: &str, at: u64) {
+    use super::fixture_occurrence::{put_bind, BindOptions};
+    use super::fixture_switch as e2;
+    for s in [u, d1, d2] {
+        e2::put_key(d, s, &["user"]).await;
+    }
+    let opts = BindOptions {
+        asserted_at_ms: at,
+        ..BindOptions::default()
+    };
+    assert!(
+        matches!(
+            put_bind(d, u, u, d1, "laptop", &opts).await,
+            Ok(StatementOutcome::Row { .. })
+        ),
+        "I4327 premise: d1 joins u's roster"
+    );
+}
+
+/// Is `out` the refusal `withdraws_never_retracts` (variant and token)?
+fn never_retracts(out: &Result<StatementOutcome, Error>) -> bool {
+    matches!(
+        out,
+        Err(Error::MalformedRow { reason, .. })
+            if *reason == crate::federation::malformed_row::WITHDRAWS_NEVER_RETRACTS
+    )
+}
+
+/// **I4327** (KR-fix20b; CC 3.3.6.4, as ruled 2026-11-22: "the withdrawal
+/// rule should follow what the row IS (a proposal), not where it is kept").
+/// A self-roster proposal is its proposer's authored row: the proposer
+/// withdraws it while it is OPEN, for an EVICTION and for an ADDITION. A
+/// LANDED revocation is never withdrawn. A withdrawal counts at a node only
+/// if the node holds it before the proposal lands there. Two nodes, sqlite
+/// and postgres:
+///
+/// - **eviction, node A, withdrawal FIRST:** it waits (`link_unheld`); the
+///   eviction proposal arrives, the withdrawal lands (`Row`) and the
+///   proposal is no longer open; past `W_self` the lone path lands nothing:
+///   d1 stays a roster key;
+/// - **eviction, node B, revocation FIRST:** the proposal lands by the lone
+///   path past its window (the roster clock seam); then the withdrawal is
+///   REFUSED `withdraws_never_retracts`, nothing kept; d1 stays evicted;
+/// - **addition, both orders:** u proposes d2 at two keys; the withdrawal
+///   lands whether it arrives after the proposal (A) or before it (B), and
+///   past `W_self` d2 never joins.
+///
+/// NOT WITNESSED (stated in KR-fix20b.md): "then B's revocation reaches A and
+/// A converges to revoked". A lone-path landing is node-local; no row tells
+/// A that B landed it.
+pub(crate) async fn i4327_a_proposer_withdraws_an_open_proposal(
+    a: &dyn FederationDirectory,
+    b: &dyn FederationDirectory,
+) {
+    use super::fixture_occurrence::{occurrence_bind_voices, BindOptions};
+    use super::fixture_switch as e2;
+    use super::occurrence::OCCURRENCE_REVOCATION_FAMILY;
+    use crate::federation::types::IdentityOccurrenceRevocation;
+    let (u, d1, d2) = ("kr-i4327-u", "kr-i4327-d1", "kr-i4327-d2");
+    let t = now_ms() - 3_600_000;
+    i4327_roster(a, u, d1, d2, t).await;
+    i4327_roster(b, u, d1, d2, t).await;
+    let uk = e2::kid(u);
+    assert_eq!(
+        head(a, &uk).await,
+        head(b, &uk).await,
+        "I4327 premise: one roster head on both nodes"
+    );
+
+    // ── EVICTION ──────────────────────────────────────────────────────────
+    let now = crate::host::clock::now();
+    let rev = IdentityOccurrenceRevocation {
+        identity_key_id: uk.clone(),
+        occurrence_key_id: e2::kid(d1),
+        revoked_at: now,
+        effective_at: now,
+        reason: None,
+        witness_set: Vec::new(),
+        persist_row_hash: String::new(),
+    };
+    let voice = revocation_voice(a, u, &rev, now_ms()).await;
+    let evict = RowId::of_statement(&voice).unwrap();
+    let w_evict = proposer_withdraws(
+        u,
+        OCCURRENCE_REVOCATION_FAMILY,
+        &e2::kid(d1),
+        &evict,
+        now_ms() + 1,
+    );
+
+    // A: the withdrawal first, then the proposal.
+    let o = put(a, &w_evict).await;
+    assert!(
+        matches!(o, Ok(StatementOutcome::Pending { .. })),
+        "I4327 A: the withdrawal waits for the proposal: {o:?}"
+    );
+    let o = put(a, &voice).await;
+    assert!(
+        matches!(o, Ok(StatementOutcome::Pending { .. })),
+        "I4327 A: the eviction is a held proposal at two keys: {o:?}"
+    );
+    assert!(
+        !open(a, &uk).await.contains(&evict.hex()),
+        "I4327 A: the proposer's withdrawal, held first, closed the proposal"
+    );
+    assert!(
+        super::fold::why_held(a, &RowId::of_statement(&w_evict).unwrap())
+            .await
+            .unwrap()
+            .is_none(),
+        "I4327 A: the withdrawal landed (no longer held)"
+    );
+    // B: the proposal first; it lands by the lone path past its window.
+    let o = put(b, &voice).await;
+    assert!(
+        matches!(o, Ok(StatementOutcome::Pending { .. })),
+        "I4327 B: the eviction is a held proposal: {o:?}"
+    );
+    advance(sr::W_SELF_SECS + 1);
+    sr::execute_for(a, &uk).await.unwrap();
+    sr::execute_for(b, &uk).await.unwrap();
+    reset_clock();
+    assert!(
+        active(a, &uk, &e2::kid(d1)).await,
+        "I4327 A: a withdrawn eviction never lands"
+    );
+    assert!(
+        !active(b, &uk, &e2::kid(d1)).await,
+        "I4327 B: the eviction landed by the lone path"
+    );
+    // B: the withdrawal after the revocation landed: refused, nothing kept.
+    let out = put(b, &w_evict).await;
+    assert!(
+        never_retracts(&out),
+        "I4327 B: a landed revocation is never withdrawn: {out:?}"
+    );
+    let wid = RowId::of_statement(&w_evict).unwrap();
+    assert!(
+        b.fold_state(&wid).await.unwrap().is_none()
+            && b.edition2_voices(&wid).await.unwrap().is_empty(),
+        "I4327 B: nothing of the refused withdrawal is kept"
+    );
+    assert!(
+        !active(b, &uk, &e2::kid(d1)).await,
+        "I4327 B: the revocation stands"
+    );
+
+    // ── ADDITION (on A, whose roster is still {u, d1}) in both orders ──────
+    let opts = BindOptions {
+        asserted_at_ms: now_ms() - 1_000,
+        head: Some(head(a, &uk).await),
+        ..BindOptions::default()
+    };
+    let voices = occurrence_bind_voices(u, u, d2, "laptop", &opts);
+    let add = RowId::of_statement(&voices[0]).unwrap();
+    let w_add = proposer_withdraws(u, OCCURRENCE_FAMILY, &e2::kid(d2), &add, now_ms() + 2);
+    // Proposal first, then the withdrawal (A).
+    for v in &voices {
+        put(a, v).await.unwrap();
+    }
+    assert!(open(a, &uk).await.contains(&add.hex()), "I4327 add A: held");
+    assert!(
+        matches!(put(a, &w_add).await, Ok(StatementOutcome::Row { .. })),
+        "I4327 add A: the proposer's withdrawal lands"
+    );
+    assert!(
+        !open(a, &uk).await.contains(&add.hex()),
+        "I4327 add A: the proposal is closed"
+    );
+    // Withdrawal first, then the proposal: `i4327_add_withdrawal_first`.
+    advance(sr::W_SELF_SECS + 1);
+    sr::execute_for(a, &uk).await.unwrap();
+    reset_clock();
+    assert!(
+        !active(a, &uk, &e2::kid(d2)).await,
+        "I4327 add A: a withdrawn addition never lands"
+    );
+}
+
+/// **I4327 (add, withdrawal first)** — on one store: the proposer's
+/// withdrawal of an addition, held BEFORE the proposal, waits for it and
+/// lands when it arrives; past `W_self` the addition never lands.
+pub(crate) async fn i4327_add_withdrawal_first(d: &dyn FederationDirectory) {
+    use super::fixture_occurrence::{occurrence_bind_voices, BindOptions};
+    use super::fixture_switch as e2;
+    let (u, d1, d2) = ("kr-i4327-u", "kr-i4327-d1", "kr-i4327-d2");
+    i4327_roster(d, u, d1, d2, now_ms() - 3_600_000).await;
+    let uk = e2::kid(u);
+    let opts = BindOptions {
+        asserted_at_ms: now_ms() - 1_000,
+        head: Some(head(d, &uk).await),
+        ..BindOptions::default()
+    };
+    let voices = occurrence_bind_voices(u, u, d2, "laptop", &opts);
+    let add = RowId::of_statement(&voices[0]).unwrap();
+    let w_add = proposer_withdraws(u, OCCURRENCE_FAMILY, &e2::kid(d2), &add, now_ms() + 2);
+    let o = put(d, &w_add).await;
+    assert!(
+        matches!(o, Ok(StatementOutcome::Pending { .. })),
+        "I4327 add B: the withdrawal waits for the proposal: {o:?}"
+    );
+    for v in &voices {
+        put(d, v).await.unwrap();
+    }
+    assert!(
+        !open(d, &uk).await.contains(&add.hex()),
+        "I4327 add B: the withdrawal, held first, closed the proposal"
+    );
+    advance(sr::W_SELF_SECS + 1);
+    sr::execute_for(d, &uk).await.unwrap();
+    reset_clock();
+    assert!(
+        !active(d, &uk, &e2::kid(d2)).await,
+        "I4327 add B: a withdrawn addition never lands"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i4327_sqlite() {
+    use crate::store::Backend as _;
+    let fresh = || async {
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        b
+    };
+    let (a, b) = (fresh().await, fresh().await);
+    Box::pin(i4327_a_proposer_withdraws_an_open_proposal(&a, &b)).await;
+    Box::pin(i4327_add_withdrawal_first(&fresh().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i4327_postgres() {
+    use crate::store::Backend as _;
+    let fresh = || async {
+        let dsn = crate::test_pg::empty_dsn()?;
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Some(b)
+    };
+    let (Some(a), Some(b), Some(c)) = (fresh().await, fresh().await, fresh().await) else {
+        return;
+    };
+    Box::pin(i4327_a_proposer_withdraws_an_open_proposal(&a, &b)).await;
+    Box::pin(i4327_add_withdrawal_first(&c)).await;
 }
 
 #[cfg(feature = "sqlite")]
