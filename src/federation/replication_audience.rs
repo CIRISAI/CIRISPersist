@@ -1030,7 +1030,73 @@ impl Verdict {
 /// 5. the commons, or a public group;
 /// 6. the row's cohort [`audience_nodes`] contains the recipient;
 /// 7. else no.
+///
+/// v62.0.0 (BIND-6; CC 5.3.4, the lead's ruling (c) and Edge's accepted
+/// proposal) — **the rooted wait is this check's**: a commons row that waits
+/// (`edition2::serve::row_waits_unrooted`: not a bootstrap kind, not an
+/// allegiance row) reaches a recipient that is no party to it (arms 1–2 are
+/// asked first, so its origin and the keys it refers to are exempt, as the
+/// statement serve's `commons_servable` exempts the row's parties) only once
+/// this node is rooted. It surfaces as `No(Reason::NotInAudience)`: no new
+/// variant. This node itself as the recipient (the put-time gate) and
+/// persist's own reads (`edition2::serve::as_internal_read`) never wait.
+/// Rooting is read at most ONCE per [`ServeRooting`] handle and only after
+/// the pure row test says the row waits: this form reads it at most once per
+/// call; a sweep passes one handle to [`may_receive_with`].
 pub async fn may_receive<D>(dir: &D, recipient: &str, row: &Attestation) -> Result<Verdict, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    may_receive_with(dir, recipient, row, &ServeRooting::new()).await
+}
+
+/// v62.0.0 (BIND-6) — **this node's rooting, read at most once** for every
+/// [`may_receive_with`] call that shares the handle (one advertise sweep, one
+/// Deliver batch). [`ServeRooting::known`] takes a flag the caller already
+/// read ([`crate::federation::edition2::serve::serve_standing`]).
+#[derive(Debug, Default)]
+pub struct ServeRooting(std::sync::OnceLock<bool>);
+
+impl ServeRooting {
+    /// A handle that reads this node's rooting the first time a waiting row
+    /// asks.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A handle with the rooting already read.
+    #[must_use]
+    pub fn known(rooted: bool) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(rooted);
+        Self(cell)
+    }
+
+    async fn rooted<D>(&self, dir: &D) -> Result<bool, Error>
+    where
+        D: FederationDirectory + ?Sized,
+    {
+        if let Some(r) = self.0.get() {
+            return Ok(*r);
+        }
+        let r = Box::pin(super::edition2::serve::rooted_for_serve(dir)).await?;
+        let _ = self.0.set(r);
+        Ok(r)
+    }
+}
+
+/// v62.0.0 (BIND-6) — [`may_receive`] with a [`ServeRooting`] handle shared
+/// across a sweep, so the rooting is read once per sweep, not once per row.
+///
+/// # Errors
+/// Directory reads.
+pub async fn may_receive_with<D>(
+    dir: &D,
+    recipient: &str,
+    row: &Attestation,
+    rooting: &ServeRooting,
+) -> Result<Verdict, Error>
 where
     D: FederationDirectory + ?Sized,
 {
@@ -1153,6 +1219,19 @@ where
         }
         return Ok(Verdict::No(Reason::NotInAudience));
     }
+    // v62.0.0 (BIND-4; Constitution: an ALLEGIANCE row is the owner's
+    // acceptance edge(s), and the node's owner binding ONLY where placed at
+    // federation) — an owner binding placed at another commons scope
+    // (`species`, `biosphere`) reaches its own parties (above) and nobody
+    // else: it is not the public audience's.
+    if (super::admission::is_any_owner_binding_envelope(&row.attestation_envelope)
+        || super::admission::owner_binding_marker(&row.attestation_envelope))
+        && cs::Scope::parse(&row.cohort_scope).map(cs::Scope::placement)
+            == Some(cs::Placement::Commons)
+        && row.cohort_scope != super::types::cohort_scope::FEDERATION
+    {
+        return Ok(Verdict::No(Reason::NotInAudience));
+    }
     let target = match super::admission::envelope_cohort_target(&row.attestation_envelope) {
         Ok(t) => t,
         Err(_) => return Ok(Verdict::No(Reason::Malformed)),
@@ -1161,6 +1240,24 @@ where
         // A key-grant row to its recipient (the arm above kept only those):
         // refers-to, governed by the audience.
         Audience::Everyone if key_set => Ok(Verdict::Yes(Reason::RefersTo)),
+        // v62.0.0 (BIND-6) — the rooted wait: after the pure row test, the
+        // rooting read once per handle.
+        Audience::Everyone
+            if super::edition2::serve::row_waits_unrooted(row)
+                && dir.node_key_id().as_deref() != Some(recipient)
+                // v62.0.0 (BIND-6b) — this node's owner's acceptance edge
+                // crosses (a directory read, after the pure test).
+                && Box::pin(super::edition2::serve::row_waits_unrooted_here(dir, row)).await?
+                && !rooting.rooted(dir).await? =>
+        {
+            tracing::debug!(
+                reason = super::edition2::serve::SERVE_WAITS_FOR_ROOTED,
+                recipient,
+                attestation_id = %row.attestation_id,
+                "a commons row waits: this node's own standing chain reaches no root"
+            );
+            Ok(Verdict::No(Reason::NotInAudience))
+        }
         Audience::Everyone => Ok(Verdict::Yes(Reason::Public)),
         a if a.contains(recipient) && key_set => Ok(Verdict::Yes(Reason::RefersTo)),
         a if a.contains(recipient) => Ok(Verdict::Yes(Reason::Cohort)),

@@ -990,7 +990,8 @@ mod engine_bodies {
                 let id = e
                     .put_custody_ack(&sha, CustodyState::Here, Some(scope), named, None)
                     .await
-                    .unwrap_or_else(|e| panic!("I512 {what} target {named:?}: {e}"));
+                    .unwrap_or_else(|e| panic!("I512 {what} target {named:?}: {e}"))
+                    .into_row_id();
                 let row = stored(ba, &id).await;
                 // v62.0.0 (T2) — the projected custody envelope names a family by
                 // `family_id` (T2-fix2), a room by `community_id`.
@@ -1041,7 +1042,7 @@ mod engine_bodies {
             "the ladder's subscriber is B's key"
         );
         let at_ms = u64::try_from(at.timestamp_millis()).expect("after the epoch");
-        let st = e2::delivery_receipt_statement(&b_seed, sid, 0, 1, root, at_ms);
+        let st = e2::delivery_ack_statement(&b_seed, sid, 0, 1, root, at_ms);
         match e2::put_statement(l.ba.as_dyn_directory(), &st)
             .await
             .expect("B's receipt is stored")
@@ -1336,7 +1337,8 @@ mod engine_bodies {
         let id = e
             .put_custody_ack(&p.at_rest_sha256, CustodyState::Here, None, None, None)
             .await
-            .unwrap_or_else(|e| panic!("I525 plaintext room, at the content's scope: {e}"));
+            .unwrap_or_else(|e| panic!("I525 plaintext room, at the content's scope: {e}"))
+            .into_row_id();
         let row = stored(ba, &id).await;
         assert_eq!(
             row.cohort_scope,
@@ -1499,7 +1501,8 @@ mod engine_bodies {
         let id = e
             .put_custody_ack(&sha, CustodyState::Here, None, None, None)
             .await
-            .unwrap_or_else(|e| panic!("I579 the report at the content's scope: {e}"));
+            .unwrap_or_else(|e| panic!("I579 the report at the content's scope: {e}"))
+            .into_row_id();
         let row = stored(ba, &id).await;
         assert_eq!(
             row.cohort_scope,
@@ -1729,7 +1732,8 @@ mod engine_bodies {
         let id = shared
             .put_custody_ack(&root, CustodyState::Here, None, None, None)
             .await
-            .unwrap_or_else(|e| panic!("I514 the node reports a DAG it holds whole: {e}"));
+            .unwrap_or_else(|e| panic!("I514 the node reports a DAG it holds whole: {e}"))
+            .into_row_id();
         let row = stored(l.ba.as_ref(), &id).await;
         assert_eq!(
             row.attesting_key_id, l.node_a,

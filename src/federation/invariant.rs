@@ -549,9 +549,12 @@ mod tests {
                 backend
                     .set_node_key_id(crate::federation::edition2::fixture_switch::kid("wia-node"));
                 for scope in [
-                    crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+                    // v62.0.0 (D3) — the assurance duties (CC 3.4.7).
+                    crate::federation::types::delegation_scope::ASSURE_AGE,
+                    crate::federation::types::delegation_scope::ASSURE_CAPACITY,
                     crate::federation::types::delegation_scope::INFRA_DETECT,
-                    crate::federation::types::delegation_scope::INFRA_RECORD_HARD_CASE,
+                    // v62.0.0 (D2) — `infra:record_hard_case` is the OWNER's to
+                    // confer now (`confer_from_owner` below), never a root's.
                 ] {
                     crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
                         &backend,
@@ -563,6 +566,28 @@ mod tests {
                     .await;
                 }
             }
+        }
+        // v62.0.0 (D1, D2; CC 3.4.3, CC 3.4.7) — the substrate self-report
+        // families and `hard_case:` open to NO label: their "required
+        // identity" leg is a `node` key holding `infra:attest` (and, for a row
+        // about another party, `infra:record_hard_case`) from its owner (the
+        // one fixture, `confer_from_owner`; rootless). A `substrate_persist`
+        // key is refused like any other key that is no node.
+        #[cfg(any(feature = "sqlite", feature = "postgres"))]
+        {
+            register(&backend, "wia-right-node", identity_type::NODE).await;
+            crate::federation::admission::r2_test_support::confer_from_owner(
+                &backend,
+                "wia-node-owner",
+                "wia-right-node",
+                &[
+                    crate::federation::types::delegation_scope::INFRA_ATTEST,
+                    // v62.0.0 (D2) — the `hard_case:` fact's leg is a row about
+                    // another party: `infra:record_hard_case`, from the owner.
+                    crate::federation::types::delegation_scope::INFRA_RECORD_HARD_CASE,
+                ],
+            )
+            .await;
         }
 
         for fact in RESERVED_FACTS {
@@ -628,7 +653,8 @@ mod tests {
             // The REFUSAL direction above still runs on every build, so this
             // leg keeps proving the half it can: the wrong identity is rejected.
             #[cfg(not(any(feature = "sqlite", feature = "postgres")))]
-            if fact.sample_attestation_type.starts_with("hard_case:")
+            if self_report
+                || fact.sample_attestation_type.starts_with("hard_case:")
                 || crate::federation::admission::default_reserved_prefix_rules()
                     .iter()
                     .any(|r| {
@@ -646,13 +672,27 @@ mod tests {
                 // the conferral this build cannot sign.
                 continue;
             }
-            let right_key = format!("wia-right-{}", fact.required_identity_type);
-            let right = fix_attestation(
+            let owner_conferred =
+                self_report || fact.sample_attestation_type.starts_with("hard_case:");
+            let right_key = if owner_conferred {
+                "wia-right-node".to_owned()
+            } else {
+                format!("wia-right-{}", fact.required_identity_type)
+            };
+            let mut right = fix_attestation(
                 "wia-att",
                 fact.sample_attestation_type,
                 &right_key,
                 &about(right_key.as_str()),
             );
+            // v62.0.0 (D1) — the duty is read at the row's own instant, and
+            // the owner binding is dated inside the node's key window (30 days
+            // before today): the fixture's fixed 2026-05-01 precedes it.
+            if owner_conferred {
+                right.asserted_at = crate::federation::admission::truncate_to_substrate_resolution(
+                    chrono::Utc::now(),
+                );
+            }
             check_reserved_prefix_admission(&backend, &right)
                 .await
                 .unwrap_or_else(|e| {

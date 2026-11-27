@@ -64,8 +64,20 @@ pub mod refusal {
     /// A v59 typed cirisnode envelope (self-signed, carrying its contributor
     /// id) offered at a door that now takes a row's body.
     pub const TYPED_OBJECT_RETIRED: &str = "cirisnode_typed_object_retired";
+    /// v62.0.0 (CN-fix1.r62; Constitution, FREEZE 486) — a Contribution
+    /// carrying a `witness_set`. Each witness's "signature" is
+    /// caller-supplied, pair-shaped bytes nothing verifies (no key is named,
+    /// no signed bytes are defined), and no verdict reads the set. An
+    /// unverified witness set is not stored: the body is refused and nothing
+    /// is planned.
+    pub const CONTRIBUTION_WITNESS_SET_UNVERIFIED: &str =
+        "cirisnode_contribution_witness_set_unverified";
     /// Every token.
-    pub const ALL: &[&str] = &[KEY_GRANT_RETIRED, TYPED_OBJECT_RETIRED];
+    pub const ALL: &[&str] = &[
+        KEY_GRANT_RETIRED,
+        TYPED_OBJECT_RETIRED,
+        CONTRIBUTION_WITNESS_SET_UNVERIFIED,
+    ];
 }
 
 /// The `contribution:{subject_kind}` family stem.
@@ -138,7 +150,10 @@ pub struct ContributionInput {
     pub subject: Cell,
     /// Subject-kind-specific payload (`SCHEMA.md` §4).
     pub payload: serde_json::Value,
-    /// Witness set for high-stakes contributions.
+    /// v62.0.0 (CN-fix1.r62) — kept on the input only so a body naming it is
+    /// refused BY NAME (`cirisnode_contribution_witness_set_unverified`)
+    /// rather than as an unknown member. A present `witness_set` is never
+    /// admitted and never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub witness_set: Option<WitnessSet>,
 }
@@ -406,17 +421,21 @@ async fn held_on_family(
 
 /// **A Contribution as a row** (CC 2.1): `contribution:{subject_kind}`,
 /// score `+1`, the body under `contribution_type` / `subject_kind` /
-/// `domain` / `language` / `payload` / `witness_set`. A
+/// `domain` / `language` / `payload` (a `witness_set` is refused, v62.0.0
+/// CN-fix1.r62). A
 /// `federation_announcement` keeps its constitutional asymmetry (FSD §4.5);
 /// a `takedown_notice` is the notice row ([`plan_takedown_notice_row`],
 /// routed by the door); `key_grant` is retired.
 ///
 /// # Errors
 ///
-/// [`Error::Retired`] for `key_grant`; [`Error::InvalidArgument`] for a
-/// missing or non-vocabulary subject kind, a `takedown_notice` (its own
-/// planner), or an announcement that breaks the asymmetry.
+/// [`Error::Retired`] for `key_grant` and for a present `witness_set`
+/// (`cirisnode_contribution_witness_set_unverified`);
+/// [`Error::InvalidArgument`] for a missing or non-vocabulary subject kind,
+/// a `takedown_notice` (its own planner), or an announcement that breaks the
+/// asymmetry.
 pub fn plan_contribution_row(c: &ContributionInput) -> Result<EmitAttestationInput, Error> {
+    refuse_unverified_witness_set(c)?;
     let subject_kind = c.subject.subject.as_deref().ok_or_else(|| {
         Error::InvalidArgument("subject.subject (subject_kind) is required".into())
     })?;
@@ -439,19 +458,39 @@ pub fn plan_contribution_row(c: &ContributionInput) -> Result<EmitAttestationInp
     super::federation_announcement::extract_announcement_payload(subject_kind, &c.payload)?;
     let ct = serde_json::to_value(c.contribution_type)
         .map_err(|e| Error::Internal(format!("contribution_type: {e}")))?;
-    let mut members = serde_json::json!({
+    let members = serde_json::json!({
         "contribution_type": ct,
         "subject_kind": subject_kind,
         "domain": c.subject.domain,
         "language": c.subject.language,
         "payload": c.payload,
     });
-    if let Some(ws) = &c.witness_set {
-        members["witness_set"] =
-            serde_json::to_value(ws).map_err(|e| Error::Internal(format!("witness_set: {e}")))?;
-    }
     let dimension = format!("{CONTRIBUTION_PREFIX}{subject_kind}:v1");
     Ok(input(envelope(members, &dimension, 1.0)?))
+}
+
+/// v62.0.0 (CN-fix1.r62; Constitution, FREEZE 486: "an unverified
+/// witness_set must NOT be stored") — a body carrying a `witness_set` is
+/// refused by name before anything is planned, so nothing is stored or
+/// served. Persist has no key, signed bytes or count for the set; a witness
+/// that endorses a Contribution does so as its own edition-2 voice over the
+/// row (not built).
+///
+/// # Errors
+///
+/// [`Error::Retired`] with `cirisnode_contribution_witness_set_unverified`.
+fn refuse_unverified_witness_set(c: &ContributionInput) -> Result<(), Error> {
+    if c.witness_set.is_none() {
+        return Ok(());
+    }
+    Err(Error::Retired {
+        token: refusal::CONTRIBUTION_WITNESS_SET_UNVERIFIED,
+        detail: "a Contribution's `witness_set` is not admitted: its witnesses' signatures are \
+                 unverified caller-supplied bytes (no key, no signed bytes) and no verdict \
+                 reads the set; a witness endorses a Contribution as its own edition-2 voice \
+                 over the row"
+            .into(),
+    })
 }
 
 /// **A takedown notice as a row** (CC 3.1.1 / CC 3.3.2, CIRISPersist#803;
@@ -742,6 +781,9 @@ pub fn plan_any_contribution(
     c: &ContributionInput,
     signer_key_id: &str,
 ) -> Result<EmitAttestationInput, Error> {
+    // v62.0.0 (CN-fix1.r62) — before either planner: a takedown body naming a
+    // witness set is refused by name too, never silently dropped.
+    refuse_unverified_witness_set(c)?;
     if c.subject.subject.as_deref() == Some(TAKEDOWN_NOTICE_SUBJECT_KIND) {
         let p: TakedownNoticePayload = serde_json::from_value(c.payload.clone())
             .map_err(|e| Error::InvalidArgument(format!("takedown_notice payload shape: {e}")))?;
@@ -912,7 +954,11 @@ impl crate::Engine {
     /// Sign `row` with this engine's own composed hybrid signer and put it
     /// through the plane's door. Returns the row's `attestation_id`.
     async fn cirisnode_emit(&self, row: EmitAttestationInput) -> Result<String, Error> {
-        self.emit_attestation_self(row).await.map_err(Error::from)
+        // VD-step2b: this verb still answers the row id alone.
+        self.emit_attestation_self(row)
+            .await
+            .map(crate::federation::edition2::second_signer_voice::VoiceOutcome::into_row_id)
+            .map_err(Error::from)
     }
 
     async fn cirisnode_signer_key_id(&self) -> Result<String, Error> {

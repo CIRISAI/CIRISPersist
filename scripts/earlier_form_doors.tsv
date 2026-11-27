@@ -98,7 +98,7 @@ pyo3	put_blob	edition2	store/sqlite.rs::put_blob > store/sqlite.rs::put_blob_wit
 pyo3	put_blob_signing	exempt	-	node-local bytes or tier data under this node's own signer; no signed object is admitted
 pyo3	put_calibration_bundle	composite	derived/calibration_admit.rs::verify_calibration_bundle	crosses nodes: ONE composite under the RATCHET steward's live edition-2 key (F0-cp7: composite only)
 pyo3	put_community_json	refuses	-	refuses in its own body, before any decode (D1)
-pyo3	put_delivery_receipt	refuses	-	refuses in its own body, before any decode (D1)
+pyo3	put_delivery_ack	refuses	-	refuses in its own body, before any decode (D1)
 pyo3	put_edge_detection_event	exempt	-	an adjacent signed plane (edge detection), not a CEG row; scope ruling pending (JSON_CUT_PLAN §8)
 pyo3	put_family_json	refuses	-	refuses in its own body, before any decode (D1)
 pyo3	put_fountain_content	node_local	store/sqlite.rs::put_fountain_content > store/backend_plan.rs::put_fountain_content_planned > fountain/admit.rs::check_admission | store/postgres.rs::put_fountain_content > store/backend_plan.rs::put_fountain_content_planned > fountain/admit.rs::check_admission	NODE-LOCAL (CC: the fountain is not a CC object): a manifest produced by another node is refused fountain_manifest_not_cc_object; this node's own coding is unpinned (CC 1.13.4)
@@ -168,3 +168,7 @@ http	put_filter_config	exempt	-	secrets plane: a request authenticated by its ca
 # v62.0.0 (F0-cp6c) — the BlobStorage doors, now inventoried.
 trait	put_stream_sth	composite	federation/blob_admit.rs::put_stream_sth_planned > federation/blobs.rs::verify_stream_sth_signature > federation/sth_form.rs::verify_sth_signature_via_directory	a stream head: ONE composite under the producer's key; the earlier HybridSignature head refused by name (sth_signature_earlier_form)
 trait	set_active_halt	exempt	-	node-local halt latch state (CIRISVerify 23.5.0 HaltLatch JSON, written by the halt door, HALT-235), not a signed CEG object
+trait	put_identity_occurrence_edition2	sealed	federation/edition2/occurrence.rs::put_occurrence_voice | federation/edition2/occurrence.rs::land_held_bind	STORAGE ONLY behind the edition-2 occurrence door (WD-fix9 rev 2): sealed by DoorToken; only the door's own two writes call it
+trait	put_identity_occurrence_local	retired	-	WD-fix9: the unsigned trusted-local occurrence write is retired on every directory (Unsupported naming the edition-2 bind)
+trait	put_identity_occurrence_revocation_edition2	sealed	federation/edition2/typed.rs::put_occurrence_revocation | federation/edition2/occurrence.rs::land_held_eviction | federation/attestation_admit.rs::put_attestation_planned	STORAGE ONLY behind the edition-2 eviction door (WD-fix8/9): sealed by DoorToken
+trait	put_identity_occurrence_revocation_local	refuses	-	WD-fix8: the unsigned trusted-local eviction is retired: refused by name, earlier_form_object

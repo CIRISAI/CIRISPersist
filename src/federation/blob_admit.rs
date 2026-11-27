@@ -12,7 +12,7 @@
 //!   inside it by [`stream_claim_verdict`], a shared plan the executor
 //!   re-asks; each item's answer is [`item_answer`];
 //! - the stream plane's records (`stream_dek_insert`,
-//!   `stream_dek_put_grants`, `put_stream_sth`, `put_delivery_receipt`): the gates, then a write that reports what it
+//!   `stream_dek_put_grants`, `put_stream_sth`, `put_delivery_ack`): the gates, then a write that reports what it
 //!   found under the key for the plan to judge.
 //!
 //! # Which instant each plan reads
@@ -151,7 +151,7 @@ pub(crate) trait BlobFloorStore: BlobStorage + FederationDirectory + Sized {
 
     /// In ONE transaction: the published-root JOIN, then the receipt at
     /// `(stream_id, subscriber_key_id, k)` unless one is held.
-    async fn store_delivery_receipt(
+    async fn store_delivery_ack(
         &self,
         receipt: PlannedReceipt<'_>,
     ) -> Result<ReceiptWrite, BlobError>;
@@ -564,7 +564,7 @@ pub(crate) struct PlannedSth<'a> {
 #[derive(Debug, Clone)]
 pub(crate) struct PlannedReceipt<'a> {
     /// The admitted receipt.
-    pub(crate) receipt: &'a super::stream_receipt::DeliveryReceipt,
+    pub(crate) receipt: &'a super::stream_receipt::DeliveryAck,
     /// `k`, as stored.
     pub(crate) k_i64: i64,
     /// `epoch`, as stored.
@@ -675,19 +675,19 @@ where
         .map(|_| ())
 }
 
-/// The door: every backend's `put_delivery_receipt`.
-pub(crate) async fn put_delivery_receipt_planned<D: BlobFloorStore>(
+/// The door: every backend's `put_delivery_ack`.
+pub(crate) async fn put_delivery_ack_planned<D: BlobFloorStore>(
     dir: &D,
-    receipt: super::stream_receipt::DeliveryReceipt,
+    receipt: super::stream_receipt::DeliveryAck,
 ) -> Result<(), BlobError> {
-    super::edition2::door::refuse_earlier_form("delivery_receipt")
+    super::edition2::door::refuse_earlier_form("delivery_ack")
         .map_err(|e| BlobError::InvalidArgument(e.to_string()))?;
     // v62.0.0 (F0-cp5) — the earlier receipt's bound-hybrid verify is
     // deleted, so this door admits nothing whatever the switch says: it
     // never stores a receipt it has not verified.
     let _ = (dir, receipt);
     Err(BlobError::InvalidArgument(
-        "put_delivery_receipt: the earlier-form receipt (a bound-hybrid \
+        "put_delivery_ack: the earlier-form receipt (a bound-hybrid \
          signature) admits nothing; send a delivery_receipt:{stream_id} statement \
          (v62.0.0)"
             .into(),
@@ -699,9 +699,9 @@ pub(crate) async fn put_delivery_receipt_planned<D: BlobFloorStore>(
 /// edition-2 door verified the subscriber's composite statement (its step
 /// 1); the JOIN and equivocation steps are this door's own
 /// ([`store_receipt_checked`]), the same ones the earlier form meets.
-pub(crate) async fn put_delivery_receipt_edition2_planned<D: BlobFloorStore>(
+pub(crate) async fn put_delivery_ack_edition2_planned<D: BlobFloorStore>(
     dir: &D,
-    receipt: super::stream_receipt::DeliveryReceipt,
+    receipt: super::stream_receipt::DeliveryAck,
 ) -> Result<(), BlobError> {
     store_receipt_checked(dir, receipt).await
 }
@@ -710,13 +710,12 @@ pub(crate) async fn put_delivery_receipt_edition2_planned<D: BlobFloorStore>(
 /// published STH and the equivocation check. Shared by both forms.
 async fn store_receipt_checked<D: BlobFloorStore>(
     dir: &D,
-    receipt: super::stream_receipt::DeliveryReceipt,
+    receipt: super::stream_receipt::DeliveryAck,
 ) -> Result<(), BlobError> {
     let k_i64 = i64::try_from(receipt.k)
-        .map_err(|_| BlobError::InvalidArgument("put_delivery_receipt: k exceeds i64".into()))?;
-    let epoch_i64 = i64::try_from(receipt.epoch).map_err(|_| {
-        BlobError::InvalidArgument("put_delivery_receipt: epoch exceeds i64".into())
-    })?;
+        .map_err(|_| BlobError::InvalidArgument("put_delivery_ack: k exceeds i64".into()))?;
+    let epoch_i64 = i64::try_from(receipt.epoch)
+        .map_err(|_| BlobError::InvalidArgument("put_delivery_ack: epoch exceeds i64".into()))?;
     let planned = PlannedReceipt {
         receipt: &receipt,
         k_i64,
@@ -725,7 +724,7 @@ async fn store_receipt_checked<D: BlobFloorStore>(
         signature_blob: receipt.composite_signature.clone(),
         received_at: crate::host::clock::now(),
     };
-    match dir.store_delivery_receipt(planned).await? {
+    match dir.store_delivery_ack(planned).await? {
         // Step 2: the JOIN gate. The signature proved WHO; a root this node
         // published at tree_size >= k proves the root is REAL.
         // v62.0.0 (wave GC7; CC 2.7.3) — the publication is another row: the
@@ -734,7 +733,7 @@ async fn store_receipt_checked<D: BlobFloorStore>(
             super::edition2::fold::reason::RECEIPT_ROOT_UNPUBLISHED,
             &receipt.stream_id,
             BlobError::InvalidArgument(format!(
-                "put_delivery_receipt: no published STH for stream={} matches the acknowledged \
+                "put_delivery_ack: no published STH for stream={} matches the acknowledged \
                  chunk_root at tree_size >= {} (a subscriber cannot acknowledge an unpublished \
                  root)",
                 receipt.stream_id, receipt.k
@@ -746,7 +745,7 @@ async fn store_receipt_checked<D: BlobFloorStore>(
             super::edition2::fold::reason::RECEIPT_EQUIVOCATION,
             &receipt.stream_id,
             BlobError::InvalidArgument(format!(
-                "put_delivery_receipt: subscriber equivocation — a receipt for stream={} \
+                "put_delivery_ack: subscriber equivocation — a receipt for stream={} \
                  subscriber={} k={} already exists with a different chunk_root",
                 receipt.stream_id, receipt.subscriber_key_id, receipt.k
             )),

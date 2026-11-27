@@ -52,6 +52,24 @@ pub(crate) mod bodies {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
+        ladder_placed(dsn_a, dsn_b, run, pick, false).await
+    }
+
+    /// [`ladder`], or (v62.0.0, WD-fix16i; `room_placed`) with both members'
+    /// nodes placed at the ROOM only: the room is PUBLIC (`found_community`
+    /// on A by alice, no `membership` stated), bob joins through the
+    /// identity-key carriage (`two_node::seed_room_by_carriage`), and B
+    /// holds alice's node binding ONLY through the serve rule.
+    pub(crate) async fn ladder_placed<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+        room_placed: bool,
+    ) -> Ladder<B>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
         let (alias_a, alias_b) = (format!("em-a-{run}"), format!("em-b-{run}"));
         let engine_a = Engine::with_signer_pre_genesis(ts::local_signer(&alias_a), dsn_a)
             .await
@@ -99,7 +117,21 @@ pub(crate) mod bodies {
             crate::federation::edition2::fixture_switch::kid(&format!("em-alice-{run}")),
             crate::federation::edition2::fixture_switch::kid(&format!("em-bob-{run}")),
         );
-        seed_community_everywhere(&[&a, &b], &comm, &[(&alice, Some(&a)), (&bob, Some(&b))]).await;
+        let comm = if room_placed {
+            crate::federation::key_grant_invariants::two_node::seed_room_by_carriage(
+                &a,
+                &format!("em-alice-{run}"),
+                &[(&b, format!("em-bob-{run}").as_str())],
+                &format!("em-rp-comm-{run}"),
+            )
+            .await
+        } else {
+            seed_community_everywhere(&[&a, &b], &comm, &[(&alice, Some(&a)), (&bob, Some(&b))])
+                .await;
+            // GID-fixtures-sites — the room's DERIVED id, once founded
+            // (`room_id` panics if it was not).
+            crate::federation::edition2::fixture_switch::room_id(&comm)
+        };
         let (node_a, node_b) = (a.key.clone(), b.key.clone());
         Ladder {
             engine_a,
@@ -181,12 +213,32 @@ pub(crate) mod bodies {
     ) where
         B: BlobStorage + FederationDirectory + Sync,
     {
-        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        i126_with(dsn_a, dsn_b, run, pick, false).await;
+    }
+
+    /// v62.0.0 (WD-fix16i; WD-fix16 part 2, variant 4) — **I126 on the
+    /// room-placed ladder** (room kind: PUBLIC; [`ladder_placed`]): A's
+    /// seal wraps to B's node only because A holds bob as its owner through
+    /// the carriage's answer, and B admits A's row only because B holds
+    /// alice's node binding through the serve rule; then I126's legs
+    /// unchanged.
+    pub(crate) async fn i126_room_placed<B>(dsn_a: &str, dsn_b: &str, run: &str, pick: Pick<B>)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        i126_with(dsn_a, dsn_b, run, pick, true).await;
+    }
+
+    async fn i126_with<B>(dsn_a: &str, dsn_b: &str, run: &str, pick: Pick<B>, room_placed: bool)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let l = ladder_placed(dsn_a, dsn_b, run, pick, room_placed).await;
         let (sha, bytes, set) = seal_and_set(&l, b"chat body").await;
         assert_ne!(l.alice, l.node_a, "I126: the fixture's whole point");
 
         // (a) bytes with no key set: still NotGranted — the fix admits nothing.
-        let l2 = ladder(dsn_a, dsn_b, &format!("{run}x"), pick).await;
+        let l2 = ladder_placed(dsn_a, dsn_b, &format!("{run}x"), pick, room_placed).await;
         let (sha2, bytes2, _) = seal_and_set(&l2, b"unkeyed").await;
         l2.engine_b
             .adopt_sealed_blob(
@@ -451,7 +503,7 @@ pub(crate) mod bodies {
         );
         // Two candidates act for the author: still no guess.
         b.as_ref()
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: l.alice.clone(),
                 occurrence_key_id: other.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -1164,6 +1216,11 @@ mod run {
                     bodies::i126_author_is_not_the_sealer(&a, &b, &super::suffix(), $pick).await
                 }
                 #[tokio::test]
+                async fn i126_room_placed() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i126_room_placed(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
                 async fn i127() {
                     let Some((a, b)) = $dsns else { return };
                     bodies::i127_explicit_minter_wins(&a, &b, &super::suffix(), $pick).await
@@ -1382,6 +1439,9 @@ pub(crate) mod room_1271 {
             )
             .await;
         }
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         let (node_a, node_b, node_c) = (
             nodes[0].key.clone(),
             nodes[1].key.clone(),
@@ -2097,7 +2157,7 @@ pub(crate) mod room_1271 {
         assert_eq!(bound(&r.bc, &sha_a).await, r.alice, "I1782: stranded");
         // The occurrence lands (the same record the other nodes hold).
         let kem_a = r.ba.load_or_init_content_kem_identity().await.unwrap();
-        r.bc.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+        r.bc.test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
             identity_key_id: r.alice.clone(),
             occurrence_key_id: r.node_a.clone(),
             device_class: crate::federation::types::device_class::LAPTOP.into(),

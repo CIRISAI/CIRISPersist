@@ -17,7 +17,7 @@
 //! - **I201** (v52.0.0, #953) — a stored receipt lists with the
 //!   `received_at` this node stored it at, and the plain listing is the same
 //!   receipts. v62.0.0 (T2-fix9): the receipt is node B's edition-2
-//!   `delivery_receipt` statement through A's statement door.
+//!   `delivery_ack` statement through A's statement door.
 //! - **I4170–I4176** (DR-fix1; sqlite, postgres) — a delivery receipt
 //!   produced AS A HOST PRODUCES IT: the subscriber's
 //!   `Engine::statement_draft` → `Engine::sign_draft`, then
@@ -126,7 +126,7 @@ pub(crate) mod bodies {
     ) -> serde_json::Value {
         serde_json::json!({
             "dimension":
-                crate::federation::custody_ack::delivery_receipt_dimension(dimension_stream),
+                crate::federation::custody_ack::delivery_ack_dimension(dimension_stream),
             "stream_id": stream,
             "epoch": 0,
             "k": k,
@@ -259,7 +259,7 @@ pub(crate) mod bodies {
             "I4170 held, reason receipt_root_unpublished"
         );
         assert!(
-            l.ba.list_delivery_receipts_for(&stream, 10)
+            l.ba.list_delivery_acks_for(&stream, 10)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -276,7 +276,7 @@ pub(crate) mod bodies {
             None,
             "I4171 the head's door woke the held receipt (no manual re-fold)"
         );
-        let listed = l.ba.list_delivery_receipts_for(&stream, 10).await.unwrap();
+        let listed = l.ba.list_delivery_acks_for(&stream, 10).await.unwrap();
         assert_eq!(listed.len(), 1, "I4171 the receipt landed");
         assert_eq!(
             (
@@ -301,7 +301,7 @@ pub(crate) mod bodies {
             matches!(out, StatementOutcome::Row { new: true, .. }),
             "I4172 {out:?}"
         );
-        let listed = l.ba.list_delivery_receipts_for(&stream, 10).await.unwrap();
+        let listed = l.ba.list_delivery_acks_for(&stream, 10).await.unwrap();
         assert_eq!(listed.len(), 2, "I4172 both receipts");
         let mine = listed
             .iter()
@@ -406,7 +406,7 @@ pub(crate) mod bodies {
             .await;
         }
 
-        let listed = l.ba.list_delivery_receipts_for(&stream, 10).await.unwrap();
+        let listed = l.ba.list_delivery_acks_for(&stream, 10).await.unwrap();
         assert_eq!(
             listed
                 .iter()
@@ -535,7 +535,7 @@ pub(crate) mod bodies {
         // (the stored instant and the two listings) is unchanged.
         let b_seed = format!("em-b-{run}");
         assert_eq!(e2::kid(&b_seed), l.node_b, "I201: B's seed is node B's key");
-        let receipt = e2::delivery_receipt_statement(
+        let receipt = e2::delivery_ack_statement(
             &b_seed,
             &sid,
             0,
@@ -548,10 +548,7 @@ pub(crate) mod bodies {
             .await
             .expect("I201: the receipt is stored");
         let after = chrono::Utc::now() + chrono::Duration::seconds(5);
-        let stored =
-            l.ba.list_stored_delivery_receipts_for(&sid, 10)
-                .await
-                .unwrap();
+        let stored = l.ba.list_stored_delivery_acks_for(&sid, 10).await.unwrap();
         assert_eq!(stored.len(), 1);
         assert!(
             stored[0].received_at > before && stored[0].received_at < after,
@@ -559,7 +556,7 @@ pub(crate) mod bodies {
             stored[0].received_at
         );
         assert_eq!(stored[0].receipt.subscriber_key_id, l.node_b);
-        let plain = l.ba.list_delivery_receipts_for(&sid, 10).await.unwrap();
+        let plain = l.ba.list_delivery_acks_for(&sid, 10).await.unwrap();
         assert_eq!(plain.len(), 1);
         assert_eq!(
             (plain[0].k, &plain[0].subscriber_key_id, plain[0].chunk_root),

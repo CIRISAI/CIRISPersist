@@ -911,12 +911,15 @@ where
     }
     let mut statements = vec![row.bytes.clone()];
     statements.extend(held.into_iter().filter(|st| *st != row.bytes));
-    dir.put_identity_occurrence_edition2(OccurrenceBind {
-        occurrence,
-        author_key_id: author_key,
-        row_id: row.row_id,
-        statements,
-    })
+    dir.put_identity_occurrence_edition2(
+        OccurrenceBind {
+            occurrence,
+            author_key_id: author_key,
+            row_id: row.row_id,
+            statements,
+        },
+        crate::federation::DoorToken::new(),
+    )
     .await?;
     Ok(StatementOutcome::Row {
         row_id: row.row_id,
@@ -1111,6 +1114,15 @@ where
 /// else its live edition-2 bind's ([`bind_xwing_keys_for`]), passing the
 /// cross-row rule at use (also against the transit key's halves).
 ///
+/// v62.0.0 (BIND-3; CC 5.4.6 "relayable exactly when its owner-binding is
+/// announced", Constitution's ruling on the login placement) — a non-seat
+/// is an onion hop only while its owner is ANNOUNCED
+/// ([`serve_seat_owner_announced`](crate::federation::admission::serve_seat_owner_announced):
+/// a live owner binding at `federation`, the one announced-owner fold). An
+/// unannounced device (its binding at `self` or in its rooms) answers `None`:
+/// it is never offered as a relay hop. Its transit key is unchanged: it
+/// still dials (`transit_xwing_pubkey_for`).
+///
 /// # Errors
 /// Directory read failures.
 pub async fn onion_hop_xwing_pubkey_for<F>(
@@ -1125,6 +1137,9 @@ where
         .seat(occurrence_key_id)
     {
         return Ok(XWingPublicKey::from_bytes(&seat.onion_hop_xwing_pubkey));
+    }
+    if !crate::federation::admission::serve_seat_owner_announced(dir, occurrence_key_id).await? {
+        return Ok(None);
     }
     let Some(BindXWing {
         transit,
@@ -1445,8 +1460,9 @@ where
 }
 
 /// v62.0.0 (wave O1, S1b) — **has the proposer withdrawn this edition-2
-/// proposal?** A held `withdraws` statement naming the proposal's row id by
-/// `refs.target`, signed by the proposer's key.
+/// proposal?** A CONCLUDED `withdraws` naming the proposal's row id by
+/// `refs.target`, signed by the proposer's key (VD-step1b: a kept-but-held
+/// one withdraws nothing).
 ///
 /// # Errors
 /// Directory read failures.
@@ -1464,6 +1480,24 @@ where
         return Ok(false);
     };
     for c in dir.edition2_rows_naming(row_id, "target").await? {
+        // v62.0.0 (VD-step1b, F6; the lead's ruling of 2026-11-22) — only a
+        // CONCLUDED `withdraws` closes the proposal: a kept-but-held one (a
+        // withdraws of another family, held `composer_family_mismatch`) has
+        // not been judged admissible and withdraws nothing
+        // (`verdict::row_state`).
+        //
+        // VD-step1d (Constitution's ruling of 2026-11-22: the proposer MAY
+        // withdraw its own OPEN proposal, an add and an evict alike, rule 1;
+        // what is never withdrawn is the occurrence REVOCATION, which exists
+        // only once the proposal lands) — the same for both acts: only a
+        // CONCLUDED withdraws closes it. Its door lands it (the roots door
+        // change, KR-fix20.rev2, for an evict). This reader is asked only
+        // over OPEN proposals (`self_roster` reads its receipts with
+        // `settled_at IS NULL`), so a withdrawal arriving after the proposal
+        // landed here cancels nothing.
+        if !super::verdict::row_state(dir, &c).await?.is_concluded() {
+            continue;
+        }
         for v in dir.edition2_voices(&c).await? {
             let withdraws = statement_parts(&v).is_some_and(|(h, _)| {
                 h.get_int(-70001).and_then(Value::as_text)
@@ -1518,12 +1552,15 @@ where
 {
     let (admitted, statements) = landing_statement(dir, row_id, OCCURRENCE_FAMILY).await?;
     let occurrence = read_payload(&admitted)?;
-    dir.put_identity_occurrence_edition2(OccurrenceBind {
-        occurrence,
-        author_key_id: identity_ref(&admitted.kid),
-        row_id: *row_id,
-        statements,
-    })
+    dir.put_identity_occurrence_edition2(
+        OccurrenceBind {
+            occurrence,
+            author_key_id: identity_ref(&admitted.kid),
+            row_id: *row_id,
+            statements,
+        },
+        crate::federation::DoorToken::new(),
+    )
     .await?;
     Ok(())
 }
@@ -1567,7 +1604,7 @@ where
 /// v62.0.0 (wave O1, S1b) — **land a held edition-2 eviction** (the
 /// self-roster executor): the `identity:occurrence_revocation` read
 /// (T2's `typed::occurrence_revocation_of`) and written as T2's door
-/// writes it (`put_identity_occurrence_revocation_local`), unless the pair is
+/// writes it (`put_identity_occurrence_revocation_edition2`), unless the pair is
 /// already revoked by it.
 ///
 /// # Errors
@@ -1587,19 +1624,40 @@ where
                 && r.effective_at == revocation.effective_at
         });
     if !held {
-        dir.put_identity_occurrence_revocation_local(revocation)
-            .await?;
+        dir.put_identity_occurrence_revocation_edition2(
+            revocation,
+            crate::federation::DoorToken::new(),
+        )
+        .await?;
     }
     Ok(())
 }
 
-/// v62.0.0 (wave O1, S1b) — **a proposer withdraws its own edition-2
-/// proposal**: a `withdraws` statement of this family naming, by
-/// `refs.target`, the row id of an OPEN edition-2 self-roster proposal (an
-/// addition here; an eviction's withdrawal reaches T2's door) and signed by
+/// v62.0.0 (wave O1, S1b; KR-fix20b) — **a proposer withdraws its own
+/// edition-2 proposal**: a `withdraws` statement of this family, or of
+/// `identity:occurrence_revocation` (KR-fix20b: routed here by
+/// `ingest::route_of`), naming by `refs.target` the row id of an OPEN
+/// edition-2 self-roster proposal, an ADDITION or an EVICTION, and signed by
 /// the proposal's proposer key. The statement is held and this node's
-/// receipt settled `withdrawn`; the change never lands. Anything else of
-/// this kind is refused `occurrence_withdraws_not_proposer`.
+/// receipt settled `withdrawn`; the change never lands.
+///
+/// KR-fix20b (the Constitution's ruling of 2026-11-22, CC 3.3.6.4: "the
+/// withdrawal rule should follow what the row IS (a proposal), not where it
+/// is kept"; rule 1):
+///
+/// - an open EVICTION is a request for a revocation, not one: its
+///   proposer's withdrawal lands as an addition's does. Before, it went to
+///   the attestation tail, which read the eviction's statement as an
+///   occurrence revocation on a never-withdrawn plane and held it
+///   `withdraws_not_admitted` for ever (KR-fix20 would have refused it);
+/// - a LANDED revocation (the eviction's receipt settled `lands_*` here, or
+///   a held revocation statement that is no proposal) is never withdrawn:
+///   refused `withdraws_never_retracts`, nothing kept. A withdrawal counts at
+///   a node only if the node held it before the proposal landed there;
+/// - a target this node does not hold yet: the withdrawal WAITS
+///   (`link_unheld`), re-folded when the target arrives, and is judged then.
+///
+/// Anything else of this kind is refused `occurrence_withdraws_not_proposer`.
 async fn withdraw_proposal<F>(dir: &F, row: &AdmittedRow) -> Result<StatementOutcome, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -1608,9 +1666,24 @@ where
         refuse(
             malformed_row::OCCURRENCE_WITHDRAWS_NOT_PROPOSER,
             format!(
-                "{OCCURRENCE_FAMILY}: a {} by {}: {why}",
+                "{}: a {} by {}: {why}",
+                row.family,
                 row.row_type,
                 identity_ref(&row.kid)
+            ),
+        )
+    };
+    let eviction = row.family == OCCURRENCE_REVOCATION_FAMILY;
+    let never_retracts = |target: &RowId| {
+        Error::malformed_row(
+            crate::federation::admission::WITHDRAWS_PLANE,
+            malformed_row::WITHDRAWS_NEVER_RETRACTS,
+            format!(
+                "{} {} names {}: a landed occurrence revocation is never withdrawn (CC \
+                 2.4.1.1, CC 3.3.6.4); it is not kept",
+                row.row_type,
+                row.row_id.hex(),
+                target.hex()
             ),
         )
     };
@@ -1620,7 +1693,21 @@ where
     let Some(target) = super::names::single(&row.names, "target") else {
         return Err(refuse_it("it names no proposal by refs.target"));
     };
+    super::fold::reads(super::fold::Dep::Row(target));
     let Some(carried) = carried_of_bind(dir, &target.hex()).await? else {
+        if dir.edition2_voices(&target).await?.is_empty() {
+            return Err(super::fold::hold(
+                super::fold::reason::LINK_UNHELD,
+                refuse_it("the proposal it names is not held yet: it waits for it"),
+            ));
+        }
+        if eviction
+            && crate::federation::cosign::held_unretractable_target(dir, &target.hex())
+                .await?
+                .is_some()
+        {
+            return Err(never_retracts(&target));
+        }
         return Err(refuse_it("the row it names is not a held proposal"));
     };
     let open = dir
@@ -1629,6 +1716,20 @@ where
         .iter()
         .any(|r| r.proposal_id == target.hex());
     if !open {
+        if eviction
+            && dir
+                .list_settled_edition2_roster_proposals(carried.identity_key_id())
+                .await?
+                .iter()
+                .any(|r| {
+                    r.proposal_id == target.hex()
+                        && r.outcome
+                            .as_deref()
+                            .is_some_and(|o| o == "lands_quorum" || o == "lands_lone")
+                })
+        {
+            return Err(never_retracts(&target));
+        }
         return Err(refuse_it("the proposal it names is not open on this node"));
     }
     if identity_ref(&row.kid) != carried.proposer() {
@@ -1937,11 +2038,24 @@ pub fn bind_payload(t: &BindTerms) -> Result<Value, Error> {
 ///
 /// # Errors
 /// As [`bind_payload`]; `signer_iss` that is not an identity-ref.
-pub fn bind_draft(t: &BindTerms, signer_iss: &str) -> Result<super::emit::Draft, Error> {
-    let kid = kid_of_identity_ref(signer_iss)
-        .ok_or_else(|| payload_invalid(format!("{signer_iss} is not an identity-ref")))?;
+pub fn bind_draft(
+    t: &BindTerms,
+    signer_iss: &str,
+    signer_kid: &Digest32,
+) -> Result<super::emit::Draft, Error> {
+    // v62.0.0 (WD-fix18; RESIGN-6's rule) — the draft names the key the
+    // signer WILL sign with, as the caller states it (`signer_kid`), never
+    // the identity's genesis kid: a second device or a rotated key drafts its
+    // own voice. Only the form of `signer_iss` is checked here; the door's one
+    // check (`door::require_key_of_iss`) judges the key when the signed
+    // statement arrives.
+    if kid_of_identity_ref(signer_iss).is_none() {
+        return Err(payload_invalid(format!(
+            "{signer_iss} is not an identity-ref"
+        )));
+    }
     super::emit::draft_row(
-        &kid,
+        signer_kid,
         signer_iss,
         &t.occurrence_key_id,
         "scores",
@@ -1949,6 +2063,17 @@ pub fn bind_draft(t: &BindTerms, signer_iss: &str) -> Result<super::emit::Draft,
         &bind_payload(t)?,
     )
     .map_err(|e| super::emit::produce_error("identity_occurrence", e))
+}
+
+/// v62.0.0 (WD-fix18) — **the kid of a key that signs as itself**: the key
+/// `key` names (an identity-ref's own thumbprint). For a voice whose `iss`
+/// IS the signing key (an occurrence key's own statement, a seat's binding),
+/// never for an author that may sign from another roster key.
+///
+/// # Errors
+/// `edition2_payload_invalid` when `key` is not an identity-ref.
+pub fn own_kid(key: &str) -> Result<Digest32, Error> {
+    kid_of_identity_ref(key).ok_or_else(|| payload_invalid(format!("{key} is not an identity-ref")))
 }
 
 /// v62.0.0 (v62 P8) — what [`publish_bind`] did.
@@ -2002,6 +2127,7 @@ pub async fn publish_bind<F>(
     dir: &F,
     occurrence_signer: Option<&crate::signing::LocalSigner>,
     author_signer: Option<&crate::signing::LocalSigner>,
+    author_kid: Option<&Digest32>,
     terms: &BindTerms,
 ) -> Result<OccurrenceBindOutcome, Error>
 where
@@ -2033,7 +2159,11 @@ where
             out.own_voice = Some(stated.statement);
         }
         None => {
-            let d = bind_draft(terms, &terms.occurrence_key_id)?;
+            let d = bind_draft(
+                terms,
+                &terms.occurrence_key_id,
+                &own_kid(&terms.occurrence_key_id)?,
+            )?;
             out.row_id = row_id_of(&d.assemble(Vec::new()));
             out.own_draft = Some(d);
         }
@@ -2052,7 +2182,16 @@ where
             out.landed = matches!(stated.outcome, StatementOutcome::Row { .. });
             out.author_voice = Some(stated.statement);
         }
-        _ => out.author_draft = Some(bind_draft(terms, &terms.author)?),
+        _ => {
+            // WD-fix18 — the author's draft names the key the caller says the
+            // author signs with (`author_kid`: a second device, a rotated
+            // key); stated by no caller, the author identity's own key.
+            let kid = match author_kid {
+                Some(k) => *k,
+                None => own_kid(&terms.author)?,
+            };
+            out.author_draft = Some(bind_draft(terms, &terms.author, &kid)?);
+        }
     }
     Ok(out)
 }
@@ -2118,6 +2257,20 @@ fn agent_owner_binding_payload(owner_iss: &str, asserted_at_ms: u64) -> Value {
             Value::Text("dimension".into()),
             Value::Text("ownership:responsible_party:agent:v1".into()),
         ),
+        // v62.0.0 (BIND-1; CC rc22 rule `owner-binding`) — the purpose
+        // always, and the placement always. The first binding is written at
+        // whatever scope its owner first places the key at (Constitution's
+        // ruling (b), CC 3.2): this producer places an agent at `self`; a
+        // re-signing at a wider scope is a second row. No `scope` on an
+        // agent's binding.
+        (
+            Value::Text("delegation_purpose".into()),
+            Value::Text(crate::federation::types::owner_binding::PURPOSE.into()),
+        ),
+        (
+            Value::Text("cohort_scope".into()),
+            Value::Text(crate::federation::types::cohort_scope::SELF.into()),
+        ),
     ];
     m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
     Value::Map(m)
@@ -2158,7 +2311,7 @@ where
     .await
     .map_err(|e| super::emit::produce_error(producer, e))?;
     super::ingest::put_statement(dir, &st, None, super::ingest::INGEST_TIER).await?;
-    super::second_signer_voice::voice_draft(&st, agent_iss)
+    super::second_signer_voice::voice_draft(&st, agent_iss, None)
 }
 
 /// v62.0.0 (v62 P8) — the author of a bind under `identity_key_id` at

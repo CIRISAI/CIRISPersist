@@ -25,6 +25,12 @@
 //!   (the read returns the row id), the rehome moves a pre-V203 balance, and
 //!   the delivery attestation lands on a held announcement row and is refused
 //!   for one not held.
+//! - **I7220** (sqlite, postgres engines; v62.0.0 CN-fix1.r62) — a
+//!   Contribution carrying a `witness_set` is refused by name
+//!   (`cirisnode_contribution_witness_set_unverified`) and nothing is stored
+//!   under the author; a takedown body carrying one is refused the same way;
+//!   the same announcement without it is filed and its row has no
+//!   `witness_set` member.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -439,6 +445,106 @@ pub(crate) mod engine_bodies {
             .await
             .expect("register the engine's own key");
         e
+    }
+
+    /// A one-witness set whose "signature" is bytes nothing can verify. The
+    /// instant is fixed, not a wall-clock read.
+    fn unverified_witness_set() -> crate::cirisnode::types::WitnessSet {
+        use crate::cirisnode::types::{DiversityProof, HybridSignature, Witness, WitnessSet};
+        WitnessSet {
+            witnesses: vec![Witness {
+                witness_id: "w1".into(),
+                jurisdiction: "KE".into(),
+                operator: "self".into(),
+                software_stack: "ciris-agent".into(),
+                cell_expertise: 0.9,
+                signature: HybridSignature {
+                    ed25519: "AAAA".into(),
+                    ml_dsa_65: Some("AAAA".into()),
+                    signed_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                },
+            }],
+            diversity_proof: DiversityProof {
+                jurisdictions: vec!["KE".into()],
+                operators_distinct: 1,
+                software_stacks_distinct: 1,
+                cell_expertise_floor_met: true,
+            },
+        }
+    }
+
+    // ── I7220 ─────────────────────────────────────────────────────────────
+    /// v62.0.0 (CN-fix1.r62; Constitution, FREEZE 486) — an unverified
+    /// `witness_set` is refused by name through the Engine's door and nothing
+    /// is stored or listed under the author. RED on dbc14b2d: the set is
+    /// copied into the row's members and the row is filed.
+    pub(crate) async fn i7220_an_unverified_witness_set_is_refused(dsn: &str, tag: &str) {
+        let e = engine(dsn, &format!("i7220-node-{tag}")).await;
+        let me = e.local_derived_key_id().await.unwrap();
+        let dir = e.federation_directory();
+        async fn listed(
+            dir: &dyn crate::federation::FederationDirectory,
+            me: &str,
+        ) -> Vec<crate::federation::Attestation> {
+            rows::list_contributions(dir, me, &Default::default(), None, 10)
+                .await
+                .unwrap()
+                .items
+        }
+        let mut witnessed = announcement();
+        witnessed.witness_set = Some(unverified_witness_set());
+        let err = e
+            .cirisnode_put_contribution(&witnessed)
+            .await
+            .expect_err("I7220: a witness set is refused");
+        assert_eq!(
+            err.kind(),
+            rows::refusal::CONTRIBUTION_WITNESS_SET_UNVERIFIED,
+            "I7220: by name: {err}"
+        );
+        assert!(
+            listed(dir.as_ref(), &me).await.is_empty(),
+            "I7220: nothing stored or listed"
+        );
+        // A takedown body naming one is refused by name too, not dropped.
+        let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+            format!("i7220-{tag}").as_bytes(),
+        ));
+        let mut notice = notice_body(&sha, LegalBasis::NcmecCsam);
+        notice.witness_set = Some(unverified_witness_set());
+        let err = e
+            .cirisnode_put_contribution(&notice)
+            .await
+            .expect_err("I7220: a takedown body's witness set is refused");
+        assert_eq!(
+            err.kind(),
+            rows::refusal::CONTRIBUTION_WITNESS_SET_UNVERIFIED,
+            "I7220: takedown body by name: {err}"
+        );
+        assert!(
+            rows::list_takedowns(dir.as_ref(), &me, None, None, None, None, 10)
+                .await
+                .unwrap()
+                .items
+                .is_empty(),
+            "I7220: no notice row stored"
+        );
+        // The same announcement without it is filed, with no such member.
+        let id = e
+            .cirisnode_put_contribution(&announcement())
+            .await
+            .expect("I7220: the same body without it is filed");
+        let items = listed(dir.as_ref(), &me).await;
+        assert_eq!(items.len(), 1, "I7220: one row");
+        assert_eq!(items[0].attestation_id, id, "I7220: the filed row");
+        assert!(
+            items[0].attestation_envelope.get("witness_set").is_none(),
+            "I7220: no witness_set member on the row"
+        );
+        assert!(
+            rows::refusal::ALL.contains(&rows::refusal::CONTRIBUTION_WITNESS_SET_UNVERIFIED),
+            "I7220: the token is listed"
+        );
     }
 
     fn notice_body(sha: &str, basis: LegalBasis) -> ContributionInput {
@@ -1049,6 +1155,28 @@ mod run {
             return;
         };
         Box::pin(super::engine_bodies::i4127_the_slashing_verb_returns_the_hold(&dsn, &tag()))
+            .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i7220_sqlite_engine() {
+        Box::pin(
+            super::engine_bodies::i7220_an_unverified_witness_set_is_refused(
+                "sqlite::memory:",
+                &tag(),
+            ),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i7220_postgres_engine() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        Box::pin(super::engine_bodies::i7220_an_unverified_witness_set_is_refused(&dsn, &tag()))
             .await;
     }
 

@@ -28,9 +28,10 @@
 //!   key that is no member is KEPT (a voice), never refused, and changes
 //!   nothing the group holds.
 //!
-//! - **I3835** (lead's ruling (b)) the charter rides `refs.also.cites`
-//!   beside a geographic version's proofs; the record's `charter_digest` is
-//!   the chain head's charter when the version cites it, never a proof.
+//! - **I3835** DELETED (LINEAGE charter arm): at pre4 no row carries a
+//!   charter. **I6932** replaces it: a geographic version's
+//!   `refs.also.cites` holds location proofs AND (on a counted version) the
+//!   resignations it names; each reader takes only its own family.
 //!
 //! No withdrawal leg: G0 v4 makes the group, re-bind and own-store planes
 //! FINAL ("a count once met is final", CC 2.7.5), and a genesis bundle is
@@ -121,11 +122,19 @@ fn at(ms: i64) -> chrono::DateTime<Utc> {
 }
 
 fn roster(rec: &GroupRecord, version: u64, head: Option<&RowId>, at_ms: u64, k: &K) -> Vec<u8> {
-    let group = match rec {
-        GroupRecord::Family(f) => f.family_key_id.clone(),
-        GroupRecord::Community(c) => c.community_key_id.clone(),
+    use crate::federation::edition2::group_fixtures::{fixture_founding, fixture_record};
+    // GID-fixtures-sites — a first version is founded under its DERIVED id
+    // (the record's id is the room's NAME); a later one names that id.
+    let (group, p) = if version == 1 && head.is_none() {
+        fixture_founding(rec, at_ms)
+    } else {
+        let rec = &fixture_record(rec);
+        let group = match rec {
+            GroupRecord::Family(f) => f.family_key_id.clone(),
+            GroupRecord::Community(c) => c.community_key_id.clone(),
+        };
+        (group, roster_payload(rec, version, head, at_ms).unwrap())
     };
-    let p = roster_payload(rec, version, head, at_ms).unwrap();
     ciris_verify_core::edition2::sign_row_statement(
         k,
         &iref(k),
@@ -174,8 +183,10 @@ async fn group_order_body(d: &dyn FederationDirectory, v2_first: bool) -> (Strin
             .await
             .unwrap();
     }
-    let gid = iref(&g);
     let v1 = family(&g, "fam one", &[&a, &b, &c]);
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&v1);
     let v1_voices: Vec<Vec<u8>> = [&a, &b, &c]
         .iter()
         .map(|k| roster(&v1, 1, None, 2_000, k))
@@ -387,14 +398,17 @@ fn geographic_room(g: &K, constraint: &str, members: &[&K]) -> GroupRecord {
 }
 
 fn citing(rec: &GroupRecord, proofs: &[RowId], k: &K) -> Vec<u8> {
-    let GroupRecord::Community(c) = rec else {
+    let GroupRecord::Community(_) = rec else {
         unreachable!("a community")
     };
-    let p = roster_payload_citing(rec, 1, None, proofs, 2_000).unwrap();
+    // GID-fixtures-sites — a first version citing its proofs, founded under
+    // its DERIVED id.
+    let (gid, p) =
+        crate::federation::edition2::group_fixtures::fixture_founding_citing(rec, proofs, 2_000);
     ciris_verify_core::edition2::sign_row_statement(
         k,
         &iref(k),
-        &c.community_key_id,
+        &gid,
         "scores",
         &ciris_verify_core::namespace_match::family_id(GROUP_ROSTER_PREFIX),
         &p,
@@ -421,7 +435,7 @@ async fn geographic_order_body(d: &dyn FederationDirectory, proofs_first: bool) 
     let room = geographic_room(&g, &constraint, &[&a, &b]);
     let voices = [citing(&room, &ids, &a), citing(&room, &ids, &b)];
     let room_id = RowId::of_statement(&voices[0]).unwrap();
-    let gid = iref(&g);
+    let gid = crate::federation::edition2::fixture_switch::room_id(&iref(&g)); // GID-fixtures-sites: founded above
     if proofs_first {
         for p in &proofs {
             put_statement(d, p, None, INGEST_TIER).await.unwrap();
@@ -492,7 +506,14 @@ async fn geographic_outside_body(d: &dyn FederationDirectory) {
         "I3833: a member outside the constraint"
     );
     assert!(
-        d.lookup_community(&iref(&g)).await.unwrap().is_none(),
+        // GID-fixtures-sites — asked under the DERIVED id (the raw name
+        // would answer `None` whatever concluded).
+        d.lookup_community(&crate::federation::edition2::fixture_switch::room_id(
+            &iref(&g)
+        ))
+        .await
+        .unwrap()
+        .is_none(),
         "I3833: concludes nothing"
     );
 }
@@ -507,52 +528,168 @@ async fn geographic_both_orders(early: &dyn FederationDirectory, late: &dyn Fede
     Box::pin(geographic_outside_body(late)).await;
 }
 
-/// I3835: ruling (b), the pure half.
+/// **I6932, the pure half (LINEAGE charter arm; CC 3.3.4, pre4 part 3
+/// "each new member's location_proof stands in the version's refs.also
+/// under cites").** A geographic founding citing two proofs and one other
+/// row (a resignation's id) of three members: the payload door's
+/// "cited >= listed" counts every cited row, so the extra row SATISFIES it
+/// (it can never break it: more cites only raise the count); the fold then
+/// reads each cited row by family and finds a member unlocated (I3833's
+/// rule). The record reads no charter from the cites.
 #[test]
-fn i3835_a_geographic_charter_is_told_apart_at_the_chain_head() {
-    let (a, b, g) = (key(211), key(212), key(213));
+fn i6932_cites_hold_proofs_and_resignations_pure() {
+    let (a, b, c, g) = (key(221), key(222), key(223), key(224));
     let (_, constraint, _) = cells();
-    let charter = RowId([0xc4; 32]);
-    let proofs = [RowId([0x51; 32]), RowId([0x52; 32])];
-    let mut room = geographic_room(&g, &constraint, &[&a, &b]);
-    if let GroupRecord::Community(c) = &mut room {
-        c.charter_digest = charter.hex();
-    }
-    let p = roster_payload_citing(&room, 1, None, &proofs, 2_000).unwrap();
-    let mut view = roster_view(&iref(&g), &p).unwrap();
+    let proofs = [RowId([0x61; 32]), RowId([0x62; 32])];
+    let end = RowId([0xe1; 32]);
+    let room = geographic_room(&g, &constraint, &[&a, &b, &c]);
+    let p = super::head_rule::with_cites(
+        roster_payload_citing(&room, 1, None, &proofs, 2_000).unwrap(),
+        &[end],
+    )
+    .unwrap();
+    let view = roster_view(&iref(&g), &p).unwrap();
     let cited = view.names.iter().filter(|n| n.role == "also:cites").count();
-    assert_eq!(
-        cited, 3,
-        "I3835: one cites set, the charter beside the proofs"
+    assert_eq!(cited, 3, "I6932: two proofs and one resignation, one set");
+    assert!(
+        super::payloads::check(
+            &ciris_verify_core::namespace_match::family_id(GROUP_ROSTER_PREFIX),
+            &p
+        )
+        .is_ok(),
+        "I6932: cited (3) >= listed (3): satisfied by the extra row, never broken by it"
     );
-    let digest = |v: &super::group::RosterView| match record_of_roster(v, String::new()).unwrap() {
+    let digest = match record_of_roster(&view, String::new()).unwrap() {
         GroupRecord::Community(c) => c.charter_digest,
         GroupRecord::Family(f) => f.charter_digest,
     };
-    assert_eq!(
-        digest(&view),
-        "",
-        "I3835: unresolved, no cited row reads as the charter"
+    assert_eq!(digest, "", "I6932: no cited row reads as a charter");
+}
+
+/// **I6932, the door half.** A `unanimous` geographic room of a, b, c,
+/// founded citing their three proofs; c RESIGNS. Version 2 lists a and b and
+/// cites a's and b's proofs AND c's resignation: the proof rule reads only
+/// the proofs (no new member: nothing to locate) and the count reads only the
+/// end (less c): a's and b's voices LAND it. The same version without the
+/// resignation is counted over a, b, c: short. Inherits I3833's expected red
+/// until a `location_proof:v1` row is admitted at the door (the Verify pin).
+async fn cites_hold_proofs_and_resignations_body(d: &dyn FederationDirectory) {
+    use crate::federation::edition2::group::{resignation_draft, MembershipRecord};
+    use crate::federation::types::{CommunityMembershipRevocation, RevocationLeaf};
+    let (a, b, c, g) = (key(231), key(232), key(233), key(234));
+    for k in [&a, &b, &c] {
+        put_statement(d, &key_record(k, &["user"], 0, None), None, INGEST_TIER)
+            .await
+            .unwrap();
+    }
+    let (inside, constraint, _) = cells();
+    let proofs = [
+        proof(&a, &inside, 1_500),
+        proof(&b, &inside, 1_500),
+        proof(&c, &inside, 1_500),
+    ];
+    let ids: Vec<RowId> = proofs
+        .iter()
+        .map(|p| RowId::of_statement(p).unwrap())
+        .collect();
+    for p in &proofs {
+        put_statement(d, p, None, INGEST_TIER).await.unwrap();
+    }
+    let mut room = geographic_room(&g, &constraint, &[&a, &b, &c]);
+    if let GroupRecord::Community(r) = &mut room {
+        r.consensus_protocol = "unanimous".into();
+    }
+    let founding = [
+        citing(&room, &ids, &a),
+        citing(&room, &ids, &b),
+        citing(&room, &ids, &c),
+    ];
+    let v1 = RowId::of_statement(&founding[0]).unwrap();
+    for v in &founding {
+        put_statement(d, v, None, INGEST_TIER).await.unwrap();
+    }
+    let gid = crate::federation::edition2::fixture_switch::room_id(&iref(&g));
+    assert!(
+        d.lookup_community(&gid).await.unwrap().is_some(),
+        "I6932 premise: the room concluded"
     );
-    view.geographic_charter = Some(proofs[0]);
-    assert_eq!(
-        digest(&view),
-        proofs[0].hex(),
-        "I3835: the resolved id, as cited"
+    let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap();
+    let resign = MembershipRecord::CommunityRemoval(CommunityMembershipRevocation {
+        community_key_id: gid.clone(),
+        removed_identity_key_id: iref(&c),
+        removed_at: at(i64::try_from(now_ms).unwrap() - 60_000),
+        effective_at: at(i64::try_from(now_ms).unwrap() - 60_000),
+        reason: None,
+        witness_set: vec![],
+        persist_row_hash: String::new(),
+        leaf: RevocationLeaf::Resignation,
+    });
+    let draft = resignation_draft(
+        &resign,
+        &v1,
+        &[],
+        &iref(&c),
+        &ciris_verify_core::edition2::thumbprint(c.public_key()),
+    )
+    .unwrap();
+    let st = draft.assemble(c.sign(&draft.sig_structure).unwrap());
+    let end = RowId::of_statement(&st).unwrap();
+    let o = put_statement(d, &st, None, INGEST_TIER).await.unwrap();
+    assert!(
+        matches!(o, StatementOutcome::Row { .. }),
+        "I6932 premise: c resigns: {o:?}"
     );
-    view.geographic_charter = Some(charter);
-    assert_eq!(
-        digest(&view),
-        charter.hex(),
-        "I3835: the chain head's charter"
+    let mut v2_rec = crate::federation::edition2::group_fixtures::fixture_record(&room);
+    if let GroupRecord::Community(r) = &mut v2_rec {
+        r.members.retain(|m| m.key_id != iref(&c));
+    }
+    let version = |cite_end: bool, at_ms: u64| {
+        let p = roster_payload_citing(&v2_rec, 2, Some(&v1), &ids[..2], at_ms).unwrap();
+        let p = if cite_end {
+            super::head_rule::with_cites(p, &[end]).unwrap()
+        } else {
+            p
+        };
+        [&a, &b]
+            .iter()
+            .map(|k| {
+                ciris_verify_core::edition2::sign_row_statement(
+                    k,
+                    &iref(k),
+                    &gid,
+                    "scores",
+                    &ciris_verify_core::namespace_match::family_id(GROUP_ROSTER_PREFIX),
+                    &p,
+                    vec![],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut last = None;
+    for v in version(false, now_ms - 30_000) {
+        last = Some(put_statement(d, &v, None, INGEST_TIER).await.unwrap());
+    }
+    assert!(
+        matches!(last, Some(StatementOutcome::Pending { .. })),
+        "I6932: not citing the resignation, c is counted under unanimous: short: {last:?}"
     );
-    view.geographic_charter = Some(RowId([0x99; 32]));
-    assert_eq!(
-        digest(&view),
-        "",
-        "I3835: a charter this version does not cite"
+    let mut last = None;
+    for v in version(true, now_ms - 20_000) {
+        last = Some(put_statement(d, &v, None, INGEST_TIER).await.unwrap());
+    }
+    assert!(
+        matches!(last, Some(StatementOutcome::Row { .. })),
+        "I6932: citing two proofs and the resignation, a and b are every counted member: {last:?}"
     );
 }
+
+// v62.0.0 (LINEAGE charter arm) — I3835 (a geographic charter told apart
+// at the chain head) is DELETED: it witnessed the earlier model, where a
+// roster version cited its charter (pre4: "charter_digest names nothing in
+// this form: no row carries a charter"). What covers the property now: a
+// cited row is read by its FAMILY on each side (location proofs by
+// `check_named_location_proofs`, resignations by the lineage), I6932.
 
 // ─────────────────────────────────────────────────────────────────────────
 //  I3834 — a non-member's cosign is kept
@@ -565,9 +702,11 @@ async fn cosign_non_member_body(d: &dyn FederationDirectory) {
             .await
             .unwrap();
     }
-    let gid = iref(&g);
     let v1 = family(&g, "fam", &[&a, &b, &c]);
     let mut event = None;
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&v1);
     for k in [&a, &b, &c] {
         let st = roster(&v1, 1, None, 2_000, k);
         put_statement(d, &st, None, INGEST_TIER).await.unwrap();
@@ -673,6 +812,19 @@ async fn i3832_genesis_count_held_then_concluded_postgres() {
         return;
     };
     Box::pin(genesis_both_orders(&early, &late)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i6932_cites_hold_proofs_and_resignations_sqlite() {
+    Box::pin(cites_hold_proofs_and_resignations_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i6932_cites_hold_proofs_and_resignations_postgres() {
+    let Some(d) = postgres().await else { return };
+    Box::pin(cites_hold_proofs_and_resignations_body(&d)).await;
 }
 
 #[cfg(feature = "sqlite")]

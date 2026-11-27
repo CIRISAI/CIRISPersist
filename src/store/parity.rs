@@ -252,7 +252,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("adopt_sealed_chunk_planned", Class::Plan),
     ("adopt_sealed_chunks_planned", Class::Plan),
     ("put_stream_sth_planned", Class::Plan),
-    ("put_delivery_receipt_planned", Class::Plan),
+    ("put_delivery_ack_planned", Class::Plan),
     ("stream_dek_insert_planned", Class::Plan),
     ("stream_dek_put_grants_planned", Class::Plan),
     // The stream claim's verdict (#837 / I41, #954), re-asked by the chunk executor inside its transaction against the row it just read.
@@ -459,7 +459,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // withdraws gate's; this fails only on storage.
     ("after_withdraws", Class::Plumbing),
     ("occurrence_withdrawal_of", Class::Plumbing),
-    ("put_identity_occurrence_revocation_local", Class::Plumbing),
+    (
+        "put_identity_occurrence_revocation_edition2",
+        Class::Plumbing,
+    ),
     ("sqlite_sync_key_record_row", Class::Plumbing),
     ("sqlite_sync_occurrence_row", Class::Plumbing),
     ("sqlite_drop_key_record_rows", Class::Plumbing),
@@ -577,6 +580,20 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // Inside the shared plan: its two same-file halves.
     ("plan_put_attestation", Class::Delegates),
     ("execute_planned", Class::Delegates),
+    // v62.0.0 (VD-fix3; WD-fix4's routing) — a row that carries its edition-2
+    // statement is admitted AS that statement: the shared plan hands it to the
+    // statement door (`put_statement_with_origin`: every gate, the fold),
+    // a same-file helper that runs gates.
+    ("route_into_statement_door", Class::Delegates),
+    // Inside it: the carried statement's hex member (a malformed member is
+    // refused by name: a Gate); the held errors' scan, the fold record's read
+    // and the one verdict's read of a voice (`verdict::row_state`): reads
+    // that fail only on the substrate's own terms; the door's own refusal
+    // of a row it holds is the statement door's (inlined above).
+    ("carried_statement", Class::Gate),
+    ("iter", Class::Plumbing),
+    ("fold_state", Class::Plumbing),
+    ("row_state", Class::Plumbing),
     // The executor's storage steps, called by the shared plan. Each is itself
     // an `AttestationStore` door, compared across backends on its own.
     ("store_planned_attestation", Class::Plumbing),
@@ -784,7 +801,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("inline_blob_of_stream_id", Class::Plumbing),
     // v52.0.0 (#953) — Delegates: the plain receipt listing is the stored
     // listing with the instants dropped.
-    ("list_stored_delivery_receipts_for", Class::Delegates),
+    ("list_stored_delivery_acks_for", Class::Delegates),
     // v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — Gate: refuses a dimension whose
     // segment breaks its manifest-declared case class. A statement about the
     // caller's input.
@@ -903,10 +920,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_reseal_admission", Class::Gate),
     ("check_reseal_seal_admission", Class::Gate),
     ("check_reserved_prefix_admission", Class::Gate),
-    // v61.1.0 (CIRISPersist#1174 item 3, as ruled) — the CC 3.4.3 substrate
-    // self-report attester, asked beside the reserved-prefix gate with its
-    // door: a refusal at the local door, reported at a peer's.
-    ("check_substrate_self_report_attester_at", Class::Gate),
+    // v61.1.0 (CIRISPersist#1174 item 3) — the CC 3.4.3 substrate
+    // self-report attester at the local-tier door (v62.0.0, D1: enforced at
+    // every door; the others ask it inside `check_reserved_prefix_admission`).
+    ("check_substrate_self_report_attester", Class::Gate),
     ("check_revocation_authority", Class::Gate),
     ("check_revocation_bound", Class::Gate),
     ("check_revocation_envelope_binding", Class::Gate),
@@ -1031,10 +1048,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("from_str", Class::Plumbing),
     ("from_value", Class::Plumbing),
     ("from_wire_str", Class::Plumbing),
-    // v59.0.0 (CIRISPersist#1099) — the self-roster door: refuses (holds) a
-    // roster change one key of two or more signed.
-    ("gate_occurrence", Class::Gate),
-    ("gate_withdrawal", Class::Gate),
     ("get", Class::Plumbing),
     ("get_attestation", Class::Delegates),
     ("get_client", Class::Delegates),
@@ -1329,11 +1342,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v61 S2 (CC 4.5.13) — the open:self_admit removal window at the local
     // door: refuses a removal received outside 259 200 s of its signed instant.
     ("check_open_self_admit_removal_window", Class::Gate),
-    // v61 S2 (CIRISPersist#1123) — a room stored under founder_only: the
-    // record door admits only its escape, the roster doors no membership
-    // event (both refuse the caller's input).
-    ("check_founder_only_escape", Class::Gate),
-    ("refuse_membership_event_under_founder_only", Class::Gate),
     // #840 (I44) — the V070 checksum repair. PLUMBING, and the reason is
     // that it cannot refuse anything: one conditional UPDATE whose entire
     // predicate is this crate's own constants (version 70, that name, one
@@ -1740,10 +1748,7 @@ mod tests {
             "adopt_sealed_chunks_planned",
         ),
         ("src/federation/blob_admit.rs", "put_stream_sth_planned"),
-        (
-            "src/federation/blob_admit.rs",
-            "put_delivery_receipt_planned",
-        ),
+        ("src/federation/blob_admit.rs", "put_delivery_ack_planned"),
         ("src/federation/blob_admit.rs", "stream_dek_insert_planned"),
         (
             "src/federation/blob_admit.rs",
@@ -1976,9 +1981,10 @@ mod tests {
             "put_identity_occurrence",
             "put_identity_occurrence_planned",
         ),
+        // v62.0.0 (WD-fix9) — the retired trusted-local write, a TEST seam.
         (
             "FederationDirectory",
-            "put_identity_occurrence_local",
+            "test_seam_put_identity_occurrence",
             "put_identity_occurrence_local_planned",
         ),
         // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
@@ -2040,8 +2046,8 @@ mod tests {
         ("BlobStorage", "put_stream_sth", "put_stream_sth_planned"),
         (
             "BlobStorage",
-            "put_delivery_receipt",
-            "put_delivery_receipt_planned",
+            "put_delivery_ack",
+            "put_delivery_ack_planned",
         ),
         (
             "BlobStorage",
@@ -3640,13 +3646,6 @@ mod tests {
         (
             "plan_put_community_membership_revocation",
             "reject_future_dated_community_revocation",
-            Reads::ReceivedAt,
-        ),
-        // v61 S2 (CIRISPersist#1123) — the founder_only escape: the founders
-        // under the old protocol, folded at receipt.
-        (
-            "plan_put_community",
-            "check_founder_only_escape",
             Reads::ReceivedAt,
         ),
         // v61 S2 — the open:self_admit removal window, bounded on receipt at

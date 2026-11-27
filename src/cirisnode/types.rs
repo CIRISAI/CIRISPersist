@@ -90,13 +90,15 @@ pub struct Witness {
     pub software_stack: String,
     /// Witness's expertise in the cell, in `[0, 1]`.
     pub cell_expertise: f64,
-    /// Hybrid signature over the witness attestation bytes.
+    /// The witness's claimed signature: caller-supplied, pair-shaped bytes
+    /// persist has never verified (v62.0.0, CN-fix1.r62: a set carrying it
+    /// is refused, `cirisnode_contribution_witness_set_unverified`).
     pub signature: HybridSignature,
 }
 
-/// Diversity accounting carried alongside the witness list. The
-/// crate validates this against the computed diversity at submission
-/// time; mismatch rejects the WitnessSet.
+/// Diversity accounting carried alongside the witness list. Persist never
+/// validated it; v62.0.0 (CN-fix1.r62) admits no `WitnessSet` at all
+/// (`cirisnode_contribution_witness_set_unverified`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiversityProof {
     /// Distinct jurisdictions represented.

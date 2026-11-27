@@ -18,7 +18,7 @@
 //! | `takedown_notice:steward_purge` | none: its row door is held shut (CIRISPersist#988); the purge door counts the stewards' voices | `ceg_statements` |
 //! | `custody:{kind}` | `put_attestation` (the custody gate; the holding-claim fold reads the row) | `federation_attestations` |
 //! | `key_grant:{axis}` | `put_attestation`, then the grant projection the typed doors run (`project_key_grant_row`) | `federation_attestations` + the grant tables |
-//! | `delivery_receipt:{stream_id}` | the receipt door's JOIN and equivocation steps; the signed receipt row through `put_attestation` (`custody_ack::signed_receipt_at` reads it) | `federation_stream_delivery_receipts` + `federation_attestations` |
+//! | `delivery_receipt:{stream_id}` | the receipt door's JOIN and equivocation steps; the signed receipt row through `put_attestation` (`custody_ack::signed_receipt_at` reads it) | `federation_stream_delivery_acks` + `federation_attestations` |
 //! | `cosign:{state}` | none: the hold IS the counted row (CC 3.1.3; [`crate::federation::cosign`]) | `ceg_statements` |
 //!
 //! # Counted voices
@@ -45,7 +45,7 @@
 //! (and states each hash digest as the 64 lowercase hex the gates read), so
 //! the put, `verify_carried` and `check_carried_projection` read ONE
 //! projection. The writers ([`custody_payload`], [`key_grant_payload`],
-//! [`takedown_payload`], [`delivery_receipt_payload`],
+//! [`takedown_payload`], [`delivery_ack_payload`],
 //! [`revocation_payload`], [`occurrence_revocation_payload`]) are the
 //! inverse, for producers and fixtures.
 
@@ -58,12 +58,12 @@ use sha2::Digest as _;
 
 use super::door::AdmittedRow;
 use super::group::{composite_signature_b64, run_vouched, Landing, Vouch};
-use super::ingest::{attestation_of, json_of, StatementOutcome, COMPOSER_ROW_TYPES};
+use super::ingest::{attestation_of, json_of, StatementOutcome};
 use super::names::{single, RowId};
 use crate::federation::blobs::GrantWrap;
 use crate::federation::custody_ack::CustodyState;
 use crate::federation::key_grant::{KeyGrantAxis, KeyGrantRow};
-use crate::federation::stream_receipt::DeliveryReceipt;
+use crate::federation::stream_receipt::DeliveryAck;
 use crate::federation::types::{
     cohort_scope as cs, IdentityOccurrenceRevocation, Revocation, SignedAttestation,
     SignedRevocation,
@@ -86,7 +86,7 @@ pub const CUSTODY_PREFIX: &str = "custody:{kind}";
 /// `key_grant:{axis}`.
 pub const KEY_GRANT_PREFIX: &str = "key_grant:{axis}";
 /// `delivery_receipt:{stream_id}`.
-pub const DELIVERY_RECEIPT_PREFIX: &str = "delivery_receipt:{stream_id}";
+pub const DELIVERY_ACK_PREFIX: &str = "delivery_receipt:{stream_id}";
 
 /// The `refs` role a cosign statement names the event it cosigns by.
 pub const TARGET_ROLE: &str = "target";
@@ -113,7 +113,7 @@ pub enum TypedPlane {
     /// `key_grant:{axis}`.
     KeyGrant,
     /// `delivery_receipt:{stream_id}`.
-    DeliveryReceipt,
+    DeliveryAck,
 }
 
 /// Each typed plane's registry prefix.
@@ -127,7 +127,7 @@ pub const PLANES: [(&str, TypedPlane); 7] = [
     (TAKEDOWN_PREFIX, TypedPlane::Takedown),
     (CUSTODY_PREFIX, TypedPlane::Custody),
     (KEY_GRANT_PREFIX, TypedPlane::KeyGrant),
-    (DELIVERY_RECEIPT_PREFIX, TypedPlane::DeliveryReceipt),
+    (DELIVERY_ACK_PREFIX, TypedPlane::DeliveryAck),
 ];
 
 /// **Is this row one of the typed planes?** By its header family id
@@ -179,7 +179,7 @@ pub fn never_replaced(family: &str, payload: &Value) -> bool {
             .and_then(Value::as_text)
             .is_some_and(crate::federation::admission::is_peer_deadmission_dimension),
         TypedPlane::OccurrenceRevocation | TypedPlane::Cosign | TypedPlane::KeyGrant => true,
-        TypedPlane::Takedown | TypedPlane::Custody | TypedPlane::DeliveryReceipt => false,
+        TypedPlane::Takedown | TypedPlane::Custody | TypedPlane::DeliveryAck => false,
     }
 }
 
@@ -656,7 +656,7 @@ fn put_digests_hex(row: &AdmittedRow, o: &mut serde_json::Map<String, serde_json
 ///   `minter_key_id`, `owner` → `owner_key_id`, `at_rest_sha256` as hex,
 ///   `wrapped_dek` as the verbatim wrap text (its UTF-8 bytes in edition
 ///   2), `family_id` → `family_key_id`.
-/// - `delivery_receipt`: `chunk_root` as hex.
+/// - `delivery_ack`: `chunk_root` as hex.
 pub fn project_envelope(row: &AdmittedRow, o: &mut serde_json::Map<String, serde_json::Value>) {
     let Some(plane) = typed_plane_of_row(row) else {
         return;
@@ -696,7 +696,7 @@ pub fn project_envelope(row: &AdmittedRow, o: &mut serde_json::Map<String, serde
                 );
             }
         }
-        TypedPlane::DeliveryReceipt => put_digest_hex(row, o, "chunk_root"),
+        TypedPlane::DeliveryAck => put_digest_hex(row, o, "chunk_root"),
         TypedPlane::OccurrenceRevocation | TypedPlane::Cosign | TypedPlane::Revocation => {}
     }
 }
@@ -736,7 +736,7 @@ pub fn unproject_payload(family_id: &str, m: &mut Vec<(Value, Value)>) {
         | TypedPlane::OccurrenceRevocation
         | TypedPlane::Cosign
         | TypedPlane::Revocation
-        | TypedPlane::DeliveryReceipt => &[],
+        | TypedPlane::DeliveryAck => &[],
     };
     if plane == TypedPlane::Takedown {
         m.retain(|(k, _)| k.as_text() != Some("subject_kind"));
@@ -868,7 +868,7 @@ fn composite_signature(statement: &[u8]) -> Option<Vec<u8>> {
     Some(sig)
 }
 
-/// **A `delivery_receipt:{stream_id}` statement as the [`DeliveryReceipt`]
+/// **A `delivery_receipt:{stream_id}` statement as the [`DeliveryAck`]
 /// it states**: `stream_id` (equal to the `{stream_id}` leaf), the
 /// subscriber (`iss`, equal to `sub`), `epoch`, `k`, `chunk_root`. The
 /// receipt carries the statement's composite signature WHOLE, as one field
@@ -881,19 +881,19 @@ fn composite_signature(statement: &[u8]) -> Option<Vec<u8>> {
 /// `edition2_payload_invalid` for a missing or ill-typed member, a stream
 /// that is not the leaf, a subscriber that is not the row's `sub`, or a
 /// signature that is not a composite.
-pub fn delivery_receipt_of(row: &AdmittedRow) -> Result<DeliveryReceipt, Error> {
+pub fn delivery_ack_of(row: &AdmittedRow) -> Result<DeliveryAck, Error> {
     let p = &row.payload;
     let stream_id = req_text(p, "stream_id")?;
     if text_of(p, "dimension")
-        != Some(crate::federation::custody_ack::delivery_receipt_dimension(stream_id).as_str())
+        != Some(crate::federation::custody_ack::delivery_ack_dimension(stream_id).as_str())
     {
         return Err(invalid(format!(
-            "{DELIVERY_RECEIPT_PREFIX}: `stream_id` {stream_id:?} is not the dimension's leaf"
+            "{DELIVERY_ACK_PREFIX}: `stream_id` {stream_id:?} is not the dimension's leaf"
         )));
     }
     if row.iss != row.sub {
         return Err(invalid(format!(
-            "{DELIVERY_RECEIPT_PREFIX}: the subscriber {:?} is the row's sub, not {:?}",
+            "{DELIVERY_ACK_PREFIX}: the subscriber {:?} is the row's sub, not {:?}",
             row.iss, row.sub
         )));
     }
@@ -903,7 +903,7 @@ pub fn delivery_receipt_of(row: &AdmittedRow) -> Result<DeliveryReceipt, Error> 
         .ok_or_else(|| invalid("`chunk_root` is required (a hash digest)"))?;
     let composite_signature = composite_signature(&row.bytes)
         .ok_or_else(|| invalid("the statement's signature is not a composite"))?;
-    Ok(DeliveryReceipt {
+    Ok(DeliveryAck {
         stream_id: stream_id.to_owned(),
         subscriber_key_id: row.iss.clone(),
         epoch: req_u64(p, "epoch")?,
@@ -1011,7 +1011,7 @@ where
     match plane {
         TypedPlane::OccurrenceRevocation => Box::pin(put_occurrence_revocation(dir, row)).await,
         TypedPlane::Revocation => Box::pin(put_revocation_statement(dir, row)).await,
-        TypedPlane::DeliveryReceipt => Box::pin(put_delivery_receipt(dir, row, tier)).await,
+        TypedPlane::DeliveryAck => Box::pin(put_delivery_ack(dir, row, tier)).await,
         TypedPlane::Cosign => Box::pin(put_cosign(dir, row)).await,
         TypedPlane::Takedown if is_steward_purge(row) => {
             let new = dir.put_edition2_statement(row).await?;
@@ -1269,7 +1269,7 @@ where
 /// which reads [`occurrence_revocation_of`]). A proposal no answer can mend
 /// is `SelfRosterNotLanded` (the voice stays held: the gate counts held
 /// voices, so it is stored first). Landing writes the revocation the carrier
-/// feeds (`put_identity_occurrence_revocation_local`) unless the pair is
+/// feeds (`put_identity_occurrence_revocation_edition2`) unless the pair is
 /// already revoked: the first route to land fixes the instants.
 async fn put_occurrence_revocation<F>(dir: &F, row: &AdmittedRow) -> Result<StatementOutcome, Error>
 where
@@ -1320,8 +1320,11 @@ where
         .iter()
         .any(|r| r.occurrence_key_id == revocation.occurrence_key_id);
     if !held {
-        dir.put_identity_occurrence_revocation_local(revocation)
-            .await?;
+        dir.put_identity_occurrence_revocation_edition2(
+            revocation,
+            crate::federation::DoorToken::new(),
+        )
+        .await?;
     }
     Ok(StatementOutcome::Row {
         row_id: row.row_id,
@@ -1416,12 +1419,12 @@ where
 
 /// **`delivery_receipt:{stream_id}`**: the subscriber's key (held, else the
 /// retryable unknown signer), the receipt it states
-/// ([`delivery_receipt_of`]) through the receipt door's JOIN and
-/// equivocation steps (`put_delivery_receipt_edition2`), then the signed
+/// ([`delivery_ack_of`]) through the receipt door's JOIN and
+/// equivocation steps (`put_delivery_ack_edition2`), then the signed
 /// receipt row through the attestation door (the custody fold reads it,
 /// `custody_ack::signed_receipt_at`). A receipt the JOIN refuses is not
 /// kept anywhere.
-async fn put_delivery_receipt<F>(
+async fn put_delivery_ack<F>(
     dir: &F,
     row: &AdmittedRow,
     tier: &str,
@@ -1433,13 +1436,13 @@ where
     if dir.lookup_public_key(&row.iss).await?.is_none() {
         return Err(Error::unknown_signer(&row.iss, PLANE));
     }
-    let receipt = delivery_receipt_of(row)?;
+    let receipt = delivery_ack_of(row)?;
     // v62.0.0 (wave GC4; CC 2.7.3) — the receipt door's JOIN and
     // equivocation steps read other rows (the stream, the subscriber's other
     // receipts): they run inside the door's fold attempt
     // (`ingest::put_admitted_row`), so a step that marks its condition holds
     // the statement instead of losing it. (Their owner converts them.)
-    dir.put_delivery_receipt_edition2(receipt).await?;
+    dir.put_delivery_ack_edition2(receipt).await?;
     put_attestation_row(dir, row, tier).await
 }
 
@@ -1556,7 +1559,7 @@ where
         crate::federation::replication::admission::WriteOrigin::Wire,
     ))
     .await?;
-    let edge = if COMPOSER_ROW_TYPES.contains(&row.row_type.as_str()) {
+    let edge = if super::emit::names_a_target(&row.row_type) {
         match single(&row.names, TARGET_ROLE) {
             Some(t) => dir.get_attestation(&t.hex()).await?,
             None => None,
@@ -1900,6 +1903,42 @@ pub fn takedown_payload(
     Ok(det_map(m))
 }
 
+/// LEAD-root2 (CC 2.4.1.1 "A purge is a tombstone"; CC 3.1.1's
+/// `takedown_notice` row; CC 3.2 T5) — **the payload of a STEWARD PURGE
+/// notice**: a row COUNTED over the holders of the bundle `head` (its
+/// `refs.head`), with no `author` and no `claimant` (a counted row has no one
+/// issuer; its `sub` is the lineage's name). Every other member is
+/// [`takedown_payload`]'s.
+///
+/// # Errors
+/// As [`takedown_payload`].
+pub fn steward_purge_payload(
+    head: &ciris_verify_core::edition2::Digest32,
+    content_sha256: &[u8; 32],
+    content_holders: &[String],
+    notice: &NoticeText,
+    expires_at_ms: u64,
+    asserted_at_ms: u64,
+) -> Result<Value, Error> {
+    let basis = crate::federation::steward_purge::STEWARD_PURGE_BASIS;
+    Ok(det_map(vec![
+        ("asserted_at", Value::Uint(asserted_at_ms)),
+        ("dimension", text(&format!("takedown_notice:{basis}:v1"))),
+        ("legal_basis", text(basis)),
+        ("content_sha256", hash_digest_value(content_sha256)),
+        ("content_holders", identity_set(content_holders)),
+        ("claim_text", text(&notice.claim_text)),
+        ("good_faith_statement", text(&notice.good_faith_statement)),
+        ("jurisdiction", text(&notice.jurisdiction)),
+        ("expires_at", Value::Uint(expires_at_ms)),
+        ("score", fixed6(-1_000_000)),
+        (
+            "refs",
+            det_map(vec![("head", ciris_verify_core::edition2::row_ref(head))]),
+        ),
+    ]))
+}
+
 /// The CC 2.1 cohort-target member a scope names its group by:
 /// `community_id` at a room, `family_id` at a family, none otherwise.
 fn cohort_target_member(scope: &str) -> Option<&'static str> {
@@ -2035,7 +2074,7 @@ pub fn key_grant_payload(
 
 /// The payload of a `delivery_receipt:{stream_id}` row by `subscriber`.
 #[must_use]
-pub fn delivery_receipt_payload(
+pub fn delivery_ack_payload(
     subscriber: &str,
     stream_id: &str,
     epoch: u64,
@@ -2048,7 +2087,7 @@ pub fn delivery_receipt_payload(
         ("author", text(subscriber)),
         (
             "dimension",
-            text(&crate::federation::custody_ack::delivery_receipt_dimension(
+            text(&crate::federation::custody_ack::delivery_ack_dimension(
                 stream_id,
             )),
         ),
@@ -2077,16 +2116,17 @@ pub fn cosign_payload(author: &str, state: &str, event: &RowId, asserted_at_ms: 
 }
 
 /// The payload of a `trust:accepts:v1` acceptance edge (a `delegates_to`
-/// from `granter` to the trusted key or root, the row's `sub`): the edge's
-/// `scope`, its `trust_classes` (the v1.3 `trust_domains`), its
-/// `valid_until` (the v1.3 `expires_at`), placed at `cohort_scope` (`self`
-/// for an anonymous grant). `trust_type` is no member (CC: structure
-/// carries it).
+/// from `granter` to the trusted key or root, the row's `sub`): its
+/// `trust_classes` (the v1.3 `trust_domains`), its `valid_until` (the v1.3
+/// `expires_at`), placed at `cohort_scope` (`self` for an anonymous grant).
+/// `trust_type` is no member (CC: structure carries it).
 ///
+/// v62.0.0 (R2-accept; the Constitution's `trust-accepts` rule) — the edge
+/// **carries no `scope`**. An edge to a root names the bundle it attaches on
+/// (`attached_head_digest`, a hash digest); a caller that names one adds it.
 #[must_use]
 pub fn trust_accepts_payload(
     granter: &str,
-    scope: &[&str],
     trust_classes: &[String],
     valid_until_ms: Option<u64>,
     cohort_scope: &str,
@@ -2098,10 +2138,6 @@ pub fn trust_accepts_payload(
         (
             "dimension",
             text(crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION),
-        ),
-        (
-            "scope",
-            Value::Array(scope.iter().map(|s| text(s)).collect()),
         ),
         ("cohort_scope", text(cohort_scope)),
     ];

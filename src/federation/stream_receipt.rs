@@ -51,10 +51,10 @@ const RECEIPT_SIGNING_DOMAIN: &[u8] = b"ciris-delivery-receipt/v1";
 /// A subscriber's signed delivery acknowledgement for one chunk.
 ///
 /// `Serialize`/`Deserialize` is the FFI boundary shape (PyO3
-/// `list_delivery_receipts_for` serves it as JSON). `chunk_root` serializes
+/// `list_delivery_acks_for` serves it as JSON). `chunk_root` serializes
 /// as a 32-element byte array; `composite_signature` as standard base64.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DeliveryReceipt {
+pub struct DeliveryAck {
     /// The stream this receipt is for (`log_id`-equivalent `stream:<id>`
     /// is the transparency log; `stream_id` here is the bare id).
     pub stream_id: String,
@@ -83,11 +83,11 @@ pub struct DeliveryReceipt {
 /// it (the signing bytes do not change). It serializes flat: the receipt's
 /// members plus `received_at`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct StoredDeliveryReceipt {
+pub struct StoredDeliveryAck {
     /// The receipt as the subscriber signed it.
     #[serde(flatten)]
-    pub receipt: DeliveryReceipt,
-    /// When this node's `put_delivery_receipt` stored it.
+    pub receipt: DeliveryAck,
+    /// When this node's `put_delivery_ack` stored it.
     pub received_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -167,8 +167,8 @@ pub fn receipt_signing_bytes(
     buf
 }
 
-/// Canonical signing bytes for a [`DeliveryReceipt`].
-pub fn receipt_signing_bytes_of(receipt: &DeliveryReceipt) -> Vec<u8> {
+/// Canonical signing bytes for a [`DeliveryAck`].
+pub fn receipt_signing_bytes_of(receipt: &DeliveryAck) -> Vec<u8> {
     receipt_signing_bytes(
         &receipt.subscriber_key_id,
         &receipt.stream_id,
@@ -330,12 +330,12 @@ mod tests {
         assert!(receipt_bytes.starts_with(RECEIPT_SIGNING_DOMAIN));
     }
 
-    /// The FFI boundary serializes `DeliveryReceipt` as JSON; confirm a
+    /// The FFI boundary serializes `DeliveryAck` as JSON; confirm a
     /// full round-trip preserves every field including the 32-byte root
     /// and the hybrid signature.
     #[test]
-    fn delivery_receipt_json_round_trips() {
-        let receipt = DeliveryReceipt {
+    fn delivery_ack_json_round_trips() {
+        let receipt = DeliveryAck {
             stream_id: "stream-x".to_owned(),
             subscriber_key_id: "sub-x".to_owned(),
             epoch: 9,
@@ -344,7 +344,7 @@ mod tests {
             composite_signature: vec![7u8; ciris_crypto::composite::SIGNATURE_LEN],
         };
         let json = serde_json::to_string(&receipt).unwrap();
-        let back: DeliveryReceipt = serde_json::from_str(&json).unwrap();
+        let back: DeliveryAck = serde_json::from_str(&json).unwrap();
         assert_eq!(back.stream_id, receipt.stream_id);
         assert_eq!(back.subscriber_key_id, receipt.subscriber_key_id);
         assert_eq!(back.epoch, receipt.epoch);

@@ -210,19 +210,24 @@ pub mod bodies {
         else {
             return Ok(None);
         };
-        // `authority_of` already answers the authority's identity-ref (P2's
-        // key-segment parser), so it is the group id as the store keys it.
+        // `authority_of` answers the KEY spelling of the dimension's segment
+        // (P2's key-segment parser).
         let Some(authority) = crate::federation::licensure::authority_of(dimension) else {
             return Ok(None);
         };
         let group = authority.to_string();
-        Ok(dir
-            .lookup_community(&group)
-            .await?
+        // GID-fix6 — the authority's room by the id the store keys it: the
+        // key spelling `authority_of` answers, else the held group the
+        // dimension's segment names (an affiliation's derived id; GID-fix3).
+        let held = match dir.lookup_community(&group).await? {
+            Some(c) => Some(c),
+            None => crate::federation::admission::held_group_of_segment_id(dir, &group).await?,
+        };
+        Ok(held
             .filter(|c| {
                 c.consensus_protocol != crate::federation::types::consensus_protocol::FOUNDER_ONLY
             })
-            .map(|_| group))
+            .map(|c| c.community_key_id))
     }
 
     /// Offer `row` at its door, returning the row as offered and the door's
@@ -256,19 +261,19 @@ pub mod bodies {
             .unwrap_or_default();
         // v62.0.0 (wave V1b, CC 3.2 / C557): an owner binding lands only with
         // the bound node's own voice; without it the door holds it Pending.
-        // One that names an affiliation (`community_id`) is COUNTED (CC ruling
-        // (a), V1b `check_owner_binding_counted`): it names the affiliation's
-        // held roster version as `refs.head`, and the members' voices count
-        // over it at the affiliation's protocol.
+        // One on behalf of an affiliation is COUNTED (CC ruling (a), V1b
+        // `check_owner_binding_counted`): it names the affiliation's held
+        // roster version as `refs.head`, and the members' voices count over
+        // it at the affiliation's protocol. v62.0.0 (BIND-1; CC rc22 rule
+        // `owner-binding`) — the affiliation is the one `on_behalf_of` names;
+        // a placement (`community_id`) is counted by nobody.
         let mut row = row.clone();
         if row.attestation_type == attestation_type::DELEGATES_TO
             && crate::federation::admission::is_owner_binding_envelope(&row.attestation_envelope)
         {
-            let named = row
-                .attestation_envelope
-                .get("community_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
+            let named =
+                crate::federation::admission::owner_binding_on_behalf_of(&row.attestation_envelope)
+                    .map(str::to_owned);
             // v62.0.0 (E2-fix3; K2.api) — a plain owner binding (no
             // affiliation, no further cosigner) lands through K2's shared
             // helper: the owner's statement, then the bound key's voice.
@@ -910,6 +915,7 @@ pub mod bodies {
                 reason: None,
                 witness_set: vec![],
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Resignation,
             },
         ))
         .await

@@ -50,8 +50,9 @@
 //!   `is_canonical`);
 //! - key liveness ([`super::ingest::held_keys_for_kid`] →
 //!   [`HeldKeys::liveness`](super::liveness::HeldKeys::liveness));
-//! - the delegation plane's live conferral rows
-//!   (`trust_root::live_conferral_rows`, the body the capability walk reads);
+//! - the live conferral rows (`trust_root::live_conferral_rows`, the body
+//!   the capability walk reads): the root's counted grants (the ceremony
+//!   plane, R2-planes) and any other grant (the delegation plane);
 //! - the reader's accepted roots and T3 legs (`trust_root::accepted_roots_of`,
 //!   `trust_root::chain_legs_of`, the body `own_chain_to` reads);
 //! - the trust root's read verdict for that reader
@@ -59,13 +60,19 @@
 //!   reads);
 //! - T7's margin, inside that read verdict (`compute_standing`: Rooted iff
 //!   the active founders reach M + 1, TR-fix1).
+//!
+//! v62.0.0 (R2-rooms; CC 3.2 T5) — the room-chain pieces above (the T3 legs,
+//! `reader_standing`, `compute_standing`'s margin) are no longer read: the
+//! one root is the bundle's lineage (`trust_root::bundle_root_accepted`, T7's
+//! margin over the holders in force); with a bundle in force any other id is
+//! `root_chain_not_rooted`, and with none it waits.
 
 use ciris_crypto::composite::CompositePublicKey;
 use ciris_verify_core::edition2::{identity_ref, Digest32, MissingKey};
 use serde::{Deserialize, Serialize};
 
 use super::liveness::Liveness;
-use crate::federation::canonical_community::{self, StoredStanding};
+use crate::federation::canonical_community;
 use crate::federation::trust_root::{self, ChainLegs, CharterLeg};
 use crate::federation::{Error, FederationDirectory};
 
@@ -147,12 +154,25 @@ impl ClaimedKeyWire {
 }
 
 /// Which of CC 3.2 T2's two planes carried the peer's conferral.
+///
+/// v62.0.0 (R2-planes; Constitution 11-24 "CONSTITUTION RULED THE DELEGATION
+/// ARM": peer rooting "has them backwards and is aligned") — named by the
+/// count, never by a granter-declared field, as `trust_root::ConferralPlane`
+/// is: a seat the BUNDLE gives (a holder, a serve seat) and the ROOT's
+/// counted grant are both `Ceremony` (rows counted over the holders, naming
+/// the bundle); `Delegation` is a grant whose legitimacy is NOT a count over
+/// the holders. Before, a counted root grant read as `Delegation`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Plane {
-    /// A count by a family roster: the genesis bundle in force.
+    /// A row counted over the holders of the bundle in force, naming it: the
+    /// bundle itself (its holders, its serve seats) or the root's counted
+    /// grant (`admission::root_grant_of`).
     Ceremony,
-    /// A live `delegates_to(root → peer)` grant bearing the scope.
+    /// A live `delegates_to` bearing the scope from a grantee, resolved at
+    /// use (CC 3.2 T2). No such grant roots a peer yet: the delegation walk
+    /// is not written (P/R2-delegation-read.md), so a seat on this plane
+    /// names its granter's key, which is no root, and reads not rooted.
     Delegation,
 }
 
@@ -551,14 +571,16 @@ fn claim_matches(
 }
 
 /// One root's reading for the reader, through the trust root's own read
-/// verdict ([`canonical_community::reader_standing`]) and T7's margin.
-/// `Ok(None)`: no record of the root is held (it waits).
+/// verdict and T7's margin. v62.0.0 (R2-rooms): the bundle's lineage only
+/// (`trust_root::bundle_root_accepted`); the room-chain reading is deleted.
+/// It is asked only once the genesis in force is held (`peer_rooting`'s
+/// step 1), so it never waits.
 async fn root_arm<F>(
     dir: &F,
     reader: &str,
     root: &str,
     t: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<Arm>, Error>
+) -> Result<Arm, Error>
 where
     F: FederationDirectory + ?Sized,
 {
@@ -570,34 +592,38 @@ where
     // holders in force: `Stalled` when losing one holder would leave the
     // rest short of the strict majority. No room chain is read for it.
     if let Some(holders) = trust_root::bundle_root_holders(dir, root).await? {
-        if !Box::pin(trust_root::bundle_root_accepted(dir, reader, root, t)).await? {
-            return Ok(Some(Arm::NotRooted(NotRootedReason::NoAcceptanceEdge {
-                root: Some(root.to_owned()),
-            })));
-        }
+        // v62.0.0 (R2-rooms) — through the model's `V` (`arm`): the chain
+        // holds (the bundle in force is its current head); the reader's T3
+        // legs are its acceptance, live or not (`root_arm` is asked only for a
+        // root the reader's acceptor names by a held acceptance row,
+        // `trust_root::accepted_roots_of`, so the edge is HELD: one that is
+        // not live reads `edge_or_charter_withdrawn`, I2223), and the charter
+        // is the bundle's (complete by its placement); T7's margin is over the
+        // holders in force.
+        let accepted = Box::pin(trust_root::bundle_root_accepted(dir, reader, root, t)).await?;
         let n = holders.len();
-        return Ok(Some(
-            if n > crate::federation::admission::strict_majority(n) {
-                Arm::Rooted
-            } else {
-                Arm::Stalled
-            },
+        return Ok(arm(
+            root,
+            true,
+            "",
+            Some(ChainLegs {
+                accepted,
+                edge_held: true,
+                charter: CharterLeg::Complete,
+            }),
+            n > crate::federation::admission::strict_majority(n),
         ));
     }
-    // A KEYED root (a self-charter signed by the root's key) keeps its legs
-    // as they were, kept until the keyed-root question is ruled.
-    let (standing, legs) = canonical_community::reader_standing(dir, Some(reader), root, t).await?;
-    // A chain that holds is judged on its legs; a NotRooted answer with legs
-    // Some failed a T3 leg over a chain that held (`reader_standing`).
-    let (chain_holds, detail, live) = match &standing {
-        StoredStanding::Absent => return Ok(None),
-        // TR-fix1: the trust root's own verdict carries T7's margin
-        // (`compute_standing`: Rooted iff active founders ≥ M + 1).
-        StoredStanding::Rooted(_) => (true, String::new(), true),
-        StoredStanding::Stalled { .. } => (true, String::new(), false),
-        StoredStanding::NotRooted { reason } => (legs.is_some(), reason.clone(), false),
-    };
-    Ok(Some(arm(root, chain_holds, &detail, legs, live)))
+    // v62.0.0 (R2-rooms; CC 3.2 T5, "There is no other kind of root") — the
+    // KEYED branch (a room chain judged as a root's,
+    // `canonical_community::reader_standing`) is deleted: the genesis in
+    // force is held here, and an id that is not its lineage is no root.
+    Ok(Arm::NotRooted(NotRootedReason::RootChainNotRooted {
+        root: root.to_owned(),
+        detail: "not the lineage of the genesis bundle in force: the root is the bundle's \
+                 lineage, and there is no other kind of root (CC 3.2 T5)"
+            .to_owned(),
+    }))
 }
 
 /// v62.0.0 (PR-fix1; CC 3.2 T8, CC 5.3.4) — **is the peer `peer_identity_ref`
@@ -627,8 +653,8 @@ where
 /// record (not held: waits); the peer's key (not an identity-ref:
 /// `UnknownKey`; its liveness; the claim); the peer's conferrals; each
 /// conferral's root through the reader's chain. `Rooted` wins over
-/// `Stalled`, `Stalled` over a wait for an accepted root not held, that over
-/// a named `NotRooted`.
+/// `Stalled`, that over a named `NotRooted` (v62.0.0 R2-rooms: an accepted
+/// root is the lineage or no root, so nothing past step 1 waits on a root).
 ///
 /// # Errors
 ///
@@ -714,20 +740,27 @@ pub async fn peer_rooting<F: FederationDirectory + ?Sized>(
     let grants =
         trust_root::live_conferral_rows(dir, peer_identity_ref, trust_root::INFRA_SERVE_SCOPE, t)
             .await?;
+    // v62.0.0 (R2-planes) — the counted grant's seat is on the CEREMONY plane
+    // (a row counted over the holders, naming the bundle); any other grant's
+    // on the DELEGATION plane, under its granter's key.
+    let mut counted: Vec<String> = Vec::new();
     let mut granters: Vec<String> = Vec::new();
     for g in grants {
-        let granter = if crate::federation::admission::is_counted_root_grant_row(&g) {
+        let (plane_of, granter) = if crate::federation::admission::is_counted_root_grant_row(&g) {
             match crate::federation::admission::root_grant_of(dir.as_dyn_directory(), &g, t).await?
             {
-                Some(rg) if rg.accepted => rg.family_key_id,
+                Some(rg) if rg.accepted => (&mut counted, rg.family_key_id),
                 _ => continue,
             }
         } else {
-            g.attesting_key_id
+            (&mut granters, g.attesting_key_id)
         };
-        if !granters.contains(&granter) {
-            granters.push(granter);
+        if !plane_of.contains(&granter) {
+            plane_of.push(granter);
         }
+    }
+    if !counted.is_empty() {
+        seats.push((Plane::Ceremony, RootedVia::ConferredSeat, counted));
     }
     if !granters.is_empty() {
         seats.push((Plane::Delegation, RootedVia::ConferredSeat, granters));
@@ -745,7 +778,6 @@ pub async fn peer_rooting<F: FederationDirectory + ?Sized>(
 
     // 5. Each root through the reader's chain (T3) and T7's margin.
     let mut stalled: Option<PeerRooting> = None;
-    let mut waits = false;
     let mut named: Option<NotRootedReason> = None;
     let mut no_edge: Option<NotRootedReason> = None;
     for (plane, via, roots) in seats {
@@ -760,8 +792,7 @@ pub async fn peer_rooting<F: FederationDirectory + ?Sized>(
                 continue;
             }
             match root_arm(dir, reader_node, &root, t).await? {
-                None => waits = true,
-                Some(Arm::Rooted) => {
+                Arm::Rooted => {
                     return Ok(PeerRooting::Rooted {
                         root,
                         plane,
@@ -769,7 +800,7 @@ pub async fn peer_rooting<F: FederationDirectory + ?Sized>(
                         record,
                     })
                 }
-                Some(Arm::Stalled) => {
+                Arm::Stalled => {
                     stalled.get_or_insert(PeerRooting::Stalled {
                         root,
                         plane,
@@ -777,10 +808,10 @@ pub async fn peer_rooting<F: FederationDirectory + ?Sized>(
                         record: record.clone(),
                     });
                 }
-                Some(Arm::NotRooted(r @ NotRootedReason::NoAcceptanceEdge { .. })) => {
+                Arm::NotRooted(r @ NotRootedReason::NoAcceptanceEdge { .. }) => {
                     no_edge.get_or_insert(r);
                 }
-                Some(Arm::NotRooted(r)) => {
+                Arm::NotRooted(r) => {
                     named.get_or_insert(r);
                 }
             }
@@ -788,9 +819,6 @@ pub async fn peer_rooting<F: FederationDirectory + ?Sized>(
     }
     if let Some(s) = stalled {
         return Ok(s);
-    }
-    if waits {
-        return wait(CannotTellYet::NoGenesisOrRootLineageHeld);
     }
     match named.or(no_edge) {
         Some(r) => not(r),

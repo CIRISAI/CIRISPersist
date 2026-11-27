@@ -446,7 +446,7 @@ Engine	list_consent_revocation_promotion_overdue_json	empirical
 Engine	list_consent_revocation_promotion_overdue_readonly_json	empirical	
 Engine	list_consumers	structural	
 Engine	list_derived_json	empirical	
-Engine	list_delivery_receipts_for	testimonial	delivery_event
+Engine	list_delivery_acks_for	testimonial	delivery_event
 Engine	list_families_for_member_active_json	empirical	
 Engine	list_families_for_member_json	empirical	
 Engine	list_family_membership_revocations_for_json	empirical	
@@ -548,7 +548,7 @@ Engine	put_blob_scoped	deontic
 Engine	put_blob_signing	deontic	
 Engine	put_calibration_bundle	empirical	
 Engine	put_community_json	deontic	
-Engine	put_delivery_receipt	testimonial	delivery_event
+Engine	put_delivery_ack	testimonial	delivery_event
 Engine	put_edge_detection_event	deontic	
 Engine	put_family_json	deontic	
 Engine	put_fountain_content	deontic	

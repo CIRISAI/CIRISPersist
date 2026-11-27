@@ -82,11 +82,19 @@ fn sign(k: &K, sub: &str, prefix: &str, p: &Value) -> Vec<u8> {
 }
 
 fn roster(rec: &GroupRecord, version: u64, head: Option<&RowId>, at_ms: u64, k: &K) -> Vec<u8> {
-    let group = match rec {
-        GroupRecord::Family(f) => f.family_key_id.clone(),
-        GroupRecord::Community(c) => c.community_key_id.clone(),
+    use crate::federation::edition2::group_fixtures::{fixture_founding, fixture_record};
+    // GID-fixtures-sites — a first version is founded under its DERIVED id
+    // (the record's id is the room's NAME); a later one names that id.
+    let (group, p) = if version == 1 && head.is_none() {
+        fixture_founding(rec, at_ms)
+    } else {
+        let rec = &fixture_record(rec);
+        let group = match rec {
+            GroupRecord::Family(f) => f.family_key_id.clone(),
+            GroupRecord::Community(c) => c.community_key_id.clone(),
+        };
+        (group, roster_payload(rec, version, head, at_ms).unwrap())
     };
-    let p = roster_payload(rec, version, head, at_ms).unwrap();
     sign(k, &group, GROUP_ROSTER_PREFIX, &p)
 }
 
@@ -162,11 +170,13 @@ fn sorted(mut v: Vec<String>) -> Vec<String> {
 pub(crate) async fn roster_body(d: &dyn FederationDirectory) {
     let (a, b, c, g) = (key(151), key(152), key(153), key(154));
     register(d, &[&a, &b, &c]).await;
-    let gid = iref(&g);
     let members = [(&a, None), (&b, None), (&c, None)];
 
     // I2993 — founding, counted.
     let v1 = family(&g, "fam one", "majority", &members);
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&v1);
     let o = put(d, &roster(&v1, 1, None, 2_000, &a)).await.unwrap();
     assert!(pending(&o), "I2993 first voice: {o:?}");
     assert!(
@@ -335,9 +345,11 @@ pub(crate) async fn roster_body(d: &dyn FederationDirectory) {
 pub(crate) async fn membership_body(d: &dyn FederationDirectory) {
     let (a, b, c, n, g, g3) = (key(161), key(162), key(163), key(164), key(165), key(166));
     register(d, &[&a, &b, &c, &n]).await;
-    let gid = iref(&g);
     let f = family(&g, "fam", "majority", &[(&a, None), (&b, None), (&c, None)]);
     let mut head = None;
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&f);
     for k in [&a, &b, &c] {
         head = landed(&put(d, &roster(&f, 1, None, 2_000, k)).await.unwrap());
     }
@@ -352,6 +364,7 @@ pub(crate) async fn membership_body(d: &dyn FederationDirectory) {
         reason: None,
         witness_set: Vec::new(),
         persist_row_hash: String::new(),
+        leaf: crate::federation::types::RevocationLeaf::Removal,
     });
     let o = put(d, &membership(&removal, &head, &a)).await.unwrap();
     assert!(pending(&o), "I2998 one of three: {o:?}");
@@ -394,7 +407,6 @@ pub(crate) async fn membership_body(d: &dyn FederationDirectory) {
 
     // I2999 — a widening meets the growth gate (founder_only: a's voice
     // alone has standing; no acceptance is held).
-    let gid3 = iref(&g3);
     let f3 = family(
         &g3,
         "fam3",
@@ -402,6 +414,9 @@ pub(crate) async fn membership_body(d: &dyn FederationDirectory) {
         &[(&a, Some("founder")), (&b, None)],
     );
     let mut head3 = None;
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid3 = crate::federation::edition2::group_fixtures::fixture_group_id(&f3);
     for k in [&a, &b] {
         head3 = landed(&put(d, &roster(&f3, 1, None, 2_000, k)).await.unwrap());
     }
@@ -467,6 +482,9 @@ pub(crate) async fn community_body(d: &dyn FederationDirectory) {
         charter_digest: String::new(),
         persist_row_hash: String::new(),
     });
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&c);
     let o = put(d, &roster(&c, 1, None, 2_000, &a)).await.unwrap();
     assert!(pending(&o), "I3000 founding short: {o:?}");
     assert!(d.lookup_community(&gid).await.unwrap().is_none(), "I3000");
@@ -487,6 +505,7 @@ pub(crate) async fn community_body(d: &dyn FederationDirectory) {
         reason: None,
         witness_set: Vec::new(),
         persist_row_hash: String::new(),
+        leaf: crate::federation::types::RevocationLeaf::Removal,
     });
     let o = put(d, &membership(&removal, &head, &a)).await.unwrap();
     assert!(pending(&o), "I3000 removal short of majority: {o:?}");
@@ -516,10 +535,12 @@ pub(crate) async fn fork_roster_body(d: &dyn FederationDirectory) {
     };
 
     // I3001 — a fork with an overlap: the common members, through the door.
-    let gid = iref(&g);
     let abc = [(&a, None), (&b, None), (&c, None)];
     let v1 = family(&g, "v1", "majority", &abc);
     let mut v1_id = None;
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&v1);
     for k in [&a, &b, &c] {
         v1_id = landed(&put(d, &roster(&v1, 1, None, 2_000, k)).await.unwrap());
     }
@@ -563,10 +584,12 @@ pub(crate) async fn fork_roster_body(d: &dyn FederationDirectory) {
     // of the head (#955 Q2, judged against THIS node's head) and is held as
     // a tip. The members common to the head {a,b,c,e}, the tip {a,b} and the
     // tip {c,e} are none.
-    let gid2 = iref(&g2);
     let abce = [(&a, None), (&b, None), (&c, None), (&e, None)];
     let w1 = family(&g2, "w1", "majority", &abce);
     let mut w1_id = None;
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid2 = crate::federation::edition2::group_fixtures::fixture_group_id(&w1);
     for k in [&a, &b, &c, &e] {
         w1_id = landed(&put(d, &roster(&w1, 1, None, 2_000, k)).await.unwrap());
     }
@@ -628,10 +651,12 @@ pub(crate) async fn fork_roster_body(d: &dyn FederationDirectory) {
 pub(crate) async fn dissolution_body(d: &dyn FederationDirectory) {
     let (a, b, c, g) = (key(191), key(192), key(193), key(194));
     register(d, &[&a, &b, &c]).await;
-    let gid = iref(&g);
     let abc = [(&a, None), (&b, None), (&c, None)];
     let v1 = family(&g, "to dissolve", "majority", &abc);
     let mut v1_id = None;
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&v1);
     for k in [&a, &b, &c] {
         v1_id = landed(&put(d, &roster(&v1, 1, None, 2_000, k)).await.unwrap());
     }
@@ -679,7 +704,6 @@ pub(crate) async fn widening_body(d: &dyn FederationDirectory) {
     let joiner = e2::put_key(d, "t1-joiner", &["user"]).await;
     let (kf, ko) = (e2::signing_key("t1-founder"), e2::signing_key("t1-other"));
     let g = key(195);
-    let gid = iref(&g);
     let f = family(
         &g,
         "growing",
@@ -687,6 +711,9 @@ pub(crate) async fn widening_body(d: &dyn FederationDirectory) {
         &[(&kf, Some("founder")), (&ko, None)],
     );
     let mut head = None;
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&f);
     for k in [&kf, &ko] {
         head = landed(&put(d, &roster(&f, 1, None, 2_000, k)).await.unwrap());
     }
@@ -736,11 +763,13 @@ pub(crate) async fn widening_body(d: &dyn FederationDirectory) {
 pub(crate) async fn fork_heals_body(d: &dyn FederationDirectory) {
     let (a, b, c, g) = (key(201), key(202), key(203), key(204));
     register(d, &[&a, &b, &c]).await;
-    let gid = iref(&g);
     let abc = [(&a, None), (&b, None), (&c, None)];
     let ab = [(&a, None), (&b, None)];
     let v1 = family(&g, "v1", "majority", &abc);
     let mut v1_id = None;
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&v1);
     for k in [&a, &b, &c] {
         v1_id = landed(&put(d, &roster(&v1, 1, None, 2_000, k)).await.unwrap());
     }
@@ -773,8 +802,15 @@ pub(crate) async fn fork_heals_body(d: &dyn FederationDirectory) {
 
     let merge = family(&g, "healed", "majority", &ab);
     let voice = |k: &K| {
-        let p = super::group::roster_payload_merging(&merge, 3, Some(&head_id), &[fork_id], 5_000)
-            .unwrap();
+        // GID-fix6 — the merge names the family's DERIVED id (`fixture_record`).
+        let p = super::group::roster_payload_merging(
+            &crate::federation::edition2::group_fixtures::fixture_record(&merge),
+            3,
+            Some(&head_id),
+            &[fork_id],
+            5_000,
+        )
+        .unwrap();
         sign(k, &gid, GROUP_ROSTER_PREFIX, &p)
     };
     let o = put(d, &voice(&a)).await.unwrap();
@@ -870,6 +906,9 @@ pub(crate) async fn countersign_body(d: &dyn FederationDirectory) {
         persist_row_hash: String::new(),
     });
     let mut head = None;
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&room);
     for k in [&f, &m] {
         head = landed(&put(d, &roster(&room, 1, None, 2_000, k)).await.unwrap());
     }
@@ -882,6 +921,7 @@ pub(crate) async fn countersign_body(d: &dyn FederationDirectory) {
         reason: None,
         witness_set: Vec::new(),
         persist_row_hash: String::new(),
+        leaf: crate::federation::types::RevocationLeaf::Removal,
     });
     let seated = |gid: String| async move {
         d.active_community_members(&gid)
@@ -919,6 +959,108 @@ pub(crate) async fn countersign_body(d: &dyn FederationDirectory) {
         1,
         "I3012 the removal landed"
     );
+}
+
+/// I6121 (HEAD-6; CC 2.4.1.1, `end_names_old_head`) — **an end that acts
+/// from an old head concludes nothing**, at the statement door: a family's
+/// version 2 extends version 1; a member's act at the family names version
+/// 2; the member's own withdrawal of it naming version 1 is refused
+/// `end_names_old_head` (the act it ends, in its own past, names the newer
+/// head), and the same withdrawal naming version 2 is not.
+pub(crate) async fn end_old_head_body(d: &dyn FederationDirectory) {
+    use super::door_invariants::fixture::map;
+    let (a, b, c, g) = (key(171), key(172), key(173), key(174));
+    register(d, &[&a, &b, &c]).await;
+    let members = [(&a, None), (&b, None), (&c, None)];
+    let v1 = family(&g, "end one", "majority", &members);
+    let mut v1_id = None;
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&v1);
+    for k in [&a, &b, &c] {
+        let o = put(d, &roster(&v1, 1, None, 2_000, k)).await.unwrap();
+        v1_id = v1_id.or(landed(&o));
+    }
+    let v1_id = v1_id.expect("I6121 version 1 lands");
+    let v2 = family(&g, "end two", "majority", &members);
+    let mut v2_id = None;
+    for k in [&a, &b] {
+        let o = put(d, &roster(&v2, 2, Some(&v1_id), 3_000, k))
+            .await
+            .unwrap();
+        v2_id = v2_id.or(landed(&o));
+    }
+    let v2_id = v2_id.expect("I6121 version 2 lands");
+    let head_ref = |h: &RowId| ciris_verify_core::edition2::row_ref(&h.0);
+    let act = sign(
+        &a,
+        &iref(&a),
+        "chat:*",
+        &map(vec![
+            ("asserted_at", Value::Uint(5_000)),
+            ("author", Value::Text(iref(&a))),
+            ("dimension", Value::Text("chat:message:v1".into())),
+            ("cohort_scope", Value::Text("family".into())),
+            ("family_id", Value::Text(gid.clone())),
+            ("refs", map(vec![("head", head_ref(&v2_id))])),
+        ]),
+    );
+    let act_id = RowId::of_statement(&act).expect("I6121 a row");
+    put(d, &act)
+        .await
+        .unwrap_or_else(|e| panic!("I6121 the act at version 2 lands: {e:?}"));
+    let end = |head: &RowId| {
+        ciris_verify_core::edition2::sign_row_statement(
+            &a,
+            &iref(&a),
+            &iref(&a),
+            "withdraws",
+            &ciris_verify_core::namespace_match::family_id("chat:*"),
+            &map(vec![
+                ("asserted_at", Value::Uint(6_000)),
+                ("author", Value::Text(iref(&a))),
+                (
+                    "refs",
+                    map(vec![
+                        ("head", head_ref(head)),
+                        ("target", head_ref(&act_id)),
+                    ]),
+                ),
+            ]),
+            vec![],
+        )
+        .unwrap()
+    };
+    let e = put(d, &end(&v1_id))
+        .await
+        .expect_err("I6121 an end naming the old head");
+    assert_eq!(
+        reason(&e),
+        malformed_row::END_NAMES_OLD_HEAD,
+        "I6121 refused end_names_old_head: {e:?}"
+    );
+    if let Err(e) = put(d, &end(&v2_id)).await {
+        assert_ne!(
+            reason(&e),
+            malformed_row::END_NAMES_OLD_HEAD,
+            "I6121 an end naming the newest head is not refused by the rule: {e:?}"
+        );
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i6121_an_end_naming_an_old_head_sqlite() {
+    Box::pin(end_old_head_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i6121_an_end_naming_an_old_head_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(end_old_head_body(&b)).await;
 }
 
 #[cfg(feature = "sqlite")]
@@ -1090,10 +1232,12 @@ pub(crate) async fn fork_through_proxy_body(dir: std::sync::Arc<dyn FederationDi
             )
         }
     };
-    let gid = iref(&g);
     let abc = [(&a, None), (&b, None), (&c, None)];
     let v1 = family(&g, "v1", "majority", &abc);
     let mut v1_id = None;
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&v1);
     for k in [&a, &b, &c] {
         v1_id = landed(&put(d, &roster(&v1, 1, None, 2_000, k)).await.unwrap());
     }

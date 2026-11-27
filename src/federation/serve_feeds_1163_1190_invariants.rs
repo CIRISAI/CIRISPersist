@@ -1187,7 +1187,7 @@ pub(crate) mod bodies {
         let table = raw.attestations_table();
         let marker = crate::federation::read_plan::owner_binding_marker_sql(raw.dialect(), "fa");
         let dim = owner_binding::DIMENSION;
-        let purpose = owner_binding::CC_DELEGATION_PURPOSE;
+        let purpose = owner_binding::PURPOSE;
         let mut agreed = (0, 0);
         for envelope in [
             json!({ "dimension": dim }),

@@ -906,6 +906,45 @@ pub fn projection_outranks(event_id: &str, candidate: &str, held: Option<&str>) 
     candidate < held
 }
 
+/// v62.0.0 (D2; CC 3.4.7: "A `hard_case` row whose body names another party
+/// needs `infra:record_hard_case`, even when the row is self-attested") —
+/// **does `row` record something about a party other than its signer?** True
+/// when it is attested about another key, or when its body (the
+/// [`BODY_MEMBER`] object) names a `target_key_id` or `subject_key_id` that
+/// is not the signer. Pure: it reads the signed row alone.
+#[must_use]
+pub fn names_another_party(row: &super::types::Attestation) -> bool {
+    let signer = row.attesting_key_id.as_str();
+    if row.attested_key_id != signer {
+        return true;
+    }
+    let Some(body) = row.attestation_envelope.get(BODY_MEMBER) else {
+        return false;
+    };
+    ["target_key_id", "subject_key_id"].iter().any(|member| {
+        body.get(*member)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|k| !k.is_empty() && k != signer)
+    })
+}
+
+/// v62.0.0 (D2; CC 3.4.7, the `hard_case` row of the enforcement table) —
+/// **the duty a `hard_case:` row's signer must hold from its OWNER**:
+/// `infra:record_hard_case` for a row about another party
+/// ([`names_another_party`]); otherwise `infra:attest` for the row's family
+/// (`infra:attest:hard_case`, which a held `infra:attest` covers;
+/// [`trust_root::attest_scope_for_dimension`](super::trust_root::attest_scope_for_dimension),
+/// bare `infra:attest` when the family does not resolve).
+#[must_use]
+pub fn hard_case_duty_scope(row: &super::types::Attestation, family: &str) -> String {
+    use super::types::delegation_scope as ds;
+    if names_another_party(row) {
+        return ds::INFRA_RECORD_HARD_CASE.to_owned();
+    }
+    super::trust_root::attest_scope_for_dimension(family)
+        .unwrap_or_else(|_| ds::INFRA_ATTEST.to_owned())
+}
+
 /// v57.0.0 (CIRISPersist#988 item 2) — the signed envelope of the row an event
 /// is written as: `{dimension, hard_case: <the event>}`. The event rides whole,
 /// as serde writes it, so the projection reads back exactly what the emitter
@@ -1123,24 +1162,34 @@ pub fn hard_case_emit_input(
 /// door a peer's copy meets. Returns the row id (hex). A re-record of the
 /// same event is the same statement: admitted idempotently, the same id.
 ///
-/// The `hard_case:` emitter rule is the door's (`node` or
-/// `substrate_persist`, about itself; a row about another party needs the
-/// `infra:record_hard_case` conferral).
+/// The `hard_case:` emitter rule is the door's (v62.0.0, D2: a node holding
+/// `infra:attest` from its owner, or `infra:record_hard_case` for a row about
+/// another party; [`hard_case_duty_scope`]).
+///
+/// v62.0.0 (D2; the HEAD-4.rev2 pattern, `holding_claim::node_is_unowned`;
+/// Constitution: "An unowned node signs its key record, its own occurrence
+/// with its route, and a device-join request; NO infra:attest report") —
+/// `Ok(None)`: `signer` is an UNOWNED node, so nothing is stated and nothing
+/// is written; it is not an error (the in-transaction door's node-local
+/// record is unaffected, and `Engine::enter_mesh` restates it once owned).
 ///
 /// # Errors
-/// The attribution refusal (`AdminActionUnattributed`);
-/// `composite_signing_unavailable`; every refusal of the edition-2 door and
-/// the attestation gates.
+/// The attribution refusal (`AdminActionUnattributed`), asked first, owned or
+/// not; `composite_signing_unavailable`; every refusal of the edition-2 door
+/// and the attestation gates.
 pub async fn state_hard_case<D>(
     dir: &D,
     signer: &crate::signing::LocalSigner,
     event: HardCaseEvent,
-) -> Result<String, super::Error>
+) -> Result<Option<String>, super::Error>
 where
     D: super::FederationDirectory + Sync + ?Sized,
 {
     check_admin_action_attribution(&event)?;
-    stated_hard_case(dir, signer, &event).await
+    if super::holding_claim::node_is_unowned(dir, &signer.federation_id().await).await? {
+        return Ok(None);
+    }
+    stated_hard_case(dir, signer, &event).await.map(Some)
 }
 
 /// The statement step both producers share: [`hard_case_emit_input`], then

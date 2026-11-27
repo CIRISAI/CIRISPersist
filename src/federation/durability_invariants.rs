@@ -668,9 +668,12 @@ pub(crate) mod engine_bodies {
         )
         .await
         {
-            p.b.apply_replicated_key_grant(set)
-                .await
-                .expect("B applies A's row");
+            crate::federation::key_grant_invariants::two_node::deliver_key_grant_row(
+                &*p.b.federation_directory(),
+                &set,
+            )
+            .await
+            .expect("B applies A's row");
         }
         let Some(crate::federation::BlobBody::Inline(menv)) = p.sa.get_blob(&whole).await.unwrap()
         else {

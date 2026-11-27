@@ -374,7 +374,8 @@ pub fn seat_binding_draft(
         }
     }
     let terms = seat_binding_terms(seat, seat_record, asserted_at_ms, transport, dial_hints);
-    occurrence::bind_draft(&terms, &terms.occurrence_key_id)
+    let kid = occurrence::own_kid(&terms.occurrence_key_id)?;
+    occurrence::bind_draft(&terms, &terms.occurrence_key_id, &kid)
 }
 
 /// **Check a signed seat binding** (step 2b) as the bundle reader and the

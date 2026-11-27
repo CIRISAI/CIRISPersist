@@ -352,9 +352,12 @@ pub(crate) mod bodies {
             "I313: one content row for B, the manifest's"
         );
         for set in content_sets {
-            p.b.apply_replicated_key_grant(set)
-                .await
-                .expect("B applies the manifest's row");
+            crate::federation::key_grant_invariants::two_node::deliver_key_grant_row(
+                &*p.b.federation_directory(),
+                &set,
+            )
+            .await
+            .expect("B applies the manifest's row");
         }
         let prov = BlobProvenance {
             author_key_id: p.owner.clone(),
@@ -447,9 +450,12 @@ pub(crate) mod bodies {
             Err(BlobError::NotGranted { .. })
         ));
         for set in stream_sets {
-            p.b.apply_replicated_key_grant(set)
-                .await
-                .expect("B applies the stream row");
+            crate::federation::key_grant_invariants::two_node::deliver_key_grant_row(
+                &*p.b.federation_directory(),
+                &set,
+            )
+            .await
+            .expect("B applies the stream row");
         }
         let r =
             p.b.sealed_dag_readiness(&root, &p.key_b, None)
@@ -539,14 +545,47 @@ pub(crate) mod bodies {
         let outsider = crate::federation::tier_ingest::test_support::local_signer(&format!(
             "i313-outsider-{run}"
         ));
-        let e =
-            p.a.apply_replicated_key_grant(sign_row_unstored(&outsider, &forged).await)
+        // VD-t16fix2 — through the replicated STATEMENT door (the earlier-form
+        // key-grant door refuses `earlier_form_object` whatever it is handed).
+        // That door verifies the signer against a HELD key first, so the
+        // outsider's key is registered: what it refuses then is the sealer
+        // rule, by name.
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            p.sa.as_ref(),
+            &format!("i313-outsider-{run}"),
+            &format!("i313-outsider-{run}"),
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        // Edition 2: the sealer rule reads OTHER rows (who owns the stream),
+        // so the door HOLDS the outsider's row (CC 2.7.3), kept and
+        // concluding nothing, with the rule's own reason; it is never
+        // projected.
+        let dir_a = p.a.federation_directory();
+        let out = crate::federation::key_grant_invariants::two_node::deliver_key_grant_row(
+            &*dir_a,
+            &sign_row_unstored(&outsider, &forged).await,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("I313: the outsider's row is kept and held, not refused: {e:?}")
+        });
+        let crate::federation::edition2::ingest::ReplicatedStatementOutcome::Admitted(
+            crate::federation::edition2::ingest::StatementOutcome::Pending { row_id, .. },
+        ) = out
+        else {
+            panic!(
+                "I313: a row signed by a party that does not speak for the owner is held: {out:?}"
+            );
+        };
+        assert_eq!(
+            crate::federation::edition2::fold::why_held(&*dir_a, &row_id)
                 .await
-                .expect_err("I313: a row signed by a party that does not speak for the owner");
-        assert!(
-            matches!(&e, crate::federation::Error::KeyGrantRefused { reason, .. }
-                if *reason == "signer_not_stream_owner"),
-            "I313: {e:?}"
+                .unwrap()
+                .map(|h| h.reason)
+                .as_deref(),
+            Some("signer_not_stream_owner"),
+            "I313: held by the sealer rule, by name"
         );
         // A late device: one re-grant per EPOCH (and the manifest), not per chunk.
         let late = format!("i313-late-{run}");
@@ -1401,7 +1440,7 @@ pub(crate) mod bodies {
             .unwrap()
             .iter()
             .any(|w| w.recipient_key_id == p.key_b));
-        p.sa.put_identity_occurrence_revocation_local(
+        p.sa.put_identity_occurrence_revocation_edition2(
             crate::federation::types::IdentityOccurrenceRevocation {
                 identity_key_id: p.owner.clone(),
                 occurrence_key_id: p.key_b.clone(),
@@ -1411,6 +1450,7 @@ pub(crate) mod bodies {
                 witness_set: vec![p.owner.clone()],
                 persist_row_hash: String::new(),
             },
+            crate::federation::DoorToken::new(),
         )
         .await
         .unwrap();
@@ -1758,9 +1798,12 @@ pub(crate) mod bodies {
         let root = seal(&p, &stream).await;
         p.a.emit_pending_key_grants().await.unwrap();
         for set in key_grant_rows_for(p.sa.as_ref(), &p.key_a, &p.key_b).await {
-            p.b.apply_replicated_key_grant(set)
-                .await
-                .expect("B applies A's rows");
+            crate::federation::key_grant_invariants::two_node::deliver_key_grant_row(
+                &*p.b.federation_directory(),
+                &set,
+            )
+            .await
+            .expect("B applies A's rows");
         }
         let prov = BlobProvenance {
             author_key_id: p.owner.clone(),

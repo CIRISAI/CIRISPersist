@@ -174,10 +174,12 @@ pub(crate) mod bodies {
             sets.len()
         );
         for a in &sets {
-            engine_b
-                .apply_replicated_key_grant(a.clone())
-                .await
-                .expect("B applies A's row");
+            crate::federation::key_grant_invariants::two_node::deliver_key_grant_row(
+                &*engine_b.federation_directory(),
+                a,
+            )
+            .await
+            .expect("B applies A's row");
         }
         let prov = BlobProvenance {
             author_key_id: owner.clone(),

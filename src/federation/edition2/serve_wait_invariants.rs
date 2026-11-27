@@ -1,5 +1,7 @@
 //! v62.0.0 (RL-fix2b; CC 5.3.4, lead ruling (A): one rule, every serve path)
-//! — **I2253: the JSON attestation serve plane waits in the SQL**, on sqlite
+//! — **I2253: the JSON attestation serve plane waits in the SQL**
+//! (v62.0.0 BIND-6: superseded in part, see the body: the held reads no
+//! longer wait; `may_receive` and the point read do), on sqlite
 //! and postgres. A node whose own standing chain reaches no root (its node
 //! key set, no root accepted) pages `list_attestations_since`,
 //! `list_attestations_since_by_prefixes` and the #1225 subject read past the
@@ -94,33 +96,54 @@ pub(crate) async fn body(d: &dyn FederationDirectory, tag: &str) {
     for i in 0..5 {
         mine.push(n::put_naming(d, &a, &[&k], n::DIM, n::at(50 - i), None).await);
     }
-    // Rootless: every walk pages past the five to the end.
+    // v62.0.0 (BIND-6; the lead's ruling (c) and Edge's accepted proposal) —
+    // the earlier legs here witnessed the HELD reads waiting (RL-fix2b). The
+    // held reads are what this node holds (BIND-5), and the wait is the
+    // per-recipient check's (`replication_audience::may_receive`): rootless,
+    // every held read returns the five to the end, a peer that is no party is
+    // refused them by `may_receive`, and the point read keeps its wait (it
+    // goes when Edge confirms its fetch sub-paths ask may_receive).
     let since = since_walk(d, 2).await;
     assert!(
-        mine.iter().all(|id| !since.contains(id)),
-        "[{tag}] I2253: the federation-tier rows wait in list_attestations_since"
+        mine.iter().all(|id| since.contains(id)),
+        "[{tag}] I2253 (BIND-6): the held read list_attestations_since returns the rows"
     );
     let fam = prefix_walk(d, "chat:", 2).await;
     assert!(
-        mine.iter().all(|id| !fam.contains(id)),
-        "[{tag}] I2253: and in the family read"
+        mine.iter().all(|id| fam.contains(id)),
+        "[{tag}] I2253 (BIND-6): and the family read"
     );
     let (named, _) = n::walk(d, &k, n::DIM, 2).await;
-    assert!(named.is_empty(), "[{tag}] I2253: and in the subject read");
-    // The advertisement and the point read: no waiting row is advertised,
-    // and none is handed out.
+    assert_eq!(
+        named.len(),
+        mine.len(),
+        "[{tag}] I2253 (BIND-6): and the subject read"
+    );
     let hashes = hashes_of(d, &mine).await;
     let ads = advertised(d).await;
     assert!(
-        hashes.iter().all(|h| !ads.contains(h)),
-        "[{tag}] I2253: a waiting row's hash is not advertised"
+        hashes.iter().all(|h| ads.contains(h)),
+        "[{tag}] I2253 (BIND-6): and the hash advertisement (the holdings index)"
     );
     assert!(
         d.lookup_signed_record_by_content_hash("Attestation", &hashes[0])
             .await
             .unwrap()
             .is_none(),
-        "[{tag}] I2253: nor handed out by the point read"
+        "[{tag}] I2253: the point read still withholds a waiting row"
+    );
+    let stranger = e2::put_key(d, &format!("i2253-stranger-{tag}"), &["node"]).await;
+    let first = d
+        .get_attestation(&mine[0])
+        .await
+        .unwrap()
+        .expect("the row is held");
+    assert!(
+        !crate::federation::replication_audience::may_receive(d, &stranger, &first)
+            .await
+            .unwrap()
+            .allowed(),
+        "[{tag}] I2253 (BIND-6): may_receive withholds it from a peer that is no party"
     );
     let internal = crate::federation::edition2::serve::as_internal_read(since_walk(d, 2)).await;
     assert!(

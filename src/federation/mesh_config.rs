@@ -30,6 +30,16 @@
 //! variant for one. Authority is a trust-root question, re-derived from this
 //! node's own stored edges ([`trust_root`](super::trust_root)).
 //!
+//! **v62.0.0 (R2-rest-b2; CC 4.2.1 "Mesh-config authorship" at pre4,
+//! Constitution 11-24 "MESH-CONFIG HAS NO DELEGATE").** The quoted
+//! delegation-plane wording is the earlier text. Now: *"The author of mesh
+//! configuration is **the root**: the lineage of the bundle a node's owner
+//! accepted"*; a durable setting is *"a row counted over a strict majority of
+//! the holders of the bundle in force"*; emergency relief is *"one holder's
+//! row"*; *"A node MUST NOT author a `mesh_config` value"* (CC 4.2.1.4). No
+//! grant and no scope word confers the authority, so persist has no delegate
+//! leg and no keyed root here (`root_authorizes_author`, `config_roots`).
+//!
 //! Four rules bind, all four from CC 4.2.1:
 //!
 //! 1. **relieve-never-expand** — a `mesh_config` action MAY relieve or restrict
@@ -196,7 +206,8 @@ pub mod field {
     /// The `delegates_to` attestation id the author acted UNDER. Required at
     /// admission, per #570 ask 3's rule applied to this plane: an act that does
     /// not carry its own authority is indistinguishable from an unauthorized
-    /// one once the actor is gone.
+    /// one once the actor is gone. v62.0.0 (R2-rest-b2): mesh config has no
+    /// delegate, so it is a self-attribution label; still required non-empty.
     pub const DELEGATION_ID: &str = "delegation_id";
     /// On a [`Durable`](super::MeshConfigForm::Durable) row: the
     /// `attestation_id` of the emergency row this makes permanent. CC 4.2.1
@@ -894,17 +905,12 @@ pub enum MeshConfigForm {
     ///    ([`field::RATIFIES`]); that emergency must be one this node holds, on
     ///    the same key and root, agreeing about the value.
     /// 2. **Cold durable, under the root's own quorum.** No prior emergency —
-    ///    admitted iff the act is not UNILATERAL. For a
-    ///    [`RootKind::Family`](super::trust_root::RootKind::Family) root that
-    ///    means ≥m distinct seated holders scrubbed this row, counted by the
-    ///    same [`family_quorum_over`](super::trust_root::family_quorum_over)
-    ///    that charters roots. For a
-    ///    [`RootKind::Key`](super::trust_root::RootKind::Key) root it means the
-    ///    root ITSELF signed — *"1-of-1 is a legitimate quorum for a root you
-    ///    alone own"*, which is
-    ///    [`trust_root`](super::trust_root)'s own doctrine, not a hole opened
-    ///    here. A CONFERRED delegate is refused on both arms: a delegation is
-    ///    not a quorum, and that is where this door actually bites.
+    ///    admitted iff the act is not UNILATERAL: v62.0.0 (R2-rest) the row's
+    ///    voices reach the accord's threshold over the holders of the bundle
+    ///    in force (`root_quorum_reached`; the earlier family and key arms are
+    ///    deleted). v62.0.0 (R2-rest-b2): a delegate does not reach this
+    ///    door at all (mesh config has no delegate), and door 1's conversion
+    ///    is counted the same way: one holder converts nothing alone.
     ///
     /// # The reading, and the one it replaced
     ///
@@ -1011,6 +1017,10 @@ pub enum MeshConfigRefusalReason {
     /// the one it actually has — which is worse, because it reads as attributed
     /// and gets stored in a signed row that anything downstream will report as
     /// verified provenance.
+    ///
+    /// v62.0.0 (R2-rest-b2) — **unreachable**: mesh config has no delegate,
+    /// so no conferral exists for `delegation_id` to name. Kept because this
+    /// mapping is append-only.
     DelegationIdNotConferring,
     /// The row is not filed against the root it names, so the fold's
     /// `list_attestations_for(root)` read would never see it. A row stored and
@@ -1019,11 +1029,14 @@ pub enum MeshConfigRefusalReason {
     /// This node holds no live `trust:accepts:v1` edge to the named root. **The
     /// subscription is the trust edge** (CC 4.2.1), so a root this node has not
     /// subscribed to has nothing to say to it — and un-trusting is one row,
-    /// which is the T3 lever CC names.
+    /// which is the T3 lever CC names. v62.0.0 (R2-rest-b2): the root is the
+    /// lineage of the bundle in force; an edge to anything else (a key)
+    /// subscribes to no config.
     RootNotTrusted,
-    /// The author is neither the root itself nor a key the root has conferred
-    /// to by a live `trust:confers:v1` `delegates_to`. CC 4.2.1 puts the
-    /// authority *on the delegation plane*; this is that sentence as a gate.
+    /// v62.0.0 (R2-rest-b2; Constitution 11-24 "MESH-CONFIG HAS NO
+    /// DELEGATE") — the author is not a holder of the bundle in force. No
+    /// grant and no scope word confers mesh-config authority: a grantee of
+    /// the root, a delegate and a node (CC 4.2.1.4) are all refused here.
     AuthorNotRootAuthorized,
     /// The author's own scrub signature did not verify against pubkeys resolved
     /// from THIS node's directory (#377 — never pubkeys carried on the row).
@@ -1054,15 +1067,14 @@ pub enum MeshConfigRefusalReason {
     ///
     /// CC 4.2.1 rule 3 gives durability to quorum, and rule 4 says why:
     /// *"relief expires because it is unilateral."* So a durable setting with
-    /// no emergency behind it must not be a unilateral act. A conferred
-    /// delegate is refused here on both root arms — a delegation is not a
-    /// quorum — as is a family-root row that fewer than m distinct seated
-    /// holders scrubbed.
+    /// no emergency behind it must not be a unilateral act.
     ///
-    /// The one act this does NOT refuse is a single-key root signing for
-    /// itself: 1-of-1 is that root's whole quorum, which is
-    /// [`trust_root`](super::trust_root)'s own doctrine and not a carve-out
-    /// invented here.
+    /// v62.0.0 (R2-rest-b2; CC 4.2.1 rule 3 at pre4, "two routes to one
+    /// authority") — the quorum is a strict majority of the holders of the
+    /// bundle in force, on BOTH durable routes: a durable row that names a
+    /// held emergency is refused here too when one holder signs it alone.
+    /// The earlier single-key "1-of-1" root and the family-record arm are
+    /// gone with the keyed root.
     DurableWithoutRootQuorum,
     /// **CC 4.2.1 rule 1, at the door.** The value means MORE flow than this
     /// node's own baseline. *"No key may cause a node to share more than its
@@ -1668,148 +1680,77 @@ pub fn fold_mesh_config(
 /// **CC 4.2.1's authority sentence, as a predicate.** May `author` set config
 /// under `root_ref`?
 ///
-/// Two ways, and only two:
+/// v62.0.0 (R2-rest-b2; CC 4.2.1 "Mesh-config authorship" at pre4,
+/// Constitution 11-24 "MESH-CONFIG HAS NO DELEGATE") — **one way only: the
+/// author is a HOLDER of the bundle in force, and `root_ref` is that bundle's
+/// lineage** ([`bundle_root_holders`](super::trust_root::bundle_root_holders)).
+/// One holder may raise emergency relief (rule 3); a durable setting is
+/// counted over a strict majority of the holders ([`root_quorum_reached`]).
+/// No scope word and no grant confers mesh-config authority, so the
+/// delegate leg (a live `trust:confers:v1` to the author, read by key) is
+/// deleted, and with it the KEYED arm (`root_ref == author`, a key speaking
+/// as its own root): the root is the bundle's lineage and has no key. Every
+/// other author, a node's own key included (CC 4.2.1.4 "A node MUST NOT
+/// author a `mesh_config` value"), is [`AuthorAuthority::None`].
 ///
-/// - `author == root_ref` — the root speaking for itself;
-/// - a live `delegates_to(root → author)` labelled `trust:confers:v1` — the
-///   conferral leg, which is the plane CC names verbatim (*"the trust root,
-///   acting on the CC 3.2 delegation plane (`trust:confers:v1`)"*).
+/// Read from the node's OWN stored state, never from anything the incoming
+/// row carries (#377: a caller-supplied decision is a forgeable bypass).
 ///
-/// Read from the node's OWN stored rows, never from anything the incoming row
-/// carries (#377: a caller-supplied decision is a forgeable bypass). Live means
-/// non-tombstoned, non-expired, federation-tier — the same four predicates
-/// [`trust_root_valid`](super::trust_root::trust_root_valid) applies, reached
-/// through [`trusted_roots_of`](super::trust_root::trusted_roots_of)'s module
-/// rather than re-implemented here.
-///
-/// **No accord-holder arm exists**, deliberately: CC 4.2.1 confines
-/// `HUMANITY_ACCORD` signatures to `EmergencyShutdown` and its named siblings
-/// and says the mesh-config author is *"never the accord's ceremony plane"*.
-/// Widening that scope is the thing CIRISConstitution#57 was opened to avoid.
+/// **No accord-holder arm exists**, deliberately: a holder signs here as the
+/// root's conferring roster, never as an accord invocation; the accord's
+/// powers stay exactly those CC 4.2.1 enumerates (CIRISConstitution#57).
 pub(crate) async fn root_authorizes_author<F>(
     directory: &F,
     root_ref: &str,
     author: &str,
-    now: DateTime<Utc>,
 ) -> Result<AuthorAuthority, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    if root_ref == author {
-        return Ok(AuthorAuthority::Inherent);
-    }
-    // v62.0.0 (KB-fix1; CC 3.2 at rc22 `87abd2d`, CC 4.2.1) — the bundle
-    // root acts through its holders in force: an author that is one of them
-    // is the root acting on the delegation plane (an emergency stands on one
-    // holder, 72 h; a durable setting is counted below,
-    // `root_quorum_reached`). Any other author is not authorized by this
-    // root: a keyless lineage confers by no row of its own id.
-    if let Some(holders) = super::trust_root::bundle_root_holders(directory, root_ref).await? {
-        return Ok(if holders.iter().any(|h| h == author) {
-            AuthorAuthority::Inherent
-        } else {
-            AuthorAuthority::None
-        });
-    }
-    // The root's conferrals to the author and the root's composers naming
-    // them — the rows the tombstone fold and the filter below read (the
-    // trust-root walks' shape, v53.1.7).
-    let mut rows = Vec::new();
-    let mut pages = AttestationQuery::by(root_ref, FOLD_PAGE)
-        .attested_to(author)
-        .types(&[super::types::attestation_type::DELEGATES_TO])
-        .dimension(super::trust_root::TRUST_CONFERS_DIMENSION)
-        .pages();
-    let read: Result<(), Error> = async {
-        while let Some(page) = pages.next(directory).await? {
-            rows.extend(page);
-        }
-        Ok(())
-    }
-    .await;
-    let by_root = match read {
-        Ok(()) => {
-            super::trust_root::with_slice_composers(directory, rows, None, Some(root_ref)).await?
-        }
-        Err(e) => return Err(e),
-    };
-    let refs: Vec<&Attestation> = by_root.iter().collect();
-    let dead = super::trust_root::tombstoned_ids(&refs);
-    let mut conferring: Vec<String> = by_root
-        .iter()
-        .filter(|a| {
-            a.attestation_type == super::types::attestation_type::DELEGATES_TO
-                && a.attested_key_id == author
-                && a.tier == super::types::attestation_tier::FEDERATION
-                && !dead.contains(&a.attestation_id)
-                && !a.expires_at.is_some_and(|e| e <= now)
-                && env_str(a, "dimension") == Some(super::trust_root::TRUST_CONFERS_DIMENSION)
-        })
-        .map(|a| a.attestation_id.clone())
-        .collect();
-    if conferring.is_empty() {
+    let Some(holders) = super::trust_root::bundle_root_holders(directory, root_ref).await? else {
         return Ok(AuthorAuthority::None);
-    }
-    conferring.sort();
-    Ok(AuthorAuthority::Conferred(conferring))
+    };
+    Ok(if holders.iter().any(|h| h == author) {
+        AuthorAuthority::Holder
+    } else {
+        AuthorAuthority::None
+    })
 }
 
-/// v30.0.0 (CIRISPersist#601) — **what authorises this author, and by which
-/// edge.**
+/// v30.0.0 (CIRISPersist#601) — **what authorises this author.**
 ///
-/// [`root_authorizes_author`] used to return `bool`, which threw away the one
-/// thing the envelope's [`field::DELEGATION_ID`] needed in order to mean
-/// anything. The door required that field to be non-empty
-/// ([`Unattributed`](MeshConfigRefusalReason::Unattributed)) and never checked
-/// that the id named **the conferral it had just verified** — so a
-/// syntactically valid but entirely unrelated id landed in a stored, signed
-/// row and was then reported as provenance by anything reading it. **The
-/// attribution read as verified and was not.**
-///
-/// Found by CIRISServer, who noted that `check_admin_action_attribution` is
-/// **stricter on a lower-stakes plane** — and who declined to re-implement this
-/// predicate on their side, correctly, because a second copy of an authority
-/// rule is the drift shape this module exists to avoid.
+/// v62.0.0 (R2-rest-b2) — the `Conferred` arm (a delegate named by its
+/// `trust:confers:v1` edge, which `delegation_id` had to name) is deleted:
+/// mesh config has no delegate (Constitution 11-24). `Inherent` (the root
+/// itself, a key) became [`Holder`](Self::Holder): the root is the bundle's
+/// lineage and acts through its holders in force.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuthorAuthority {
-    /// The author IS the root. There is no delegation, because none is needed:
-    /// *"1-of-1 is a legitimate quorum for a root you alone own"*. Nothing to
-    /// bind [`field::DELEGATION_ID`] to, so the door keeps requiring it
-    /// non-empty and treats it as a self-attribution label rather than
-    /// inventing a wire contract for a delegation that does not exist.
-    Inherent,
-    /// One or more live `trust:confers:v1` edges confer on this author. The
-    /// declared `delegation_id` MUST be one of these — sorted, so the refusal
-    /// message is stable.
-    Conferred(Vec<String>),
+    /// The author is a holder of the bundle in force, and the row's root is
+    /// that bundle's lineage. One holder's row is emergency relief at most;
+    /// durability is counted ([`root_quorum_reached`]).
+    Holder,
     /// Nothing authorises this author.
     None,
 }
 
 /// **"The root's own quorum" (CC 4.2.1 rule 3), as a predicate over one row.**
 ///
-/// What counts depends on what kind of thing the root is, resolved once through
-/// [`resolve_family_root`](super::trust_root::resolve_family_root) — the same
-/// function [`trust_root_valid`](super::trust_root::trust_root_valid) uses to
-/// pick its arm, so the two can never disagree about which arm a root is on:
+/// v62.0.0 (R2-rest; CC 3.2 T5, CC 4.2.1 rule 3; lead's ruling 1) — **what it
+/// counts:** the row's distinct voices (`edition2::voices::counted_roster_signers`)
+/// among the HOLDERS OF THE BUNDLE IN FORCE, against the accord's threshold
+/// (`admission::accord_threshold`, the one strict-majority seam), when
+/// `root_ref` is that bundle's lineage (`trust_root::bundle_root_holders`).
+/// Any other `root_ref` has no quorum and the answer is `false`: the root is
+/// the bundle's lineage, and there is no other kind of root. The earlier
+/// FAMILY-record arm (`resolve_family_root`, a family's m-of-n over the row's
+/// scrubs) and the KEY arm ("the root itself is the author": 1-of-1) are
+/// deleted.
 ///
-/// - **Family root** — ≥m distinct SEATED holders must have scrubbed this row,
-///   counted by [`family_quorum_over`](super::trust_root::family_quorum_over):
-///   the row's full scrub set intersected with the family's own
-///   revocation-folded roster, each survivor hybrid-verified against pubkeys
-///   from THIS node's directory, against a threshold floored at a strict
-///   majority of that roster. Not a second m-of-n implementation — the one
-///   that charters roots.
-/// - **Key root** — the root itself must be the author. *"1-of-1 is a
-///   legitimate quorum for a root you alone own"* is
-///   [`trust_root`](super::trust_root)'s stated doctrine, and this is where it
-///   is being relied on rather than quietly assumed.
-///
-/// **A conferred delegate fails on both arms.** That is the whole bite of this
-/// gate: a `trust:confers:v1` grant lets a key act for the root at
-/// threshold-1 — which is exactly what CC 4.2.1 rule 4 says must expire — so
-/// it can raise a bounded emergency and it cannot make anything permanent
-/// alone.
+/// **One holder is not a quorum.** That is the whole bite of this gate: one
+/// holder acts for the root at threshold-1, which is exactly what CC 4.2.1
+/// rule 4 says must expire, so it can raise a bounded emergency and it cannot
+/// make anything permanent alone, by either durable route.
 async fn root_quorum_reached<F>(
     directory: &F,
     root_ref: &str,
@@ -1818,37 +1759,46 @@ async fn root_quorum_reached<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    // v31.0.0 (CIRISPersist#648) — the constitutional family is judged on the
-    // FAMILY arm or not at all.
-    //
-    // The `None` arm below is correct for a key root, where authorship IS the
-    // 1-of-1 quorum. It is a silent downgrade for a FAMILY root that this node
-    // simply has not seeded yet: `humanity-accord` holds no key, so
-    // "did a key literally named humanity-accord sign this" is a question no
-    // legitimate signer can answer and a squatted key id can. On a pre-genesis
-    // node that turned a strict-majority count into a string comparison. Absence of the family
-    // row is not permission to use a weaker rule about it.
     // v62.0.0 (KB-fix1; CC 3.2 at `87abd2d`, CC 4.2.1 rule 3) — the bundle
     // root's own quorum: the row's distinct voices among the holders of the
     // bundle in force, at the accord's threshold (the one strict-majority
-    // seam). It replaces the family-row reading below, which no v62 door
-    // can satisfy for the accord.
-    if let Some(holders) = super::trust_root::bundle_root_holders(directory, root_ref).await? {
-        let counted =
-            super::edition2::voices::counted_roster_signers(directory, row, &holders).await?;
-        return Ok(counted.len() >= super::admission::accord_threshold(holders.len()));
-    }
-    match super::trust_root::resolve_family_root(directory, root_ref).await? {
-        Some(family) => Ok(
-            super::trust_root::family_quorum_over(directory, row, &family)
-                .await?
-                .met(),
-        ),
-        None if root_ref == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID => {
-            Ok(false)
+    // seam). v62.0.0 (R2-rest) — the only quorum there is.
+    let Some(holders) = super::trust_root::bundle_root_holders(directory, root_ref).await? else {
+        return Ok(false);
+    };
+    let counted = super::edition2::voices::counted_roster_signers(directory, row, &holders).await?;
+    Ok(counted.len() >= super::admission::accord_threshold(holders.len()))
+}
+
+/// v62.0.0 (R2-rest-b2; CC 4.2.1 "The author of mesh configuration is the
+/// root: the lineage of the bundle a node's owner accepted") — **the roots a
+/// node's mesh config is read under**: the ids its acceptance edges name
+/// ([`trusted_roots_of`](super::trust_root::trusted_roots_of), the
+/// subscription) that are the lineage of the bundle in force
+/// ([`bundle_root_holders`](super::trust_root::bundle_root_holders)). An edge
+/// to any other id (a key, a room: an acceptance of kind C) subscribes to no
+/// config: the keyed root is gone, and a key's rows filed against itself are
+/// refused [`RootNotTrusted`](MeshConfigRefusalReason::RootNotTrusted) at
+/// the door and never folded. A ROOTLESS node (no accepted lineage) reads
+/// none: its effective config is its own baseline.
+async fn config_roots<F>(
+    directory: &F,
+    node_key_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Vec<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut roots = Vec::new();
+    for root in super::trust_root::trusted_roots_of(directory, node_key_id, now).await? {
+        if super::trust_root::bundle_root_holders(directory, &root)
+            .await?
+            .is_some()
+        {
+            roots.push(root);
         }
-        None => Ok(row.attesting_key_id == root_ref),
     }
+    Ok(roots)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1859,6 +1809,15 @@ where
 ///
 /// Verify-before-mutation (AV-9): every gate below runs BEFORE any row is
 /// written, and a refusal writes nothing.
+///
+/// v62.0.0 (WD-fix6) — a HOLD is not a refusal: when the final put's
+/// statement door HOLDS the row (a fold condition not yet met; WD-fix4 routes
+/// a statement-carrying row through the statement funnel), the answer is the
+/// gate's error, as before, but the statement is KEPT and concludes when what
+/// it waits for arrives. Told apart structurally by
+/// [`kept_waiting`](super::attestation_admit::kept_waiting) (the fold's held
+/// state, `fold::why_held`), never by the error's text; a re-offer is a no-op
+/// on the statement id.
 ///
 /// `node_key_id` is the node whose subscription and consent are being judged —
 /// its live trust edges decide [`RootNotTrusted`](MeshConfigRefusalReason::RootNotTrusted),
@@ -1968,28 +1927,20 @@ where
         reads(Dep::key(&root_ref));
         reads(Dep::key(&row.attesting_key_id));
     }
-    let roots = super::trust_root::trusted_roots_of(directory, node_key_id, now).await?;
+    let roots = config_roots(directory, node_key_id, now).await?;
     if !roots.iter().any(|r| r == &root_ref) {
         return held_as(R::RootNotTrusted);
     }
 
     // ── The authority, re-derived from this node's own state.
-    match root_authorizes_author(directory, &root_ref, &row.attesting_key_id, now).await? {
+    // v62.0.0 (R2-rest-b2) — a holder of the bundle in force, or nothing:
+    // mesh config has no delegate, so there is no conferral for
+    // `delegation_id` to name (`DelegationIdNotConferring` is unreachable and
+    // kept only because the token mapping is append-only). The non-empty
+    // requirement above still stands, as a self-attribution label.
+    match root_authorizes_author(directory, &root_ref, &row.attesting_key_id).await? {
         AuthorAuthority::None => return held_as(R::AuthorNotRootAuthorized),
-        // v30.0.0 (#601) — BIND the declared id to the edge just verified. The
-        // door has always required `delegation_id` to be non-empty; until now
-        // it never required it to be the conferral that authorised the author,
-        // so an unrelated id was stored in a signed row and read back as
-        // verified provenance.
-        AuthorAuthority::Conferred(edges) => {
-            let declared = env_str(row, field::DELEGATION_ID).unwrap_or_default();
-            if !edges.iter().any(|e| e == declared) {
-                return held_as(R::DelegationIdNotConferring);
-            }
-        }
-        // The author is the root: no delegation exists to name, so there is
-        // nothing to bind. The non-empty requirement above still stands.
-        AuthorAuthority::Inherent => {}
+        AuthorAuthority::Holder => {}
     }
 
     // ── The author's own signature, against pubkeys from THIS node's
@@ -2082,6 +2033,16 @@ where
                 if !ratifies_a_real_emergency {
                     return held_as(R::DurableUnratified);
                 }
+                // v62.0.0 (R2-rest-b2; CC 4.2.1 rule 3 at pre4, "The root's
+                // own quorum MAY establish a durable setting directly (cold),
+                // or MAY ratify a held emergency's `payload_sha256` …: two
+                // routes to one authority") — the ratification is the
+                // QUORUM's act too. Before, any author the root authorised
+                // converted a held emergency alone, so ONE holder made its
+                // own 72-hour relief permanent.
+                if !root_quorum_reached(directory, &root_ref, row).await? {
+                    return held_as(R::DurableWithoutRootQuorum);
+                }
             }
             // Door 2 — COLD DURABLE, under the root's OWN quorum. What is
             // refused here is a UNILATERAL durable act (rule 4: "relief
@@ -2124,7 +2085,8 @@ pub async fn resolve_mesh_config<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let roots = super::trust_root::trusted_roots_of(directory, node_key_id, now).await?;
+    // v62.0.0 (R2-rest-b2) — the accepted lineage only (`config_roots`).
+    let roots = config_roots(directory, node_key_id, now).await?;
     let mut rows: Vec<Attestation> = Vec::new();
     for root in &roots {
         // The root's `mesh_config:*` rows, every page.
@@ -3510,33 +3472,10 @@ mod tests {
     /// A really-hybrid-signed `delegates_to` carrying a `trust:*` job label.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn trust_edge(id: &str, from: &str, to: &str, job: &str) -> Attestation {
-        trust_edge_with(id, from, to, job, &[])
-    }
-
-    /// [`trust_edge`] with `extra` envelope fields merged in BEFORE signing.
-    ///
-    /// A SELF-loop `delegates_to` carrying an `infra:*` scope is a root charter
-    /// (CIRISPersist#488) and the write door refuses one without a
-    /// `pre_rotation_commitment` — so a test that wants a node to charter
-    /// itself has to build the field into the envelope. It cannot be added
-    /// afterwards: the envelope is what the row is signed over, and
-    /// "construct the signed bytes, then mutate the row" is the class v31.0.0
-    /// spent a cut removing from six sites.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    fn trust_edge_with(
-        id: &str,
-        from: &str,
-        to: &str,
-        job: &str,
-        extra: &[(&str, serde_json::Value)],
-    ) -> Attestation {
-        let mut envelope = serde_json::json!({
+        let envelope = serde_json::json!({
             "dimension": job,
             "scope": ["infra:attest", "infra:serve"],
         });
-        for (k, v) in extra {
-            envelope[*k] = v.clone();
-        }
         let now = Utc::now();
         let sealed_row_ = Attestation {
             attestation_id: id.to_owned(),
@@ -3618,6 +3557,134 @@ mod tests {
         crate::federation::edition2::fixture_switch::row_of(&sealed_row_, &seed_of(author))
     }
 
+    /// v62.0.0 (R2-rest-b2) — holder `i`'s (of `fixture_genesis::HOLDER_SEEDS`)
+    /// mesh-config statement filed against the lineage `root`, and the row
+    /// this node admits it as: over the keys it HOLDS (the bundle places a
+    /// holder's key; RL-fix10), never a fixture seed map.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn holder_config_row(
+        dir: &dyn FederationDirectory,
+        i: usize,
+        root: &str,
+        key: MeshConfigKey,
+        value: i64,
+        form: MeshConfigForm,
+        asserted_at: DateTime<Utc>,
+        valid_until: Option<DateTime<Utc>>,
+        ratifies: Option<&str>,
+    ) -> (Vec<u8>, Attestation) {
+        use crate::federation::edition2::fixture_genesis as fg;
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::ingest;
+        let seed = fg::HOLDER_SEEDS[i];
+        let author = fg::identity_ref_of(seed);
+        let a = Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: author.clone(),
+            attested_key_id: root.to_owned(),
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: None,
+            asserted_at,
+            expires_at: None,
+            attestation_envelope: mesh_config_envelope(
+                key,
+                value,
+                root,
+                form,
+                valid_until,
+                "holders-in-force",
+                ratifies,
+                "congestion",
+            ),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: author,
+            scrub_timestamp: asserted_at,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+            tier: attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        let st = e2::statement_of_with_key(&a, &fg::test_key(seed), &e2::family_of(&a));
+        let keys = ingest::held_keys_for(dir, &st)
+            .await
+            .unwrap_or_else(|e| panic!("holder {i}'s key reads: {e}"));
+        let admitted = crate::federation::edition2::door::admit_row(
+            &st,
+            &keys,
+            None,
+            ciris_verify_core::edition2::family::SelectContext::default(),
+        )
+        .unwrap_or_else(|e| panic!("holder {i}'s row admits: {e}"));
+        let row = ingest::attestation_of(&admitted, ingest::INGEST_TIER)
+            .unwrap_or_else(|e| panic!("holder {i}'s row maps: {e}"));
+        (st, row)
+    }
+
+    /// v62.0.0 (R2-rest-b2) — holder `i`'s voice over the payload of the
+    /// statement `st` (the same header and payload, its own `iss` and key):
+    /// how a second holder joins a counted row.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn holder_voice(st: &[u8], i: usize) -> Vec<u8> {
+        use crate::federation::edition2::fixture_genesis as fg;
+        use ciris_verify_core::cde::Value;
+        let (protected, payload) =
+            crate::federation::edition2::liveness::statement_parts(st).expect("a statement");
+        let text = |k: i64| {
+            protected
+                .get_int(k)
+                .and_then(Value::as_text)
+                .expect("a header member")
+                .to_owned()
+        };
+        let sub = protected
+            .get_int(15)
+            .and_then(|c| c.get_int(2))
+            .and_then(Value::as_text)
+            .expect("sub")
+            .to_owned();
+        let seed = fg::HOLDER_SEEDS[i];
+        ciris_verify_core::edition2::sign_row_statement(
+            &fg::test_key(seed),
+            &fg::identity_ref_of(seed),
+            &sub,
+            &text(-70001),
+            &text(-70002),
+            &payload,
+            vec![],
+        )
+        .expect("the holder's voice signs")
+    }
+
+    /// v62.0.0 (R2-rest-b2) — stand `dir`'s node up under the test bundle's
+    /// lineage (`fixture_trust_root::rooted_trust_root`: the bundle installed
+    /// when none is held, the node's acceptance edge landed). Returns what it
+    /// stood up and the node's kid. Precondition: the runner set
+    /// `dir.node_key_id()`.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn rooted(
+        dir: &dyn FederationDirectory,
+    ) -> (
+        crate::federation::edition2::fixture_trust_root::RootedTrustRoot,
+        String,
+    ) {
+        use crate::federation::edition2::fixture_genesis as fg;
+        let r = crate::federation::edition2::fixture_trust_root::rooted_trust_root(
+            dir,
+            &fg::HOLDER_SEEDS,
+            "quorum:2/3",
+        )
+        .await;
+        let node = dir.node_key_id().expect("the runner set the node key");
+        (r, node)
+    }
+
     /// **The whole plane, driven through the REAL doors, on one backend.**
     ///
     /// Every gate below runs against rows that were actually stored by
@@ -3625,93 +3692,89 @@ mod tests {
     /// a hand-built `Error`. The "code-path-exists ≠ host-reachable" class this
     /// repo has been bitten by repeatedly is what this exists to close.
     ///
-    /// The shape: one node, TWO trust roots it has live edges to, one key each
-    /// root has conferred to, and one root the node has NOT subscribed to.
+    /// v62.0.0 (R2-rest-b2; CC 4.2.1 "Mesh-config authorship" at pre4,
+    /// Constitution 11-24 "MESH-CONFIG HAS NO DELEGATE") — **the shape**: one
+    /// node ROOTED under the test bundle's lineage (its owner accepted it);
+    /// the bundle's three holders author; a KEY the node also holds an edge
+    /// to; a user key holding the root's accepted COUNTED grant; a stranger.
+    /// The earlier shape (two KEY roots, each authoring as itself, and a
+    /// delegate conferred by one signature) witnessed the keyed root and the
+    /// delegate leg, both deleted.
+    ///
+    /// - **I6413** a key holding the root's accepted counted grant (it
+    ///   confers, `root_grants_for`) is refused `author_not_root_authorized`
+    ///   for emergency relief and for a durable setting, naming the grant as
+    ///   its `delegation_id`: no grant confers mesh-config authority; nothing
+    ///   it filed binds at the read.
+    /// - **I6414** a durable row RATIFYING a held emergency, signed by one
+    ///   holder alone, is refused `durable_without_root_quorum`; a second
+    ///   holder's voice admits it (CC 4.2.1 rule 3: "two routes to one
+    ///   authority"). Before, one holder made its own relief permanent.
+    /// - **I6407** (rewritten) a KEY is no config root: its own durable row
+    ///   filed against itself is refused `root_not_trusted` although this
+    ///   node holds an acceptance edge to it, and the fold reads the lineage
+    ///   alone (`config_roots`).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn mesh_config_door_body(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::edition2::fixture_genesis as fg;
         use MeshConfigKey as K;
-        let node = format!("mc-node-{tag}");
-        let root_a = format!("mc-root-a-{tag}");
-        let root_b = format!("mc-root-b-{tag}");
-        let delegate = format!("mc-deleg-{tag}");
-        let stranger = format!("mc-stranger-{tag}");
-        let outsider = format!("mc-outsider-{tag}");
-        // v62.0.0 — each name is rebound to its kid once registered.
-        let node = register(dir, &node).await;
-        let root_a = register(dir, &root_a).await;
-        let root_b = register(dir, &root_b).await;
-        // v62.0.0 (E6-fix8) — the delegate is a PERSON's key: a `trust:confers`
-        // grant counts with the delegate's own voice (CC 2.6.1.9), and a
-        // machine delegate also needs its owner's (`delegate_owner`), which an
-        // unowned agent key cannot give. A person delegate is what CC 4.2.1's
-        // "a key the root has conferred to" needs here.
-        let delegate_seed = delegate.clone();
-        let delegate = {
-            let k = crate::federation::edition2::fixture_switch::put_key(
-                dir,
-                &delegate_seed,
-                &[crate::federation::types::identity_type::USER],
-            )
-            .await;
-            seeds()
-                .lock()
-                .expect("seed map")
-                .insert(k.clone(), delegate_seed.clone());
-            k
-        };
-        let stranger = register(dir, &stranger).await;
-        let outsider = register(dir, &outsider).await;
+        let (r, node) = rooted(dir).await;
+        let root = r.lineage.clone();
+        let holder = |i: usize| fg::identity_ref_of(fg::HOLDER_SEEDS[i]);
+        let key_root = register(dir, &format!("mc-keyroot-{tag}")).await;
+        let stranger = register(dir, &format!("mc-stranger-{tag}")).await;
+        let outsider = register(dir, &format!("mc-outsider-{tag}")).await;
 
-        // The node's SUBSCRIPTION: live trust edges to two roots, and none to
-        // `stranger`. CC 4.2.1: "the trust edge is the subscription."
-        for (i, root) in [&root_a, &root_b].iter().enumerate() {
-            dir.put_attestation(super::super::SignedAttestation {
-                attestation: trust_edge(
-                    &uuid::Uuid::new_v4().to_string(),
-                    &node,
-                    root,
-                    crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
-                ),
-            })
+        // The node ALSO holds an acceptance edge to a KEY (an acceptance of
+        // kind C): before R2-rest-b2 that key was a config root that authored
+        // as itself.
+        dir.put_attestation(super::super::SignedAttestation {
+            attestation: trust_edge(
+                &uuid::Uuid::new_v4().to_string(),
+                &node,
+                &key_root,
+                crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
+            ),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the edge to the key must admit: {e}"));
+        let now = crate::federation::admission::truncate_to_substrate_resolution(Utc::now());
+        let subscribed = crate::federation::trust_root::trusted_roots_of(dir, &node, now)
             .await
-            .unwrap_or_else(|e| panic!("[{tag}] trust edge {i} must admit: {e}"));
-        }
-        // root_a confers config authority on `delegate` — the CC 3.2
-        // delegation plane CC 4.2.1 names verbatim.
-        //
-        // v30.0.0 (#601) — the id is BOUND to a variable and threaded into the
-        // rows below. It used to be a discarded `Uuid::new_v4()` while every
-        // row declared the literal "att-deleg", and the door admitted them:
-        // the fixture was exercising the exact defect #601 reported, and
-        // passing. A conferral whose id nothing references cannot witness that
-        // `delegation_id` means anything.
-        let conferral = trust_edge(
-            &uuid::Uuid::new_v4().to_string(),
-            &root_a,
-            &delegate,
-            crate::federation::trust_root::TRUST_CONFERS_DIMENSION,
+            .unwrap_or_else(|e| panic!("[{tag}] trusted_roots_of: {e}"));
+        assert!(
+            subscribed.contains(&root) && subscribed.contains(&key_root),
+            "[{tag}] precondition: the node's edges name the lineage and the key: {subscribed:?}"
         );
-        // v62.0.0 — the id the row is stored under is computed.
-        let conferral_id = conferral.attestation_id.clone();
-        // v62.0.0 (E6-fix8) — the root's grant, then the delegate's own voice
-        // (`land_with_voices`): the counted row lands only with both.
-        let landed = crate::federation::edition2::fixture_switch::land_with_voices(
+
+        // The root's accepted COUNTED grant to a user key: it confers.
+        let deleg_seed = format!("mc-deleg-{tag}");
+        let grant = crate::federation::edition2::fixture_trust_root::put_conferral(
             dir,
-            &conferral,
-            &[&delegate_seed],
+            &r,
+            &deleg_seed,
+            &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
         )
         .await
-        .unwrap_or_else(|e| panic!("[{tag}] conferral must admit: {e}"));
+        .unwrap_or_else(|e| panic!("[{tag}] the root's counted grant lands: {e}"));
+        let delegate = crate::federation::edition2::fixture_switch::kid(&deleg_seed);
+        seeds()
+            .lock()
+            .expect("seed map")
+            .insert(delegate.clone(), deleg_seed.clone());
         assert!(
-            matches!(
-                landed,
-                crate::federation::edition2::ingest::StatementOutcome::Row { .. }
-                    | crate::federation::edition2::ingest::StatementOutcome::Voice { .. }
-            ),
-            "[{tag}] the conferral lands with the delegate's voice: {landed:?}"
+            crate::federation::admission::root_grants_for(
+                dir,
+                &delegate,
+                crate::host::clock::now() + Duration::seconds(1)
+            )
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] root_grants_for: {e}"))
+            .iter()
+            .any(|g| g.row_id == grant.hex() && g.confers),
+            "[{tag}] I6413 precondition: the counted grant is accepted and confers"
         );
 
-        let now = Utc::now();
         let base = MeshConfigBaseline::owner_defaults();
         /// The REAL door. A policy refusal comes back as `Refused`; anything
         /// else is a bug in the test's fixture, so it panics rather than being
@@ -3733,211 +3796,216 @@ mod tests {
                 door(dir, &node, &base, $row, now, tag).await
             };
         }
+        macro_rules! by_holder {
+            ($i:expr, $key:expr, $value:expr, $form:expr, $at:expr, $until:expr, $ratifies:expr) => {
+                holder_config_row(dir, $i, &root, $key, $value, $form, $at, $until, $ratifies).await
+            };
+        }
 
-        // ── 1. THE HAPPY PATH: the root itself relieves. #570's headline,
-        //       "20 copies -> 10", in the form CC 4.2.1 gives a single holder:
-        //       bounded emergency relief.
-        let relief = signed_config_row(
-            &root_a,
-            &root_a,
+        // ── 1. THE HAPPY PATH: one holder relieves. #570's headline, "20
+        //       copies -> 10", in the form CC 4.2.1 gives one holder: bounded
+        //       emergency relief.
+        let (_, relief) = by_holder!(
+            0,
             K::RedundancyKRepairSymbols,
             10,
             MeshConfigForm::Emergency,
             now - Duration::hours(1),
             Some(now + Duration::hours(24)),
-            None,
-            "att-deleg",
+            None
         );
         assert_eq!(
-            door!(relief.clone()),
+            door!(relief),
             MeshConfigOutcome::Admitted,
             "[{tag}] 20 copies -> 10 is relief and must admit"
         );
 
-        // ── 2. THE CONFERRED AUTHOR: a key the root delegated to, naming the
-        //       conferral it actually acted under.
-        let by_delegate = signed_config_row(
-            &delegate,
-            &root_a,
-            K::AntientropyRoundSecs,
-            600,
-            MeshConfigForm::Emergency,
-            now - Duration::hours(1),
-            Some(now + Duration::hours(24)),
-            None,
-            &conferral_id,
-        );
-        // v30.0.0 (#601) — THE WITNESS for the defect. Same author, same root,
-        // same everything the door verified — differing ONLY in the id it
-        // claims to have acted under. Before this, a well-formed id naming
-        // nothing landed in a stored, signed row and was reported downstream as
-        // verified provenance. The NEGATIVE control is `by_delegate` directly
-        // below: identical call shape, real conferral, admitted — so "the
-        // delegate arm broke entirely" cannot pass this pair.
-        let wrong_delegation = signed_config_row(
-            &delegate,
-            &root_a,
-            K::AntientropyRoundSecs,
-            600,
-            MeshConfigForm::Emergency,
-            now - Duration::hours(1),
-            Some(now + Duration::hours(24)),
-            None,
-            &uuid::Uuid::new_v4().to_string(),
-        );
-        assert_eq!(
-            door!(wrong_delegation),
-            MeshConfigOutcome::Refused {
-                reason: MeshConfigRefusalReason::DelegationIdNotConferring
-            },
-            "[{tag}] an act must name the conferral it ACTUALLY acted under. A syntactically \
-             valid id that names no live trust:confers:v1 edge is worse than naming none: it \
-             reads as attributed, and gets stored in a signed row anything downstream will \
-             report as verified provenance."
-        );
-        assert_eq!(
-            door!(by_delegate),
-            MeshConfigOutcome::Admitted,
-            "[{tag}] a live trust:confers:v1 grant is the CC 3.2 delegation plane CC 4.2.1 names"
-        );
+        // ── 2. I6413 — NO DELEGATE. The root's grantee, naming the grant.
+        for (what, form, until) in [
+            (
+                "emergency relief",
+                MeshConfigForm::Emergency,
+                Some(now + Duration::hours(24)),
+            ),
+            ("a durable setting", MeshConfigForm::Durable, None),
+        ] {
+            let row = signed_config_row(
+                &delegate,
+                &root,
+                K::AntientropyRoundSecs,
+                600,
+                form,
+                now - Duration::hours(1),
+                until,
+                None,
+                &grant.hex(),
+            );
+            assert_eq!(
+                door!(row),
+                MeshConfigOutcome::Refused {
+                    reason: MeshConfigRefusalReason::AuthorNotRootAuthorized
+                },
+                "[{tag}] I6413: the root's grantee may not author {what}: no grant and no scope \
+                 word confers mesh-config authority (Constitution 11-24)"
+            );
+        }
 
-        // ── 2b. **CC 4.2.1 RULE 3, THE READ THAT MATTERS.** A COLD durable
-        //        row — no prior emergency — turns on whether the act is
-        //        UNILATERAL, not on whether it was exercised. `root_a` is a
-        //        single-key root, so signing for itself IS its whole quorum
-        //        and this admits; the conferred delegate is refused, because a
-        //        delegation is threshold-1 and rule 4 says threshold-1
-        //        expires. See `MeshConfigForm::Durable` for the argument that
-        //        overturned the stricter reading.
-        let cold_durable_by_root = signed_config_row(
-            &root_a,
-            &root_a,
+        // ── 3. I6407 (rewritten) — a KEY is no config root, the node's edge to
+        //       it notwithstanding.
+        let by_key = signed_config_row(
+            &key_root,
+            &key_root,
             K::FeatureAvStreams,
             0,
             MeshConfigForm::Durable,
             now - Duration::hours(1),
             None,
             None,
-            "att-deleg",
+            "att-self",
         );
         assert_eq!(
-            door!(cold_durable_by_root),
-            MeshConfigOutcome::Admitted,
-            "[{tag}] a single-key root IS its own quorum (1-of-1), so a cold durable RESTRICTION \
-             it signs for itself must admit. Refusing here makes a durable setting unreachable on \
-             a fresh mesh until someone fires a 72h emergency to bootstrap one — the \
-             circular-at-genesis class."
-        );
-        // Names the REAL conferral, so this row reaches the durability check
-        // rather than stopping at #601's attribution gate — the refusal under
-        // test is DurableWithoutRootQuorum, and a fixture that never gets there
-        // would assert it while proving something else.
-        let cold_durable_by_delegate = signed_config_row(
-            &delegate,
-            &root_a,
-            K::FeatureTraceReplication,
-            0,
-            MeshConfigForm::Durable,
-            now - Duration::hours(1),
-            None,
-            None,
-            &conferral_id,
-        );
-        assert_eq!(
-            door!(cold_durable_by_delegate),
+            door!(by_key),
             MeshConfigOutcome::Refused {
-                reason: MeshConfigRefusalReason::DurableWithoutRootQuorum
+                reason: MeshConfigRefusalReason::RootNotTrusted
             },
-            "[{tag}] a CONFERRED delegate acts at threshold-1, and CC 4.2.1 rule 4 says \
-             threshold-1 expires. It may raise a bounded emergency; it may not make anything \
-             permanent alone. That asymmetry is the whole bite of the cold-durable door."
+            "[{tag}] I6407: a key is no root: its own row filed against itself subscribes to \
+             nothing at this node"
         );
 
-        // ── 3. Every refusal branch, on the real door. Each differs from an
+        // ── 4. Every refusal branch, on the real door. Each differs from an
         //       ADMITTED row in exactly one input.
-        let refusals: Vec<(&str, Attestation, MeshConfigRefusalReason)> =
-            vec![
+        let ago = now - Duration::hours(1);
+        let mut refusals: Vec<(&str, Attestation, MeshConfigRefusalReason)> = vec![
             (
                 "an unsubscribed root has nothing to say to this node",
-                signed_config_row(&stranger, &stranger, K::AntientropyPageLimit, 50,
-                    MeshConfigForm::Durable, now - Duration::hours(1), None, None, "att-deleg"),
+                signed_config_row(
+                    &stranger,
+                    &stranger,
+                    K::AntientropyPageLimit,
+                    50,
+                    MeshConfigForm::Durable,
+                    ago,
+                    None,
+                    None,
+                    "att-self",
+                ),
                 MeshConfigRefusalReason::RootNotTrusted,
             ),
             (
-                "an author the root never conferred to",
-                signed_config_row(&outsider, &root_a, K::AntientropyPageLimit, 50,
-                    MeshConfigForm::Durable, now - Duration::hours(1), None, None, "att-deleg"),
+                "an author who holds no seat of the bundle in force",
+                signed_config_row(
+                    &outsider,
+                    &root,
+                    K::AntientropyPageLimit,
+                    50,
+                    MeshConfigForm::Emergency,
+                    ago,
+                    Some(now + Duration::hours(24)),
+                    None,
+                    "att-self",
+                ),
                 MeshConfigRefusalReason::AuthorNotRootAuthorized,
             ),
+        ];
+        for (why, key, value, form, until, ratifies, expected) in [
             (
                 "relieve-never-expand at the door: 40 copies is MORE than the 20 consented",
-                signed_config_row(&root_a, &root_a, K::RedundancyKRepairSymbols, 40,
-                    MeshConfigForm::Durable, now - Duration::hours(1), None, None, "att-deleg"),
+                K::RedundancyKRepairSymbols,
+                40,
+                MeshConfigForm::Durable,
+                None,
+                None,
                 MeshConfigRefusalReason::ExpandsBeyondConsent,
             ),
             (
                 "relieve-never-expand on the LowerMeansMoreFlow arm: 5s is MORE gossip than 60s",
-                signed_config_row(&root_a, &root_a, K::AntientropyRoundSecs, 5,
-                    MeshConfigForm::Durable, now - Duration::hours(1), None, None, "att-deleg"),
+                K::AntientropyRoundSecs,
+                5,
+                MeshConfigForm::Durable,
+                None,
+                None,
                 MeshConfigRefusalReason::ExpandsBeyondConsent,
             ),
             (
                 "emergency relief with no TTL is not relief, it is government",
-                signed_config_row(&root_a, &root_a, K::AntientropyPageLimit, 50,
-                    MeshConfigForm::Emergency, now - Duration::hours(1), None, None, "att-deleg"),
+                K::AntientropyPageLimit,
+                50,
+                MeshConfigForm::Emergency,
+                None,
+                None,
                 MeshConfigRefusalReason::TtlMissing,
             ),
             (
                 "an emergency window beyond 72h",
-                signed_config_row(&root_a, &root_a, K::AntientropyPageLimit, 50,
-                    MeshConfigForm::Emergency, now - Duration::hours(1),
-                    Some(now + Duration::hours(100)), None, "att-deleg"),
+                K::AntientropyPageLimit,
+                50,
+                MeshConfigForm::Emergency,
+                Some(now + Duration::hours(100)),
+                None,
                 MeshConfigRefusalReason::TtlTooLong,
             ),
             (
-                "an act that does not carry its own authority (#570 ask 3)",
-                signed_config_row(&root_a, &root_a, K::AntientropyPageLimit, 50,
-                    MeshConfigForm::Durable, now - Duration::hours(1), None, None, ""),
-                MeshConfigRefusalReason::Unattributed,
-            ),
-            (
                 "a durable row NAMING a ratification that resolves to nothing (distinct from a \
-                 cold durable, which names none and is judged on quorum)",
-                signed_config_row(&root_a, &root_a, K::AntientropyPageLimit, 50,
-                    MeshConfigForm::Durable, now - Duration::hours(1), None,
-                    Some("00000000-0000-0000-0000-000000000000"), "att-deleg"),
+              cold durable, which names none and is judged on quorum)",
+                K::AntientropyPageLimit,
+                50,
+                MeshConfigForm::Durable,
+                None,
+                Some("00000000-0000-0000-0000-000000000000"),
                 MeshConfigRefusalReason::DurableUnratified,
             ),
             (
                 "a value outside the key's declared domain",
-                signed_config_row(&root_a, &root_a, K::AntientropyRoundSecs, 999_999,
-                    MeshConfigForm::Durable, now - Duration::hours(1), None, None, "att-deleg"),
+                K::AntientropyRoundSecs,
+                999_999,
+                MeshConfigForm::Durable,
+                None,
+                None,
                 MeshConfigRefusalReason::ValueOutOfDomain,
             ),
-        ];
+        ] {
+            let (_, row) = by_holder!(0, key, value, form, ago, until, ratifies);
+            refusals.push((why, row, expected));
+        }
         for (why, row, expected) in refusals {
-            let got = door!(row);
             assert_eq!(
-                got,
+                door!(row),
                 MeshConfigOutcome::Refused { reason: expected },
                 "[{tag}] {why}"
             );
         }
 
-        // ── 3b. The CLOSED REGISTRY (CC 4.2.1 rule 2). Hand-built envelope,
-        //        because the typed builder cannot express an unregistered key —
-        //        which is itself the point, but a wire row can, so the door
-        //        must refuse it.
-        let mut unknown = signed_config_row(
-            &root_a,
-            &root_a,
+        // ── 4b. #570 ask 3 (an act that does not carry its own authority), the
+        //        CLOSED REGISTRY (CC 4.2.1 rule 2) and a misfiled row. The three
+        //        gates read the row alone, ahead of the signature; each is the
+        //        holder's admitted row edited after admission, which only those
+        //        gates see.
+        let (_, mut unattributed) = by_holder!(
+            0,
             K::AntientropyPageLimit,
             50,
             MeshConfigForm::Durable,
-            now - Duration::hours(1),
+            ago,
             None,
+            None
+        );
+        unattributed.attestation_envelope[field::DELEGATION_ID] =
+            serde_json::Value::String(String::new());
+        assert_eq!(
+            door!(unattributed),
+            MeshConfigOutcome::Refused {
+                reason: MeshConfigRefusalReason::Unattributed
+            },
+            "[{tag}] an act that does not carry its own authority (#570 ask 3)"
+        );
+        let (_, mut unknown) = by_holder!(
+            0,
+            K::AntientropyPageLimit,
+            50,
+            MeshConfigForm::Durable,
+            ago,
             None,
-            "att-deleg",
+            None
         );
         unknown.attestation_envelope["dimension"] =
             serde_json::Value::String("mesh_config:cluster.secret_knob:v1".to_owned());
@@ -3950,24 +4018,16 @@ mod tests {
             },
             "[{tag}] CC 4.2.1 rule 2: a key naming no consumer processor cannot be set"
         );
-
-        // ── 3c. Filed against something other than the root it names — the
-        //        row the fold would never find.
-        let mut misfiled = signed_config_row(
-            &root_a,
-            &root_a,
+        let (_, mut misfiled) = by_holder!(
+            0,
             K::AntientropyPageLimit,
             50,
             MeshConfigForm::Durable,
-            now - Duration::hours(1),
+            ago,
             None,
-            None,
-            "att-deleg",
+            None
         );
         misfiled.attested_key_id = node.clone();
-        // v62.0.0 — re-signed over the new subject (an edition-2 statement).
-        let misfiled =
-            crate::federation::edition2::fixture_switch::row_of(&misfiled, &seed_of(&root_a));
         assert_eq!(
             door!(misfiled),
             MeshConfigOutcome::Refused {
@@ -3976,49 +4036,35 @@ mod tests {
             "[{tag}] a row the fold cannot find is not a row"
         );
 
-        // ── 4. THE BACK-TO-BACK RENEWAL BAN (CC 4.2.1 rule 3). One emergency
+        // ── 5. THE BACK-TO-BACK RENEWAL BAN (CC 4.2.1 rule 3). One emergency
         //       admits; a second from the SAME holder whose window opens before
-        //       the first closes does not. "The emergency path must not become
-        //       the government."
-        // v31.0.0 (CIRISPersist#598) — this window CLOSES two minutes from
-        // `now`, not 24 hours from it, and that is forced rather than
-        // stylistic. `em3` below has to open AFTER it closes while still being
-        // a row the write door will accept, and the door now refuses any
-        // `asserted_at` more than `DEFAULT_MAX_TOUCH_SKEW` (5 minutes) into the
-        // future. The whole em1/em2/em3 chronology therefore lives inside that
-        // tolerance. Nothing about what the three rows PROVE changed: the
-        // back-to-back rule is a purely relative comparison
-        // (`prior.valid_until > row.asserted_at`), so compressing the scale
-        // leaves it measuring exactly what it did.
-        let em1 = signed_config_row(
-            &root_a,
-            &root_a,
+        //       the first closes is kept and concludes nothing. The window
+        //       closes two minutes from `now` and em3 opens four minutes ahead:
+        //       inside #598's five-minute skew guard (see the earlier note on
+        //       this chronology; the rule is a relative comparison).
+        let (_, em1) = by_holder!(
+            0,
             K::AntientropyPageLimit,
             50,
             MeshConfigForm::Emergency,
             now - Duration::hours(2),
             Some(now + Duration::minutes(2)),
-            None,
-            "att-deleg",
+            None
         );
         assert_eq!(
             door!(em1.clone()),
             MeshConfigOutcome::Admitted,
             "[{tag}] a bounded emergency relief must admit"
         );
-        let em2 = signed_config_row(
-            &root_a,
-            &root_a,
+        let (_, em2) = by_holder!(
+            0,
             K::AntientropyPageLimit,
             40,
             MeshConfigForm::Emergency,
             now - Duration::hours(1),
             Some(now + Duration::hours(48)),
-            None,
-            "att-deleg",
+            None
         );
-        // v62.0.0 (wave GC7; CC rc21 item 14) — KEPT, concluding nothing
-        // (the fold below never counts it), not refused.
         let em2_id = em2.attestation_id.clone();
         assert_eq!(
             door!(em2),
@@ -4031,27 +4077,14 @@ mod tests {
             dir.get_attestation(&em2_id).await.unwrap().is_some(),
             "[{tag}] I3918: the kept renewal is stored (the fold does not count it)"
         );
-        // The same holder CAN act again once the first window has closed —
-        // the ban is on CHAINING, not on ever acting twice.
-        //
-        // Still FUTURE-DATED relative to the fold's `now`, which is the second
-        // job this row does (see the `AntientropyPageLimit` assertion at the
-        // end): it must be admitted and then NOT counted as live. Four minutes
-        // rather than 25 hours because #598's skew guard is the outer bound on
-        // how far ahead any row may be dated at all — and note which direction
-        // elapsed test time pushes this: wall-clock advances TOWARD the
-        // instant, so a slow run makes the write door happier, never less so,
-        // while the fold compares against the captured `now` and is unaffected.
-        let em3 = signed_config_row(
-            &root_a,
-            &root_a,
+        let (_, em3) = by_holder!(
+            0,
             K::AntientropyPageLimit,
             40,
             MeshConfigForm::Emergency,
             now + Duration::minutes(4),
             Some(now + Duration::hours(48)),
-            None,
-            "att-deleg",
+            None
         );
         assert_eq!(
             door!(em3),
@@ -4059,89 +4092,89 @@ mod tests {
             "[{tag}] a fresh window after the last one closed is not a renewal"
         );
 
-        // ── 5. THE DURABLE RATIFICATION (CC 4.2.1 rule 3). A durable row
-        //       naming the emergency it makes permanent, at the same value.
-        let durable = signed_config_row(
-            &root_a,
-            &root_a,
+        // ── 6. I6414 — THE DURABLE RATIFICATION is the QUORUM's act. One
+        //       holder ratifying its own held emergency is short; a second
+        //       holder's voice over the same row admits it.
+        let (st, durable) = by_holder!(
+            0,
             K::AntientropyPageLimit,
             50,
             MeshConfigForm::Durable,
             now - Duration::hours(1),
             None,
-            Some(&em1.attestation_id),
-            "att-deleg",
+            Some(em1.attestation_id.as_str())
         );
+        let _held =
+            crate::federation::edition2::fixture_switch::put_held(dir, &st, "I6414: holder 0's")
+                .await;
+        assert_eq!(
+            door!(durable.clone()),
+            MeshConfigOutcome::Refused {
+                reason: MeshConfigRefusalReason::DurableWithoutRootQuorum
+            },
+            "[{tag}] I6414: one holder does not make its own relief permanent"
+        );
+        let _ =
+            crate::federation::edition2::fixture_switch::put_statement(dir, &holder_voice(&st, 1))
+                .await;
         assert_eq!(
             door!(durable),
             MeshConfigOutcome::Admitted,
-            "[{tag}] a durable row ratifying a held emergency at the same value must admit"
+            "[{tag}] I6414: two of three holders ratify the held emergency"
         );
 
-        // ── 6. THE READ SIDE, through the real reads. root_b now disagrees
-        //       with root_a about k_repair_target, more tightly.
-        dir.put_attestation(super::super::SignedAttestation {
-            attestation: signed_config_row(
-                &root_b,
-                &root_b,
-                K::RedundancyKRepairSymbols,
-                4,
-                MeshConfigForm::Durable,
-                now - Duration::hours(1),
-                None,
-                None,
-                "att-deleg",
-            ),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("[{tag}] root_b's row must store: {e}"));
-
+        // ── 7. THE READ SIDE, through the real reads. Holder 1 relieves the
+        //       same key more tightly than holder 0 did.
+        let (_, tighter) = by_holder!(
+            1,
+            K::RedundancyKRepairSymbols,
+            4,
+            MeshConfigForm::Emergency,
+            now - Duration::hours(1),
+            Some(now + Duration::hours(24)),
+            None
+        );
+        assert_eq!(
+            door!(tighter),
+            MeshConfigOutcome::Admitted,
+            "[{tag}] another holder's relief is not holder 0's renewal"
+        );
         let fold = resolve_mesh_config(dir, &node, &base, now)
             .await
             .unwrap_or_else(|e| panic!("[{tag}] resolve: {e}"));
         assert_eq!(
             fold.roots,
-            vec![root_a.clone(), root_b.clone()],
-            "[{tag}] both subscriptions are folded, and only those"
+            vec![root.clone()],
+            "[{tag}] I6407: the lineage is the one config root; the key the node also \
+             accepted is none"
         );
         let s = fold
             .setting(K::RedundancyKRepairSymbols)
             .unwrap_or_else(|| panic!("[{tag}] key present"));
         assert_eq!(
             s.effective, 4,
-            "[{tag}] MOST-RESTRICTIVE-ACROSS-ROOTS on the real read path: root_b's 4 binds over \
-             root_a's 10"
+            "[{tag}] the tighter relief binds over the looser on the real read path"
         );
-        assert_eq!(s.decided_by_root.as_deref(), Some(root_b.as_str()));
-        assert_eq!(
-            s.per_root.len(),
-            2,
-            "[{tag}] the disagreement is carried, not merely resolved"
-        );
+        assert_eq!(s.decided_by.as_deref(), Some(holder(1).as_str()));
+        assert_eq!(s.decided_by_root.as_deref(), Some(root.as_str()));
         assert_eq!(
             fold.effective(K::AntientropyRoundSecs),
-            600,
-            "[{tag}] the conferred delegate's row binds too"
+            base.get(K::AntientropyRoundSecs),
+            "[{tag}] I6413: the grantee's rows bind nothing"
         );
         assert_eq!(
             fold.effective(K::AntientropyPageLimit),
             50,
             "[{tag}] the live rows for this key are the emergency at 50 and the durable that \
              ratified it, also 50. The tighter emergency at 40 was admitted with an \
-             `asserted_at` FOUR MINUTES in the future, so it has not started — answering 40 \
-             means a future-dated row is being counted as live, which would let an author \
-             pre-schedule the mesh's configuration. Four minutes and not 25 hours because \
-             CIRISPersist#598's skew guard now caps how far ahead the write door will accept \
-             any row; the unbounded version of this claim is pinned on the pure fold by \
-             `ttl_expired_rows_drop_at_read_time_and_future_rows_have_not_started`, which no \
-             write door constrains"
+             `asserted_at` FOUR MINUTES in the future, so it has not started (the unbounded \
+             claim is pinned on the pure fold by \
+             `ttl_expired_rows_drop_at_read_time_and_future_rows_have_not_started`)"
         );
-        // Nothing the stranger root said reaches this node.
         assert!(
             !fold.roots.contains(&stranger),
             "[{tag}] an unsubscribed root must not appear in the fold"
         );
-        // And the whole plane still honours rule 1 on the real path.
         for setting in &fold.settings {
             assert!(
                 !setting
@@ -4151,6 +4184,99 @@ mod tests {
                 setting.key
             );
         }
+    }
+
+    /// v62.0.0 (R2-rest-b2; Lead, after the rootless READ: "ROOTLESS is a
+    /// supported state", the mesh runs) — **I6415: a ROOTLESS node runs its own
+    /// baseline.** The bundle is held (its holders' keys are placed), the node
+    /// has accepted no lineage:
+    ///
+    /// - `resolve_mesh_config` folds NO root and every key's effective value
+    ///   is the owner's baseline;
+    /// - a holder's well-formed emergency relief, filed against the lineage,
+    ///   is refused `root_not_trusted` (held under a fold attempt) and binds
+    ///   nothing;
+    /// - once the node accepts the lineage, the same row is admitted and
+    ///   binds: the refusal was the subscription's, not the row's.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn rootless_baseline_body(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::edition2::fixture_genesis as fg;
+        use MeshConfigKey as K;
+        fg::install_ceremony_v2(dir, fg::bundle_v2_wide())
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] the bundle installs: {e}"));
+        let root = crate::federation::edition2::genesis::genesis_in_force(dir)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] the bundle reads: {e}"))
+            .family_key_id()
+            .expect("a bundle in force")
+            .to_owned();
+        let node = dir.node_key_id().expect("the runner set the node key");
+        let now = crate::federation::admission::truncate_to_substrate_resolution(Utc::now());
+        let base = MeshConfigBaseline::owner_defaults();
+        let baseline_only = |fold: &MeshConfigFold, when: &str| {
+            assert!(
+                fold.roots.is_empty(),
+                "[{tag}] I6415 {when}: no root: {:?}",
+                fold.roots
+            );
+            for k in MeshConfigKey::ALL {
+                assert_eq!(
+                    fold.effective(*k),
+                    base.get(*k),
+                    "[{tag}] I6415 {when}: {k} runs at the owner's baseline"
+                );
+            }
+        };
+        let fold = resolve_mesh_config(dir, &node, &base, now)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] resolve: {e}"));
+        baseline_only(&fold, "before any row");
+        let (_, relief) = holder_config_row(
+            dir,
+            0,
+            &root,
+            K::LoadCeiling,
+            8,
+            MeshConfigForm::Emergency,
+            now - Duration::hours(1),
+            Some(now + Duration::hours(24)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            record_mesh_config_row(dir, &node, &base, &relief, now)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] door errored rather than refusing: {e}")),
+            MeshConfigOutcome::Refused {
+                reason: MeshConfigRefusalReason::RootNotTrusted
+            },
+            "[{tag}] I6415: a rootless node subscribes to no root"
+        );
+        let fold = resolve_mesh_config(dir, &node, &base, now)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] resolve: {e}"));
+        baseline_only(&fold, "after the holder's relief");
+
+        // CONTROL — the node's owner accepts the lineage: the same row binds.
+        let (accepted, _) = rooted(dir).await;
+        assert_eq!(accepted.lineage, root, "[{tag}] one lineage");
+        assert_eq!(
+            record_mesh_config_row(dir, &node, &base, &relief, now)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] door errored rather than refusing: {e}")),
+            MeshConfigOutcome::Admitted,
+            "[{tag}] I6415 CONTROL: rooted, the holder's relief is admitted"
+        );
+        let fold = resolve_mesh_config(dir, &node, &base, now)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] resolve: {e}"));
+        assert_eq!(fold.roots, vec![root.clone()], "[{tag}] I6415 CONTROL");
+        assert_eq!(
+            fold.effective(K::LoadCeiling),
+            8,
+            "[{tag}] I6415 CONTROL: the relief binds once the lineage is accepted"
+        );
     }
 
     /// v62.0.0 (KB-fix1; CC 3.2 at rc22 `87abd2d`, CC 4.2.1 rule 3) —
@@ -4353,83 +4479,108 @@ mod tests {
         Box::pin(bundle_root_durable_body(&dir, "pg")).await;
     }
 
+    /// v62.0.0 (R2-rest-b2) — a fresh sqlite store whose node key is set
+    /// (`seed`'s node key), as `fixture_trust_root::rooted_trust_root` needs.
     #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn mesh_config_door_and_fold_sqlite() {
+    async fn sqlite_with_node(seed: &str) -> crate::store::SqliteBackend {
         use crate::store::Backend;
         let dir = crate::store::SqliteBackend::open_in_memory()
             .await
             .expect("sqlite");
         dir.run_migrations().await.expect("migrations");
-        mesh_config_door_body(&dir, "sq").await;
+        let node =
+            crate::federation::edition2::fixture_switch::put_key(&dir, seed, &["node"]).await;
+        dir.set_node_key_id(node);
+        dir
     }
 
+    /// The postgres twin of [`sqlite_with_node`], on a fresh database
+    /// (`test_pg::empty_dsn`: the bundle is installed per store). `None`
+    /// without a DSN.
     #[cfg(feature = "postgres")]
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn mesh_config_door_and_fold_postgres() {
+    async fn postgres_with_node(seed: &str) -> Option<crate::store::PostgresBackend> {
         use crate::store::Backend;
-        let Some(dsn) = crate::test_pg::dsn() else {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
+            return None;
         };
         let dir = crate::store::PostgresBackend::connect(&dsn)
             .await
             .expect("pg");
         dir.run_migrations().await.expect("migrations");
-        // Invocation-unique so the key ids and the row set cannot collide with
-        // an earlier run against the same database.
-        let tag = format!("pg{}", uuid::Uuid::new_v4().simple());
-        mesh_config_door_body(&dir, &tag).await;
+        let node =
+            crate::federation::edition2::fixture_switch::put_key(&dir, seed, &["node"]).await;
+        dir.set_node_key_id(node);
+        Some(dir)
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn mesh_config_door_and_fold_sqlite() {
+        let dir = sqlite_with_node("mc-node-sq").await;
+        Box::pin(mesh_config_door_body(&dir, "sq")).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn mesh_config_door_and_fold_postgres() {
+        let Some(dir) = postgres_with_node("mc-node-pg").await else {
+            return;
+        };
+        Box::pin(mesh_config_door_body(&dir, "pg")).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i6415_a_rootless_node_runs_its_baseline_sqlite() {
+        let dir = sqlite_with_node("mc-rootless-sq").await;
+        Box::pin(rootless_baseline_body(&dir, "sq")).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i6415_a_rootless_node_runs_its_baseline_postgres() {
+        let Some(dir) = postgres_with_node("mc-rootless-pg").await else {
+            return;
+        };
+        Box::pin(rootless_baseline_body(&dir, "pg")).await;
     }
 
     /// **CIRISPersist#777 — the node detects, the OWNER relieves.**
     ///
     /// `load.ceiling` is the key a stalling node has the most reason to want to
-    /// set for itself, and the one it may least do so: CC 4.2.1 puts the
-    /// mesh-config author on the CC 3.2 delegation plane, and a node holds no
-    /// delegation to itself. CIRISServer#503 proposed the node-local form and
-    /// was withdrawn on exactly that.
+    /// set for itself, and the one it may least do so: CC 4.2.1.4 *"A node
+    /// MUST NOT author a `mesh_config` value: that plane is the root's"*.
+    /// CIRISServer#503 proposed the node-local form and was withdrawn on
+    /// exactly that.
     ///
-    /// Three claims, in the order that makes the refusals mean something:
+    /// v62.0.0 (R2-rest-b2) — on the lineage: the root is the bundle the
+    /// node's owner accepted, and its author is a holder. Three claims, in
+    /// the order that makes the refusals mean something:
     ///
-    /// 1. the ROOT's relief is **admitted** and binds — without this the other
+    /// 1. a HOLDER's relief is **admitted** and binds — without this the other
     ///    two would pass on a key nothing can set at all, which is a witness
     ///    for nothing;
-    /// 2. the same row, signed by the NODE under the root it subscribes to, is
+    /// 2. the same row, signed by the NODE under the lineage it accepted, is
     ///    refused `author_not_root_authorized`;
-    /// 3. the node naming ITSELF as the root is refused `root_not_trusted`
-    ///    **even after it charters itself** — a self-loop `trust:accepts:v1`
-    ///    edge that the write door actually admits, because
-    ///    [`trusted_roots_of`](super::trust_root::trusted_roots_of) drops
-    ///    self-edges before this plane's gates ever run.
-    ///
-    /// No refusal variant was added for any of this, which is the point: the
-    /// authority taxonomy is *root or conferred delegate*, so "a node" is
-    /// already outside it. (The issue states persist "cannot even express
-    /// refusing a node-authored value" — it can, twice, and these are the two
-    /// branches.)
+    /// 3. the node naming ITSELF as the root is refused `root_not_trusted`:
+    ///    a node is no lineage. (The earlier leg first stored a self-charter
+    ///    edge, `trust:accepts:v1` node → node, to show `trusted_roots_of`
+    ///    drops self-edges; with the keyed root gone no edge to a key makes a
+    ///    config root, `config_roots`, so that premise is deleted.)
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn node_authored_load_ceiling_body(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::edition2::fixture_genesis as fg;
         use MeshConfigKey as K;
-        let node = format!("lc-node-{tag}");
-        let root = format!("lc-root-{tag}");
-        // v62.0.0 — each name is rebound to its kid once registered.
-        let node = register(dir, &node).await;
-        let root = register(dir, &root).await;
-        // The subscription — the trust edge CC 4.2.1 calls the subscription.
-        dir.put_attestation(super::super::SignedAttestation {
-            attestation: trust_edge(
-                &uuid::Uuid::new_v4().to_string(),
-                &node,
-                &root,
-                crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
-            ),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("[{tag}] the node's trust edge must admit: {e}"));
+        let (r, node) = rooted(dir).await;
+        let root = r.lineage;
+        let seed = format!("lc-node-{tag}");
+        seeds()
+            .lock()
+            .expect("seed map")
+            .insert(node.clone(), seed.clone());
 
-        let now = Utc::now();
+        let now = crate::federation::admission::truncate_to_substrate_resolution(Utc::now());
         let base = MeshConfigBaseline::owner_defaults();
         let relief_at = now - Duration::hours(1);
         // v61 (CC 2.6.2) — the signed expiry carries milliseconds.
@@ -4437,10 +4588,11 @@ mod tests {
             now + Duration::hours(24),
         );
 
-        // ── 1. The OWNER's root relieves the node it subscribes to. Bounded
-        //       emergency relief, which is what CC 4.2.1 gives a single holder.
-        let by_root = signed_config_row(
-            &root,
+        // ── 1. A HOLDER relieves the node. Bounded emergency relief, which is
+        //       what CC 4.2.1 gives one holder.
+        let (_, by_holder) = holder_config_row(
+            dir,
+            0,
             &root,
             K::LoadCeiling,
             8,
@@ -4448,20 +4600,19 @@ mod tests {
             relief_at,
             Some(expires),
             None,
-            "att-deleg",
-        );
+        )
+        .await;
         assert_eq!(
-            record_mesh_config_row(dir, &node, &base, &by_root, now)
+            record_mesh_config_row(dir, &node, &base, &by_holder, now)
                 .await
                 .unwrap_or_else(|e| panic!("[{tag}] door errored rather than refusing: {e}")),
             MeshConfigOutcome::Admitted,
-            "[{tag}] the root's own relief must be admitted, or the refusals below prove only \
-             that nothing can set this key"
+            "[{tag}] the holder's relief must be admitted, or the refusals below prove only              that nothing can set this key"
         );
 
-        // ── 2. The NODE signs the identical relief, under the root it
-        //       subscribes to. The value is the same and the direction is
-        //       relief; what is refused is the AUTHOR.
+        // ── 2. The NODE signs the identical relief, under the lineage it
+        //       accepted. The value is the same and the direction is relief;
+        //       what is refused is the AUTHOR.
         let by_node = signed_config_row(
             &node,
             &root,
@@ -4471,7 +4622,7 @@ mod tests {
             relief_at,
             Some(expires),
             None,
-            "att-deleg",
+            "att-self",
         );
         assert_eq!(
             record_mesh_config_row(dir, &node, &base, &by_node, now)
@@ -4479,36 +4630,10 @@ mod tests {
                 .unwrap_or_else(|e| panic!("[{tag}] door errored rather than refusing: {e}"))
                 .refusal(),
             Some(MeshConfigRefusalReason::AuthorNotRootAuthorized),
-            "[{tag}] the root conferred on nobody, so a node signing under it is not on the \
-             delegation plane CC 4.2.1 names"
+            "[{tag}] CC 4.2.1.4: a node MUST NOT author a mesh_config value"
         );
 
-        // ── 3. The NODE names ITSELF as the root, having first chartered
-        //       itself: a self-loop `trust:accepts:v1` edge, born recoverable
-        //       with the pre-rotation commitment CIRISPersist#488 requires, so
-        //       it is ADMITTED and the refusal below is this plane's rather
-        //       than the charter door's. `trusted_roots_of` filters
-        //       `attested_key_id != node_key_id`, so the self-charter is not
-        //       even a trust question by the time this plane looks.
-        dir.put_attestation(super::super::SignedAttestation {
-            attestation: trust_edge_with(
-                &uuid::Uuid::new_v4().to_string(),
-                &node,
-                &node,
-                crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
-                &[(
-                    crate::federation::trust_root::CHARTER_PRE_ROTATION_FIELD,
-                    serde_json::Value::String("11".repeat(32)),
-                )],
-            ),
-        })
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "[{tag}] the node's self-charter must STORE, or step 3 witnesses the charter \
-                 door instead of the mesh-config plane: {e}"
-            )
-        });
+        // ── 3. The NODE names ITSELF as the root.
         let self_rooted = signed_config_row(
             &node,
             &node,
@@ -4518,7 +4643,7 @@ mod tests {
             relief_at,
             Some(expires),
             None,
-            "att-deleg",
+            "att-self",
         );
         assert_eq!(
             record_mesh_config_row(dir, &node, &base, &self_rooted, now)
@@ -4526,19 +4651,22 @@ mod tests {
                 .unwrap_or_else(|e| panic!("[{tag}] door errored rather than refusing: {e}"))
                 .refusal(),
             Some(MeshConfigRefusalReason::RootNotTrusted),
-            "[{tag}] a node is not a trust root of itself, self-charter or not"
+            "[{tag}] a node is no root of itself"
         );
 
-        // ── 4. And the node runs the OWNER's number, from the real read path.
+        // ── 4. And the node runs the HOLDER's number, from the real read path.
         let fold = resolve_mesh_config(dir, &node, &base, now)
             .await
             .unwrap_or_else(|e| panic!("[{tag}] resolve: {e}"));
         let s = fold.setting(K::LoadCeiling).expect("registered key");
         assert_eq!(
             s.effective, 8,
-            "[{tag}] the relief the root filed is the ceiling the node runs"
+            "[{tag}] the relief the holder filed is the ceiling the node runs"
         );
-        assert_eq!(s.decided_by.as_deref(), Some(root.as_str()));
+        assert_eq!(
+            s.decided_by.as_deref(),
+            Some(fg::identity_ref_of(fg::HOLDER_SEEDS[0]).as_str())
+        );
         assert_eq!(s.decided_by_root.as_deref(), Some(root.as_str()));
         assert_eq!(s.form, Some(MeshConfigForm::Emergency));
         assert_eq!(
@@ -4555,30 +4683,17 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn a_node_cannot_author_its_own_load_ceiling_sqlite() {
-        use crate::store::Backend;
-        let dir = crate::store::SqliteBackend::open_in_memory()
-            .await
-            .expect("sqlite");
-        dir.run_migrations().await.expect("migrations");
-        node_authored_load_ceiling_body(&dir, "sq").await;
+        let dir = sqlite_with_node("lc-node-sq").await;
+        Box::pin(node_authored_load_ceiling_body(&dir, "sq")).await;
     }
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn a_node_cannot_author_its_own_load_ceiling_postgres() {
-        use crate::store::Backend;
-        let Some(dsn) = crate::test_pg::dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+        let Some(dir) = postgres_with_node("lc-node-pg").await else {
             return;
         };
-        let dir = crate::store::PostgresBackend::connect(&dsn)
-            .await
-            .expect("pg");
-        dir.run_migrations().await.expect("migrations");
-        // Invocation-unique, so a re-run cannot collide with its own key ids.
-        let tag = format!("pg{}", uuid::Uuid::new_v4().simple());
-        node_authored_load_ceiling_body(&dir, &tag).await;
+        Box::pin(node_authored_load_ceiling_body(&dir, "pg")).await;
     }
 
     // ══════════════════════════════════════════════════════════════════

@@ -183,7 +183,9 @@ pub fn settles_at(execution: &PurgeExecution) -> chrono::DateTime<chrono::Utc> {
     // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — an erasure's tombstone
     // (the subject's `withdraws` is its authority) is destroyed on receipt:
     // Art. 17 waits on no dwell.
-    if execution.legal_basis == super::subject_erasure::WITHDRAWS_AUTHORITY {
+    if execution.legal_basis == super::subject_erasure::WITHDRAWS_AUTHORITY
+        || execution.legal_basis == super::steward_purge::WITHDRAWAL_DESCENT_BASIS
+    {
         return execution.executed_at;
     }
     match basis_disposition(&execution.legal_basis) {
@@ -899,6 +901,35 @@ fn notice_row_of_header(execution: &PurgeExecution) -> Option<(String, String)> 
     Some((row.attestation_id, shape.content_sha256))
 }
 
+/// v62.0.0 (WD-fix24) — **is the takedown notice ROW `row` executed here?**
+/// True when a held takedown execution's header records this very row
+/// ([`notice_row_of_header`]) among the executions naming the row's content
+/// on the bytes plane. Read by the fold's finality test
+/// (`withdrawn_content::taken_out_beneath`): an executed notice is never
+/// un-concluded for the absence of the binding it was judged over.
+///
+/// # Errors
+/// Directory reads.
+pub(crate) async fn notice_row_executed(
+    directory: &dyn FederationDirectory,
+    row: &super::Attestation,
+) -> Result<bool, Error> {
+    let Ok(shape) = notice_row_shape(row) else {
+        return Ok(false);
+    };
+    for notice_id in directory
+        .purge_tombstone_notices(PurgePlane::Blob.as_str(), &shape.content_sha256)
+        .await?
+    {
+        if let Some(e) = directory.purge_execution(&notice_id).await? {
+            if notice_row_of_header(&e).is_some_and(|(id, _)| id == row.attestation_id) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// v60.1.0 (CIRISPersist#1113) — is `row` a `reconsideration:{grounds}`
 /// RULING with `outcome: reversed` naming `notice_row_id`?
 #[must_use]
@@ -1154,11 +1185,27 @@ async fn hold_notice_row(
         .await?
         .is_none()
     {
-        directory
+        // v62.0.0 (WD-fix6) — the put routes the notice's statement through
+        // the statement funnel (WD-fix4). A HOLD answers the gate's error as
+        // before and the takedown records nothing, but the notice's statement
+        // is KEPT: a re-run re-offers it, a no-op on the statement id, and
+        // the notice concludes when what it waits for arrives.
+        if let Err(e) = directory
             .put_attestation(super::SignedAttestation {
                 attestation: row.clone(),
             })
-            .await?;
+            .await
+        {
+            if super::attestation_admit::kept_waiting(directory, row).await? {
+                tracing::info!(
+                    notice = %row.attestation_id,
+                    error = %e,
+                    "takedown: the notice row is kept and waiting (a hold, not a refusal); \
+                     nothing is recorded until it concludes"
+                );
+            }
+            return Err(e);
+        }
     }
     Ok(())
 }

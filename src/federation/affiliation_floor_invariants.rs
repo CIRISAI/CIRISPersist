@@ -5,7 +5,8 @@
 //!   with ONE deciding seat removes a member only with a countersign from a
 //!   key outside the seat (its designated official): the seat alone is
 //!   refused `affiliation_countersign_missing`; the seat with the official is
-//!   admitted; a member's own resignation needs no one; an affiliation of two
+//!   admitted; a member's own resignation (the `membership:resignation` leaf,
+//!   RESIGN-3) needs no one; an affiliation of two
 //!   seats decides under its own protocol.
 //! - **I1514** (`CLM-affiliation-dissolution`) — dissolution is the cosigned
 //!   `withdraws` of the community's record under its protocol: one voice of
@@ -99,6 +100,7 @@ pub(crate) mod bodies {
                 reason: None,
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Removal,
             },
         );
         for c in &signers[1..] {
@@ -156,7 +158,8 @@ pub(crate) mod bodies {
             id_of(&solo),
             id_of(&pair),
         );
-        found_room_with_blob(
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let solo = found_room_with_blob(
             d,
             &solo,
             "founder_only",
@@ -189,17 +192,29 @@ pub(crate) mod bodies {
             "I1513: the designated official's voice completes the seat's",
         );
         assert!(!active(d, &solo, &m).await, "I1513: removed");
+        // v62.0.0 (RESIGN-3; CC 3.1.3.2) — n's own `membership:resignation`
+        // leaf (a removal n alone voices is a counted row, which the one-seat
+        // floor counts like any other).
         landed(
             e2::put_voices(
                 d,
-                &removal_voices(d, &solo, &[&n], &n, at + Duration::minutes(7)).await,
+                &crate::federation::resign_invariants::bodies::room_end_voices(
+                    d,
+                    &solo,
+                    &n,
+                    &[&n],
+                    at + Duration::minutes(7),
+                    crate::federation::types::RevocationLeaf::Resignation,
+                )
+                .await,
             )
             .await,
             "I1513: a resignation needs no countersign",
         );
         assert!(!active(d, &solo, &n).await, "I1513: n resigned");
-        // Two seats decide under their own protocol.
-        found_room_with_blob(
+        // Two seats decide under their own protocol. GID-fix6: rebound to
+        // the RETURNED (derived) id.
+        let pair = found_room_with_blob(
             d,
             &pair,
             "founder_only",
@@ -301,7 +316,8 @@ pub(crate) mod bodies {
         let k = |n: &str| format!("i1514-{n}-{s}");
         let (a, b, j, room, fam) = (k("a"), k("b"), k("j"), k("room"), k("fam"));
         reg(d, &[&a, &b, &j, &room, &fam]).await;
-        found_community(d, &room, "unanimous", &[&a, &b], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let room = found_community(d, &room, "unanimous", &[&a, &b], &[])
             .await
             .unwrap();
         let rec = record_row(d, &room, cohort_scope::COMMUNITY).await;
@@ -348,7 +364,8 @@ pub(crate) mod bodies {
             .expect_err("I1514: no new seat");
         assert_eq!(e.kind(), "federation_group_dissolved", "I1514: {e}");
         // A family's record withdraws is still refused (its own amendment).
-        found_family(d, &fam, "founder_only", &[&a], &[])
+        // GID-fix6: rebound to the RETURNED (derived) id.
+        let fam = found_family(d, &fam, "founder_only", &[&a], &[])
             .await
             .unwrap();
         let frec = record_row(d, &fam, cohort_scope::FAMILY).await;
@@ -377,7 +394,8 @@ pub(crate) mod bodies {
         for n in [a, b] {
             reg(n, &[&f, &g, &stranger, &room]).await;
         }
-        found_community(a, &room, "unanimous", &[&f, &g], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let room = found_community(a, &room, "unanimous", &[&f, &g], &[])
             .await
             .unwrap();
         let rec = record_row(a, &room, cohort_scope::COMMUNITY).await;

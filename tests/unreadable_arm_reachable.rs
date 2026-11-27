@@ -27,6 +27,7 @@
 #![cfg(all(feature = "test-anchor", feature = "sqlite"))]
 
 use ciris_persist::federation::directory_double::FaultInjectingDirectory;
+use ciris_persist::federation::edition2::{fixture_genesis, fixture_switch as e2};
 use ciris_persist::federation::mesh_config::{resolve_mesh_config, MeshConfigBaseline};
 use ciris_persist::store::{Backend as _, SqliteBackend};
 use std::sync::Arc;
@@ -45,7 +46,6 @@ async fn backend() -> Arc<SqliteBackend> {
 #[tokio::test]
 async fn an_unreadable_root_is_not_a_silent_root_603() {
     let inner = backend().await;
-    let now = chrono::Utc::now();
     let baseline = MeshConfigBaseline::owner_defaults();
 
     // `resolve_mesh_config` reads per TRUSTED ROOT, so a node with no roots
@@ -53,23 +53,24 @@ async fn an_unreadable_root_is_not_a_silent_root_603() {
     // an empty loop and the test would pass for the wrong reason. Establish a
     // real root first, so the read the fault interrupts is a read that would
     // otherwise have happened.
-    const NODE: &str = "node-603";
-    const ROOT: &str = "root-603";
-    // NOTE: only the NODE is pre-registered. `establish_trust_root` registers the
-    // ROOT itself, and pre-registering it collides — `Conflict("key_id root-603
-    // already exists with different content")`.
-    ciris_persist::federation::tier_ingest::test_support::register_hybrid_key(&*inner, NODE).await;
-    ciris_persist::federation::operational::test_support::establish_trust_root(
+    // v62.0.0 (R2-fixture; CC 3.2 T5) — the root is the bundle's LINEAGE: the
+    // bundle in force and THIS node's acceptance of it
+    // (`fixture_trust_root::rooted_trust_root`). The earlier-form
+    // `establish_trust_root` (a KEYED root) is deleted.
+    let node = e2::put_key(&*inner, "node-603", &["node"]).await;
+    inner.set_node_key_id(node.clone());
+    ciris_persist::federation::edition2::fixture_trust_root::rooted_trust_root(
         &*inner,
-        NODE,
-        ROOT,
-        NODE,
-        "infra:serve",
+        &fixture_genesis::HOLDER_SEEDS,
+        "quorum:2/3",
     )
-    .await
-    .expect("establish a trust root so there is something to read");
+    .await;
+    let node = node.as_str();
+    // The acceptance is stated after the node key's own start: read at an
+    // instant after it.
+    let now = chrono::Utc::now() + chrono::Duration::seconds(5);
 
-    let roots = ciris_persist::federation::trust_root::trusted_roots_of(&*inner, NODE, now)
+    let roots = ciris_persist::federation::trust_root::trusted_roots_of(&*inner, node, now)
         .await
         .expect("roots resolve");
     assert!(
@@ -80,7 +81,7 @@ async fn an_unreadable_root_is_not_a_silent_root_603() {
 
     // A directory that answers normally. Nothing is unreadable.
     let readable = FaultInjectingDirectory::new(inner.clone());
-    let fold_ok = resolve_mesh_config(&readable, NODE, &baseline, now)
+    let fold_ok = resolve_mesh_config(&readable, node, &baseline, now)
         .await
         .expect("a readable directory resolves");
     assert!(
@@ -104,7 +105,7 @@ async fn an_unreadable_root_is_not_a_silent_root_603() {
          silently failed to register reads as a passing test"
     );
 
-    let fold_bad = resolve_mesh_config(&unreadable, NODE, &baseline, now)
+    let fold_bad = resolve_mesh_config(&unreadable, node, &baseline, now)
         .await
         .expect(
             "Unsupported is a legitimate answer from a backend that does not \

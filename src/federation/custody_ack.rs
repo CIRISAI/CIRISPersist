@@ -638,13 +638,13 @@ where
 /// spelling CIRISEdge's receiver already emits (`receipts.rs`,
 /// `RECEIPT_DIMENSION_VERSION`), signed by the receiving node.
 #[must_use]
-pub fn delivery_receipt_dimension(stream_id: &str) -> String {
+pub fn delivery_ack_dimension(stream_id: &str) -> String {
     format!("delivery_receipt:{stream_id}:v1")
 }
 
 /// v60.1.0 (CIRISPersist#1006, CC 3.1.3.3 / CC 3.4.6) — **`device`'s latest
 /// SIGNED delivery instant for `stream_id`**: the greatest `asserted_at` of the
-/// rows the device signed under exactly [`delivery_receipt_dimension`] (the
+/// rows the device signed under exactly [`delivery_ack_dimension`] (the
 /// query pins both) that no composer of the device retired and that have not
 /// expired at `now`.
 ///
@@ -652,7 +652,7 @@ pub fn delivery_receipt_dimension(stream_id: &str) -> String {
 /// LATER live report" compares the receipt's instant with the device's signed
 /// report instant, so both must be the device's. A stored
 /// `ciris-delivery-receipt/v1` receipt
-/// ([`StoredDeliveryReceipt`](super::stream_receipt::StoredDeliveryReceipt))
+/// ([`StoredDeliveryAck`](super::stream_receipt::StoredDeliveryAck))
 /// carries no signed instant (its signing bytes are `(stream, epoch, k, root)`),
 /// only this node's `received_at` storage stamp, so it is not custody
 /// evidence: it still joins the STH and names the subscriber as a device to
@@ -667,7 +667,7 @@ where
     D: FederationDirectory + ?Sized,
 {
     use super::attestation_query::{AttestationQuery, FOLD_PAGE};
-    let dimension = delivery_receipt_dimension(stream_id);
+    let dimension = delivery_ack_dimension(stream_id);
     let mut rows: Vec<Attestation> = Vec::new();
     let mut pages = AttestationQuery::by(device_key_id, FOLD_PAGE)
         .dimension(&dimension)
@@ -834,7 +834,7 @@ where
         // never by this node's storage stamp on the stored receipt.
         devices.extend(
             backend
-                .list_stored_delivery_receipts_for(stream, 1_000_000)
+                .list_stored_delivery_acks_for(stream, 1_000_000)
                 .await?
                 .into_iter()
                 .map(|r| r.receipt.subscriber_key_id),

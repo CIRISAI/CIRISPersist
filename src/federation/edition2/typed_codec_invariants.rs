@@ -36,10 +36,10 @@ use super::door::{admit_row, AdmittedRow};
 use super::door_invariants::fixture::{holding, iref, key};
 use super::ingest::{attestation_of, check_carried_projection, INGEST_TIER};
 use super::typed::{
-    custody_payload, delivery_receipt_payload, key_grant_payload, occurrence_revocation_of,
+    custody_payload, delivery_ack_payload, key_grant_payload, occurrence_revocation_of,
     occurrence_revocation_payload, revocation_of, revocation_payload, takedown_payload,
-    typed_plane_of, NoticeText, TypedPlane, CUSTODY_PREFIX, DELIVERY_RECEIPT_PREFIX,
-    KEY_GRANT_PREFIX, OCCURRENCE_REVOCATION_PREFIX, PLANES, REVOCATION_PREFIX, TAKEDOWN_PREFIX,
+    typed_plane_of, NoticeText, TypedPlane, CUSTODY_PREFIX, DELIVERY_ACK_PREFIX, KEY_GRANT_PREFIX,
+    OCCURRENCE_REVOCATION_PREFIX, PLANES, REVOCATION_PREFIX, TAKEDOWN_PREFIX,
 };
 use crate::federation::blobs::GrantWrap;
 use crate::federation::custody_ack::{parse_custody_ack, CustodyState};
@@ -200,7 +200,13 @@ fn i3142_a_key_grant_reads_back_as_its_row_on_each_axis() {
         wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.to_owned(),
         wrapped_dek: "{\"v\":2,\"ct\":\"AAAA\"}".to_owned(),
     };
-    let community = iref(&key(43));
+    // GID-fix5 — an epoch grant's `community` is a group-ref (the derived
+    // id's form: `group-` and 43 characters), never a key's identity-ref.
+    let community = format!(
+        "{}{}",
+        crate::federation::edition2::group_id::GROUP_REF_PREFIX,
+        crate::federation::namespace::key_segment::segment_of(&iref(&key(43))).expect("a segment")
+    );
     let axes = [
         KeyGrantAxis::Content {
             at_rest_sha256: hex::encode([0x61; 32]),
@@ -272,11 +278,11 @@ fn i3143_a_takedown_notice_reads_back_through_the_notice_shape() {
 
 /// I3144.
 #[test]
-fn i3144_a_delivery_receipt_states_its_root_as_hex() {
+fn i3144_a_delivery_ack_states_its_root_as_hex() {
     let s = key(81);
     let si = iref(&s);
-    let p = delivery_receipt_payload(&si, "t2-stream", 2, 17, &[0x3a; 32], 1_000);
-    let a = attestation_of(&admitted(&s, &si, DELIVERY_RECEIPT_PREFIX, &p), INGEST_TIER).unwrap();
+    let p = delivery_ack_payload(&si, "t2-stream", 2, 17, &[0x3a; 32], 1_000);
+    let a = attestation_of(&admitted(&s, &si, DELIVERY_ACK_PREFIX, &p), INGEST_TIER).unwrap();
     assert_eq!(
         a.attestation_envelope["chunk_root"],
         serde_json::json!(hex::encode([0x3a; 32])),

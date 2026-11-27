@@ -12,11 +12,9 @@
 //!
 //! - **the holder arm of a founder** ([`is_bundle_holder`]): an identity-ref
 //!   that is a holder of the bundle in force (common to every tip);
-//! - **the birth's accord count** ([`bundle_quorum_over`]): the distinct
-//!   holders among the version's voices, against a strict majority of the
-//!   holders (CC 3.2, citing CC 2.7.5: "a co-signature by a strict majority of the standing
-//!   accord roster"; CC 2.6.1.11, the bundle's own count for the holders'
-//!   acts);
+//! - the birth's accord count (`bundle_quorum_over`) is DELETED (v62.0.0
+//!   R2-rooms-b; Constitution 11-24 "CONSTITUTION RULED ROOM ROOTING": "the
+//!   holders' birth count … go"): a room's birth is its founders' act;
 //! - **a version's voices** ([`version_signers`]): the signers of the held
 //!   `group:roster` statements whose typed record is that version (each was
 //!   verified at the edition-2 door when it arrived), plus, while the
@@ -121,34 +119,12 @@ where
     Ok((true, next))
 }
 
-/// **The birth's accord count**: the distinct holders of the bundle in force
-/// among `signers`, against [`accord_threshold`](crate::federation::admission::accord_threshold). With no bundle held the
-/// roster is empty and the count is never met.
-///
-/// # Errors
-/// Directory read failures.
-pub async fn bundle_quorum_over<F>(
-    dir: &F,
-    signers: &BTreeSet<String>,
-) -> Result<SignerCount, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    // v62.0.0 (RL-fix6) — a birth counted short over no (or an earlier)
-    // bundle's holders re-folds at a placement. `accord_holder_roster` itself
-    // does not declare it: it is also the standing cache's key input.
-    super::genesis::reads_bundle_in_force();
-    let holders = crate::federation::admission::accord_holder_roster(dir).await?;
-    Ok(holders_count(&holders, signers))
-}
-
 /// v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21) — **the ONE count over a
 /// bundle's holders**: the distinct `holders` (identity-refs) among `signers`,
 /// against [`accord_threshold`](crate::federation::admission::accord_threshold)
 /// of their number (the strict majority, through the one seam). Shared by the
-/// birth's count ([`bundle_quorum_over`]: the holders in force) and a counted
-/// grant from the root ([`holders_count_at`]: the holders of the bundle the
-/// grant NAMES). No holder, never met.
+/// counted grant from the root ([`holders_count_at`]: the holders of the
+/// bundle the grant NAMES) and the steward purge. No holder, never met.
 #[must_use]
 pub fn holders_count(holders: &[String], signers: &BTreeSet<String>) -> SignerCount {
     SignerCount {

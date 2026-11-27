@@ -311,6 +311,8 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
     ),
     ("list_widening_candidates", Bound::Paged),
     ("list_wire_hashes_since", Bound::Paged),
+    // v62.0.0 (VD-fix3; WD-fix1's read) — a `(since, limit)` cursor page.
+    ("list_withdrawals_since", Bound::Paged),
     (
         "list_witness_equivocations",
         Bound::Open("every equivocation proof recorded about one peer"),

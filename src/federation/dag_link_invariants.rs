@@ -180,7 +180,11 @@ pub(crate) mod bodies {
         {
             // A row B already applied answers as a duplicate; the delivery is
             // what matters, not the count.
-            let _ = p.b.apply_replicated_key_grant(set).await;
+            let _ = crate::federation::key_grant_invariants::two_node::deliver_key_grant_row(
+                &*p.b.federation_directory(),
+                &set,
+            )
+            .await;
         }
         p.b.adopt_sealed_blob(
             &inline(p.sa.as_ref(), root).await,
@@ -402,7 +406,11 @@ pub(crate) mod bodies {
         )
         .await
         {
-            let _ = p.b.apply_replicated_key_grant(set).await;
+            let _ = crate::federation::key_grant_invariants::two_node::deliver_key_grant_row(
+                &*p.b.federation_directory(),
+                &set,
+            )
+            .await;
         }
         p.b.adopt_sealed_blob(
             &inline(p.sa.as_ref(), &root2).await,
@@ -947,7 +955,11 @@ pub(crate) mod bodies {
         )
         .await
         {
-            let _ = p.b.apply_replicated_key_grant(set).await;
+            let _ = crate::federation::key_grant_invariants::two_node::deliver_key_grant_row(
+                &*p.b.federation_directory(),
+                &set,
+            )
+            .await;
         }
         p.b.adopt_sealed_blob(
             &inline(p.sa.as_ref(), &root).await,

@@ -64,7 +64,7 @@
 //!   publication (v62.0.0 wave GC7, CC 2.7.3): kept, `Pending`, held with
 //!   reason `receipt_root_unpublished`, and no receipt row.
 //! - **I3163** against a published root it lands in
-//!   `federation_stream_delivery_receipts` and as its signed row.
+//!   `federation_stream_delivery_acks` and as its signed row.
 //! - **I3164** a second root at the same `k` is kept and concludes nothing
 //!   (held, `receipt_equivocation`; v62.0.0 wave GC7), the first receipt
 //!   standing.
@@ -108,10 +108,8 @@
 //! - **I3174** the granter's `withdraws` expires the row, and the other end
 //!   is re-derived `temporary`.
 //! - **I3175** a `self`-scope edge is `anonymous`.
-//! - **I3176** the purge count over a trust root's head: one voice of three
-//!   is `quorum_not_met`; a voice holding no seat is `not_a_seat`.
-//! - **I3177** two voices of three meet the head's `majority`: the counted
-//!   signers are exactly the voices.
+//! - **I3176 / I3177** — DELETED (v62.0.0 R2-rooms): the room-head purge
+//!   count they read is gone (the note at their site).
 //! - **I3179** an edition-2 purge bundle carries the notice's statements: a
 //!   second node admits them through its own door (it then holds both
 //!   voices) and counts them by the edition-2 count (`root_not_held` with no
@@ -132,7 +130,7 @@ use super::names::RowId;
 use super::typed::{
     cosign_payload,
     custody_payload,
-    delivery_receipt_payload,
+    delivery_ack_payload,
     key_grant_payload,
     occurrence_revocation_payload,
     revocation_payload,
@@ -143,7 +141,7 @@ use super::typed::{
     NoticeText,
     COSIGN_PREFIX,
     CUSTODY_PREFIX,
-    DELIVERY_RECEIPT_PREFIX,
+    DELIVERY_ACK_PREFIX,
     KEY_GRANT_PREFIX,
     OCCURRENCE_REVOCATION_PREFIX,
     REVOCATION_PREFIX,
@@ -1622,14 +1620,7 @@ fn sign_typed(k: &K, row_type: &str, sub: &str, prefix: &str, p: &Value) -> Vec<
 }
 
 fn accepts(granter: &K, key: &str, scope: &str, until: Option<u64>, t: u64) -> Vec<u8> {
-    let p = trust_accepts_payload(
-        &iref(granter),
-        &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
-        &[],
-        until,
-        scope,
-        t,
-    );
+    let p = trust_accepts_payload(&iref(granter), &[], until, scope, t);
     sign_typed(granter, "delegates_to", key, TRUST_PREFIX, &p)
 }
 
@@ -1726,69 +1717,10 @@ async fn trust_body<D: FederationDirectory + ?Sized>(d: &D) {
     );
 }
 
-/// I3176–I3177: the purge door's count over voices against a trust root's
-/// head (handed in: no edition-2 path seats a ROOTED trust root yet).
-async fn purge_quorum_body<D: FederationDirectory + ?Sized>(d: &D) {
-    use crate::federation::canonical_community::counts_voices_over_head;
-    use crate::federation::steward_purge::unauthorised_reason as why;
-    use crate::federation::types::{Community, CommunityMember, SignedCommunity};
-    let (f1, f2, f3, x) = (key(190), key(191), key(192), key(193));
-    register(d, &[&f1, &f2, &f3, &x]).await;
-    let head = SignedCommunity {
-        community: Community {
-            community_key_id: iref(&key(194)),
-            community_name: "t2 root".into(),
-            members: [&f1, &f2, &f3]
-                .iter()
-                .map(|k| CommunityMember {
-                    key_id: iref(k),
-                    joined_at: at(1_000),
-                    role: Some("founder".into()),
-                })
-                .collect(),
-            founded_at: at(1_000),
-            consensus_protocol: "majority".into(),
-            policy_blob: None,
-            prev_head_digest: String::new(),
-            charter_digest: String::new(),
-            persist_row_hash: String::new(),
-        },
-        authority_key_id: String::new(),
-        scrub_signature_classical: String::new(),
-        scrub_signature_pqc: None,
-        supersede_proof: None,
-        cosignatures: vec![],
-        lineage: vec![],
-    };
-    fn set(ks: &[&K]) -> std::collections::BTreeSet<String> {
-        ks.iter().map(|k| iref(k)).collect()
-    }
-    let now = Utc::now();
-    let one = counts_voices_over_head(d, &head, &set(&[&f1]), now)
-        .await
-        .unwrap();
-    assert_eq!(
-        one.map_err(|(r, _)| r),
-        Err(why::QUORUM_NOT_MET),
-        "I3176 one voice of three is short of the root's majority"
-    );
-    let stranger = counts_voices_over_head(d, &head, &set(&[&f1, &x]), now)
-        .await
-        .unwrap();
-    assert_eq!(
-        stranger.map_err(|(r, _)| r),
-        Err(why::NOT_A_SEAT),
-        "I3176 a voice that holds no seat is a refusal, not a discount"
-    );
-    let two = counts_voices_over_head(d, &head, &set(&[&f1, &f2]), now)
-        .await
-        .unwrap();
-    assert_eq!(
-        two.map_err(|(r, _)| r),
-        Ok(set(&[&f1, &f2])),
-        "I3177 two voices of three meet the root's majority"
-    );
-}
+// v62.0.0 (R2-rooms; CC 3.2 T5) — I3176 / I3177 DELETED: they witnessed the
+// purge count over a trust-root ROOM's head (`counts_voices_over_head`),
+// deleted with it; the steward purge counts over the holders of the bundle in
+// force (`steward_purge_invariants` I650).
 
 /// I3179–I3180: an edition-2 purge bundle replicated to a second node.
 async fn purge_replication_body<D: FederationDirectory + ?Sized>(a: &D, b: &D) {
@@ -1920,8 +1852,8 @@ async fn receipt_refused_body<B: FederationDirectory + BlobStorage + Sync>(d: &B
     let st = sign(
         &s,
         &si,
-        DELIVERY_RECEIPT_PREFIX,
-        &delivery_receipt_payload(&si, STREAM, 0, 2, &ROOT, now_ms()),
+        DELIVERY_ACK_PREFIX,
+        &delivery_ack_payload(&si, STREAM, 0, 2, &ROOT, now_ms()),
     );
     let out = put(d, &st).await;
     assert!(
@@ -1938,7 +1870,7 @@ async fn receipt_refused_body<B: FederationDirectory + BlobStorage + Sync>(d: &B
     );
     assert!(kept(d, &st).await, "I3162 kept");
     assert!(
-        d.list_delivery_receipts_for(STREAM, 10)
+        d.list_delivery_acks_for(STREAM, 10)
             .await
             .unwrap()
             .is_empty(),
@@ -1954,15 +1886,15 @@ async fn receipt_lands_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) 
     let st = sign(
         &s,
         &si,
-        DELIVERY_RECEIPT_PREFIX,
-        &delivery_receipt_payload(&si, STREAM, 0, 2, &ROOT, now_ms()),
+        DELIVERY_ACK_PREFIX,
+        &delivery_ack_payload(&si, STREAM, 0, 2, &ROOT, now_ms()),
     );
     let out = put(d, &st).await.unwrap();
     assert!(
         matches!(out, StatementOutcome::Row { new: true, .. }),
         "I3163 {out:?}"
     );
-    let listed = d.list_delivery_receipts_for(STREAM, 10).await.unwrap();
+    let listed = d.list_delivery_acks_for(STREAM, 10).await.unwrap();
     assert_eq!(listed.len(), 1, "I3163");
     assert_eq!(listed[0].chunk_root, ROOT, "I3163");
     assert_eq!(listed[0].subscriber_key_id, si, "I3163");
@@ -2005,10 +1937,7 @@ async fn receipt_lands_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) 
         )
         .await
         .unwrap_or_else(|e| panic!("I2128: verifies as a composite under the key record: {e}"));
-        let stored = d
-            .list_stored_delivery_receipts_for(STREAM, 10)
-            .await
-            .unwrap();
+        let stored = d.list_stored_delivery_acks_for(STREAM, 10).await.unwrap();
         assert_eq!(
             stored[0].receipt.composite_signature, listed[0].composite_signature,
             "I2128: stored as the composite"
@@ -2027,8 +1956,8 @@ async fn receipt_lands_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) 
     let equivocal = sign(
         &s,
         &si,
-        DELIVERY_RECEIPT_PREFIX,
-        &delivery_receipt_payload(&si, STREAM, 0, 2, &ROOT_B, now_ms()),
+        DELIVERY_ACK_PREFIX,
+        &delivery_ack_payload(&si, STREAM, 0, 2, &ROOT_B, now_ms()),
     );
     let out = put(d, &equivocal).await;
     assert!(
@@ -2044,7 +1973,7 @@ async fn receipt_lands_body<B: FederationDirectory + BlobStorage + Sync>(d: &B) 
         "I3164 held, reason receipt_equivocation"
     );
     assert!(kept(d, &equivocal).await, "I3164 kept");
-    let listed = d.list_delivery_receipts_for(STREAM, 10).await.unwrap();
+    let listed = d.list_delivery_acks_for(STREAM, 10).await.unwrap();
     assert_eq!(listed.len(), 1, "I3164 the first receipt stands alone");
     assert_eq!(listed[0].chunk_root, ROOT, "I3164");
 }
@@ -2215,7 +2144,7 @@ async fn i3160_i3161_key_grant_postgres() {
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-async fn i3162_i3164_delivery_receipt_sqlite() {
+async fn i3162_i3164_delivery_ack_sqlite() {
     let b = sqlite().await;
     Box::pin(receipt_refused_body(&b)).await;
     sqlite_publish(&b, 3, ROOT);
@@ -2225,7 +2154,7 @@ async fn i3162_i3164_delivery_receipt_sqlite() {
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
-async fn i3162_i3164_delivery_receipt_postgres() {
+async fn i3162_i3164_delivery_ack_postgres() {
     let Some(b) = postgres().await else {
         return;
     };
@@ -2263,21 +2192,6 @@ async fn i3172_i3175_trust_postgres() {
         return;
     };
     Box::pin(trust_body(&b)).await;
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn i3176_i3177_purge_quorum_sqlite() {
-    Box::pin(purge_quorum_body(&sqlite().await)).await;
-}
-
-#[cfg(feature = "postgres")]
-#[tokio::test]
-async fn i3176_i3177_purge_quorum_postgres() {
-    let Some(b) = postgres().await else {
-        return;
-    };
-    Box::pin(purge_quorum_body(&b)).await;
 }
 
 #[cfg(feature = "sqlite")]

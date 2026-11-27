@@ -13,7 +13,7 @@
 //! | a `takedown_notice:{basis}:v1` scores row | [`takedown_statement`] |
 //! | `custody_ack_envelope` + an emitted `custody:ack:v1` row | [`custody_statement`] |
 //! | `KeyGrantRow::emit_input` | [`key_grant_statement`] |
-//! | a `DeliveryReceipt` literal (`put_delivery_receipt`) | [`delivery_receipt_statement`] |
+//! | a `DeliveryAck` literal (`put_delivery_ack`) | [`delivery_ack_statement`] |
 //! | a `cosign:{pending,signature}:v1` row | [`cosign_statement`] (kept beside the event only) |
 
 use ciris_verify_core::cde::Value;
@@ -23,9 +23,9 @@ use ciris_verify_core::namespace_match;
 use super::fixture_switch::{kid_or_keep, signing_key};
 use super::names::RowId;
 use super::typed::{
-    cosign_payload, custody_payload, delivery_receipt_payload, key_grant_payload,
+    cosign_payload, custody_payload, delivery_ack_payload, key_grant_payload,
     occurrence_revocation_payload, revocation_payload, takedown_payload, trust_accepts_payload,
-    withdraws_payload, NoticeText, COSIGN_PREFIX, CUSTODY_PREFIX, DELIVERY_RECEIPT_PREFIX,
+    withdraws_payload, NoticeText, COSIGN_PREFIX, CUSTODY_PREFIX, DELIVERY_ACK_PREFIX,
     KEY_GRANT_PREFIX, OCCURRENCE_REVOCATION_PREFIX, REVOCATION_PREFIX, TAKEDOWN_PREFIX,
     TRUST_PREFIX,
 };
@@ -363,7 +363,7 @@ pub fn key_grant_statement(signer: &str, row: &KeyGrantRow, asserted_at_ms: u64)
 /// A `delivery_receipt:{stream_id}:v1` statement by `subscriber` (the
 /// row's `sub`).
 #[must_use]
-pub fn delivery_receipt_statement(
+pub fn delivery_ack_statement(
     subscriber: &str,
     stream_id: &str,
     epoch: u64,
@@ -371,7 +371,7 @@ pub fn delivery_receipt_statement(
     chunk_root: &[u8; 32],
     asserted_at_ms: u64,
 ) -> Vec<u8> {
-    let p = delivery_receipt_payload(
+    let p = delivery_ack_payload(
         &kid_or_keep(subscriber),
         stream_id,
         epoch,
@@ -379,7 +379,7 @@ pub fn delivery_receipt_statement(
         chunk_root,
         asserted_at_ms,
     );
-    typed_statement(subscriber, None, subscriber, DELIVERY_RECEIPT_PREFIX, &p)
+    typed_statement(subscriber, None, subscriber, DELIVERY_ACK_PREFIX, &p)
 }
 
 /// A `cosign:{state}:v1` statement by `signer` naming the held event
@@ -449,7 +449,6 @@ pub fn trust_accepts_statement(
     let classes: Vec<String> = classes.iter().map(|c| (*c).to_owned()).collect();
     let p = trust_accepts_payload(
         &kid_or_keep(granter),
-        &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
         &classes,
         valid_until.map(ms),
         cohort_scope,
@@ -498,7 +497,6 @@ pub async fn trust_accepts_edge<D: crate::federation::FederationDirectory + ?Siz
     let classes: Vec<String> = classes.iter().map(|c| (*c).to_owned()).collect();
     let p = trust_accepts_payload(
         &kid_or_keep(granter),
-        &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
         &classes,
         valid_until.map(ms),
         cohort_scope,

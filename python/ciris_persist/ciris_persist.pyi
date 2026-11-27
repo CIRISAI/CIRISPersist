@@ -1319,7 +1319,7 @@ class Engine:
     def promote_adopted_manifest_to_dag_json(self, at_rest_sha256_hex: str, viewer_key_id: str, disposition: str, caller_aad_b64: str | None = None) -> str:
         """(derived) deontic — v51.3.0 (CIRISPersist#947) — finish a sealed DAG adopt. adopt_sealed_blob_json stores a received sealed manifest as an inline envelope; until this..."""
 
-    def publish_self_occurrence(self, identity_key_id: str, device_class: str, valid_until_iso: str | None = None) -> str:
+    def publish_self_occurrence(self, identity_key_id: str, device_class: str, valid_until_iso: str | None = None, author_kid_hex: str | None = None) -> str:
         """(derived) deontic — CIRISPersist#851 (BLOB_REPLICATION.md §20.3) — publish this node's own content-only occurrence under identity_key_id (its owner), signed with the L..."""
 
     def purge_finalize_json(self, notice_id: str) -> str:
@@ -1896,7 +1896,7 @@ class Engine:
     def submit_voice(self, statement_hex: str) -> str:
         """(derived) deontic — v62.0.0 (v62 P8-fix5) — submit a second signer's voice signed elsewhere (statement_hex: the assembled COSE_Sign1, lowercase hex) through the statem..."""
 
-    def voice_draft(self, row_id: str, signer_iss: str) -> str:
+    def voice_draft(self, row_id: str, signer_iss: str, signer_kid: str | None = None) -> str:
         """(derived) procedural — v62.0.0 (v62 P8-fix5) — a held row's voice, drafted for a hardware or remote second signer (signer_iss, its identity-ref): JSON {protected, payload..."""
 
     def voice_held_row(self, row_id: str) -> str:
@@ -2146,7 +2146,7 @@ class Engine:
     def ledger_record_fork_evidence(self, evidence_json: str) -> str:
         """(derived) testimonial — CC 3.3.10.1 L8 — record a proven fork (JSON ForkEvidence) for the adjudication plane. Returns the content-derived evidence_id (idempotent: one fork... [build-conditional: #[cfg(feature = "ledgers")]]"""
 
-    def list_delivery_receipts_for(self, stream_id: str, limit: int) -> str:
+    def list_delivery_acks_for(self, stream_id: str, limit: int) -> str:
         """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C4) — list stored delivery receipts for stream_id, ascending (k, subscriber_key_id), bounded by limit. Returns a JSON a..."""
 
     def list_witness_equivocations_json(self, peer_id: str) -> str:
@@ -2197,8 +2197,8 @@ class Engine:
     def put_custody_ack(self, at_rest_sha256_hex: str, state: str, cohort_scope: str | None = None, cohort_target: str | None = None, aad_b64: str | None = None) -> str:
         """(derived) testimonial — v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — this node's custody report for one blob: state is "here" or "none". here needs the bytes on this no..."""
 
-    def put_delivery_receipt(self, receipt_json: str) -> None:
-        """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C4, CEG §10.5.4) — store a subscriber delivery receipt (receipt_json is a serialized DeliveryReceipt). Runs the JOIN-ag..."""
+    def put_delivery_ack(self, receipt_json: str) -> None:
+        """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C4, CEG §10.5.4) — store a subscriber delivery receipt (receipt_json is a serialized DeliveryAck). Runs the JOIN-ag..."""
 
     def put_stream_sth(self, sth_json: str, producer_key_id: str) -> None:
         """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C1b) — store a producer-signed Signed Tree Head for a stream's transparency log (CEG §10.5.1)."""
@@ -3364,10 +3364,10 @@ class Engine:
         """(derived) empirical — #135 + part of #150 — list every attestation whose subject is target_key_id (attested_key_id = target_key_id), newest-first, cursor-paged. Scope is..."""
 
     def list_attestations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
-        """(derived) empirical — v21.1.0 (CIRISPersist#507c) — bulk-list Attestation rows since a cursor, as a JSON array, federation tier only (the E5 invariant — a local-tier row..."""
+        """(derived) empirical — HELD READ (v62.0.0 BIND-5): returns what this node HOLDS, including rows no third party may receive; filter per recipient with may_receive before sending anything. v21.1.0 (CIRISPersist#507c) — bulk-list Attestation rows since a cursor, as a JSON array, federation tier only (the E5 invariant — a local-tier row..."""
 
     def list_attestations_since_by_prefixes(self, since_rfc3339: str | None, since_id: str | None, family_prefixes: list[str], limit: int) -> str:
-        """(derived) empirical — v61.1.0 (CIRISPersist#1190) — list_attestations_since narrowed by family: the federation-tier rows whose family (row_type::claim_token: a scores ro..."""
+        """(derived) empirical — HELD READ (v62.0.0 BIND-5): returns what this node HOLDS, including rows no third party may receive; filter per recipient with may_receive before sending anything. v61.1.0 (CIRISPersist#1190) — list_attestations_since narrowed by family: the federation-tier rows whose family (row_type::claim_token: a scores ro..."""
 
     def list_canonical_servers(self) -> str:
         """(derived) empirical — v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the canonical / founding bootstrap servers as a JSON array of KeyRecords (federation_keys rows w..."""
@@ -4063,7 +4063,7 @@ class Engine:
     def claim_pending_outbound(self, batch_size: int, claim_duration_seconds: int, claimed_by: str) -> list[Any]:
         """(derived) procedural — v0.4.0 — Atomic claim of up to batch_size pending rows. Returns a list of dicts (one per claimed row)."""
 
-    def detection_draft(self, event_json: str, subject: str | None = None) -> str:
+    def detection_draft(self, event_json: str, subject: str | None = None, signer_kid: str | None = None) -> str:
         """(derived) procedural — v62.0.0 (v62 P8-fix10; CC 3.4.8) — a detection drafted for its detector's pen (Lens, an external detector): the detection:{detector} statement's pa..."""
 
     def enqueue_outbound(self, sender_key_id: str, destination_key_id: str, message_type: str, edge_schema_version: str, envelope_bytes: bytes, body_sha256: bytes, body_size_bytes: int, requires_ack: bool, max_attempts: int, ttl_seconds: int, initial_next_attempt_after_rfc3339: str, ack_timeout_seconds: int | None = None) -> str:

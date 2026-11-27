@@ -146,10 +146,19 @@ fn statement_with(
     iss: &str,
     edit: impl FnOnce(&mut Vec<(Value, Value)>),
 ) -> Vec<u8> {
-    let Value::Map(mut members) =
+    let Value::Map(members) =
         trace_row_payload(&parsed(blob), blob, iss).expect("trace row payload")
     else {
         panic!("trace_row_payload builds a map")
+    };
+    // v62.0.0 (HEAD-fix1) — an owned agent's trace names its owner binding
+    // (`trace_anchor::agent_trace_head`); before the edit, so a test's edit
+    // still sees the row as the producer states it.
+    let Value::Map(mut members) =
+        crate::ingest::trace_anchor::with_agent_trace_head(iss, Value::Map(members))
+            .expect("the trace row head")
+    else {
+        panic!("a headed payload is a map")
     };
     edit(&mut members);
     ciris_verify_core::edition2::sign_row_statement(
@@ -171,6 +180,7 @@ fn statement(blob: &[u8], seed: &str) -> Vec<u8> {
 /// The row id Verify computes for `blob`'s row signed as `iss`.
 fn row_id_hex(blob: &[u8], iss: &str) -> String {
     let payload = trace_row_payload(&parsed(blob), blob, iss).unwrap();
+    let payload = crate::ingest::trace_anchor::with_agent_trace_head(iss, payload).unwrap();
     hex::encode(ciris_verify_core::edition2::row_id(
         TRACE_ROW_TYPE,
         TRACE_FAMILY_ID,
@@ -293,7 +303,7 @@ where
     D: Backend + FederationDirectory + BlobStorage,
 {
     let a = unique("agent");
-    let kid_a = e2::put_key(d, &a, &["agent"]).await;
+    let kid_a = crate::ingest::trace_anchor::put_agent_trace_key(d, &a).await;
 
     let blob = blob_of(&raw_trace(recently()));
     let st = statement(&blob, &a);
@@ -374,8 +384,8 @@ where
 {
     let a = unique("agent-a");
     let b = unique("agent-b");
-    let kid_a = e2::put_key(d, &a, &["agent"]).await;
-    let kid_b = e2::put_key(d, &b, &["agent"]).await;
+    let kid_a = crate::ingest::trace_anchor::put_agent_trace_key(d, &a).await;
+    let kid_b = crate::ingest::trace_anchor::put_agent_trace_key(d, &b).await;
 
     // I3474 — B's key signs a row whose iss is A.
     let blob = blob_of(&raw_trace(recently()));
@@ -468,7 +478,7 @@ where
         &kid_a,
         &kid_a,
         "scores",
-        "evidence:.suite:.kind:.cell:.prefix",
+        "coherence_standing:.cohort",
         &Value::Map(vec![(
             Value::Text("asserted_at".into()),
             Value::Uint(u64::try_from(recently().timestamp_millis()).unwrap()),
@@ -503,7 +513,7 @@ where
     D: Backend + FederationDirectory + BlobStorage,
 {
     let a = unique("agent-local");
-    let kid_a = e2::put_key(d, &a, &["agent"]).await;
+    let kid_a = crate::ingest::trace_anchor::put_agent_trace_key(d, &a).await;
     let mut raw = raw_trace(recently());
     raw["signature_key_id"] = serde_json::json!(kid_a.clone());
     let trace_id = raw["trace_id"].as_str().unwrap().to_owned();
@@ -576,7 +586,7 @@ where
 {
     const SECRET: &str = "alice.p7@example.com";
     let a = unique("agent-seal");
-    let kid_a = e2::put_key(d, &a, &["agent"]).await;
+    let kid_a = crate::ingest::trace_anchor::put_agent_trace_key(d, &a).await;
     let mut raw = raw_trace(recently());
     raw["trace_level"] = serde_json::json!("detailed");
     raw["components"][0]["data"]["task_description"] =
@@ -690,8 +700,8 @@ where
 {
     let agent = unique("agent-repl");
     let holder = unique("holder");
-    let kid = e2::put_key(a_node, &agent, &["agent"]).await;
-    e2::put_key(b_node, &agent, &["agent"]).await;
+    let kid = crate::ingest::trace_anchor::put_agent_trace_key(a_node, &agent).await;
+    crate::ingest::trace_anchor::put_agent_trace_key(b_node, &agent).await;
     e2::put_key(b_node, &holder, &["user"]).await;
 
     for blob_first in [false, true] {
@@ -1045,10 +1055,12 @@ pub(crate) mod engine_level {
         .await;
         assert!(!sets.is_empty(), "I3488: A emitted B's content grant");
         for set in sets {
-            engine_b
-                .apply_replicated_key_grant(set)
-                .await
-                .expect("I3488: B admits A's grant");
+            crate::federation::key_grant_invariants::two_node::deliver_key_grant_row(
+                &*engine_b.federation_directory(),
+                &set,
+            )
+            .await
+            .expect("I3488: B admits A's grant");
         }
         assert!(
             crate::federation::edition2::fold::why_held(
@@ -1112,7 +1124,7 @@ fn i3482_the_crossing_gate() {
         refuse_unsigned_trace_crossing(&with_statement).is_ok(),
         "I3482: a row carrying its statement is not this gate's"
     );
-    let other = row(serde_json::json!({ "dimension": "evidence:safety_battery:capture:a:b:v1" }));
+    let other = row(serde_json::json!({ "dimension": "coherence_standing:cab:v1" }));
     assert!(
         refuse_unsigned_trace_crossing(&other).is_ok(),
         "I3482: other rows pass"
@@ -1317,7 +1329,7 @@ where
     D: Backend + FederationDirectory + BlobStorage,
 {
     let agent = unique("kind-agent");
-    let kid_agent = e2::put_key(d, &agent, &["agent"]).await;
+    let kid_agent = crate::ingest::trace_anchor::put_agent_trace_key(d, &agent).await;
     let blob = blob_of(&raw_trace(recently()));
     let st = statement(&blob, &agent);
     assert_eq!(

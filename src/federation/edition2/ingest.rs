@@ -53,16 +53,6 @@ pub const STATEMENT_MEMBER: &str = "ceg_statement";
 /// The envelope member the earlier gates read a composer's target from.
 pub const REFERENCES_MEMBER: &str = "references_attestation_id";
 
-/// The composer row types (CC 2.4.1.1): each names its target by
-/// `refs.target` and carries the target's family.
-///
-/// v62.0.0 (PIN-fix3) — NAMING: since the Constitution's 2026-11-21 ruling
-/// this list means "the rows that name a `refs.target`", NOT Verify's
-/// composers (`withdraws` / `recants`, the rows that carry no dimension:
-/// `emit::carries_no_dimension`); it decides no dimension. Its copy is
-/// `payloads::COMPOSER_ROW_TYPES`.
-pub const COMPOSER_ROW_TYPES: [&str; 3] = ["withdraws", "recants", "supersedes"];
-
 /// v62.0.0 (JSON-cut slice A, I2105) — **a composer's target.** A
 /// `withdraws` / `recants` / `supersedes` row names its target by
 /// `refs.target`. The target must be held (else the retryable
@@ -73,8 +63,8 @@ pub const COMPOSER_ROW_TYPES: [&str; 3] = ["withdraws", "recants", "supersedes"]
 ///
 /// v62.0.0 (PIN-fix9d; the lead's ruling of 2026-11-21 on I1846) — a
 /// `supersedes` replaces a row that has LANDED: its target must be
-/// CONCLUDED here (held, and not held back by the fold: `fold_held` is
-/// `None`), else it WAITS on the target (`link_unheld`, `Dep::Row(target)`)
+/// CONCLUDED here ([`super::verdict::row_state`]; VD-step1: not merely
+/// "no fold hold recorded"), else it WAITS on the target (`link_unheld`, `Dep::Row(target)`)
 /// and is re-judged when the target concludes. Its family is then checked
 /// against that concluded row. A retraction (`withdraws` / `recants`) of a
 /// held row that has not concluded is not changed here: a signer may take
@@ -86,7 +76,7 @@ pub async fn check_composer_target<F>(dir: &F, row: &AdmittedRow) -> Result<(), 
 where
     F: FederationDirectory + ?Sized,
 {
-    if !COMPOSER_ROW_TYPES.contains(&row.row_type.as_str()) {
+    if !super::emit::names_a_target(&row.row_type) {
         return Ok(());
     }
     let Some(target) = super::names::single(&row.names, "target") else {
@@ -119,7 +109,13 @@ where
     };
     // PIN-fix9d — a replacement of a row that has not concluded has nothing
     // to replace yet: it waits on the target, as for an unheld one.
-    if !super::emit::carries_no_dimension(&row.row_type) && dir.fold_held(&target).await?.is_some()
+    // VD-step1 — "concluded" is the one verdict's (`verdict::row_state`),
+    // never "no fold hold": a target kept as a lone voice, or with its hold
+    // cleared by a `Voice` re-run, has no hold and has not concluded.
+    if !super::emit::carries_no_dimension(&row.row_type)
+        && !super::verdict::row_state(dir, &target)
+            .await?
+            .is_concluded()
     {
         return Err(unheld());
     }
@@ -146,12 +142,19 @@ where
 }
 
 /// The payload's instant members (CC 2.6.2), projected as RFC 3339 text.
+///
+/// v62.0.0 (BIND-1; CC rc22 rule `owner-binding`: `delegation_valid_from` /
+/// `delegation_valid_until` are ms-time) — a delegation's term members are
+/// instants too: the payload states them as POSIX ms, the projection as the
+/// RFC 3339 text the term readers parse. APPENDED.
 pub const INSTANT_MEMBERS: &[&str] = &[
     "asserted_at",
     "valid_from",
     "valid_until",
     "expires_at",
     "revoked_after",
+    "delegation_valid_from",
+    "delegation_valid_until",
 ];
 
 /// The payload's fixed-scale members (CC 2.6.1.5), projected as reals.
@@ -196,6 +199,59 @@ where
             Ok(held.with_occurrences(seats))
         }
         None => Ok(HeldKeys::new()),
+    }
+}
+
+/// v62.0.0 (HEAD-4.rev3) — a key's roles (`identity_type`) as its key
+/// record states them ([`machine_kind_at`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyRoles(pub Vec<String>);
+
+impl KeyRoles {
+    /// Does the record hold `role`?
+    #[must_use]
+    pub fn holds(&self, role: &str) -> bool {
+        self.0.iter().any(|r| r == role)
+    }
+
+    /// Is it a machine's key (`node` or `agent`)?
+    #[must_use]
+    pub fn is_machine(&self) -> bool {
+        self.holds(crate::federation::types::identity_type::NODE)
+            || self.holds(crate::federation::types::identity_type::AGENT)
+    }
+}
+
+/// v62.0.0 (HEAD-4.rev3) — **THE read of a key's kind from its key
+/// record**, one helper for the head rule's door (the SIGNER, at the row's
+/// own instant: its live edition-2 record, the one the door verified the
+/// statement against) and the withdrawal door's subject resolution
+/// (`admission::resolve_subjects`: a SUBJECT, `at_ms = None`, any held
+/// record of the key). `None`: no record is held (live at `at_ms`, when
+/// given), and the caller waits or reads the key as unresolved.
+///
+/// # Errors
+/// Directory reads.
+pub async fn machine_kind_at<F>(
+    dir: &F,
+    kid: &Digest32,
+    at_ms: Option<u64>,
+) -> Result<Option<KeyRoles>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    match at_ms {
+        Some(at) => {
+            let keys = held_keys_for_kid(dir, kid).await?;
+            Ok(match keys.liveness(kid, at) {
+                Liveness::Live(r) => Some(KeyRoles(r.identity_type.clone())),
+                _ => None,
+            })
+        }
+        None => Ok(dir
+            .lookup_public_key(&identity_ref(kid))
+            .await?
+            .map(|k| KeyRoles(super::head_rule::identity_types_of(&k.identity_type)))),
     }
 }
 
@@ -1001,9 +1057,22 @@ pub fn put_admitted_row<'a, F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    Box::pin(put_admitted_row_body(
-        dir, admitted, tier, replicated, origin,
-    ))
+    Box::pin(async move {
+        let out = put_admitted_row_body(dir, admitted, tier, replicated, origin).await?;
+        // v62.0.0 (WD-fix3 rev 2; CC 6.1.5 N5) — THE descent step, in the
+        // admission itself and before the door returns: every row admission
+        // and every re-conclusion passes here, whichever door took it and
+        // whichever of a withdrawal and its target arrived first
+        // (`withdrawn_content::descend_at_admission`).
+        if let StatementOutcome::Row { row_id, .. } = &out {
+            Box::pin(crate::federation::withdrawn_content::descend_at_admission(
+                dir,
+                &row_id.hex(),
+            ))
+            .await;
+        }
+        Ok(out)
+    })
 }
 
 /// [`put_admitted_row`]'s body.
@@ -1023,6 +1092,16 @@ where
     // replicated door runs the replicated door's gates (T1), at the tier it
     // first arrived at.
     let state = dir.fold_state(&admitted.row_id).await?;
+    // v62.0.0 (HEAD-2, moved here by HEAD-4.rev2; CC 2.4.1.1) — THE funnel
+    // every statement door and every fold re-conclusion passes: a row this
+    // node holds no fold state for (its first arrival, whichever door) is
+    // judged by the head rule from the row alone (`act_names_no_head`) and
+    // an end by its head (`end_names_old_head`). A re-fold or a further voice
+    // of a held row is not re-judged.
+    if state.is_none() {
+        super::head_rule::require_head_named(dir, admitted).await?;
+        super::head_rule::require_end_head_current(dir, admitted).await?;
+    }
     let (tier, replicated): (String, bool) = match &state {
         Some(s) => (s.tier.clone(), s.replicated),
         None => (tier.to_owned(), replicated),
@@ -1031,9 +1110,25 @@ where
     // G0-fix6 — a row already CONCLUDED on a FINAL plane never un-concludes,
     // on ANY path (a re-offered voice, a re-run): a hold its re-run marks is
     // not recorded, and the row stays concluded (CC 2.7.5).
-    let concluded_final = state
-        .as_ref()
-        .is_some_and(|s| s.held.is_none() && super::fold::plane_for(&s.plane).is_final());
+    //
+    // VD-step1 — "concluded" is the one verdict's: a fold state with no hold
+    // is not a conclusion (fix3 below CLEARS a hold when a re-run answers
+    // `Voice`, e.g. a device's lone occurrence voice on the FINAL occurrence
+    // plane; that row has concluded nothing and must still be held when a
+    // later re-run marks a hold). The re-bind plane keeps its STORED state
+    // here: the fold's own callers act on it (`fold::why_held_listed`).
+    let concluded_final = match state.as_ref() {
+        Some(s) if super::fold::plane_for(&s.plane).is_final() => {
+            if s.plane == plane::REBIND {
+                !was_held
+            } else {
+                super::verdict::row_state(dir, &admitted.row_id)
+                    .await?
+                    .is_concluded()
+            }
+        }
+        _ => false,
+    };
     let (plane_name, slot) = fold_plane_of(admitted);
     let arrival = Arrival {
         row_id: admitted.row_id,
@@ -1145,7 +1240,22 @@ where
                 }
             }
             (Err(e), Some((r, detail))) => {
+                // v62.0.0 (HOLD-1a; CC 2.7.3 as ruled 11-23) — a NEW write-scope
+                // hold of a row that only adds is kept only inside this node's
+                // own bound; over it the row is declined, never Invalid
+                // (`hold_bound::admit`).
+                let bound = if was_held {
+                    None
+                } else {
+                    Box::pin(super::hold_bound::admit(dir, admitted, &r, &e)).await?
+                };
                 let new = dir.put_edition2_statement(admitted).await?;
+                if let (Some(entry), true) = (&bound, new) {
+                    match dir.edition2_held_bound_put(entry).await {
+                        Ok(()) | Err(Error::Unsupported { .. }) => {}
+                        Err(x) => return Err(x),
+                    }
+                }
                 let detail = if detail.is_empty() {
                     e.to_string()
                 } else {
@@ -1165,7 +1275,26 @@ where
                     new,
                 }
             }
-            (Err(e), None) => return Err(e),
+            // v62.0.0 (KR-fix20; CC 2.4.1.1 rule 0) — a HELD row (a
+            // withdrawal that waited `link_unheld` for its target) now refused
+            // by a refusal no later row changes (`fold::never_retracts`: the
+            // target arrived and is never withdrawn, or is a counted row this
+            // is no count of) is DROPPED: its statements, names and fold
+            // record are deleted, so it ends as the door ends it when the
+            // target is held first: refused, nothing kept. The refusal is
+            // returned (the re-fold reports the row dropped).
+            (Err(e), None) => {
+                if was_held && super::fold::never_retracts(&e) {
+                    let dropped = dir.drop_held_row(&admitted.row_id).await?;
+                    tracing::debug!(
+                        row_id = %admitted.row_id.hex(),
+                        statements = dropped,
+                        error = %e,
+                        "edition-2 held row dropped: refused for good when its target arrived"
+                    );
+                }
+                return Err(e);
+            }
         };
         // The key plane's read model skips held-back statements
         // (`held_keys_for_kid`): re-derive it once the fold state of a key
@@ -1176,6 +1305,17 @@ where
                 super::projection::project_key(dir, &kid).await?;
             }
         }
+        // v62.0.0 (HOLD-1a) — a held row that now concludes leaves the bound
+        // ledger.
+        if was_held && !matches!(out, StatementOutcome::Pending { .. }) {
+            match dir.edition2_held_bound_remove(&admitted.row_id).await {
+                Ok(()) | Err(Error::Unsupported { .. }) => {}
+                Err(x) => return Err(x),
+            }
+        }
+        // v62.0.0 (CONTENT-A6; CC rc22 3.1.3.2) — the cache of the room
+        // content answers for the (member, room)s this statement bears on.
+        Box::pin(super::content_cache::refresh_after(dir, admitted)).await?;
         Ok(out)
     })
     .await
@@ -1238,7 +1378,7 @@ pub fn fold_plane_of(admitted: &AdmittedRow) -> (&'static str, String) {
             TypedPlane::OccurrenceRevocation
             | TypedPlane::Cosign
             | TypedPlane::Revocation
-            | TypedPlane::DeliveryReceipt,
+            | TypedPlane::DeliveryAck,
         ) => (plane::TYPED_FINAL, own()),
         Route::Rebind => (plane::REBIND, format!("rebind:{}", admitted.sub)),
         Route::Key => match key_statement_about(admitted) {
@@ -1361,6 +1501,15 @@ pub fn route_of(admitted: &AdmittedRow) -> Route {
         return Route::Group(plane);
     }
     if admitted.family == super::occurrence::OCCURRENCE_FAMILY {
+        return Route::Occurrence;
+    }
+    // v62.0.0 (KR-fix20b; CC 3.3.6.4, as ruled 2026-11-22) — a retraction of
+    // an eviction is judged by the self-roster proposal door
+    // (`occurrence::withdraw_proposal`): it names an open eviction PROPOSAL
+    // (its proposer's to withdraw) or a landed revocation (never withdrawn).
+    if admitted.family == super::occurrence::OCCURRENCE_REVOCATION_FAMILY
+        && super::emit::carries_no_dimension(&admitted.row_type)
+    {
         return Route::Occurrence;
     }
     if super::typed::is_trust_family(&admitted.family) {
@@ -1587,6 +1736,21 @@ where
                 reason: AttestationRefusalReason::StoreConflict,
             })
         }
+        // v62.0.0 (HOLD-1a) — this node's own bound declined the row: a
+        // local decline, the cursor advances, never Invalid.
+        //
+        // v62.0.0 (HEAD-fix8) — a row that names no head is not kept here:
+        // its own local decline (not retryable), the cursor advances, nothing
+        // is raised to the sender.
+        Err(Error::NotKept {
+            why: crate::federation::NotKeptWhy::NamesNoHead,
+            ..
+        }) => Ok(ReplicatedStatementOutcome::Refused {
+            reason: AttestationRefusalReason::NamesNoHead,
+        }),
+        Err(Error::NotKept { .. }) => Ok(ReplicatedStatementOutcome::Refused {
+            reason: AttestationRefusalReason::NotKept,
+        }),
         Err(e) => Err(e),
     }
 }

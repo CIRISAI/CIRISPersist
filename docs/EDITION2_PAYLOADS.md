@@ -69,7 +69,7 @@ The tables below are rendered from `ciris_persist::federation::edition2::payload
 | member | CBOR type | presence | maps from |
 |---|---|---|---|
 | `group_kind` | `tstr` | required | the record's kind: "family" \| "community" |
-| `group` | `identity-ref` | required | Family.family_key_id / Community.community_key_id (equals sub) |
+| `group` | `group-ref` | required | Family.family_key_id / Community.community_key_id (equals sub; GID-prod: derived from the founding, a group-ref) |
 | `name` | `tstr` | required | Family.family_name / Community.community_name |
 | `version` | `uint` | required | federation_group_versions.version (a consistency check only) |
 | `members` | `[* roster-member]` | required | Family.members / Community.members (a set) |
@@ -81,6 +81,7 @@ The tables below are rendered from `ciris_persist::federation::edition2::payload
 | `cohort_subkind` | `tstr` | optional | a community's discriminator (CC 3.2; earlier: policy_blob.cohort_subkind) |
 | `cohort_subkind_payload` | `map` | optional | a community's Option<SubkindPayload> (CC 3.2) |
 | `membership` | `tstr` | optional | a community's founding row: "private" \| "public" (CC 3.1.3.2; absent reads public) |
+| `nonce` | `bstr` | optional | GID-prod: 32 fresh bytes, on the FIRST version only (the group id's derivation input; group_id::check_group_roster_founding) |
 | `refs.head` | `row-ref` | optional | prev_head_digest: the version this one extends (CC 3.2 T6); absent on version 1, present on every later one |
 | `refs.also.cites` | `row-ref` | optional | charter_digest: the trust:charter row in force; and, for a geographic community (rc21, CC 3.2), each NEW member's location_proof:v1 row. A reader places each cited row by its family |
 
@@ -108,7 +109,7 @@ Rules beyond the list (refused `edition2_payload_invalid`):
 | member | CBOR type | presence | maps from |
 |---|---|---|---|
 | `group_kind` | `tstr` | required | "family" \| "community" (which struct) |
-| `group` | `identity-ref` | required | family_key_id / community_key_id |
+| `group` | `group-ref` | required | family_key_id / community_key_id (GID-prod: a group-ref) |
 | `member` | `identity-ref` | required | removal: removed_identity_key_id; widening: member_key_id (equals sub) |
 | `removed_at` | `uint (ms)` | required when `dimension` is `removal` | MembershipRevocation.removed_at |
 | `joined_at` | `uint (ms)` | required when `dimension` is `widening` | MembershipWidening.joined_at |
@@ -227,7 +228,7 @@ Members of its own: none.
 | member | CBOR type | presence | maps from |
 |---|---|---|---|
 | `legal_basis` | `tstr` | required | legal_basis (CC 3.3.2's closed set; equals the {basis} leaf) |
-| `claimant` | `identity-ref` | required | claimant_key_id |
+| `claimant` | `identity-ref` | optional | claimant_key_id (iff the notice is authored) |
 | `content_sha256` | `hash-digest [-16, bstr .size 32]` | required | content_sha256 (the selection digest) |
 | `content_holders` | `[* identity-ref]` | required | content_holder_key_ids |
 | `claim_text` | `tstr` | required | claim_text |
@@ -282,11 +283,11 @@ Co-signatures now counted voices: none (the author's statement alone).
 | `axis` | `tstr` | required | axis: "epoch" \| "content" \| "stream" (also the {axis} leaf) |
 | `wrap_algorithm` | `tstr` | required | GrantWrap.wrap_algorithm (the v2 wire string only) |
 | `wrapped_dek` | `bstr` | required | GrantWrap.wrapped_dek |
-| `community` | `identity-ref` | required when `axis` is `epoch` | community_key_id |
+| `community` | `group-ref` | required when `axis` is `epoch` | community_key_id (GID-prod: a group-ref) |
 | `minter` | `identity-ref` | required when `axis` is `epoch` | minter_key_id |
 | `epoch` | `uint` | required when `axis` is `epoch` or `stream` | epoch |
 | `at_rest_sha256` | `hash-digest [-16, bstr .size 32]` | required when `axis` is `content` | at_rest_sha256 |
-| `owner` | `identity-ref` | required when `axis` is `content` or `stream` | owner_key_id (the axis identity, CC 3.3.2) |
+| `owner` | `identity-ref / group-ref` | required when `axis` is `content` or `stream` | owner_key_id (the axis identity, CC 3.3.2; GID-fix2: a family's or community's group-ref) |
 | `stream_id` | `tstr` | required when `axis` is `stream` | stream_id |
 
 Rules beyond the list (refused `edition2_payload_invalid`):
@@ -297,7 +298,7 @@ Co-signatures now counted voices: none (the author's statement alone).
 
 ### `delivery_receipt:{stream_id}`
 
-- **Replaces:** DeliveryReceipt
+- **Replaces:** DeliveryAck
 - **Authorship:** authored
 - **`sub`:** the subscriber's identity-ref (subscriber_key_id; equals iss)
 - **Lands in:** federation_stream_delivery_receipts
@@ -316,7 +317,7 @@ Co-signatures now counted voices: none (the author's statement alone).
 ### `admission:unit`
 
 - **Replaces:** nothing: new in rc21 (CC 2.7.11, the code scope of kernel admission; wire admission:unit:v1, row type scores)
-- **Authorship:** counted where refs.head is present (act = group), authored otherwise; one person's (authored) row naming an effect is at cohort_scope self and admits only on a host that person owns; every signer a person (identity_type holds user or accord_holder); no delegate role
+- **Authorship:** counted where the payload carries no author (act = group; it names its roster head in refs.head), authored otherwise (naming no head); one person's (authored) row naming an effect is at cohort_scope self and admits only on a host that person owns; every signer a person (identity_type holds user or accord_holder); no delegate role
 - **`sub`:** the unit digest as tagged text, canonical:sha256:{hex} (not an identity-ref)
 - **Lands in:** ceg_statements + federation_attestations (the mapped scores row), held count_short until a counted row's count is met; no typed plane: the host's answer (admission_unit_runnable) reads the conclusion, the lease, the withdrawal, the standing and the receipt
 

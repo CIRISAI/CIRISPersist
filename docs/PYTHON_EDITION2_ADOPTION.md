@@ -10,7 +10,7 @@ The witnesses are `tests/python/test_edition2_surface.py` (I2510–I2515).
   - `put_public_key`, `register_federation_key`, `rebind_key_record`, `apply_replicated_key_record`;
   - `put_revocation`, `deregister_federation_key`;
   - `put_attestation`, `apply_replicated_attestation`, `apply_replicated_key_grant`, `apply_replicated_accord_evidence`;
-  - `put_delivery_receipt`, `put_identity_occurrence_json`, `put_wholeness_witness_json`, `put_family_json`, `put_community_json`, `put_lineage_head_cosign_json`;
+  - `put_delivery_ack`, `put_identity_occurrence_json`, `put_wholeness_witness_json`, `put_family_json`, `put_community_json`, `put_lineage_head_cosign_json`;
   - `put_accord_proposal_json`, `put_accord_participation_json`, `put_accord_decision_json`;
   - `bake_assembled_genesis`, `install_genesis_bundle_roster_json`, `pin_trust_from_bundle_response_json`;
   - `apply_replicated_purge_json`, `purge_rows_json`, `federation_grant_trust`, `federation_revoke_trust`.

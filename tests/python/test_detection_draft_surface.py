@@ -14,7 +14,9 @@ the three steps:
 Standing is the conferral plane's (``infra:detect`` from a root this node
 trusts, CC 3.4.8), never the key's type. This file witnesses the path end to
 end on a node WITHOUT the conferral: the row is held, by reason
-(``reserved_prefix_emitter_mismatch``), read through ``voice_status``.
+(``reserved_family_unseated``, CC 3.4.7's token for ``detection:*``; v62.0.0
+D4, it was ``reserved_prefix_emitter_mismatch``), read through
+``voice_status``.
 
 The conferred leg (the row LANDS and projects) is witnessed in Rust, I3523
 (sqlite and postgres), over the same drafted bytes: chartering a trust root
@@ -72,7 +74,7 @@ def test_draft_sign_submit_is_held_without_the_conferral(engine_factory, tmp_pat
         assert out["plane"] == "pending", out
         state = json.loads(eng.voice_status(out["row_id"]))
         assert state["status"] == "waiting", state
-        assert state["reason"] == "reserved_prefix_emitter_mismatch", state
+        assert state["reason"] == "reserved_family_unseated", state
 
         # The same bytes again: idempotent, the same row.
         again = json.loads(eng.put_edition2_statement(statement))
@@ -99,3 +101,26 @@ def test_the_earlier_detection_door_is_gone() -> None:
     assert hasattr(ciris_persist.Engine, "detection_draft")
     assert hasattr(ciris_persist.Engine, "sign_draft")
     assert not hasattr(ciris_persist.Engine, "put_detection_event")
+
+
+def test_detection_draft_names_the_stated_signing_key(engine_factory, tmp_path) -> None:
+    """v62.0.0 (HEAD-fix5p) — ``detection_draft(…, signer_kid=None)``: the
+    draft's protected header names the key id the detector will sign with
+    when it is stated (a rotated key, a second device); absent, the detector
+    identity's own key, as before; a ``signer_kid`` that is not 32 bytes of
+    hex is a ``ValueError``."""
+    eng = engine_factory("lens-k", 0x20, dsn=f"sqlite:///{tmp_path / 'lens-k.db'}")
+    try:
+        key = eng.register_self_federation_key("agent")
+        event = json.dumps(_event(key))
+        stated = "ab" * 32
+        default = json.loads(eng.detection_draft(event))
+        named = json.loads(eng.detection_draft(event, signer_kid=stated))
+        assert stated in named["protected"], named
+        assert stated not in default["protected"], default
+        # the payload is the detection's own, whichever key signs it
+        assert named["payload"] == default["payload"]
+        with pytest.raises(ValueError):
+            eng.detection_draft(event, signer_kid="zz")
+    finally:
+        eng.close(force=True)

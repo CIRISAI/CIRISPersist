@@ -303,8 +303,8 @@ pub(crate) mod bodies {
     }
 
     /// **I911** — the custody/config/index plane: a holder's custody claims
-    /// (`held_by`), a producer's retractions (the deletion window), a root's
-    /// conferral of a mesh-config author, a member's candidate holders (the
+    /// (`held_by`), a producer's retractions (the deletion window), a member's
+    /// candidate holders (the
     /// at-rest cascade) read narrowed; the subject's wire refs walk its slice
     /// in pages, each row once.
     pub async fn i911_custody_config_and_index_folds_read_bounded(d: &dyn FederationDirectory) {
@@ -328,13 +328,12 @@ pub(crate) mod bodies {
         assert!(retracted.is_empty(), "I911 noise retracts nothing");
         assert_narrowed(&read_probe::take(), &k, n, "I911 producer_retracted_ids");
 
-        // `other` authored n rows about `k`: the root's conferral read pins
-        // both and one dimension.
-        let _ = read_probe::take();
-        crate::federation::mesh_config::root_authorizes_author(d, &other, &k, now)
-            .await
-            .expect("I911 root authorizes author");
-        assert_narrowed(&read_probe::take(), &k, n, "I911 root_authorizes_author");
+        // v62.0.0 (R2-rest-b2; Constitution 11-24 "MESH-CONFIG HAS NO
+        // DELEGATE") — the leg that read a root's `trust:confers` conferral of
+        // a mesh-config author is DELETED with that read: the author is a
+        // holder of the bundle in force (`mesh_config::root_authorizes_author`
+        // reads the bundle, no row of `k`), witnessed by I2404 and
+        // `mesh_config_door_body`.
 
         let _ = read_probe::take();
         let refs = crate::federation::wire_index::wire_refs_for_subject(d, &k)

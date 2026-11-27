@@ -108,10 +108,21 @@ mod from_disk {
             "I1740: the rebuild, the subject refs and the reload each use the one rule"
         );
         assert!(prod.contains("reload_record_hashed(dir, kind, record_key_json)"));
+        // v62.0.0 (VD-fix3) — the point read is ONE shared plan
+        // (`wire_index::point_read_planned`): its self-check asks the one
+        // derivation, and each backend's door is that plan.
+        assert!(
+            prod.contains(
+                "let Some((bytes, recomputed)) = reload_record_hashed(dir, kind, record_key)"
+            ),
+            "I1740: the shared point read's self-check asks the one derivation"
+        );
         for backend in ["src/store/sqlite.rs", "src/store/postgres.rs"] {
             let src = code(&read(backend));
             assert!(
-                src.contains("wire_index::reload_record_hashed(self, kind, &record_key)"),
+                src.contains(
+                    "wire_index::point_read_planned(self, kind, content_hash, &record_key)"
+                ),
                 "I1740: {backend}'s point-read self-check asks the one derivation"
             );
             assert!(

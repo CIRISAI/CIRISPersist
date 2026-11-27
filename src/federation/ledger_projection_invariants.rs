@@ -42,6 +42,13 @@ pub(crate) mod bodies {
         let signer = ts::local_signer(alias);
         let id = signer.derived_key_id();
         ts::register_hybrid_key_as(b, &id, alias, role).await;
+        // v62.0.0 (HEAD-fix1) — a machine signer is owned (an unowned one
+        // signs nothing); a person's key is left alone.
+        crate::federation::admission::r2_test_support::own_fixture_machine(
+            b.as_dyn_directory(),
+            alias,
+        )
+        .await;
         Signer { signer, id }
     }
 

@@ -403,7 +403,7 @@ pub(crate) mod bodies {
     pub(crate) fn mtr_dimension() -> String {
         format!(
             "moderation_track_record:{}:v1",
-            e2::kid_thumb(crate::federation::edition2::fixture_trust_root::ROOT_SEED)
+            e2::kid_thumb("w1-rooted-trust-root")
         )
     }
 
@@ -444,8 +444,14 @@ pub(crate) mod bodies {
         let node = e2::put_key(dir, NODE, &["node"]).await;
         d.set_node(&node);
         let r = e2::rooted_trust_root(dir, &fixture_genesis::HOLDER_SEEDS, PROTOCOL).await;
+        // LEAD-root1 (CC 2.4.1.1; Constitution: an unowned agent signs
+        // nothing) — the actors are OWNED agents: an agent's row names its
+        // owner binding in `refs.head`, and an unowned agent has none.
+        let bound_at = crate::host::clock::now() - chrono::Duration::hours(1);
         for s in [AGENT, SCORER, BYSTANDER, HARNESS] {
             e2::put_key(dir, s, &["agent"]).await;
+            crate::federation::admission::r2_test_support::bind_owner_if_machine(dir, s, bound_at)
+                .await;
         }
         r
     }
@@ -501,9 +507,10 @@ pub(crate) mod bodies {
             good_faith_statement: "the selection never belonged".into(),
             jurisdiction: "ZZ".into(),
         };
-        let p = takedown_payload(
-            sp::STEWARD_PURGE_BASIS,
-            &r.root,
+        // LEAD-root2 — counted over the holders of the bundle in force: no
+        // claimant, `refs.head` = the bundle.
+        let p = crate::federation::edition2::typed::steward_purge_payload(
+            &r.head,
             &digest,
             &holders,
             &text,
@@ -545,7 +552,7 @@ pub(crate) mod bodies {
 
     /// Founder `i`'s voice over `payload` (its bundle-placed holder key).
     pub(crate) fn founder_voice(r: &RootedTrustRoot, i: usize, payload: &Value) -> Vec<u8> {
-        signed_voice(&r.founder_key(i), &r.founders[i], &r.root, payload)
+        signed_voice(&r.founder_key(i), &r.founders[i], &r.lineage, payload)
     }
 
     /// A voice over `payload` by `key` as `iss`, about `sub`.
@@ -903,7 +910,7 @@ pub(crate) mod bodies {
         const STRANGER: &str = "i650-no-seat";
         let stranger = e2::put_key(dir, STRANGER, &["user"]).await;
         let stranger_voice =
-            |p: &Value| signed_voice(&e2::signing_key(STRANGER), &stranger, &r.root, p);
+            |p: &Value| signed_voice(&e2::signing_key(STRANGER), &stranger, &r.lineage, p);
 
         let mut cases: Vec<(&str, Notice)> = Vec::new();
         // Nothing of the notice is held.
@@ -926,7 +933,7 @@ pub(crate) mod bodies {
         let dmca = {
             let p = takedown_payload(
                 "dmca512",
-                &r.root,
+                &r.lineage,
                 &<[u8; 32]>::try_from(hex::decode(&dry.selection_digest).unwrap().as_slice())
                     .unwrap(),
                 &[],
@@ -1355,7 +1362,7 @@ pub(crate) mod bodies {
             format!("# notice_id\t{}", report.notice_id),
             "# record_count\t5".to_owned(),
             format!("# executed_by\t{}", k(NODE)),
-            format!("# claimant_key_id\t{}", r.root),
+            format!("# claimant_key_id\t{}", r.lineage),
             format!("# executed_at\t{}", report.executed_at.to_rfc3339()),
         ] {
             assert!(
@@ -1434,6 +1441,28 @@ pub(crate) mod bodies {
         assert_eq!(status.state, sp::PurgeState::Executed);
     }
 
+    /// v62.0.0 (WD-fix1 rev 3) — how many held edition-2 statements carry
+    /// row `id` (its row statement and voices).
+    async fn statements_of_row(d: &dyn FederationDirectory, id: &str) -> usize {
+        use crate::federation::edition2::names::RowId;
+        let (mut n, mut cursor) = (0, None);
+        loop {
+            let page = d
+                .edition2_statements_since(cursor.as_ref(), 500)
+                .await
+                .expect("the statement listing");
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map(|st| st.cursor);
+            n += page
+                .iter()
+                .filter(|st| RowId::of_statement(&st.bytes).map(|r| r.hex()).as_deref() == Some(id))
+                .count();
+        }
+        n
+    }
+
     // ── I655 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i655_finalize_after_settle_and_the_tombstone_outlives<D: Seams>(d: &D) {
         let r = root(d).await;
@@ -1471,10 +1500,29 @@ pub(crate) mod bodies {
                 .state,
             sp::PurgeState::Settled
         );
+        // v62.0.0 (WD-fix1 rev 3) — I4407 premise: the purged row's signed
+        // statement is held before the finalize.
+        let statements_before = statements_of_row(dir, &derived).await;
+        assert!(
+            statements_before > 0,
+            "I4407 premise: the row's statement is held"
+        );
         let fin = finalize_at(dir, &report.notice_id, later, None)
             .await
             .expect("finalizes");
         assert_eq!(fin.attestations_deleted, 3, "{fin:?}");
+        // **I4407** — a finalized purge (here a steward purge; every basis
+        // shares the line) deletes the row's statement bytes too: before
+        // WD-fix1 rev 3 they stayed held, only withheld from serve.
+        assert_eq!(
+            statements_of_row(dir, &derived).await,
+            0,
+            "I4407: no statement of the purged row is held"
+        );
+        assert!(
+            fin.statements_deleted >= statements_before as u64,
+            "I4407: the report counts them: {fin:?}"
+        );
         assert_eq!(fin.trace_events_deleted, 4, "{fin:?}");
         assert_eq!(fin.trace_llm_calls_deleted, 2, "{fin:?}");
         for m in &mocks {
@@ -2298,6 +2346,8 @@ pub(crate) mod bodies {
         ] {
             let tid = format!("trace-i670-{kind}");
             let (trace, st) = signed_run_kind_trace(&tid, AGENT, kind, kind);
+            // v62.0.0 (HEAD-fix1) — the agent's trace names its owner binding.
+            let st = headed(dir, &st).await;
             let summary = ingest_full(d, &with_statement(&batch(&trace), &st))
                 .await
                 .unwrap_or_else(|e| panic!("I670: a signed run_kind {kind} trace admits: {e}"));
@@ -2316,6 +2366,8 @@ pub(crate) mod bodies {
         // (b) signed one way, sent another: the binding refuses it.
         let (tampered, st) =
             signed_run_kind_trace("trace-i670-tampered", AGENT, "mock", "production");
+        // v62.0.0 (HEAD-fix1) — the agent's trace names its owner binding.
+        let st = headed(dir, &st).await;
         let e = ingest_full(d, &with_statement(&batch(&tampered), &st))
             .await
             .expect_err("a run_kind edited after signing");
@@ -2339,6 +2391,8 @@ pub(crate) mod bodies {
         );
         // (c) outside the closed vocabulary: a schema refusal.
         let (odd, st) = signed_run_kind_trace("trace-i670-odd", AGENT, "staging", "staging");
+        // v62.0.0 (HEAD-fix1) — the agent's trace names its owner binding.
+        let st = headed(dir, &st).await;
         let e = ingest_full(d, &with_statement(&batch(&odd), &st))
             .await
             .expect_err("closed vocabulary");
@@ -2347,6 +2401,8 @@ pub(crate) mod bodies {
         let g = confer_canonical(dir).await;
         d.set_node(&g);
         let (mock, st) = signed_run_kind_trace("trace-i670-mock", AGENT, "mock", "mock");
+        // v62.0.0 (HEAD-fix1) — the agent's trace names its owner binding.
+        let st = headed(dir, &st).await;
         let e = ingest_full(d, &with_statement(&batch(&mock), &st))
             .await
             .expect_err("a mock run");
@@ -2462,6 +2518,15 @@ pub(crate) mod bodies {
         (json, st)
     }
 
+    /// LEAD-head2 (CC 2.4.1.1) — the trace statement as its producer signs it:
+    /// an agent's trace names its owner binding in `refs.head`
+    /// (`e2::with_head_resolved`, re-signed by the agent's fixture key).
+    async fn headed(dir: &dyn FederationDirectory, statement: &[u8]) -> Vec<u8> {
+        e2::with_head_resolved(dir, statement, None)
+            .await
+            .expect("the trace statement names its head")
+    }
+
     /// A one-trace batch at `level`, envelope epoch `"3.0.0"`.
     fn v28_batch(trace: &serde_json::Value, level: &str) -> Vec<u8> {
         serde_json::json!({
@@ -2507,6 +2572,7 @@ pub(crate) mod bodies {
             v28_trace_json("trace-i1030-prod", AGENT, Some("production"), Some("2.8.0")),
             AGENT,
         );
+        let st = headed(d.as_dyn_directory(), &st).await;
         let summary = ingest_full(d, &v28_signed_batch(&prod, &st, "generic"))
             .await
             .unwrap_or_else(|e| panic!("I1030: a v2.8.0 production trace admits: {e}"));
@@ -2531,6 +2597,7 @@ pub(crate) mod bodies {
             v28_trace_json("trace-i1030-mock", AGENT, Some("mock"), Some("2.8.0")),
             AGENT,
         );
+        let st = headed(d.as_dyn_directory(), &st).await;
         let e = ingest_full(d, &v28_signed_batch(&mock, &st, "generic"))
             .await
             .expect_err("I1030: a v2.8.0 mock run is refused on the canonical");
@@ -2556,6 +2623,7 @@ pub(crate) mod bodies {
             v28_trace_json("trace-i1031", AGENT, Some("qa"), Some("2.8.0")),
             AGENT,
         );
+        let st = headed(d.as_dyn_directory(), &st).await;
         let bytes = v28_signed_batch(&signed, &st, "generic");
         // Pure: the parsed trace (the inline batch; the row form carries it
         // as the blob) keeps both members, typed, and serializes back to the
@@ -2620,6 +2688,7 @@ pub(crate) mod bodies {
             t["deployment_profile"]["calibration_version"] = calibration.clone();
             t["deployment_profile"]["pipeline_metadata"] = metadata.clone();
             let (signed, st) = sign_v28(t, AGENT);
+            let st = headed(d.as_dyn_directory(), &st).await;
             let bytes = v28_signed_batch(&signed, &st, "generic");
             let env =
                 BatchEnvelope::from_json(&v28_batch(&signed, "generic")).expect("I1364: parses");
@@ -2673,6 +2742,7 @@ pub(crate) mod bodies {
         extra["smuggled"] = serde_json::json!("x");
         t["deployment_profile"]["pipeline_metadata"] = extra;
         let (signed, st) = sign_v28(t, AGENT);
+        let st = headed(d.as_dyn_directory(), &st).await;
         let e = ingest_full(d, &v28_signed_batch(&signed, &st, "generic"))
             .await
             .expect_err("I1364: an unknown pipeline_metadata member is refused");
@@ -2693,6 +2763,8 @@ pub(crate) mod bodies {
         let dir = d.as_dyn_directory();
         // A v2.7.0 trace with a signed top-level run_kind: admitted as before.
         let (trace, st) = signed_run_kind_trace("trace-i1032", AGENT, "production", "production");
+        // v62.0.0 (HEAD-fix1) — the agent's trace names its owner binding.
+        let st = headed(dir, &st).await;
         let summary = ingest_full(d, &with_statement(&batch(&trace), &st))
             .await
             .unwrap_or_else(|e| panic!("I1032: a v2.7.0 trace admits: {e}"));
@@ -2745,6 +2817,7 @@ pub(crate) mod bodies {
             v28_trace_json("trace-i1033", AGENT, Some("production"), Some("2.9.0")),
             AGENT,
         );
+        let st = headed(d.as_dyn_directory(), &st).await;
         let e = ingest_full(d, &v28_signed_batch(&t, &st, "generic"))
             .await
             .expect_err("I1033: an unvendored trace_format_version is refused");
@@ -2770,6 +2843,7 @@ pub(crate) mod bodies {
         // signed: the schema refuses before the statement is read).
         let refused = |t: serde_json::Value| async move {
             let (t, st) = sign_v28(t, AGENT);
+            let st = headed(d.as_dyn_directory(), &st).await;
             ingest_full(d, &v28_signed_batch(&t, &st, "generic"))
                 .await
                 .expect_err("refused")

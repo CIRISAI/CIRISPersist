@@ -173,7 +173,7 @@ pub(crate) mod bodies {
     where
         B: FederationDirectory + Sync,
     {
-        b.put_identity_occurrence_local(IdentityOccurrence {
+        b.test_seam_put_identity_occurrence(IdentityOccurrence {
             identity_key_id: identity.to_owned(),
             occurrence_key_id: occurrence.to_owned(),
             device_class: device_class::SERVER.to_owned(),
@@ -323,6 +323,8 @@ pub(crate) mod bodies {
             "room",
         )
         .await;
+        // GID-fix6 — the room's DERIVED id, once founded.
+        let comm = e2::room_id(&comm);
         let joined = chrono::Utc::now() - chrono::Duration::minutes(2);
         widen(b, &comm, &bob, &[&alice], joined).await;
         widen(b, &comm, &carol, &[&alice, &bob], joined).await;
@@ -706,6 +708,7 @@ pub(crate) mod bodies {
             reason: None,
             witness_set: vec![],
             persist_row_hash: String::new(),
+            leaf: crate::federation::types::RevocationLeaf::Resignation,
         });
         let kb = keys_of(&[bob.as_str()]);
         let rb: Vec<&CompositeSigningKey> = kb.iter().collect();
@@ -1016,7 +1019,7 @@ pub(crate) mod two_node {
         apply_replicated_statement, ReplicatedStatementOutcome, StatementOutcome,
     };
     use crate::federation::edition2::names::RowId;
-    use crate::federation::epoch_minter_invariants::bodies::{ladder, Pick};
+    use crate::federation::epoch_minter_invariants::bodies::{ladder, ladder_placed, Pick};
     use crate::federation::key_grant::{is_key_grant_row, KeyGrantAxis, KeyGrantRow};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::COMMUNITY;
@@ -1119,7 +1122,7 @@ pub(crate) mod two_node {
         d: &Device,
     ) {
         backend
-            .put_identity_occurrence_local(IdentityOccurrence {
+            .test_seam_put_identity_occurrence(IdentityOccurrence {
                 identity_key_id: d.key.clone(),
                 occurrence_key_id: d.key.clone(),
                 device_class: device_class::SERVER.to_owned(),
@@ -1163,7 +1166,23 @@ pub(crate) mod two_node {
     /// binding row (now-relative) and the device's own voice over it (CC 3.2:
     /// the bound node co-signs; `owner_of` requires it). Returns its row id.
     async fn bind_on<B: FederationDirectory + Sync>(n: &B, bob: &str, device: &str) -> RowId {
+        bind_on_placed(n, bob, device, None).await
+    }
+
+    /// v62.0.0 (WD-fix16j) — [`bind_on`], placed at the ROOM `room` when it
+    /// is `Some` (`cohort_scope: community` naming it), at `federation`
+    /// (announced, as every earlier fixture) when `None`.
+    async fn bind_on_placed<B: FederationDirectory + Sync>(
+        n: &B,
+        bob: &str,
+        device: &str,
+        room: Option<&str>,
+    ) -> RowId {
         let mut row = ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), bob, device);
+        if let Some(r) = room {
+            row.cohort_scope = COMMUNITY.to_owned();
+            row.attestation_envelope["community_key_id"] = serde_json::json!(r);
+        }
         row.asserted_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
             (chrono::Utc::now() - chrono::Duration::minutes(5)).timestamp_millis(),
         )
@@ -1271,7 +1290,39 @@ pub(crate) mod two_node {
     ) where
         B: BlobStorage + FederationDirectory + Sync + 'static,
     {
-        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        Box::pin(i188_two_node_with(dsn_a, dsn_b, run, pick, false)).await;
+    }
+
+    /// v62.0.0 (WD-fix16j; WD-fix16 part 2, variant 5) — **I188 two-node
+    /// with every node placed at the ROOM only** (room kind: PUBLIC; the
+    /// epoch-minter ladder's room-placed form, `ladder_placed(.., true)`):
+    /// bob's node joined through the carriage, and each new device's binding
+    /// placed at the room, so A is served it (`statements_served_to`, A's
+    /// node the requester) only as a member's node. Then I188's arms
+    /// unchanged.
+    pub(crate) async fn i188_the_minter_rewraps_its_own_history_room_placed<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        Box::pin(i188_two_node_with(dsn_a, dsn_b, run, pick, true)).await;
+    }
+
+    async fn i188_two_node_with<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+        room_placed: bool,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder_placed(dsn_a, dsn_b, run, pick, room_placed).await;
+        // WD-fix16j — where each new device's binding is placed.
+        let placed: Option<String> = room_placed.then(|| l.comm.clone());
         // v62.0.0 (E13) — `ladder` names bob by his identity-ref.
         let bob = e2::kid(&format!("em-bob-{run}"));
         let (a, b) = (l.ba.as_ref(), l.bb.as_ref());
@@ -1357,7 +1408,7 @@ pub(crate) mod two_node {
         // its own; its pending loop is the one every host runs).
         let d0 = device(a, b, &format!("d0-{run}")).await;
         anchor_local(a, &bob, &d0).await;
-        let binding = bind_on(b, &bob, &d0.key).await;
+        let binding = bind_on_placed(b, &bob, &d0.key, placed.as_deref()).await;
         deliver(a_dyn, &served(b, &l.node_a, &[binding]).await).await;
         assert_eq!(grants_of(d0.key.clone()).await, 3, "(T0) re-wrapped");
         l.engine_a
@@ -1378,7 +1429,7 @@ pub(crate) mod two_node {
         // d1's anchor is already on A (A's host wrote it).
         let d1 = device(a, b, &format!("d1-{run}")).await;
         anchor_local(a, &bob, &d1).await;
-        let binding = bind_on(b, &bob, &d1.key).await;
+        let binding = bind_on_placed(b, &bob, &d1.key, placed.as_deref()).await;
         let outcomes = deliver(a_dyn, &served(b, &l.node_a, &[binding]).await).await;
         assert!(
             outcomes
@@ -1401,7 +1452,7 @@ pub(crate) mod two_node {
         // requester.
         let d2 = device(a, b, &format!("d2-{run}")).await;
         anchor_local(a, &bob, &d2).await;
-        let binding = bind_on(b, &bob, &d2.key).await;
+        let binding = bind_on_placed(b, &bob, &d2.key, placed.as_deref()).await;
         deliver(a_dyn, &served(b, &l.node_a, &[binding]).await).await;
         assert_eq!(
             grants_of(d2.key.clone()).await,
@@ -1422,7 +1473,7 @@ pub(crate) mod two_node {
             0,
             "(T3) precondition: d3 has no owner on A yet, so it is no device of bob's"
         );
-        let binding = bind_on(b, &bob, &d3.key).await;
+        let binding = bind_on_placed(b, &bob, &d3.key, placed.as_deref()).await;
         deliver(a_dyn, &served(b, &l.node_a, &[binding]).await).await;
         assert_eq!(
             grants_of(d3.key.clone()).await,
@@ -1453,7 +1504,7 @@ pub(crate) mod two_node {
         .expect("abi ok");
         let d6 = device(a, b, &format!("d6-{run}")).await;
         anchor_local(a, &bob, &d6).await;
-        let binding = bind_on(b, &bob, &d6.key).await;
+        let binding = bind_on_placed(b, &bob, &d6.key, placed.as_deref()).await;
         for (bytes, id) in served(b, &l.node_a, &[binding]).await {
             let out = crate::ffi::directory_capsule::dispatch_directory_op(
                 a_dyn,
@@ -1485,7 +1536,7 @@ pub(crate) mod two_node {
         // `rewrap_own_epochs_for_device` (the trait's no-op).
         let d7 = device(a, b, &format!("d7-{run}")).await;
         anchor_local(a, &bob, &d7).await;
-        let binding = bind_on(b, &bob, &d7.key).await;
+        let binding = bind_on_placed(b, &bob, &d7.key, placed.as_deref()).await;
         let offered = served(b, &l.node_a, &[binding]).await;
         let outs = deliver(&*proxy, &offered).await;
         assert!(
@@ -1576,7 +1627,7 @@ pub(crate) mod two_node {
         // its anchor (nothing); the anchor lands through a door with no hook;
         // the pending sweep re-wraps and emits.
         let d4 = device(a, b, &format!("d4-{run}")).await;
-        let binding = bind_on(b, &bob, &d4.key).await;
+        let binding = bind_on_placed(b, &bob, &d4.key, placed.as_deref()).await;
         let statements = served(b, &l.node_a, &[binding]).await;
         deliver(a_dyn, &statements).await;
         anchor_local(a, &bob, &d4).await;
@@ -1620,7 +1671,7 @@ pub(crate) mod two_node {
         // emits sets for A's own epochs only.
         let d5 = device(a, b, &format!("d5-{run}")).await;
         // (D) bob binds d5 on A (A's host's own door).
-        bind_on(a, &bob, &d5.key).await;
+        bind_on_placed(a, &bob, &d5.key, placed.as_deref()).await;
         anchor_local(a, &bob, &d5).await;
         let r = l
             .engine_a
@@ -1667,7 +1718,7 @@ pub(crate) mod two_node {
         // re-wraps B's epoch 0 to d5 and emits B's row to d5, and d5 opens it
         // to the DEK B sealed under, so the re-added device reads B's content.
         anchor_local(b, &bob, &d5).await;
-        let _ = bind_on(b, &bob, &d5.key).await;
+        let _ = bind_on_placed(b, &bob, &d5.key, placed.as_deref()).await;
         let rb = l
             .engine_b
             .rekey_community_member_device_add(&l.comm, &bob, &d5.key, &bob)
@@ -1887,6 +1938,45 @@ mod run_two_node {
                     crate::store::sqlite::SqliteBackend,
                 >,
         ))
+        .await;
+    }
+
+    /// v62.0.0 (WD-fix16j) — I188 two-node, room-placed (sqlite).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i188_two_node_room_placed_sqlite() {
+        Box::pin(
+            super::two_node::i188_the_minter_rewraps_its_own_history_room_placed(
+                "sqlite::memory:",
+                "sqlite::memory:",
+                &suffix(),
+                (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
+                    as crate::federation::epoch_minter_invariants::bodies::Pick<
+                        crate::store::sqlite::SqliteBackend,
+                    >,
+            ),
+        )
+        .await;
+    }
+
+    /// v62.0.0 (WD-fix16j) — I188 two-node, room-placed (postgres).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i188_two_node_room_placed_postgres() {
+        let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
+            return;
+        };
+        Box::pin(
+            super::two_node::i188_the_minter_rewraps_its_own_history_room_placed(
+                &a,
+                &b,
+                &suffix(),
+                (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
+                    as crate::federation::epoch_minter_invariants::bodies::Pick<
+                        crate::store::postgres::PostgresBackend,
+                    >,
+            ),
+        )
         .await;
     }
 
