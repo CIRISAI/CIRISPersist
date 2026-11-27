@@ -921,6 +921,106 @@ pub(crate) async fn countersign_body(d: &dyn FederationDirectory) {
     );
 }
 
+/// I6121 (HEAD-6; CC 2.4.1.1, `end_names_old_head`) — **an end that acts
+/// from an old head concludes nothing**, at the statement door: a family's
+/// version 2 extends version 1; a member's act at the family names version
+/// 2; the member's own withdrawal of it naming version 1 is refused
+/// `end_names_old_head` (the act it ends, in its own past, names the newer
+/// head), and the same withdrawal naming version 2 is not.
+pub(crate) async fn end_old_head_body(d: &dyn FederationDirectory) {
+    use super::door_invariants::fixture::map;
+    let (a, b, c, g) = (key(171), key(172), key(173), key(174));
+    register(d, &[&a, &b, &c]).await;
+    let gid = iref(&g);
+    let members = [(&a, None), (&b, None), (&c, None)];
+    let v1 = family(&g, "end one", "majority", &members);
+    let mut v1_id = None;
+    for k in [&a, &b, &c] {
+        let o = put(d, &roster(&v1, 1, None, 2_000, k)).await.unwrap();
+        v1_id = v1_id.or(landed(&o));
+    }
+    let v1_id = v1_id.expect("I6121 version 1 lands");
+    let v2 = family(&g, "end two", "majority", &members);
+    let mut v2_id = None;
+    for k in [&a, &b] {
+        let o = put(d, &roster(&v2, 2, Some(&v1_id), 3_000, k))
+            .await
+            .unwrap();
+        v2_id = v2_id.or(landed(&o));
+    }
+    let v2_id = v2_id.expect("I6121 version 2 lands");
+    let head_ref = |h: &RowId| ciris_verify_core::edition2::row_ref(&h.0);
+    let act = sign(
+        &a,
+        &iref(&a),
+        "chat:*",
+        &map(vec![
+            ("asserted_at", Value::Uint(5_000)),
+            ("author", Value::Text(iref(&a))),
+            ("dimension", Value::Text("chat:message:v1".into())),
+            ("cohort_scope", Value::Text("family".into())),
+            ("family_id", Value::Text(gid.clone())),
+            ("refs", map(vec![("head", head_ref(&v2_id))])),
+        ]),
+    );
+    let act_id = RowId::of_statement(&act).expect("I6121 a row");
+    put(d, &act)
+        .await
+        .unwrap_or_else(|e| panic!("I6121 the act at version 2 lands: {e:?}"));
+    let end = |head: &RowId| {
+        ciris_verify_core::edition2::sign_row_statement(
+            &a,
+            &iref(&a),
+            &iref(&a),
+            "withdraws",
+            &ciris_verify_core::namespace_match::family_id("chat:*"),
+            &map(vec![
+                ("asserted_at", Value::Uint(6_000)),
+                ("author", Value::Text(iref(&a))),
+                (
+                    "refs",
+                    map(vec![
+                        ("head", head_ref(head)),
+                        ("target", head_ref(&act_id)),
+                    ]),
+                ),
+            ]),
+            vec![],
+        )
+        .unwrap()
+    };
+    let e = put(d, &end(&v1_id))
+        .await
+        .expect_err("I6121 an end naming the old head");
+    assert_eq!(
+        reason(&e),
+        malformed_row::END_NAMES_OLD_HEAD,
+        "I6121 refused end_names_old_head: {e:?}"
+    );
+    if let Err(e) = put(d, &end(&v2_id)).await {
+        assert_ne!(
+            reason(&e),
+            malformed_row::END_NAMES_OLD_HEAD,
+            "I6121 an end naming the newest head is not refused by the rule: {e:?}"
+        );
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i6121_an_end_naming_an_old_head_sqlite() {
+    Box::pin(end_old_head_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i6121_an_end_naming_an_old_head_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(end_old_head_body(&b)).await;
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite() -> crate::store::sqlite::SqliteBackend {
     use crate::store::Backend as _;

@@ -150,7 +150,6 @@ fn acceptance(signer: &str, grant: &Attestation) -> Attestation {
         "id": uuid::Uuid::new_v4().to_string(),
         "dimension": crate::federation::membership_acceptance::ACCEPTANCE_DIMENSION,
         "references_attestation_id": grant.attestation_id,
-        "proposal_hash": grant.original_content_hash,
     });
     let mut r = ts::bare_attestation(
         &uuid::Uuid::new_v4().to_string(),
