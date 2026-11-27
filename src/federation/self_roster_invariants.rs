@@ -1380,6 +1380,141 @@ pub(crate) mod bodies {
             "I1713: the roster's own keys stay"
         );
     }
+
+    /// **I4413** (WD-fix8; the lead's ruling) — the trusted-local occurrence
+    /// revocation is retired: `put_identity_occurrence_revocation_local` (an
+    /// unsigned, statement-less eviction with no roster gate) is refused by
+    /// name, `earlier_form_object`, with a message naming the edition-2
+    /// `identity:occurrence_revocation` and its door; nothing is written and
+    /// the roster is unchanged. (The edition-2 eviction still lands and
+    /// projects its revocation through the store method
+    /// `put_identity_occurrence_revocation_edition2`: I1141.)
+    pub(crate) async fn i4413_the_trusted_local_revocation_refuses_by_name(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::types::IdentityOccurrenceRevocation;
+        let (f, dev) = (format!("f-{tag}"), format!("dev-{tag}"));
+        for k in [&f, &dev] {
+            e2::put_key(d, k, &[it::USER]).await;
+        }
+        let me = e2::kid(&f);
+        assert!(
+            landed(&bind(d, &f, &dev, &[&f]).await),
+            "I4413 premise: one key binds dev"
+        );
+        let before = sr::roster_now(d, &me).await.unwrap();
+        assert!(
+            before.contains(&e2::kid(&dev)),
+            "I4413 premise: dev is on the roster"
+        );
+        let now = chrono::Utc::now();
+        let err = d
+            .put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
+                identity_key_id: me.clone(),
+                occurrence_key_id: e2::kid(&dev),
+                revoked_at: now,
+                effective_at: now,
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            })
+            .await
+            .expect_err("I4413: the trusted-local revocation is retired");
+        assert_eq!(err.kind(), "federation_malformed_row", "I4413: {err}");
+        // The token is the error's `reason` (the stable token); its Display
+        // is the prose, which names the edition-2 path.
+        let text = err.to_string();
+        assert!(
+            matches!(
+                &err,
+                crate::federation::Error::MalformedRow { reason, .. }
+                    if *reason == crate::federation::edition2::token::EARLIER_FORM_OBJECT
+            ),
+            "I4413: refused by name, earlier_form_object: {err:?}"
+        );
+        assert!(
+            text.contains("identity:occurrence_revocation"),
+            "I4413: the refusal names the edition-2 path: {text}"
+        );
+        assert!(
+            d.list_identity_occurrence_revocations_for(&me)
+                .await
+                .unwrap()
+                .is_empty(),
+            "I4413: nothing was written"
+        );
+        assert_eq!(
+            sr::roster_now(d, &me).await.unwrap(),
+            before,
+            "I4413: the roster is unchanged"
+        );
+    }
+
+    /// **I4412** (WD-fix7; the lead's ruling) — the earlier-form roster path is
+    /// retired: `put_identity_occurrence` (a signed `identity_occurrence`
+    /// object, a device add by the earlier form) is refused by name,
+    /// `earlier_form_object`, with a message naming the edition-2 statement
+    /// and the door that takes it; nothing is bound and the roster is
+    /// unchanged. (The earlier gate minted a statement-less proposal row that
+    /// every door refused the same way; no proposal ever opened.)
+    pub(crate) async fn i4412_the_earlier_form_roster_path_refuses_by_name(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::types::{
+            device_class, IdentityOccurrence, RetiredPairSignature, SignedIdentityOccurrence,
+        };
+        let (f, dev) = (format!("f-{tag}"), format!("dev-{tag}"));
+        for k in [&f, &dev] {
+            e2::put_key(d, k, &[it::USER]).await;
+        }
+        let me = e2::kid(&f);
+        let before = sr::roster_now(d, &me).await.unwrap();
+        let err = d
+            .put_identity_occurrence(SignedIdentityOccurrence {
+                identity_occurrence: IdentityOccurrence {
+                    identity_key_id: me.clone(),
+                    occurrence_key_id: e2::kid(&dev),
+                    device_class: device_class::SERVER.to_owned(),
+                    hardware_attestation: None,
+                    asserted_at: chrono::Utc::now(),
+                    valid_until: None,
+                    encryption_pubkeys: None,
+                    transport_binding: None,
+                    persist_row_hash: String::new(),
+                },
+                attesting_key_id: me.clone(),
+                signed_envelope: serde_json::json!({}),
+                signature: RetiredPairSignature {
+                    ed25519_signature_base64: String::new(),
+                    mldsa65_signature_base64: None,
+                },
+            })
+            .await
+            .expect_err("I4412: the earlier-form occurrence door is shut");
+        assert_eq!(err.kind(), "federation_malformed_row", "I4412: {err}");
+        // The token is the error's `reason` (the stable token); its Display
+        // is the prose, which names the edition-2 path.
+        let text = err.to_string();
+        assert!(
+            matches!(
+                &err,
+                crate::federation::Error::MalformedRow { reason, .. }
+                    if *reason == crate::federation::edition2::token::EARLIER_FORM_OBJECT
+            ),
+            "I4412: refused by name, earlier_form_object: {err:?}"
+        );
+        assert!(
+            text.contains("identity:occurrence") && text.contains("put_edition2_statement"),
+            "I4412: the refusal names the edition-2 path: {text}"
+        );
+        assert_eq!(
+            sr::roster_now(d, &me).await.unwrap(),
+            before,
+            "I4412: the roster is unchanged"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -1526,6 +1661,14 @@ mod tests {
     on_every_backend!(i1342, bodies::i1342_the_seek_walks_owner_bindings_only);
     on_every_backend!(i1307, bodies::i1307_the_corridor_runs_at_admission);
     on_every_backend!(i1141, bodies::i1141_the_genesis_key_is_evictable);
+    on_every_backend!(
+        i4412,
+        bodies::i4412_the_earlier_form_roster_path_refuses_by_name
+    );
+    on_every_backend!(
+        i4413,
+        bodies::i4413_the_trusted_local_revocation_refuses_by_name
+    );
     on_every_backend!(
         i1142,
         bodies::i1142_an_evicted_key_cannot_sign_into_its_old_window

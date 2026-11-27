@@ -14,7 +14,9 @@ the three steps:
 Standing is the conferral plane's (``infra:detect`` from a root this node
 trusts, CC 3.4.8), never the key's type. This file witnesses the path end to
 end on a node WITHOUT the conferral: the row is held, by reason
-(``reserved_prefix_emitter_mismatch``), read through ``voice_status``.
+(``reserved_family_unseated``, CC 3.4.7's token for ``detection:*``; v62.0.0
+D4, it was ``reserved_prefix_emitter_mismatch``), read through
+``voice_status``.
 
 The conferred leg (the row LANDS and projects) is witnessed in Rust, I3523
 (sqlite and postgres), over the same drafted bytes: chartering a trust root
@@ -72,7 +74,7 @@ def test_draft_sign_submit_is_held_without_the_conferral(engine_factory, tmp_pat
         assert out["plane"] == "pending", out
         state = json.loads(eng.voice_status(out["row_id"]))
         assert state["status"] == "waiting", state
-        assert state["reason"] == "reserved_prefix_emitter_mismatch", state
+        assert state["reason"] == "reserved_family_unseated", state
 
         # The same bytes again: idempotent, the same row.
         again = json.loads(eng.put_edition2_statement(statement))

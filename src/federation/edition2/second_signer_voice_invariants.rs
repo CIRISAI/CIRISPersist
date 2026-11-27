@@ -7,7 +7,7 @@
 //! P8-fix5's fold read `Dep::key(party)` in that resolver: without the read,
 //! `held_rows_for` finds nothing and I3526 reds on "D sees the delegation".
 //!
-//! - **I3525** — `grant_delegation_outcome` of a delegation to D answers
+//! - **I3525** — `grant_delegation` (VD-step2b: it answers the row's state) of a delegation to D answers
 //!   `Waiting` (reason `count_short`, HTTP 424), not an error; no row is held.
 //! - **I3526** — D finds it: `held_rows_for` (D's own key) lists it, role
 //!   `delegate`, author A, with A's statement; a third key that is no party
@@ -17,7 +17,7 @@
 //!   (`voice_draft(row, E)`), E's key signs the draft (`sign_draft`), and
 //!   `submit_voice` seats the row.
 //! - **I3528** — **the agent steward path, end to end.** An agent G is bound
-//!   to its owner O. Steward S `steward_bind_outcome`s G: `Waiting`. Both G
+//!   to its owner O. Steward S `steward_bind`s G: `Waiting`. Both G
 //!   (role `delegate`) and O (role `delegate_owner`) find it with
 //!   `held_rows_for`. G voices through a DRAFT (its pen is hardware: the
 //!   draft is signed elsewhere and submitted): still `Waiting`, now only on
@@ -77,7 +77,7 @@ pub(crate) mod bodies {
 
         // I3525 — held, not refused.
         let out = a
-            .grant_delegation_outcome(
+            .grant_delegation(
                 &a_signer,
                 &d_id,
                 vec!["act_on_behalf".to_owned()],
@@ -150,7 +150,7 @@ pub(crate) mod bodies {
 
         // I3527 — the drafted voice of a remote / hardware delegate.
         let out = a
-            .grant_delegation_outcome(
+            .grant_delegation(
                 &a_signer,
                 &e_id,
                 vec!["act_on_behalf".to_owned()],
@@ -204,7 +204,7 @@ pub(crate) mod bodies {
 
         // S steward-binds G: held for G and for G's owner.
         let out = s
-            .steward_bind_outcome(
+            .steward_bind(
                 &s_signer,
                 &g_id,
                 vec![delegation_scope::INFRA_ATTEST.to_owned()],
@@ -286,7 +286,7 @@ pub(crate) mod bodies {
         let (n, n_id) = party(dsn, &alias("n"), identity_type::NODE).await;
 
         let out = u
-            .grant_delegation_outcome(
+            .grant_delegation(
                 &u_signer,
                 &n_id,
                 vec![delegation_scope::INFRA_ATTEST.to_owned()],
@@ -343,7 +343,7 @@ pub(crate) mod bodies {
         let (d, d_id) = party(&dsn, &alias("d"), identity_type::USER).await;
 
         let out = a
-            .grant_delegation_outcome(
+            .grant_delegation(
                 &a_signer,
                 &d_id,
                 vec!["act_on_behalf".to_owned()],

@@ -15,11 +15,10 @@
 //! takes them; [`put_bind`] offers them through `ingest::put_statement`.
 
 use ciris_verify_core::cde::{self, Value};
-use ciris_verify_core::edition2::family::SelectContext;
 use ciris_verify_core::edition2::sign_row_statement;
 
 use super::fixture_switch::{kid, signing_key};
-use super::ingest::{held_keys_for, put_statement, StatementOutcome, INGEST_TIER};
+use super::ingest::{put_statement, StatementOutcome, INGEST_TIER};
 use super::occurrence::OCCURRENCE_FAMILY;
 use crate::federation::{Error, FederationDirectory};
 
@@ -162,29 +161,88 @@ pub async fn put_bind<D: FederationDirectory + ?Sized>(
 /// **An agent's owner binding**, held as edition-2 statements:
 /// `delegates_to(owner → agent)` at `ownership:responsible_party:agent:v1`
 /// (family `ownership:{relation}:{target_kind}:{version}`), the owner's
-/// statement and the agent's own (`bound_node`), each admitted by the door
-/// and stored ([`crate::federation::admission::agent_owner_of`] reads them).
+/// statement and the agent's own (`bound_node`), each put through the
+/// statement door (VD-step1c: before, they were stored
+/// directly and never concluded; [`crate::federation::admission::agent_owner_of`]
+/// now counts only a concluded binding).
 ///
 /// # Panics
-/// The door refuses a voice; the store refuses it.
+/// The door refuses a voice, or the binding does not conclude.
 pub async fn put_agent_owner_binding<D: FederationDirectory + ?Sized>(
     dir: &D,
     owner: &str,
     agent: &str,
     asserted_at_ms: u64,
 ) {
+    put_agent_owner_binding_placed(
+        dir,
+        owner,
+        agent,
+        asserted_at_ms,
+        crate::federation::types::cohort_scope::SELF,
+        None,
+    )
+    .await;
+}
+
+/// v62.0.0 (BIND-2; CC rc22 rule `owner-binding`, Constitution's ruling (b):
+/// "the first binding is written at whatever scope its owner first places
+/// the key at") — **[`put_agent_owner_binding`] PLACED**: the agent's owner
+/// binding at `cohort_scope`, naming `group` as its placement member where
+/// the scope is a group's (`community_id` for `community` / `affiliations`,
+/// `family_id` for `family`). The placement says who may hold the row; it
+/// counts nobody (`on_behalf_of` does that, and this helper states none). An
+/// agent's binding carries no `scope`. Returns the binding's row id (the
+/// owner's statement's).
+///
+/// # Panics
+/// A group scope with no `group`, or a `group` at a scope that names none;
+/// the door refuses a voice; the binding does not conclude.
+pub async fn put_agent_owner_binding_placed<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    owner: &str,
+    agent: &str,
+    asserted_at_ms: u64,
+    cohort_scope: &str,
+    group: Option<&str>,
+) -> super::names::RowId {
+    use crate::federation::types::cohort_scope as cs;
+    let member = match cohort_scope {
+        cs::COMMUNITY | cs::AFFILIATIONS => Some("community_id"),
+        cs::FAMILY => Some("family_id"),
+        _ => None,
+    };
+    assert_eq!(
+        member.is_some(),
+        group.is_some(),
+        "fixture_occurrence: an agent binding at {cohort_scope:?} names a group exactly when \
+         the scope is a group's (got {group:?})"
+    );
     let family = ciris_verify_core::namespace_match::family_id(
         "ownership:{relation}:{target_kind}:{version}",
     );
     let agent_ref = kid(agent);
-    let payload = det_map(vec![
+    let mut members = vec![
         ("asserted_at", Value::Uint(asserted_at_ms)),
         ("author", Value::Text(kid(owner))),
         (
             "dimension",
             Value::Text("ownership:responsible_party:agent:v1".into()),
         ),
-    ]);
+        // v62.0.0 (BIND-1) — as the producer states it
+        // (`occurrence::agent_owner_binding_payload`).
+        (
+            "delegation_purpose",
+            Value::Text(crate::federation::types::owner_binding::PURPOSE.into()),
+        ),
+        ("cohort_scope", Value::Text(cohort_scope.to_owned())),
+    ];
+    if let (Some(m), Some(g)) = (member, group) {
+        members.push((m, Value::Text(g.to_owned())));
+    }
+    let payload = det_map(members);
+    let mut binding = None;
+    let mut last = None;
     for seed in [owner, agent] {
         let st = sign_row_statement(
             &signing_key(seed),
@@ -196,13 +254,22 @@ pub async fn put_agent_owner_binding<D: FederationDirectory + ?Sized>(
             vec![],
         )
         .expect("fixture_occurrence: sign an owner binding voice");
-        let keys = held_keys_for(dir, &st)
-            .await
-            .unwrap_or_else(|e| panic!("fixture_occurrence: keys for {seed}: {e}"));
-        let admitted = super::door::admit_row(&st, &keys, None, SelectContext::default())
-            .unwrap_or_else(|e| panic!("fixture_occurrence: owner binding voice of {seed}: {e}"));
-        dir.put_edition2_statement(&admitted)
-            .await
-            .unwrap_or_else(|e| panic!("fixture_occurrence: store {seed}'s voice: {e}"));
+        if binding.is_none() {
+            binding = super::names::RowId::of_statement(&st);
+        }
+        last = Some(
+            Box::pin(put_statement(dir, &st, None, INGEST_TIER))
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("fixture_occurrence: owner binding voice of {seed}: {e}")
+                }),
+        );
     }
+    // v62.0.0 (VD-step1c, F9) — the binding must CONCLUDE: `agent_owner_of`
+    // counts a concluded binding only, never kept voices.
+    assert!(
+        matches!(last, Some(StatementOutcome::Row { .. })),
+        "fixture_occurrence: the owner binding {owner} -> {agent} did not conclude: {last:?}"
+    );
+    binding.expect("fixture_occurrence: the owner's statement has a row id")
 }

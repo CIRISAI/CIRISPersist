@@ -529,7 +529,7 @@ pub mod key_grant_arms {
         ts::register_hybrid_key_as(n.backend, recipient, recipient, USER).await;
         let recipient = e2::kid(recipient);
         n.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: e2::kid_or_keep(identity),
                 occurrence_key_id: recipient.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -558,7 +558,7 @@ pub mod key_grant_arms {
         // identity-ref.
         let owner_k = e2::kid(&owner);
         a.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner_k.clone(),
                 occurrence_key_id: a.key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -686,7 +686,7 @@ pub mod key_grant_arms {
         // identity-ref.
         let owner_k = e2::kid(&owner);
         a.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner_k.clone(),
                 occurrence_key_id: a.key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -829,7 +829,7 @@ pub mod key_grant_arms {
         // identity-ref.
         let owner_k = e2::kid(&owner);
         a.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner_k.clone(),
                 occurrence_key_id: a.key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),

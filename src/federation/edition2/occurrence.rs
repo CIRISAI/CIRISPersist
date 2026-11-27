@@ -911,12 +911,15 @@ where
     }
     let mut statements = vec![row.bytes.clone()];
     statements.extend(held.into_iter().filter(|st| *st != row.bytes));
-    dir.put_identity_occurrence_edition2(OccurrenceBind {
-        occurrence,
-        author_key_id: author_key,
-        row_id: row.row_id,
-        statements,
-    })
+    dir.put_identity_occurrence_edition2(
+        OccurrenceBind {
+            occurrence,
+            author_key_id: author_key,
+            row_id: row.row_id,
+            statements,
+        },
+        crate::federation::DoorToken::new(),
+    )
     .await?;
     Ok(StatementOutcome::Row {
         row_id: row.row_id,
@@ -1445,8 +1448,9 @@ where
 }
 
 /// v62.0.0 (wave O1, S1b) — **has the proposer withdrawn this edition-2
-/// proposal?** A held `withdraws` statement naming the proposal's row id by
-/// `refs.target`, signed by the proposer's key.
+/// proposal?** A CONCLUDED `withdraws` naming the proposal's row id by
+/// `refs.target`, signed by the proposer's key (VD-step1b: a kept-but-held
+/// one withdraws nothing).
 ///
 /// # Errors
 /// Directory read failures.
@@ -1464,6 +1468,24 @@ where
         return Ok(false);
     };
     for c in dir.edition2_rows_naming(row_id, "target").await? {
+        // v62.0.0 (VD-step1b, F6; the lead's ruling of 2026-11-22) — only a
+        // CONCLUDED `withdraws` closes the proposal: a kept-but-held one (a
+        // withdraws of another family, held `composer_family_mismatch`) has
+        // not been judged admissible and withdraws nothing
+        // (`verdict::row_state`).
+        //
+        // VD-step1d (Constitution's ruling of 2026-11-22: the proposer MAY
+        // withdraw its own OPEN proposal, an add and an evict alike, rule 1;
+        // what is never withdrawn is the occurrence REVOCATION, which exists
+        // only once the proposal lands) — the same for both acts: only a
+        // CONCLUDED withdraws closes it. Its door lands it (the roots door
+        // change, KR-fix20.rev2, for an evict). This reader is asked only
+        // over OPEN proposals (`self_roster` reads its receipts with
+        // `settled_at IS NULL`), so a withdrawal arriving after the proposal
+        // landed here cancels nothing.
+        if !super::verdict::row_state(dir, &c).await?.is_concluded() {
+            continue;
+        }
         for v in dir.edition2_voices(&c).await? {
             let withdraws = statement_parts(&v).is_some_and(|(h, _)| {
                 h.get_int(-70001).and_then(Value::as_text)
@@ -1518,12 +1540,15 @@ where
 {
     let (admitted, statements) = landing_statement(dir, row_id, OCCURRENCE_FAMILY).await?;
     let occurrence = read_payload(&admitted)?;
-    dir.put_identity_occurrence_edition2(OccurrenceBind {
-        occurrence,
-        author_key_id: identity_ref(&admitted.kid),
-        row_id: *row_id,
-        statements,
-    })
+    dir.put_identity_occurrence_edition2(
+        OccurrenceBind {
+            occurrence,
+            author_key_id: identity_ref(&admitted.kid),
+            row_id: *row_id,
+            statements,
+        },
+        crate::federation::DoorToken::new(),
+    )
     .await?;
     Ok(())
 }
@@ -1567,7 +1592,7 @@ where
 /// v62.0.0 (wave O1, S1b) — **land a held edition-2 eviction** (the
 /// self-roster executor): the `identity:occurrence_revocation` read
 /// (T2's `typed::occurrence_revocation_of`) and written as T2's door
-/// writes it (`put_identity_occurrence_revocation_local`), unless the pair is
+/// writes it (`put_identity_occurrence_revocation_edition2`), unless the pair is
 /// already revoked by it.
 ///
 /// # Errors
@@ -1587,19 +1612,40 @@ where
                 && r.effective_at == revocation.effective_at
         });
     if !held {
-        dir.put_identity_occurrence_revocation_local(revocation)
-            .await?;
+        dir.put_identity_occurrence_revocation_edition2(
+            revocation,
+            crate::federation::DoorToken::new(),
+        )
+        .await?;
     }
     Ok(())
 }
 
-/// v62.0.0 (wave O1, S1b) — **a proposer withdraws its own edition-2
-/// proposal**: a `withdraws` statement of this family naming, by
-/// `refs.target`, the row id of an OPEN edition-2 self-roster proposal (an
-/// addition here; an eviction's withdrawal reaches T2's door) and signed by
+/// v62.0.0 (wave O1, S1b; KR-fix20b) — **a proposer withdraws its own
+/// edition-2 proposal**: a `withdraws` statement of this family, or of
+/// `identity:occurrence_revocation` (KR-fix20b: routed here by
+/// `ingest::route_of`), naming by `refs.target` the row id of an OPEN
+/// edition-2 self-roster proposal, an ADDITION or an EVICTION, and signed by
 /// the proposal's proposer key. The statement is held and this node's
-/// receipt settled `withdrawn`; the change never lands. Anything else of
-/// this kind is refused `occurrence_withdraws_not_proposer`.
+/// receipt settled `withdrawn`; the change never lands.
+///
+/// KR-fix20b (the Constitution's ruling of 2026-11-22, CC 3.3.6.4: "the
+/// withdrawal rule should follow what the row IS (a proposal), not where it
+/// is kept"; rule 1):
+///
+/// - an open EVICTION is a request for a revocation, not one: its
+///   proposer's withdrawal lands as an addition's does. Before, it went to
+///   the attestation tail, which read the eviction's statement as an
+///   occurrence revocation on a never-withdrawn plane and held it
+///   `withdraws_not_admitted` for ever (KR-fix20 would have refused it);
+/// - a LANDED revocation (the eviction's receipt settled `lands_*` here, or
+///   a held revocation statement that is no proposal) is never withdrawn:
+///   refused `withdraws_never_retracts`, nothing kept. A withdrawal counts at
+///   a node only if the node held it before the proposal landed there;
+/// - a target this node does not hold yet: the withdrawal WAITS
+///   (`link_unheld`), re-folded when the target arrives, and is judged then.
+///
+/// Anything else of this kind is refused `occurrence_withdraws_not_proposer`.
 async fn withdraw_proposal<F>(dir: &F, row: &AdmittedRow) -> Result<StatementOutcome, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -1608,9 +1654,24 @@ where
         refuse(
             malformed_row::OCCURRENCE_WITHDRAWS_NOT_PROPOSER,
             format!(
-                "{OCCURRENCE_FAMILY}: a {} by {}: {why}",
+                "{}: a {} by {}: {why}",
+                row.family,
                 row.row_type,
                 identity_ref(&row.kid)
+            ),
+        )
+    };
+    let eviction = row.family == OCCURRENCE_REVOCATION_FAMILY;
+    let never_retracts = |target: &RowId| {
+        Error::malformed_row(
+            crate::federation::admission::WITHDRAWS_PLANE,
+            malformed_row::WITHDRAWS_NEVER_RETRACTS,
+            format!(
+                "{} {} names {}: a landed occurrence revocation is never withdrawn (CC \
+                 2.4.1.1, CC 3.3.6.4); it is not kept",
+                row.row_type,
+                row.row_id.hex(),
+                target.hex()
             ),
         )
     };
@@ -1620,7 +1681,21 @@ where
     let Some(target) = super::names::single(&row.names, "target") else {
         return Err(refuse_it("it names no proposal by refs.target"));
     };
+    super::fold::reads(super::fold::Dep::Row(target));
     let Some(carried) = carried_of_bind(dir, &target.hex()).await? else {
+        if dir.edition2_voices(&target).await?.is_empty() {
+            return Err(super::fold::hold(
+                super::fold::reason::LINK_UNHELD,
+                refuse_it("the proposal it names is not held yet: it waits for it"),
+            ));
+        }
+        if eviction
+            && crate::federation::cosign::held_unretractable_target(dir, &target.hex())
+                .await?
+                .is_some()
+        {
+            return Err(never_retracts(&target));
+        }
         return Err(refuse_it("the row it names is not a held proposal"));
     };
     let open = dir
@@ -1629,6 +1704,20 @@ where
         .iter()
         .any(|r| r.proposal_id == target.hex());
     if !open {
+        if eviction
+            && dir
+                .list_settled_edition2_roster_proposals(carried.identity_key_id())
+                .await?
+                .iter()
+                .any(|r| {
+                    r.proposal_id == target.hex()
+                        && r.outcome
+                            .as_deref()
+                            .is_some_and(|o| o == "lands_quorum" || o == "lands_lone")
+                })
+        {
+            return Err(never_retracts(&target));
+        }
         return Err(refuse_it("the proposal it names is not open on this node"));
     }
     if identity_ref(&row.kid) != carried.proposer() {
@@ -2117,6 +2206,20 @@ fn agent_owner_binding_payload(owner_iss: &str, asserted_at_ms: u64) -> Value {
         (
             Value::Text("dimension".into()),
             Value::Text("ownership:responsible_party:agent:v1".into()),
+        ),
+        // v62.0.0 (BIND-1; CC rc22 rule `owner-binding`) — the purpose
+        // always, and the placement always. The first binding is written at
+        // whatever scope its owner first places the key at (Constitution's
+        // ruling (b), CC 3.2): this producer places an agent at `self`; a
+        // re-signing at a wider scope is a second row. No `scope` on an
+        // agent's binding.
+        (
+            Value::Text("delegation_purpose".into()),
+            Value::Text(crate::federation::types::owner_binding::PURPOSE.into()),
+        ),
+        (
+            Value::Text("cohort_scope".into()),
+            Value::Text(crate::federation::types::cohort_scope::SELF.into()),
         ),
     ];
     m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));

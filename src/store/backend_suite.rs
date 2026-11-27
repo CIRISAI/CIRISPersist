@@ -247,7 +247,11 @@ mod tests {
                         x if x == r::STEWARD_UNPROVEN => {
                             "federation_user_target_steward_binding_forbidden".to_owned()
                         }
-                        x if x == r::gc1::RESERVED_PREFIX_EMITTER_MISMATCH => {
+                        // v62.0.0 (D1, D4) — a reserved family's duty not
+                        // held: the text's token, the same error kind.
+                        x if x == r::gc1::RESERVED_PREFIX_EMITTER_MISMATCH
+                            || x == r::gc1::RESERVED_FAMILY_UNSEATED =>
+                        {
                             "federation_reserved_prefix_emitter_mismatch".to_owned()
                         }
                         x if x == r::gc6::CHARTER_SUCCESSOR_UNHELD
@@ -415,7 +419,7 @@ mod tests {
                 "id": id,
                 // v62.0.0 (E5) — the earlier form (held tests) keeps its own.
                 "dimension": if e2::emit_edition2() {
-                    "evidence:safety_battery:capture:a:b:v1"
+                    "coherence_standing:cab:v1"
                 } else {
                     "identity_binding:v1"
                 },
@@ -1050,7 +1054,7 @@ mod tests {
         att.attestation_envelope = serde_json::json!({
             "id": id,
             "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
-            "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+            "delegation_purpose": crate::federation::types::owner_binding::PURPOSE,
         });
         resign_fix(&mut att); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         att
@@ -3357,7 +3361,7 @@ mod tests {
         att.attestation_envelope = serde_json::json!({
             "id": id,
             "kind": "delegates_to",
-            "delegation_purpose": owner_binding::CC_DELEGATION_PURPOSE,
+            "delegation_purpose": owner_binding::PURPOSE,
             "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
         });
         resign_fix(&mut att);
@@ -3575,8 +3579,9 @@ mod tests {
 
     /// #288 (CC 3.4.1/3.4.3/3.4.5) — reserved-prefix admission on the
     /// attestation_TYPE, keyed on the attesting key's identity_type:
-    /// `accord:*`→accord_holder, `system:*`→substrate_persist,
-    /// `hard_case:*`→substrate_persist, `capacity:*`→no self-emission.
+    /// `accord:*`→accord_holder, `system:*`→a node holding its owner's
+    /// `infra:attest` (v62.0.0, D1; until then the `substrate_persist` label),
+    /// `hard_case:*`→a node holding its owner's `infra:attest` (D2), `capacity:*`→no self-emission.
     /// Reproduces the issue's three repro cases + the authorized contrast.
     #[tokio::test]
     async fn check_reserved_prefix_admission_enforces_cc_3_4_x_288() {
@@ -3640,26 +3645,39 @@ mod tests {
         .await
         .expect("non-self capacity:* is allowed");
 
-        // system:* — agent REJECTED (CC 3.4.3), substrate_persist OK.
-        let e = check_reserved_prefix_admission(
+        // system:* — agent REJECTED (CC 3.4.3). v62.0.0 (D1; CC 3.4.7): the
+        // `substrate_persist` label opens nothing (refused like the agent);
+        // a NODE holding `infra:attest` from its owner may emit it (rootless:
+        // no root is built here).
+        for signer in ["rp-agent", "rp-substrate"] {
+            let e = check_reserved_prefix_admission(
+                &backend,
+                &row("system:audit_chain:hash_continuity", signer, signer),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                e.kind(),
+                "federation_reserved_prefix_emitter_mismatch",
+                "{signer}: {e}"
+            );
+        }
+        put_e2_key(&backend, "rp-node", "node").await;
+        crate::federation::admission::r2_test_support::confer_from_owner(
             &backend,
-            &row("system:audit_chain:hash_continuity", "rp-agent", "rp-agent"),
+            "rp-node-owner",
+            "rp-node",
+            &[crate::federation::types::delegation_scope::INFRA_ATTEST],
         )
-        .await
-        .unwrap_err();
-        assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
+        .await;
         check_reserved_prefix_admission(
             &backend,
-            &row(
-                "system:audit_chain:hash_continuity",
-                "rp-substrate",
-                "rp-substrate",
-            ),
+            &row("system:audit_chain:hash_continuity", "rp-node", "rp-node"),
         )
         .await
-        .expect("substrate_persist may emit system:*");
+        .expect("a node holding its owner's infra:attest may emit system:*");
 
-        // hard_case:* — agent REJECTED, substrate_persist OK.
+        // hard_case:* — agent REJECTED (D2: and the substrate_persist label).
         let e = check_reserved_prefix_admission(
             &backend,
             &row("hard_case:promotion_overdue", "rp-agent", "rp-agent"),
@@ -3667,7 +3685,9 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
-        check_reserved_prefix_admission(
+        // v62.0.0 (D2; CC 3.4.7) — the label opens nothing; the node holding
+        // its owner's `infra:attest` may emit its own hard_case row.
+        let e = check_reserved_prefix_admission(
             &backend,
             &row(
                 "hard_case:promotion_overdue",
@@ -3676,7 +3696,14 @@ mod tests {
             ),
         )
         .await
-        .expect("substrate_persist may emit hard_case:*");
+        .unwrap_err();
+        assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
+        check_reserved_prefix_admission(
+            &backend,
+            &row("hard_case:promotion_overdue", "rp-node", "rp-node"),
+        )
+        .await
+        .expect("a node holding its owner's infra:attest may emit its own hard_case:*");
 
         // Non-reserved types fast-exit OK regardless of identity_type.
         check_reserved_prefix_admission(&backend, &row("scores", "rp-agent", "rp-agent"))
@@ -3840,7 +3867,7 @@ mod tests {
         .await;
         let msg = err.to_string();
         assert!(
-            msg.contains("infra:attest_assurance"),
+            msg.contains("assure:age"),
             "the refusal must name the missing conferral so an operator knows what to obtain; \
              got: {msg}"
         );
@@ -3858,7 +3885,7 @@ mod tests {
     ///
     /// The negative case (claim present, conferral absent) is
     /// `a_self_asserted_witness_is_refused_607`.
-    async fn put_conferred_key(backend: &SqliteBackend, key_id: &str, it: &str, scope: &str) {
+    async fn put_conferred_key(backend: &SqliteBackend, key_id: &str, it: &str, scopes: &[&str]) {
         // E5-fix2 (round 6; CP2) — PORTED to an edition-2 trust root. The
         // earlier fixture chartered a KEY root (`n607-root`) by hand; under
         // edition 2 a key-arm root is as attested as its holder's custody
@@ -3882,33 +3909,31 @@ mod tests {
             "quorum:2/3",
         )
         .await;
-        crate::federation::edition2::fixture_trust_root::put_conferral(
-            backend,
-            &r,
-            key_id,
-            &[scope],
-        )
-        .await
-        .unwrap_or_else(|e| panic!("the root confers {scope} on {key_id}: {e}"));
+        crate::federation::edition2::fixture_trust_root::put_conferral(backend, &r, key_id, scopes)
+            .await
+            .unwrap_or_else(|e| panic!("the root confers {scopes:?} on {key_id}: {e}"));
         // RT-fix1 — the postcondition (the K2-fix13 pattern): the grant
         // reaches the root through THIS node, so a conferral that confers
         // nothing stops here and not at a later band / row assert.
         let node = crate::federation::FederationDirectory::node_key_id(backend)
             .expect("put_conferred_key: the node key is set above");
-        let rooted = crate::federation::trust_root::capability_roots_to_trusted_root(
-            backend,
-            &node,
-            &e2::kid(key_id),
-            scope,
-            crate::host::clock::now(),
-        )
-        .await
-        .expect("put_conferred_key: capability_roots_to_trusted_root");
-        assert!(
-            rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
-            "put_conferred_key: {key_id}'s {scope} roots at {} through node {node}: {rooted:?}",
-            r.root
-        );
+        for scope in scopes {
+            let rooted = crate::federation::trust_root::capability_roots_to_trusted_root(
+                backend,
+                &node,
+                &e2::kid(key_id),
+                scope,
+                crate::host::clock::now(),
+            )
+            .await
+            .expect("put_conferred_key: capability_roots_to_trusted_root");
+            assert!(
+                rooted.as_ref().is_some_and(|g| g.root_key_id == r.lineage),
+                "put_conferred_key: {key_id}'s {scope} roots at {} through node {node}: \
+                 {rooted:?}",
+                r.lineage
+            );
+        }
     }
 
     /// Register a key with a chosen `identity_type` (e.g. `user` / `witness` /
@@ -3945,7 +3970,7 @@ mod tests {
             &backend,
             "ab-witness",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_AGE],
         )
         .await;
         put_typed_key(&backend, "ab-subj", "user").await;
@@ -4026,7 +4051,7 @@ mod tests {
             &backend,
             "abe-witness",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_AGE],
         )
         .await;
         put_typed_key(&backend, "abe-subj", "user").await;
@@ -4083,7 +4108,7 @@ mod tests {
             &backend,
             "ut-witness",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_AGE],
         )
         .await;
         put_typed_key(&backend, "ut-S", "user").await;
@@ -4150,7 +4175,7 @@ mod tests {
             &backend,
             "ug-witness",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_AGE],
         )
         .await;
         put_typed_key(&backend, "ug-U", "user").await; // unknown-age user (granter)
@@ -4220,7 +4245,7 @@ mod tests {
             &backend,
             "wts-witness",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_AGE],
         )
         .await;
         put_typed_key(&backend, "wts-T", "user").await; // the subject
@@ -4331,7 +4356,7 @@ mod tests {
             &backend,
             "pg-witness",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_AGE],
         )
         .await;
         put_typed_key(&backend, "pg-T", "user").await;
@@ -4405,7 +4430,7 @@ mod tests {
             // Fail-safe either way: an undeclared edge confers no custody, so a
             // host that forgets the marker gets a grant that establishes nothing
             // rather than silent stewardship.
-            "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+            "delegation_purpose": crate::federation::types::owner_binding::PURPOSE,
         });
         let obj = env.as_object_mut().unwrap();
         if let Some(l) = legit {
@@ -4442,7 +4467,10 @@ mod tests {
             backend,
             &format!("{p}-assessor"),
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[
+                crate::federation::types::delegation_scope::ASSURE_AGE,
+                crate::federation::types::delegation_scope::ASSURE_CAPACITY,
+            ],
         )
         .await;
         put_typed_key(backend, &format!("{p}-S"), "user").await;
@@ -4485,7 +4513,7 @@ mod tests {
             &backend,
             "cap-assessor",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_CAPACITY],
         )
         .await;
         put_typed_key(&backend, "cap-user", "user").await;
@@ -4528,7 +4556,7 @@ mod tests {
             &backend,
             "cap-selfwit",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_CAPACITY],
         )
         .await;
         let e = NotLanded::of(
@@ -4930,7 +4958,7 @@ mod tests {
             &backend,
             "ml-witness",
             "witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            &[crate::federation::types::delegation_scope::ASSURE_AGE],
         )
         .await;
         put_typed_key(&backend, "ml-S", "user").await; // adult-user steward
