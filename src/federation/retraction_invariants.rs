@@ -118,7 +118,6 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
-        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::identity_type::NODE;
         let (holder, third) = (format!("i520-h-{tag}"), format!("i520-t-{tag}"));
         for k in [&holder, &third] {
@@ -174,14 +173,29 @@ pub(crate) mod bodies {
         );
         assert!(listed().await, "I520 the holder is still listed");
         // The holder's own withdraws retires it in the fold and the listing.
-        put(d, composer(&holder, attestation_type::WITHDRAWS, &claim))
+        // v62.0.0 (WD-fix5; CC 6.1.5 N5, the lead's ruling) — a holding claim
+        // is a CLAIM: the holder's admitted withdrawal descends it at the
+        // door, so it is gone (its id a tombstone naming the withdrawal), not
+        // merely retired among the rows still held.
+        let own = composer(&holder, attestation_type::WITHDRAWS, &claim);
+        let own_id = e2::rid(&own);
+        put(d, own)
             .await
             .expect("I520 the holder withdraws its own claim");
-        let mine = d.all_attestations_by(&holder_kid).await.unwrap();
         assert!(
-            retired(&mine, &claim_id),
-            "I520 the holder's own withdraws retires it"
+            d.get_attestation(&claim_id).await.unwrap().is_none(),
+            "I520 the holder's own withdraws descends the claim"
         );
+        match crate::federation::withdrawn_content::held_row_state(d, &claim_id)
+            .await
+            .unwrap()
+        {
+            crate::federation::withdrawn_content::HeldRowState::Withdrawn {
+                withdraws_attestation_id,
+                ..
+            } => assert_eq!(withdraws_attestation_id, own_id, "I520"),
+            other => panic!("I520 Withdrawn, not {other:?}"),
+        }
         assert!(!listed().await, "I520 and the listing agrees");
     }
 

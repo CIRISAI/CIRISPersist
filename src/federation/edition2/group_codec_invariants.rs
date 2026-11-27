@@ -162,6 +162,7 @@ fn i2991_membership_payload_reads_back_as_its_record() {
             reason: Some("3".into()),
             witness_set: vec![iref(&key(91))],
             persist_row_hash: String::new(),
+            leaf: crate::federation::types::RevocationLeaf::Removal,
         }),
         MembershipRecord::CommunityRemoval(CommunityMembershipRevocation {
             community_key_id: g.clone(),
@@ -171,6 +172,7 @@ fn i2991_membership_payload_reads_back_as_its_record() {
             reason: None,
             witness_set: vec![],
             persist_row_hash: String::new(),
+            leaf: crate::federation::types::RevocationLeaf::Removal,
         }),
         MembershipRecord::FamilyWidening(FamilyMembershipWidening {
             family_key_id: g.clone(),

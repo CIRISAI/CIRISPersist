@@ -32,7 +32,7 @@ pub mod bodies {
 
     /// v62.0.0 (JSON cut, E7) — a dimension Verify's family matcher
     /// registers (the fixtures' `x:y` is not; an edition-2 row of it is refused).
-    const DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
+    const DIMENSION: &str = "coherence_standing:cab:v1";
 
     fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
         s.parse().expect("rfc3339")
@@ -133,6 +133,7 @@ pub mod bodies {
                 reason: None,
                 witness_set: vec![],
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Removal,
             },
         );
         for c in &signers[1..] {

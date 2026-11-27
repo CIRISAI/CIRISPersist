@@ -1059,7 +1059,8 @@ async fn av26_cold_boot(dsn: String) {
 /// `serve_seat_owner_announced` (step 9); and the draft-and-voice surface
 /// they stand on, none of which this file named before: `statement_draft`,
 /// `submit_voice`, `voice_status`, `held_rows_for`, `voice_draft`,
-/// `voice_held_row`, plus `root_grants_for` and `owner_of`.
+/// `voice_held_row`, plus `root_grants_for` and `owner_of`. VD-step2:
+/// `emit_attestation_self`, whose answer is the row's state (`VoiceOutcome`).
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn ceremony_verbs_are_awaitable_in_a_spawned_task() {
@@ -1176,4 +1177,20 @@ async fn ceremony_verbs_are_awaitable_in_a_spawned_task() {
     spawned!("withdraw_statement_draft", |e, a| e
         .withdraw_statement_draft(&a.hex32, &a.owner, &a.hex32, 1)
         .await);
+    // VD-step2 — the emit verbs answer the row's STATE (`VoiceOutcome`:
+    // seated = landed, waiting = held or a voice awaiting others), named
+    // here from an external crate.
+    spawned!("emit_attestation_self", |e, a| {
+        let input = ciris_persist::federation::EmitAttestationInput::with_envelope(
+            ciris_persist::federation::types::attestation_type::SCORES,
+            ciris_persist::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({ "dimension": "health:liveness:v1" }),
+            )
+            .expect("an envelope"),
+            ciris_persist::federation::types::cohort_scope::FEDERATION,
+        );
+        let out: Result<ciris_persist::federation::edition2::second_signer_voice::VoiceOutcome, _> =
+            e.emit_attestation_self(input).await;
+        out.map(|o| (o.is_seated(), o.into_row_id()))
+    });
 }

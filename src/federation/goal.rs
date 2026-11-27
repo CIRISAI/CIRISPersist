@@ -718,7 +718,10 @@ impl crate::Engine {
     /// # Errors
     ///
     /// The gate's refusals; the plane's.
-    pub async fn put_goal(&self, input: &GoalInput) -> Result<String, Error> {
+    pub async fn put_goal(
+        &self,
+        input: &GoalInput,
+    ) -> Result<crate::federation::edition2::second_signer_voice::VoiceOutcome, Error> {
         self.emit_attestation_self(plan_goal_row(input)?).await
     }
 
@@ -750,7 +753,11 @@ impl crate::Engine {
     /// # Errors
     ///
     /// The goal not held or not this node's; the gate's; the plane's.
-    pub async fn amend_goal(&self, goal_id: &str, input: &GoalInput) -> Result<String, Error> {
+    pub async fn amend_goal(
+        &self,
+        goal_id: &str,
+        input: &GoalInput,
+    ) -> Result<crate::federation::edition2::second_signer_voice::VoiceOutcome, Error> {
         let goal = self.own_goal(goal_id).await?;
         let head_type = if goal.attestation_id == goal.goal_id {
             attestation_type::SCORES
@@ -772,7 +779,10 @@ impl crate::Engine {
     /// # Errors
     ///
     /// The goal not held or not this node's; the plane's.
-    pub async fn retire_goal(&self, goal_id: &str) -> Result<String, Error> {
+    pub async fn retire_goal(
+        &self,
+        goal_id: &str,
+    ) -> Result<crate::federation::edition2::second_signer_voice::VoiceOutcome, Error> {
         self.own_goal(goal_id).await?;
         self.emit_attestation_self(plan_goal_retraction_row(
             attestation_type::WITHDRAWS,
@@ -788,7 +798,10 @@ impl crate::Engine {
     /// # Errors
     ///
     /// The goal not held or not this node's; the plane's.
-    pub async fn recant_goal(&self, goal_id: &str) -> Result<String, Error> {
+    pub async fn recant_goal(
+        &self,
+        goal_id: &str,
+    ) -> Result<crate::federation::edition2::second_signer_voice::VoiceOutcome, Error> {
         self.own_goal(goal_id).await?;
         self.emit_attestation_self(plan_goal_retraction_row(
             attestation_type::RECANTS,

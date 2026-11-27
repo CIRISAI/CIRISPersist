@@ -250,7 +250,6 @@ async fn setup(d: &dyn FederationDirectory, people: &[&str]) {
 async fn edge(d: &dyn FederationDirectory, granter: &str, subject: &str, class: &str) {
     let p = super::typed::trust_accepts_payload(
         &e2::kid(granter),
-        &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
         &[class.to_owned()],
         None,
         "self",
@@ -666,7 +665,8 @@ pub(crate) async fn voice_listing_body(d: &dyn FederationDirectory) {
         ),
         "I2158 not for the member who voiced it"
     );
-    let draft = super::second_signer_voice::voice_draft(&st, &e2::kid(m2)).expect("I2158 a draft");
+    let draft =
+        super::second_signer_voice::voice_draft(&st, &e2::kid(m2), None).expect("I2158 a draft");
     let sig = e2::signing_key(m2)
         .sign(&draft.sig_structure)
         .expect("I2158 sign the draft");
@@ -825,7 +825,6 @@ pub(crate) async fn model_order_body(d: &dyn FederationDirectory) {
     let ghost = e2::kid("au-o-ghost");
     let p = super::typed::trust_accepts_payload(
         &e2::kid(OWNER),
-        &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
         &[au::ADMISSION_CLASS.to_owned()],
         None,
         "self",

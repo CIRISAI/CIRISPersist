@@ -393,8 +393,9 @@ pub fn pure_statement_gates(bytes: &[u8], keys: &dyn KeyDirectory) -> Result<(),
         ));
     }
     // v62.0.0 (RL-fix19; CC 2.6.1.11) — a group-plane statement about the
-    // accord is refused BY NAME before its shape is judged (the accord's id
-    // is no identity-ref: the shape check would name it payload-invalid).
+    // accord is refused BY NAME before its shape is judged (the accord's
+    // name is a root lineage's, no group-ref: the shape check or the
+    // founding check would name it payload-invalid).
     if super::group::group_plane_of(row_type, family, &payload).is_some() {
         let sub = protected
             .get_int(15)
@@ -403,7 +404,44 @@ pub fn pure_statement_gates(bytes: &[u8], keys: &dyn KeyDirectory) -> Result<(),
             .unwrap_or_default();
         super::group::refuse_accord_group_statement(sub, &payload)?;
     }
+    // v62.0.0 (GID-prod; CIRISConstitution "THE DERIVED GROUP ID", the rule
+    // Verify 23.5.1's statement reader applies) — every `group:roster`
+    // statement that is not a retraction meets the founding check: a first
+    // version (no `refs.head`) names the id its own members derive and
+    // carries its 32-byte `nonce`; a later version carries none. It reads
+    // the row alone, so it is a refusal.
+    if family == ciris_verify_core::namespace_match::family_id(super::group::GROUP_ROSTER_PREFIX)
+        && !super::emit::carries_no_dimension(row_type)
+    {
+        use super::group_id::{check_group_roster_founding, Invalid as GroupIdInvalid};
+        match check_group_roster_founding(&payload) {
+            Ok(()) => {}
+            Err(GroupIdInvalid::GroupIdNotOfFounding) => {
+                return Err(refuse(
+                    crate::federation::malformed_row::GROUP_ID_NOT_OF_FOUNDING,
+                    "group:roster: a first version's `group` is not the id derived from its own \
+                     group_kind, members, founded_at and nonce",
+                ));
+            }
+            Err(GroupIdInvalid::Malformed { member }) => {
+                return Err(refuse(
+                    crate::federation::malformed_row::EDITION2_PAYLOAD_INVALID,
+                    format!(
+                        "group:roster: `{member}` is missing or not at its type (the founding \
+                         check: a first version carries a 32-byte `nonce`, a later one none)"
+                    ),
+                ));
+            }
+        }
+    }
     super::payloads::check_by_id(family, row_type, &payload)?;
+    // v62.0.0 (ACK-1; CC pre4 Part 3 l.208) — a receipt names 1 to 256 acts
+    // under `refs.also.ack` and no head; more is `ack_names_too_many`. From
+    // the row alone. (A retraction carries the family, not the payload; a
+    // `supersedes` carries the full payload and meets the rule.)
+    if family == super::act_ack::ACT_ACK_FAMILY && !super::emit::carries_no_dimension(row_type) {
+        super::act_ack::check_shape(&payload)?;
+    }
     // v62.0.0 (wave P1e; CC rc21 CC 2.7.11) — the verifier's pure rules over
     // an `admission:unit` payload, each with its own token.
     // (A retraction of an admission row carries the family, not the payload.)
@@ -698,9 +736,9 @@ pub fn admit_row(
 /// count cells).
 pub const AFFILIATION_MEMBER_ROLE: &str = "affiliation_member";
 
-/// v62.0.0 (wave V1b) — is `bytes` an owner binding (`ownership:*`) whose
-/// payload names a community (`community_id` or one of its aliases): the
-/// binding counted over the affiliation's roster (CC 3.2 ruling (a))? Read
+/// v62.0.0 (wave V1b; BIND-1) — is `bytes` an owner binding (`ownership:*`)
+/// held ON BEHALF OF an organisation (`on_behalf_of`, a group-ref to an
+/// affiliation): the binding counted over the affiliation's roster (CC 3.2)? Read
 /// from the bytes only; whether the community is an affiliation, and who is
 /// on its roster, is the counted rule's (`admission::check_owner_binding_counted`).
 #[must_use]
@@ -713,10 +751,14 @@ pub fn names_an_affiliation_on_the_bond(bytes: &[u8]) -> bool {
         .and_then(Value::as_text)
         .and_then(ciris_verify_core::namespace_match::prefix_of_family_id)
         .is_some_and(|p| p.starts_with("ownership:"));
+    // v62.0.0 (BIND-1; CC rc22 rule `owner-binding`) — the organisation is
+    // the one `on_behalf_of` names; `community_id` / `family_id` are the
+    // row's placement and admit no affiliation member's voice.
     ownership
-        && crate::federation::admission::COHORT_TARGET_ENVELOPE_FIELDS
-            .iter()
-            .any(|f| payload.get_text(f).and_then(Value::as_text).is_some())
+        && payload
+            .get_text(crate::federation::admission::ON_BEHALF_OF_FIELD)
+            .and_then(Value::as_text)
+            .is_some_and(|s| !s.is_empty())
 }
 
 /// v62.0.0 (K2-fix6; CC 2.6.1.9) — who fills a second-signer role.
@@ -744,12 +786,6 @@ pub struct SecondSignerRole {
     /// filled, and the row waits.
     pub parties: Vec<SecondSignerParty>,
 }
-
-/// v62.0.0 (WD-fix1) — the composer row types that RETRACT their target
-/// (CC 2.4.1.1): each concludes on its own author's voice and takes no
-/// second-signer role from the target's family ([`second_signer_roles`]).
-/// The third composer, `supersedes`, restates content and keeps the roles.
-pub const RETRACTION_ROW_TYPES: &[&str] = &["withdraws", "recants"];
 
 /// v62.0.0 (K2-fix4, K2-fix6; CC 2.6.1.9 (P2:1147): "The second consent of a
 /// scoped delegates_to is a second statement over the same payload, signed
@@ -838,7 +874,10 @@ pub fn second_signer_roles_with(
     // `supersedes` is a composer too but restates content, so it keeps the
     // family's roles.
     let row_type = protected.get_int(-70001).and_then(Value::as_text);
-    if row_type.is_some_and(|t| RETRACTION_ROW_TYPES.contains(&t)) {
+    // v62.0.0 (FS-step1) — a retraction (CC 2.4.1.1) concludes on its own
+    // author's voice and takes no second-signer role from the target's
+    // family: the two-type predicate, `emit::carries_no_dimension`.
+    if row_type.is_some_and(super::emit::carries_no_dimension) {
         return Vec::new();
     }
     let ctx = door_context(bytes, SelectContext::default());

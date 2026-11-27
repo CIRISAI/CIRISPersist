@@ -507,6 +507,7 @@ mod revocation_honesty_tests {
                     reason: None,
                     witness_set: vec![],
                     persist_row_hash: String::new(),
+                    leaf: crate::federation::types::RevocationLeaf::Resignation,
                 },
             );
         e2::put_voices(&*sq, &e2::family_revocation_voices(&removal, Some(&head)))

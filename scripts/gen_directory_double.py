@@ -63,6 +63,11 @@ from pathlib import Path
 # operation: backends override it, it composes no other trait method through
 # `self`, and a consumer wrapping a backend in this double must reach the
 # override rather than the default.
+# v62.0.0 (WD-fix11) — trait methods gated `#[cfg(test)]` on the trait (the
+# retired trusted-local occurrence write's storage, a test seam): their
+# delegation is gated too, so a `test-anchor` build has neither.
+TEST_ONLY = ("test_seam_put_identity_occurrence",)
+
 DELEGATED_DEFAULTS = (
     # The wire-hash family's one non-`Unsupported` member (its default is a
     # generic `Backend` "not implemented"); the rest of the family is found.
@@ -423,8 +428,8 @@ def render(methods) -> str:
     A("// generator exists to remove.")
     A("#[allow(unused_imports)]")
     A("use super::*;")
-    A("use std::collections::BTreeSet;")
-    A("use std::sync::Arc;")
+    A("use std::collections::{BTreeMap, BTreeSet};")
+    A("use std::sync::{Arc, Mutex};")
     A("")
     A("/// A `FederationDirectory` that delegates to `inner`, except where a method")
     A("/// has been declared faulted — there it returns [`Error::Unsupported`].")
@@ -438,6 +443,9 @@ def render(methods) -> str:
     A("    inner: Arc<dyn FederationDirectory>,")
     A("    unsupported: BTreeSet<&'static str>,")
     A("    erroring: BTreeSet<&'static str>,")
+    A("    // v62.0.0 (CONTENT-A6b) — every Result-returning call, by method name,")
+    A("    // shared by clones: a witness counts the store reads a door makes.")
+    A("    calls: Arc<Mutex<BTreeMap<&'static str, u64>>>,")
     A("}")
     A("")
     A("impl std::fmt::Debug for FaultInjectingDirectory {")
@@ -454,7 +462,26 @@ def render(methods) -> str:
     A("    /// identical to `inner` — a fixture opts INTO each divergence.")
     A("    #[must_use]")
     A("    pub fn new(inner: Arc<dyn FederationDirectory>) -> Self {")
-    A("        Self { inner, unsupported: BTreeSet::new(), erroring: BTreeSet::new() }")
+    A("        Self {")
+    A("            inner,")
+    A("            unsupported: BTreeSet::new(),")
+    A("            erroring: BTreeSet::new(),")
+    A("            calls: Arc::default(),")
+    A("        }")
+    A("    }")
+    A("")
+    A("    /// v62.0.0 (CONTENT-A6b) — the calls made through this double so far")
+    A("    /// (every Result-returning trait method), by method name.")
+    A("    #[must_use]")
+    A("    pub fn calls(&self) -> BTreeMap<&'static str, u64> {")
+    A("        self.calls.lock().map(|m| m.clone()).unwrap_or_default()")
+    A("    }")
+    A("")
+    A("    /// v62.0.0 (CONTENT-A6b) — forget the calls counted so far.")
+    A("    pub fn reset_calls(&self) {")
+    A("        if let Ok(mut m) = self.calls.lock() {")
+    A("            m.clear();")
+    A("        }")
     A("    }")
     A("")
     A("    /// Declare that `method` answers `Error::Unsupported { method }`.")
@@ -498,6 +525,9 @@ def render(methods) -> str:
     A("    }")
     A("")
     A("    fn faulted(&self, method: &'static str) -> Option<Error> {")
+    A("        if let Ok(mut m) = self.calls.lock() {")
+    A("            *m.entry(method).or_insert(0) += 1;")
+    A("        }")
     A("        if self.unsupported.contains(method) {")
     A("            return Some(Error::Unsupported { method });")
     A("        }")
@@ -511,6 +541,10 @@ def render(methods) -> str:
     A("#[async_trait::async_trait]")
     A("impl FederationDirectory for FaultInjectingDirectory {")
     for name, args_src, ret in methods:
+        # v62.0.0 (WD-fix11) — a trait method compiled for persist's own
+        # tests only carries the same gate on its delegation.
+        if name in TEST_ONLY:
+            A("    #[cfg(test)]")
         args = split_args(args_src)
         # drop the receiver
         params = [a for a in args if a.strip() not in ("&self", "self", "&mut self")]

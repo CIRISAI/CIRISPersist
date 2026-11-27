@@ -161,7 +161,8 @@ pub(crate) mod bodies {
             .find(|h| h.row_id == rid.hex())
             .unwrap_or_else(|| panic!("{what}: the official lists the held verdict: {held:?}"));
         assert_eq!(row.role, AFFILIATION_COUNTERSIGN_ROLE, "{what}");
-        let draft = voice_draft(&row.statement, official).expect("the official's voice drafts");
+        let draft =
+            voice_draft(&row.statement, official, None).expect("the official's voice drafts");
         let sig = e2::signing_key(official)
             .sign(&draft.sig_structure)
             .expect("the official's own key signs");
@@ -190,7 +191,8 @@ pub(crate) mod bodies {
         let (f, official, m, solo) = (k("f"), k("official"), k("m"), k("solo"));
         reg(a, &[&f, &official, &m, &solo]).await;
         let (f, official, m, solo) = (id_of(&f), id_of(&official), id_of(&m), id_of(&solo));
-        found_room_with_blob(
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let solo = found_room_with_blob(
             a,
             &solo,
             "founder_only",
@@ -368,7 +370,8 @@ pub(crate) mod replacement {
         let (f, official, m, solo) = (k("f"), k("official"), k("m"), k("solo"));
         reg(a, &[&f, &official, &m, &solo]).await;
         let (f, official, m, solo) = (id_of(&f), id_of(&official), id_of(&m), id_of(&solo));
-        found_room_with_blob(
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let solo = found_room_with_blob(
             a,
             &solo,
             "founder_only",

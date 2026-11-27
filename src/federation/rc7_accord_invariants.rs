@@ -51,6 +51,10 @@
 //!   keeps its intent: a grant ONE founder signs confers nothing; the
 //!   root's own `trust:confers:v1` grant (with the delegate's second voice)
 //!   does, plane `Delegation`.
+//!
+//! v62.0.0 (R2-fixture; CC 3.2 T5) — **I437 / I438 are deleted** (a second
+//! root to rotate an acceptance to is a keyed root); the note at their site
+//! names the gap. I439 stays.
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod bodies {
@@ -58,134 +62,19 @@ pub(crate) mod bodies {
     use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::operational::test_support as ops;
     use crate::federation::trust_root::{
-        capability_roots_to_trusted_root, trust_root_valid, trusted_roots_of, ConferralPlane,
-        INFRA_SERVE_SCOPE, TRUST_ACCEPTS_DIMENSION,
+        capability_roots_to_trusted_root, trust_root_valid, ConferralPlane, INFRA_SERVE_SCOPE,
     };
     use crate::federation::FederationDirectory;
-    use ciris_verify_core::cde::Value;
 
     // ── I437 / I438 ─────────────────────────────────────────────────────
-
-    struct Edges {
-        node: String,
-        r1: String,
-        r2: String,
-    }
-
-    /// Two rooted trust roots; THIS node's acceptance edge to `r1` is then
-    /// superseded by the node's own successor naming `r2`.
-    async fn rotate_the_edge(d: &dyn FederationDirectory, tag: &str) -> Edges {
-        let node = ops::e2_node(d, tag);
-        let r1 = e2::rooted_trust_root(d, &HOLDER_SEEDS, "quorum:2/3").await;
-        let r2 = ops::stand_up_e2_root(d, &format!("i437-r2-{tag}"))
-            .await
-            .expect("the second root stands up");
-        assert!(
-            trust_root_valid(d, &node, &r1.root, crate::host::clock::now())
-                .await
-                .unwrap()
-                .edge_exists,
-            "CONTROL: the edge to r1 stands before the rotation"
-        );
-        // v62.0.0 (E9-fix2) — a composer states only the common members and
-        // `refs.target` (`payloads::check_composer`, CC 2.4.1.1): no `scope`,
-        // no `attached_head_digest`. The head-naming rule gates `delegates_to`
-        // only (`check_attach_freshness`), never its composers.
-        let succ = ciris_verify_core::edition2::sign_row_statement(
-            &e2::signing_key(&node),
-            &node,
-            &r2.root,
-            crate::federation::types::attestation_type::SUPERSEDES,
-            &ciris_verify_core::namespace_match::family_id(
-                crate::federation::edition2::typed::TRUST_PREFIX,
-            ),
-            &det_map(vec![
-                ("author", Value::Text(node.clone())),
-                ("asserted_at", Value::Uint(ops::e2_now_ms())),
-                ("dimension", Value::Text(TRUST_ACCEPTS_DIMENSION.to_owned())),
-                (
-                    "refs",
-                    det_map(vec![(
-                        "target",
-                        ciris_verify_core::edition2::row_ref(&r1.acceptance.0),
-                    )]),
-                ),
-            ]),
-            vec![],
-        )
-        .expect("sign the successor edge");
-        e2::put_statement(d, &succ)
-            .await
-            .expect("the node's successor edge naming r2");
-        Edges {
-            node,
-            r1: r1.root,
-            r2: r2.root,
-        }
-    }
-
-    fn det_map(members: Vec<(&str, Value)>) -> Value {
-        let mut m: Vec<(Value, Value)> = members
-            .into_iter()
-            .map(|(k, v)| (Value::Text(k.to_owned()), v))
-            .collect();
-        m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(k));
-        Value::Map(m)
-    }
-
-    /// **I437** — the edge leg reads the rotation.
-    pub(crate) async fn i437_trust_root_valid_reads_a_superseded_edge(
-        d: &dyn FederationDirectory,
-        tag: &str,
-    ) {
-        let e = rotate_the_edge(d, tag).await;
-        assert!(
-            !trust_root_valid(d, &e.node, &e.r1, crate::host::clock::now())
-                .await
-                .unwrap()
-                .edge_exists,
-            "I437: the superseded edge to r1 is not live"
-        );
-        let v2 = trust_root_valid(d, &e.node, &e.r2, crate::host::clock::now())
-            .await
-            .unwrap();
-        assert!(
-            v2.edge_exists && v2.valid,
-            "I437: the successor edge to r2 is the live edge (depends on W1): {v2:?}"
-        );
-    }
-
-    /// **I438** — the subscription read agrees.
-    pub(crate) async fn i438_trusted_roots_of_reads_a_superseded_edge(
-        d: &dyn FederationDirectory,
-        tag: &str,
-    ) {
-        use crate::federation::attestation_query::test_support::AllAttestations as _;
-        let e = rotate_the_edge(d, tag).await;
-        let roots = trusted_roots_of(d, &e.node, chrono::Utc::now())
-            .await
-            .unwrap();
-        assert_eq!(
-            roots,
-            vec![e.r2.clone()],
-            "I438: the subscription set is the successor's root, not the superseded edge's"
-        );
-        // The transit candidate set reaches the successor's root (each
-        // candidate is then judged by `trust_root_valid`, I437).
-        let by_user = d.all_attestations_by(&e.node).await.unwrap();
-        let candidates: Vec<String> = crate::federation::trust_root::transit_candidate_roots(
-            &by_user,
-            &e.node,
-            chrono::Utc::now(),
-        )
-        .into_iter()
-        .map(|c| c.root_ref)
-        .collect();
-        assert!(
-            candidates.contains(&e.r2),
-            "I438: transit follows the rotated edge to its root: {candidates:?}"
-        );
-    }
+    //
+    // v62.0.0 (R2-fixture; CC 3.2 T5) — I437 / I438 DELETED: they rotated THIS
+    // node's acceptance from one root to a SECOND root (`stand_up_e2_root`, a
+    // keyed root). A node accepts one root, the bundle's lineage; a second
+    // lineage is a fork, unreachable in v62. The acceptance's own end is its
+    // `withdraws` (peer_rooting I2223, `exercise_ceremony_plane_capability_walk`'s
+    // lever). GAP: an acceptance superseded by its own successor (same lineage)
+    // has no witness.
 
     // ── I439 ────────────────────────────────────────────────────────────
 
@@ -198,7 +87,7 @@ pub(crate) mod bodies {
         let node = ops::e2_node(d, tag);
         let r = e2::rooted_trust_root(d, &HOLDER_SEEDS, "quorum:2/3").await;
         assert!(
-            trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+            trust_root_valid(d, &node, &r.lineage, crate::host::clock::now())
                 .await
                 .unwrap()
                 .valid,
@@ -251,7 +140,7 @@ pub(crate) mod bodies {
         .unwrap()
         .expect("I439: the root's own grant confers");
         assert_eq!(
-            g.root_key_id, r.root,
+            g.root_key_id, r.lineage,
             "I439: the threshold root is the root"
         );
         assert_eq!(
@@ -293,8 +182,6 @@ mod runners {
                         }
                     };
                 }
-                tagged!(i437_trust_root_valid_reads_a_superseded_edge);
-                tagged!(i438_trusted_roots_of_reads_a_superseded_edge);
                 tagged!(i439_a_keyed_root_confers_by_its_own_key_not_by_one_founder);
             }
         };

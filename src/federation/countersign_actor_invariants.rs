@@ -120,7 +120,8 @@ pub(crate) mod bodies {
             id_of(&q),
             id_of(&solo),
         );
-        found_room_with_blob(
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let solo = found_room_with_blob(
             d,
             &solo,
             "founder_only",
@@ -254,7 +255,8 @@ pub(crate) mod bodies {
         // the seat's voice arrives the row names the seat, not `h`.
         let (h, other) = (id_of(&k("h")), id_of(&k("other")));
         reg(d, &[&k("h"), &k("other")]).await;
-        found_room_with_blob(d, &other, "majority", &[&f], &[], None)
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let other = found_room_with_blob(d, &other, "majority", &[&f], &[], None)
             .await
             .expect("I4154: the other room");
         appoint_in(d, &f, &h, &other, acts - Duration::minutes(30)).await;
