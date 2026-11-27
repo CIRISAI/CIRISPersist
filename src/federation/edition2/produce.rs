@@ -92,12 +92,23 @@ pub async fn signer_identity(signer: &LocalSigner) -> Result<(Digest32, String),
 /// — **`refs` as Verify's reader checks it** (`edition2::check_refs`, run in
 /// every `verify_row_statement` since 23.0.0), so a statement persist signs
 /// is one the door admits. The members are closed (`head`, `prev`,
-/// `answers`, `target` one row-ref; `further_heads`, `trusted_through` a
-/// row-ref-set; `also` a non-empty map over `ack` | `cites`, each a
-/// row-ref-set), and every set is sorted by encoding with no duplicate.
+/// `answers`, `target` one row-ref; `further_heads`, `trusted_through`,
+/// `further_prev` a row-ref-set; `also` a non-empty map over `ack` |
+/// `cites`, each a row-ref-set), and every set is sorted by encoding with
+/// no duplicate.
+///
+/// v62.0.0 (CONTENT-A2) — `further_prev` and the cap on
+/// `trusted_through` ([`TRUSTED_THROUGH_MAX`]) are Verify 23.5.1's. Until
+/// that pin the door (Verify 23.5.0's reader) refuses `further_prev` as
+/// `unexpected:refs` and carries no cap. So no persist producer states
+/// `further_prev` before the pin (CONTENT-A4 states `prev` alone). These
+/// arms are deleted at the pin, with the rest of this copy.
 /// The error is Verify's label, as `door::invalid_label` spells it:
 /// `unexpected:refs`, `unexpected:also`, `malformed:<member>`,
 /// `set_order:<member>`.
+///
+/// Replaced by a call to Verify's own refs reader once CIRISVerify exports
+/// it (asked for 23.5.1; private at 23.5.0, FS-step3).
 ///
 /// # Errors
 /// The label of the first rule broken, in Verify's order.
@@ -117,6 +128,19 @@ pub fn check_refs(v: &Value) -> Result<(), &'static str> {
             }
             Some("trusted_through") => {
                 row_ref_set_ok(x, "malformed:trusted_through", "set_order:trusted_through")?;
+                // v62.0.0 (CONTENT-A2; DELETED AT THE VERIFY PIN: Verify
+                // 23.5.1's public `check_refs` carries the cap for every row)
+                // — at most [`TRUSTED_THROUGH_MAX`] tips.
+                if x.as_array().is_some_and(|a| a.len() > TRUSTED_THROUGH_MAX) {
+                    return Err(TRUSTED_THROUGH_TOO_MANY);
+                }
+            }
+            // v62.0.0 (CONTENT-A2; DELETED AT THE VERIFY PIN, where Verify
+            // 23.5.1's reader carries it) — a content row's further
+            // predecessors (the author's other tips in the room), a
+            // row-ref-set, allowed only beside `prev` (checked below).
+            Some("further_prev") => {
+                row_ref_set_ok(x, "malformed:further_prev", "set_order:further_prev")?;
             }
             Some("also") => {
                 let roles = x
@@ -128,6 +152,25 @@ pub fn check_refs(v: &Value) -> Result<(), &'static str> {
                         Some("ack" | "cites") => {
                             row_ref_set_ok(set, "malformed:also", "set_order:also")?;
                         }
+                        // v62.0.0 (HEAD-fix1; Constitution's two-standings
+                        // ruling, Verify feat/23.5.1 14a8357) — the FOURTH
+                        // `also` role: a row signed under a root grant names
+                        // the owner's acceptance of the grant, a set of
+                        // exactly one. DELETED AT THE VERIFY 23.6.0 PIN with
+                        // this interim copy (Verify's own `check_refs`
+                        // carries it).
+                        // v62.0.0 (HEAD-fix7; Constitution, "THE ROLE NAME") —
+                        // the FIFTH `also` role: the head of a voice's key
+                        // roster, on every row of a private room; a set of
+                        // exactly one. DELETED AT THE VERIFY 23.7.0 PIN
+                        // (23.6.0's `check_refs` refuses it, so no producer
+                        // emits it before that pin).
+                        Some("stands_on" | "voice") => {
+                            row_ref_set_ok(set, "malformed:also", "set_order:also")?;
+                            if set.as_array().map(<[Value]>::len) != Some(1) {
+                                return Err("malformed:also");
+                            }
+                        }
                         _ => return Err("unexpected:also"),
                     }
                 }
@@ -135,8 +178,25 @@ pub fn check_refs(v: &Value) -> Result<(), &'static str> {
             _ => return Err("unexpected:refs"),
         }
     }
+    // v62.0.0 (CONTENT-A2; DELETED AT THE VERIFY PIN) — `further_prev` only
+    // on a row that also names `prev`.
+    let named = |role: &str| m.iter().any(|(k, _)| k.as_text() == Some(role));
+    if named("further_prev") && !named("prev") {
+        return Err("malformed:further_prev");
+    }
     Ok(())
 }
+
+/// v62.0.0 (CONTENT-A2; the Constitution's room-content rule, R3) — the most
+/// tips one `refs.trusted_through` names, on every row that carries it.
+/// DELETED AT THE VERIFY PIN, with [`TRUSTED_THROUGH_TOO_MANY`] and the
+/// `further_prev` arm of [`check_refs`]: Verify 23.5.1's public `check_refs`
+/// carries all three.
+pub const TRUSTED_THROUGH_MAX: usize = 64;
+
+/// v62.0.0 (CONTENT-A2) — [`check_refs`]' label for a `refs.trusted_through`
+/// of more than [`TRUSTED_THROUGH_MAX`] tips (Verify's token).
+pub const TRUSTED_THROUGH_TOO_MANY: &str = "trusted_through_too_many";
 
 /// `row-ref = [2, [-16, bstr .size 32]]` (Verify's `check_row_ref`).
 fn row_ref_ok(v: &Value, malformed: &'static str) -> Result<(), &'static str> {

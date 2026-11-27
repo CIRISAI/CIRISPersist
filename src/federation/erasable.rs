@@ -1155,7 +1155,12 @@ mod ingest_gate_proof {
 
         // Admitted while fully disclosed — the gate runs inside put_attestation.
         dir.put_attestation(SignedAttestation {
-            attestation: att.clone(),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &att.clone(),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("erasable row must be admitted before erasure");
@@ -1234,7 +1239,12 @@ mod ingest_gate_proof {
         )
         .await;
         peer.put_attestation(SignedAttestation {
-            attestation: erased.clone(),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*peer,
+                &erased.clone(),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("a PEER must admit a fully-erased erasable row — otherwise this is inert");
@@ -1284,7 +1294,12 @@ mod ingest_gate_proof {
         let mut att = row(&attester, envelope);
 
         dir.put_attestation(SignedAttestation {
-            attestation: att.clone(),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(
+                &*dir,
+                &att.clone(),
+            )
+            .await
+            .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .expect("the sealed row must be admitted before we try to erase it");

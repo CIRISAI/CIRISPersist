@@ -91,7 +91,10 @@ pub mod bodies {
         let _ = e2::put_key(d, k, &[identity_type::AGENT]).await;
         let owner = format!("owner-{k}");
         let _ = e2::put_key(d, &owner, &[identity_type::USER]).await;
-        e2::put_agent_owner_binding(d, &owner, k, e2::ms(chrono::Utc::now())).await;
+        // v62.0.0 (HEAD-fix1) — bound from the agent key's own window start,
+        // so every act it signs (a fixture row may be dated before now) is
+        // under the binding and names it as its head.
+        e2::put_agent_owner_binding(d, &owner, k, e2::key_window_start_ms(k)).await;
     }
 
     /// v62.0.0 (E2-fix8) — land an authored delegation with the voices its

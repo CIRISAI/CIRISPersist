@@ -30,7 +30,7 @@
 //!   what `Engine.sign_draft` returns) and put through the statement door:
 //!   the same row id as the locally produced statement; on a node holding
 //!   the `infra:detect` conferral it LANDS and projects; on a node without
-//!   it the row is HELD (`Pending`), reason `reserved_prefix_emitter_mismatch`,
+//!   it the row is HELD (`Pending`), reason `reserved_family_unseated` (D4),
 //!   and nothing projects. A draft whose `sig_structure` is signed by
 //!   another key is refused by the door.
 //! - **I3570** (v62 P8-fix17, pass 4e) — **a fractional score lands and
@@ -291,7 +291,7 @@ where
     // I3536 — a declared type confers nothing. v62.0.0 (P8-fix10) — in
     // edition 2 the type is not consulted (the rule's `conferred_only`) and a
     // missing conferral is OTHER rows, a fold condition: the row is HELD
-    // `reserved_prefix_emitter_mismatch` (GC1), never seated.
+    // `reserved_family_unseated` (D4) (GC1), never seated.
     let rogue = "p8-rogue-detector";
     e2::put_key(a, rogue, &["lenscore_detector"]).await;
     let rogue_ev = event(&e2::kid(rogue));
@@ -307,7 +307,7 @@ where
             .unwrap()
             .map(|h| h.reason)
             .as_deref(),
-        Some(super::fold::reason::gc1::RESERVED_PREFIX_EMITTER_MISMATCH),
+        Some(super::fold::reason::gc1::RESERVED_FAMILY_UNSEATED),
         "I3536: held for the missing infra:detect conferral"
     );
     assert!(
@@ -329,8 +329,21 @@ where
     let det = "p4-detector";
     e2::put_key(bare, det, &[crate::federation::types::identity_type::AGENT]).await;
     let ev = event(&e2::kid(det));
-    let draft = crate::derived::detection_row::draft_detection(&ev, None)
+    // I6138 (HEAD-fix5; the RESIGN-6 rule) — the draft names the key the
+    // detector signs with, as its caller states it.
+    let pen = ciris_verify_core::edition2::thumbprint(e2::signing_key(det).public_key());
+    let draft = crate::derived::detection_row::draft_detection(&ev, None, &pen)
         .expect("I3523: the detection drafts");
+    assert_eq!(
+        ciris_verify_core::cde::decode(&draft.protected)
+            .ok()
+            .and_then(|h| h
+                .get_int(4)
+                .and_then(ciris_verify_core::cde::Value::as_bytes)
+                .map(<[u8]>::to_vec)),
+        Some(pen.to_vec()),
+        "I6138: the drafted kid is the one the caller states"
+    );
     assert_eq!(
         draft.sig_structure,
         ciris_verify_core::edition2::sig_structure(&draft.protected, &draft.payload),
@@ -376,7 +389,7 @@ where
             .unwrap()
             .map(|h| h.reason)
             .as_deref(),
-        Some(super::fold::reason::gc1::RESERVED_PREFIX_EMITTER_MISMATCH),
+        Some(super::fold::reason::gc1::RESERVED_FAMILY_UNSEATED),
         "I3523: held for the missing conferral"
     );
     assert!(

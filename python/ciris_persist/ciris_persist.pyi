@@ -4063,7 +4063,7 @@ class Engine:
     def claim_pending_outbound(self, batch_size: int, claim_duration_seconds: int, claimed_by: str) -> list[Any]:
         """(derived) procedural — v0.4.0 — Atomic claim of up to batch_size pending rows. Returns a list of dicts (one per claimed row)."""
 
-    def detection_draft(self, event_json: str, subject: str | None = None) -> str:
+    def detection_draft(self, event_json: str, subject: str | None = None, signer_kid: str | None = None) -> str:
         """(derived) procedural — v62.0.0 (v62 P8-fix10; CC 3.4.8) — a detection drafted for its detector's pen (Lens, an external detector): the detection:{detector} statement's pa..."""
 
     def enqueue_outbound(self, sender_key_id: str, destination_key_id: str, message_type: str, edge_schema_version: str, envelope_bytes: bytes, body_sha256: bytes, body_size_bytes: int, requires_ack: bool, max_attempts: int, ttl_seconds: int, initial_next_attempt_after_rfc3339: str, ack_timeout_seconds: int | None = None) -> str:
