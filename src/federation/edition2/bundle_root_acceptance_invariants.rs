@@ -227,7 +227,7 @@ async fn bind_owner(e: &crate::Engine, alias: &str, owner: &str, owner_seed: &st
         .await
         .unwrap_or_else(|e| panic!("[{tag}] Engine::held_rows_for: {e}"));
     let vd = e
-        .voice_draft(&rows[0].row_id, &node)
+        .voice_draft(&rows[0].row_id, &node, None)
         .await
         .unwrap_or_else(|e| panic!("[{tag}] Engine::voice_draft: {e}"));
     let voice = vd.assemble(

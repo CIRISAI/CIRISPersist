@@ -146,6 +146,13 @@ fn verify_token_reasons() -> Vec<&'static str> {
         Invalid::KidNotOfIss,
         Invalid::ValidUntilNotAfterAssertedAt,
         Invalid::BodyNumberUnrepresentable,
+        // v62.0.0 (PIN-verify-23.6; CIRISVerify 23.6.0).
+        Invalid::GroupIdNotOfFounding,
+        Invalid::TrustedThroughTooMany,
+        Invalid::KeepsCitesNoEnd,
+        Invalid::AckNamesTooMany,
+        Invalid::TrustAcceptsClassesMalformed,
+        Invalid::TrustAcceptsDepthOutOfRange,
     ]
     .iter()
     .filter_map(Invalid::token)

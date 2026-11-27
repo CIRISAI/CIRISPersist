@@ -459,7 +459,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // withdraws gate's; this fails only on storage.
     ("after_withdraws", Class::Plumbing),
     ("occurrence_withdrawal_of", Class::Plumbing),
-    ("put_identity_occurrence_revocation_local", Class::Plumbing),
+    (
+        "put_identity_occurrence_revocation_edition2",
+        Class::Plumbing,
+    ),
     ("sqlite_sync_key_record_row", Class::Plumbing),
     ("sqlite_sync_occurrence_row", Class::Plumbing),
     ("sqlite_drop_key_record_rows", Class::Plumbing),
@@ -903,10 +906,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_reseal_admission", Class::Gate),
     ("check_reseal_seal_admission", Class::Gate),
     ("check_reserved_prefix_admission", Class::Gate),
-    // v61.1.0 (CIRISPersist#1174 item 3, as ruled) — the CC 3.4.3 substrate
-    // self-report attester, asked beside the reserved-prefix gate with its
-    // door: a refusal at the local door, reported at a peer's.
-    ("check_substrate_self_report_attester_at", Class::Gate),
+    // v61.1.0 (CIRISPersist#1174 item 3) — the CC 3.4.3 substrate
+    // self-report attester at the local-tier door (v62.0.0, D1: enforced at
+    // every door; the others ask it inside `check_reserved_prefix_admission`).
+    ("check_substrate_self_report_attester", Class::Gate),
     ("check_revocation_authority", Class::Gate),
     ("check_revocation_bound", Class::Gate),
     ("check_revocation_envelope_binding", Class::Gate),
@@ -1031,10 +1034,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("from_str", Class::Plumbing),
     ("from_value", Class::Plumbing),
     ("from_wire_str", Class::Plumbing),
-    // v59.0.0 (CIRISPersist#1099) — the self-roster door: refuses (holds) a
-    // roster change one key of two or more signed.
-    ("gate_occurrence", Class::Gate),
-    ("gate_withdrawal", Class::Gate),
     ("get", Class::Plumbing),
     ("get_attestation", Class::Delegates),
     ("get_client", Class::Delegates),
@@ -1976,9 +1975,10 @@ mod tests {
             "put_identity_occurrence",
             "put_identity_occurrence_planned",
         ),
+        // v62.0.0 (WD-fix9) — the retired trusted-local write, a TEST seam.
         (
             "FederationDirectory",
-            "put_identity_occurrence_local",
+            "test_seam_put_identity_occurrence",
             "put_identity_occurrence_local_planned",
         ),
         // v61 (CIRISPersist#934, S4b) — the transport-destination writes.

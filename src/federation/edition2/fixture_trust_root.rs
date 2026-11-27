@@ -1,84 +1,61 @@
-//! v62.0.0 (wave W1b) — **a ROOTED edition-2 trust root**, stood up through
-//! the doors a node uses (CC 3.2 T2/T3, CC 4.4.3.34):
+//! v62.0.0 — **a node ROOTED under the genesis bundle**, stood up through the
+//! doors a node uses (CC 3.2 T3–T6).
+//!
+//! THE ROOT IS THE BUNDLE'S LINEAGE (CC 3.2 T5, "The root is the bundle's
+//! lineage"): it is named by the bundle's `family_key_id`, its charter is the
+//! bundle's `charter` member, its conferring roster is the bundle's
+//! `holders`. "There is no other kind of root. A key that signs a charter
+//! about itself is no root." So this fixture founds no root community and
+//! signs no charter row (LEAD-root1; the earlier W1b form did both, under a
+//! key whose id was also the community's):
 //!
 //! 1. the genesis bundle in force (`fixture_genesis::install_v2` when none is
 //!    held);
-//! 2. the root's key: an identity-ref (`e2::kid(ROOT_SEED)`);
-//! 3. an `infrastructure` community at that identity-ref, founded by holders
-//!    of the bundle in force through T1's `group:roster` voices (the birth is
-//!    counted over the bundle's holders, `edition2::trust_root_group`);
-//! 4. the root's `trust:charter:v1` self-edge `delegates_to(root → root)`,
-//!    scope `infra:serve` + `infra:attest`, with a pre-rotation commitment
-//!    over a successor key's material;
-//! 5. THIS node's `trust:accepts:v1` edge `delegates_to(node → root)`, naming
-//!    the root's held head (CC 3.2 T4a).
+//! 2. THIS node's `trust:accepts:v1` edge to the lineage, attached on the
+//!    bundle in force (`attached_head_digest`, CC 3.2 T4a);
+//! 3. on request ([`put_conferral`]), a grant from the root: a
+//!    `trust:confers:v1` row COUNTED over the holders of the bundle in force,
+//!    naming that bundle in `refs.head`, and the grantee's acceptance.
 //!
-//! Every statement goes through `ingest::put_statement`. See `W1.api.md`.
-//!
-//! **Idempotent per directory** (for the same founders and protocol, while
-//! the bundle in force is the same): every statement is stated at an instant
-//! derived from the bundle in force, so a second call re-puts identical
-//! bytes and returns identical ids. Two directories standing the root up
-//! independently hold byte-identical statements too.
+//! Every statement goes through the statement door. **Idempotent per
+//! directory**: every instant derives from the bundle in force.
 
 use ciris_crypto::composite::CompositeSigningKey;
 use ciris_verify_core::cde::{self, Value};
-use ciris_verify_core::edition2::recovery::recovery_commitment;
-use ciris_verify_core::edition2::sign_row_statement;
+use ciris_verify_core::edition2::{row_ref, sign_row_statement, Digest32};
 use ciris_verify_core::namespace_match;
 
 use super::fixture_genesis;
 use super::fixture_switch as e2;
 use super::genesis::genesis_in_force;
-use super::group::GroupRecord;
-use super::group_fixtures::{put_voices, roster_voices, row_id_of};
-use super::ingest::StatementOutcome;
+use super::group_fixtures::row_id_of;
 use super::names::RowId;
-use crate::federation::types::{Community, CommunityMember};
 use crate::federation::{Error, FederationDirectory};
-
-/// The root's E0 seed: the root's identity-ref is `e2::kid(ROOT_SEED)`.
-pub const ROOT_SEED: &str = "w1-rooted-trust-root";
-
-/// The seed of the successor key the root's charter commits to.
-pub const ROOT_SUCCESSOR_SEED: &str = "w1-rooted-trust-root-successor";
 
 /// What [`rooted_trust_root`] stood up.
 #[derive(Clone, Debug)]
 pub struct RootedTrustRoot {
-    /// The root's identity-ref (the community_key_id, `e2::kid(ROOT_SEED)`).
-    pub root: String,
-    /// The root's E0 seed ([`ROOT_SEED`], or the seed
-    /// [`try_rooted_trust_root_at_seed`] was given): the key that signs the
-    /// root's charter and its grants ([`confers_statement`]).
-    pub root_seed: String,
-    /// The founders' identity-refs, in the order given.
+    /// The root: the LINEAGE of the bundle in force, by its `family_key_id`
+    /// (a name, never a key or a group).
+    pub lineage: String,
+    /// The object id of the bundle in force the node attached on.
+    pub head: Digest32,
+    /// The identity-refs of the holders asked for, in the order given.
     pub founders: Vec<String>,
-    /// The founders' holder seeds, same order ([`Self::founder_key`]).
+    /// Their holder seeds, same order ([`Self::founder_key`]).
     pub founder_seeds: Vec<u8>,
-    /// The `consensus_protocol` the root was founded at.
+    /// The protocol asked for (kept for callers that state it).
     pub protocol: String,
-    /// The founding `group:roster` version's row id.
-    pub birth: RowId,
-    /// The root's `trust:charter:v1` self-edge.
-    pub charter: RowId,
-    /// THIS node's `trust:accepts:v1` edge to the root.
+    /// THIS node's `trust:accepts:v1` edge to the lineage.
     pub acceptance: RowId,
 }
 
 impl RootedTrustRoot {
-    /// Founder `i`'s signing key (its bundle-placed holder key).
+    /// Holder `i`'s signing key (its bundle-placed holder key).
     #[must_use]
     pub fn founder_key(&self, i: usize) -> CompositeSigningKey {
         fixture_genesis::test_key(self.founder_seeds[i])
     }
-}
-
-fn instant(ms: u64) -> chrono::DateTime<chrono::Utc> {
-    i64::try_from(ms)
-        .ok()
-        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-        .expect("fixture_trust_root: an instant")
 }
 
 fn text(s: &str) -> Value {
@@ -115,38 +92,43 @@ fn trust_edge(
     .map_err(|e| refused("sign a trust edge", e))
 }
 
-/// The root's `trust:confers:v1` grant `delegates_to(root → subject)` with
-/// `scope`, stated at `asserted_at_ms`, signed by the root's key. Verify's
-/// rule for the `confers` leaf asks the subject for a second voice
-/// (`delegate: sub`): add it with `e2::voice_of(&st, subject_seed)`.
+/// One voice of the COUNTED root grant of `scope` to `grantee` over the
+/// bundle `head` (CC 3.2 T5: counted over the holders of the bundle in force;
+/// no `author`; `sub` = the grantee; `refs.head` = the bundle's object id).
 ///
 /// # Panics
 /// A signing failure (a fixture).
 #[must_use]
-pub fn confers_statement(
-    r: &RootedTrustRoot,
-    subject: &str,
+pub fn grant_voice(
+    key: &CompositeSigningKey,
+    iss: &str,
+    grantee: &str,
     scope: &[&str],
+    head: &Digest32,
     asserted_at_ms: u64,
 ) -> Vec<u8> {
-    trust_edge(
-        &e2::signing_key(&r.root_seed),
-        &r.root,
-        subject,
-        vec![
-            ("author", text(&r.root)),
-            ("asserted_at", Value::Uint(asserted_at_ms)),
-            (
-                "dimension",
-                text(crate::federation::trust_root::TRUST_CONFERS_DIMENSION),
-            ),
-            (
-                "scope",
-                Value::Array(scope.iter().map(|s| text(s)).collect()),
-            ),
-        ],
+    let payload = map(vec![
+        ("asserted_at", Value::Uint(asserted_at_ms)),
+        (
+            "dimension",
+            text(crate::federation::trust_root::TRUST_CONFERS_DIMENSION),
+        ),
+        ("refs", map(vec![("head", row_ref(head))])),
+        (
+            "scope",
+            Value::Array(scope.iter().map(|s| text(s)).collect()),
+        ),
+    ]);
+    sign_row_statement(
+        key,
+        iss,
+        grantee,
+        crate::federation::types::attestation_type::DELEGATES_TO,
+        &namespace_match::family_id("trust:{job}:{version}"),
+        &payload,
+        vec![],
     )
-    .expect("fixture_trust_root: sign a conferral")
+    .expect("fixture_trust_root: sign a grant voice")
 }
 
 /// [`rooted_trust_root`], returning the first refusal.
@@ -162,53 +144,11 @@ pub async fn try_rooted_trust_root<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    try_rooted_trust_root_at_seed(dir, ROOT_SEED, founders, protocol).await
-}
-
-/// The seed of the successor key the charter of the root at `root_seed`
-/// commits to: `s-` and the first 30 characters of the root's own key
-/// thumbprint (32 bytes, unique per root). Never the root seed with a suffix:
-/// a test signer seeds from the first 32 bytes of its seed name, so a
-/// suffixed long seed would be the root's own key. [`ROOT_SEED`] keeps
-/// [`ROOT_SUCCESSOR_SEED`] (its statements' bytes are unchanged).
-fn successor_seed_of(root_seed: &str) -> String {
-    if root_seed == ROOT_SEED {
-        return ROOT_SUCCESSOR_SEED.to_owned();
-    }
-    let root = e2::kid(root_seed);
-    let thumb = root.rsplit(':').next().unwrap_or(root.as_str());
-    format!("s-{}", &thumb[..thumb.len().min(30)])
-}
-
-/// v62.0.0 (RT-fix1) — **[`try_rooted_trust_root`] with the root at
-/// `root_seed`'s key** instead of [`ROOT_SEED`]: the same five steps, the
-/// same instants (derived from the bundle in force), the same idempotence
-/// per directory and per seed. For a fixture that names its own root (the
-/// shared conferral helper `admission::r2_test_support::
-/// confer_scope_from_trusted_root`), so a root is ROOTED whichever seed names
-/// it: a bare key chartering itself is no trust root a v62 reader trusts.
-///
-/// `root_seed` is a seed, or a kid E0 minted from one. THIS node's acceptance
-/// is stated no earlier than one second after the node's own `key:record`
-/// starts (a node key registered after the bundle's tip signs inside its own
-/// window).
-///
-/// # Errors
-/// As [`try_rooted_trust_root`].
-pub async fn try_rooted_trust_root_at_seed<D>(
-    dir: &D,
-    root_seed: &str,
-    founders: &[u8],
-    protocol: &str,
-) -> Result<RootedTrustRoot, Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    let root_seed = e2::seed_of(root_seed);
-    let root_seed = root_seed.as_str();
     // 1. The genesis bundle in force.
     if !genesis_in_force(dir).await?.is_held() {
-        fixture_genesis::install_v2(dir).await?;
+        // The production-scope charter: the root can then grant what the
+        // production root grants.
+        fixture_genesis::install_ceremony_v2(dir, fixture_genesis::bundle_v2_wide()).await?;
     }
     let in_force = genesis_in_force(dir).await?;
     let mut founder_refs = Vec::with_capacity(founders.len());
@@ -226,178 +166,42 @@ where
         }
         founder_refs.push(iref);
     }
+    let lineage = in_force
+        .family_key_id()
+        .ok_or_else(|| refused("genesis", "no bundle in force"))?
+        .to_owned();
+    let head = in_force
+        .tips()
+        .first()
+        .ok_or_else(|| refused("genesis", "no bundle in force"))?
+        .object_id;
     let Some(node) = dir.node_key_id() else {
         return Err(refused(
             "node",
             "the directory has no node key: set it first (set_node_key_id(e2::put_key(..)))",
         ));
     };
-    // W1-fix2 — the node signs THIS node's acceptance edge, so its edition-2
-    // key must be live first (a caller that set the node key without putting
-    // its `key:record` met the door's retryable unknown-signer wait).
+    // The node signs THIS node's acceptance edge, so its edition-2 key must
+    // be live first.
     ensure_live_key(dir, &node, &["node"]).await?;
 
-    // 2. The root's key.
-    // (RT-fix1: a root key the caller already registered is kept as held.)
-    let root = e2::kid(root_seed);
-    if root_seed == ROOT_SEED || dir.lookup_public_key(&root).await?.is_none() {
-        e2::put_key(dir, root_seed, &["user"]).await;
-    }
-
-    // 3. The founding. IDEMPOTENT per directory: every instant derives from
-    // the bundle in force (one minute after its newest tip), so a second call
-    // with the same founders and protocol re-puts byte-identical statements,
-    // each a no-op (`Row`/`Voice { new: false }`), and returns the same ids.
-    let at = in_force
-        .tips()
-        .iter()
-        .map(|t| t.asserted_at)
-        .max()
-        .ok_or_else(|| refused("genesis", "no bundle in force"))?
-        + 60_000;
-    let founded_at = instant(at - 30_000);
-    let community = Community {
-        community_key_id: root.clone(),
-        community_name: if root_seed == ROOT_SEED {
-            "w1b rooted trust root".to_owned()
-        } else {
-            format!("w1b rooted trust root {root}")
-        },
-        members: founder_refs
-            .iter()
-            .map(|f| CommunityMember {
-                key_id: f.clone(),
-                joined_at: founded_at,
-                role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
-            })
-            .collect(),
-        founded_at,
-        consensus_protocol: protocol.to_owned(),
-        policy_blob: Some(serde_json::json!({
-            "cohort_subkind": crate::federation::canonical_community::COHORT_SUBKIND_INFRASTRUCTURE,
-            "cohort_subkind_payload": {
-                "infrastructure_constraint": {
-                    "admission_quorum_basis":
-                        crate::federation::canonical_community::ADMISSION_QUORUM_BASIS_FOUNDERS,
-                },
-            },
-            "consensus_protocol_entrenched": true,
-        })),
-        prev_head_digest: String::new(),
-        charter_digest: String::new(),
-        persist_row_hash: String::new(),
-    };
-    let keys: Vec<CompositeSigningKey> = founders
-        .iter()
-        .map(|s| fixture_genesis::test_key(*s))
-        .collect();
-    let key_refs: Vec<&CompositeSigningKey> = keys.iter().collect();
-    let voices = roster_voices(&GroupRecord::Community(community), 1, None, at, &key_refs);
-    let birth = row_id_of(&voices[0]);
-    let charter = charter_statement(root_seed, &root, at)?;
-    // RT-fix1 — the node's acceptance, inside the node's own key window.
-    let accept_at = match dir.lookup_public_key(&node).await? {
-        Some(rec) => at.max(e2::ms(rec.valid_from).saturating_add(1_000)),
-        None => at,
-    };
-
-    // A second call: the root this directory already holds is RETURNED, never
-    // re-founded. A root held at ROOT_SEED that another call founded with
-    // other founders or another protocol is refused (it would fork).
-    if let Some(held) = dir.lookup_community(&root).await? {
-        if dir.edition2_voices(&birth).await?.is_empty() {
-            return Err(refused(
-                "founding",
-                "a root founded with other founders or another protocol is already held at \
-                 this root seed",
-            ));
-        }
-        let acceptance = acceptance_statement(&node, &root, &held.persist_row_hash, accept_at)?;
-        if dir
-            .get_attestation(&row_id_of(&charter).hex())
-            .await?
-            .is_some()
-            && dir
-                .get_attestation(&row_id_of(&acceptance).hex())
-                .await?
-                .is_some()
-        {
-            return Ok(RootedTrustRoot {
-                root,
-                root_seed: root_seed.to_owned(),
-                founders: founder_refs,
-                founder_seeds: founders.to_vec(),
-                protocol: protocol.to_owned(),
-                birth,
-                charter: row_id_of(&charter),
-                acceptance: row_id_of(&acceptance),
-            });
-        }
-    }
-    match put_voices(dir, &voices).await? {
-        StatementOutcome::Row { .. } => {}
-        other => return Err(refused("founding", format!("did not land: {other:?}"))),
-    }
-
-    // 4. The root's charter self-edge.
-    e2::put_statement(dir, &charter).await?;
-    require_concluded(dir, "charter", &row_id_of(&charter)).await?;
-
-    // 5. THIS node's acceptance edge, naming the held head.
-    let head = dir
-        .lookup_community(&root)
-        .await?
-        .ok_or_else(|| refused("acceptance", "the root is not held"))?
-        .persist_row_hash;
-    let acceptance = acceptance_statement(&node, &root, &head, accept_at)?;
+    // 2. THIS node's acceptance of the lineage, attached on the bundle in
+    // force. (The node's own edge: CC 3.2 T3 reads it for that node while its
+    // owner has signed none.)
+    let acceptance =
+        bundle_acceptance_statement(dir, &e2::signing_key(&node), &node, &hex::encode(head))
+            .await?;
     e2::put_statement(dir, &acceptance).await?;
     require_concluded(dir, "acceptance", &row_id_of(&acceptance)).await?;
 
     Ok(RootedTrustRoot {
-        root,
-        root_seed: root_seed.to_owned(),
+        lineage,
+        head,
         founders: founder_refs,
         founder_seeds: founders.to_vec(),
         protocol: protocol.to_owned(),
-        birth,
-        charter: row_id_of(&charter),
         acceptance: row_id_of(&acceptance),
     })
-}
-
-/// The `trust:charter:v1` self-edge of the root at `root_seed`, at `at`.
-fn charter_statement(root_seed: &str, root: &str, at: u64) -> Result<Vec<u8>, Error> {
-    let successor = e2::signing_key(&successor_seed_of(root_seed));
-    let commitment = recovery_commitment(&[successor.public_key().clone()]);
-    trust_edge(
-        &e2::signing_key(root_seed),
-        root,
-        root,
-        vec![
-            ("author", text(root)),
-            ("asserted_at", Value::Uint(at)),
-            (
-                "dimension",
-                text(crate::federation::trust_root::TRUST_CHARTER_DIMENSION),
-            ),
-            (
-                "scope",
-                Value::Array(vec![
-                    text(crate::federation::trust_root::INFRA_SERVE_SCOPE),
-                    text(crate::federation::trust_root::INFRA_ATTEST_SCOPE),
-                ]),
-            ),
-            (
-                crate::federation::trust_root::CHARTER_PRE_ROTATION_FIELD,
-                Value::Bytes(commitment.to_vec()),
-            ),
-        ],
-    )
-}
-
-/// `node`'s `trust:accepts:v1` edge to `root`, naming the head `head_hex`.
-fn acceptance_statement(node: &str, root: &str, head_hex: &str, at: u64) -> Result<Vec<u8>, Error> {
-    acceptance_statement_by(&e2::signing_key(node), node, root, head_hex, at)
 }
 
 /// `iss`'s `trust:accepts:v1` edge to `root` signed by `key`, naming the head
@@ -498,14 +302,12 @@ pub fn root_acceptance_statement(
     trust_edge(key, iss, root, members)
 }
 
-/// **Another party accepts the root**: `iss`'s `trust:accepts:v1` edge to
-/// `r.root`, signed by `key` (e.g. a bundle seat's
-/// `fixture_genesis::test_key(seed)` signing as its identity-ref), naming the
-/// held head, stated at the bundle's newest tip + 60 s (idempotent). Returns
-/// the edge's row id.
+/// **Another party accepts the root**: `iss`'s `trust:accepts:v1` edge to the
+/// lineage, signed by `key`, attached on the bundle in force (idempotent).
+/// Returns the edge's row id.
 ///
 /// # Errors
-/// The root not held, or the door's refusal.
+/// No bundle in force, or the door's refusal.
 pub async fn put_acceptance<D>(
     dir: &D,
     r: &RootedTrustRoot,
@@ -515,13 +317,7 @@ pub async fn put_acceptance<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    let head = dir
-        .lookup_community(&r.root)
-        .await?
-        .ok_or_else(|| refused("acceptance", "the root is not held"))?
-        .persist_row_hash;
-    let at = conferral_instant(dir).await? - 30_000;
-    let st = acceptance_statement_by(key, iss, &r.root, &head, at)?;
+    let st = bundle_acceptance_statement(dir, key, iss, &hex::encode(r.head)).await?;
     e2::put_statement(dir, &st).await?;
     require_concluded(dir, "acceptance", &row_id_of(&st)).await?;
     Ok(row_id_of(&st))
@@ -585,37 +381,196 @@ where
         + 90_000)
 }
 
-/// **The root confers `scope` on `subject_seed`'s key** (a room's key, or any
-/// key E0 minted): the root's `trust:confers:v1` grant
-/// ([`confers_statement`]) and then the subject's own second voice, which
-/// Verify's `confers` rule requires (`delegate: sub`, CC 2.6.1.9). The
-/// subject's key is registered first (`user`). Idempotent. Returns the
-/// grant's row id.
+/// **The root confers `scope` on `subject_seed`'s key**: the grant COUNTED
+/// over holders 0 and 1 of the bundle in force ([`grant_voice`]), then the
+/// grantee's own acceptance through the real producer
+/// (`membership_acceptance::reply_input`), dated 1 ms after the grant, or
+/// after a machine grantee's owner binding ([`acceptance_instant`], v62.0.0
+/// DUTY-D6-fx). The subject's key is registered
+/// first (`user`) when it is not held. Idempotent. Returns the grant's row
+/// id.
 ///
 /// # Errors
-/// Either voice's refusal.
-pub async fn put_conferral<D>(
-    dir: &D,
+/// Either voice's refusal, or the acceptance's.
+pub async fn put_conferral(
+    dir: &dyn FederationDirectory,
     r: &RootedTrustRoot,
     subject_seed: &str,
     scope: &[&str],
-) -> Result<RowId, Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    let subject = e2::put_key(dir, subject_seed, &["user"]).await;
-    let at = conferral_instant(dir).await?;
-    let grant = confers_statement(r, &subject, scope, at);
-    e2::put_statement(dir, &grant).await?;
-    e2::put_statement(dir, &e2::voice_of(&grant, subject_seed)).await?;
-    require_concluded(dir, "conferral", &row_id_of(&grant)).await?;
-    Ok(row_id_of(&grant))
+) -> Result<RowId, Error> {
+    put_conferral_accepted_by(dir, r, subject_seed, scope, subject_seed).await
 }
 
-/// **Stand up a ROOTED edition-2 trust root** (module doc; `W1.api.md`).
+/// [`put_conferral`] where `acceptor_seed` gives the consent (a machine
+/// grantee's OWNER accepts for it).
+///
+/// # Errors
+/// As [`put_conferral`].
+pub async fn put_conferral_accepted_by(
+    dir: &dyn FederationDirectory,
+    r: &RootedTrustRoot,
+    subject_seed: &str,
+    scope: &[&str],
+    acceptor_seed: &str,
+) -> Result<RowId, Error> {
+    let subject = e2::kid(subject_seed);
+    if dir.lookup_public_key(&subject).await?.is_none() {
+        e2::put_key(dir, subject_seed, &["user"]).await;
+    }
+    let at = conferral_instant(dir).await?;
+    let c = fixture_genesis::bundle_v2();
+    let v0 = grant_voice(
+        &c.holder_key(0),
+        c.holder_identity_ref(0),
+        &subject,
+        scope,
+        &r.head,
+        at,
+    );
+    let id = row_id_of(&v0);
+    let v1 = grant_voice(
+        &c.holder_key(1),
+        c.holder_identity_ref(1),
+        &subject,
+        scope,
+        &r.head,
+        at,
+    );
+    e2::put_statement(dir, &v0).await?;
+    e2::put_statement(dir, &v1).await?;
+    require_concluded(dir, "conferral", &id).await?;
+    let grant = dir
+        .get_attestation(&id.hex())
+        .await?
+        .ok_or_else(|| refused("conferral", "the grant is not held"))?;
+    let already = crate::federation::admission::root_grants_for(
+        dir,
+        &subject,
+        crate::host::clock::now() + chrono::Duration::seconds(1),
+    )
+    .await?
+    .into_iter()
+    .any(|g| g.row_id == grant.attestation_id && g.accepted);
+    if !already {
+        let signer = crate::federation::tier_ingest::test_support::local_signer(acceptor_seed);
+        // v62.0.0 (DUTY-D6-fx; KR-fix19 "an act is judged at its own signed
+        // instant", `membership_acceptance::root_grant_acceptance_for`: an
+        // acceptance counts at `t` only when `asserted_at <= t`) — the
+        // grantee's consent is dated at the GRANT's instant + 1 ms, not at
+        // the wall clock. Dated at the clock, every act a fixture states
+        // after the grant but before the moment the fixture ran (a detection
+        // at the grant + 60 s, an age row "now − 4 min") read the grant as
+        // not yet accepted at its own instant, and was held
+        // `reserved_prefix_emitter_mismatch` (VD-triage16, 24 + 5).
+        //
+        // A MACHINE grantee's acceptance is its owner's consent as bound at
+        // the acceptance's own instant (KR-fix28), so it is never dated
+        // before that binding ([`acceptance_instant`]).
+        // v62.0.0 (DUTY-D7a) — the acceptance cites the grantee's
+        // federation-placed owner binding (a machine), through the producer.
+        //
+        // A machine whose owner placed its binding only at `self` (an agent's
+        // first binding, BIND-1) has no federation row: the fixture then NAMES
+        // the binding in force (`owner_binding_ref`, the caller's stated
+        // choice), which every witness store here holds.
+        let mut reply = match crate::federation::membership_acceptance::root_grant_reply_input(
+            dir, &grant, true, None,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let crate::federation::admission::MachineOwner::Bound { bindings, .. } =
+                    crate::federation::admission::machine_owner_binding_at(
+                        dir,
+                        &subject,
+                        crate::host::clock::now(),
+                    )
+                    .await?
+                else {
+                    return Err(e);
+                };
+                let Some(first) = bindings.first() else {
+                    return Err(e);
+                };
+                crate::federation::membership_acceptance::root_grant_reply_input(
+                    dir,
+                    &grant,
+                    true,
+                    Some(first),
+                )
+                .await?
+            }
+        };
+        if let Some(accepted_at) = acceptance_instant(dir, &subject, at).await? {
+            reply.attestation_envelope.asserted_at = Some(
+                crate::federation::admission::render_signed_instant(accepted_at),
+            );
+        }
+        crate::federation::attestation_emit::emit_with_local_signer(dir, &signer, reply).await?;
+    }
+    Ok(id)
+}
+
+/// v62.0.0 (DUTY-D6-fx) — **the instant [`put_conferral_accepted_by`] dates
+/// the acceptance of a grant stated at `grant_at_ms`**: 1 ms after the grant.
+/// For a MACHINE grantee whose owner is bound only later (KR-fix28: its
+/// acceptance is the owner's consent as bound at the acceptance's own
+/// instant), it is 1 ms after the earliest of the owner bindings in force
+/// now, when the owner is bound at that instant and it is before the clock.
+/// `None`: no such instant (a machine with no owner bound even now, or a
+/// binding this read cannot date). The acceptance then keeps the clock (the
+/// earlier dating).
+///
+/// # Errors
+/// Directory reads; an instant out of range.
+async fn acceptance_instant(
+    dir: &dyn FederationDirectory,
+    subject: &str,
+    grant_at_ms: u64,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error> {
+    use crate::federation::admission::{machine_owner_binding_at, MachineOwner};
+    let at_ms = |ms: u64| -> Result<chrono::DateTime<chrono::Utc>, Error> {
+        i64::try_from(ms)
+            .ok()
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            .ok_or_else(|| refused("conferral", "an instant out of range"))
+    };
+    let after_grant = at_ms(grant_at_ms + 1)?;
+    match machine_owner_binding_at(dir, subject, after_grant).await? {
+        MachineOwner::NotAMachine | MachineOwner::Bound { .. } => return Ok(Some(after_grant)),
+        MachineOwner::Unbound => {}
+    }
+    let now = crate::host::clock::now();
+    let MachineOwner::Bound { bindings, .. } = machine_owner_binding_at(dir, subject, now).await?
+    else {
+        return Ok(None);
+    };
+    let mut first: Option<chrono::DateTime<chrono::Utc>> = None;
+    for b in &bindings {
+        if let Some(row) = dir.get_attestation(b).await? {
+            first = Some(first.map_or(row.asserted_at, |f| f.min(row.asserted_at)));
+        }
+    }
+    let Some(first) = first else {
+        return Ok(None);
+    };
+    let bound_ms = u64::try_from(first.timestamp_millis())
+        .map_err(|_| refused("conferral", "an instant out of range"))?;
+    let candidate = at_ms(bound_ms + 1)?.max(after_grant);
+    if candidate >= now {
+        return Ok(None);
+    }
+    Ok(matches!(
+        machine_owner_binding_at(dir, subject, candidate).await?,
+        MachineOwner::Bound { .. }
+    )
+    .then_some(candidate))
+}
+
+/// **Stand a node up ROOTED under the genesis bundle** (module doc).
 ///
 /// `founders`: holder seeds of the bundle in force (`bundle_v2()`: 1, 2, 3).
-/// `protocol`: `quorum:M/N` with `founders.len() >= M + 1`.
 /// Precondition: `dir.node_key_id()` is a kid E0 minted in this process.
 ///
 /// # Panics

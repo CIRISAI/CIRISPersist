@@ -64,6 +64,7 @@ pub mod bodies {
             reason: None,
             witness_set: vec![],
             persist_row_hash: String::new(),
+            leaf: crate::federation::types::RevocationLeaf::Removal,
         }
     }
 
@@ -287,6 +288,9 @@ pub mod bodies {
             None,
             ms_ago(30),
         );
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let fam = crate::federation::edition2::fixture_switch::room_id(&fam);
         let r = put_all(a, &founding).await;
         assert!(landed(&r), "{tag}: family {fam}: {r:?}");
         rows.push(e2::row_id_of(&founding[0]));
@@ -645,7 +649,12 @@ pub mod bodies {
         // The last founder may not leave ...
         let r = put_all(
             d,
-            &revocation_voices(d, &[&k[0]], revocation(&fo, &k[0], at_ago(19))).await,
+            &revocation_voices(
+                d,
+                &[&k[0]],
+                revocation(&fo, &k[0], at_ago(19)).as_resignation(),
+            )
+            .await,
         )
         .await;
         assert!(
@@ -683,7 +692,12 @@ pub mod bodies {
         // ... and then she may.
         let r = put_all(
             d,
-            &revocation_voices(d, &[&k[0]], revocation(&fo, &k[0], at_ago(17))).await,
+            &revocation_voices(
+                d,
+                &[&k[0]],
+                revocation(&fo, &k[0], at_ago(17)).as_resignation(),
+            )
+            .await,
         )
         .await;
         assert!(
@@ -730,7 +744,12 @@ pub mod bodies {
         );
         let r = put_all(
             d,
-            &revocation_voices(d, &[&m[2]], revocation(&mj, &m[2], at_ago(15))).await,
+            &revocation_voices(
+                d,
+                &[&m[2]],
+                revocation(&mj, &m[2], at_ago(15)).as_resignation(),
+            )
+            .await,
         )
         .await;
         assert!(
@@ -781,7 +800,12 @@ pub mod bodies {
         .await;
         let r = put_all(
             d,
-            &revocation_voices(d, &[&q[2]], revocation(&qf, &q[2], at_ago(22))).await,
+            &revocation_voices(
+                d,
+                &[&q[2]],
+                revocation(&qf, &q[2], at_ago(22)).as_resignation(),
+            )
+            .await,
         )
         .await;
         assert!(landed(&r), "{tag} I179: q3 leaves: {r:?}");

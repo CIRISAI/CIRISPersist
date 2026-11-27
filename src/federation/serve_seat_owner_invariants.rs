@@ -27,9 +27,10 @@
 //!   unstewarded `agent` member is HELD `unstewarded_community_member`
 //!   (the door's `UnstewardedCommunityMember`, a fold condition) and nothing
 //!   is stored; the same room with only its unstewarded `node` member lands.
-//! - **I3113** — an unowned seat's own `hard_case:*` statement is admitted
-//!   and held: the rule withholds serve standing, never the node's
-//!   accountability records.
+//! - **I3113** — an unowned seat's own `hard_case:*` names no head and is
+//!   not kept (`act_names_no_head`, Constitution's ruling (a)); once its
+//!   owner's binding lands, a NEW row naming the binding as its head
+//!   concludes.
 //!
 //! Mutations: drop `serve_seat_owner_announced` from `serves_under_seat` and
 //! I3110 reds; make `seat_serve_standing` ignore the identity-ref branch and
@@ -67,12 +68,27 @@ pub(crate) mod bodies {
     /// the seat. Synchronous, so the multi-KiB composite key never crosses an
     /// `.await` (the 2 MiB test-thread stack).
     fn seat_signed(statement: &[u8], i: usize) -> Vec<u8> {
+        seat_signed_naming(statement, i, None)
+    }
+
+    /// [`seat_signed`], with `head` joined into the payload's `refs`
+    /// (`head_rule::with_head`) when given (HEAD-fix3b, I3113).
+    fn seat_signed_naming(
+        statement: &[u8],
+        i: usize,
+        head: Option<&crate::federation::edition2::names::RowId>,
+    ) -> Vec<u8> {
         let c = fg::bundle_v2();
         let key = Box::new(c.serve_node_key(i));
         let iss = c.serve_node_identity_ref(i).to_owned();
         let (protected, payload) =
             crate::federation::edition2::liveness::statement_parts(statement)
                 .expect("a row statement");
+        let payload = match head {
+            Some(h) => crate::federation::edition2::head_rule::with_head(payload, h)
+                .expect("the payload's refs join a head"),
+            None => payload,
+        };
         let header = |label: i64| -> String {
             protected
                 .get_int(label)
@@ -372,48 +388,86 @@ pub(crate) mod bodies {
             .is_some());
     }
 
-    /// **I3113** — an unowned seat states a `hard_case:*` about itself at
-    /// `federation` scope; the statement is admitted and held, and the seat
-    /// still has no serve standing.
-    pub async fn i3113_an_unowned_seats_hard_case_still_admits(d: &dyn FederationDirectory) {
+    /// **I3113** (v62.0.0, rewritten by HEAD-fix3b; Constitution's ruling
+    /// (a), "AN UNOWNED SERVE SEAT'S OWN REPORT"; CC 4.2: a node holds
+    /// `infra:attest` for its own reports FROM ITS OWNER, and "a canonical
+    /// seat is no exception") — an UNOWNED seat's own `hard_case:*` at
+    /// `federation` names no head and is NOT KEPT (`act_names_no_head`): it
+    /// counts for nobody, and the seat still does not serve. Once its owner's
+    /// binding lands, the seat signs a NEW row naming that binding as its
+    /// head, and that row concludes. (The earlier body, "an unowned seat's
+    /// own hard_case is admitted and held", witnessed the model before the
+    /// head rule.)
+    pub async fn i3113_an_unowned_seats_hard_case_concludes_nothing(d: &dyn FederationDirectory) {
+        use crate::federation::edition2::names::RowId;
         install(d).await;
         let seat = fg::bundle_v2().serve_node_identity_ref(0).to_owned();
         let at = now_ms();
-        let ev = HardCaseEvent {
-            event_id: "i3113-ev".to_owned(),
-            kind: hard_case::kind::LINEAGE_EQUIVOCATION.to_owned(),
-            target_key_id: None,
-            subject_key_id: None,
-            detail: serde_json::json!({ "heads": 2 }),
-            emitted_at: at,
-            emitter_key_id: String::new(),
-        };
-        let statement = {
+        // The seat's own hard case, as its producer signs it; `head` joined
+        // into `refs` when given.
+        let report = |event_id: &str, head: Option<&RowId>| -> Vec<u8> {
+            let ev = HardCaseEvent {
+                event_id: event_id.to_owned(),
+                kind: hard_case::kind::LINEAGE_EQUIVOCATION.to_owned(),
+                target_key_id: None,
+                subject_key_id: None,
+                detail: serde_json::json!({ "heads": 2 }),
+                emitted_at: at,
+                emitter_key_id: String::new(),
+            };
             let mut envelope = hard_case::hard_case_envelope(&ev).expect("envelope");
             // The seat is the author `hard_case:*` commits to (an authored
             // family): the statement is the seat's own.
             envelope["author"] = serde_json::Value::String(seat.clone());
-            let mut literal = { ts::bare_attestation("unused", "i3113-scribe", &seat, &envelope) };
+            let mut literal = ts::bare_attestation("unused", "i3113-scribe", &seat, &envelope);
             literal.attestation_type = attestation_type::SCORES.to_owned();
             literal.asserted_at = at;
             literal.scrub_timestamp = at;
-            seat_signed(&e2::statement_of(&literal, "i3113-scribe"), 0)
+            seat_signed_naming(&e2::statement_of(&literal, "i3113-scribe"), 0, head)
         };
-        e2::put_statement(d, &statement)
+
+        // Unowned: not kept, counts for nobody.
+        let unowned = report("i3113-ev", None);
+        let e = e2::put_statement(d, &unowned)
             .await
-            .expect("I3113: an unowned seat's own hard_case statement is admitted");
-        let id = crate::federation::edition2::names::RowId::of_statement(&statement)
-            .expect("a row id")
-            .hex();
-        let held = d
-            .get_attestation(&id)
-            .await
-            .unwrap()
-            .expect("I3113: the statement is held");
-        assert_eq!(held.attesting_key_id, seat, "I3113: signed by the seat");
+            .expect_err("I3113: an unowned seat's hard case names no head");
+        assert!(
+            matches!(
+                &e,
+                crate::federation::Error::MalformedRow { reason, .. }
+                    if *reason == crate::federation::malformed_row::ACT_NAMES_NO_HEAD
+            ),
+            "I3113: not kept, act_names_no_head: {e:?}"
+        );
+        let id = RowId::of_statement(&unowned).expect("a row id");
+        assert!(
+            d.get_attestation(&id.hex()).await.unwrap().is_none(),
+            "I3113: nothing of the row is kept"
+        );
         assert!(
             !serves_under_seat(d, &seat).await.unwrap(),
-            "I3113: and the seat still does not serve: standing is withheld, rows are not"
+            "I3113: and the unowned seat does not serve"
+        );
+
+        // Owned: a NEW row naming the owner binding concludes.
+        announce_seat(d, 0, "i3113-owner").await;
+        let head = crate::federation::edition2::head_rule::owner_binding_row(d, &seat, false, 0)
+            .await
+            .expect("I3113: the owner read")
+            .expect("I3113: the seat is owned once announced");
+        let owned = report("i3113-ev-owned", Some(&head));
+        e2::put_statement(d, &owned)
+            .await
+            .expect("I3113: the owned seat's hard case naming its binding is admitted");
+        let held = d
+            .get_attestation(&RowId::of_statement(&owned).expect("a row id").hex())
+            .await
+            .unwrap()
+            .expect("I3113: the new row concludes");
+        assert_eq!(held.attesting_key_id, seat, "I3113: signed by the seat");
+        assert!(
+            d.get_attestation(&id.hex()).await.unwrap().is_none(),
+            "I3113: the headless row is still not kept: only the new row counts"
         );
     }
 }
@@ -450,7 +504,7 @@ mod run {
                 #[tokio::test]
                 async fn i3113() {
                     let Some(d) = $fresh.await else { return };
-                    bodies::i3113_an_unowned_seats_hard_case_still_admits(
+                    bodies::i3113_an_unowned_seats_hard_case_concludes_nothing(
                         &d as &dyn FederationDirectory,
                     )
                     .await

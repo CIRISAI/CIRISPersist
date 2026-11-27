@@ -45,8 +45,80 @@ const DAY_MS: u64 = 86_400_000;
 /// Put the seed-named fixture key `seed` on `dir` as an **agent** key (its
 /// self-signed edition-2 `key:record`, the default agent window), returning
 /// its identity-ref: the `iss` every trace row it signs carries.
+///
+/// v62.0.0 (HEAD-fix1; CC 2.4.1.1, the unowned-machine ruling) — the agent
+/// is OWNED: a fixture owner key (`{seed}-trace-owner`, a person) and the
+/// agent owner binding, at the agent key's window start, are put beside it.
+/// An agent's trace names that binding as its `refs.head`; an unowned agent
+/// signs nothing. [`sign_agent_trace`] states it ([`agent_trace_head`]).
+/// Putting the same seed on a second node puts the same binding row.
 pub async fn put_agent_trace_key<D: FederationDirectory + ?Sized>(dir: &D, seed: &str) -> String {
-    e2::put_key(dir, seed, &[crate::federation::types::identity_type::AGENT]).await
+    use crate::federation::types::identity_type;
+    let iss = e2::put_key(dir, seed, &[identity_type::AGENT]).await;
+    let owner = format!("{seed}-trace-owner");
+    e2::put_key(dir, &owner, &[identity_type::USER]).await;
+    let at_ms = e2::key_window_start_ms(seed);
+    // Idempotent: a second call for a seed already owned on `dir` (one agent
+    // signing on several backends, or twice on one) puts nothing again.
+    let owned = crate::federation::admission::agent_owner_of(dir, &iss, at_ms)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    if !owned {
+        crate::federation::edition2::fixture_occurrence::put_agent_owner_binding(
+            dir, &owner, seed, at_ms,
+        )
+        .await;
+    }
+    owned_agents()
+        .lock()
+        .expect("owned agents")
+        .insert(iss.clone(), (owner, seed.to_owned(), at_ms));
+    iss
+}
+
+/// The agents [`put_agent_trace_key`] owned: identity-ref → (owner seed,
+/// agent seed, binding instant ms).
+fn owned_agents(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, String, u64)>> {
+    static OWNED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (String, String, u64)>>,
+    > = std::sync::OnceLock::new();
+    OWNED.get_or_init(Default::default)
+}
+
+/// v62.0.0 (HEAD-fix1; CC 2.4.1.1) — **the head an agent's trace names**:
+/// the row id of the owner binding [`put_agent_trace_key`] put for the agent
+/// whose identity-ref is `iss`, or `None` for an agent no such call owned.
+#[must_use]
+pub fn agent_trace_head(iss: &str) -> Option<crate::federation::edition2::names::RowId> {
+    let (owner, agent, at_ms) = owned_agents()
+        .lock()
+        .expect("owned agents")
+        .get(iss)
+        .cloned()?;
+    Some(
+        crate::federation::edition2::fixture_occurrence::agent_owner_binding_row_id(
+            &owner, &agent, at_ms,
+        ),
+    )
+}
+
+/// v62.0.0 (HEAD-fix1) — `payload` naming [`agent_trace_head`]`(iss)` as its
+/// `refs.head`, when that agent was owned here; unchanged otherwise.
+///
+/// # Errors
+/// `IngestError::Sign` for a malformed `refs`.
+pub fn with_agent_trace_head(
+    iss: &str,
+    payload: ciris_verify_core::cde::Value,
+) -> Result<ciris_verify_core::cde::Value, IngestError> {
+    match agent_trace_head(iss) {
+        Some(h) => crate::federation::edition2::head_rule::with_head(payload, &h)
+            .map_err(|e| IngestError::Sign(format!("trace row head: {e}"))),
+        None => Ok(payload),
+    }
 }
 
 /// The instant (ms) a trace signed by `seed` is dated at: the agent key's own
@@ -125,6 +197,8 @@ pub fn sign_agent_trace_with(
     let parsed: CompleteTrace =
         serde_json::from_slice(&trace_blob).map_err(|e| IngestError::Schema(e.into()))?;
     let payload = trace_row_payload(&parsed, &trace_blob, &iss)?;
+    // v62.0.0 (HEAD-fix1) — the head the agent acts at (its owner binding).
+    let payload = with_agent_trace_head(&iss, payload)?;
     let statement = sign_row_statement(
         key,
         &iss,

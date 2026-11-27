@@ -2959,6 +2959,13 @@ where
 ///
 /// # Errors
 /// As above; directory reads.
+tokio::task_local! {
+    /// v62.0.0 (DUTY-D7) — set while [`conferred_for_act`] walks for an ACT:
+    /// the bundle-root arm of the walk is skipped (a root grant confers on an
+    /// act by naming only); outside it the arm is the live-state READING.
+    static ACT_WALK: ();
+}
+
 pub async fn conferred_for_act<F>(
     directory: &F,
     user_key_id: &str,
@@ -2970,13 +2977,31 @@ pub async fn conferred_for_act<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let Some(at_signed) =
-        capability_roots_to_trusted_root(directory, user_key_id, signer, scope, act_at).await?
+    // v62.0.0 (DUTY-D7; Constitution "confers-by-naming") — a ROOT GRANT
+    // confers on an act only BY NAMING
+    // (`edition2::conferral_naming::confers_on_act`, asked by the doors
+    // beside this walk): this act walk reads the other planes alone.
+    let Some(at_signed) = ACT_WALK
+        .scope(
+            (),
+            capability_roots_to_trusted_root(directory, user_key_id, signer, scope, act_at),
+        )
+        .await?
     else {
         return Ok(None);
     };
     if super::self_roster::outside_past_freshness_window(act_at, received_at)
-        && capability_roots_to_trusted_root(directory, user_key_id, signer, scope, received_at)
+        && ACT_WALK
+            .scope(
+                (),
+                capability_roots_to_trusted_root(
+                    directory,
+                    user_key_id,
+                    signer,
+                    scope,
+                    received_at,
+                ),
+            )
             .await?
             .is_none()
     {
@@ -3221,6 +3246,15 @@ where
             && a.attesting_key_id != subject_key_id
             && !dead.contains(&a.attestation_id)
             && !is_expired(a, now)
+            // v62.0.0 (DUTY-D6; KR-fix19, CC 2.6.7 "judged at its signed
+            // asserted_at") — a grant confers at `now` only once it is
+            // stated: a grant dated after `now` is not yet a conferral. The
+            // acceptance leg (`asserted_at <= t`) did not carry this: an
+            // acceptance is the grantee's own row, and nothing dates it after
+            // the grant it answers, so a grantee backdating its acceptance and
+            // its act before the grant held the scope before the root
+            // conferred it (I6634).
+            && a.asserted_at <= now
             && counts_in_capability_walk(a)
             // v23.0.0 (#551 item 2) — this loop reads CONFERRALS
             // (R → subject); a row here labeled charter or trust-edge is
@@ -3322,19 +3356,35 @@ where
     // (KB-fix1's bundle arm), which takes a later bundle of the same lineage
     // without re-acceptance. A grant naming a superseded bundle still confers
     // (a counted grant stands on its own; CC rc22 7b4a55e).
+    //
+    // v62.0.0 (DUTY-D7; Constitution "confers-by-naming", answer (1)) — with
+    // no act in hand this arm is the LIVE-STATE READING
+    // (`edition2::conferral_naming::holds_now`: a counted grant held, the
+    // owner's acceptance answering it, citing the binding in force for a
+    // machine, nothing ended; no stamped instant). For an act it is skipped
+    // ([`ACT_WALK`]): the doors ask `confers_on_act` (the naming chain).
+    let reading_grants: Vec<String> = if ACT_WALK.try_with(|()| ()).is_ok() {
+        Vec::new()
+    } else {
+        super::edition2::conferral_naming::holds_now_all(directory, subject_key_id, scope)
+            .await?
+            .into_iter()
+            .map(|h| h.grant.hex())
+            .collect()
+    };
     for grant in live
         .iter()
         .copied()
         .filter(|a| super::admission::is_counted_root_grant_row(a))
     {
+        if !reading_grants.contains(&grant.attestation_id) {
+            continue;
+        }
         let Some(root) =
             super::admission::root_grant_of(directory.as_dyn_directory(), grant, now).await?
         else {
             continue;
         };
-        if !root.accepted {
-            continue;
-        }
         let verdict = trust_root_valid(directory, user_key_id, &root.family_key_id, now).await?;
         if verdict.valid {
             return Ok(Some(TrustedGrant {

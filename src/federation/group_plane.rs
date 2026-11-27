@@ -419,22 +419,19 @@ impl GroupSigned {
         }
     }
 
-    /// The group plane family: a revocation whose signer is the removed
-    /// member is a resignation (CC 3.1.3.2: "the leaving member"), any other a
-    /// removal.
+    /// The group plane family: a revocation stored under the `resignation`
+    /// leaf is a resignation (CC 3.1.3.2: "the leaving member"), any other a
+    /// removal. v62.0.0 (RESIGN-3) — the LEAF decides, never who signed: a
+    /// removal its subject alone voiced is a removal.
     #[must_use]
     pub fn family(&self) -> GroupPlaneFamily {
         match self {
             Self::Family(_) | Self::Community(_) => GroupPlaneFamily::Roster,
             Self::FamilyWidening(_) | Self::CommunityWidening(_) => GroupPlaneFamily::Widening,
-            Self::FamilyRevocation(r) => revocation_family(
-                &r.authority_key_id,
-                &r.family_membership_revocation.removed_identity_key_id,
-            ),
-            Self::CommunityRevocation(r) => revocation_family(
-                &r.authority_key_id,
-                &r.community_membership_revocation.removed_identity_key_id,
-            ),
+            Self::FamilyRevocation(r) => revocation_family(r.family_membership_revocation.leaf),
+            Self::CommunityRevocation(r) => {
+                revocation_family(r.community_membership_revocation.leaf)
+            }
         }
     }
 
@@ -653,8 +650,8 @@ impl GroupSigned {
     }
 }
 
-fn revocation_family(authority: &str, removed: &str) -> GroupPlaneFamily {
-    if authority == removed {
+fn revocation_family(leaf: super::types::RevocationLeaf) -> GroupPlaneFamily {
+    if leaf.is_resignation() {
         GroupPlaneFamily::Resignation
     } else {
         GroupPlaneFamily::Removal
@@ -1386,7 +1383,9 @@ where
     // (`group_dissolved`), and re-folds when a row about the community
     // lands or is withdrawn.
     super::edition2::fold::reads(super::edition2::fold::Dep::key(community_key_id));
-    match community_dissolved_at(dir, community_key_id).await? {
+    // v62.0.0 (RESIGN-3c) — or its last member's end
+    // ([`super::community_ended_at`]): the same verdict.
+    match Box::pin(super::community_ended_at(dir, community_key_id)).await? {
         Some(dissolved_at) => Err(super::edition2::fold::hold(
             super::edition2::fold::reason::GROUP_DISSOLVED,
             Error::GroupDissolved {

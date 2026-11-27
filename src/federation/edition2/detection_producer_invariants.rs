@@ -30,7 +30,7 @@
 //!   what `Engine.sign_draft` returns) and put through the statement door:
 //!   the same row id as the locally produced statement; on a node holding
 //!   the `infra:detect` conferral it LANDS and projects; on a node without
-//!   it the row is HELD (`Pending`), reason `reserved_prefix_emitter_mismatch`,
+//!   it the row is HELD (`Pending`), reason `reserved_family_unseated` (D4),
 //!   and nothing projects. A draft whose `sig_structure` is signed by
 //!   another key is refused by the door.
 //! - **I3570** (v62 P8-fix17, pass 4e) — **a fractional score lands and
@@ -291,7 +291,7 @@ where
     // I3536 — a declared type confers nothing. v62.0.0 (P8-fix10) — in
     // edition 2 the type is not consulted (the rule's `conferred_only`) and a
     // missing conferral is OTHER rows, a fold condition: the row is HELD
-    // `reserved_prefix_emitter_mismatch` (GC1), never seated.
+    // `reserved_family_unseated` (D4) (GC1), never seated.
     let rogue = "p8-rogue-detector";
     e2::put_key(a, rogue, &["lenscore_detector"]).await;
     let rogue_ev = event(&e2::kid(rogue));
@@ -307,7 +307,7 @@ where
             .unwrap()
             .map(|h| h.reason)
             .as_deref(),
-        Some(super::fold::reason::gc1::RESERVED_PREFIX_EMITTER_MISMATCH),
+        Some(super::fold::reason::gc1::RESERVED_FAMILY_UNSEATED),
         "I3536: held for the missing infra:detect conferral"
     );
     assert!(
@@ -329,8 +329,31 @@ where
     let det = "p4-detector";
     e2::put_key(bare, det, &[crate::federation::types::identity_type::AGENT]).await;
     let ev = event(&e2::kid(det));
-    let draft = crate::derived::detection_row::draft_detection(&ev, None)
+    // I6138 (HEAD-fix5; the RESIGN-6 rule) — the draft names the key the
+    // detector signs with, as its caller states it.
+    let pen = ciris_verify_core::edition2::thumbprint(e2::signing_key(det).public_key());
+    // I7102 (HEAD-fix6; Constitution, "a root grant confers BY NAMING") —
+    // the draft is made AS THE PRODUCER STATES IT, over the conferred node:
+    // it names the bundle in `refs.head` and the acceptance of the conferring
+    // grant in `refs.also.stands_on`.
+    let draft = crate::derived::detection_row::draft_detection_in(conferred, &ev, None, &pen)
+        .await
         .expect("I3523: the detection drafts");
+    let drafted = ciris_verify_core::cde::decode(&draft.payload).expect("I7102: the payload");
+    assert!(
+        super::head_rule::names_a_head(&drafted) && super::head_rule::names_stands_on(&drafted),
+        "I7102: a drafted root-conferred detection names its bundle and its acceptance"
+    );
+    assert_eq!(
+        ciris_verify_core::cde::decode(&draft.protected)
+            .ok()
+            .and_then(|h| h
+                .get_int(4)
+                .and_then(ciris_verify_core::cde::Value::as_bytes)
+                .map(<[u8]>::to_vec)),
+        Some(pen.to_vec()),
+        "I6138: the drafted kid is the one the caller states"
+    );
     assert_eq!(
         draft.sig_structure,
         ciris_verify_core::edition2::sig_structure(&draft.protected, &draft.payload),
@@ -343,9 +366,28 @@ where
         .expect("I3523: the detector's pen signs");
     let st = draft.assemble(sig);
     let rid = super::names::RowId::of_statement(&st).expect("a row statement");
+    // The same row as the producer's own statement (`state_detection`'s
+    // payload: the parts, then the head rule over the same node).
+    let produced = {
+        let (sub, family, payload) =
+            detection_statement_parts(&ev, None).expect("the detection's parts");
+        let payload = super::head_rule::state_head(conferred, "scores", &family, &sub, payload)
+            .await
+            .expect("I3523: the producer states the head");
+        ciris_verify_core::edition2::sign_row_statement(
+            &e2::signing_key(det),
+            &sub,
+            &sub,
+            "scores",
+            &family,
+            &payload,
+            vec![],
+        )
+        .expect("the detector signs")
+    };
     assert_eq!(
         Some(rid),
-        super::names::RowId::of_statement(&sign(det, &ev)),
+        super::names::RowId::of_statement(&produced),
         "I3523: the drafted statement names the same row as the produced one"
     );
 
@@ -362,7 +404,11 @@ where
         "I3523: projected on the conferred node"
     );
 
-    // Without it: held by reason, nothing projected.
+    // Without it: held, nothing projected. v62.0.0 (HEAD-fix6) — the row
+    // now NAMES the rows it stands on (the bundle, the acceptance), which
+    // the bare node does not hold: it waits on them (`link_unheld`, CC
+    // 2.7.3), the reading of "confers by naming"; before, it was held for
+    // the missing conferral (`reserved_family_unseated`).
     let out = put_statement(bare, &st, None, INGEST_TIER)
         .await
         .expect("I3523: an unconferred detection is held, not an error");
@@ -376,8 +422,8 @@ where
             .unwrap()
             .map(|h| h.reason)
             .as_deref(),
-        Some(super::fold::reason::gc1::RESERVED_PREFIX_EMITTER_MISMATCH),
-        "I3523: held for the missing conferral"
+        Some(super::fold::reason::LINK_UNHELD),
+        "I3523: held for the rows it stands on, which this node does not hold"
     );
     assert!(
         projected(bare, &ev).await.is_none(),

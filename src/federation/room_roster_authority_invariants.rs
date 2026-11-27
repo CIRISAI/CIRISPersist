@@ -66,6 +66,7 @@ pub mod bodies {
             reason: None,
             witness_set: vec![],
             persist_row_hash: String::new(),
+            leaf: crate::federation::types::RevocationLeaf::Removal,
         }
     }
 
@@ -578,7 +579,7 @@ pub mod bodies {
         revoke_by(
             d,
             &[bob],
-            revocation(&room, bob, at("2026-03-01T00:00:00Z")),
+            revocation(&room, bob, at("2026-03-01T00:00:00Z")).as_resignation(),
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I180: bob leaves a unanimous room alone: {e}"));
@@ -588,7 +589,7 @@ pub mod bodies {
             revoke_by(
                 d,
                 &[alice],
-                revocation(&room, alice, at("2026-03-02T00:00:00Z")),
+                revocation(&room, alice, at("2026-03-02T00:00:00Z")).as_resignation(),
             )
             .await,
             crate::federation::ROSTER_LAST_FOUNDER,
@@ -614,7 +615,7 @@ pub mod bodies {
         revoke_by(
             d,
             &[alice],
-            revocation(&room, alice, at("2026-03-04T00:00:00Z")),
+            revocation(&room, alice, at("2026-03-04T00:00:00Z")).as_resignation(),
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I180: alice may leave once carol is a founder: {e}"));
@@ -733,6 +734,7 @@ pub mod bodies {
             signers: ["mo".to_owned()].into_iter().collect(),
             moderator_roots: ["a".to_owned()].into_iter().collect(),
             reversed: false,
+            is_resignation: false,
         };
         let rules = crate::federation::RosterRules {
             protocol: consensus_protocol::UNANIMOUS,
@@ -777,6 +779,7 @@ pub mod bodies {
             signers: Default::default(),
             moderator_roots: Default::default(),
             reversed: false,
+            is_resignation: false,
         };
         let rules = crate::federation::RosterRules {
             protocol: consensus_protocol::UNANIMOUS,

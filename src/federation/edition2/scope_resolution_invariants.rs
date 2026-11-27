@@ -150,7 +150,6 @@ fn acceptance(signer: &str, grant: &Attestation) -> Attestation {
         "id": uuid::Uuid::new_v4().to_string(),
         "dimension": crate::federation::membership_acceptance::ACCEPTANCE_DIMENSION,
         "references_attestation_id": grant.attestation_id,
-        "proposal_hash": grant.original_content_hash,
     });
     let mut r = ts::bare_attestation(
         &uuid::Uuid::new_v4().to_string(),
@@ -537,8 +536,9 @@ pub(crate) async fn i4226_an_unaccepted_root_grant_never_confers_by_its_first_vo
     d: &dyn FederationDirectory,
     node: &str,
 ) {
-    use super::fixture_genesis::{DAY_MS, HOLDER_SEEDS};
-    use super::fixture_trust_root::ROOT_SEED;
+    use super::fixture_genesis::DAY_MS;
+    // LEAD-root1 — a stranger's key (the earlier form's keyed-root seed).
+    const ROOT_SEED: &str = "w1-rooted-trust-root";
     use super::receipts::statement_id_of;
     let c = bundle_v2();
     let head = c.object_id;
@@ -571,21 +571,11 @@ pub(crate) async fn i4226_an_unaccepted_root_grant_never_confers_by_its_first_vo
         head,
         "I4226: the bundle the voice names"
     );
-    // A keyed trust root at that key, which THIS node accepts (W1b).
-    let r = super::fixture_trust_root::try_rooted_trust_root(d, &HOLDER_SEEDS, "quorum:2/3")
-        .await
-        .expect("I4226: a keyed root this node accepts");
-    assert_eq!(
-        r.root, root_key,
-        "I4226 premise: the root is the early voice's key"
-    );
-    assert!(
-        crate::federation::trust_root::trust_root_valid(d, node, &r.root, later())
-            .await
-            .expect("I4226 reads")
-            .valid,
-        "I4226 premise: this node accepts the keyed root"
-    );
+    // LEAD-root1 (CC 3.2 T5) — no key is a root: the early voice's key is
+    // a stranger's, a holder of nothing. (The earlier form stood a KEYED
+    // root up at it and had this node accept that; "a key that signs a
+    // charter about itself is no root, and a node accepts none".) This node
+    // accepts no root here.
     e2::put_key(d, owner_seed, &["user"]).await;
     crate::federation::admission::steward_liveness_test_support::bind_machine_owner(
         d,
@@ -608,7 +598,7 @@ pub(crate) async fn i4226_an_unaccepted_root_grant_never_confers_by_its_first_vo
         // CONSTRUCTIBLE: the bypass shape. Dropping the delegation-loop
         // exclusion would confer it as a grant BY the keyed root.
         assert_eq!(
-            grant.attesting_key_id, r.root,
+            grant.attesting_key_id, root_key,
             "I4226: the early (kept) voice is the row's first voice"
         );
     } else {

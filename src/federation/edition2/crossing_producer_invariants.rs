@@ -119,6 +119,14 @@ pub(crate) mod bodies {
             .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .expect("I3520: A registers");
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — a machine acts under its owner
+        // binding; an unowned one signs nothing. The fixture machine is owned.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            &*a.federation_directory(),
+            &a_id,
+            crate::host::clock::now(),
+        )
+        .await;
         let mut cursor = None;
         deliver(&a, &b, &mut cursor).await;
 
@@ -279,6 +287,14 @@ pub(crate) mod bodies {
             .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .expect("I3524: A registers");
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — a machine acts under its owner
+        // binding; an unowned one signs nothing. The fixture machine is owned.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            &*a.federation_directory(),
+            &a_id,
+            crate::host::clock::now(),
+        )
+        .await;
         let mut cursor = None;
         deliver(&a, &b, &mut cursor).await;
         let local_id = a
@@ -371,6 +387,14 @@ pub(crate) mod bodies {
             .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .expect("I3532: A registers");
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — a machine acts under its owner
+        // binding; an unowned one signs nothing. The fixture machine is owned.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            &*a.federation_directory(),
+            &a_id,
+            crate::host::clock::now(),
+        )
+        .await;
         let mut cursor = None;
         deliver(&a, &b, &mut cursor).await;
 
@@ -696,6 +720,14 @@ pub(crate) mod bodies {
             .register_self_federation_key(identity_type::NODE, None, None)
             .await
             .expect("I3541: A registers");
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — a machine acts under its owner
+        // binding; an unowned one signs nothing. The fixture machine is owned.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            &*a.federation_directory(),
+            &a_id,
+            crate::host::clock::now(),
+        )
+        .await;
         let mut cursor = None;
         deliver(&a, &b, &mut cursor).await;
         let kid = kid_of_identity_ref(&a_id).expect("an identity-ref");
@@ -794,10 +826,12 @@ pub(crate) mod bodies {
 
     /// I3542 / I3543 / I3544.
     pub(crate) async fn i3542_founding_and_rekey(dsn: &str, tag: &str) {
-        use crate::federation::edition2::group::{removal_draft, MembershipRecord};
+        use crate::federation::edition2::group::{
+            removal_draft, CommunityFounding, FamilyFounding, MembershipRecord,
+        };
         use crate::federation::edition2::ingest::StatementOutcome as O;
         use crate::federation::types::{
-            Community, CommunityMember, CommunityMembershipRevocation, Family, FamilyMember,
+            CommunityMember, CommunityMembershipRevocation, FamilyMember,
         };
         let party = |who: &'static str| {
             let alias = format!("{tag}-3542-{who}");
@@ -812,15 +846,13 @@ pub(crate) mod bodies {
         };
         let (a, a_id) = party("a").await;
         let (x, x_id) = party("x").await;
-        let (_g, g_id) = party("g").await;
-        let (_f, f_id) = party("f").await;
         let now = crate::host::clock::now();
 
         // I3542 — a community founding is Pending until the listed member
         // voices it, then lands.
-        let community = Community {
-            community_key_id: g_id.clone(),
-            community_name: "p8 room".into(),
+        // GID-prod.fix1: a founding names no id (it is derived and returned).
+        let community = CommunityFounding {
+            name: "p8 room".into(),
             members: [(&a_id, Some("founder")), (&x_id, None)]
                 .iter()
                 .map(|(k, role)| CommunityMember {
@@ -832,13 +864,15 @@ pub(crate) mod bodies {
             founded_at: now,
             consensus_protocol: "majority".into(),
             policy_blob: None,
-            prev_head_digest: String::new(),
             charter_digest: String::new(),
-            persist_row_hash: String::new(),
         };
-        let rid = match a.state_community_founding(community).await {
-            Ok(O::Pending { row_id, .. }) => row_id,
-            other => panic!("I3542: short of the listed members: {other:?}"),
+        // GID-prod: the id is derived by the verb and returned.
+        let (rid, g_id) = match a.state_community_founding(community).await {
+            Ok(f) => match f.outcome {
+                O::Pending { row_id, .. } => (row_id, f.group_id),
+                other => panic!("I3542: short of the listed members: {other:?}"),
+            },
+            Err(e) => panic!("I3542: the founding: {e}"),
         };
         let dir = a.federation_directory();
         assert!(
@@ -870,10 +904,15 @@ pub(crate) mod bodies {
             reason: None,
             witness_set: Vec::new(),
             persist_row_hash: String::new(),
+            leaf: crate::federation::types::RevocationLeaf::Removal,
         });
         let voice = |e: &'static str| {
             let (eng, id) = if e == "a" { (&a, &a_id) } else { (&x, &x_id) };
-            let draft = removal_draft(&removal, &head, id).expect("I3543: drafted");
+            // v62.0.0 (RESIGN-6) — the draft names the key the Engine signs
+            // with: its identity's genesis key here (one key per identity).
+            let kid = crate::federation::edition2::ingest::kid_of_identity_ref(id)
+                .expect("I3543: an identity-ref");
+            let draft = removal_draft(&removal, &head, id, &kid).expect("I3543: drafted");
             async move { eng.sign_draft(&draft).await.expect("I3543: signed") }
         };
         let va = voice("a").await;
@@ -897,9 +936,8 @@ pub(crate) mod bodies {
         );
 
         // I3544 — the family twin of I3542.
-        let family = Family {
-            family_key_id: f_id.clone(),
-            family_name: "p8 family".into(),
+        let family = FamilyFounding {
+            name: "p8 family".into(),
             members: [&a_id, &x_id]
                 .iter()
                 .map(|k| FamilyMember {
@@ -911,14 +949,15 @@ pub(crate) mod bodies {
             founded_at: now,
             consensus_protocol: "majority".into(),
             consensus_protocol_entrenched: false,
-            dissolved_at: None,
-            prev_head_digest: String::new(),
             charter_digest: String::new(),
-            persist_row_hash: String::new(),
         };
-        let rid = match a.state_family_founding(family).await {
-            Ok(O::Pending { row_id, .. }) => row_id,
-            other => panic!("I3544: short of the listed members: {other:?}"),
+        // GID-prod: the id is derived by the verb and returned.
+        let (rid, f_id) = match a.state_family_founding(family).await {
+            Ok(f) => match f.outcome {
+                O::Pending { row_id, .. } => (row_id, f.group_id),
+                other => panic!("I3544: short of the listed members: {other:?}"),
+            },
+            Err(e) => panic!("I3544: the founding: {e}"),
         };
         assert!(
             dir.lookup_family(&f_id).await.unwrap().is_none(),

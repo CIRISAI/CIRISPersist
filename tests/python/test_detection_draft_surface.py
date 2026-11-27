@@ -12,14 +12,14 @@ the three steps:
 3. ``Engine.put_edition2_statement(statement)``.
 
 Standing is the conferral plane's (``infra:detect`` from a root this node
-trusts, CC 3.4.8), never the key's type. This file witnesses the path end to
-end on a node WITHOUT the conferral: the row is held, by reason
-(``reserved_prefix_emitter_mismatch``), read through ``voice_status``.
-
-The conferred leg (the row LANDS and projects) is witnessed in Rust, I3523
-(sqlite and postgres), over the same drafted bytes: chartering a trust root
-and conferring ``infra:detect`` needs a root's pre-rotation commitment and
-trust edges the wheel has no producer for.
+trusts, CC 3.4.8), never the key's type. v62.0.0 (HEAD-fix6; "a root grant
+confers BY NAMING") — the draft is made as the producer states it: it names
+the bundle and the acceptance of the conferring grant it stands on, so on a
+node holding NO acceptance (this file's: the wheel has no producer for a
+root's charter and trust edges) ``detection_draft`` refuses (``stands_on``)
+rather than drafting a row that would count for nobody. The conferred leg
+(drafted, signed, LANDED and projected) is witnessed in Rust, I3523 / I7102
+(sqlite and postgres).
 """
 from __future__ import annotations
 
@@ -56,27 +56,20 @@ def _event(signing_key_id: str) -> dict:
     }
 
 
-def test_draft_sign_submit_is_held_without_the_conferral(engine_factory, tmp_path) -> None:
+def test_detection_draft_is_refused_without_an_acceptance(engine_factory, tmp_path) -> None:
+    """v62.0.0 (HEAD-fix6; Constitution, "a root grant confers BY NAMING") —
+    a detection is signed under a root grant (``infra:detect``), so its draft
+    names the bundle AND the acceptance of the conferring grant it stands on
+    (``refs.also.stands_on``). A detector holding no acceptance is not drafted
+    a row that would count for nobody: ``ValueError`` naming ``stands_on``.
+    (Before HEAD-fix6 this file drafted, signed and submitted such a row and
+    saw it held ``reserved_family_unseated``; the conferred leg, drafted with
+    its acceptance, lands in Rust, I3523 / I7102, sqlite and postgres.)"""
     eng = engine_factory("lens", 0x1E, dsn=f"sqlite:///{tmp_path / 'lens.db'}")
     try:
         key = eng.register_self_federation_key("agent")
-        draft = json.loads(eng.detection_draft(json.dumps(_event(key))))
-        assert set(draft) == {"protected", "payload", "sig_structure"}, draft
-        for member in draft.values():
-            assert bytes.fromhex(member), draft
-
-        statement = eng.sign_draft(json.dumps(draft))
-        assert isinstance(statement, bytes) and statement, statement
-
-        out = json.loads(eng.put_edition2_statement(statement))
-        assert out["plane"] == "pending", out
-        state = json.loads(eng.voice_status(out["row_id"]))
-        assert state["status"] == "waiting", state
-        assert state["reason"] == "reserved_prefix_emitter_mismatch", state
-
-        # The same bytes again: idempotent, the same row.
-        again = json.loads(eng.put_edition2_statement(statement))
-        assert again["row_id"] == out["row_id"], again
+        with pytest.raises(ValueError, match="stands_on"):
+            eng.detection_draft(json.dumps(_event(key)))
     finally:
         eng.close(force=True)
 
@@ -84,9 +77,17 @@ def test_draft_sign_submit_is_held_without_the_conferral(engine_factory, tmp_pat
 def test_sign_draft_refuses_a_mismatched_sig_structure(engine_factory, tmp_path) -> None:
     eng = engine_factory("lens-x", 0x1F, dsn=f"sqlite:///{tmp_path / 'lens-x.db'}")
     try:
-        key = eng.register_self_federation_key("agent")
-        draft = json.loads(eng.detection_draft(json.dumps(_event(key))))
-        draft["sig_structure"] = "00" + draft["sig_structure"][2:]
+        eng.register_self_federation_key("agent")
+        # v62.0.0 (HEAD-fix6) — a draft is no longer obtainable from
+        # ``detection_draft`` on a node with no conferral; the parts here are
+        # an empty protected map and payload, and the Sig_structure stated for
+        # them is NOT theirs (one byte off), so it is refused, never signed.
+        sig_structure = "846a5369676e61747572653141a04041a0"
+        draft = {
+            "protected": "a0",
+            "payload": "a0",
+            "sig_structure": "85" + sig_structure[2:],
+        }
         with pytest.raises(ValueError):
             eng.sign_draft(json.dumps(draft))
         with pytest.raises(ValueError):
@@ -99,3 +100,22 @@ def test_the_earlier_detection_door_is_gone() -> None:
     assert hasattr(ciris_persist.Engine, "detection_draft")
     assert hasattr(ciris_persist.Engine, "sign_draft")
     assert not hasattr(ciris_persist.Engine, "put_detection_event")
+
+
+def test_detection_draft_takes_a_signer_kid(engine_factory, tmp_path) -> None:
+    """v62.0.0 (HEAD-fix5p, HEAD-fix6) — ``detection_draft(…, signer_kid=None)``
+    takes the key id the detector will sign with; one that is not 32 bytes of
+    hex is a ``ValueError`` naming it. A well-formed one reaches the producer,
+    which (no acceptance held on this node) refuses ``stands_on``. That the
+    drafted header names the stated kid is witnessed in Rust (I6138, on the
+    same builder)."""
+    eng = engine_factory("lens-k", 0x20, dsn=f"sqlite:///{tmp_path / 'lens-k.db'}")
+    try:
+        key = eng.register_self_federation_key("agent")
+        event = json.dumps(_event(key))
+        with pytest.raises(ValueError, match="signer_kid"):
+            eng.detection_draft(event, signer_kid="zz")
+        with pytest.raises(ValueError, match="stands_on"):
+            eng.detection_draft(event, signer_kid="ab" * 32)
+    finally:
+        eng.close(force=True)

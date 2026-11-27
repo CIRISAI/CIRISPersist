@@ -412,7 +412,9 @@ pub(crate) struct ServedRows {
     pub(crate) backend: crate::observe::StoreBackend,
 }
 
-/// v61.1.0 (#1190, #1163 review D3) — **THE serve rule**, as the predicates
+/// v61.1.0 (#1190, #1163 review D3) — **THE held-read row rule** (BIND-5: the
+/// requester-less reads are HELD reads; a serve path adds the requester's
+/// audience on top, `edition2::serve::servable_to`), as the predicates
 /// over the held row `alias` (tables under the schema `prefix`): the
 /// federation tier (E5: a local-tier row never reaches the serve surface),
 /// the row-type serve filter (v53.0.0 #975, CC 2.4: under enforcement an
@@ -444,7 +446,9 @@ pub(crate) fn serve_rule_parts(
         &format!("{alias}.attestation_type"),
         dialect.row_type(),
     ));
-    parts.push(super::steward_purge::served_under_purge_sql(alias, prefix));
+    parts.push(super::steward_purge::served_under_purge_sql(
+        alias, prefix, dialect,
+    ));
     if !rooted {
         parts.push(served_while_unrooted_sql(dialect, alias));
     }
@@ -452,10 +456,13 @@ pub(crate) fn serve_rule_parts(
 }
 
 /// v62.0.0 (RL-fix2b) — **the SQL form of the serve wait**: the rows a node
-/// that is not rooted still serves. A row at no commons scope, an owner
-/// binding ([`owner_binding_marker_sql`]), or a bootstrap kind by its
-/// dimension (`edition2::serve::BOOTSTRAP_DIMENSION_PREFIXES`). The same
-/// decision as `edition2::serve::row_waits_unrooted`, negated.
+/// that is not rooted still serves. A row at no commons scope, an
+/// allegiance row (v62.0.0 BIND-4: an owner binding,
+/// [`owner_binding_marker_sql`], placed at `federation`; not `species` /
+/// `biosphere`), or a bootstrap kind by its dimension
+/// (`edition2::serve::BOOTSTRAP_DIMENSION_PREFIXES`). The same decision as
+/// `edition2::serve::row_waits_unrooted`, negated, on both backends (this
+/// one function builds both dialects).
 pub(crate) fn served_while_unrooted_sql(dialect: Dialect, alias: &str) -> String {
     let commons = super::types::cohort_scope::commons()
         .iter()
@@ -468,8 +475,10 @@ pub(crate) fn served_while_unrooted_sql(dialect: Dialect, alias: &str) -> String
         .collect::<Vec<_>>()
         .join(" OR ");
     format!(
-        "({alias}.cohort_scope NOT IN ({commons}) OR {owner} OR {bootstrap})",
-        owner = owner_binding_marker_sql(dialect, alias)
+        "({alias}.cohort_scope NOT IN ({commons}) OR ({owner} AND {alias}.cohort_scope = '{fed}') \
+         OR {bootstrap})",
+        owner = owner_binding_marker_sql(dialect, alias),
+        fed = super::types::cohort_scope::FEDERATION,
     )
 }
 
@@ -566,7 +575,7 @@ pub(crate) fn owner_binding_marker_sql(dialect: Dialect, t: &str) -> String {
     format!(
         "({t}.dimension = '{}' OR {purpose} = '{}')",
         owner_binding::DIMENSION,
-        owner_binding::CC_DELEGATION_PURPOSE
+        owner_binding::PURPOSE
     )
 }
 
