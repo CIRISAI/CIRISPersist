@@ -10,7 +10,8 @@
 //!   most 30 days out;
 //! - `membership:acceptance:v1` / `membership:decline:v1` — K's reply, signed
 //!   by K (or a device acting for K), attested to K, placed at the group, and
-//!   binding the proposal's id, content hash and (acceptance) role.
+//!   naming the proposal by its row id in `refs.answers` (KR-fix32; the row
+//!   id is the digest of its payload) and restating the (acceptance) role.
 //!
 //! Every roster GROWTH — a widening that adds a key not active before its
 //! instant — needs a live acceptance ([`check_growth_accepted`]). A founding
@@ -267,12 +268,14 @@ pub fn check_membership_row_shape(row: &Attestation) -> Result<(), Error> {
     // at the federation scope and names no group: the root is the accord of
     // the bundle the grant names (`check_root_grant_reply`).
     if is_root_grant_reply(row) {
-        for key in ["references_attestation_id", "proposal_hash"] {
-            if env_str(row, key).is_none_or(str::is_empty) {
-                return Err(Error::InvalidArgument(format!(
-                    "root grant reply: envelope `{key}` is required"
-                )));
-            }
+        // v62.0.0 (KR-fix32; the Constitution's ruling (A)) — the answered
+        // row is named by `refs.answers` (read back as
+        // `references_attestation_id`); `proposal_hash` is gone (a row's id
+        // IS the digest of its payload).
+        if env_str(row, "references_attestation_id").is_none_or(str::is_empty) {
+            return Err(Error::InvalidArgument(
+                "root grant reply: the row it answers (refs.answers) is required".into(),
+            ));
         }
         return Ok(());
     }
@@ -305,12 +308,11 @@ pub fn check_membership_row_shape(row: &Attestation) -> Result<(), Error> {
             }
         }
         MembershipRow::Acceptance | MembershipRow::Decline => {
-            for key in ["references_attestation_id", "proposal_hash"] {
-                if env_str(row, key).is_none_or(str::is_empty) {
-                    return Err(Error::InvalidArgument(format!(
-                        "membership reply: envelope `{key}` is required"
-                    )));
-                }
+            // v62.0.0 (KR-fix32) — `proposal_hash` is gone, as above.
+            if env_str(row, "references_attestation_id").is_none_or(str::is_empty) {
+                return Err(Error::InvalidArgument(
+                    "membership reply: the row it answers (refs.answers) is required".into(),
+                ));
             }
         }
     }
@@ -352,7 +354,6 @@ pub(crate) fn as_proposal(row: Attestation) -> Option<Proposal> {
 fn reply_matches(reply: &Attestation, p: &Proposal) -> bool {
     group_of(reply).is_ok_and(|g| g == p.group)
         && same_membership_plane(&reply.cohort_scope, &p.row.cohort_scope)
-        && env_str(reply, "proposal_hash") == Some(p.row.original_content_hash.as_str())
         && p.invitee
             .as_ref()
             .is_none_or(|i| reply.attested_key_id == *i)
@@ -662,21 +663,27 @@ where
                     return Ok(());
                 }
             }
+            // v62.0.0 (KR-fix30) — standing at the row's own instant.
             return dir
-                .check_write_cohort_scope_for(
+                .check_write_cohort_scope_for_at(
                     &row.attesting_key_id,
                     write_path,
                     &placed.cohort_scope,
                     placed.target.as_deref(),
+                    Some(row.asserted_at),
                 )
                 .await;
         }
+        // v62.0.0 (KR-fix30; the lead's ruling on I4310) — a row a member
+        // wrote while a member counted when it was made: standing at the
+        // row's own instant, within W, never "now".
         return dir
-            .check_write_cohort_scope_for(
+            .check_write_cohort_scope_for_at(
                 &row.attesting_key_id,
                 write_path,
                 &row.cohort_scope,
                 super::admission::envelope_cohort_target(&row.attestation_envelope)?,
+                Some(row.asserted_at),
             )
             .await;
     };
@@ -719,11 +726,14 @@ where
             if !group_is_held(dir, &row.cohort_scope, &group).await? {
                 return Ok(());
             }
-            dir.check_write_cohort_scope_for(
+            // v62.0.0 (KR-fix30) — the proposer's standing at the
+            // proposal's own instant.
+            dir.check_write_cohort_scope_for_at(
                 &row.attesting_key_id,
                 write_path,
                 &row.cohort_scope,
                 Some(&group),
+                Some(row.asserted_at),
             )
             .await
             .map_err(|e| hold_unless_storage(reason::MEMBERSHIP_PROPOSER_OUT_OF_SCOPE, e))?;
@@ -867,7 +877,7 @@ const ROOT_GRANT_GROUP: &str = "trust-root";
 /// a counted grant from the root** (the grant's second consent, the same
 /// acceptance family as an officer's): it names a HELD counted root grant
 /// (`references_attestation_id`; not held yet, it waits), is attested to the
-/// grant's grantee, binds the grant's content hash, and is signed FOR the
+/// grant's grantee (named in `refs.answers`, KR-fix32), and is signed FOR the
 /// grantee: by the grantee's person, or for a MACHINE grantee (a `node` or an
 /// `agent`) by its OWNER at the reply's own instant
 /// ([`admission::root_grant_consenter`](super::admission::root_grant_consenter)).
@@ -913,7 +923,6 @@ where
     )
     .await?
         || member != grant.attested_key_id
-        || env_str(row, "proposal_hash") != Some(grant.original_content_hash.as_str())
     {
         return Err(fold::hold(
             reason::MEMBERSHIP_ACCEPTANCE_MISMATCH,
@@ -954,7 +963,11 @@ where
 /// signed FOR the grantee (its person, or a machine grantee's owner at the
 /// acceptance's own instant: `admission::signs_for_root_grantee`), asserted
 /// by `t`, and NOT WITHDRAWN BY ITS OWN SIGNER by `t`
-/// ([`acceptance_withdrawn_by`]). No decline of the grant by `t`.
+/// ([`acceptance_withdrawn_by`]). No decline of the grant by `t`. KR-fix28:
+/// for a machine grantee, the owner binding in force at the acceptance's
+/// instant is the one in force at `t` (`admission::machine_owner_binding_at`):
+/// after a re-binding the grant confers again only once the new owner
+/// accepts it.
 ///
 /// - **From then on.** A withdrawal counts from its own signed
 ///   `asserted_at`: read at an instant before it, the acceptance still
@@ -976,12 +989,57 @@ pub async fn root_grant_acceptance_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    root_grant_acceptance_for(dir, grant, t, None).await
+}
+
+/// v62.0.0 (HEAD-4.rev3; KR-fix28's marked move, CC 2.4.1.1 "an act names
+/// its head") — [`root_grant_acceptance_at`] for an ACT IN HAND: `act_head`
+/// is the act's `refs.head`. For a machine grantee, a node's or agent's act
+/// names its owner-binding row (`edition2::head_rule`), so the acceptance
+/// stands for the act exactly when that binding row is among the bindings in
+/// force at the acceptance's own instant: "the binding an act names" is read
+/// from the act, not from the binding in force at its instant. `None` (no
+/// act in hand: the grant listing, `admission::root_grants_for`; or an act
+/// naming no head) keeps the instant form below.
+///
+/// # Errors
+/// Directory reads.
+pub async fn root_grant_acceptance_for<F>(
+    dir: &F,
+    grant: &Attestation,
+    t: chrono::DateTime<chrono::Utc>,
+    act_head: Option<&crate::federation::edition2::names::RowId>,
+) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let grantee = grant.attested_key_id.as_str();
     let held = replies_of(dir, grantee).await?;
     let replies: Vec<&Attestation> = replies_to(&held, &grant.attestation_id)
         .into_iter()
         .filter(|r| r.asserted_at <= t && is_root_grant_reply(r))
         .collect();
+    // v62.0.0 (KR-fix28; CC 3.2, as the Constitution ruled 2026-11-22) — a
+    // machine grantee's acceptance is its owner's consent AS BOUND AT THE
+    // ACCEPTANCE'S OWN INSTANT, and it stands only for acts under THAT
+    // binding: a re-binding is a new owner-binding row, rows under it stand
+    // on the new owner, who has consented to nothing until they accept the
+    // grant themselves (the old owner's acceptance does not carry over, and
+    // the old owner cannot withdraw or renew on the new owner's behalf).
+    // v62.0.0 (HEAD-4.rev3) — "the binding an act names" is the act's
+    // `refs.head` when the act is in hand (`act_head`); with no act in hand,
+    // the binding in force at `t`.
+    let binding_at_t = super::admission::machine_owner_binding_at(dir, grantee, t).await?;
+    let names_the_binding = |at_acceptance: &super::admission::MachineOwner| match act_head {
+        Some(h) => match at_acceptance {
+            super::admission::MachineOwner::Bound { bindings, .. } => {
+                bindings.iter().any(|b| *b == h.hex())
+            }
+            super::admission::MachineOwner::NotAMachine => true,
+            super::admission::MachineOwner::Unbound => false,
+        },
+        None => *at_acceptance == binding_at_t,
+    };
     if replies
         .iter()
         .any(|r| membership_row(r) == Some(MembershipRow::Decline))
@@ -999,6 +1057,9 @@ where
             r.asserted_at,
         )
         .await?
+            && names_the_binding(
+                &super::admission::machine_owner_binding_at(dir, grantee, r.asserted_at).await?,
+            )
             && !acceptance_withdrawn_by(dir, r, t).await?
         {
             return Ok(Some(r.attestation_id.clone()));
@@ -1082,7 +1143,7 @@ where
 /// v62.0.0 (wave V1b; CC 4.4.3.12) — **a reply to a counted officer
 /// appointment**: signed for the officer (the appointment's attested key, by
 /// person), attested to it, about the affiliation the appointment names,
-/// binding the appointment's content hash; never both an acceptance and a
+/// naming the appointment in `refs.answers` (KR-fix32); never both an acceptance and a
 /// decline of one appointment.
 async fn check_officer_reply<F>(
     dir: &F,
@@ -1103,11 +1164,7 @@ where
         .active_identity_for_occurrence(&appointment.attested_key_id)
         .await?;
     let names = super::admission::envelope_cohort_target(&appointment.attestation_envelope)?;
-    if signer != officer
-        || member != appointment.attested_key_id
-        || names != Some(group)
-        || env_str(row, "proposal_hash") != Some(appointment.original_content_hash.as_str())
-    {
+    if signer != officer || member != appointment.attested_key_id || names != Some(group) {
         return Err(fold::hold(
             reason::MEMBERSHIP_ACCEPTANCE_MISMATCH,
             refuse(group, member, RULE_ACCEPTANCE_MISMATCH),
@@ -1355,17 +1412,27 @@ where
 }
 
 /// **A node gives no acceptance** (CIRISPersist#972; CC 3.1.3.2: "a node
-/// member of an `infrastructure` community is seated by the founders' quorum
-/// … the seat is valid when the founders' quorum signed the record and the
-/// node's own key record carries the conferring family's m-of-n scrub").
+/// member of an `infrastructure` community is seated by the founders' quorum";
+/// CC 4.4.3.19: in an infrastructure room a node "gives NO acceptance: seated
+/// by the founders' count alone, for the canonical room with the bundle's
+/// conferral").
 ///
 /// The ONE predicate both the growth gate and the founding rule read: `member`
 /// needs no acceptance in `community` at `at` iff the community is
 /// `infrastructure`, the key is node-bearing at `at` (#925's predicate), and
-/// its own key record carries the accord's m-of-n scrub. The founders' quorum
-/// is the caller's roster-authority check and is not weakened here. A person
-/// in the same community, and a node anywhere else, still needs what they
-/// needed.
+///
+/// - v62.0.0 (KR-fix23) — the community is any infrastructure room but the
+///   canonical one: nothing more (the founders' count seats it);
+/// - the community is THE CANONICAL room
+///   ([`CIRIS_CANONICAL_COMMUNITY_KEY_ID`](super::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID)):
+///   the bundle's conferral, which on v62 is a serve SEAT of the genesis
+///   bundle in force (KR-fix13). (The earlier co-scrub on the node's own key
+///   record is gone, KR-fix27.)
+///
+/// The founders' quorum is the caller's roster-authority check and is not
+/// weakened here. A person in the same community, and a node in any room
+/// that is not `infrastructure`, still needs what they needed (CC 4.4.3.19:
+/// there a node is never a member; its owner is).
 ///
 /// v61 (CIRISPersist#1101) — the announced-owner leg is the growth
 /// gate's ([`check_growth_accepted`]), not this predicate's: the founding
@@ -1387,21 +1454,27 @@ where
     if !super::is_node_bearing_key_at(dir, member, at).await? {
         return Ok(false);
     }
+    // v62.0.0 (KR-fix23; CC 4.4.3.19, the text as written: "seated by the
+    // founders' count alone") — in an infrastructure room that is not the
+    // canonical one, a node is seated by the founders' count and nothing
+    // else. (KR-fix13 asked every infrastructure room for the bundle's seat:
+    // narrower than the text, so no other node could be seated without its
+    // own voice, which KR-fix10 refuses.)
+    if community.community_key_id != super::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID {
+        return Ok(true);
+    }
     // v62.0.0 (KR-fix13; CC 3.1.3.2, CC 4.4.3.19: in an infrastructure room
     // a node "gives NO acceptance: seated by the founders' count alone, for
     // the canonical room with the bundle's conferral") — THE CONFERRAL ON
     // v62 IS THE BUNDLE'S SEAT. A canonical install is a serve seat of the
     // genesis bundle in force (`is_canonical_by_bundle`). The earlier
-    // conferral (the accord's co-scrub on the node's own key record) can
-    // never pass on v62 (`verify_accord_family_coscrub` answers
-    // `accord_conferral_awaits_trust_blessing_card`, TR-fix1), so before this
-    // line NO node was ever seated without its own voice, and after KR-fix10
-    // a node's acceptance of a named invitation is refused: a canonical
-    // install could not be added to the room at all.
-    if super::edition2::genesis::is_canonical_by_bundle(dir, member).await? {
-        return Ok(true);
-    }
-    super::admission::key_record_carries_accord_scrub(dir, member).await
+    // conferral (the accord's co-scrub on the node's own key record) is gone
+    // (KR-fix27: an edition-2 key record carries no capability role; it
+    // could never pass on v62), so before KR-fix13 NO node was ever seated
+    // without its own voice, and after KR-fix10 a node's acceptance of a
+    // named invitation is refused: a canonical install could not be added to
+    // the room at all.
+    super::edition2::genesis::is_canonical_by_bundle(dir, member).await
 }
 
 /// **The growth gate** (FSD §5): `member` joins `group` at `growth_instant`
@@ -1901,18 +1974,227 @@ pub fn standing_proposal_input(
     input
 }
 
+/// v62.0.0 (DUTY-D7a; CC 3.2 "the owner's acceptance": "It names in
+/// refs.also.cites the owner-binding it is made under"; Constitution's Q2
+/// ruling 11-24) — **the owner binding a root grant's acceptance cites**, for
+/// the grant's grantee `grantee`:
+///
+/// - a person (no `node` / `agent` record): `None` (a person's acceptance
+///   cites nothing);
+/// - `explicit` (the caller names the row, `owner_binding_ref`): that row,
+///   when it is a held owner binding over `grantee` (the caller's stated
+///   choice of placement);
+/// - else EXACTLY ONE row, the binding placed where the acceptance is placed:
+///   a live owner binding over `grantee` at `cohort_scope: federation`. One
+///   owner's re-signed rows are one ownership, so where the one owner holds
+///   several federation rows the lowest row id is cited (deterministic on
+///   every node).
+///
+/// # Errors
+/// `InvalidArgument`: a machine grantee with no federation-placed binding
+/// and no `explicit` row (an unannounced machine: name the row to cite), or
+/// an `explicit` row that is no held owner binding over `grantee`; directory
+/// reads.
+pub async fn root_grant_acceptance_cites<F>(
+    dir: &F,
+    grantee: &str,
+    explicit: Option<&str>,
+) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use super::admission::{machine_owner_binding_at, owner_binding_marker, MachineOwner};
+    if let Some(id) = explicit {
+        let row = dir.get_attestation(id).await?;
+        let ok = row.as_ref().is_some_and(|r| {
+            r.attestation_type == attestation_type::DELEGATES_TO
+                && r.attested_key_id == grantee
+                && owner_binding_marker(&r.attestation_envelope)
+        });
+        if !ok {
+            return Err(Error::InvalidArgument(format!(
+                "root grant acceptance: {id} is no held owner binding over {grantee} \
+                 (CC 3.2: the acceptance cites the owner-binding it is made under)"
+            )));
+        }
+        return Ok(Some(id.to_owned()));
+    }
+    let bindings = match machine_owner_binding_at(dir, grantee, crate::host::clock::now()).await? {
+        MachineOwner::NotAMachine => return Ok(None),
+        MachineOwner::Unbound => Vec::new(),
+        MachineOwner::Bound { bindings, .. } => bindings,
+    };
+    let mut federation = Vec::new();
+    for id in bindings {
+        if let Some(r) = dir.get_attestation(&id).await? {
+            if r.cohort_scope == cohort_scope::FEDERATION {
+                federation.push(id);
+            }
+        }
+    }
+    federation.sort();
+    federation.into_iter().next().map(Some).ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "root grant acceptance: {grantee} is a machine with no federation-placed owner \
+             binding, so an acceptance at federation has none to cite (CC 3.2, the Q2 ruling): \
+             announce the binding, or name the row to cite ({})",
+            super::edition2::payloads::OWNER_BINDING_REF_MEMBER
+        ))
+    })
+}
+
+/// v62.0.0 (DUTY-D7a3) — **the ONE refusal of an uncited machine
+/// acceptance** at a producer: an acceptance of a counted root grant
+/// (`root_grant_acceptance`) for a MACHINE grantee that carries no
+/// `owner_binding_ref` would land and confer nothing (DUTY-D7). A local
+/// producer refusal, not a wire rule: the door is unchanged. Asked by
+/// [`reply_envelope`] (pure: its caller says whether the grantee is a
+/// machine) and by [`check_acceptance_cited`] (the producers with a
+/// directory).
+///
+/// # Errors
+/// `InvalidArgument` (no token).
+pub(crate) fn refuse_uncited_machine_acceptance(
+    who: &str,
+    root_grant_acceptance: bool,
+    machine_grantee: bool,
+    cited: bool,
+) -> Result<(), Error> {
+    if root_grant_acceptance && machine_grantee && !cited {
+        return Err(Error::InvalidArgument(format!(
+            "{who}: an acceptance of a root grant for a machine grantee cites the owner binding \
+             it is made under (CC 3.2); this one names none ({}): it would land and confer \
+             nothing. Draft it through root_grant_reply_input, or name the row",
+            super::edition2::payloads::OWNER_BINDING_REF_MEMBER
+        )));
+    }
+    Ok(())
+}
+
+/// v62.0.0 (DUTY-D7a3) — the producers that HOLD the directory
+/// (`attestation_emit::produce_row`, behind `emit_attestation` /
+/// `emit_with_local_signer`; `emit::draft_from_envelope_in`, behind
+/// `Engine::statement_draft`): is `envelope` (at `cohort_scope`) an
+/// acceptance of a HELD counted root grant whose grantee is a machine, and
+/// does it carry the cite? A grant this node does not hold is not judged
+/// (the producer cannot tell; the row then lands and the reader decides).
+///
+/// # Errors
+/// [`refuse_uncited_machine_acceptance`]; directory reads.
+pub(crate) async fn check_acceptance_cited<F>(
+    dir: &F,
+    who: &str,
+    envelope: &serde_json::Value,
+    cohort_scope: &str,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use super::types::identity_type as it;
+    if envelope
+        .get("dimension")
+        .and_then(serde_json::Value::as_str)
+        != Some(ACCEPTANCE_DIMENSION)
+        || cohort_scope != cohort_scope::FEDERATION
+    {
+        return Ok(());
+    }
+    let Some(grant_id) = envelope
+        .get("references_attestation_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    let Some(grant) = dir.get_attestation(grant_id).await? else {
+        return Ok(());
+    };
+    if !super::admission::is_counted_root_grant_row(&grant) {
+        return Ok(());
+    }
+    let machine = dir
+        .lookup_public_key(&grant.attested_key_id)
+        .await?
+        .is_some_and(|r| {
+            it::set_contains(&r.identity_type, it::NODE)
+                || it::set_contains(&r.identity_type, it::AGENT)
+        });
+    refuse_uncited_machine_acceptance(
+        who,
+        true,
+        machine,
+        envelope
+            .get(super::edition2::payloads::OWNER_BINDING_REF_MEMBER)
+            .is_some(),
+    )
+}
+
+/// v62.0.0 (DUTY-D7a) — [`reply_input`] for a counted root grant, with the
+/// acceptance's `owner_binding_ref` (stated as `refs.also.cites`) filled by
+/// [`root_grant_acceptance_cites`]. A decline, and any reply that is not to a
+/// counted root grant, is [`reply_input`] unchanged.
+///
+/// # Errors
+/// As [`root_grant_acceptance_cites`].
+pub async fn root_grant_reply_input<F>(
+    dir: &F,
+    grant: &Attestation,
+    accept: bool,
+    explicit_binding: Option<&str>,
+) -> Result<super::types::EmitAttestationInput, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut input = reply_input(grant, accept);
+    if accept && super::admission::is_counted_root_grant_row(grant) {
+        if let Some(cite) =
+            root_grant_acceptance_cites(dir, &grant.attested_key_id, explicit_binding).await?
+        {
+            input.attestation_envelope.extra.insert(
+                super::edition2::payloads::OWNER_BINDING_REF_MEMBER.to_owned(),
+                serde_json::Value::String(cite),
+            );
+        }
+    }
+    Ok(input)
+}
+
 /// v62.0.0 (KR-fix6) — **a reply's envelope, for a signer whose pen is
 /// elsewhere** (a hardware-held owner): exactly the members
 /// [`reply_input`] gives the software producer (`dimension`,
-/// `references_attestation_id`, `proposal_hash`, the group's members for a
+/// `references_attestation_id` (stated as `refs.answers`), the group's members for a
 /// group reply) plus the `cohort_scope` the producer states. Hand it to
 /// `Engine::statement_draft("scores", &envelope, signer_iss, signer_kid_hex,
 /// sub, asserted_at_ms, None)`, with `sub` = the proposal's
 /// `attested_key_id` for a root grant; sign the draft; `submit_voice`. Both
 /// paths then state the reply through `emit::row_payload`.
-#[must_use]
-pub fn reply_envelope(proposal: &Attestation, accept: bool) -> serde_json::Value {
-    let input = reply_input(proposal, accept);
+///
+/// v62.0.0 (DUTY-D7a2; the Q2 ruling) — takes the reply's INPUT
+/// ([`root_grant_reply_input`], which fills a root grant's cite, or
+/// [`reply_input`]), so a hardware-pen draft states exactly what the software
+/// producer states. `machine_grantee`: the grant's grantee is a `node` /
+/// `agent` key (the caller read it; this draft holds no directory).
+///
+/// # Errors
+/// `InvalidArgument` (no token): an acceptance of a counted root grant for a
+/// MACHINE grantee whose input carries no cite (`owner_binding_ref`). Such a
+/// row would land and confer nothing anywhere: draft it through
+/// [`root_grant_reply_input`], or name the row.
+pub fn reply_envelope(
+    input: &super::types::EmitAttestationInput,
+    machine_grantee: bool,
+) -> Result<serde_json::Value, Error> {
+    let root_grant_acceptance = input.attestation_envelope.dimension.as_deref()
+        == Some(ACCEPTANCE_DIMENSION)
+        && input.cohort_scope == cohort_scope::FEDERATION;
+    refuse_uncited_machine_acceptance(
+        "reply_envelope",
+        root_grant_acceptance,
+        machine_grantee,
+        input
+            .attestation_envelope
+            .extra
+            .contains_key(super::edition2::payloads::OWNER_BINDING_REF_MEMBER),
+    )?;
     let mut envelope = input.attestation_envelope.to_value();
     if let Some(o) = envelope.as_object_mut() {
         if !input.subject_key_ids.is_empty() {
@@ -1927,7 +2209,7 @@ pub fn reply_envelope(proposal: &Attestation, accept: bool) -> serde_json::Value
         );
         o.retain(|_, v| !v.is_null());
     }
-    envelope
+    Ok(envelope)
 }
 
 /// The emit input for K's reply (acceptance or decline) to `proposal`.
@@ -1936,15 +2218,12 @@ pub fn reply_input(proposal: &Attestation, accept: bool) -> super::types::EmitAt
     // v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21) — a reply to a counted
     // grant from the root: placed at the federation scope, naming no group
     // (the root is the accord of the bundle the grant names), attested to the
-    // grantee, binding the grant's id and content hash
+    // grantee, naming the grant by its row id (`refs.answers`, KR-fix32:
+    // no `proposal_hash`, the row id IS the digest of the grant's payload)
     // ([`check_root_grant_reply`]). The signer must be the grantee's
     // consenter: for a `node` or `agent` grantee, its owner.
     if super::admission::is_counted_root_grant_row(proposal) {
-        let mut extra = serde_json::Map::new();
-        extra.insert(
-            "proposal_hash".into(),
-            proposal.original_content_hash.clone().into(),
-        );
+        let extra = serde_json::Map::new();
         let envelope = super::envelope::EnvelopeCore {
             dimension: Some(
                 if accept {
@@ -1978,10 +2257,8 @@ pub fn reply_input(proposal: &Attestation, accept: bool) -> super::types::EmitAt
             extra.insert(key.into(), v.clone());
         }
     }
-    extra.insert(
-        "proposal_hash".into(),
-        proposal.original_content_hash.clone().into(),
-    );
+    // v62.0.0 (KR-fix32) — no `proposal_hash`: the reply names the
+    // proposal by its row id (`refs.answers`), the digest of its payload.
     // The acceptance restates the offered role, and carries none when none
     // was offered (absent, never `null`).
     if accept {
@@ -2112,7 +2389,6 @@ pub mod test_support {
             "group_kind": super::group_kind_for_scope(&scope).unwrap_or("community"),
             target_key(&scope): p.attestation_envelope.get(target_key(&scope)).cloned(),
             "references_attestation_id": p.attestation_id,
-            "proposal_hash": p.original_content_hash,
         });
         // The acceptance restates the offered role, and carries none when none
         // was offered.

@@ -102,3 +102,36 @@ def test_the_surface_is_present() -> None:
         "submit_delegation_voice",
     ):
         assert not hasattr(ciris_persist.Engine, gone), gone
+
+
+def test_voice_draft_names_the_stated_signing_key(engine_factory, tmp_path) -> None:
+    """v62.0.0 (RESIGN-7) — ``voice_draft(…, signer_kid=None)``: the draft's
+    protected header names the key id the voice will sign with when it is
+    stated (a rotated key, a second device); absent, the identity's first
+    key, as before; a ``signer_kid`` that is not 32 bytes of hex is a
+    ``ValueError``."""
+    dsn = _dsn(tmp_path)
+    d = engine_factory("ssv-d", 0xD5, dsn=dsn)
+    try:
+        kd = d.register_self_federation_key("user")
+    finally:
+        d.close(force=True)
+    a = engine_factory("ssv-a", 0xA5, dsn=dsn)
+    try:
+        a.register_self_federation_key("user")
+        row = a.grant_delegation(kd, ["act_on_behalf"], False)
+    finally:
+        a.close(force=True)
+    d = engine_factory("ssv-d", 0xD5, dsn=dsn)
+    try:
+        stated = "ab" * 32
+        default = json.loads(d.voice_draft(row, kd))
+        named = json.loads(d.voice_draft(row, kd, signer_kid=stated))
+        assert stated in named["protected"], named
+        assert stated not in default["protected"], default
+        # the payload is the row's own, whichever key signs it
+        assert named["payload"] == default["payload"]
+        with pytest.raises(ValueError):
+            d.voice_draft(row, kd, signer_kid="zz")
+    finally:
+        d.close(force=True)

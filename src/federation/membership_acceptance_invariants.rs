@@ -59,7 +59,7 @@ pub(crate) mod bodies {
         protocol: &str,
         founders: &[&str],
         unsigned: &[&str],
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         found_room(d, cid, protocol, founders, unsigned, None).await
     }
 
@@ -71,7 +71,7 @@ pub(crate) mod bodies {
         protocol: &str,
         founders: &[&str],
         unsigned: &[&str],
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         let blob = serde_json::json!({
             crate::federation::affiliation_config::POLICY_COHORT_FIELD: "affiliations"
         });
@@ -86,7 +86,7 @@ pub(crate) mod bodies {
         protocol: &str,
         founders: &[&str],
         unsigned: &[&str],
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         let blob = serde_json::json!({
             "cohort_subkind": crate::federation::public_room::COHORT_SUBKIND_PUBLIC
         });
@@ -102,7 +102,7 @@ pub(crate) mod bodies {
         founders: &[&str],
         unsigned: &[&str],
         policy_blob: Option<serde_json::Value>,
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         found_room(d, cid, protocol, founders, unsigned, policy_blob).await
     }
 
@@ -115,7 +115,7 @@ pub(crate) mod bodies {
         protocol: &str,
         founders: &[&str],
         founded_at: DateTime<Utc>,
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         let blob = serde_json::json!({
             "cohort_subkind": crate::federation::public_room::COHORT_SUBKIND_PUBLIC
         });
@@ -129,7 +129,7 @@ pub(crate) mod bodies {
         founders: &[&str],
         unsigned: &[&str],
         policy_blob: Option<serde_json::Value>,
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         let founded_at = Utc::now() - Duration::days(1);
         found_room_at(
             d,
@@ -151,7 +151,7 @@ pub(crate) mod bodies {
         unsigned: &[&str],
         policy_blob: Option<serde_json::Value>,
         founded_at: DateTime<Utc>,
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         let members = founders
             .iter()
             .map(|k| ((*k).to_owned(), Some("founder".to_owned())))
@@ -189,9 +189,13 @@ pub(crate) mod bodies {
                 None,
                 crate::federation::edition2::fixture_switch::ms(founded_at),
             );
-            return gf::put_voices(d, &voices).await.map(|_| ());
+            // v62.0.0 (GID-fixtures-mech, .rev2) — the room's DERIVED id,
+            // which the codec recorded for the name `cid`
+            // (`fixture_switch::room_id`: it panics if no founding did).
+            gf::put_voices(d, &voices).await?;
+            return Ok(crate::federation::edition2::fixture_switch::room_id(cid));
         }
-        d.put_community(signed).await.map(|_| ())
+        d.put_community(signed).await.map(|_| cid.to_owned())
     }
 
     pub(crate) async fn found_family<D: FederationDirectory + ?Sized>(
@@ -200,7 +204,7 @@ pub(crate) mod bodies {
         protocol: &str,
         founders: &[&str],
         unsigned: &[&str],
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         let members = founders
             .iter()
             .map(|k| ((*k).to_owned(), Some("founder".to_owned())))
@@ -233,9 +237,10 @@ pub(crate) mod bodies {
             let at =
                 crate::federation::edition2::fixture_switch::ms(Utc::now() - Duration::days(1));
             let voices = gf::family_voices(&signed, 1, None, at);
-            return gf::put_voices(d, &voices).await.map(|_| ());
+            gf::put_voices(d, &voices).await?;
+            return Ok(crate::federation::edition2::fixture_switch::room_id(fid));
         }
-        d.put_family(signed).await
+        d.put_family(signed).await.map(|()| fid.to_owned())
     }
 
     fn row(
@@ -332,7 +337,6 @@ pub(crate) mod bodies {
             "group_kind": group_kind(&p.cohort_scope),
             target_key(&p.cohort_scope): group,
             "references_attestation_id": p.attestation_id,
-            "proposal_hash": p.original_content_hash,
         });
         if accept {
             if let Some(role) = p.attestation_envelope.get("role").filter(|v| !v.is_null()) {
@@ -560,7 +564,8 @@ pub(crate) mod bodies {
         // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
         let (cid, founder, k, stranger) =
             (id_of(&cid), id_of(&founder), id_of(&k), id_of(&stranger));
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .expect("I210: the founder founds the room");
         let p = proposal(
@@ -649,7 +654,8 @@ pub(crate) mod bodies {
         // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
         let (cid, founder, k, stranger) =
             (id_of(&cid), id_of(&founder), id_of(&k), id_of(&stranger));
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let p = proposal(
@@ -711,7 +717,8 @@ pub(crate) mod bodies {
             id_of(&k),
             id_of(&j),
         );
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -828,7 +835,8 @@ pub(crate) mod bodies {
         reg(d, &[&cid, &founder, &k]).await;
         // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
         let (cid, founder, k) = (id_of(&cid), id_of(&founder), id_of(&k));
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -931,7 +939,8 @@ pub(crate) mod bodies {
             id_of(&j),
             id_of(&m),
         );
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let t0 = Utc::now() - Duration::days(20);
@@ -1035,7 +1044,8 @@ pub(crate) mod bodies {
         reg(d, &[&cid, &founder, &k]).await;
         // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
         let (cid, founder, k) = (id_of(&cid), id_of(&founder), id_of(&k));
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -1094,28 +1104,32 @@ pub(crate) mod bodies {
             format!("i216-k-{s}"),
         );
         reg(d, &[&c1, &c2, &f1, &f2, &founder, &cofounder, &k]).await;
-        found_community(d, &c1, "majority", &[&founder], &[&k])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let c1 = found_community(d, &c1, "majority", &[&founder], &[&k])
             .await
             .expect("I216: an unsigned founding member leaves the roster pending");
         assert!(
             d.lookup_community(&id_of(&c1)).await.unwrap().is_none(),
             "I216: nothing stored"
         );
-        found_community(d, &c2, "majority", &[&founder, &cofounder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let c2 = found_community(d, &c2, "majority", &[&founder, &cofounder], &[])
             .await
             .expect("I216: every founding member signed");
         assert!(
             d.lookup_community(&id_of(&c2)).await.unwrap().is_some(),
             "I216: the fully voiced room lands"
         );
-        found_family(d, &f1, "majority", &[&founder], &[&k])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let f1 = found_family(d, &f1, "majority", &[&founder], &[&k])
             .await
             .expect("I216: an unsigned founding family member leaves it pending");
         assert!(
             d.lookup_family(&id_of(&f1)).await.unwrap().is_none(),
             "I216: nothing stored"
         );
-        found_family(d, &f2, "majority", &[&founder, &cofounder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let f2 = found_family(d, &f2, "majority", &[&founder, &cofounder], &[])
             .await
             .expect("I216: a co-signed family founding");
         assert!(
@@ -1135,7 +1149,8 @@ pub(crate) mod bodies {
         reg(d, &[&cid, &founder, &k]).await;
         // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
         let (cid, founder, k) = (id_of(&cid), id_of(&founder), id_of(&k));
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let mut c = d.lookup_community(&cid).await.unwrap().unwrap();
@@ -1194,7 +1209,8 @@ pub(crate) mod bodies {
         reg(d, &[&cid, &a, &b, &c, &k]).await;
         // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
         let (cid, a, b, c, k) = (id_of(&cid), id_of(&a), id_of(&b), id_of(&c), id_of(&k));
-        found_community(d, &cid, "majority", &[&a, &b, &c], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "majority", &[&a, &b, &c], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -1274,7 +1290,8 @@ pub(crate) mod bodies {
         for n in [a, b] {
             reg(n, &[&cid, &founder, &k]).await;
         }
-        found_community(a, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(a, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let (cid, founder, k) = (id_of(&cid), id_of(&founder), id_of(&k));

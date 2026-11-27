@@ -259,6 +259,9 @@ where
         .await?
         {
             crate::federation::holding_claim::HoldingClaimOutcome::Emitted { .. } => {}
+            // v62.0.0 (HEAD-4.rev2; Constitution, head cases (3)) — an
+            // unowned node holds the adopted bytes and claims nothing yet.
+            crate::federation::holding_claim::HoldingClaimOutcome::Unowned { .. } => {}
             crate::federation::holding_claim::HoldingClaimOutcome::NotInCohort { scope } => {
                 return Err(BlobError::AttestationEmissionFailed(format!(
                     "the adopted blob {} is held, but this node is not in its cohort {:?} and \

@@ -133,10 +133,12 @@ pub(crate) mod bodies {
         for d in [src, outsider, inside] {
             reg(d, &[&m, &x, &room, &public]).await;
         }
-        found_community(src, &room, "quorum:1/1", &[&m], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let room = found_community(src, &room, "quorum:1/1", &[&m], &[])
             .await
             .unwrap();
-        found_public_room(
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let public = found_public_room(
             src,
             &public,
             crate::federation::types::consensus_protocol::OPEN_SELF_ADMIT,
@@ -350,10 +352,12 @@ pub(crate) mod invitee {
         }
         // Every event in the past, so the seat is in force when it is read.
         let now = Utc::now() - Duration::minutes(10);
-        found_family(a, &fam, "founder_only", &[&p], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let fam = found_family(a, &fam, "founder_only", &[&p], &[])
             .await
             .unwrap();
-        found_community(a, &room, "quorum:1/1", &[&p], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let room = found_community(a, &room, "quorum:1/1", &[&p], &[])
             .await
             .unwrap();
         for (scope, group) in [(FAMILY, &fam), (COMMUNITY, &room)] {
@@ -492,7 +496,8 @@ pub(crate) mod family_events {
         for d in [p_node, q_node, r_node] {
             reg(d, &[&p, &q, &r, &fam]).await;
         }
-        found_family(p_node, &fam, "founder_only", &[&p, &q, &r], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let fam = found_family(p_node, &fam, "founder_only", &[&p, &q, &r], &[])
             .await
             .unwrap();
         for d in [q_node, r_node] {
@@ -513,6 +518,7 @@ pub(crate) mod family_events {
                 reason: None,
                 witness_set: vec![],
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Removal,
             },
         );
         let (head, _) = e2::held_head(p_node, &e2::kid(&fam))
@@ -566,7 +572,8 @@ pub(crate) mod family_events {
                 ts::put_owner_binding(d, owner, node).await;
             }
         }
-        found_family(a, &fam, "founder_only", &[&p, &q], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let fam = found_family(a, &fam, "founder_only", &[&p, &q], &[])
             .await
             .unwrap();
         assert!(

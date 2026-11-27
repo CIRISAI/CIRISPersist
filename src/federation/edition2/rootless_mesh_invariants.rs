@@ -54,6 +54,9 @@
 //!   (counted over no bundle's holders) and declares "the bundle in force"
 //!   read (`family:ceg-genesis-bundle/2`); the ceremony's import lands it,
 //!   with no further act.
+//! - **I6640** — (BIND-6, v62-duty) a rootless node is pulled through the
+//!   HELD read and `may_receive`: B receives A's key records and A's
+//!   federation owner binding, and not a third party's commons row.
 //! - **I2268** — (RL-fix6) the negative: the same founding voiced by one
 //!   holder (short of the strict majority) is held while rootless and STAYS
 //!   held after the import re-folds it; nothing concludes it.
@@ -782,12 +785,118 @@ async fn i2240_engine_opens_and_serves(dsn_a: &str, dsn_b: &str, tag: &str) {
     assert_rootless(db.as_ref(), &format!("{tag} B after")).await;
 }
 
+/// **I6640** (BIND-6 / BIND-6a; CC 5.3.4 "What crosses before Rooted"; Edge's
+/// path A, the advertise sweep) — **a fresh rootless node A is pulled by B
+/// through the HELD read and the per-recipient check**: B takes every row
+/// A's `list_attestations_since` returns that `may_receive_with(A, B, row,
+/// one sweep handle)` passes, fetched by A's statement point read and offered
+/// to B's replicated door. B then holds A's node key record, A's owner's key
+/// record and A's federation owner binding (the allegiance row), and NOT a
+/// third party's commons row A holds. The self pair and the route travel on
+/// the occurrence and route planes (no attestation row; I2241); this
+/// witnesses the attestation plane Edge advertises from.
+pub(crate) async fn i6640_a_rootless_node_is_pulled_through_the_held_read(
+    a: &dyn FederationDirectory,
+    b: &dyn FederationDirectory,
+    tag: &str,
+) {
+    use super::fixture_switch as e2;
+    use crate::federation::replication_audience::{may_receive_with, ServeRooting};
+    assert_rootless(a, &format!("{tag} A")).await;
+    assert_rootless(b, &format!("{tag} B")).await;
+    let node = e2::put_key(a, "i6640-a-node", &["node"]).await;
+    let owner = e2::put_key(a, "i6640-a-owner", &["user"]).await;
+    let stranger = e2::put_key(a, "i6640-stranger", &["user"]).await;
+    let peer = e2::put_key(b, "i6640-b-node", &["node"]).await;
+    let at_ms =
+        u64::try_from((chrono::Utc::now() - chrono::Duration::minutes(5)).timestamp_millis())
+            .expect("after 1970");
+    let binding = super::fixture_occurrence::announce_node_owner_seeds(
+        a,
+        "i6640-a-owner",
+        "i6640-a-node",
+        at_ms,
+    )
+    .await;
+    let mut third = crate::federation::genesis::ordinary_scores_row(
+        &uuid::Uuid::new_v4().to_string(),
+        &stranger,
+    );
+    third.cohort_scope = crate::federation::types::cohort_scope::FEDERATION.to_owned();
+    let third = e2::row_of(&third, "i6640-stranger");
+    e2::put_signed(a, &third)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] I6640: the third party's row on A: {e}"));
+    // B pulls: A's held read, one sweep handle, the per-recipient check.
+    let sweep = ServeRooting::new();
+    let mut sent: Vec<Vec<u8>> = Vec::new();
+    let mut since = None;
+    for _ in 0..1_000 {
+        let page = a.list_attestations_since(since.clone(), 50).await.unwrap();
+        let Some(last) = page.last() else { break };
+        since = Some(last.resume_pair());
+        for r in page {
+            if !may_receive_with(a, &peer, &r.attestation, &sweep)
+                .await
+                .unwrap()
+                .allowed()
+            {
+                continue;
+            }
+            // The row's statement and every voice over it (a counted row,
+            // e.g. the owner binding, lands on its voices).
+            if let Some(Some(st)) = super::store::lookup_by_id(
+                a,
+                super::store::STATEMENT_KIND,
+                &r.attestation.attestation_id,
+            )
+            .await
+            .unwrap()
+            {
+                if let Some(rid) = RowId::of_statement(&st) {
+                    sent.extend(a.edition2_voices(&rid).await.unwrap_or_default());
+                }
+                sent.push(st);
+            }
+        }
+    }
+    let mut pending = sent;
+    for _ in 0..8 {
+        let mut waiting = Vec::new();
+        for st in pending {
+            if offer(b, &st).await.is_err() {
+                waiting.push(st);
+            }
+        }
+        if waiting.is_empty() {
+            break;
+        }
+        pending = waiting;
+    }
+    for (what, k) in [("A's node", &node), ("A's owner", &owner)] {
+        assert!(
+            b.lookup_public_key(k).await.unwrap().is_some(),
+            "[{tag}] I6640: B holds {what} key record, pulled from a rootless A"
+        );
+    }
+    assert!(
+        b.get_attestation(&binding.hex()).await.unwrap().is_some(),
+        "[{tag}] I6640: B holds A's federation owner binding (the allegiance row)"
+    );
+    assert!(
+        b.get_attestation(&e2::rid(&third)).await.unwrap().is_none(),
+        "[{tag}] I6640: and NOT a third party's commons row A holds"
+    );
+    assert_rootless(a, &format!("{tag} A after")).await;
+    assert_rootless(b, &format!("{tag} B after")).await;
+}
+
 #[cfg(feature = "sqlite")]
 mod sqlite {
     use super::*;
     use crate::federation::key_grant_invariants::two_node::{
         exercise_i199_family_member_publishes_and_another_opens, exercise_i61_end_to_end,
-        introduce, introduce_as, node, node_as,
+        introduce, introduce_as, node, node_as, own,
     };
     use crate::store::sqlite::SqliteBackend;
     use crate::store::Backend as _;
@@ -805,6 +914,16 @@ mod sqlite {
         i2240_engine_opens_and_serves("sqlite::memory:", "sqlite::memory:", "sqlite").await;
     }
 
+    /// I6640 — a rootless node pulled through the held read and may_receive.
+    #[tokio::test]
+    async fn i6640_a_rootless_node_is_pulled_through_the_held_read_sqlite() {
+        let (a, b) = (fresh().await, fresh().await);
+        Box::pin(i6640_a_rootless_node_is_pulled_through_the_held_read(
+            &a, &b, "sqlite",
+        ))
+        .await;
+    }
+
     /// I2241 — first contact between two rootless nodes.
     #[tokio::test]
     async fn i2241_two_rootless_nodes_make_first_contact_sqlite() {
@@ -813,7 +932,7 @@ mod sqlite {
     }
 
     /// I2242 — community roster, key grant to the peer and sealed blob cross
-    /// between two rootless nodes.
+    /// between two rootless nodes (v62.0.0 HEAD-6: two OWNED rootless nodes).
     #[tokio::test]
     async fn i2242_a_community_blob_opens_across_rootless_nodes_sqlite() {
         use crate::federation::types::identity_type::NODE;
@@ -821,6 +940,12 @@ mod sqlite {
         let a = node_as(&ba, "i2242-a", NODE).await;
         let b = node_as(&bb, "i2242-b", NODE).await;
         introduce_as(&[&a, &b], &["i2242-a", "i2242-b"], NODE).await;
+        // v62.0.0 (HEAD-6; Constitution, head cases (3)) — re-staged on OWNED
+        // nodes: an unowned node is only reachable (it signs no holding claim
+        // and no report); owned-but-rootless runs the mesh. Each node's owner
+        // binding lands through the real door; neither node holds a root.
+        own(&a, "i2242-a", "i2242-owner-a").await;
+        own(&b, "i2242-b", "i2242-owner-b").await;
         assert_rootless(&ba, "sqlite A").await;
         assert_rootless(&bb, "sqlite B").await;
         Box::pin(exercise_i61_end_to_end(&a, &b, "i2242-sqlite")).await;
@@ -884,7 +1009,7 @@ mod postgres {
     use super::*;
     use crate::federation::key_grant_invariants::two_node::{
         exercise_i199_family_member_publishes_and_another_opens, exercise_i61_end_to_end,
-        introduce, introduce_as, node, node_as,
+        introduce, introduce_as, node, node_as, own,
     };
     use crate::store::postgres::PostgresBackend;
     use crate::store::Backend as _;
@@ -909,6 +1034,18 @@ mod postgres {
     }
 
     #[tokio::test]
+    async fn i6640_a_rootless_node_is_pulled_through_the_held_read_postgres() {
+        let (Some(a), Some(b)) = (fresh().await, fresh().await) else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        Box::pin(i6640_a_rootless_node_is_pulled_through_the_held_read(
+            &a, &b, "postgres",
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn i2241_two_rootless_nodes_make_first_contact_postgres() {
         let (Some(a), Some(b)) = (fresh().await, fresh().await) else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -927,6 +1064,12 @@ mod postgres {
         let a = node_as(&ba, "i2242-a", NODE).await;
         let b = node_as(&bb, "i2242-b", NODE).await;
         introduce_as(&[&a, &b], &["i2242-a", "i2242-b"], NODE).await;
+        // v62.0.0 (HEAD-6; Constitution, head cases (3)) — re-staged on OWNED
+        // nodes: an unowned node is only reachable (it signs no holding claim
+        // and no report); owned-but-rootless runs the mesh. Each node's owner
+        // binding lands through the real door; neither node holds a root.
+        own(&a, "i2242-a", "i2242-owner-a").await;
+        own(&b, "i2242-b", "i2242-owner-b").await;
         assert_rootless(&ba, "postgres A").await;
         assert_rootless(&bb, "postgres B").await;
         Box::pin(exercise_i61_end_to_end(&a, &b, "i2242-postgres")).await;

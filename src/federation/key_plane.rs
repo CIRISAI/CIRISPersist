@@ -871,6 +871,9 @@ pub fn is_never_withdrawn(row: &Attestation) -> bool {
         // v59.0.0 (CIRISPersist#1104, CC 3.1.5) — nor is an occurrence
         // revocation's carrier.
         || super::occurrence_revocation_carrier::is_carrier_row(row)
+        // v62.0.0 (ACK-1; CC 2.4.1.1 "Never withdrawn": "a receipt [is]
+        // never withdrawn either") — nor is an `act:ack` receipt.
+        || super::edition2::act_ack::is_act_ack_row(row)
 }
 
 /// The rebuild gate's rendering of one `federation_revocations` projection

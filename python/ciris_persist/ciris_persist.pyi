@@ -1896,7 +1896,7 @@ class Engine:
     def submit_voice(self, statement_hex: str) -> str:
         """(derived) deontic — v62.0.0 (v62 P8-fix5) — submit a second signer's voice signed elsewhere (statement_hex: the assembled COSE_Sign1, lowercase hex) through the statem..."""
 
-    def voice_draft(self, row_id: str, signer_iss: str) -> str:
+    def voice_draft(self, row_id: str, signer_iss: str, signer_kid: str | None = None) -> str:
         """(derived) procedural — v62.0.0 (v62 P8-fix5) — a held row's voice, drafted for a hardware or remote second signer (signer_iss, its identity-ref): JSON {protected, payload..."""
 
     def voice_held_row(self, row_id: str) -> str:
@@ -3364,10 +3364,10 @@ class Engine:
         """(derived) empirical — #135 + part of #150 — list every attestation whose subject is target_key_id (attested_key_id = target_key_id), newest-first, cursor-paged. Scope is..."""
 
     def list_attestations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
-        """(derived) empirical — v21.1.0 (CIRISPersist#507c) — bulk-list Attestation rows since a cursor, as a JSON array, federation tier only (the E5 invariant — a local-tier row..."""
+        """(derived) empirical — HELD READ (v62.0.0 BIND-5): returns what this node HOLDS, including rows no third party may receive; filter per recipient with may_receive before sending anything. v21.1.0 (CIRISPersist#507c) — bulk-list Attestation rows since a cursor, as a JSON array, federation tier only (the E5 invariant — a local-tier row..."""
 
     def list_attestations_since_by_prefixes(self, since_rfc3339: str | None, since_id: str | None, family_prefixes: list[str], limit: int) -> str:
-        """(derived) empirical — v61.1.0 (CIRISPersist#1190) — list_attestations_since narrowed by family: the federation-tier rows whose family (row_type::claim_token: a scores ro..."""
+        """(derived) empirical — HELD READ (v62.0.0 BIND-5): returns what this node HOLDS, including rows no third party may receive; filter per recipient with may_receive before sending anything. v61.1.0 (CIRISPersist#1190) — list_attestations_since narrowed by family: the federation-tier rows whose family (row_type::claim_token: a scores ro..."""
 
     def list_canonical_servers(self) -> str:
         """(derived) empirical — v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the canonical / founding bootstrap servers as a JSON array of KeyRecords (federation_keys rows w..."""

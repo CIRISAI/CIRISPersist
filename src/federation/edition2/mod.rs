@@ -42,6 +42,9 @@ pub mod composite_verify;
 mod composite_verify_invariants;
 pub mod door;
 pub mod emit;
+// v62.0.0 (DUTY-D7) — a root grant confers BY NAMING: `confers_on_act` (the
+// doors) and `holds_now` (the reading), kept apart by type.
+pub mod conferral_naming;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod fixture_genesis;
 #[cfg(any(test, feature = "test-anchor"))]
@@ -60,6 +63,9 @@ pub mod accord_rescan;
 // v62.0.0 (RL-fix2) — first contact by node code: the local dial hint, the
 // checked pre-seal admission and the post-seal owner check.
 pub mod contact;
+// v62.0.0 (CONTENT-A2) — I6703–I6705: the room-content door.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod content_door_invariants;
 pub mod fold;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod fold_invariants;
@@ -102,9 +108,21 @@ mod accord_rescan_invariants;
 // v62.0.0 (RL-fix2) — I2247–I2252: first contact by node code.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod contact_invariants;
-// v62.0.0 (RL-fix2b) — I2253: the JSON attestation serve plane waits in the SQL.
+// v62.0.0 (RL-fix2b) — I2253: the JSON attestation held read (BIND-5) waits in the SQL.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod serve_wait_invariants;
+// v62.0.0 (DUTY-D7) — I6645–I6648: a root grant confers on an act by
+// naming; the handover; the reading.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod conferral_naming_invariants;
+// v62.0.0 (DUTY-D7a) — I6641–I6643: a root grant's acceptance cites the
+// owner binding placed where it is placed (federation), or names the row.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod acceptance_cites_invariants;
+// v62.0.0 (BIND-6a) — I6636–I6637: an unrooted node serves its key record
+// and every bootstrap / allegiance row (a rootless node runs the mesh).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod unrooted_bootstrap_invariants;
 // v62.0.0 (RL-fix4) — I2255–I2259: relay eligibility by consent.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod relay_eligibility_invariants;
@@ -115,8 +133,22 @@ pub mod genesis;
 pub mod group;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod group_fixtures;
+// v62.0.0 (GID-prod) — the derived group id: one module, swapped for Verify
+// 23.5.1's export at the pin step.
+pub mod group_id;
 pub mod group_serve;
+// v62.0.0 (GID-tips) — I5717, I5718: a contested founding concludes nothing.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod group_tips_invariants;
+// v62.0.0 (ACK-1, ACK-2; CC pre4 3.1.3, 2.4.1.1) — the `act:ack` receipt:
+// its door rules and its draft.
+pub mod act_ack;
 pub mod halt;
+// v62.0.0 (HEAD-1; CC 2.4.1.1) — the head rule: which head a row names.
+pub mod head_rule;
+// v62.0.0 (HEAD-2) — the head rule at the statement door (sqlite + pg).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod head_rule_invariants;
 pub mod ingest;
 pub mod liveness;
 pub mod names;
@@ -127,6 +159,9 @@ pub mod peer_rooting;
 pub mod produce;
 pub mod projection;
 pub mod recovery_signer;
+// v62.0.0 (CONTENT-A3) — which rows are a room's content (R1): one
+// predicate, a constant list until the family table carries the column.
+pub mod room_content;
 // v62.0.0 (P10; CC rc21 2.7.11) — SCITT receipts (RFC 9942, label 394) held
 // with their statements; the receipt leg of running admitted code.
 pub mod receipts;
@@ -159,6 +194,19 @@ pub mod trust_root_group;
 pub mod typed;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod typed_fixtures;
+// v62.0.0 (VD-step1) — the one row-state verdict: "is this row concluded".
+pub mod verdict;
+// v62.0.0 (VD-step1b) — I6300–I6305: the one row-state verdict's findings.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod verdict_invariants;
+// v62.0.0 (BIND-1) — I6620–I6626: placement is not accountability;
+// `on_behalf_of` counts the affiliation (node and agent).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod owner_binding_rule_invariants;
+// v62.0.0 (BIND-1b) — I6627–I6628: a delegation's term is ms-time in the
+// payload and RFC 3339 text on the row, on every family that carries one.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod term_ms_invariants;
 pub mod voices;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod voices_invariants;
