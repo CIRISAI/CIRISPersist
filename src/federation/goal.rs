@@ -719,7 +719,10 @@ impl crate::Engine {
     ///
     /// The gate's refusals; the plane's.
     pub async fn put_goal(&self, input: &GoalInput) -> Result<String, Error> {
-        self.emit_attestation_self(plan_goal_row(input)?).await
+        self.emit_attestation_self(plan_goal_row(input)?)
+            .await
+            // VD-step2b: this verb still answers the row id alone.
+            .map(crate::federation::edition2::second_signer_voice::VoiceOutcome::into_row_id)
     }
 
     /// The held goal `goal_id`, declared by this engine.
@@ -763,6 +766,8 @@ impl crate::Engine {
             input,
         )?)
         .await
+        // VD-step2b: this verb still answers the row id alone.
+        .map(crate::federation::edition2::second_signer_voice::VoiceOutcome::into_row_id)
     }
 
     /// v60.0.0 — **retire a goal**: this declarer's `withdraws` of the
@@ -779,6 +784,8 @@ impl crate::Engine {
             goal_id,
         )?)
         .await
+        // VD-step2b: this verb still answers the row id alone.
+        .map(crate::federation::edition2::second_signer_voice::VoiceOutcome::into_row_id)
     }
 
     /// v60.0.0 — **disown a goal** ("never mine"): this declarer's `recants`
@@ -795,6 +802,8 @@ impl crate::Engine {
             goal_id,
         )?)
         .await
+        // VD-step2b: this verb still answers the row id alone.
+        .map(crate::federation::edition2::second_signer_voice::VoiceOutcome::into_row_id)
     }
 }
 

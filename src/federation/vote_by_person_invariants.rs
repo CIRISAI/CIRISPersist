@@ -117,15 +117,18 @@ pub(crate) mod bodies {
     async fn evict(d: &dyn FederationDirectory, f: &str, device: &str) {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let at = ms(Utc::now());
-        d.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-            identity_key_id: e2::kid(f),
-            occurrence_key_id: e2::kid(device),
-            revoked_at: at,
-            effective_at: at,
-            reason: None,
-            witness_set: Vec::new(),
-            persist_row_hash: String::new(),
-        })
+        d.put_identity_occurrence_revocation_edition2(
+            IdentityOccurrenceRevocation {
+                identity_key_id: e2::kid(f),
+                occurrence_key_id: e2::kid(device),
+                revoked_at: at,
+                effective_at: at,
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+            crate::federation::DoorToken::new(),
+        )
         .await
         .unwrap_or_else(|e| panic!("evict {device}: {e}"));
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
