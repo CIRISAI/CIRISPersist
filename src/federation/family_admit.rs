@@ -147,7 +147,8 @@ pub(crate) async fn put_family_membership_revocation_planned<D: FamilyStore>(
             joined_at: row.effective_at,
             role: None,
         },
-        true,
+        // v62.0.0 (RESIGN-3) — the end the row's LEAF names.
+        super::RosterChange::of_leaf(row.leaf),
         row.effective_at,
     )
     .await?;
@@ -200,7 +201,7 @@ pub(crate) async fn put_family_membership_widening_planned<D: FamilyStore>(
         &widening.authority_key_id,
         &super::roster_row_signer_set(&widening.authority_key_id, &widening.cosignatures),
         row.member(),
-        false,
+        super::RosterChange::Widening,
         row.effective_at,
     )
     .await?;

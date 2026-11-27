@@ -85,6 +85,7 @@ pub(crate) mod bodies {
                     reason: None,
                     witness_set: Vec::new(),
                     persist_row_hash: String::new(),
+                    leaf: crate::federation::types::RevocationLeaf::Removal,
                 },
             );
             for c in &signers[1..] {
@@ -102,6 +103,7 @@ pub(crate) mod bodies {
                 reason: None,
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Removal,
             },
         );
         for c in &signers[1..] {

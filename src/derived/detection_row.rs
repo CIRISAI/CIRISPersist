@@ -532,21 +532,32 @@ pub fn detection_statement_parts(
 /// submits `Draft::assemble(signature)` through the statement door
 /// (`Engine::put_edition2_statement`).
 ///
+/// v62.0.0 (HEAD-fix5; the RESIGN-6 rule) — the draft names `signer_kid`,
+/// the key the detector SIGNS with, which the caller states. It is never
+/// derived from the detector's identity-ref (that is its genesis key: a
+/// detector whose key rotated, or that signs from another device, would get
+/// a draft naming a key it does not hold). The door's one check,
+/// `door::require_key_of_iss`, refuses a kid that is not of the `iss`
+/// (`kid_not_of_iss`).
+///
 /// # Errors
 /// As [`detection_statement_parts`]; a `signing_key_id` that is not an
 /// identity-ref.
 pub fn draft_detection(
     event: &DetectionEvent,
     subject: Option<&str>,
+    signer_kid: &ciris_verify_core::edition2::Digest32,
 ) -> Result<crate::federation::edition2::emit::Draft, crate::federation::Error> {
     let (sub, family, payload) = detection_statement_parts(event, subject)?;
-    let kid = crate::federation::edition2::ingest::kid_of_identity_ref(&sub).ok_or_else(|| {
-        crate::federation::Error::InvalidArgument(format!(
+    if !ciris_verify_core::edition2::is_identity_ref(&sub) {
+        return Err(crate::federation::Error::InvalidArgument(format!(
             "detection: the detector {sub} is not an identity-ref"
-        ))
-    })?;
-    crate::federation::edition2::emit::draft_row(&kid, &sub, &sub, "scores", &family, &payload)
-        .map_err(|e| crate::federation::edition2::emit::produce_error("detection", e))
+        )));
+    }
+    crate::federation::edition2::emit::draft_row(
+        signer_kid, &sub, &sub, "scores", &family, &payload,
+    )
+    .map_err(|e| crate::federation::edition2::emit::produce_error("detection", e))
 }
 
 /// v62.0.0 (v62 P8; CC 3.4.8, CC 4.4.3.34) — **state a detection on the
@@ -582,6 +593,12 @@ where
     let subject =
         crate::federation::attestation_admit::detection_subject(dir, Some(&event.trace_id)).await?;
     let (sub, family, payload) = detection_statement_parts(event, subject.as_deref())?;
+    // v62.0.0 (HEAD-1; CC 2.4.1.1) — a duty row names the standing it is
+    // exercised under: the detector node's owner binding, or a delegate's
+    // delegation (`edition2::head_rule::state_head`).
+    let payload =
+        crate::federation::edition2::head_rule::state_head(dir, "scores", &family, &iss, payload)
+            .await?;
     let statement =
         crate::federation::edition2::produce::sign_row(signer, &sub, "scores", &family, &payload)
             .await

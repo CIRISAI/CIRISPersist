@@ -202,9 +202,13 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         a: Attestation,
     ) -> Result<(), crate::federation::Error> {
-        d.put_attestation(SignedAttestation { attestation: a })
-            .await
-            .map(|_| ())
+        d.put_attestation(SignedAttestation {
+            attestation: crate::federation::edition2::fixture_switch::headed_row(&*d, &a)
+                .await
+                .expect("HEAD-fix1: the row names its head"),
+        })
+        .await
+        .map(|_| ())
     }
 
     /// The trusted-local occurrence row: `occurrence` as an occurrence of `identity`.
@@ -215,7 +219,7 @@ pub(crate) mod bodies {
         class: &str,
         valid_until: Option<chrono::DateTime<chrono::Utc>>,
     ) {
-        d.put_identity_occurrence_local(IdentityOccurrence {
+        d.test_seam_put_identity_occurrence(IdentityOccurrence {
             identity_key_id: identity.to_owned(),
             occurrence_key_id: occurrence_key.to_owned(),
             device_class: class.to_owned(),

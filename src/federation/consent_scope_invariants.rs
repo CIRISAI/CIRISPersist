@@ -360,7 +360,7 @@ pub(crate) mod bodies {
             &format!("i106b-held-{s}"),
             &producer,
             &subject,
-            serde_json::json!({"id": format!("i106b-held-{s}"), "dimension": "evidence:safety_battery:capture:a:b:v1", "score": 1.0,
+            serde_json::json!({"id": format!("i106b-held-{s}"), "dimension": "coherence_standing:cab:v1", "score": 1.0,
                 crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(at("2026-05-01T00:00:00Z"))}),
             vec![subject.clone()],
             at("2026-05-01T00:00:00Z"),
@@ -475,7 +475,11 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         s: &str,
     ) {
-        let (subject, target, node, stranger) = (
+        // v62.0.0 (D2.rev2; CC 3.4.7) — the expired record is a NODE's report
+        // under `infra:attest` from its owner: `node` is a node key, owned
+        // (the one fixture, `confer_from_owner`; rootless), and every instant
+        // is relative to now, inside its key window and after its binding.
+        let (subject, target, node_seed, stranger) = (
             format!("i111-s-{s}"),
             format!("i111-t-{s}"),
             format!("i111-n-{s}"),
@@ -483,8 +487,27 @@ pub(crate) mod bodies {
         );
         let subject = e2::put_key(d, &subject, &[USER]).await;
         let target = e2::put_key(d, &target, &[USER]).await;
-        let node = e2::put_key(d, &node, &[USER]).await;
+        let node = e2::put_key(
+            d,
+            &node_seed,
+            &[crate::federation::types::identity_type::NODE],
+        )
+        .await;
+        crate::federation::admission::r2_test_support::confer_from_owner(
+            d,
+            &format!("i111-o-{s}"),
+            &node_seed,
+            &[crate::federation::types::delegation_scope::INFRA_ATTEST],
+        )
+        .await;
         let stranger = e2::put_key(d, &stranger, &[USER]).await;
+        let base = crate::federation::admission::truncate_to_substrate_resolution(
+            chrono::Utc::now() - chrono::Duration::days(10),
+        );
+        let iso = |hours: i64, secs: i64| {
+            (base + chrono::Duration::hours(hours) + chrono::Duration::seconds(secs))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
         let grant = stance(
             &format!("i111-g-{s}"),
             &subject,
@@ -492,13 +515,13 @@ pub(crate) mod bodies {
             "granted",
             serde_json::json!("share"),
             serde_json::json!({}),
-            "2026-05-01T00:00:00Z",
-            Some("2026-05-02T00:00:00Z"),
+            &iso(0, 0),
+            Some(&iso(24, 0)),
         );
         // v62.0.0 (E5) — an expired row's edge names the grant's row id.
         let g = e2::rid(&grant);
         put(d, grant).await.unwrap();
-        let now = at("2026-05-03T00:00:00Z");
+        let now = at(&iso(48, 0));
         let expired = |id: &str, by: &str, names: Option<&str>, asserted: &str| {
             let mut extras = serde_json::json!({});
             if let Some(n) = names {
@@ -519,12 +542,7 @@ pub(crate) mod bodies {
         // (a) no edge → ignored.
         put(
             d,
-            expired(
-                &format!("i111-e-noedge-{s}"),
-                &node,
-                None,
-                "2026-05-02T00:00:01Z",
-            ),
+            expired(&format!("i111-e-noedge-{s}"), &node, None, &iso(24, 1)),
         )
         .await
         .unwrap();
@@ -536,8 +554,8 @@ pub(crate) mod bodies {
             "granted",
             serde_json::json!("share"),
             serde_json::json!({}),
-            "2026-05-01T00:00:00Z",
-            Some("2026-05-02T00:00:00Z"),
+            &iso(0, 0),
+            Some(&iso(24, 0)),
         );
         let other_g = e2::rid(&other_grant);
         put(d, other_grant).await.unwrap();
@@ -547,7 +565,7 @@ pub(crate) mod bodies {
                 &format!("i111-e-other-{s}"),
                 &node,
                 Some(&other_g),
-                "2026-05-02T00:00:01Z",
+                &iso(24, 1),
             ),
         )
         .await
@@ -555,17 +573,12 @@ pub(crate) mod bodies {
         // (c) an edge to the subject's grant, asserted BEFORE it lapsed → ignored (early expiry).
         put(
             d,
-            expired(
-                &format!("i111-e-early-{s}"),
-                &node,
-                Some(&g),
-                "2026-05-01T12:00:00Z",
-            ),
+            expired(&format!("i111-e-early-{s}"), &node, Some(&g), &iso(12, 0)),
         )
         .await
         .unwrap();
         assert_eq!(
-            d.resolve_scoped_consent(&target, &subject, "share", None, at("2026-05-01T18:00:00Z"))
+            d.resolve_scoped_consent(&target, &subject, "share", None, at(&iso(18, 0)))
                 .await
                 .unwrap(),
             ConsentState::Granted,
@@ -574,12 +587,7 @@ pub(crate) mod bodies {
         // (d) the real one: an edge to the subject's grant, asserted at/after its lapse.
         put(
             d,
-            expired(
-                &format!("i111-e-bound-{s}"),
-                &node,
-                Some(&g),
-                "2026-05-02T00:00:00Z",
-            ),
+            expired(&format!("i111-e-bound-{s}"), &node, Some(&g), &iso(24, 0)),
         )
         .await
         .unwrap();
@@ -600,14 +608,14 @@ pub(crate) mod bodies {
                 "granted",
                 serde_json::json!("share"),
                 serde_json::json!({}),
-                "2026-05-04T00:00:00Z",
+                &iso(72, 0),
                 None,
             ),
         )
         .await
         .unwrap();
         assert_eq!(
-            d.resolve_scoped_consent(&target, &subject, "share", None, at("2026-05-05T00:00:00Z"))
+            d.resolve_scoped_consent(&target, &subject, "share", None, at(&iso(96, 0)))
                 .await
                 .unwrap(),
             ConsentState::Granted,
@@ -1181,12 +1189,22 @@ mod run {
             crate::Engine::with_signer(ts::local_signer(&format!("i109-{run}")), "sqlite::memory:")
                 .await
                 .unwrap();
+        // v62.0.0 (D2.rev2; CC 3.4.7) — the record is a NODE's report
+        // under `infra:attest` from its owner: the engine's key is a node's,
+        // owned (the one fixture, `confer_from_owner`; rootless).
         let node = engine
-            .register_self_federation_key("primitive", None, None)
+            .register_self_federation_key(crate::federation::types::identity_type::NODE, None, None)
             .await
             .unwrap();
         let sq = engine.sqlite_backend().unwrap().clone();
         let d: &dyn FederationDirectory = sq.as_ref();
+        crate::federation::admission::r2_test_support::confer_from_owner(
+            d,
+            &format!("i109-owner-{run}"),
+            &format!("i109-{run}"),
+            &[crate::federation::types::delegation_scope::INFRA_ATTEST],
+        )
+        .await;
         let (subject, target) = (format!("i109-s-{run}"), format!("i109-t-{run}"));
         let subject = e2::put_key(d, &subject, &[USER]).await;
         let target = e2::put_key(d, &target, &[USER]).await;

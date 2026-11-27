@@ -287,8 +287,10 @@ mod pure {
                 p.check(t, Some("  "), "user").unwrap();
             }
             // A reserved dimension from an unauthorized emitter is refused.
+            // v62.0.0 (D1) — a ROOT-conferred family: the self-report families
+            // (`system:*`, owner-conferred) read no label here (CC 3.4.7).
             let e = p
-                .check(DELEGATES_TO, Some("system:health:v1"), "user")
+                .check(DELEGATES_TO, Some("detection:temporal_drift:v1"), "user")
                 .expect_err("ask 3: the reserved-prefix rule follows the dimension");
             assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
             let e = p
@@ -303,15 +305,19 @@ mod pure {
                 .expect_err("the version tail is required on a composer's dimension too");
             assert_eq!(e.kind(), "federation_dimension_rejected");
             // A carrier or an unregistered type is not asked here.
-            p.check("key_grant:epoch:v1", Some("system:health:v1"), "user")
-                .unwrap();
-            p.check("consent", Some("system:health:v1"), "user")
+            p.check(
+                "key_grant:epoch:v1",
+                Some("detection:temporal_drift:v1"),
+                "user",
+            )
+            .unwrap();
+            p.check("consent", Some("detection:temporal_drift:v1"), "user")
                 .unwrap();
         })
         .await;
         // Under the shipped REPORT setting the same refusal is counted, not raised.
         let before = composer_count("delegates_to:federation_reserved_prefix_emitter_mismatch");
-        p.check(DELEGATES_TO, Some("system:health:v1"), "user")
+        p.check(DELEGATES_TO, Some("detection:temporal_drift:v1"), "user")
             .expect("v53 reports ask 3");
         assert!(
             composer_count("delegates_to:federation_reserved_prefix_emitter_mismatch") > before,
@@ -672,11 +678,11 @@ pub(crate) mod bodies {
         for t in PROBES {
             let e = with_enforcement(
                 ENFORCE,
-                emit_with_local_signer(
+                Box::pin(emit_with_local_signer(
                     b,
                     &w.signer,
                     input(t, serde_json::json!({"id": "x", "size": 3})),
-                ),
+                )),
             )
             .await
             .expect_err("the emit mint refuses it too");
@@ -818,7 +824,7 @@ pub(crate) mod bodies {
     }
 
     /// **I377** — age and capacity assurance from both shapes. The witness
-    /// holds a conferred `infra:attest:assurance` scope (the runner seeds it);
+    /// holds a conferred `assure:age` / `assure:capacity` scope (v62.0.0, D3) (the runner seeds it);
     /// the subject-must-not-emit rule binds the dimension shape too.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i377_assurance_reads_both_shapes<B: FederationDirectory + Sync>(
@@ -883,7 +889,7 @@ pub(crate) mod bodies {
             .expect_err("only a conferred witness emits assurance");
         assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
         // ...and the role alone is not enough: a witness with NO conferred
-        // `infra:attest:assurance` scope is refused on the dimension shape as
+        // `assure:age` / `assure:capacity` scope is refused on the dimension shape as
         // on the type shape (the rule's delegation-scope arm, not layer 1b).
         let bare = who(
             b,
@@ -909,7 +915,7 @@ pub(crate) mod bodies {
         }
     }
 
-    /// The witness for I377, conferred `infra:attest:assurance` by a root
+    /// The witness for I377, conferred `assure:age` and `assure:capacity` (v62.0.0, D3) by a root
     /// `node` trusts. The runner has set `node` as the directory's node key.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn witness<B: FederationDirectory + Sync>(b: &B, node: &str, s: &str) -> Who {
@@ -919,14 +925,20 @@ pub(crate) mod bodies {
             crate::federation::types::identity_type::WITNESS,
         )
         .await;
-        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
-            b.as_dyn_directory(),
-            node,
-            &format!("i377-root-{s}"),
-            &w.key,
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
-        )
-        .await;
+        // v62.0.0 (D3) — the assurance duties, one each (CC 3.4.7).
+        for scope in [
+            crate::federation::types::delegation_scope::ASSURE_AGE,
+            crate::federation::types::delegation_scope::ASSURE_CAPACITY,
+        ] {
+            crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+                b.as_dyn_directory(),
+                node,
+                &format!("i377-root-{s}"),
+                &w.key,
+                scope,
+            )
+            .await;
+        }
         w
     }
 

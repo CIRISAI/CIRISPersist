@@ -360,12 +360,13 @@ pub(crate) mod bodies {
     }
 
     /// v62.0.0 (JSON cut, E12) — a registered dimension for the content's
-    /// binding rows: `evidence:{suite}:{kind}:{cell}:{prefix}` (Verify
+    /// binding rows: `coherence_standing:{cohort}` (v62.0.0 FS-sig-b; it
+    /// was `evidence:*`, which now needs `infra:attest`; Verify
     /// v23.3.0 `family_authorship.json`; the earlier fixtures'
     /// `content:established:v1` is not registered, so no statement of it can
     /// be signed). It is an open family: `evidence_refs` and the cohort
     /// target ride as they did.
-    pub(crate) const BINDING_DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
+    pub(crate) const BINDING_DIMENSION: &str = "coherence_standing:cab:v1";
 
     // ── I1170 (binding) ───────────────────────────────────────────────────
     /// v60.0.0 (#803) — a takedown notice ROW is about the content, never a
@@ -789,9 +790,22 @@ pub(crate) mod bodies {
         community: Option<&str>,
         expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<String, crate::federation::Error> {
-        for k in [producer, attested].iter().chain(subjects) {
-            key_as(dir, k, AGENT).await;
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — the PRODUCER is an agent (owned,
+        // below); the attested key and the subjects are PEOPLE: a subject who
+        // later files a takedown notice signs it as a person, and an unowned
+        // agent signs nothing.
+        key_as(dir, producer, AGENT).await;
+        for k in std::iter::once(&attested).chain(subjects) {
+            key_as(dir, k, USER).await;
         }
+        // LEAD-head2 (CC 2.4.1.1; an unowned agent signs nothing) — the
+        // producer is an OWNED agent: its row names its owner binding.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            dir,
+            producer,
+            crate::host::clock::now() - chrono::Duration::hours(1),
+        )
+        .await;
         let mut env = serde_json::json!({
             "dimension": BINDING_DIMENSION,
             "evidence_refs": [sha_hex],

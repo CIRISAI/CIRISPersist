@@ -2822,6 +2822,213 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await
     }
 
+    async fn edition2_room_series(
+        &self,
+        scope: &str,
+        target: &str,
+        author: &str,
+    ) -> Result<Vec<(crate::federation::edition2::names::RowId, i64)>, crate::federation::Error>
+    {
+        let (scope, target, author) = (scope.to_owned(), target.to_owned(), author.to_owned());
+        self.read(move |conn| {
+            crate::federation::edition2::store::room_series_sqlite(conn, &scope, &target, &author)
+        })
+        .await
+    }
+
+    async fn edition2_room_tips(
+        &self,
+        scope: &str,
+        target: &str,
+        author: &str,
+        limit: u32,
+    ) -> Result<Vec<(crate::federation::edition2::names::RowId, i64)>, crate::federation::Error>
+    {
+        let (scope, target, author) = (scope.to_owned(), target.to_owned(), author.to_owned());
+        self.read(move |conn| {
+            crate::federation::edition2::store::room_tips_sqlite(
+                conn, &scope, &target, &author, limit,
+            )
+        })
+        .await
+    }
+
+    async fn edition2_held_bound_put(
+        &self,
+        entry: &crate::federation::edition2::hold_bound::HeldEntry,
+    ) -> Result<(), crate::federation::Error> {
+        let e = entry.clone();
+        self.write(move |conn| crate::federation::edition2::hold_bound::put_sqlite(conn, &e))
+            .await
+    }
+
+    async fn edition2_held_bound_remove(
+        &self,
+        row: &crate::federation::edition2::names::RowId,
+    ) -> Result<(), crate::federation::Error> {
+        let row = *row;
+        self.write(move |conn| crate::federation::edition2::hold_bound::remove_sqlite(conn, &row))
+            .await
+    }
+
+    async fn edition2_held_bound_usage(
+        &self,
+        scope: &str,
+        target: &str,
+        bucket: &str,
+        writer: Option<&str>,
+        cap: u64,
+    ) -> Result<(u64, u64), crate::federation::Error> {
+        let (s, t, b, w) = (
+            scope.to_owned(),
+            target.to_owned(),
+            bucket.to_owned(),
+            writer.map(str::to_owned),
+        );
+        self.read(move |conn| {
+            crate::federation::edition2::hold_bound::usage_sqlite(
+                conn,
+                &s,
+                &t,
+                &b,
+                w.as_deref(),
+                cap,
+            )
+        })
+        .await
+    }
+
+    async fn edition2_held_bound_expired(
+        &self,
+        scope: &str,
+        target: &str,
+        bucket: &str,
+        before_us: i64,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::edition2::names::RowId>, crate::federation::Error> {
+        let (s, t, b) = (scope.to_owned(), target.to_owned(), bucket.to_owned());
+        self.read(move |conn| {
+            crate::federation::edition2::hold_bound::expired_sqlite(
+                conn, &s, &t, &b, before_us, limit,
+            )
+        })
+        .await
+    }
+
+    async fn edition2_content_ends(
+        &self,
+        group_kind: &str,
+        group: &str,
+        member: &str,
+    ) -> Result<
+        Vec<crate::federation::edition2::content_store::RetainedEnd>,
+        crate::federation::Error,
+    > {
+        let (k, g, m) = (group_kind.to_owned(), group.to_owned(), member.to_owned());
+        self.read(move |conn| {
+            crate::federation::edition2::content_store::ends_sqlite(conn, &k, &g, &m)
+        })
+        .await
+    }
+
+    async fn edition2_put_content_answers(
+        &self,
+        scope: &str,
+        target: &str,
+        member: &str,
+        answers: &[crate::federation::edition2::content_store::CachedAnswer],
+    ) -> Result<(), crate::federation::Error> {
+        let (s, t, m, a) = (
+            scope.to_owned(),
+            target.to_owned(),
+            member.to_owned(),
+            answers.to_vec(),
+        );
+        self.write(move |conn| {
+            crate::federation::edition2::content_store::put_answers_sqlite(conn, &s, &t, &m, &a)
+        })
+        .await
+    }
+
+    async fn edition2_put_content_answer(
+        &self,
+        scope: &str,
+        target: &str,
+        member: &str,
+        answer: &crate::federation::edition2::content_store::CachedAnswer,
+    ) -> Result<(), crate::federation::Error> {
+        let (s, t, m, a) = (
+            scope.to_owned(),
+            target.to_owned(),
+            member.to_owned(),
+            answer.clone(),
+        );
+        self.write(move |conn| {
+            crate::federation::edition2::content_store::put_answer_sqlite(conn, &s, &t, &m, &a)
+        })
+        .await
+    }
+
+    async fn edition2_content_answer(
+        &self,
+        row: &crate::federation::edition2::names::RowId,
+    ) -> Result<
+        Option<crate::federation::edition2::content_store::CachedAnswer>,
+        crate::federation::Error,
+    > {
+        let row = *row;
+        self.read(move |conn| crate::federation::edition2::content_store::answer_sqlite(conn, &row))
+            .await
+    }
+
+    async fn put_group_lineage_node(
+        &self,
+        node: &crate::federation::edition2::lineage::LineageNode,
+    ) -> Result<(), crate::federation::Error> {
+        let node = node.clone();
+        self.write(move |conn| crate::federation::edition2::lineage::put_node_sqlite(conn, &node))
+            .await
+    }
+
+    async fn group_lineage_nodes(
+        &self,
+        group: &str,
+    ) -> Result<Vec<crate::federation::edition2::lineage::LineageNode>, crate::federation::Error>
+    {
+        let group = group.to_owned();
+        self.read(move |conn| crate::federation::edition2::lineage::nodes_sqlite(conn, &group))
+            .await
+    }
+
+    async fn group_lineage_node(
+        &self,
+        row_id: &crate::federation::edition2::names::RowId,
+    ) -> Result<Option<crate::federation::edition2::lineage::LineageNode>, crate::federation::Error>
+    {
+        let row_id = *row_id;
+        self.read(move |conn| crate::federation::edition2::lineage::node_sqlite(conn, &row_id))
+            .await
+    }
+
+    async fn put_group_lineage_end(
+        &self,
+        end: &crate::federation::edition2::lineage::LineageEnd,
+    ) -> Result<(), crate::federation::Error> {
+        let end = end.clone();
+        self.write(move |conn| crate::federation::edition2::lineage::put_end_sqlite(conn, &end))
+            .await
+    }
+
+    async fn group_lineage_ends(
+        &self,
+        group: &str,
+    ) -> Result<Vec<crate::federation::edition2::lineage::LineageEnd>, crate::federation::Error>
+    {
+        let group = group.to_owned();
+        self.read(move |conn| crate::federation::edition2::lineage::ends_sqlite(conn, &group))
+            .await
+    }
+
     async fn edition2_voices(
         &self,
         row_id: &crate::federation::edition2::names::RowId,
@@ -2921,6 +3128,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await
     }
 
+    async fn drop_held_row(
+        &self,
+        row_id: &crate::federation::edition2::names::RowId,
+    ) -> Result<u64, crate::federation::Error> {
+        // v62.0.0 (KR-fix20) — one write transaction, gated in the statement.
+        let row_id = *row_id;
+        self.write(move |conn| {
+            crate::federation::edition2::fold::drop_held_row_sqlite(conn, &row_id)
+        })
+        .await
+    }
+
     async fn fold_slot_rows(
         &self,
         slot: &str,
@@ -2933,6 +3152,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn fold_slot_held(&self, slot: &str) -> Result<bool, crate::federation::Error> {
         let slot = slot.to_owned();
         self.read(move |conn| crate::federation::edition2::fold::slot_held_sqlite(conn, &slot))
+            .await
+    }
+
+    async fn fold_slot_all_rows(
+        &self,
+        slot: &str,
+    ) -> Result<Vec<crate::federation::edition2::names::RowId>, crate::federation::Error> {
+        let slot = slot.to_owned();
+        self.read(move |conn| crate::federation::edition2::fold::slot_all_rows_sqlite(conn, &slot))
             .await
     }
 
@@ -3382,7 +3610,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                            WHERE plane = 'attestation' AND record_ref = ?1) \
                AND NOT {} AND NOT {}",
             crate::federation::migration::accountability_record_sql("dimension"),
-            crate::federation::steward_purge::person_subject_sql("federation_attestations", "")
+            // v62.0.0 (WD-fix1) — the person-subject void, lifted only by an
+            // admitted withdrawal's descent re-derived here from stored rows.
+            crate::federation::steward_purge::person_void_sql(
+                "federation_attestations",
+                "",
+                crate::federation::attestation_query::Dialect::Sqlite,
+            )
         );
         self.write(move |conn| -> Result<usize, rusqlite::Error> { conn.execute(&sql, [&id]) })
             .await
@@ -3392,6 +3626,85 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "purge_delete_tombstoned_attestation: {e}"
                 ))
             })
+    }
+
+    async fn list_withdrawals_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedAttestation>, crate::federation::Error> {
+        // v62.0.0 (WD-fix1) — the withdrawn-content sweep's read: every held
+        // withdrawal in admission order, no serve rule.
+        // A row-value seek on the partial index (`''` before every instant
+        // and id when there is no cursor): a tick reads its page, not the
+        // withdrawals before it (EXPLAIN QUERY PLAN in WD-fix1.md).
+        let since_at = since
+            .as_ref()
+            .map_or_else(String::new, |(t, _)| t.to_rfc3339());
+        let since_id = since
+            .as_ref()
+            .map_or_else(String::new, |(_, id)| id.clone());
+        let sql = format!(
+            "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                weight, asserted_at, expires_at, attestation_envelope, \
+                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
+                additional_scrubs, admitted_at AS _pos \
+             FROM federation_attestations \
+             WHERE attestation_type IN ('{w}', '{r}') \
+               AND (admitted_at, attestation_id) > (?1, ?2) \
+             ORDER BY admitted_at ASC, attestation_id ASC LIMIT ?3",
+            w = crate::federation::types::attestation_type::WITHDRAWS,
+            r = crate::federation::types::attestation_type::RECANTS,
+        );
+        let (read, _) = self
+            .read_measured(move |conn| -> Result<Vec<_>, rusqlite::Error> {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params![since_at, since_id, limit], |row| {
+                    let pos: String = row.get("_pos")?;
+                    Ok(crate::federation::ServedAttestation {
+                        attestation: sqlite_row_to_attestation(row)?,
+                        admitted_at: parse_rfc3339(&pos),
+                    })
+                })?;
+                rows.collect()
+            })
+            .await;
+        read.map_err(|e| crate::federation::Error::Backend(format!("list_withdrawals_since: {e}")))
+    }
+
+    async fn purge_delete_tombstoned_statements(
+        &self,
+        attestation_id: &str,
+    ) -> Result<u64, crate::federation::Error> {
+        // v62.0.0 (WD-fix1) — the door's own gate, in the statement: a row an
+        // `attestation` tombstone names whose attestation row is already gone
+        // (so a void the attestation door kept keeps its statements too).
+        // v62.0.0 (LINEAGE-L1; CC 2.7.8) — never a node of a group's roster
+        // lineage: every later row names it, so a lineage keeps every link.
+        let mut row_id = [0u8; 32];
+        if hex::decode_to_slice(attestation_id, &mut row_id).is_err() {
+            return Ok(0);
+        }
+        let id = attestation_id.to_owned();
+        self.write(move |conn| -> Result<usize, rusqlite::Error> {
+            conn.execute(
+                "DELETE FROM ceg_statements WHERE row_id = ?1 \
+                   AND EXISTS (SELECT 1 FROM purge_tombstones \
+                               WHERE plane = 'attestation' AND record_ref = ?2) \
+                   AND NOT EXISTS (SELECT 1 FROM federation_attestations \
+                                   WHERE attestation_id = ?2) \
+                   AND NOT EXISTS (SELECT 1 FROM ceg_group_lineage WHERE row_id = ?1) \
+                   AND NOT EXISTS (SELECT 1 FROM ceg_group_lineage_ends WHERE row_id = ?1)",
+                rusqlite::params![row_id.to_vec(), id],
+            )
+        })
+        .await
+        .map(|n| n as u64)
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("purge_delete_tombstoned_statements: {e}"))
+        })
     }
 
     async fn purge_delete_tombstoned_trace(
@@ -3578,6 +3891,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
     fn node_key_id(&self) -> Option<String> {
         self.node_key_id.read().expect("node_key_id lock").clone()
+    }
+    // v62.0.0 (WD-fix3 rev 2) — this backend evicts its own bytes for the
+    // descent a statement door runs in its own admission.
+    fn withdrawn_bytes_evictor(
+        &self,
+    ) -> Option<&dyn crate::federation::steward_purge::BytesEvictor> {
+        Some(self)
     }
     // v23.1.0 (CIRISPersist#554) — surface THIS backend's configured policy on
     // the trait so `genesis::verify_bundle_quorum` gates holder evidence with
@@ -5013,7 +5333,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         crate::federation::occurrence_admit::put_identity_occurrence_planned(self, occurrence).await
     }
 
-    async fn put_identity_occurrence_local(
+    // v62.0.0 (WD-fix9) — the retired trusted-local write survives as a
+    // TEST seam only; `put_identity_occurrence_local` refuses (trait default).
+    #[cfg(test)]
+    async fn test_seam_put_identity_occurrence(
         &self,
         occurrence: crate::federation::IdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
@@ -5024,6 +5347,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn put_identity_occurrence_edition2(
         &self,
         bind: crate::federation::edition2::occurrence::OccurrenceBind,
+        _door: crate::federation::DoorToken,
     ) -> Result<bool, crate::federation::Error> {
         // v62.0.0 (wave O1) — the gates are the edition-2 door's.
         crate::federation::occurrence_admit::put_identity_occurrence_edition2_planned(self, bind)
@@ -5870,9 +6194,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.
 
-    async fn put_identity_occurrence_revocation_local(
+    // v62.0.0 (WD-fix8) — the edition-2 eviction's STORE (the retired
+    // trusted-local verb `put_identity_occurrence_revocation_local` refuses
+    // by name, the trait default).
+    async fn put_identity_occurrence_revocation_edition2(
         &self,
         revocation: crate::federation::IdentityOccurrenceRevocation,
+        _door: crate::federation::DoorToken,
     ) -> Result<(), crate::federation::Error> {
         // #421 — trusted-local (grandfathered) write: NO signature gate, signed
         // columns NULL. Engine-internal self-writes only; never reached from the
@@ -6481,7 +6809,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
             let mut stmt = conn.prepare(
                 "SELECT family_key_id, removed_identity_key_id, removed_at, effective_at, \
-                        reason, witness_set, persist_row_hash \
+                        reason, witness_set, persist_row_hash, leaf \
                      FROM federation_family_membership_revocations \
                      WHERE family_key_id = ?1 ORDER BY removed_identity_key_id ASC",
             )?;
@@ -6505,7 +6833,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
             let mut stmt = conn.prepare(
                 "SELECT community_key_id, removed_identity_key_id, removed_at, effective_at, \
-                        reason, witness_set, persist_row_hash \
+                        reason, witness_set, persist_row_hash, leaf \
                      FROM federation_community_membership_revocations \
                      WHERE community_key_id = ?1 ORDER BY removed_identity_key_id ASC",
             )?;
@@ -12153,6 +12481,44 @@ impl crate::federation::BlobStorage for SqliteBackend {
             .collect()
     }
 
+    async fn held_blob_claim_window(
+        &self,
+        after: Option<[u8; 32]>,
+        limit: u32,
+        holder: &str,
+    ) -> Result<Vec<([u8; 32], bool)>, crate::federation::BlobError> {
+        let after = after.map(|a| a.to_vec()).unwrap_or_default();
+        let lim = i64::from(limit);
+        let holder = holder.to_owned();
+        let dimension = crate::federation::custody_ack::CUSTODY_ACK_DIMENSION.to_owned();
+        let rows: Vec<(Vec<u8>, bool)> = self
+            .read(
+                move |conn| -> Result<Vec<(Vec<u8>, bool)>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(&sqlite_held_blob_claim_window_sql())?;
+                    let it = stmt
+                        .query_map(rusqlite::params![after, lim, holder, dimension], |r| {
+                            Ok((r.get(0)?, r.get(1)?))
+                        })?;
+                    it.collect()
+                },
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("held_blob_claim_window: {e}"))
+            })?;
+        rows.into_iter()
+            .map(|(v, claimed)| {
+                <[u8; 32]>::try_from(v.as_slice())
+                    .map(|sha| (sha, claimed))
+                    .map_err(|_| {
+                        crate::federation::BlobError::Backend(
+                            "held_blob_claim_window: a 32-byte sha".into(),
+                        )
+                    })
+            })
+            .collect()
+    }
+
     async fn link_dag_chunks_if_exact(
         &self,
         manifest_sha: &[u8; 32],
@@ -16752,6 +17118,28 @@ fn sqlite_attestations_referencing_sql() -> String {
     )
 }
 
+/// v62.0.0 (HEAD-7) — `held_blob_claim_window`'s statement (`?1` the
+/// cursor, `?2` the window, `?3` the holder, `?4` the custody dimension):
+/// the window seeks the blob primary key; each blob's report is one seek of
+/// V180's `(attesting_key_id, dimension, evidence_refs[0])` (pinned with
+/// INDEXED BY, as `sqlite_by_dimension_citing_sql` is). Plan (CHECKED,
+/// `EXPLAIN QUERY PLAN` on V300):
+/// `CO-ROUTINE b` / `SEARCH federation_blobs USING COVERING INDEX
+/// sqlite_autoindex_federation_blobs_1 (sha256>?)` / `SCAN b` /
+/// `CORRELATED SCALAR SUBQUERY 1` / `SEARCH a USING INDEX
+/// federation_attestations_attester_dimension_citation (attesting_key_id=?
+/// AND dimension=? AND <expr>=?)`. The caller takes the cursor from the
+/// largest sha it read, so the window needs no outer ORDER BY.
+pub(crate) fn sqlite_held_blob_claim_window_sql() -> String {
+    "SELECT b.sha256, EXISTS (SELECT 1 FROM federation_attestations a \
+       INDEXED BY federation_attestations_attester_dimension_citation \
+       WHERE a.attesting_key_id = ?3 AND a.dimension = ?4 \
+         AND json_extract(a.attestation_envelope, '$.evidence_refs[0]') = lower(hex(b.sha256)) \
+         AND a.tier = 'federation') \
+     FROM (SELECT sha256 FROM federation_blobs WHERE sha256 > ?1 ORDER BY sha256 LIMIT ?2) b"
+        .to_owned()
+}
+
 /// v61 — `list_attestations_by_dimension_citing`'s statement (`?1` the
 /// attester, `?2` the dimension, `?3` the cited blob), spelled once so the
 /// plan witness reads the statement the door runs.
@@ -17913,6 +18301,24 @@ fn sqlite_row_to_identity_occurrence_revocation(
     })
 }
 
+/// v62.0.0 (RESIGN-1) — the stored `leaf` of a membership revocation row
+/// (`removal` | `resignation`, the column's CHECK); a value outside the set is
+/// a conversion failure, never read as a removal.
+fn sqlite_revocation_leaf(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::types::RevocationLeaf> {
+    let token: String = row.get("leaf")?;
+    crate::federation::types::RevocationLeaf::parse(&token).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(format!(
+                "membership revocation leaf {token:?} is not removal | resignation"
+            ))),
+        )
+    })
+}
+
 fn sqlite_row_to_family_membership_revocation(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<crate::federation::FamilyMembershipRevocation> {
@@ -17927,6 +18333,7 @@ fn sqlite_row_to_family_membership_revocation(
         reason: row.get("reason")?,
         witness_set: decode_witness_set(&witness_text, 5)?,
         persist_row_hash: row.get("persist_row_hash")?,
+        leaf: sqlite_revocation_leaf(row)?,
     })
 }
 
@@ -17944,6 +18351,7 @@ fn sqlite_row_to_community_membership_revocation(
         reason: row.get("reason")?,
         witness_set: decode_witness_set(&witness_text, 5)?,
         persist_row_hash: row.get("persist_row_hash")?,
+        leaf: sqlite_revocation_leaf(row)?,
     })
 }
 
@@ -26390,8 +26798,8 @@ impl crate::federation::family_admit::FamilyStore for SqliteBackend {
                     family_key_id, removed_identity_key_id, removed_at, effective_at, \
                     reason, witness_set, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at, cosignatures\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+                    admitted_at, cosignatures, leaf\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
                  ON CONFLICT (family_key_id, removed_identity_key_id, effective_at) DO NOTHING",
                 rusqlite::params![
                     row.family_key_id,
@@ -26406,6 +26814,7 @@ impl crate::federation::family_admit::FamilyStore for SqliteBackend {
                     r.scrub_signature_pqc,
                     admitted_at.to_rfc3339(),
                     cosignatures,
+                    row.leaf.as_str(),
                 ],
             )?;
             if n == 0 {
@@ -27347,8 +27756,8 @@ impl crate::federation::community_admit::CommunityStore for SqliteBackend {
                     community_key_id, removed_identity_key_id, removed_at, effective_at, \
                     reason, witness_set, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at, cosignatures\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+                    admitted_at, cosignatures, leaf\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
                  ON CONFLICT (community_key_id, removed_identity_key_id, effective_at) DO NOTHING",
                 rusqlite::params![
                     row.community_key_id,
@@ -27363,6 +27772,7 @@ impl crate::federation::community_admit::CommunityStore for SqliteBackend {
                     scrub_signature_pqc,
                     admitted_at.to_rfc3339(),
                     cosignatures,
+                    row.leaf.as_str(),
                 ],
             )?;
             if n == 0 {
@@ -27555,36 +27965,11 @@ mod accord_tests {
         );
     }
 
-    /// v21.15.0 (CIRISPersist#536) — the trust-root fixture (`establish_trust_root`,
-    /// the leg-B counterpart to `confer_roles`) must work on SQLITE: the reserved
-    /// heartbeat leg and the federation-tier hybrid-verify of every leg
-    /// round-trip here, so an in-process round test downstream (CIRISServer#327)
-    /// can stand up a genuinely valid trust root without hand-assembling five rows.
-    #[tokio::test]
-    async fn trust_root_helper_works_on_sqlite_536() {
-        // v62.0.0 (E7: the body is re-pointed at W1b's `rooted_trust_root`) —
-        // the node key is an edition-2 `node` record, set before the body runs.
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        backend.set_node_key_id(e2::put_key(&backend, "sq536-node", &["node"]).await);
-        crate::federation::operational::test_support::exercise_trust_root(&backend, "sq536").await;
-    }
+    // v62.0.0 (R2-fixture) — the runner of the deleted `exercise_trust_root`
+    // (a keyed root); the bundle path is
+    // `exercise_ceremony_plane_capability_walk`'s runner.
 
-    #[tokio::test]
-    async fn family_trust_root_works_on_sqlite_557() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        // v62.0.0 (E9: the body is edition 2) — this node's key, an edition-2
-        // `node` record, set before the body runs (the body needs it).
-        backend.set_node_key_id(e2::put_key(&backend, "sq557-node", &["node"]).await);
-        Box::pin(
-            crate::federation::operational::test_support::exercise_family_trust_root(
-                &backend, "sq557",
-            ),
-        )
-        .await
-        .expect("557 family trust root exercise");
-    }
+    // LEAD-root1 — runner of the deleted exercise_family_trust_root (the root is the bundle).
 
     /// **CIRISPersist#561 — transport-hop eligibility.** The A/B/C/D rule, its
     /// authoritative TTL, the anti-inflation bound and the withdrawal contract,
@@ -27601,11 +27986,8 @@ mod accord_tests {
         )
         .await
         .expect("561 transit eligibility exercise");
-        crate::federation::operational::test_support::exercise_transit_eligibility_family_root(
-            &backend, "sq561f",
-        )
-        .await
-        .expect("561 family-root transit eligibility exercise");
+        // v62.0.0 (R2-fixture) — `exercise_transit_eligibility_family_root` is
+        // deleted: there is one kind of root (the body above is its witness).
     }
 
     /// CIRISPersist#785 — reachable through the public double, sqlite.
@@ -27771,17 +28153,28 @@ mod accord_tests {
         .expect("548 exercise");
     }
 
-    #[tokio::test]
-    async fn trust_root_real_user_works_on_sqlite_536() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        // v62.0.0 (E9: the body is edition 2) — this node's key, an edition-2
-        // `node` record, set before the body runs (the body needs it).
-        backend.set_node_key_id(e2::put_key(&backend, "sqR536-node", &["node"]).await);
-        crate::federation::operational::test_support::exercise_trust_root_real_user(
-            &backend, "sqR536",
-        )
-        .await;
+    // v62.0.0 (R2-fixture) — the runner of the deleted `exercise_trust_root_real_user`
+    // (a keyed root); the bundle path is
+    // `exercise_ceremony_plane_capability_walk`'s runner.
+}
+
+/// v62.0.0 (WD-fix3 rev 2; CC 6.1.5 N5) — the backend's own bytes plane for a
+/// door's descent ([`FederationDirectory::withdrawn_bytes_evictor`](crate::federation::FederationDirectory::withdrawn_bytes_evictor)):
+/// the purge's one eviction (`engine::purge_evict_blob_on`: the bytes, then
+/// the DAG children no live manifest keeps), with no signer, so no holding
+/// claim is retracted (an Engine door supplies its own, which does).
+#[async_trait::async_trait]
+impl crate::federation::steward_purge::BytesEvictor for SqliteBackend {
+    async fn evict(
+        &self,
+        sha256: &[u8; 32],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, String> {
+        let node = crate::federation::FederationDirectory::node_key_id(self).unwrap_or_default();
+        crate::engine::purge_evict_blob_on(self, &node, None, sha256, now)
+            .await
+            .map(|r| r.blob_deleted)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -28106,7 +28499,12 @@ mod tests {
         let rumour = e2::rid(&rumour_row);
         let err = backend
             .put_attestation(SignedAttestation {
-                attestation: rumour_row,
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &rumour_row,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect_err("an unresolvable owner must refuse, never admit");
@@ -28132,7 +28530,11 @@ mod tests {
         let self_id = e2::rid(&self_row);
         backend
             .put_attestation(SignedAttestation {
-                attestation: self_row,
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend, &self_row,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("a self-report must not be collateral damage of an ambiguous owner");
@@ -28352,7 +28754,7 @@ mod tests {
             .attestation_envelope
             .get("delegation_purpose")
             .and_then(serde_json::Value::as_str)
-            == Some(crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE);
+            == Some(crate::federation::types::owner_binding::PURPOSE);
         let sealed = e2_row(row);
         let out = if owner_binding {
             let node = e2::seed_of(&sealed.attested_key_id);
@@ -28373,7 +28775,12 @@ mod tests {
     {
         if !e2::emit_edition2() {
             dir.put_attestation(SignedAttestation {
-                attestation: row.clone(),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*dir,
+                    &row.clone(),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("the delegation is admitted (held test)");
@@ -28472,8 +28879,7 @@ mod tests {
             row.attestation_envelope["references_attestation_id"] =
                 serde_json::Value::String(target);
         }
-        let mapped = if [at::WITHDRAWS, at::RECANTS, at::SUPERSEDES]
-            .contains(&row.attestation_type.as_str())
+        let mapped = if crate::federation::edition2::emit::names_a_target(&row.attestation_type)
             && row.attestation_envelope.get("dimension").is_none()
         {
             let target = row
@@ -28644,7 +29050,11 @@ mod tests {
         };
         backend
             .put_attestation(SignedAttestation {
-                attestation: mapped,
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*backend, &mapped,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect_err("the row must be refused")
@@ -28731,7 +29141,7 @@ mod tests {
             attestation_envelope: serde_json::json!({
                 "id": id,
                 "dimension": if e2::emit_edition2() {
-                    "evidence:safety_battery:capture:a:b:v1"
+                    "coherence_standing:cab:v1"
                 } else {
                     "identity_binding:v1"
                 },
@@ -28778,7 +29188,12 @@ mod tests {
         let row = e2_row(row);
         backend
             .put_attestation(SignedAttestation {
-                attestation: row.clone(),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &row.clone(),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -28889,13 +29304,23 @@ mod tests {
         let grant1 = e2_row(consent_grant("grant-e7-1", "node-e7", "peer-e7-1"));
         backend
             .put_attestation(SignedAttestation {
-                attestation: grant1.clone(),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &grant1.clone(),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("grant 1 admits");
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(consent_grant("grant-e7-2", "node-e7", "peer-e7-2")),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(consent_grant("grant-e7-2", "node-e7", "peer-e7-2")),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("grant 2 admits");
@@ -28911,11 +29336,16 @@ mod tests {
 
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(withdraws_against(
-                    "withdraw-e7-1",
-                    "node-e7",
-                    &e2::rid(&grant1),
-                )),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(withdraws_against(
+                        "withdraw-e7-1",
+                        "node-e7",
+                        &e2::rid(&grant1),
+                    )),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("withdraws admits");
@@ -29183,7 +29613,7 @@ mod tests {
             "references_attestation_id": id,
             "scope": scope,
             "delegation_purpose":
-                crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+                crate::federation::types::owner_binding::PURPOSE,
         });
         resign_fed(&mut d); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         d
@@ -29227,7 +29657,11 @@ mod tests {
         let t = e2_row(t);
         let tid = e2::rid(&t);
         backend
-            .put_attestation(SignedAttestation { attestation: t })
+            .put_attestation(SignedAttestation {
+                attestation: crate::federation::edition2::fixture_switch::headed_row(&*backend, &t)
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
+            })
             .await
             .unwrap();
         tid
@@ -29247,7 +29681,11 @@ mod tests {
         let wid = e2::rid(&wid_row);
         backend
             .put_attestation(SignedAttestation {
-                attestation: wid_row,
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend, &wid_row,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -29280,7 +29718,11 @@ mod tests {
         let wid = e2::rid(&wid_row);
         backend
             .put_attestation(SignedAttestation {
-                attestation: wid_row,
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend, &wid_row,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -29314,16 +29756,21 @@ mod tests {
         // withdraws-authority split), not B5's admission gate.
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(
-                    crate::federation::bootstrap_admission::test_support::consent_scope_row(
-                        &uuid::Uuid::new_v4().to_string(),
-                        &agent,
-                        &scorer,
-                        "consent:state:granted:v1",
-                        &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
-                        chrono::Utc::now() - chrono::Duration::seconds(60),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(
+                        crate::federation::bootstrap_admission::test_support::consent_scope_row(
+                            &uuid::Uuid::new_v4().to_string(),
+                            &agent,
+                            &scorer,
+                            "consent:state:granted:v1",
+                            &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
+                            chrono::Utc::now() - chrono::Duration::seconds(60),
+                        ),
                     ),
-                ),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("the scored agent's analyze grant admits");
@@ -29343,7 +29790,11 @@ mod tests {
         let t = e2_row(t);
         let tid = e2::rid(&t);
         backend
-            .put_attestation(SignedAttestation { attestation: t })
+            .put_attestation(SignedAttestation {
+                attestation: crate::federation::edition2::fixture_switch::headed_row(&backend, &t)
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
+            })
             .await
             .unwrap();
 
@@ -29366,7 +29817,11 @@ mod tests {
         let wid = e2::rid(&wid_row);
         backend
             .put_attestation(SignedAttestation {
-                attestation: wid_row,
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend, &wid_row,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("the attester (scorer) may still withdraw its own claim");
@@ -29433,7 +29888,11 @@ mod tests {
         let wid = e2::rid(&wid_row);
         backend
             .put_attestation(SignedAttestation {
-                attestation: wid_row,
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend, &wid_row,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -29478,7 +29937,11 @@ mod tests {
         let wid = e2::rid(&wid_row);
         let err = backend
             .put_attestation(SignedAttestation {
-                attestation: wid_row,
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend, &wid_row,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap_err();
@@ -29520,7 +29983,11 @@ mod tests {
         let wid = e2::rid(&wid_row);
         backend
             .put_attestation(SignedAttestation {
-                attestation: wid_row,
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend, &wid_row,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -29557,7 +30024,11 @@ mod tests {
         let wid = e2::rid(&wid_row);
         backend
             .put_attestation(SignedAttestation {
-                attestation: wid_row,
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend, &wid_row,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -29587,7 +30058,12 @@ mod tests {
         let wid = format!("w-{}", uuid::Uuid::new_v4());
         let err = backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(withdraws_against(&wid, &rando, &tid)),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(withdraws_against(&wid, &rando, &tid)),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap_err();
@@ -29620,7 +30096,11 @@ mod tests {
         let wid = e2::rid(&wid_row);
         let err = backend
             .put_attestation(SignedAttestation {
-                attestation: wid_row,
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend, &wid_row,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap_err();
@@ -29672,7 +30152,11 @@ mod tests {
         let t = e2_row(t);
         let tid = e2::rid(&t);
         backend
-            .put_attestation(SignedAttestation { attestation: t })
+            .put_attestation(SignedAttestation {
+                attestation: crate::federation::edition2::fixture_switch::headed_row(&backend, &t)
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
+            })
             .await
             .unwrap();
 
@@ -29720,7 +30204,12 @@ mod tests {
         let cwid = format!("cw-{}", uuid::Uuid::new_v4());
         let err = backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(withdraws_against(&cwid, &rando, &ctid)),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(withdraws_against(&cwid, &rando, &ctid)),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap_err();
@@ -29782,6 +30271,7 @@ mod tests {
             reason: None,
             witness_set: Vec::new(),
             persist_row_hash: String::new(),
+            leaf: crate::federation::types::RevocationLeaf::Removal,
         };
         put_family_membership_revocation_any(
             &backend,
@@ -29866,11 +30356,16 @@ mod tests {
         let gid = format!("g-{}", uuid::Uuid::new_v4());
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(mk(
-                    &gid,
-                    crate::federation::types::consent_record::stance::GRANTED,
-                    crate::federation::types::attestation_tier::FEDERATION,
-                )),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(mk(
+                        &gid,
+                        crate::federation::types::consent_record::stance::GRANTED,
+                        crate::federation::types::attestation_tier::FEDERATION,
+                    )),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("granted/federation consent_record admits");
@@ -29878,11 +30373,16 @@ mod tests {
         let eid = format!("e-{}", uuid::Uuid::new_v4());
         let err = backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(mk(
-                    &eid,
-                    crate::federation::types::consent_record::stance::EXPIRED,
-                    crate::federation::types::attestation_tier::FEDERATION,
-                )),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(mk(
+                        &eid,
+                        crate::federation::types::consent_record::stance::EXPIRED,
+                        crate::federation::types::attestation_tier::FEDERATION,
+                    )),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap_err();
@@ -29896,11 +30396,16 @@ mod tests {
         let rid = format!("r-{}", uuid::Uuid::new_v4());
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(mk(
-                    &rid,
-                    crate::federation::types::consent_record::stance::REVOKED,
-                    crate::federation::types::attestation_tier::LOCAL,
-                )),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(mk(
+                        &rid,
+                        crate::federation::types::consent_record::stance::REVOKED,
+                        crate::federation::types::attestation_tier::LOCAL,
+                    )),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("crypto-valid revoked consent_record transits the local tier");
@@ -29925,7 +30430,12 @@ mod tests {
         let wid_pre = format!("w-{}", uuid::Uuid::new_v4());
         let err = backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(withdraws_against(&wid_pre, &k, &tid)),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(withdraws_against(&wid_pre, &k, &tid)),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap_err();
@@ -29949,7 +30459,12 @@ mod tests {
         resign_fed(&mut binding); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(binding),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(binding),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("canonical_binding self-assertion admits (version-pin exempt)");
@@ -29960,7 +30475,12 @@ mod tests {
         let wid_post = e2::rid(&wid_post_row);
         backend
             .put_attestation(SignedAttestation {
-                attestation: wid_post_row,
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &wid_post_row,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("post-binding withdraws admits");
@@ -30320,7 +30840,12 @@ mod tests {
         resign_fed(&mut expired_grant);
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(expired_grant),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(expired_grant),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -30352,7 +30877,12 @@ mod tests {
         resign_fed(&mut s3_blanket);
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(s3_blanket),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(s3_blanket),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -30599,7 +31129,13 @@ mod tests {
         let rev = e2_row(rev);
         let rev_id = e2::rid(&rev);
         backend
-            .put_attestation(SignedAttestation { attestation: rev })
+            .put_attestation(SignedAttestation {
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend, &rev,
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
+            })
             .await
             .unwrap();
         // Flip to local-tier, unpromoted (the transit staging state).
@@ -30721,7 +31257,13 @@ mod tests {
             let rev = e2_row(rev);
             ids.push(e2::rid(&rev));
             backend
-                .put_attestation(SignedAttestation { attestation: rev })
+                .put_attestation(SignedAttestation {
+                    attestation: crate::federation::edition2::fixture_switch::headed_row(
+                        &backend, &rev,
+                    )
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
+                })
                 .await
                 .unwrap();
         }
@@ -30964,12 +31506,17 @@ mod tests {
         put_fed_key(&backend, &fed_key("k-target", "primitive-a", "steward-1")).await;
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(fed_attestation(
-                    "att-1",
-                    "steward-1",
-                    "k-target",
-                    "steward-1",
-                )),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(fed_attestation(
+                        "att-1",
+                        "steward-1",
+                        "k-target",
+                        "steward-1",
+                    )),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -31026,7 +31573,12 @@ mod tests {
         ));
         backend
             .put_attestation(SignedAttestation {
-                attestation: row.clone(),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &row.clone(),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -31491,7 +32043,7 @@ mod tests {
         // Two occurrences of alice-root.
         for occ in ["alice-phone", "alice-laptop"] {
             backend
-                .put_identity_occurrence_local(fed_identity_occurrence(
+                .test_seam_put_identity_occurrence(fed_identity_occurrence(
                     "alice-root",
                     occ,
                     crate::federation::types::device_class::PHONE,
@@ -31512,15 +32064,18 @@ mod tests {
 
         // Revoke alice-phone, effective in the past (trusted-local, #421).
         backend
-            .put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-                identity_key_id: kid_any("alice-root"),
-                occurrence_key_id: kid_any("alice-phone"),
-                revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
-                effective_at: "2026-06-05T00:00:00Z".parse().unwrap(),
-                reason: Some("lost device".into()),
-                witness_set: vec![kid_any("alice-root")],
-                persist_row_hash: String::new(),
-            })
+            .put_identity_occurrence_revocation_edition2(
+                IdentityOccurrenceRevocation {
+                    identity_key_id: kid_any("alice-root"),
+                    occurrence_key_id: kid_any("alice-phone"),
+                    revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                    effective_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                    reason: Some("lost device".into()),
+                    witness_set: vec![kid_any("alice-root")],
+                    persist_row_hash: String::new(),
+                },
+                crate::federation::DoorToken::new(),
+            )
             .await
             .unwrap();
 
@@ -31557,15 +32112,18 @@ mod tests {
 
         // Future-effective revocation does NOT exclude (trusted-local, #421).
         backend
-            .put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-                identity_key_id: kid_any("alice-root"),
-                occurrence_key_id: kid_any("alice-laptop"),
-                revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
-                effective_at: "2099-01-01T00:00:00Z".parse().unwrap(),
-                reason: None,
-                witness_set: vec![],
-                persist_row_hash: String::new(),
-            })
+            .put_identity_occurrence_revocation_edition2(
+                IdentityOccurrenceRevocation {
+                    identity_key_id: kid_any("alice-root"),
+                    occurrence_key_id: kid_any("alice-laptop"),
+                    revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                    effective_at: "2099-01-01T00:00:00Z".parse().unwrap(),
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+                crate::federation::DoorToken::new(),
+            )
             .await
             .unwrap();
         let active = backend
@@ -31591,6 +32149,7 @@ mod tests {
                     reason: Some("left household".into()),
                     witness_set: vec![kid_any("alice-root")],
                     persist_row_hash: String::new(),
+                    leaf: crate::federation::types::RevocationLeaf::Removal,
                 },
             ),
         )
@@ -31652,7 +32211,7 @@ mod tests {
 
         // Occurrence WITH encryption keys → round-trips + resolves.
         backend
-            .put_identity_occurrence_local(occ(
+            .test_seam_put_identity_occurrence(occ(
                 "occ-enc",
                 Some(EncryptionPubkeys {
                     x25519_base64: x25519.clone(),
@@ -31683,7 +32242,7 @@ mod tests {
 
         // Occurrence WITHOUT keys → resolve = None (fail-secure exclusion).
         backend
-            .put_identity_occurrence_local(occ("occ-bare", None))
+            .test_seam_put_identity_occurrence(occ("occ-bare", None))
             .await
             .unwrap();
         assert!(backend
@@ -31698,19 +32257,28 @@ mod tests {
             .unwrap()
             .is_none());
 
-        // Admission rejects a wrong-length key.
-        let err = backend
-            .put_identity_occurrence_local(occ(
+        // Admission rejects a wrong-length key. v62.0.0 (WD-fix11) — through
+        // the signed door: the bind's `encryption_pubkeys.x25519` is 16
+        // bytes, not 32, refused `edition2_payload_invalid` by name.
+        let err = crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+            &backend,
+            occ(
                 "occ-enc",
                 Some(EncryptionPubkeys {
                     x25519_base64: B64.encode([0u8; 16]), // too short
                     ml_kem_768_base64: ml_kem,
                 }),
-            ))
-            .await
-            .unwrap_err();
+            ),
+        )
+        .await
+        .unwrap_err();
         assert!(
-            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("x25519_base64")),
+            matches!(
+                &err,
+                crate::federation::Error::MalformedRow { reason, message, .. }
+                    if *reason == crate::federation::malformed_row::EDITION2_PAYLOAD_INVALID
+                        && message.contains("x25519")
+            ),
             "got: {err:?}"
         );
     }
@@ -31759,7 +32327,7 @@ mod tests {
             persist_row_hash: String::new(),
         };
         backend
-            .put_identity_occurrence_local(occ(
+            .test_seam_put_identity_occurrence(occ(
                 &kid_any("occ-keyed"),
                 Some(EncryptionPubkeys {
                     x25519_base64: B64.encode(x_pub),
@@ -31769,7 +32337,7 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_identity_occurrence_local(occ(&kid_any("occ-bare"), None))
+            .test_seam_put_identity_occurrence(occ(&kid_any("occ-bare"), None))
             .await
             .unwrap();
 
@@ -31781,7 +32349,7 @@ mod tests {
             plaintext,
             Some("text/plain"),
             None,
-            None,
+            Some(&kid_any("occ-keyed")),
         )
         .await
         .unwrap();
@@ -31898,7 +32466,7 @@ mod tests {
             }
         };
         backend
-            .put_identity_occurrence_local(occ(
+            .test_seam_put_identity_occurrence(occ(
                 &kid_any("alice"),
                 &kid_any("alice-phone"),
                 Some(EncryptionPubkeys {
@@ -31909,7 +32477,7 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_identity_occurrence_local(occ(&kid_any("bob"), &kid_any("bob-phone"), None))
+            .test_seam_put_identity_occurrence(occ(&kid_any("bob"), &kid_any("bob-phone"), None))
             .await
             .unwrap();
 
@@ -31931,7 +32499,7 @@ mod tests {
             plaintext,
             None,
             None,
-            None,
+            Some(&kid_any("alice-phone")),
         )
         .await
         .unwrap();
@@ -31986,6 +32554,34 @@ mod tests {
         policy: Option<serde_json::Value>,
         comm_authorized: bool,
     ) -> SqliteBackend {
+        community_fixture_inner(members, policy, comm_authorized, false).await
+    }
+
+    /// v62.0.0 (KR-fix31b; CC 5.2 "a write its own author cannot open is
+    /// refused") — [`community_fixture`] for a test that SEALS: the fixture
+    /// node `comm-node` (the minter of every epoch a `None`-author write
+    /// mints) is the owned, keyed device of one more roster member,
+    /// `comm-node-owner` (a USER key with no device of its own), through
+    /// `lifecycle_support::seat_minter` (a two-voice owner binding and the
+    /// node's self pair with this store's content-KEM keys). The node is then
+    /// a granted recipient of everything it seals, after the listed members.
+    async fn community_fixture_sealed(
+        members: &[(&str, &str, bool)],
+        policy: Option<serde_json::Value>,
+        comm_authorized: bool,
+    ) -> SqliteBackend {
+        community_fixture_inner(members, policy, comm_authorized, true).await
+    }
+
+    /// The seed of the fixture node's owner ([`community_fixture_sealed`]).
+    const COMM_NODE_OWNER: &str = "comm-node-owner";
+
+    async fn community_fixture_inner(
+        members: &[(&str, &str, bool)],
+        policy: Option<serde_json::Value>,
+        comm_authorized: bool,
+        seat_comm_node: bool,
+    ) -> SqliteBackend {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         // #848 — the fixture node IS the minter of every epoch it mints.
@@ -32009,10 +32605,31 @@ mod tests {
                 None
             };
             backend
-                .put_identity_occurrence_local(occ_signed(ident, occ, enc))
+                .test_seam_put_identity_occurrence(occ_signed(ident, occ, enc))
                 .await
                 .unwrap();
             member_idents.push(*ident);
+        }
+        if seat_comm_node {
+            crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+                &backend,
+                COMM_NODE_OWNER,
+                COMM_NODE_OWNER,
+                crate::federation::types::identity_type::USER,
+            )
+            .await;
+            member_idents.push(COMM_NODE_OWNER);
+            let (_, node) = crate::federation::community_dek::lifecycle_support::seat_minter(
+                &backend,
+                COMM_NODE_OWNER,
+                "comm-node",
+            )
+            .await;
+            assert_eq!(
+                node,
+                kid_any("comm-node"),
+                "the seated node is the fixture's node key"
+            );
         }
         if comm_authorized {
             // v62.0.0 (E5's edition-2 room; W1-fix4: the earlier-form room went
@@ -32063,6 +32680,7 @@ mod tests {
                 reason: Some("left".into()),
                 witness_set: vec![],
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Resignation,
             },
         )
     }
@@ -32491,15 +33109,19 @@ mod tests {
         };
         use crate::federation::{BlobStorage, DekKeyState};
 
-        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        let backend = community_fixture_sealed(&[("alice", "alice-occ", true)], None, false).await;
         // #848 — the sweep runs over the SIGNER's own counter, so the node
-        // that mints here is the sweeper.
-        let sweeper = test_signer_for("sweeper");
-        // v62.0.0 (E1, round 3) — the sweeper is a live edition-2 key, and the
-        // minter is named by the id its statements carry (cut B:
-        // `LocalSigner::federation_id`).
-        put_fed_key(&backend, &fed_key("sweeper", "sweeper", "sweeper")).await;
+        // that mints here is the sweeper. v62.0.0 (KR-fix31b; CC 5.2) — the
+        // sweeper is the fixture node `comm-node`, seated as a member's owned,
+        // keyed device (the writes' author holds a wrap target); the minter is
+        // named by the id its statements carry (`LocalSigner::federation_id`).
+        let sweeper = test_signer_for("comm-node");
         let minter = sweeper.federation_id().await;
+        assert_eq!(
+            minter,
+            kid_any("comm-node"),
+            "the sweeper is the fixture node"
+        );
         backend.set_node_key_id(&minter);
         let old =
             encrypt_and_cascade_community(&backend, &kid_any("comm"), b"old minutes", None, None)
@@ -32562,15 +33184,19 @@ mod tests {
         };
         use crate::federation::{BlobStorage, DekKeyState};
 
-        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        let backend = community_fixture_sealed(&[("alice", "alice-occ", true)], None, false).await;
         // #848 — the sweep runs over the SIGNER's own counter, so the node
-        // that mints here is the sweeper.
-        let sweeper = test_signer_for("sweeper");
-        // v62.0.0 (E1, round 3) — the sweeper is a live edition-2 key, and the
-        // minter is named by the id its statements carry (cut B:
-        // `LocalSigner::federation_id`).
-        put_fed_key(&backend, &fed_key("sweeper", "sweeper", "sweeper")).await;
+        // that mints here is the sweeper. v62.0.0 (KR-fix31b; CC 5.2) — the
+        // sweeper is the fixture node `comm-node`, seated as a member's owned,
+        // keyed device (the writes' author holds a wrap target); the minter is
+        // named by the id its statements carry (`LocalSigner::federation_id`).
+        let sweeper = test_signer_for("comm-node");
         let minter = sweeper.federation_id().await;
+        assert_eq!(
+            minter,
+            kid_any("comm-node"),
+            "the sweeper is the fixture node"
+        );
         backend.set_node_key_id(&minter);
         let old =
             encrypt_and_cascade_community(&backend, &kid_any("comm"), b"old minutes", None, None)
@@ -32660,7 +33286,9 @@ mod tests {
         };
         use crate::federation::{BlobStorage, DekKeyState};
 
-        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — a sealing test: the minter is a
+        // member's owned, keyed device.
+        let backend = community_fixture_sealed(&[("alice", "alice-occ", true)], None, false).await;
         let sealed =
             encrypt_and_cascade_community(&backend, &kid_any("comm"), b"minutes", None, None)
                 .await
@@ -32734,7 +33362,9 @@ mod tests {
         };
         use crate::federation::DekKeyState;
 
-        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — a sealing test: the minter is a
+        // member's owned, keyed device.
+        let backend = community_fixture_sealed(&[("alice", "alice-occ", true)], None, false).await;
         let first = encrypt_and_cascade_community(&backend, &kid_any("comm"), b"one", None, None)
             .await
             .unwrap();
@@ -32787,7 +33417,9 @@ mod tests {
         use crate::federation::community_dek::orchestrate::set_key_state;
         use crate::federation::{BlobStorage, DekKeyState};
 
-        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — a sealing test: the minter is a
+        // member's owned, keyed device.
+        let backend = community_fixture_sealed(&[("alice", "alice-occ", true)], None, false).await;
         // Mint the epoch DEK without sealing anything under it.
         crate::federation::community_dek::orchestrate::encrypt_and_cascade_community(
             &backend,
@@ -32856,18 +33488,14 @@ mod tests {
         use crate::federation::hard_case::{kind, HardCaseFilter};
         use crate::federation::{BlobStorage, FederationDirectory};
 
-        let backend = community_fixture(
+        // v62.0.0 (KR-fix31b; CC 5.2) — a sealing test: the fixture's node key
+        // ("comm-node", the attester of the recipient_excluded row, v57.0.0
+        // #988 item 2) is held as a NODE key and seated as a member's owned,
+        // keyed device by the fixture itself.
+        let backend = community_fixture_sealed(
             &[("alice", "alice-occ", true), ("bob", "bob-occ", false)],
             None,
-        )
-        .await;
-        // v57.0.0 (#988 item 2) — the fixture's node key ("comm-node"), held:
-        // the attester of the recipient_excluded row.
-        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
-            &backend,
-            "comm-node",
-            "comm-node",
-            crate::federation::types::identity_type::NODE,
+            false,
         )
         .await;
 
@@ -32885,7 +33513,11 @@ mod tests {
             result.epoch, 0,
             "never-rotated community seals under epoch 0"
         );
-        assert_eq!(result.granted, vec![kid_any("alice-occ")]);
+        // KR-fix31b — the author (the seated fixture node) is granted too.
+        assert_eq!(
+            result.granted,
+            vec![kid_any("alice-occ"), kid_any("comm-node")]
+        );
         assert_eq!(result.excluded, vec![kid_any("bob-occ")]);
 
         // Granted member's grant exists and is v2; keyless member has NONE.
@@ -32893,7 +33525,11 @@ mod tests {
             .community_dek_member_grant_recipients(&kid_any("comm"), &kid_any("comm-node"), 0)
             .await
             .unwrap();
-        assert_eq!(recips, vec![kid_any("alice-occ")]);
+        let mut recips = recips;
+        recips.sort();
+        let mut want = vec![kid_any("alice-occ"), kid_any("comm-node")];
+        want.sort();
+        assert_eq!(recips, want);
         assert!(backend
             .community_dek_has_member_grant(
                 &kid_any("comm"),
@@ -32991,7 +33627,9 @@ mod tests {
 
         // Infra-LABELED community whose own key is NOT substrate_persist
         // (comm_authorized == false) — an UNauthorized self-labeled infra.
-        let backend = community_fixture_comm_authority(
+        // v62.0.0 (KR-fix31b; CC 5.2) — a sealing test: the minter is a
+        // member's owned, keyed device.
+        let backend = community_fixture_sealed(
             &[("alice", "alice-occ", true)],
             Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
             false,
@@ -33009,7 +33647,11 @@ mod tests {
         .await
         .expect("unauthorized infra label must NOT opt out of the DEK cascade");
         assert_eq!(result.epoch, 0);
-        assert_eq!(result.granted, vec![kid_any("alice-occ")]);
+        // KR-fix31b — the author (the seated fixture node) is granted too.
+        assert_eq!(
+            result.granted,
+            vec![kid_any("alice-occ"), kid_any("comm-node")]
+        );
         // An epoch-0 DEK self-retention row WAS minted (cascade ran).
         assert!(backend
             .community_dek_get_self_retention(&kid_any("comm"), &kid_any("comm-node"), 0)
@@ -33040,6 +33682,7 @@ mod tests {
                     reason: Some("left".into()),
                     witness_set: vec![],
                     persist_row_hash: String::new(),
+                    leaf: crate::federation::types::RevocationLeaf::Resignation,
                 },
             )
         };
@@ -33175,6 +33818,7 @@ mod tests {
                     reason: Some("left".into()),
                     witness_set: vec![],
                     persist_row_hash: String::new(),
+                    leaf: crate::federation::types::RevocationLeaf::Resignation,
                 },
             ),
         )
@@ -33353,9 +33997,12 @@ mod tests {
         };
         use crate::federation::BlobStorage;
 
-        let backend = community_fixture(
+        // v62.0.0 (KR-fix31b; CC 5.2) — a sealing test: the minter is a
+        // member's owned, keyed device.
+        let backend = community_fixture_sealed(
             &[("alice", "alice-occ", true), ("bob", "bob-occ", true)],
             None,
+            false,
         )
         .await;
 
@@ -33403,7 +34050,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(after.epoch, 1);
-        assert_eq!(after.granted, vec![kid_any("alice-occ")]);
+        // KR-fix31b — the author (the seated fixture node) is granted too.
+        assert_eq!(
+            after.granted,
+            vec![kid_any("alice-occ"), kid_any("comm-node")]
+        );
         assert!(!after.granted.contains(&kid_any("bob-occ")));
         assert_ne!(
             before.at_rest_sha256, after.at_rest_sha256,
@@ -33451,7 +34102,9 @@ mod tests {
         use crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2;
         use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
 
-        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — a sealing test: the minter is a
+        // member's owned, keyed device.
+        let backend = community_fixture_sealed(&[("alice", "alice-occ", true)], None, false).await;
         encrypt_and_cascade_community(&backend, &kid_any("comm"), b"x", None, None)
             .await
             .unwrap();
@@ -33533,7 +34186,7 @@ mod tests {
         }
         // A content-only occurrence with KEX keys (trusted-local path).
         backend
-            .put_identity_occurrence_local(occ_signed("root", "phone", Some(keyed_enc(0x33))))
+            .test_seam_put_identity_occurrence(occ_signed("root", "phone", Some(keyed_enc(0x33))))
             .await
             .unwrap();
         assert!(
@@ -33549,7 +34202,7 @@ mod tests {
         // asserted_at (2026-06-10), so it kills the CURRENT binding (#421:
         // the comparator is `effective_at >= asserted_at`).
         backend
-            .put_identity_occurrence_revocation_local(
+            .put_identity_occurrence_revocation_edition2(
                 crate::federation::IdentityOccurrenceRevocation {
                     identity_key_id: kid_any("root"),
                     occurrence_key_id: kid_any("phone"),
@@ -33559,6 +34212,7 @@ mod tests {
                     witness_set: vec![],
                     persist_row_hash: String::new(),
                 },
+                crate::federation::DoorToken::new(),
             )
             .await
             .unwrap();
@@ -33578,7 +34232,10 @@ mod tests {
         // compromise → revoke → re-key → publish → recovered.
         let mut fresh = occ_signed("root", "phone", Some(keyed_enc(0x44)));
         fresh.asserted_at = "2026-06-14T00:00:00Z".parse().unwrap();
-        backend.put_identity_occurrence_local(fresh).await.unwrap();
+        backend
+            .test_seam_put_identity_occurrence(fresh)
+            .await
+            .unwrap();
         assert!(
             backend
                 .resolve_encryption_keys(&kid_any("phone"))
@@ -33619,7 +34276,7 @@ mod tests {
         }
         // Only the OLD occurrence exists at write time.
         backend
-            .put_identity_occurrence_local(occ_signed("root", "occ-old", Some(keyed_enc(0x11))))
+            .test_seam_put_identity_occurrence(occ_signed("root", "occ-old", Some(keyed_enc(0x11))))
             .await
             .unwrap();
 
@@ -33631,7 +34288,7 @@ mod tests {
             plaintext,
             None,
             None,
-            None,
+            Some(&kid_any("occ-old")),
         )
         .await
         .unwrap();
@@ -33639,7 +34296,7 @@ mod tests {
 
         // The new occurrence joins AFTER the write — initially NO grant.
         backend
-            .put_identity_occurrence_local(occ_signed("root", "occ-new", Some(keyed_enc(0x22))))
+            .test_seam_put_identity_occurrence(occ_signed("root", "occ-new", Some(keyed_enc(0x22))))
             .await
             .unwrap();
         assert!(
@@ -33715,7 +34372,7 @@ mod tests {
         // occurrence is registered only afterwards, so the original write
         // could not reach her.
         backend
-            .put_identity_occurrence_local(occ_signed(
+            .test_seam_put_identity_occurrence(occ_signed(
                 "alice",
                 "alice-phone",
                 Some(keyed_enc(0x33)),
@@ -33739,7 +34396,7 @@ mod tests {
             plaintext,
             None,
             None,
-            None,
+            Some(&kid_any("alice-phone")),
         )
         .await
         .unwrap();
@@ -33747,7 +34404,7 @@ mod tests {
 
         // carol registers a KEYLESS occurrence (her wrap target is invalid).
         backend
-            .put_identity_occurrence_local(occ_signed("carol", "carol-phone", None))
+            .test_seam_put_identity_occurrence(occ_signed("carol", "carol-phone", None))
             .await
             .unwrap();
 
@@ -33834,7 +34491,7 @@ mod tests {
             put_fed_key(&backend, &fed_key(k, k, k)).await;
         }
         backend
-            .put_identity_occurrence_local(occ_signed(
+            .test_seam_put_identity_occurrence(occ_signed(
                 "alice",
                 "alice-phone",
                 Some(keyed_enc(0x66)),
@@ -33860,7 +34517,7 @@ mod tests {
             b"before bob",
             None,
             None,
-            None,
+            Some(&kid_any("alice-phone")),
         )
         .await
         .unwrap();
@@ -33868,7 +34525,11 @@ mod tests {
 
         // bob registers a KEYED occurrence, then is admitted.
         backend
-            .put_identity_occurrence_local(occ_signed("bob", "bob-phone", Some(keyed_enc(0x77))))
+            .test_seam_put_identity_occurrence(occ_signed(
+                "bob",
+                "bob-phone",
+                Some(keyed_enc(0x77)),
+            ))
             .await
             .unwrap();
         // v31.0.0 (CIRISPersist#654) — the driver REFUSES a newcomer the roster
@@ -33992,7 +34653,7 @@ mod tests {
             b"after bob",
             None,
             None,
-            None,
+            Some(&kid_any("alice-phone")),
         )
         .await
         .unwrap();
@@ -34040,7 +34701,7 @@ mod tests {
             put_fed_key(&backend, &fed_key(k, k, k)).await;
         }
         backend
-            .put_identity_occurrence_local(occ_signed(
+            .test_seam_put_identity_occurrence(occ_signed(
                 "alice",
                 "alice-phone",
                 Some(keyed_enc(0x44)),
@@ -34048,7 +34709,11 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_identity_occurrence_local(occ_signed("dave", "dave-phone", Some(keyed_enc(0x55))))
+            .test_seam_put_identity_occurrence(occ_signed(
+                "dave",
+                "dave-phone",
+                Some(keyed_enc(0x55)),
+            ))
             .await
             .unwrap();
         put_family_any(
@@ -34062,10 +34727,17 @@ mod tests {
         .unwrap();
 
         // Before removal: both occurrences are granted on a write.
-        let before =
-            encrypt_and_cascade(&backend, FAMILY, &kid_any("fam"), b"v1", None, None, None)
-                .await
-                .unwrap();
+        let before = encrypt_and_cascade(
+            &backend,
+            FAMILY,
+            &kid_any("fam"),
+            b"v1",
+            None,
+            None,
+            Some(&kid_any("alice-phone")),
+        )
+        .await
+        .unwrap();
         let mut g = before.granted.clone();
         g.sort();
         let mut want = vec![kid_any("alice-phone"), kid_any("dave-phone")];
@@ -34085,6 +34757,7 @@ mod tests {
                     reason: Some("left the household".into()),
                     witness_set: vec![],
                     persist_row_hash: String::new(),
+                    leaf: crate::federation::types::RevocationLeaf::Resignation,
                 },
             ),
         )
@@ -34100,7 +34773,7 @@ mod tests {
             b"v2-post-removal",
             None,
             None,
-            None,
+            Some(&kid_any("alice-phone")),
         )
         .await
         .unwrap();
@@ -34122,7 +34795,7 @@ mod tests {
         put_fed_key(&backend, &fed_key("alice-laptop", "alice", "alice-root")).await;
 
         backend
-            .put_identity_occurrence_local(fed_identity_occurrence(
+            .test_seam_put_identity_occurrence(fed_identity_occurrence(
                 "alice-root",
                 "alice-phone",
                 crate::federation::types::device_class::PHONE,
@@ -34130,7 +34803,7 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_identity_occurrence_local(fed_identity_occurrence(
+            .test_seam_put_identity_occurrence(fed_identity_occurrence(
                 "alice-root",
                 "alice-laptop",
                 crate::federation::types::device_class::LAPTOP,
@@ -34802,7 +35475,7 @@ mod tests {
         put_fed_key(&backend, &fed_key("alice-root", "alice", "alice-root")).await;
         put_fed_key(&backend, &fed_key("alice-phone", "alice", "alice-root")).await;
         backend
-            .put_identity_occurrence_local(fed_identity_occurrence(
+            .test_seam_put_identity_occurrence(fed_identity_occurrence(
                 "alice-root",
                 "alice-phone",
                 crate::federation::types::device_class::PHONE,
@@ -34836,11 +35509,14 @@ mod tests {
         backend.run_migrations().await.unwrap();
         put_fed_key(&backend, &fed_key("alice-root", "alice", "alice-root")).await;
         put_fed_key(&backend, &fed_key("alice-watch", "alice", "alice-root")).await;
+        // v62.0.0 (WD-fix11) — through the signed door: the bind of a
+        // device class outside the closed set is refused at its first
+        // statement (`occurrence::read_payload` → `check_device_class`).
         let bad = fed_identity_occurrence("alice-root", "alice-watch", "wearable");
-        let err = backend
-            .put_identity_occurrence_local(bad)
-            .await
-            .unwrap_err();
+        let err =
+            crate::federation::edition2::fixture_occurrence::put_occurrence_signed(&backend, bad)
+                .await
+                .unwrap_err();
         assert_eq!(err.kind(), "federation_device_class_rejected");
         assert!(matches!(
             err,
@@ -35400,7 +36076,12 @@ mod tests {
         crate::federation::tier_ingest::test_support::reseal(&mut att);
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(att),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(att),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -36143,7 +36824,9 @@ mod tests {
         a.cohort_scope = "federation".into();
         resign_fed(&mut a); // sign the as-built envelope for the ingest gate
         be.put_attestation(SignedAttestation {
-            attestation: e2_row(a),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(&*be, &e2_row(a))
+                .await
+                .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .unwrap();
@@ -36178,7 +36861,9 @@ mod tests {
         a.cohort_scope = "federation".into();
         resign_fed(&mut a);
         be.put_attestation(SignedAttestation {
-            attestation: e2_row(a),
+            attestation: crate::federation::edition2::fixture_switch::headed_row(&*be, &e2_row(a))
+                .await
+                .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .unwrap();
@@ -36970,7 +37655,12 @@ mod tests {
         );
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(att),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(att),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -37063,7 +37753,12 @@ mod tests {
         );
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(att),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(att),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -37183,7 +37878,12 @@ mod tests {
         );
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(att),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(att),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -37294,7 +37994,12 @@ mod tests {
             t.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
             backend
                 .put_attestation(SignedAttestation {
-                    attestation: e2_row(t),
+                    attestation: crate::federation::edition2::fixture_switch::headed_row(
+                        &*backend,
+                        &e2_row(t),
+                    )
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
                 })
                 .await
                 .expect("a composer's target is held");
@@ -37337,19 +38042,34 @@ mod tests {
         // returned it as is and never recorded the chosen id `w-2`.
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(w1.clone()),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(w1.clone()),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(w2),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(w2),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(w1),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(w1),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("an exact re-put of a held composer is the silent no-op");
@@ -37422,7 +38142,12 @@ mod tests {
         for att in [w1, w2, r3, w4] {
             backend
                 .put_attestation(SignedAttestation {
-                    attestation: e2_row(att),
+                    attestation: crate::federation::edition2::fixture_switch::headed_row(
+                        &backend,
+                        &e2_row(att),
+                    )
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
                 })
                 .await
                 .unwrap();
@@ -37433,12 +38158,7 @@ mod tests {
             .unwrap();
         let composers: Vec<_> = by_steward
             .iter()
-            .filter(|r| {
-                matches!(
-                    r.attestation_type.as_str(),
-                    "withdraws" | "recants" | "supersedes"
-                )
-            })
+            .filter(|r| crate::federation::edition2::emit::names_a_target(&r.attestation_type))
             .collect();
         assert_eq!(composers.len(), 3, "expected three distinct triples");
         let by_agent = backend
@@ -37480,13 +38200,23 @@ mod tests {
         );
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(recants),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(recants),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(withdraws_later),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(withdraws_later),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -37522,10 +38252,13 @@ mod tests {
         )
         .await;
         put_fed_key(&backend, &fed_key("k-a", "primitive-a", "registry-steward")).await;
+        // v62.0.0 (D1) — about ITSELF: a row about `k-a` is refused first by
+        // the self-report attester (`substrate_self_report_names_another_party`,
+        // I1593), and this leg is about the emitter.
         let att = scores_attestation_with_dimension(
             "att-sys-1",
             "registry-steward",
-            "k-a",
+            "registry-steward",
             "registry-steward",
             "system:health:n_eff_measurable:v1",
         );
@@ -37539,8 +38272,13 @@ mod tests {
         );
     }
 
+    /// v62.0.0 (D1; CC 3.4.7 "No key declares itself into a duty") — was
+    /// `..._accepts_system_prefix_from_substrate_persist`: the label opened
+    /// `system:`. It opens nothing now: a `substrate_persist` key's report
+    /// about itself is refused (no node; the family's duty is `infra:attest`
+    /// from a node's owner, landed by I6600 in `self_report_duty_invariants`).
     #[tokio::test]
-    async fn sqlite_put_attestation_accepts_system_prefix_from_substrate_persist() {
+    async fn sqlite_put_attestation_refuses_system_prefix_from_a_substrate_persist_label() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         put_fed_key(
@@ -37553,11 +38291,6 @@ mod tests {
             ),
         )
         .await;
-        put_fed_key(&backend, &fed_key("k-a", "primitive-a", "persist-self")).await;
-        // v61.1.0 (CIRISPersist#1174, CC 3.4.3) — a substrate self-report is
-        // about the substrate that signs it; one about `k-a` is refused at
-        // this node's own write door and reported from a peer until v62
-        // (`admission::check_substrate_self_report_attester_at`, I1593, I1607).
         let att = scores_attestation_with_dimension(
             "att-sys-2",
             "persist-self",
@@ -37565,12 +38298,16 @@ mod tests {
             "persist-self",
             "system:health:n_eff_measurable:v1",
         );
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: e2_row(att),
-            })
-            .await
-            .unwrap();
+        let err = refusal_of(&backend, att).await;
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::ReservedPrefixEmitterMismatch { .. }
+            ) && err
+                .to_string()
+                .contains(crate::federation::edition2::fold::reason::gc1::RESERVED_FAMILY_UNSEATED),
+            "expected ReservedPrefixEmitterMismatch naming reserved_family_unseated, got {err:?}"
+        );
     }
 
     /// v37.0.0 — the CEG 0.1 ladder shape `attestation:l{N}:{mechanism}` is
@@ -37646,16 +38383,23 @@ mod tests {
         )
         .await;
         put_fed_key(&backend, &fed_key("k-a", "primitive-a", "registry-steward")).await;
+        // v62.0.0 (FS-sig-a; CC 3.1.2.1) — `attestation:self_verify` is a
+        // key's row about itself: the canonical leg signs about its signer.
         let att = scores_attestation_with_dimension(
             "att-canonical",
             "registry-steward",
-            "k-a",
+            "registry-steward",
             "registry-steward",
             "attestation:self_verify",
         );
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(att),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(att),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -38413,7 +39157,12 @@ mod tests {
         resign_fed(&mut wrow);
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(wrow),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(wrow),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -38524,7 +39273,12 @@ mod tests {
         );
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(withdraws),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(withdraws),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -38915,7 +39669,6 @@ mod tests {
         use ciris_verify_core::cde::Value;
         let Value::Map(mut m) = crate::federation::edition2::typed::trust_accepts_payload(
             &e2::kid_or_keep(seed),
-            &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
             &[],
             None,
             crate::federation::types::cohort_scope::FEDERATION,
@@ -38923,6 +39676,15 @@ mod tests {
         ) else {
             unreachable!("trust_accepts_payload is a map")
         };
+        // v62.0.0 (R2-accept) — `trust_accepts_payload` states no `scope`
+        // (an acceptance carries none); a self-loop CHARTER row is read by its
+        // `infra:*` scope, so this fixture states it.
+        m.push((
+            Value::Text("scope".to_owned()),
+            Value::Array(vec![Value::Text(
+                crate::federation::trust_root::INFRA_SERVE_SCOPE.to_owned(),
+            )]),
+        ));
         let successor = e2::signing_key(&format!("succ-{seed}"));
         let commitment = ciris_verify_core::edition2::recovery::recovery_commitment(&[successor
             .public_key()
@@ -40385,6 +41147,42 @@ mod tests {
         v61_storm_no_history_walk(&plan, "by_dimension_citing");
     }
 
+    /// I6122 (HEAD-7) — the claim pass's window (`held_blob_claim_window`)
+    /// seeks the blob primary key for its window and V180's citation index
+    /// per blob; it never scans the blob table or walks the holder's
+    /// custody history.
+    #[tokio::test]
+    async fn i6122_the_claim_window_seeks_its_indexes() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let binds = vec![
+            SqlValue::Blob(vec![0u8; 32]),
+            SqlValue::Integer(256),
+            SqlValue::Text("device".into()),
+            SqlValue::Text("custody:ack:v1".into()),
+        ];
+        let plan = sqlite_plan(&backend, &sqlite_held_blob_claim_window_sql(), binds).await;
+        eprintln!("I6122 held_blob_claim_window plan: {plan:?}");
+        assert!(
+            plan.iter().any(|l| l.starts_with(
+                "SEARCH federation_blobs USING COVERING INDEX sqlite_autoindex_federation_blobs_1 \
+                 (sha256>?)"
+            )),
+            "I6122: the window seeks the blob primary key: {plan:?}"
+        );
+        assert!(
+            plan.iter().any(|l| l.starts_with(
+                "SEARCH a USING INDEX federation_attestations_attester_dimension_citation \
+                 (attesting_key_id=? AND dimension=? AND <expr>=?)"
+            )),
+            "I6122: each blob's report is one citation seek: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|l| l.starts_with("SCAN federation_")),
+            "I6122: never a table scan: {plan:?}"
+        );
+    }
+
     /// v61 — `list_composers_referencing_any` on the attesting axis
     /// (custody_acks_of's second read) seeks V107's `composer_ref`, on the
     /// attested axis V178's `attested_composer_ref`, with no axis
@@ -41587,7 +42385,12 @@ mod tests {
         put_fed_key(&backend, &fed_key("k-b", "agent-b", "k-a")).await;
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(fed_attestation("att-1", "k-a", "k-b", "k-a")),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(fed_attestation("att-1", "k-a", "k-b", "k-a")),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -43163,7 +43966,12 @@ mod tests {
         // Schema-resolver wasn't installed; the gate skips.
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(att),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(att),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -43329,7 +44137,12 @@ mod tests {
         resign_fed(&mut att); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(att),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &*backend,
+                    &e2_row(att),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -43503,12 +44316,12 @@ mod tests {
             );
         }
         // `scores` admission gate requires a versioned dimension —
-        // the helper picks `evidence:safety_battery:capture:a:b:v1` (registered; v62 E0 fix 9) when no dimension is
+        // the helper picks `coherence_standing:cab:v1` (registered; v62 E0 fix 9) when no dimension is
         // provided for a scores row so tests don't have to spell it.
         if atype == crate::federation::types::attestation_type::SCORES && dimension.is_none() {
             env.insert(
                 "dimension".into(),
-                serde_json::Value::String("evidence:safety_battery:capture:a:b:v1".into()),
+                serde_json::Value::String("coherence_standing:cab:v1".into()),
             );
             env.insert(
                 "score".into(),
@@ -43568,16 +44381,21 @@ mod tests {
         let when = chrono::Utc::now();
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(topo_attestation(
-                    "topo-granter",
-                    "topo-grantee",
-                    attestation_type::SCORES,
-                    Some("evidence:safety_battery:capture:a:b:v1"),
-                    None,
-                    &[],
-                    Some(2.5),
-                    when,
-                )),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(topo_attestation(
+                        "topo-granter",
+                        "topo-grantee",
+                        attestation_type::SCORES,
+                        Some("coherence_standing:cab:v1"),
+                        None,
+                        &[],
+                        Some(2.5),
+                        when,
+                    )),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -43596,7 +44414,7 @@ mod tests {
         assert_eq!(e.edge_type, crate::federation::EdgeType::Direct);
         assert_eq!(e.from_key, e2::kid("topo-grantee"));
         assert_eq!(e.to_key, e2::kid("topo-granter"));
-        assert_eq!(e.purpose, "evidence:safety_battery:capture:a:b:v1");
+        assert_eq!(e.purpose, "coherence_standing:cab:v1");
         assert!((e.weight - 2.5).abs() < 1e-9);
         assert!(e.revoked_at.is_none());
         assert_eq!(topo.nodes.len(), 2);
@@ -43621,7 +44439,7 @@ mod tests {
             "adv-granter",
             "adv-grantee",
             attestation_type::SCORES,
-            Some("evidence:safety_battery:capture:a:b:v1"),
+            Some("coherence_standing:cab:v1"),
             None,
             &[],
             Some(1.0),
@@ -43629,7 +44447,12 @@ mod tests {
         ));
         backend
             .put_attestation(SignedAttestation {
-                attestation: scored.clone(),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &scored.clone(),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -43649,7 +44472,12 @@ mod tests {
             serde_json::Value::String(e2::rid(&scored));
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(withdraws),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(withdraws),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -43832,11 +44660,16 @@ mod tests {
         let backend = bootstrap_node_agency_sqlite().await;
         let err = backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(node_delegates_to_sqlite(
-                    "owner",
-                    "node-key",
-                    &[ds::INFRA_SERVE, ds::AGENCY_ACT_ON_BEHALF],
-                )),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(node_delegates_to_sqlite(
+                        "owner",
+                        "node-key",
+                        &[ds::INFRA_SERVE, ds::AGENCY_ACT_ON_BEHALF],
+                    )),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap_err();
@@ -43869,11 +44702,16 @@ mod tests {
         let backend = bootstrap_node_agency_sqlite().await;
         let err = backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(node_delegates_to_sqlite(
-                    "owner",
-                    "node-key",
-                    &[SCOPE_ACT_ON_BEHALF],
-                )),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(node_delegates_to_sqlite(
+                        "owner",
+                        "node-key",
+                        &[SCOPE_ACT_ON_BEHALF],
+                    )),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap_err();
@@ -43895,7 +44733,12 @@ mod tests {
         let backend = bootstrap_node_agency_sqlite().await;
         let err = backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(node_delegates_to_sqlite("owner", "node-key", &[])),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(node_delegates_to_sqlite("owner", "node-key", &[])),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap_err();
@@ -43965,11 +44808,16 @@ mod tests {
                 .unwrap();
             let err = backend
                 .put_attestation(SignedAttestation {
-                    attestation: e2_row(node_delegates_to_sqlite(
-                        "owner",
-                        key_id,
-                        &[ds::AGENCY_ACT_ON_BEHALF],
-                    )),
+                    attestation: crate::federation::edition2::fixture_switch::headed_row(
+                        &backend,
+                        &e2_row(node_delegates_to_sqlite(
+                            "owner",
+                            key_id,
+                            &[ds::AGENCY_ACT_ON_BEHALF],
+                        )),
+                    )
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
                 })
                 .await
                 .unwrap_err();
@@ -44041,7 +44889,12 @@ mod tests {
         let id = att.attestation_id.clone();
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(att),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(att),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect_err(
@@ -44268,7 +45121,12 @@ mod tests {
         //     fail-secure, nothing stored.
         let err = backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(fed_attestation("nm-a1", "nm-prim", "nm-no", "nm-prim")),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(fed_attestation("nm-a1", "nm-prim", "nm-no", "nm-prim")),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap_err();
@@ -44293,7 +45151,12 @@ mod tests {
         // (2) Same shape onto the MODERATORED community → ADMITTED + stored.
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(fed_attestation("nm-a2", "nm-user", "nm-ok", "nm-user")),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(fed_attestation("nm-a2", "nm-user", "nm-ok", "nm-user")),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("moderatored community continues to federate");
@@ -44315,7 +45178,12 @@ mod tests {
         crate::federation::tier_ingest::test_support::reseal(&mut local);
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(local),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(local),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("local-tier row is not a federation apply step");
@@ -44335,6 +45203,7 @@ mod tests {
                     reason: None,
                     witness_set: Vec::new(),
                     persist_row_hash: String::new(),
+                    leaf: crate::federation::types::RevocationLeaf::Removal,
                 },
             ),
         )
@@ -44396,7 +45265,7 @@ mod tests {
             "sl-node",
             "sl-root",
             "sl-witness",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            crate::federation::types::delegation_scope::ASSURE_AGE,
         )
         .await;
 
@@ -44423,7 +45292,12 @@ mod tests {
         ] {
             backend
                 .put_attestation(SignedAttestation {
-                    attestation: e2_row(age("sl-witness", subj, token)),
+                    attestation: crate::federation::edition2::fixture_switch::headed_row(
+                        &backend,
+                        &e2_row(age("sl-witness", subj, token)),
+                    )
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
                 })
                 .await
                 .unwrap();
@@ -44449,7 +45323,12 @@ mod tests {
         // person a job.
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(node_delegates_to_sqlite("sl-S", "sl-A", &[ds::INFRA_SERVE])),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(node_delegates_to_sqlite("sl-S", "sl-A", &[ds::INFRA_SERVE])),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("an unmarked delegation to an adult is a conferral, not a custody claim");
@@ -44471,7 +45350,12 @@ mod tests {
         let ward_edge = e2_row(node_delegates_to_sqlite("sl-S", "sl-M", &[ds::INFRA_SERVE]));
         backend
             .put_attestation(SignedAttestation {
-                attestation: ward_edge.clone(),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &ward_edge.clone(),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("adult-user steward → minor ward admitted");
@@ -44502,7 +45386,12 @@ mod tests {
         resign_fed(&mut w);
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(w),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(w),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -44541,7 +45430,15 @@ mod tests {
             "si-node",
             "si-root",
             "si-assessor",
-            crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE,
+            crate::federation::types::delegation_scope::ASSURE_AGE,
+        )
+        .await;
+        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+            &backend,
+            "si-node",
+            "si-root",
+            "si-assessor",
+            crate::federation::types::delegation_scope::ASSURE_CAPACITY,
         )
         .await;
 
@@ -44559,7 +45456,12 @@ mod tests {
         ] {
             backend
                 .put_attestation(SignedAttestation {
-                    attestation: e2_row(att("si-assessor", subj, token)),
+                    attestation: crate::federation::edition2::fixture_switch::headed_row(
+                        &backend,
+                        &e2_row(att("si-assessor", subj, token)),
+                    )
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
                 })
                 .await
                 .unwrap();
@@ -44570,7 +45472,12 @@ mod tests {
         ] {
             backend
                 .put_attestation(SignedAttestation {
-                    attestation: e2_row(att("si-assessor", "si-A", token)),
+                    attestation: crate::federation::edition2::fixture_switch::headed_row(
+                        &backend,
+                        &e2_row(att("si-assessor", "si-A", token)),
+                    )
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
                 })
                 .await
                 .expect("witness capacity attestation admitted on sqlite");
@@ -44592,10 +45499,10 @@ mod tests {
                 "id": id,
                 "scope": ["financial"],
                 "binding_legitimacy_source": "prior_will_proxy",
-            "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+            "delegation_purpose": crate::federation::types::owner_binding::PURPOSE,
                 // v30.8.0 (CIRISConstitution#87) — declare custody; see the
                 // memory-backend `fix_incapacity_binding` note.
-                "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+                "delegation_purpose": crate::federation::types::owner_binding::PURPOSE,
                 "valid_until": valid_until,
             });
             resign_fed(&mut a);
@@ -44607,7 +45514,12 @@ mod tests {
             crate::federation::admission::render_signed_instant(Utc::now() + Duration::days(30));
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(binding("si-live", &future)),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(binding("si-live", &future)),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("valid adult-incapacity binding admitted on sqlite");
@@ -44624,11 +45536,16 @@ mod tests {
         .await;
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(att(
-                    "si-assessor",
-                    "si-B",
-                    "age_assurance:provider:adult:v1",
-                )),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(att(
+                        "si-assessor",
+                        "si-B",
+                        "age_assurance:provider:adult:v1",
+                    )),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -44638,7 +45555,12 @@ mod tests {
         ] {
             backend
                 .put_attestation(SignedAttestation {
-                    attestation: e2_row(att("si-assessor", "si-B", token)),
+                    attestation: crate::federation::edition2::fixture_switch::headed_row(
+                        &backend,
+                        &e2_row(att("si-assessor", "si-B", token)),
+                    )
+                    .await
+                    .expect("HEAD-fix1: the row names its head"),
                 })
                 .await
                 .unwrap();
@@ -44659,13 +45581,18 @@ mod tests {
             "id": "si-lapsed",
             "scope": ["financial"],
             "binding_legitimacy_source": "prior_will_proxy",
-            "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+            "delegation_purpose": crate::federation::types::owner_binding::PURPOSE,
             "valid_until": lapsed,
         });
         resign_fed(&mut b);
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(b),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(b),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .expect("lapsed-valid_until binding structurally admitted");
@@ -45035,7 +45962,12 @@ mod tests {
             serde_json::Value::String(e2::rid(&edge));
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(recants),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(recants),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -45337,7 +46269,12 @@ mod tests {
         let att = fed_attestation("a-1", "peer-att-a", "peer-att-b", "peer-att-a");
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(att),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(att),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -47112,7 +48049,12 @@ mod tests {
         resign_fed(&mut hit); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(hit),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(hit),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -47128,7 +48070,12 @@ mod tests {
         resign_fed(&mut miss); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(miss),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(miss),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -47198,7 +48145,7 @@ mod tests {
         let sha_hex = "d".repeat(64);
         let mut att = fed_attestation("att-steward", steward_key, steward_key, steward_key);
         att.attestation_envelope = serde_json::json!({
-            "dimension": "evidence:safety_battery:capture:a:b:v1",
+            "dimension": "coherence_standing:cab:v1",
             "score": 1.0,
             "confidence": 0.9,
             "evidence_refs": [sha_hex],
@@ -47206,7 +48153,12 @@ mod tests {
         resign_fed(&mut att); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(att),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(att),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -47857,6 +48809,7 @@ mod tests {
                     reason: None,
                     witness_set: vec![],
                     persist_row_hash: String::new(),
+                    leaf: crate::federation::types::RevocationLeaf::Removal,
                 },
             ),
         )
@@ -47917,6 +48870,7 @@ mod tests {
                     reason: None,
                     witness_set: vec![],
                     persist_row_hash: String::new(),
+                    leaf: crate::federation::types::RevocationLeaf::Resignation,
                 },
             )
         };
@@ -48317,7 +49271,12 @@ mod tests {
         // A non-delegation (scores) inbound edge must not appear.
         backend
             .put_attestation(SignedAttestation {
-                attestation: e2_row(fed_attestation("dt-vouch", "dt-g1", "dt-k", "dt-g1")),
+                attestation: crate::federation::edition2::fixture_switch::headed_row(
+                    &backend,
+                    &e2_row(fed_attestation("dt-vouch", "dt-g1", "dt-k", "dt-g1")),
+                )
+                .await
+                .expect("HEAD-fix1: the row names its head"),
             })
             .await
             .unwrap();
@@ -48774,20 +49733,7 @@ mod tests {
 
     // ── v31.0.0 (CIRISPersist#656) — the ungated-door witnesses, SQLITE legs ──
 
-    /// #686 — the SQLITE leg of the CHARTER-PLANE foreign-retraction question.
-    #[tokio::test]
-    async fn foreign_retraction_cannot_sever_charter_sqlite_686() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        // v62.0.0 (E9: the body is edition 2) — this node's key, an edition-2
-        // `node` record, set before the body runs (the body needs it).
-        backend.set_node_key_id(e2::put_key(&backend, "sq686c-node", &["node"]).await);
-        crate::federation::operational::test_support::exercise_foreign_retraction_cannot_sever_charter(
-            &backend, "sq686c",
-        )
-        .await
-        .expect("686 charter-plane foreign-retraction exercise");
-    }
+    // LEAD-root1 — runner of the deleted exercise_foreign_retraction_cannot_sever_charter (no row is a charter).
 
     /// The SQLITE leg of the FOREIGN-RETRACTION witness.
     #[tokio::test]

@@ -2586,14 +2586,21 @@ pub mod gate_order_test_support {
         let n = super::PER_PEER_ATTESTATION_WRITES_PER_WINDOW;
         // Signed BEFORE the clock starts: the drain measures the door, not
         // the signer.
-        let rows: Vec<Vec<u8>> = (0..u64::from(2 * n))
-            .map(|i| {
-                e2::statement_of(
-                    &row(&seed, attestation_tier::FEDERATION, "global", i),
-                    &seed,
-                )
-            })
-            .collect();
+        let mut rows: Vec<Vec<u8>> = Vec::new();
+        for i in 0..u64::from(2 * n) {
+            // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — as its producer signs it: the
+            // node's act names its owner binding (`e2::with_head_resolved`,
+            // which owns the fixture node), so the door reaches the scope.
+            let st = e2::statement_of(
+                &row(&seed, attestation_tier::FEDERATION, "global", i),
+                &seed,
+            );
+            rows.push(
+                e2::with_head_resolved(dir, &st, None)
+                    .await
+                    .expect("the row names its head"),
+            );
+        }
         let started = crate::host::clock::monotonic_now();
         let mut rate_limited = None;
         for (i, st) in rows.iter().enumerate() {

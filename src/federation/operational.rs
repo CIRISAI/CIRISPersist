@@ -819,7 +819,9 @@ pub mod test_support {
     /// failure surfaces as an opaque `insufficient distinct valid signatures:
     /// 0 < threshold 2`. If you are standing up a TRUST ROOT (the `infra:serve`
     /// SCOPE in a `delegates_to` charter, a different plane from the key ROLE),
-    /// use [`establish_trust_root`] instead — it needs none of this.
+    /// use [`rooted_trust_root`](crate::federation::edition2::fixture_trust_root::rooted_trust_root)
+    /// instead — it needs none of this (v62.0.0 R2-fixture: the root is the
+    /// bundle's lineage).
     pub async fn confer_roles(
         directory: &dyn crate::federation::FederationDirectory,
         key_id: &str,
@@ -1109,91 +1111,11 @@ pub mod test_support {
         }
     }
 
-    /// v47.3.0 (#901) — a chartered FAMILY root with `holders` seated
-    /// (`quorum:2/3`), its `trust:charter:v1` signed by holders[0] and co-scrubbed by
-    /// every other holder, and `user`'s synthetic trust edge — the shape
-    /// `exercise_foreign_retraction_cannot_sever_charter` builds, as a
-    /// fixture. The holders must already be registered (with whatever
-    /// evidence the witness intends).
-    pub async fn seed_chartered_family_root(
-        directory: &dyn crate::federation::FederationDirectory,
-        root_key_id: &str,
-        holders: &[String],
-        user_key_id: &str,
-    ) -> Result<(), crate::federation::Error> {
-        seed_chartered_family_root_with_scrubs(directory, root_key_id, holders, user_key_id, &[])
-            .await
-    }
-
-    /// [`seed_chartered_family_root`] where named co-scrubs (`holders[1..]`)
-    /// sign with a chosen [`ScrubSigner`] instead of their own deterministic
-    /// pair — the shape I156 needs: a holder whose record carries a mock
-    /// YubiKey member's pubkeys must scrub the charter AS that member, or its
-    /// scrub does not verify and it is not a holder of the charter at all.
-    /// `holders[0]` always signs with its deterministic pair.
-    pub async fn seed_chartered_family_root_with_scrubs(
-        directory: &dyn crate::federation::FederationDirectory,
-        root_key_id: &str,
-        holders: &[String],
-        user_key_id: &str,
-        overrides: &[(&str, ScrubSigner<'_>)],
-    ) -> Result<(), crate::federation::Error> {
-        let charter_id = format!("{root_key_id}-charter");
-        let successors = vec![
-            format!("{root_key_id}-succ-a"),
-            format!("{root_key_id}-succ-b"),
-        ];
-        let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&successors)
-            .map_err(|e| {
-            crate::federation::Error::Backend(format!("pre_rotation_commitment: {e}"))
-        })?;
-        // EVERY seated holder scrubs the charter (holders[0] signs, the rest
-        // co-scrub): the charter's verified scrub set — which is what the
-        // v47.3.0 holder-hardware leg judges — is then the whole seat set.
-        let mut charter = co_signed_trust_attestation(
-            &charter_id,
-            &holders[0],
-            root_key_id,
-            crate::federation::types::attestation_type::DELEGATES_TO,
-            json!({
-                "references_attestation_id": charter_id,
-                "dimension": crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
-                "scope": [
-                    crate::federation::trust_root::INFRA_ATTEST_SCOPE,
-                    crate::federation::trust_root::INFRA_SERVE_SCOPE,
-                ],
-                "pre_rotation_commitment": commitment,
-            }),
-            &[],
-        );
-        let sealed = charter.attestation_envelope.clone();
-        charter.additional_scrubs = holders[1..]
-            .iter()
-            .filter_map(|h| {
-                let signer = overrides
-                    .iter()
-                    .find(|(k, _)| *k == h.as_str())
-                    .map(|(_, s)| s);
-                match signer {
-                    Some(ScrubSigner::Absent) => None,
-                    Some(s) => Some(co_scrub(&sealed, h, s)),
-                    None => Some(co_scrub(&sealed, h, &ScrubSigner::Deterministic(h))),
-                }
-            })
-            .collect();
-        // v53.0.0 (CC 3.2 T6) — the family's founding version names this
-        // charter, or it is not in force.
-        let digest = charter_digest_of(&charter);
-        seed_test_family_naming(directory, root_key_id, holders, "quorum:2/3", &digest).await?;
-        directory
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: charter,
-            })
-            .await?;
-        assert_charter_digest_held(directory, root_key_id, &charter_id, &digest).await;
-        try_emit_synthetic_trust_edge(directory, user_key_id, root_key_id).await;
-        Ok(())
-    }
+    // v62.0.0 (R2-fixture; CC 3.2 T5, "the root is the bundle's lineage") —
+    // `seed_chartered_family_root` and
+    // `seed_chartered_family_root_with_scrubs` DELETED (no caller): a chartered FAMILY
+    // root signed by a holder is the earlier form; the root is the bundle
+    // (`edition2::fixture_trust_root`).
 
     /// The established mock Android-StrongBox `attestation_evidence` value the
     /// #513 hardware-attestation gate accepts in test builds (shape + a fresh
@@ -1288,40 +1210,10 @@ pub mod test_support {
         )
     }
 
-    /// v21.15.0 (CIRISPersist#536) — the ONE scope-granting edge: a live
-    /// `delegates_to(root → subject)` carrying `scope` (e.g. `infra:serve`),
-    /// really signed by `root`. The capability half the
-    /// [`crate::federation::trust_root::capability_roots_to_trusted_root`] walk
-    /// resolves. Split out (per the issue) so a consumer can grant additional
-    /// scopes off an already-established root without re-standing the four legs.
-    /// `root` must already be registered (by [`establish_trust_root`] or the
-    /// caller); `subject` must already be registered (the caller's recipient).
-    pub async fn grant_scope(
-        directory: &dyn crate::federation::FederationDirectory,
-        root_key_id: &str,
-        subject_key_id: &str,
-        scope: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let edge = signed_trust_attestation(
-            &id,
-            root_key_id,
-            subject_key_id,
-            crate::federation::types::attestation_type::DELEGATES_TO,
-            // v23.0.0 (CIRISPersist#551 item 2) — R → subject: this is the
-            // CONFERRAL, the one that points the opposite way from the trust
-            // edge it is otherwise indistinguishable from.
-            json!({
-                "references_attestation_id": id,
-                "dimension": crate::federation::trust_root::TRUST_CONFERS_DIMENSION,
-                "scope": [scope],
-            }),
-        );
-        directory
-            .put_attestation(crate::federation::SignedAttestation { attestation: edge })
-            .await
-            .map(|_| ())
-    }
+    // v62.0.0 (R2-fixture; CC 3.2 T5, "the root is the bundle's lineage") —
+    // `grant_scope` DELETED: a conferral signed
+    // by ONE root key is the keyed root; a root grant is counted over the bundle's
+    // holders (`fixture_trust_root::put_conferral`).
 
     /// **CIRISPersist#548 — a conferral the capability walk must see, and the
     /// asking node's own trust chain it must still require in full.**
@@ -1393,7 +1285,7 @@ pub mod test_support {
             )
         });
         assert_eq!(
-            grant.root_key_id, r.root,
+            grant.root_key_id, r.lineage,
             "({tag}) #548: the root that conferred is the one named"
         );
         assert_eq!(
@@ -1404,7 +1296,7 @@ pub mod test_support {
 
         // THE DRILL IS A SIGNAL, NOT A GATE (v23.0.0, CIRISPersist#551 item 4).
         let undrilled =
-            trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
+            trust_root_valid(directory, &node, &r.lineage, crate::host::clock::now()).await?;
         assert!(
             undrilled.valid,
             "({tag}) #551 item 4: an UNDRILLED root must still serve: {undrilled:?}"
@@ -1468,7 +1360,7 @@ pub mod test_support {
 
         // THE LEVER — withdraw the node's one acceptance edge; trust must
         // collapse, emergent, with the conferral still fully valid.
-        withdraw_e2(directory, &node, &r.root, &r.acceptance).await?;
+        withdraw_e2(directory, &node, &r.lineage, &r.acceptance).await?;
         let after = capability_roots_to_trusted_root(
             directory,
             &node,
@@ -1485,353 +1377,19 @@ pub mod test_support {
         Ok(())
     }
 
-    /// v21.15.0 (CIRISPersist#536) — the leg-B counterpart to [`confer_roles`]:
-    /// stand up a genuinely VALID trust root that
-    /// [`crate::federation::trust_root::trust_root_valid`] accepts, with real
-    /// signatures verified by the same walk production uses, on ANY backend.
-    ///
-    /// It writes the ROOT-SIDE legs plus the scope edge — everything signable
-    /// by the helper's own synthetic actors — and best-effort the user edge:
-    /// 2. `delegates_to(root → root)` carrying BOTH `infra:attest` AND
-    ///    `infra:serve` AND a well-formed `pre_rotation_commitment` — the root's
-    ///    self-declaration + the recovery leg (#488);
-    /// 3. a fresh heartbeat (`accord:lifecycle:v1`) `scores` row ABOUT `root`, emitted by a
-    ///    helper-created `accord_holder` — **the leg a consumer cannot stand up
-    ///    itself**: `accord:*` is reserved to `accord_holder` (CC 3.4.1) and a
-    ///    test engine signs as itself, so the ordinary emit path cannot produce
-    ///    it (CIRISPersist#536);
-    /// 4. `delegates_to(root → subject)` carrying `scope` (via [`grant_scope`]);
-    ///    (the halt latch is not a leg — v58.0.0, CIRISPersist#1094);
-    /// 1. `delegates_to(user → root)` — the user's live trust edge — is
-    ///    **best-effort** (see below).
-    ///
-    /// # SELF-ENFORCING postcondition (CIRISPersist#536 follow-up, v21.17.0)
-    ///
-    /// The contract of this helper is "after `Ok`, the trust walk succeeds." So
-    /// it **asserts that before returning**: after standing up the legs it runs
-    /// [`crate::federation::trust_root::capability_roots_to_trusted_root`]
-    /// `(user, subject, scope)` and returns **`Err` if that does not succeed** —
-    /// a helper whose contract is "the walk holds" must not be able to report
-    /// success when it doesn't (the v21.16.0 best-effort version could, which was
-    /// a fixture-contract bug).
-    ///
-    /// # Real vs synthetic user
-    ///
-    /// The root and its accord witness stay synthetic — nobody needs their
-    /// private halves. The USER is the node whose serve gate you are exercising.
-    /// The user's trust edge must be signed BY the user, and this helper can only
-    /// sign it with the deterministic `sign_envelope(user_key_id)` derivation —
-    /// correct for a **synthetic** user (whose registered pubkey IS that
-    /// derivation), **wrong for a REAL engine-backed** user (whose registered
-    /// pubkey is its own signing key → the edge fails federation-tier ingest).
-    /// The synthetic user edge is therefore **best-effort** (skipped+logged when
-    /// it won't verify). Consequently:
-    /// - **synthetic user** → the synthetic edge admits, the walk succeeds, `Ok`.
-    /// - **real user** → emit `delegates_to(user → root)` with the user's OWN
-    ///   signer **before** calling this; the walk then succeeds and it returns
-    ///   `Ok`. If you have NOT emitted it, this returns `Err` (honest — the walk
-    ///   is not satisfied). Prefer [`establish_trust_root_side`] for the
-    ///   real-user flow: it stands up only the root side (and asserts ITS
-    ///   postcondition), leaving leg 1 to your engine, then you assert the walk.
-    ///
-    /// `subject_key_id` (and, for the synthetic path, `user_key_id`) must already
-    /// be registered. `root_key_id` is a NEW id this helper registers. Does the
-    /// whole honest dance — it does NOT bypass any gate.
-    pub async fn establish_trust_root(
-        directory: &dyn crate::federation::FederationDirectory,
-        user_key_id: &str,
-        root_key_id: &str,
-        subject_key_id: &str,
-        scope: &str,
-    ) -> Result<(), crate::federation::Error> {
-        establish_trust_root_side(directory, root_key_id, subject_key_id, scope).await?;
-        // Best-effort synthetic user edge (see the type-level doc): admits for a
-        // synthetic user, skipped+logged for a real one.
-        try_emit_synthetic_trust_edge(directory, user_key_id, root_key_id).await;
+    // v62.0.0 (R2-fixture; CC 3.2 T5, "the root is the bundle's lineage") —
+    // `establish_trust_root` /
+    // `establish_trust_root_side` (the earlier-form KEYED root: a self-charter, a
+    // heartbeat, one signer's conferral) DELETED. A test that needs a valid root
+    // stands up `fixture_trust_root::rooted_trust_root` (the bundle's lineage, this
+    // node's acceptance) and `put_conferral` (the counted grant). Adopter: CIRISServer
+    // `tests/trace_round_e2e.rs:320`.
 
-        // POSTCONDITION — the reason this helper exists. Never return Ok unless
-        // the walk it is meant to satisfy actually succeeds (CIRISPersist#536).
-        let grant = crate::federation::trust_root::capability_roots_to_trusted_root(
-            directory,
-            user_key_id,
-            subject_key_id,
-            scope,
-            crate::host::clock::now(),
-        )
-        .await?;
-        if grant.is_none() {
-            return Err(crate::federation::Error::Backend(format!(
-                "establish_trust_root postcondition NOT met: \
-                 capability_roots_to_trusted_root(user={user_key_id}, subject={subject_key_id}, \
-                 scope={scope}) does not succeed — leg 1 delegates_to({user_key_id} → \
-                 {root_key_id}) is absent. For a REAL engine-backed user, emit that trust edge \
-                 with the user's OWN signer BEFORE this call, or use establish_trust_root_side \
-                 (which stands up only the root side) and assert the walk yourself."
-            )));
-        }
-        Ok(())
-    }
-
-    /// v21.16.0 (CIRISPersist#536 follow-up) — the ROOT-SIDE legs of a valid
-    /// trust root, all signable by the helper's own synthetic actors (nobody
-    /// needs the root's or the accord-holder's private halves): the root
-    /// self-declaration charter, the reserved heartbeat witness, and
-    /// the `delegates_to(root → subject)` scope edge. This is the part
-    /// [`establish_trust_root`] does that a consumer genuinely cannot do itself
-    /// (the `accord:*` reservation). The user→root TRUST edge is deliberately
-    /// NOT here — for a real engine-backed user it must be emitted by the
-    /// user's OWN signer (its registered pubkey is its signing key, not the
-    /// deterministic `sign_envelope` derivation). Call this, then have the real
-    /// user emit `delegates_to(user → root)` itself.
-    pub async fn establish_trust_root_side(
-        directory: &dyn crate::federation::FederationDirectory,
-        root_key_id: &str,
-        subject_key_id: &str,
-        scope: &str,
-    ) -> Result<(), crate::federation::Error> {
-        use crate::federation::trust_root::{INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE};
-        use crate::federation::types::{attestation_type, identity_type};
-
-        // The helper-controlled synthetic actors: the root and its accord witness.
-        // v47.3.0 (CIRISPersist#901, FSD §3.6) — a Key-kind root is its own
-        // charter holder, and a valid root is defined by its holders' attested
-        // hardware: the root carries Layer-A-valid evidence, as every seated
-        // family holder does through `register_typed_key(ACCORD_HOLDER)`.
-        register_typed_key_with_evidence(
-            directory,
-            root_key_id,
-            identity_type::NODE,
-            Some(strongbox_evidence(crate::host::clock::now())),
-        )
-        .await?;
-        let la = format!("{root_key_id}-la");
-        register_typed_key(directory, &la, identity_type::ACCORD_HOLDER).await?;
-
-        // Leg 2 — the root's self-declaration charter: infra:attest AND
-        // infra:serve AND a well-formed pre-rotation commitment (recovery leg).
-        let charter_id = uuid::Uuid::new_v4().to_string();
-        let successors = vec![
-            format!("{root_key_id}-succ-a"),
-            format!("{root_key_id}-succ-b"),
-        ];
-        let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&successors)
-            .map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "establish_trust_root pre_rotation_commitment: {e}"
-            ))
-        })?;
-        let charter = signed_trust_attestation(
-            &charter_id,
-            root_key_id,
-            root_key_id,
-            attestation_type::DELEGATES_TO,
-            json!({
-                "references_attestation_id": charter_id,
-                // v23.0.0 (CIRISPersist#551 item 2) — R → R: the charter.
-                "dimension": crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
-                "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
-                "pre_rotation_commitment": commitment,
-            }),
-        );
-        directory
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: charter,
-            })
-            .await?;
-
-        // Leg 3 — the fresh heartbeat row ABOUT the root, from the
-        // accord_holder (the reserved-family leg a consumer cannot produce).
-        let lc_id = uuid::Uuid::new_v4().to_string();
-        let lifecycle = signed_trust_attestation(
-            &lc_id,
-            &la,
-            root_key_id,
-            attestation_type::SCORES,
-            json!({
-                "id": lc_id,
-                "dimension": crate::federation::trust_root::ACCORD_HEARTBEAT_DIMENSION,
-                "score": 1.0,
-                "confidence": 0.9,
-            }),
-        );
-        directory
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: lifecycle,
-            })
-            .await?;
-
-        // Leg 4 — the scope-carrying edge (the halt latch is not a leg, v58.0.0).
-        grant_scope(directory, root_key_id, subject_key_id, scope).await?;
-
-        // POSTCONDITION (CIRISPersist#536) — the root side is GENUINELY up: the
-        // root self-declares AND the drill it just minted landed GREEN.
-        // (edge_exists is legitimately false here — leg 1 is the caller's to
-        // emit — so we probe the root-only legs with a throwaway user id.) A
-        // helper that returns Ok must have actually done what it claims.
-        //
-        // v23.0.0 (CIRISPersist#551 item 4) — the drill check here is now an
-        // assertion about THIS HELPER's emission, not about the root's
-        // validity: a red-drilled root is perfectly valid (the deadman is
-        // gone), but a helper that promised to mint a fresh drill and did
-        // not has failed its contract, and that must still surface.
-        let probe = crate::federation::trust_root::trust_root_valid(
-            directory,
-            "__side_probe__",
-            root_key_id,
-            crate::host::clock::now(),
-        )
-        .await?;
-        let drilled = probe.drill_freshness == crate::federation::trust_root::DrillFreshness::Green;
-        if !(probe.root_self_declares && drilled) {
-            return Err(crate::federation::Error::Backend(format!(
-                "establish_trust_root_side postcondition NOT met for root={root_key_id}: \
-                 root_self_declares={} drill_freshness={:?} — the charter or the drill this \
-                 helper mints did not admit",
-                probe.root_self_declares, probe.drill_freshness
-            )));
-        }
-        Ok(())
-    }
-
-    /// v21.16.0 (CIRISPersist#536 follow-up) — emit `delegates_to(user → root)`
-    /// signed with the user's DETERMINISTIC `sign_envelope` key. Correct ONLY
-    /// for a synthetic user (whose registered pubkey IS that derivation); for a
-    /// real engine-backed user the federation-tier ingest hybrid-verify fails
-    /// (`FederationTierUnverified` — the derived key ≠ the node's real signing
-    /// key). Best-effort by design: on that failure it logs and returns, and
-    /// the real user's own signer is expected to emit the honest edge.
-    /// #973 (CC 3.2 T4a) — a NEW acceptance edge names the head it attaches
-    /// on. Adds `attached_head_digest` to `envelope` when this node holds a
-    /// lineage for `root` (a key root has none and the edge stays as built).
-    pub(crate) async fn naming_the_attach_head(
-        directory: &dyn crate::federation::FederationDirectory,
-        root: &str,
-        mut envelope: serde_json::Value,
-    ) -> serde_json::Value {
-        if let Ok(Some(head)) = crate::federation::canonical_community::attach_head_for(
-            directory,
-            root,
-            crate::host::clock::now(),
-        )
-        .await
-        {
-            envelope[crate::federation::envelope::paths::ATTACHED_HEAD_DIGEST] =
-                serde_json::Value::String(head);
-        }
-        envelope
-    }
-
-    async fn try_emit_synthetic_trust_edge(
-        directory: &dyn crate::federation::FederationDirectory,
-        user_key_id: &str,
-        root_key_id: &str,
-    ) {
-        use crate::federation::trust_root::{INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE};
-        use crate::federation::types::attestation_type;
-        let edge_id = uuid::Uuid::new_v4().to_string();
-        let edge = signed_trust_attestation(
-            &edge_id,
-            user_key_id,
-            root_key_id,
-            attestation_type::DELEGATES_TO,
-            naming_the_attach_head(
-                directory,
-                root_key_id,
-                json!({
-                    "references_attestation_id": edge_id,
-                    // v23.0.0 (CIRISPersist#551 item 2) — node → R: the trust
-                    // edge, named.
-                    "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
-                    "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
-                }),
-            )
-            .await,
-        );
-        if let Err(e) = directory
-            .put_attestation(crate::federation::SignedAttestation { attestation: edge })
-            .await
-        {
-            tracing::info!(
-                user = %user_key_id, root = %root_key_id, error = %e,
-                "establish_trust_root: synthetic user→root trust edge not admitted (expected for a \
-                 REAL engine-backed user whose registered pubkey is its own signing key). The \
-                 caller must emit delegates_to(user → root) with the user's OWN signer — see \
-                 establish_trust_root_side (CIRISPersist#536)."
-            );
-        }
-    }
-
-    /// v21.15.0 (CIRISPersist#536) — the backend-agnostic TRUST-ROOT parity
-    /// body: prove [`establish_trust_root`] stands up a root that
-    /// [`crate::federation::trust_root::trust_root_valid`] accepts (all four
-    /// legs) AND that the subject's `infra:serve` roots to it via
-    /// [`crate::federation::trust_root::capability_roots_to_trusted_root`] (leg
-    /// B). Run from the memory, sqlite AND postgres backend tests — the leg 3
-    /// (the `accord:lifecycle:v1` heartbeat) reserved-family emission and the federation-tier
-    /// hybrid-verify of every leg must round-trip on each backend, not just the
-    /// tolerant one (the #534/#536 discipline).
-    pub async fn exercise_trust_root(
-        directory: &dyn crate::federation::FederationDirectory,
-        tag: &str,
-    ) {
-        use crate::federation::edition2::fixture_switch as e2;
-        use crate::federation::trust_root::{
-            capability_roots_to_trusted_root, trust_root_valid, INFRA_SERVE_SCOPE,
-        };
-
-        // v62.0.0 (JSON cut, E7; W1b) — the root is W1's ROOTED edition-2
-        // trust root: an infrastructure community founded by the genesis
-        // bundle's holders through their voices, the root's `trust:charter:v1`
-        // self-edge, and THIS node's `trust:accepts:v1` edge. The asking party
-        // is this node. PRECONDITION (the runner's): the backend's
-        // `set_node_key_id(e2::put_key(&b, "<seed>", &["node"]).await)`.
-        let node = directory.node_key_id().unwrap_or_else(|| {
-            panic!("({tag}) the runner sets the node key first (W1b precondition)")
-        });
-        let r = e2::rooted_trust_root(
-            directory,
-            &crate::federation::edition2::fixture_genesis::HOLDER_SEEDS,
-            "quorum:2/3",
-        )
-        .await;
-
-        let v = trust_root_valid(directory, &node, &r.root, crate::host::clock::now())
-            .await
-            .expect("trust_root_valid walk");
-        assert!(
-            v.valid,
-            "({tag}) a rooted trust root ⇒ trust_root_valid: {v:?}"
-        );
-
-        // `ConferralPlane::Delegation`: the root confers `infra:serve` on a
-        // subject (W1b v1.4 `put_conferral`: the root's `trust:confers:v1`
-        // grant plus the subject's co-signing voice), and the subject's
-        // infra:serve roots to the root this node trusts.
-        let subject_seed = format!("{tag}-subject");
-        crate::federation::edition2::fixture_trust_root::put_conferral(
-            directory,
-            &r,
-            &subject_seed,
-            &[INFRA_SERVE_SCOPE],
-        )
-        .await
-        .unwrap_or_else(|e| panic!("({tag}) the root confers infra:serve: {e}"));
-        let subject = e2::kid(&subject_seed);
-        let grant = capability_roots_to_trusted_root(
-            directory,
-            &node,
-            &subject,
-            INFRA_SERVE_SCOPE,
-            crate::host::clock::now(),
-        )
-        .await
-        .expect("capability walk")
-        .unwrap_or_else(|| panic!("({tag}) subject's infra:serve must root to the trusted root"));
-        assert_eq!(
-            grant.root_key_id, r.root,
-            "({tag}) the winning root is the one we established"
-        );
-    }
+    // v62.0.0 (R2-fixture; CC 3.2 T5, "the root is the bundle's lineage") —
+    // `exercise_trust_root` DELETED:
+    // its body (a rooted bundle root is valid; a counted conferral roots the
+    // subject's scope to it) is `exercise_ceremony_plane_capability_walk`, on every
+    // backend.
 
     // ── v62.0.0 (E9) — edition-2 trust roots beyond W1's fixed one ─────────
     //
@@ -1895,59 +1453,6 @@ pub mod test_support {
         .expect("operational: sign a trust edge")
     }
 
-    /// An edition-2 trust root stood up by [`stand_up_e2_root`].
-    #[derive(Clone, Debug)]
-    pub struct E2Root {
-        /// The root key's E0 seed.
-        pub seed: String,
-        /// The root's identity-ref (the community_key_id).
-        pub root: String,
-        /// The founders' identity-refs (the bundle's holders, in seed order).
-        pub founders: Vec<String>,
-        /// The founding `group:roster` version.
-        pub birth: crate::federation::edition2::names::RowId,
-        /// The root's `trust:charter:v1` self-edge.
-        pub charter: crate::federation::edition2::names::RowId,
-    }
-
-    /// The `infrastructure` community record a trust root is founded as
-    /// (`fixture_trust_root`'s shape): every member a FOUNDER, entrenched,
-    /// admission basis `founders`.
-    pub fn e2_root_community(
-        root: &str,
-        members: &[String],
-        protocol: &str,
-        founded_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::federation::types::Community {
-        crate::federation::types::Community {
-            community_key_id: root.to_owned(),
-            community_name: format!("e9 trust root {root}"),
-            members: members
-                .iter()
-                .map(|m| crate::federation::types::CommunityMember {
-                    key_id: m.clone(),
-                    joined_at: founded_at,
-                    role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
-                })
-                .collect(),
-            founded_at,
-            consensus_protocol: protocol.to_owned(),
-            policy_blob: Some(json!({
-                "cohort_subkind": crate::federation::canonical_community::COHORT_SUBKIND_INFRASTRUCTURE,
-                "cohort_subkind_payload": {
-                    "infrastructure_constraint": {
-                        "admission_quorum_basis":
-                            crate::federation::canonical_community::ADMISSION_QUORUM_BASIS_FOUNDERS,
-                    },
-                },
-                "consensus_protocol_entrenched": true,
-            })),
-            prev_head_digest: String::new(),
-            charter_digest: String::new(),
-            persist_row_hash: String::new(),
-        }
-    }
-
     /// Install the genesis bundle in force when none is held (W1b's step 1).
     pub async fn ensure_e2_genesis(
         directory: &dyn crate::federation::FederationDirectory,
@@ -1961,177 +1466,73 @@ pub mod test_support {
         Ok(())
     }
 
-    /// **Found a trust-root community at `root_seed`'s key** with `members`
-    /// (identity-refs) as founders under `protocol`, voiced by `signers`, at
-    /// `at_ms`. Returns the root, the founding version's row id and the last
-    /// voice's outcome (`Row` once the count is met; `Pending` while it is
-    /// short, T1). The first refusal returns.
-    pub async fn found_e2_root(
-        directory: &dyn crate::federation::FederationDirectory,
-        root_seed: &str,
-        members: &[String],
-        protocol: &str,
-        signers: &[&ciris_crypto::composite::CompositeSigningKey],
-        at_ms: u64,
-    ) -> Result<
-        (
-            String,
-            crate::federation::edition2::names::RowId,
-            crate::federation::edition2::ingest::StatementOutcome,
-        ),
-        crate::federation::Error,
-    > {
-        use crate::federation::edition2::fixture_switch as e2;
-        use crate::federation::edition2::group::GroupRecord;
-        ensure_e2_genesis(directory).await?;
-        let root = e2::put_key(directory, root_seed, &["user"]).await;
-        let founded_at = i64::try_from(at_ms - 30_000)
-            .ok()
-            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-            .expect("operational: a founding instant");
-        let record =
-            GroupRecord::Community(e2_root_community(&root, members, protocol, founded_at));
-        let voices = e2::roster_voices(&record, 1, None, at_ms, signers);
-        let birth = e2::row_id_of(&voices[0]);
-        let outcome = e2::put_voices(directory, &voices).await?;
-        Ok((root, birth, outcome))
-    }
+    // v62.0.0 (R2-fixture; CC 3.2 T5, "the root is the bundle's lineage") —
+    // the KEYED-root helpers (`E2Root`,
+    // `e2_root_community`, `found_e2_root`, `e2_charter_statement`,
+    // `stand_up_e2_root(_at)`, `confer_e2`, `establish_e2_trust_root`,
+    // `seed_chartered_e2_root`) DELETED: a root community at a key with its own charter
+    // self-edge and single-signer conferrals is no root. The root is
+    // `fixture_trust_root::rooted_trust_root`; its grant is `put_conferral`.
 
-    /// The root's `trust:charter:v1` self-edge `delegates_to(root → root)`,
-    /// scope `infra:serve` + `infra:attest`, committing to a successor key
-    /// (`"{root_seed}-successor"`), signed by the root's key at `at_ms`.
-    /// Pure: its row id is known before it lands.
-    pub fn e2_charter_statement(root_seed: &str, root: &str, at_ms: u64) -> Vec<u8> {
-        use crate::federation::edition2::fixture_switch as e2;
-        use crate::federation::trust_root::{
-            CHARTER_PRE_ROTATION_FIELD, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE,
-            TRUST_CHARTER_DIMENSION,
-        };
-        use ciris_verify_core::cde::Value;
-        let successor = e2::signing_key(&format!("{root_seed}-successor"));
-        let commitment = ciris_verify_core::edition2::recovery::recovery_commitment(&[successor
-            .public_key()
-            .clone()]);
-        e2_trust_edge(
-            root_seed,
-            root,
-            root,
-            vec![
-                ("author", e2_text(root)),
-                ("asserted_at", Value::Uint(at_ms)),
-                ("dimension", e2_text(TRUST_CHARTER_DIMENSION)),
-                (
-                    "scope",
-                    Value::Array(vec![
-                        e2_text(INFRA_SERVE_SCOPE),
-                        e2_text(INFRA_ATTEST_SCOPE),
-                    ]),
-                ),
-                (
-                    CHARTER_PRE_ROTATION_FIELD,
-                    Value::Bytes(commitment.to_vec()),
-                ),
-            ],
-        )
-    }
-
-    /// **The ROOT SIDE of an edition-2 trust root** (the twin of
-    /// [`establish_trust_root_side`]): the genesis bundle in force, the root
-    /// key, an `infrastructure` community founded at it by EVERY holder of
-    /// the bundle (`quorum:2/3`, each founder voicing, T1's founding rule),
-    /// and the root's charter self-edge. Nobody accepts it: acceptance is the
-    /// asking party's own row ([`accept_e2_root`]).
-    pub async fn stand_up_e2_root(
-        directory: &dyn crate::federation::FederationDirectory,
-        root_seed: &str,
-    ) -> Result<E2Root, crate::federation::Error> {
-        stand_up_e2_root_at(directory, root_seed, e2_now_ms()).await
-    }
-
-    /// [`stand_up_e2_root`] founded and chartered at `at` ms (a past instant
-    /// for a witness whose edges must post-date the root).
-    pub async fn stand_up_e2_root_at(
-        directory: &dyn crate::federation::FederationDirectory,
-        root_seed: &str,
-        at: u64,
-    ) -> Result<E2Root, crate::federation::Error> {
-        use crate::federation::edition2::fixture_genesis::{
-            identity_ref_of, test_key, HOLDER_SEEDS,
-        };
-        use crate::federation::edition2::ingest::StatementOutcome;
-        let founders: Vec<String> = HOLDER_SEEDS.iter().map(|s| identity_ref_of(*s)).collect();
-        let keys: Vec<ciris_crypto::composite::CompositeSigningKey> =
-            HOLDER_SEEDS.iter().map(|s| test_key(*s)).collect();
-        let key_refs: Vec<&ciris_crypto::composite::CompositeSigningKey> = keys.iter().collect();
-        let (root, birth, outcome) =
-            found_e2_root(directory, root_seed, &founders, "quorum:2/3", &key_refs, at).await?;
-        if !matches!(outcome, StatementOutcome::Row { .. }) {
-            return Err(crate::federation::Error::Backend(format!(
-                "stand_up_e2_root({root_seed}): the founding did not land: {outcome:?}"
-            )));
-        }
-        let charter = e2_charter_statement(root_seed, &root, at);
-        crate::federation::edition2::fixture_switch::put_statement(directory, &charter).await?;
-        Ok(E2Root {
-            seed: root_seed.to_owned(),
-            root,
-            founders,
-            birth,
-            charter: crate::federation::edition2::fixture_switch::row_id_of(&charter),
-        })
-    }
-
-    /// `granter`'s `trust:accepts:v1` edge to `root` (scope `infra:serve`),
-    /// stated at `asserted_at_ms`, ending at `valid_until_ms` when given,
-    /// naming the root's held head when the root is a held community
-    /// (CC 3.2 T4a). `granter` is a seed or a kid E0 minted (the node's).
+    /// v62.0.0 (R2-fixture; the Constitution's `trust-accepts` rule) —
+    /// `granter`'s `trust:accepts:v1` edge to the lineage `lineage` (`sub`, the
+    /// bundle's `family_key_id`), attached on the bundle `bundle_hex` (object id,
+    /// stated as a hash digest), stated at `asserted_at_ms`, ending at
+    /// `valid_until_ms` when given. No `scope`, no `refs`. `granter` is a seed or
+    /// a kid E0 minted (the node's). Pure: a bundle this node does not hold is
+    /// the stale-head shape.
     pub fn e2_acceptance_statement(
         granter: &str,
-        root: &str,
-        head: Option<&str>,
+        lineage: &str,
+        bundle_hex: &str,
         asserted_at_ms: u64,
         valid_until_ms: Option<u64>,
     ) -> Vec<u8> {
         use crate::federation::edition2::fixture_switch as e2;
-        use crate::federation::trust_root::{INFRA_SERVE_SCOPE, TRUST_ACCEPTS_DIMENSION};
+        use crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION;
         use ciris_verify_core::cde::Value;
         let iss = e2::kid(granter);
+        let bundle = hex::decode(bundle_hex).expect("operational: a bundle id is hex");
         let mut members = vec![
             ("author", e2_text(&iss)),
             ("asserted_at", Value::Uint(asserted_at_ms)),
             ("dimension", e2_text(TRUST_ACCEPTS_DIMENSION)),
-            ("scope", Value::Array(vec![e2_text(INFRA_SERVE_SCOPE)])),
-        ];
-        if let Some(h) = head {
-            let bytes = hex::decode(h).expect("operational: a held head is hex");
-            members.push((
+            (
                 crate::federation::envelope::paths::ATTACHED_HEAD_DIGEST,
-                Value::Bytes(bytes),
-            ));
-        }
+                Value::Array(vec![Value::Nint(15), Value::Bytes(bundle)]),
+            ),
+        ];
         if let Some(until) = valid_until_ms {
             members.push(("valid_until", Value::Uint(until)));
         }
-        e2_trust_edge(granter, &iss, root, members)
+        e2_trust_edge(granter, &iss, lineage, members)
     }
 
-    /// [`e2_acceptance_statement`] put through the door, naming the head
-    /// this directory holds for `root` (none for a plain key). Its row id.
-    pub async fn accept_e2_root_at(
+    /// v62.0.0 (R2-fixture) — [`e2_acceptance_statement`] of the lineage of the
+    /// bundle in force, attached on its newest tip, put through the door. Its
+    /// row id.
+    ///
+    /// # Errors
+    /// No bundle in force; the door's refusal.
+    pub async fn accept_lineage_e2_at(
         directory: &dyn crate::federation::FederationDirectory,
         granter: &str,
-        root: &str,
         asserted_at_ms: u64,
         valid_until_ms: Option<u64>,
     ) -> Result<crate::federation::edition2::names::RowId, crate::federation::Error> {
-        let head = directory
-            .lookup_community(root)
-            .await?
-            .map(|c| c.persist_row_hash);
+        let in_force = crate::federation::edition2::genesis::genesis_in_force(directory).await?;
+        let none = || crate::federation::Error::Backend("operational: no bundle in force".into());
+        let lineage = in_force.family_key_id().ok_or_else(none)?.to_owned();
+        let tip = in_force
+            .tips()
+            .iter()
+            .max_by_key(|t| t.asserted_at)
+            .ok_or_else(none)?
+            .object_id;
         let st = e2_acceptance_statement(
             granter,
-            root,
-            head.as_deref(),
+            &lineage,
+            &hex::encode(tip),
             asserted_at_ms,
             valid_until_ms,
         );
@@ -2139,49 +1540,15 @@ pub mod test_support {
         Ok(crate::federation::edition2::fixture_switch::row_id_of(&st))
     }
 
-    /// [`accept_e2_root_at`] now, with no end.
-    pub async fn accept_e2_root(
+    /// [`accept_lineage_e2_at`] now, with no end.
+    ///
+    /// # Errors
+    /// As [`accept_lineage_e2_at`].
+    pub async fn accept_lineage_e2(
         directory: &dyn crate::federation::FederationDirectory,
         granter: &str,
-        root: &str,
     ) -> Result<crate::federation::edition2::names::RowId, crate::federation::Error> {
-        accept_e2_root_at(directory, granter, root, e2_now_ms(), None).await
-    }
-
-    /// **A capability delegation from a root** (the twin of [`grant_scope`]):
-    /// `signer_seed`'s `trust:confers:v1` edge `delegates_to(signer →
-    /// subject)` carrying `scope`, then the subject's own second voice
-    /// (Verify's `delegate: sub` rule, CC 2.6.1.9). The subject must already
-    /// hold a live key. Its row id.
-    pub async fn confer_e2(
-        directory: &dyn crate::federation::FederationDirectory,
-        signer_seed: &str,
-        subject_seed: &str,
-        scope: &[&str],
-    ) -> Result<crate::federation::edition2::names::RowId, crate::federation::Error> {
-        use crate::federation::edition2::fixture_switch as e2;
-        use ciris_verify_core::cde::Value;
-        let iss = e2::kid(signer_seed);
-        let grant = e2_trust_edge(
-            signer_seed,
-            &iss,
-            &e2::kid(subject_seed),
-            vec![
-                ("author", e2_text(&iss)),
-                ("asserted_at", Value::Uint(e2_now_ms())),
-                (
-                    "dimension",
-                    e2_text(crate::federation::trust_root::TRUST_CONFERS_DIMENSION),
-                ),
-                (
-                    "scope",
-                    Value::Array(scope.iter().map(|s| e2_text(s)).collect()),
-                ),
-            ],
-        );
-        e2::put_statement(directory, &grant).await?;
-        e2::put_statement(directory, &e2::voice_of(&grant, subject_seed)).await?;
-        Ok(e2::row_id_of(&grant))
+        accept_lineage_e2_at(directory, granter, e2_now_ms(), None).await
     }
 
     /// `granter`'s `withdraws` of its own held trust edge `edge` to `sub`
@@ -2214,82 +1581,6 @@ pub mod test_support {
                  set_node_key_id(e2::put_key(&backend, \"<seed>\", &[\"node\"]).await)"
             )
         })
-    }
-
-    /// **The edition-2 twin of [`establish_trust_root`]** (I3346): the root
-    /// side ([`stand_up_e2_root`]), THIS node's acceptance, and the root's
-    /// `scope` conferral on `subject_seed`'s key (which must hold a live key).
-    /// SELF-ENFORCING postcondition, as #536 asked: it returns `Err` unless
-    /// `capability_roots_to_trusted_root(node, subject, scope)` then roots
-    /// at this root.
-    ///
-    /// The subject is a PERSON's key: the grant carries the subject's voice
-    /// only (`confer_e2`). A `node` / `agent` subject's grant also waits for
-    /// its bound owner's voice (CC 4.4.3.19), which this helper does not
-    /// give; its postcondition then fails, naming the held grant's reason.
-    pub async fn establish_e2_trust_root(
-        directory: &dyn crate::federation::FederationDirectory,
-        root_seed: &str,
-        subject_seed: &str,
-        scope: &str,
-    ) -> Result<E2Root, crate::federation::Error> {
-        use crate::federation::edition2::fixture_switch as e2;
-        let node = directory.node_key_id().ok_or_else(|| {
-            crate::federation::Error::Backend(
-                "establish_e2_trust_root: the directory has no node key (set it first)".into(),
-            )
-        })?;
-        let r = stand_up_e2_root(directory, root_seed).await?;
-        accept_e2_root(directory, &node, &r.root).await?;
-        let grant_row = confer_e2(directory, root_seed, subject_seed, &[scope]).await?;
-        let subject = e2::kid(subject_seed);
-        let grant = crate::federation::trust_root::capability_roots_to_trusted_root(
-            directory,
-            &node,
-            &subject,
-            scope,
-            crate::host::clock::now(),
-        )
-        .await?;
-        match grant {
-            Some(g) if g.root_key_id == r.root => Ok(r),
-            other => {
-                // RT-fix1 — name WHY: a grant the fold holds confers nothing.
-                // The round-6 cluster (grant_supersede, I546) was a NODE
-                // subject: a machine key's bound owner is a required voice
-                // on a delegation to it (CC 4.4.3.19), and this helper voices
-                // the subject only. Such a caller binds the owner and adds
-                // its voice (`grant_supersede_invariants::bodies::
-                // root_conferring_on_a_node`), or confers through
-                // `admission::r2_test_support::confer_scope_from_trusted_root`.
-                let why = crate::federation::edition2::fold::why_held(directory, &grant_row)
-                    .await
-                    .ok()
-                    .flatten();
-                Err(crate::federation::Error::Backend(format!(
-                    "establish_e2_trust_root postcondition NOT met: \
-                     capability_roots_to_trusted_root(node={node}, subject={subject}, \
-                     scope={scope}) = {other:?}, not the root {}; the grant {} is held: {why:?} \
-                     (a `node` / `agent` subject needs its bound owner's voice on the grant, \
-                     CC 4.4.3.19)",
-                    r.root,
-                    grant_row.hex()
-                )))
-            }
-        }
-    }
-
-    /// **The edition-2 twin of [`seed_chartered_family_root`]**: a chartered
-    /// root founded by the bundle's holders ([`stand_up_e2_root`]) and
-    /// `granter`'s acceptance of it (the node's kid, or any seed).
-    pub async fn seed_chartered_e2_root(
-        directory: &dyn crate::federation::FederationDirectory,
-        root_seed: &str,
-        granter: &str,
-    ) -> Result<E2Root, crate::federation::Error> {
-        let r = stand_up_e2_root(directory, root_seed).await?;
-        accept_e2_root(directory, granter, &r.root).await?;
-        Ok(r)
     }
 
     /// v24.0.0 (CIRISPersist#556) — a federation-tier attestation really signed
@@ -2528,405 +1819,7 @@ pub mod test_support {
             .await
     }
 
-    /// v24.0.0 (CIRISPersist#557) — **the threshold trust root, end to end, on
-    /// any backend.** The mesh's root authority is a THRESHOLD, and this body
-    /// is the proof.
-    ///
-    /// v62.0.0 (E9, I3340) — re-pointed at edition 2. The threshold is no
-    /// longer a keyless family whose holders co-scrub a charter: it is an
-    /// `infrastructure` community at the root key's identity-ref, FOUNDED by
-    /// the voices of the holders of the genesis bundle in force (T1's
-    /// `group:roster` door, counted by W1's trust-root door against a strict
-    /// majority of the bundle's holders), chartered by the root's own
-    /// `trust:charter:v1` self-edge, and accepted by THIS node (the asking
-    /// party, CC 4.4.3.34). Each leg keeps its intent:
-    ///
-    /// | # | witness | what it pins |
-    /// |---|---|---|
-    /// | a | one founder's voice alone does not found the root: the voice is KEPT (`Pending`), nothing is held, the chain is not rooted; the other founders' voices complete it | the shortfall is countable, not a silent downgrade |
-    /// | a2 | a voice with a corrupt signature is REFUSED at the door, on a founding roster AND on an ordinary trust edge | a co-signature the verifier does not check is one a writer may forge (#556) |
-    /// | d | the founded, chartered, accepted root is valid on the community arm; a `trust:confers:v1` grant from it roots the subject's `infra:serve` there, plane `Delegation` | the threshold root actually confers |
-    /// | e | the drill is a SIGNAL (none: `Red`, still valid); the halt latch on the root is REPORTED and gates nothing; a resume clears the report only | a halt is an agent pause, not an un-trust (v58.0.0, CC 4.2.1.1) |
-    /// | b1 | one compromised founder cannot amend the root: its lone v2 voice is held short, the head does not move, the root stays valid | the A1-compromise scenario |
-    /// | b2 | that founder's own conferral onto a victim roots to nothing | a seat holds no granting pen of its own |
-    /// | b3 | a founding voiced by a registered NON-holder counts toward nothing: a root founded by one holder and one outsider is not rooted | a quorum cannot be bought outside the bundle |
-    /// | b4 | the count is re-derived from THIS node's state: a later bundle of seven holders makes the three-voice birth short (4 required), the community arm is gone, the root is not valid and confers nothing | a carried `quorum:2/3` cannot talk the threshold down |
-    ///
-    /// Deleted with the earlier form (no edition-2 meaning): the charter's
-    /// `additional_scrubs` storage round-trip and `distinct_scrub_count`
-    /// (#556's column; an edition-2 voice is its own statement), and the
-    /// family `SignerCount` accounting (`signer_count` is `None` on the
-    /// community arm; the count is the chain verdict's, read here through
-    /// `chain_standing_at`).
-    ///
-    /// PRECONDITION (the runner's): `set_node_key_id(e2::put_key(..,
-    /// &["node"]))`.
-    /// DEPENDS ON W1: `trust_root_valid`'s edition-2 arm (W1b update 5: legs
-    /// at the root, the founders' hardware leg) and the ruling that an id
-    /// holding a trust-root community never takes the key arm.
-    pub async fn exercise_family_trust_root(
-        directory: &dyn crate::federation::FederationDirectory,
-        tag: &str,
-    ) -> Result<(), crate::federation::Error> {
-        use crate::federation::canonical_community::{chain_standing_at, StoredStanding};
-        use crate::federation::edition2::fixture_genesis::{self as fg, HOLDER_SEEDS};
-        use crate::federation::edition2::fixture_switch as e2;
-        use crate::federation::edition2::ingest::StatementOutcome;
-        use crate::federation::trust_root::{
-            capability_roots_to_trusted_root, own_chain_to, trust_root_valid, ConferralPlane,
-            DrillFreshness, RootKind, INFRA_SERVE_SCOPE,
-        };
-
-        let node = e2_node(directory, tag);
-        let now = crate::host::clock::now;
-        let holder_refs: Vec<String> = HOLDER_SEEDS
-            .iter()
-            .map(|s| fg::identity_ref_of(*s))
-            .collect();
-        let k1 = fg::test_key(HOLDER_SEEDS[0]);
-        let k2 = fg::test_key(HOLDER_SEEDS[1]);
-        let k3 = fg::test_key(HOLDER_SEEDS[2]);
-
-        // ── (a) RED — one founder cannot found a root ────────────────────
-        // The voice is well-formed, really signed, and names a conformant
-        // record. It is held short for the ONE reason that matters: it is a
-        // seat pretending to be a threshold.
-        let lone_seed = format!("{tag}-lone-root");
-        let at = e2_now_ms();
-        let (lone_root, lone_birth, lone) = found_e2_root(
-            directory,
-            &lone_seed,
-            &holder_refs,
-            "quorum:2/3",
-            &[&k1],
-            at,
-        )
-        .await?;
-        assert!(
-            matches!(lone, StatementOutcome::Pending { row_id, .. } if row_id == lone_birth),
-            "({tag}) (a) one founder's voice is KEPT, short of the count — not refused, \
-             not landed: {lone:?}"
-        );
-        assert!(
-            directory.lookup_community(&lone_root).await?.is_none(),
-            "({tag}) (a) nothing is held at the root while the count is short"
-        );
-        let short = chain_standing_at(directory, &lone_root, now()).await?;
-        assert!(
-            matches!(short, StoredStanding::Absent),
-            "({tag}) (a) a root one founder voiced is not a root: {short:?}"
-        );
-        // …and the shortfall is a COUNT: the other founders' voices over the
-        // same version complete it.
-        let (_, _, completed) = found_e2_root(
-            directory,
-            &lone_seed,
-            &holder_refs,
-            "quorum:2/3",
-            &[&k1, &k2, &k3],
-            at,
-        )
-        .await?;
-        assert!(
-            matches!(completed, StatementOutcome::Row { row_id, .. } if row_id == lone_birth),
-            "({tag}) (a) every founder voicing the same version lands it: {completed:?}"
-        );
-
-        // ── (a2) A CO-SIGNATURE THE VERIFIER DOES NOT CHECK IS ONE A WRITER
-        // MAY FORGE (CIRISPersist#556). A founding voice whose signature is
-        // corrupt is refused at the door, before any count.
-        let forged_seed = format!("{tag}-forged-root");
-        let forged_root = e2::put_key(directory, &forged_seed, &["user"]).await;
-        let founded_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
-            i64::try_from(at - 30_000).expect("an instant"),
-        )
-        .expect("an instant");
-        let forged_record = crate::federation::edition2::group::GroupRecord::Community(
-            e2_root_community(&forged_root, &holder_refs, "quorum:2/3", founded_at),
-        );
-        let mut forged = e2::roster_voices(&forged_record, 1, None, at, &[&k2]).remove(0);
-        // The signature is the last member of the COSE_Sign1 array.
-        *forged.last_mut().expect("a statement has bytes") ^= 0xff;
-        let forged_err = e2::put_statement(directory, &forged)
-            .await
-            .expect_err("(a2) a corrupt voice must be REFUSED at the door");
-        assert!(
-            forged_err.kind() == "federation_malformed_row"
-                && forged_err.to_string().contains("bad_signature"),
-            "({tag}) (a2) every voice is verified, by name: {forged_err}"
-        );
-        // …and on an ORDINARY row, where no count stands behind the verifier:
-        // this node's own acceptance edge with one byte of its signature
-        // flipped.
-        let mut plain = e2_acceptance_statement(&node, &lone_root, None, e2_now_ms(), None);
-        *plain.last_mut().expect("a statement has bytes") ^= 0xff;
-        let plain_err = e2::put_statement(directory, &plain)
-            .await
-            .expect_err("(a2) a corrupt signature is refused on ANY row");
-        assert!(
-            plain_err.kind() == "federation_malformed_row"
-                && plain_err.to_string().contains("bad_signature"),
-            "({tag}) (a2) the door's verifier, not a downstream gate, covers every voice: \
-             {plain_err}"
-        );
-
-        // ── (d) GREEN — the threshold root, founded, chartered, accepted ───
-        // (KR-fix2: its grant below is signed by the root's OWN KEY, a KEYED
-        // root's conferral. The federation root's counted grant, over the
-        // bundle's holders, is `edition2::root_grant_invariants`.)
-        let r = e2::rooted_trust_root(directory, &HOLDER_SEEDS, "quorum:2/3").await;
-        match chain_standing_at(directory, &r.root, now()).await? {
-            StoredStanding::Rooted(held) => {
-                let mut held_founders: Vec<String> = held
-                    .community
-                    .members
-                    .iter()
-                    .map(|m| m.key_id.clone())
-                    .collect();
-                held_founders.sort();
-                let mut want = r.founders.clone();
-                want.sort();
-                assert_eq!(
-                    held_founders, want,
-                    "({tag}) (d) the root's founders are the bundle's holders"
-                );
-            }
-            other => panic!("({tag}) (d) the founded root's chain is rooted: {other:?}"),
-        }
-        let own = own_chain_to(directory, &r.root, now()).await?;
-        assert!(
-            own.accepted && own.chartered,
-            "({tag}) (d) THIS node's own chain: accepted and chartered: {own:?}"
-        );
-        let verdict =
-            trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
-        assert!(
-            verdict.valid && verdict.root_kind == RootKind::Key,
-            "({tag}) (d) KB-fix1: the room is no root; the key at its id, chartered by its \
-             own self-edge and accepted by the node, is a valid KEYED root: {verdict:?}"
-        );
-        let subject_seed = format!("{tag}-subject");
-        let grant_id = crate::federation::edition2::fixture_trust_root::put_conferral(
-            directory,
-            &r,
-            &subject_seed,
-            &[INFRA_SERVE_SCOPE],
-        )
-        .await?;
-        let subject = e2::kid(&subject_seed);
-        let grant = capability_roots_to_trusted_root(
-            directory,
-            &node,
-            &subject,
-            INFRA_SERVE_SCOPE,
-            crate::host::clock::now(),
-        )
-        .await?
-        .unwrap_or_else(|| {
-            panic!(
-                "({tag}) (d) the subject's {INFRA_SERVE_SCOPE} must root to the threshold \
-                     root that conferred it"
-            )
-        });
-        assert_eq!(
-            grant.root_key_id, r.root,
-            "({tag}) (d) the winning root is the THRESHOLD root"
-        );
-        assert_eq!(
-            grant.grant_attestation_id,
-            grant_id.hex(),
-            "({tag}) (d) …through the conferral it holds"
-        );
-        assert_eq!(
-            grant.conferral_plane,
-            ConferralPlane::Delegation,
-            "({tag}) (d) the plane is NAMED — one field with two silent value spaces is the \
-             class this substrate keeps re-learning"
-        );
-
-        // ── (e) the drill is a signal; the HALT LATCH is reported, not a gate ─
-        assert!(
-            verdict.last_drill_at.is_none()
-                && verdict.drill_freshness == DrillFreshness::Red
-                && verdict.valid,
-            "({tag}) (e) an undrilled root reads Red and still serves — the drill is a \
-             signal, never a gate (v23.0.0): {verdict:?}"
-        );
-        // v58.0.0 (CIRISPersist#1094; CC 3.2 T3/T8 + 4.2.1.1) — a halt latches
-        // on the root the verdict reads its legs at, is REPORTED, and moves
-        // no trust state.
-        let halt_id = format!("{tag}-halt-1");
-        let before = trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
-        directory.set_active_halt(&r.root, &halt_id, None).await?;
-        let halted = trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
-        assert!(
-            halted.halt_latched == Some(true),
-            "({tag}) (e) the halt latch is REPORTED on the root's verdict: {halted:?}"
-        );
-        assert!(
-            halted.valid && halted.bounded_until == before.bounded_until,
-            "({tag}) (e) …and it is NOT a leg: the verdict holds under the latch exactly as \
-             before it: before={before:?} halted={halted:?}"
-        );
-        assert!(
-            capability_roots_to_trusted_root(
-                directory,
-                &node,
-                &subject,
-                INFRA_SERVE_SCOPE,
-                crate::host::clock::now()
-            )
-            .await?
-            .is_some(),
-            "({tag}) (e) …and the capability walk agrees — a halted root still confers"
-        );
-        directory.clear_active_halt(&r.root, &halt_id).await?;
-        let resumed =
-            trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
-        assert!(
-            resumed.valid && resumed.halt_latched == Some(false),
-            "({tag}) (e) a resume clears the REPORT and changes nothing else: {resumed:?}"
-        );
-
-        // ── (b) THE A1-COMPROMISE SCENARIO ───────────────────────────────
-        // Assume founder 0's seat is fully owned by an attacker: a real key,
-        // genuinely a holder and a founder, able to sign anything it likes.
-        //
-        // (b1) it cannot AMEND the root alone: a v2 of the root's roster
-        // voiced by it alone is held short, and the head does not move.
-        let head_before = e2::held_head(directory, &r.root).await;
-        assert_eq!(
-            head_before,
-            Some((r.birth, 1)),
-            "({tag}) (b1) the root's head is its founding version"
-        );
-        let mut seized = directory
-            .lookup_community(&r.root)
-            .await?
-            .expect("(b1) the root is held");
-        seized.community_name = format!("{tag} seized by one seat");
-        seized.persist_row_hash = String::new();
-        seized.prev_head_digest = String::new();
-        let seize = e2::roster_voices(
-            &crate::federation::edition2::group::GroupRecord::Community(seized),
-            2,
-            Some(&r.birth),
-            e2_now_ms(),
-            &[&r.founder_key(0)],
-        );
-        let seize_outcome = e2::put_voices(directory, &seize).await;
-        assert!(
-            !matches!(seize_outcome, Ok(StatementOutcome::Row { .. })),
-            "({tag}) (b1) one compromised founder must not amend the threshold root: \
-             {seize_outcome:?}"
-        );
-        assert_eq!(
-            e2::held_head(directory, &r.root).await,
-            Some((r.birth, 1)),
-            "({tag}) (b1) …the head did not move"
-        );
-        assert!(
-            trust_root_valid(directory, &node, &r.root, crate::host::clock::now())
-                .await?
-                .valid,
-            "({tag}) (b1) …and the root still stands"
-        );
-
-        // (b2) it cannot RE-GRANT under the root's name: its own conferral
-        // onto a fresh subject (with the subject's second voice) roots to
-        // nothing, because a holder is not a root this node trusts.
-        let victim_seed = format!("{tag}-victim");
-        let victim = e2::put_key(directory, &victim_seed, &["user"]).await;
-        let lone_grant = e2_trust_edge_by_key(
-            &r.founder_key(0),
-            &r.founders[0],
-            &victim,
-            &[INFRA_SERVE_SCOPE],
-        );
-        e2::put_statement(directory, &lone_grant).await?;
-        e2::put_statement(directory, &e2::voice_of(&lone_grant, &victim_seed)).await?;
-        assert!(
-            capability_roots_to_trusted_root(
-                directory,
-                &node,
-                &victim,
-                INFRA_SERVE_SCOPE,
-                crate::host::clock::now()
-            )
-            .await?
-            .is_none(),
-            "({tag}) (b2) a conferral carrying ONE seat's signature roots to nothing — the \
-             grant is held, and it grants nothing"
-        );
-
-        // (b3) it cannot buy a quorum OUTSIDE the bundle: a root founded by
-        // one holder and a registered outsider (both listed, both voicing) is
-        // one holder short of the bundle's strict majority.
-        let outsider_seed = format!("{tag}-outsider");
-        let outsider = e2::put_key(directory, &outsider_seed, &["user"]).await;
-        let outsider_key = e2::signing_key(&outsider_seed);
-        let bought_seed = format!("{tag}-bought-root");
-        let bought = found_e2_root(
-            directory,
-            &bought_seed,
-            &[holder_refs[0].clone(), outsider.clone()],
-            "quorum:1/2",
-            &[&k1, &outsider_key],
-            e2_now_ms(),
-        )
-        .await;
-        let bought_root = e2::kid(&bought_seed);
-        let bought_standing = chain_standing_at(directory, &bought_root, now()).await?;
-        assert!(
-            !matches!(
-                bought_standing,
-                StoredStanding::Rooted(_) | StoredStanding::Stalled { .. }
-            ),
-            "({tag}) (b3) the outsider's voice verifies and still counts for nothing: \
-             outcome={bought:?} standing={bought_standing:?}"
-        );
-
-        // (b4) THE COUNT IS RE-DERIVED FROM THIS NODE'S OWN STATE, and it
-        // cannot be talked down. A later bundle seats seven holders. The root
-        // still SAYS `quorum:2/3` and its birth carries three voices; a strict
-        // majority of the bundle now in force is four, so the birth is short —
-        // with no write to the root, and nothing revoked.
-        let later = fg::later_v2(
-            fg::bundle_v2(),
-            &[1, 2, 3, 4, 5, 6, 7],
-            &fg::SERVE_NODE_SEEDS,
-            &[1, 2, 3, 4, 5, 6, 7],
-        );
-        fg::install_ceremony_v2(directory, &later).await?;
-        let regrown = chain_standing_at(directory, &r.root, now()).await?;
-        assert!(
-            !matches!(regrown, StoredStanding::Rooted(_)),
-            "({tag}) (b4) three of seven holders is not a strict majority of the bundle in \
-             force, so the root's chain no longer roots — re-derived, not frozen at \
-             admission: {regrown:?}"
-        );
-        let after = trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
-        assert!(
-            !after.valid && after.root_kind == RootKind::Community && after.not_rooted.is_some(),
-            "({tag}) (b4) the carried consensus_protocol still says quorum:2/3 and the node \
-             requires 4 anyway — the root is judged on the community arm, NOT ROOTED (named), \
-             and never falls back to its key (the ruling): {after:?}"
-        );
-        assert!(
-            capability_roots_to_trusted_root(
-                directory,
-                &node,
-                &subject,
-                INFRA_SERVE_SCOPE,
-                crate::host::clock::now()
-            )
-            .await?
-            .is_none(),
-            "({tag}) (b4) …and the capability walk agrees — an un-rooted threshold confers \
-             nothing"
-        );
-        Ok(())
-    }
+    // LEAD-root1 (CC 3.2 T5) — `exercise_family_trust_root` DELETED: it witnessed the root COMMUNITY (a threshold root founded as an infrastructure community, chartered by a self-edge). The root is the bundle's lineage; its threshold is the bundle's count (genesis_invariants; root_grant_invariants I4200–I4214).
 
     /// A `trust:confers:v1` grant `delegates_to(iss → subject)` signed by
     /// `key` as `iss` (a bundle holder's placed key, which no E0 seed names).
@@ -2962,212 +1855,19 @@ pub mod test_support {
         .expect("operational: sign a holder's grant")
     }
 
-    /// v21.17.0 (CIRISPersist#536 follow-up) — the REAL engine-backed user
-    /// path, and the HONEST CONTRACT.
-    ///
-    /// v62.0.0 (E9, I3341) — re-pointed at edition 2, where the real user IS
-    /// this node: its acceptance edge is a statement its OWN key signs, and
-    /// no helper can sign it for it. The two properties stand:
-    /// - **(A) no lying**: the root side alone ([`stand_up_e2_root`]: founded,
-    ///   chartered) does NOT make the root valid for the node — the missing
-    ///   leg is the node's EDGE, a hard gate — and an edge that claims the
-    ///   node's `iss` but is signed by another key is REFUSED at the door
-    ///   (the key-of-issuer check, `kid_not_of_iss`): the edition-2 form of
-    ///   "the synthetic edge is skipped, never forged".
-    /// - **(B) the real-user flow works**: the node signs its own acceptance,
-    ///   and then `trust_root_valid` and the capability walk go green.
-    ///
-    /// Deleted with the earlier form: the deterministic-vs-real signing-key
-    /// mismatch (`register_hybrid_key_aliased`); every edition-2 key signs as
-    /// itself. PRECONDITION: the runner sets the node key.
-    /// DEPENDS ON W1: `trust_root_valid`'s edition-2 arm (W1b update 5: legs
-    /// at the root, the founders' hardware leg) and the ruling that an id
-    /// holding a trust-root community never takes the key arm.
-    pub async fn exercise_trust_root_real_user(
-        directory: &dyn crate::federation::FederationDirectory,
-        tag: &str,
-    ) {
-        use crate::federation::edition2::fixture_switch as e2;
-        use crate::federation::trust_root::{
-            capability_roots_to_trusted_root, trust_root_valid, DrillFreshness, RootKind,
-            INFRA_SERVE_SCOPE,
-        };
+    // v62.0.0 (R2-fixture; CC 3.2 T5, "the root is the bundle's lineage") —
+    // `exercise_trust_root_real_user`
+    // DELETED (lead's ruling): it witnessed a KEYED root. On the bundle path its two
+    // properties are I2400 (before the node's edge the root is not valid) and
+    // I2416/I2464 (the node, or its owner, signs its own acceptance and reads
+    // rooted). GAP: a forged acceptance in the node's name (`kid_not_of_iss`) has no
+    // acceptance-specific witness; the door's key-of-issuer check is witnessed
+    // generically (`edition2::door`, `key_chain_invariants`).
 
-        let node = e2_node(directory, tag);
-        let subject_seed = format!("{tag}-subject");
-        let subject = e2::put_key(directory, &subject_seed, &["user"]).await;
-
-        // ── (A) HONEST FAILURE — the root side is up, the node's edge is not.
-        let root_seed = format!("{tag}-rootA");
-        let a = stand_up_e2_root(directory, &root_seed)
-            .await
-            .expect("({tag}) the root side stands up");
-        confer_e2(directory, &root_seed, &subject_seed, &[INFRA_SERVE_SCOPE])
-            .await
-            .expect("({tag}) the root confers on the subject");
-        let va = trust_root_valid(directory, &node, &a.root, crate::host::clock::now())
-            .await
-            .expect("walk A");
-        assert!(
-            !va.valid
-                && !va.edge_exists
-                && va.root_self_declares
-                && va.charter_has_recovery
-                && va.drill_freshness == DrillFreshness::Red,
-            "({tag}) root side up, not yet valid without the node's edge — the missing leg is \
-             the EDGE, a hard gate; the drill would not have gated either way: {va:?}"
-        );
-        assert!(
-            capability_roots_to_trusted_root(
-                directory,
-                &node,
-                &subject,
-                INFRA_SERVE_SCOPE,
-                crate::host::clock::now()
-            )
-            .await
-            .expect("cap walk A")
-            .is_none(),
-            "({tag}) a conferral from a root the node never accepted roots to nothing"
-        );
-        // A forged edge: the node's `iss`, signed by another key.
-        let forger = format!("{tag}-forger");
-        e2::put_key(directory, &forger, &["user"]).await;
-        let head = directory
-            .lookup_community(&a.root)
-            .await
-            .expect("lookup")
-            .map(|c| c.persist_row_hash);
-        let honest = e2_acceptance_statement(&node, &a.root, head.as_deref(), e2_now_ms(), None);
-        let forged = {
-            let (_, payload) = crate::federation::edition2::liveness::statement_parts(&honest)
-                .expect("an edge is a statement");
-            ciris_verify_core::edition2::sign_row_statement(
-                &e2::signing_key(&forger),
-                &node,
-                &a.root,
-                crate::federation::types::attestation_type::DELEGATES_TO,
-                &ciris_verify_core::namespace_match::family_id(
-                    crate::federation::edition2::typed::TRUST_PREFIX,
-                ),
-                &payload,
-                vec![],
-            )
-            .expect("sign the forged edge")
-        };
-        let err = e2::put_statement(directory, &forged)
-            .await
-            .expect_err("({tag}) an edge in the node's name signed by another key is refused");
-        assert!(
-            matches!(
-                &err,
-                crate::federation::Error::MalformedRow { reason, .. }
-                    if *reason == crate::federation::malformed_row::KID_NOT_OF_ISS
-            ),
-            "({tag}) the refusal is the key-of-issuer check (kid_not_of_iss): {err:?}"
-        );
-        let va2 = trust_root_valid(directory, &node, &a.root, crate::host::clock::now())
-            .await
-            .expect("walk A2");
-        assert!(
-            !va2.edge_exists && !va2.valid,
-            "({tag}) a refused forgery leaves the node's trust untouched: {va2:?}"
-        );
-
-        // ── (B) THE REAL-USER FLOW — the node signs its own acceptance.
-        e2::put_statement(directory, &honest)
-            .await
-            .expect("({tag}) the node's own-signed edge admits");
-        let vb = trust_root_valid(directory, &node, &a.root, crate::host::clock::now())
-            .await
-            .expect("walk B");
-        assert!(
-            // KB-fix1: a keyed root at a room's id (the room is no root).
-            vb.valid && vb.edge_exists && vb.root_kind == RootKind::Key,
-            "({tag}) valid once the node emits its own edge: {vb:?}"
-        );
-        let grant = capability_roots_to_trusted_root(
-            directory,
-            &node,
-            &subject,
-            INFRA_SERVE_SCOPE,
-            crate::host::clock::now(),
-        )
-        .await
-        .expect("cap walk B")
-        .unwrap_or_else(|| {
-            panic!("({tag}) the subject's infra:serve roots to the root the node accepted")
-        });
-        assert_eq!(grant.root_key_id, a.root);
-
-        // The twin of `establish_trust_root` keeps #536's self-enforcing
-        // postcondition: it returns only once the walk it promises holds.
-        let est_subject = format!("{tag}-est-subject");
-        e2::put_key(directory, &est_subject, &["user"]).await;
-        let est = establish_e2_trust_root(
-            directory,
-            &format!("{tag}-rootB"),
-            &est_subject,
-            INFRA_SERVE_SCOPE,
-        )
-        .await
-        .expect("({tag}) establish_e2_trust_root stands up a root the walk reaches");
-        assert!(
-            capability_roots_to_trusted_root(
-                directory,
-                &node,
-                &e2::kid(&est_subject),
-                INFRA_SERVE_SCOPE,
-                crate::host::clock::now()
-            )
-            .await
-            .expect("cap walk est")
-            .is_some_and(|g| g.root_key_id == est.root),
-            "({tag}) the helper's postcondition is the walk itself"
-        );
-    }
-
-    /// v24.1.0 (CIRISPersist#561) — emit a live `delegates_to(from → root)`
-    /// `trust:accepts:v1` edge, really signed by `from`, optionally expiring.
-    ///
-    /// The un-trust lever and the TTL contributor in one row: this is the edge
-    /// a withdrawal tombstones and the edge whose `expires_at` bounds the
-    /// cached verdict.
-    pub async fn emit_trust_edge(
-        directory: &dyn crate::federation::FederationDirectory,
-        from: &str,
-        root: &str,
-        expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<String, crate::federation::Error> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let mut edge = signed_trust_attestation(
-            &id,
-            from,
-            root,
-            crate::federation::types::attestation_type::DELEGATES_TO,
-            naming_the_attach_head(
-                directory,
-                root,
-                json!({
-                    "references_attestation_id": id,
-                    "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
-                    "scope": [crate::federation::trust_root::INFRA_SERVE_SCOPE],
-                }),
-            )
-            .await,
-        );
-        edge.expires_at = expires_at;
-        // v31.0.0 (CIRISPersist#598) — `expires_at` is bound in BOTH
-        // directions, so setting the COLUMN after the seal is exactly the
-        // divergence the gate refuses. Re-seal: this helper's whole subject is
-        // the TTL min-fold, and an edge whose expiry the signature does not
-        // cover is an unsigned mute button on the bound it is testing.
-        crate::federation::tier_ingest::test_support::reseal(&mut edge);
-        directory
-            .put_attestation(crate::federation::SignedAttestation { attestation: edge })
-            .await?;
-        Ok(id)
-    }
+    // v62.0.0 (R2-fixture; CC 3.2 T5, "the root is the bundle's lineage") —
+    // `emit_trust_edge` (an earlier-form
+    // JSON acceptance to a KEYED root) DELETED; I549 states the bundle acceptance
+    // (`fixture_trust_root::bundle_acceptance_statement`).
 
     /// v24.1.0 (CIRISPersist#561) — tombstone `attestation_id` with a
     /// `withdraws` composer authored by `attester` (the CEG un-trust act).
@@ -3288,7 +1988,7 @@ pub mod test_support {
         // The shared root: founded by the bundle's holders, chartered, and
         // accepted by THIS node (the fixture), plus the peer's own edge.
         let r = e2::rooted_trust_root(directory, &HOLDER_SEEDS, "quorum:2/3").await;
-        let peer_edge = accept_e2_root(directory, &peer_seed, &r.root).await?;
+        let peer_edge = accept_lineage_e2(directory, &peer_seed).await?;
 
         // ── (c) GREEN — all four legs.
         let ok = resolve_transit_eligibility(directory, &node, &peer).await?;
@@ -3298,7 +1998,7 @@ pub mod test_support {
         );
         assert_eq!(
             ok.via_root.as_deref(),
-            Some(r.root.as_str()),
+            Some(r.lineage.as_str()),
             "({tag}) (c) via_root NAMES the shared root — the caller's cache key"
         );
         let peer_end = directory
@@ -3319,7 +2019,9 @@ pub mod test_support {
         // shared root changes NOTHING here. Transit is a data door; a halt is
         // an agent pause.
         let halt_id = format!("{tag}-halt");
-        directory.set_active_halt(&r.root, &halt_id, None).await?;
+        directory
+            .set_active_halt(&r.lineage, &halt_id, None)
+            .await?;
         let under_halt = resolve_transit_eligibility(directory, &node, &peer).await?;
         assert_eq!(
             under_halt, ok,
@@ -3327,7 +2029,7 @@ pub mod test_support {
              eligibility UNCHANGED — a relay that closed here would be the breaker \
              CC 4.2.1.1 names"
         );
-        directory.clear_active_halt(&r.root, &halt_id).await?;
+        directory.clear_active_halt(&r.lineage, &halt_id).await?;
 
         // ── (g) the `_over_roster` arm. Driven with the bundle's holders, and
         // it must agree with the default arm exactly.
@@ -3350,12 +2052,11 @@ pub mod test_support {
         let near = crate::host::clock::now() + chrono::Duration::hours(2);
         let far = crate::host::clock::now() + chrono::Duration::hours(9);
         let ms = e2::ms;
-        withdraw_e2(directory, &peer_seed, &r.root, &peer_edge).await?;
-        withdraw_e2(directory, &node, &r.root, &r.acceptance).await?;
+        withdraw_e2(directory, &peer_seed, &r.lineage, &peer_edge).await?;
+        withdraw_e2(directory, &node, &r.lineage, &r.acceptance).await?;
         let peer_far =
-            accept_e2_root_at(directory, &peer_seed, &r.root, e2_now_ms(), Some(ms(far))).await?;
-        let user_near =
-            accept_e2_root_at(directory, &node, &r.root, e2_now_ms(), Some(ms(near))).await?;
+            accept_lineage_e2_at(directory, &peer_seed, e2_now_ms(), Some(ms(far))).await?;
+        let user_near = accept_lineage_e2_at(directory, &node, e2_now_ms(), Some(ms(near))).await?;
 
         // OUR side is the earlier one.
         let bounded = resolve_transit_eligibility(directory, &node, &peer).await?;
@@ -3370,11 +2071,10 @@ pub mod test_support {
         );
 
         // THEIR side is the earlier one — same rule, other direction.
-        withdraw_e2(directory, &peer_seed, &r.root, &peer_far).await?;
-        withdraw_e2(directory, &node, &r.root, &user_near).await?;
-        accept_e2_root_at(directory, &peer_seed, &r.root, e2_now_ms(), Some(ms(near))).await?;
-        let user_far =
-            accept_e2_root_at(directory, &node, &r.root, e2_now_ms(), Some(ms(far))).await?;
+        withdraw_e2(directory, &peer_seed, &r.lineage, &peer_far).await?;
+        withdraw_e2(directory, &node, &r.lineage, &user_near).await?;
+        accept_lineage_e2_at(directory, &peer_seed, e2_now_ms(), Some(ms(near))).await?;
+        let user_far = accept_lineage_e2_at(directory, &node, e2_now_ms(), Some(ms(far))).await?;
         let flipped = resolve_transit_eligibility(directory, &node, &peer).await?;
         let flipped_ttl = flipped
             .valid_until
@@ -3412,7 +2112,21 @@ pub mod test_support {
         );
         for i in 0..50 {
             let bogus = e2::put_key(directory, &format!("{tag}-bogus{i}"), &["user"]).await;
-            accept_e2_root(directory, &flooded_seed, &bogus).await?;
+            // v62.0.0 (R2-fixture) — a hostile peer's edge to a key it chose:
+            // the shape the candidate bound exists against (no lineage, no
+            // bundle named).
+            e2::put_statement(
+                directory,
+                &e2::trust_accepts_statement(
+                    &flooded_seed,
+                    &bogus,
+                    &[],
+                    None,
+                    crate::federation::types::cohort_scope::FEDERATION,
+                    e2_now_ms(),
+                ),
+            )
+            .await?;
         }
         let (after_verdict, walked_after) =
             crate::federation::trust_root::resolve_transit_eligibility_counting_roots(
@@ -3433,7 +2147,7 @@ pub mod test_support {
         let after_flood = resolve_transit_eligibility(directory, &node, &peer).await?;
         assert_eq!(
             after_flood.via_root.as_deref(),
-            Some(r.root.as_str()),
+            Some(r.lineage.as_str()),
             "({tag}) (e) the real peer still roots through OUR root, not one of theirs"
         );
 
@@ -3460,7 +2174,7 @@ pub mod test_support {
             ],
         )
         .await;
-        accept_e2_root(directory, &agent_seed, &r.root).await?;
+        accept_lineage_e2(directory, &agent_seed).await?;
         let not_a_node = resolve_transit_eligibility(directory, &node, &agent).await?;
         assert!(
             !not_a_node.eligible,
@@ -3471,7 +2185,7 @@ pub mod test_support {
         // (d/C) a NODE, validly sharing our root, that never offered transport.
         let quiet_seed = format!("{tag}-quiet");
         let quiet = e2::put_key(directory, &quiet_seed, &["node"]).await;
-        accept_e2_root(directory, &quiet_seed, &r.root).await?;
+        accept_lineage_e2(directory, &quiet_seed).await?;
         let no_offer = resolve_transit_eligibility(directory, &node, &quiet).await?;
         assert!(
             !no_offer.eligible,
@@ -3491,7 +2205,7 @@ pub mod test_support {
         // ── (f) WITHDRAWAL — the invalidation contract's substrate half.
         // Withdraw the node's ONE live edge and the very next resolution reads
         // false: the `withdraws` IS the mechanism.
-        withdraw_e2(directory, &node, &r.root, &user_far).await?;
+        withdraw_e2(directory, &node, &r.lineage, &user_far).await?;
         let after_withdrawal = resolve_transit_eligibility(directory, &node, &peer).await?;
         assert!(
             !after_withdrawal.eligible,
@@ -3506,25 +2220,17 @@ pub mod test_support {
         // ── (e2) EXPIRY IS HONORED without any withdrawal: an edge whose
         // `valid_until` has PASSED is as dead to the walk as a withdrawn one
         // (#488 delta 3). The edge's window is in the past but well-formed
-        // (`valid_until` after `asserted_at`, K1).
-        // The stale root is founded twenty minutes back, so the node's edge to
-        // it post-dates the head it names.
+        // (`valid_until` after `asserted_at`, K1). v62.0.0 (R2-fixture): one
+        // root, the bundle's lineage; the node's only edge to it (after (f)) is
+        // this expired one, and the peer's own edge (ending `near`) is live.
         let now = crate::host::clock::now();
-        let stale = stand_up_e2_root_at(
-            directory,
-            &format!("{tag}-stale-root"),
-            ms(now - chrono::Duration::minutes(20)),
-        )
-        .await?;
-        accept_e2_root_at(
+        accept_lineage_e2_at(
             directory,
             &node,
-            &stale.root,
             ms(now - chrono::Duration::minutes(10)),
             Some(ms(now - chrono::Duration::minutes(5))),
         )
         .await?;
-        accept_e2_root(directory, &peer_seed, &stale.root).await?;
         let expired = resolve_transit_eligibility(directory, &node, &peer).await?;
         assert!(
             !expired.eligible,
@@ -3534,212 +2240,13 @@ pub mod test_support {
         Ok(())
     }
 
-    /// **CIRISPersist#686 — a foreign, unentitled `withdraws` against a trust
-    /// root's CHARTER.** Lifted from the #686 evidence thread (comment
-    /// 5312289784).
-    ///
-    /// v62.0.0 (E9, I3344) — re-pointed at edition 2. The charter is the
-    /// root's own `trust:charter:v1` self-edge; the attacker is a registered,
-    /// well-formed key with no seat, no authorship of the charter and no
-    /// standing over it. Nothing about it is malformed — only unentitled.
-    ///
-    /// Three legs, as before:
-    /// - CONTROL — the rooted root is valid on the community arm.
-    /// - LEG A (in order) — the charter is held; the foreign `withdraws` of it
-    ///   is REFUSED at the write door, and the root stays valid.
-    /// - LEG B (out of order) — the foreign `withdraws` names a charter row id
-    ///   computed before the charter lands. Edition 2 closes the deferred
-    ///   window at the door: a composer whose target is not held is refused
-    ///   `WithdrawsTargetUnheld` (CC 2.4.1.1, `ingest::check_composer_target`),
-    ///   so the retraction can never sit in wait for its target. The charter
-    ///   then lands and the root must be valid.
-    ///
-    /// PRECONDITION: the runner sets the node key.
-    /// DEPENDS ON W1: `trust_root_valid`'s edition-2 arm (W1b update 5: legs
-    /// at the root, the founders' hardware leg) and the ruling that an id
-    /// holding a trust-root community never takes the key arm.
-    pub async fn exercise_foreign_retraction_cannot_sever_charter(
-        directory: &dyn crate::federation::FederationDirectory,
-        tag: &str,
-    ) -> Result<(), crate::federation::Error> {
-        use crate::federation::edition2::fixture_genesis::HOLDER_SEEDS;
-        use crate::federation::edition2::fixture_switch as e2;
-        use crate::federation::trust_root::{trust_root_valid, RootKind};
+    // LEAD-root1 (CC 3.2 T5) — `exercise_foreign_retraction_cannot_sever_charter` DELETED: no row is a charter. A foreign withdrawal of a root grant or of an acceptance is root_grant_invariants I4219 / peer_rooting I2223.
 
-        let node = e2_node(directory, tag);
-        let foreign_seed = format!("{tag}-foreign");
-        e2::put_key(directory, &foreign_seed, &["node"]).await;
-
-        // ── CONTROL — a chartered threshold root, untouched. ─────────────
-        let ctl = e2::rooted_trust_root(directory, &HOLDER_SEEDS, "quorum:2/3").await;
-        let v = trust_root_valid(directory, &node, &ctl.root, crate::host::clock::now()).await?;
-        assert_eq!(
-            v.root_kind,
-            RootKind::Key,
-            "({tag}) CONTROL (KB-fix1): the key arm, whose charter leg reads the root's own \
-             self-edge (the room at its id is no root): {v:?}"
-        );
-        assert!(
-            v.valid,
-            "({tag}) CONTROL: the chartered root must be valid before any attack, or the \
-             legs below prove nothing: {v:?}"
-        );
-
-        // ── LEG A — IN ORDER. The charter is held. The door refuses the
-        //    unentitled `withdraws`, or (CC 2.7 hold-and-conclude, G-wave)
-        //    holds it concluding nothing; either way it must not sever the
-        //    charter. The outcome is reported, not pinned.
-        let inorder =
-            e2::trust_withdraws_statement(&foreign_seed, &ctl.root, &ctl.charter, e2_now_ms());
-        let leg_a = e2::put_statement(directory, &inorder).await;
-        assert!(
-            !matches!(
-                leg_a,
-                Err(crate::federation::Error::Backend(_)
-                    | crate::federation::Error::Unsupported { .. })
-            ),
-            "({tag}) LEG A: a store failure is not an entitlement answer: {leg_a:?}"
-        );
-        let after_a =
-            trust_root_valid(directory, &node, &ctl.root, crate::host::clock::now()).await?;
-        assert!(
-            after_a.valid,
-            "({tag}) LEG A: an unentitled withdraws ({leg_a:?}) must leave the charter standing: {after_a:?}"
-        );
-
-        // ── LEG B — OUT OF ORDER. ─────────────────────────────────────────
-        // A second root, founded but not yet chartered; its charter's row id
-        // is known before the charter exists.
-        let atk_seed = format!("{tag}-atk-root");
-        let founders: Vec<String> = HOLDER_SEEDS
-            .iter()
-            .map(|s| crate::federation::edition2::fixture_genesis::identity_ref_of(*s))
-            .collect();
-        let keys: Vec<ciris_crypto::composite::CompositeSigningKey> = HOLDER_SEEDS
-            .iter()
-            .map(|s| crate::federation::edition2::fixture_genesis::test_key(*s))
-            .collect();
-        let key_refs: Vec<&ciris_crypto::composite::CompositeSigningKey> = keys.iter().collect();
-        let at = e2_now_ms();
-        let (atk_root, _, _) =
-            found_e2_root(directory, &atk_seed, &founders, "quorum:2/3", &key_refs, at).await?;
-        let atk_charter = e2_charter_statement(&atk_seed, &atk_root, at);
-        let atk_charter_id = e2::row_id_of(&atk_charter);
-
-        // The retraction arrives FIRST, naming a charter that is not held.
-        let early =
-            e2::trust_withdraws_statement(&foreign_seed, &atk_root, &atk_charter_id, e2_now_ms());
-        // Today the door refuses a composer whose target is not held
-        // (`WithdrawsTargetUnheld`, retryable: the deferred window is closed).
-        // Under CC 2.7 hold-and-conclude it may instead be held, concluding
-        // nothing; the property below is what #686 protects either way.
-        let leg_b = e2::put_statement(directory, &early).await;
-        assert!(
-            matches!(
-                leg_b,
-                Err(crate::federation::Error::WithdrawsTargetUnheld { .. }) | Ok(_)
-            ),
-            "({tag}) LEG B: refused as unheld-target, or held: {leg_b:?}"
-        );
-
-        // NOW the charter arrives, and the node accepts the root.
-        e2::put_statement(directory, &atk_charter).await?;
-        accept_e2_root(directory, &node, &atk_root).await?;
-        let after_b =
-            trust_root_valid(directory, &node, &atk_root, crate::host::clock::now()).await?;
-        assert!(
-            after_b.valid,
-            "({tag}) #686: a `withdraws` from `{foreign_seed}` — no seat, not the charter's \
-             author, carrying no standing — that arrived BEFORE its target must not have \
-             severed the charter: {after_b:?}"
-        );
-        Ok(())
-    }
-
-    /// **CIRISPersist#561 — a shared THRESHOLD root satisfies (D) too.**
-    ///
-    /// The v24.0.0 finding was that the mesh's root authority is a THRESHOLD,
-    /// not a seat, and the transport gate inherits that for free: conjunct
-    /// (D) is `trust_root_valid` on both sides, and that predicate chooses its
-    /// own arm from the node's stored state.
-    ///
-    /// v62.0.0 (E9, I3343) — re-pointed at edition 2: the threshold is the
-    /// founded `infrastructure` community (W1b's root, the bundle's holders
-    /// voicing its birth), read on the community arm. Kept as its own body:
-    /// the point is that NOTHING in the transit walk is arm-aware. Then the
-    /// threshold is re-derived on the next call: a later bundle of seven
-    /// holders makes the three-voice birth short, the community arm goes,
-    /// and the hop goes with it — with nothing written on the transit plane.
-    /// PRECONDITION: the runner sets the node key.
-    /// DEPENDS ON W1: `trust_root_valid`'s edition-2 arm (W1b update 5: legs
-    /// at the root, the founders' hardware leg) and the ruling that an id
-    /// holding a trust-root community never takes the key arm.
-    pub async fn exercise_transit_eligibility_family_root(
-        directory: &dyn crate::federation::FederationDirectory,
-        tag: &str,
-    ) -> Result<(), crate::federation::Error> {
-        use crate::federation::edition2::fixture_genesis::{self as fg, HOLDER_SEEDS};
-        use crate::federation::edition2::fixture_switch as e2;
-        use crate::federation::trust_root::{
-            resolve_transit_eligibility, trust_root_valid, RootKind,
-        };
-
-        let node = e2_node(directory, tag);
-        let peer_seed = format!("{tag}-peer");
-        let peer = put_transport_node(directory, &peer_seed).await;
-        let r = e2::rooted_trust_root(directory, &HOLDER_SEEDS, "quorum:2/3").await;
-        // Each side names THE ROOT, never a holder.
-        accept_e2_root(directory, &peer_seed, &r.root).await?;
-
-        let verdict =
-            trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
-        assert_eq!(
-            verdict.root_kind,
-            RootKind::Key,
-            "({tag}) KB-fix1: the shared root is a keyed root at the room's id (the room is \
-             no root): {verdict:?}"
-        );
-        assert!(verdict.valid, "({tag}) …and it is valid: {verdict:?}");
-
-        let eligible = resolve_transit_eligibility(directory, &node, &peer).await?;
-        assert!(
-            eligible.eligible,
-            "({tag}) a shared THRESHOLD root satisfies (D) — the transit walk is not \
-             arm-aware, and must not need to be: {eligible:?}"
-        );
-        assert_eq!(
-            eligible.via_root.as_deref(),
-            Some(r.root.as_str()),
-            "({tag}) via_root names the ROOT — the cache key a root-wide revocation would \
-             invalidate"
-        );
-
-        // The THRESHOLD is still the gate underneath, re-derived on every call.
-        let later = fg::later_v2(
-            fg::bundle_v2(),
-            &[1, 2, 3, 4, 5, 6, 7],
-            &fg::SERVE_NODE_SEEDS,
-            &[1, 2, 3, 4, 5, 6, 7],
-        );
-        fg::install_ceremony_v2(directory, &later).await?;
-        let after_growth = resolve_transit_eligibility(directory, &node, &peer).await?;
-        assert!(
-            !after_growth.eligible,
-            "({tag}) three of seven holders is not a strict majority, so the root's chain no \
-             longer roots — and the hop it anchored goes with it, with nothing written on \
-             the transport plane: {after_growth:?}"
-        );
-        let regrown =
-            trust_root_valid(directory, &node, &r.root, crate::host::clock::now()).await?;
-        assert!(
-            !regrown.valid
-                && regrown.root_kind == RootKind::Community
-                && regrown.not_rooted.is_some(),
-            "({tag}) …because the root is judged NOT ROOTED on the community arm, never \
-             as a 1-of-1 key root: {regrown:?}"
-        );
-        Ok(())
-    }
+    // v62.0.0 (R2-fixture; CC 3.2 T5, "the root is the bundle's lineage") —
+    // `exercise_transit_eligibility_family_root` DELETED (lead's ruling): there is one
+    // kind of root, so "a threshold root satisfies (D) too" is
+    // `exercise_transit_eligibility` itself (its shared root IS the bundle's
+    // threshold); a later bundle needing no re-acceptance is I2402.
 
     /// CIRISPersist#785 — **the known set and the holdings set are
     /// never the same set**, on every backend.

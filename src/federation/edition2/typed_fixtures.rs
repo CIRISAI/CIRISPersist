@@ -449,7 +449,6 @@ pub fn trust_accepts_statement(
     let classes: Vec<String> = classes.iter().map(|c| (*c).to_owned()).collect();
     let p = trust_accepts_payload(
         &kid_or_keep(granter),
-        &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
         &classes,
         valid_until.map(ms),
         cohort_scope,
@@ -498,7 +497,6 @@ pub async fn trust_accepts_edge<D: crate::federation::FederationDirectory + ?Siz
     let classes: Vec<String> = classes.iter().map(|c| (*c).to_owned()).collect();
     let p = trust_accepts_payload(
         &kid_or_keep(granter),
-        &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
         &classes,
         valid_until.map(ms),
         cohort_scope,

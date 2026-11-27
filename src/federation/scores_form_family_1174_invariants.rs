@@ -15,25 +15,28 @@
 //! - **I1591** (sqlite, postgres) `health:liveness:` — a service attesting its
 //!   own liveness is refused (`invariant_registry_self_emission_forbidden`); a
 //!   monitor's row about another service is admitted.
-//! - **I1592** (sqlite, postgres) `hard_case:` — an `agent` key is refused as
-//!   the emitter; a `substrate_persist` key's row ABOUT ANOTHER PARTY is
-//!   refused without `infra:record_hard_case` and, in the `scores` form, never
-//!   reaches `hard_case_events`; a `substrate_persist` or `node` key's row about
-//!   itself is admitted; with the conferral the third-party row is admitted and
-//!   (scores form) projects with its signer as the emitter.
+//! - **I1592** (sqlite, postgres) `hard_case:` — v62.0.0 (D2; CC 3.4.7): a
+//!   person's key and a `substrate_persist` label are refused (no node); a
+//!   node owned under a binding carrying `infra:attest` lands its row about
+//!   itself, and its row whose body names another party is HELD
+//!   `reserved_family_unseated` until the owner's binding carries
+//!   `infra:record_hard_case`, when it re-folds, concludes and projects with
+//!   the node as its emitter. No root is read.
 //! - **I1593** (sqlite, postgres) CC 3.4.3 substrate self-report — a
 //!   `substrate_persist` key's `system:*` row about another key is refused
-//!   (`substrate_self_report_names_another_party`); about itself it is
-//!   admitted; an `agent` key about itself is refused as the emitter.
-//!   v61.1.0 (as ruled): refused at this node's own write door; **I1607**
-//!   (sqlite, postgres) a peer-offered or replicated such row is admitted and
-//!   reported (counted, logged with the token) until v62, and the local-tier
-//!   door refuses it.
+//!   (`substrate_self_report_names_another_party`). v62.0.0 (D1; CC 3.4.7):
+//!   about itself it is refused too, because the label opens nothing; the
+//!   family's duty is `infra:attest` from a node's OWNER (landed by I6600,
+//!   `self_report_duty_invariants`). **I1607** (sqlite, postgres) v62.0.0:
+//!   the same row about another key is REFUSED at every door: offered by a
+//!   peer (`put_attestation`), replicated (`apply_replicated_attestation`)
+//!   and at the local tier (v61.1 admitted the first two under report).
 //! - **I1594** (sqlite, postgres) `trace_summary:` — a summary whose signer is
 //!   not among its `subject_key_ids` is refused (`trace_dimension_invalid`);
 //!   one naming its signer is admitted.
 //! - **I1595** (unit) [`SUBSTRATE_SELF_REPORT_PREFIXES`](super::admission::SUBSTRATE_SELF_REPORT_PREFIXES)
-//!   is exactly the rule table's `substrate_persist`-only rows, and the
+//!   is exactly the rule table's owner-conferred rows (v62.0.0, D1; until then
+//!   its `substrate_persist`-only rows), and the
 //!   `hard_case:` arm's stem is the hard_case door's.
 //! - **I1596** (unit) [`trace_family_token`](super::admission::trace_family_token):
 //!   the family in either form, else the envelope dimension (the #473 reach
@@ -183,32 +186,33 @@ pub(crate) mod bodies {
         }
     }
 
-    /// I1592 — the `hard_case:` emitter rule, in both forms.
+    /// I1592 — the `hard_case:` emitter rule, in both forms. v62.0.0 (D2; CC
+    /// 3.4.7): the duty is the node's OWNER's (`infra:attest` about itself,
+    /// `infra:record_hard_case` about another party), read in its owner
+    /// binding; no label opens the family and no root is read.
     pub(crate) async fn i1592_hard_case_emitter_rule_in_both_forms<B>(b: &B, tag: &str)
     where
         B: FederationDirectory + DeclaresNode,
     {
+        use crate::federation::edition2::fold::reason::gc1::RESERVED_FAMILY_UNSEATED;
+        use crate::federation::edition2::names::RowId;
+        use crate::federation::edition2::verdict::row_state;
         let d: &dyn FederationDirectory = b;
         let family = hard_case::hard_case_dimension(hard_case::kind::CONSENT_SLA_BREACH);
         let node = format!("i1592-node-{tag}");
-        let root = format!("i1592-root-{tag}");
-        let author = format!("i1592-persist-{tag}");
-        let node_key = format!("i1592-nodekey-{tag}");
-        let agent = format!("i1592-agent-{tag}");
+        let owner = format!("i1592-owner-{tag}");
+        let label = format!("i1592-persist-{tag}");
+        let person = format!("i1592-person-{tag}");
         let victim = format!("i1592-victim-{tag}");
-        // RT-fix1: the node's identity-ref (the accepts edge's `iss`, and the
-        // asking party of the conferral walk), never the bare seed text: a
-        // backend asked as the seed text reaches no conferral.
         b.declare_node_key_for_test(&e2::kid(&node));
-        let author_kid = register(d, &author, &[it::SUBSTRATE_PERSIST]).await;
-        register(d, &node_key, &[it::NODE]).await;
-        register(d, &agent, &[it::AGENT]).await;
+        let node_kid = register(d, &node, &[it::NODE]).await;
+        register(d, &label, &[it::SUBSTRATE_PERSIST]).await;
+        register(d, &person, &[it::USER]).await;
         let victim_kid = register(d, &victim, &[it::USER]).await;
         let none = serde_json::json!({});
 
-        // A third-party event with a body the projection reads, written at the
-        // id the projection derives — the census row: a peer's `scores` row
-        // that would otherwise land in `hard_case_events`.
+        // A third-party event with a body the projection reads — the census
+        // row: a peer's `scores` row that would land in `hard_case_events`.
         let about_victim = |n: &str| {
             let event = HardCaseEvent {
                 event_id: format!("i1592-{tag}-{n}"),
@@ -223,77 +227,85 @@ pub(crate) mod bodies {
             let body = hard_case::hard_case_envelope(&event).expect("envelope")
                 [hard_case::BODY_MEMBER]
                 .clone();
-            // v62.0.0 — no id is offered: an edition-2 row id is computed
-            // (the projection's derived-id fence, see E6.md's findings).
             let mut extra = serde_json::Map::new();
             extra.insert(hard_case::BODY_MEMBER.to_owned(), body);
             (event.event_id, serde_json::Value::Object(extra))
         };
+        // The row as this node's producer states it (its head named): its
+        // id, after the put.
+        let put_stated = |r: Attestation| async move {
+            let st = e2::carried_statement(&r).expect("an edition-2 row");
+            let headed = e2::with_head_resolved(d, &st, None)
+                .await
+                .expect("the head read");
+            let id = RowId::of_statement(&headed).expect("a row statement");
+            (id, e2::put_statement(d, &headed).await.map(|_| ()))
+        };
 
         for form in FORMS {
-            refused(
-                d,
-                row(form, &family, &agent, &agent, &[], &none),
-                "federation_reserved_prefix_emitter_mismatch",
-                it::SUBSTRATE_PERSIST,
-                &format!("I1592 {form:?}: an agent key as a hard_case emitter"),
-            )
-            .await;
-            let (event_id, body) = about_victim(&format!("{form:?}-refused"));
-            refused(
-                d,
-                row(form, &family, &author, &victim, &[], &body),
-                "federation_reserved_prefix_emitter_mismatch",
-                delegation_scope::INFRA_RECORD_HARD_CASE,
-                &format!("I1592 {form:?}: a hard_case row about another party, no conferral"),
-            )
-            .await;
-            assert!(
-                listed(d, &event_id).await.is_none(),
-                "I1592 {form:?}: a refused row never reaches hard_case_events"
-            );
-            admitted(
-                d,
-                row(form, &family, &author, &author, &[], &none),
-                &format!("I1592 {form:?}: a substrate_persist key's row about itself"),
-            )
-            .await;
-            admitted(
-                d,
-                row(form, &family, &node_key, &node_key, &[], &none),
-                &format!("I1592 {form:?}: a node key's row about itself (the hard_case door)"),
-            )
-            .await;
+            // A key that is no node, labelled or not: refused (the key plane).
+            for signer in [&person, &label] {
+                refused(
+                    d,
+                    row(form, &family, signer, signer, &[], &none),
+                    "federation_reserved_prefix_emitter_mismatch",
+                    RESERVED_FAMILY_UNSEATED,
+                    &format!("I1592 {form:?}: {signer} is no node"),
+                )
+                .await;
+            }
         }
-
-        crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
+        // The node, owned, its binding carrying infra:attest (rootless).
+        crate::federation::admission::r2_test_support::confer_from_owner(
             d,
+            &owner,
             &node,
-            &root,
-            &author_kid,
-            delegation_scope::INFRA_RECORD_HARD_CASE,
+            &[delegation_scope::INFRA_ATTEST],
         )
         .await;
+        let mut held_ids = Vec::new();
         for form in FORMS {
-            let (event_id, body) = about_victim(&format!("{form:?}-conferred"));
-            admitted(
-                d,
-                row(form, &family, &author, &victim, &[], &body),
-                &format!("I1592 {form:?}: a conferred hard_case row about another party"),
-            )
-            .await;
-            // DEPENDS ON P3: the hard_case projection's derived-id fence
-            // (`project_hard_case_row`) never matches an edition-2 row's
-            // computed id, so this leg is red until P3 moves the fence.
-            if form == Form::Scores {
-                let event = listed(d, &event_id)
-                    .await
-                    .expect("I1592: the conferred scores row projects");
-                assert_eq!(
-                    event.emitter_key_id, author_kid,
-                    "I1592: the emitter is the row's signer"
-                );
-            }
+            let (event_id, body) = about_victim(&format!("{form:?}-held"));
+            let (id, put) = put_stated(row(form, &family, &node, &node, &[], &body)).await;
+            put.unwrap_or_else(|e| panic!("I1592 {form:?}: kept, not refused: {e}"));
+            let state = row_state(d, &id).await.expect("state");
+            assert_eq!(
+                state.held().map(|h| h.reason.as_str()),
+                Some(RESERVED_FAMILY_UNSEATED),
+                "I1592 {form:?}: a body naming another party needs infra:record_hard_case: {state:?}"
+            );
+            assert!(
+                listed(d, &event_id).await.is_none(),
+                "I1592 {form:?}: a held row never reaches hard_case_events"
+            );
+            held_ids.push((event_id, id));
+            let (id, put) = put_stated(row(form, &family, &node, &node, &[], &none)).await;
+            put.unwrap_or_else(|e| panic!("I1592 {form:?}: the node's own row: {e}"));
+            assert!(
+                row_state(d, &id).await.expect("state").is_concluded(),
+                "I1592 {form:?}: a node's row about itself lands under infra:attest"
+            );
+        }
+
+        crate::federation::admission::r2_test_support::confer_from_owner(
+            d,
+            &owner,
+            &node,
+            &[delegation_scope::INFRA_RECORD_HARD_CASE],
+        )
+        .await;
+        for (event_id, id) in held_ids {
+            assert!(
+                row_state(d, &id).await.expect("state").is_concluded(),
+                "I1592: the held row re-folds and concludes under infra:record_hard_case"
+            );
+            let event = listed(d, &event_id)
+                .await
+                .expect("I1592: the conferred scores row projects");
+            assert_eq!(
+                event.emitter_key_id, node_kid,
+                "I1592: the emitter is the row's signer"
+            );
         }
     }
 
@@ -304,15 +316,13 @@ pub(crate) mod bodies {
     ) {
         const FAMILY: &str = "system:health:n_eff_measurable:v1";
         let persist = format!("i1593-persist-{tag}");
-        let agent = format!("i1593-agent-{tag}");
         let other = format!("i1593-other-{tag}");
         register(d, &persist, &[it::SUBSTRATE_PERSIST]).await;
-        register(d, &agent, &[it::AGENT]).await;
         register(d, &other, &[it::USER]).await;
         let score = serde_json::json!({ "score": 1.0 });
         for form in FORMS {
-            // v61.1.0 (as ruled) — refused at this node's own write door; a
-            // peer's such row is reported, not refused, until v62 (I1607).
+            // v61.1.0 — refused at this node's own write door; v62.0.0 (D1)
+            // at a peer's and the replicated door too (I1607).
             let r = row(form, FAMILY, &persist, &other, &[], &score);
             let id = r.attestation_id.clone();
             let err = d
@@ -330,31 +340,29 @@ pub(crate) mod bodies {
                 "I1593 {form:?}: {err}"
             );
             assert!(!held(d, &id).await, "I1593 {form:?}: not stored");
-            admitted(
-                d,
-                row(form, FAMILY, &persist, &persist, &[], &score),
-                &format!("I1593 {form:?}: a substrate self-report about itself"),
-            )
-            .await;
+            // v62.0.0 (D1; CC 3.4.7 "No key declares itself into a duty") —
+            // about itself it is refused too: the label is not the duty, and
+            // the signer is no node (`OwnerConferral::NotANode`, read from
+            // the key plane: a refusal, never a hold).
             refused(
                 d,
-                row(form, FAMILY, &agent, &agent, &[], &score),
+                row(form, FAMILY, &persist, &persist, &[], &score),
                 "federation_reserved_prefix_emitter_mismatch",
-                it::SUBSTRATE_PERSIST,
-                &format!("I1593 {form:?}: an agent key's substrate self-report"),
+                crate::federation::edition2::fold::reason::gc1::RESERVED_FAMILY_UNSEATED,
+                &format!("I1593 {form:?}: a substrate_persist label's report about itself"),
             )
             .await;
         }
     }
 
-    /// I1607 (v61.1.0, as ruled) — a substrate self-report about another key
-    /// that a PEER offers (`put_attestation`) or that replicates
-    /// (`apply_replicated_attestation`) is admitted under report: held, and
-    /// counted under `persist_substrate_self_report_would_refuse_total`
-    /// (logged with `substrate_self_report_names_another_party`). This node's
-    /// own write of the same row is refused (I1593), and so is the local-tier
-    /// door's.
-    pub(crate) async fn i1607_a_peers_self_report_is_reported_not_refused(
+    /// I1607 (v62.0.0, D1; CC 3.4.7 "The signer is the node the row is about")
+    /// — a substrate self-report about another key is REFUSED at every door:
+    /// offered by a peer (`put_attestation`), replicated
+    /// (`apply_replicated_attestation`) and at the local tier, each with
+    /// `substrate_self_report_names_another_party`, and nothing is stored.
+    /// v61.1 admitted the first two under report (the
+    /// `persist_substrate_self_report_would_refuse_total` counter, deleted).
+    pub(crate) async fn i1607_a_peers_self_report_about_another_key_is_refused(
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
@@ -364,36 +372,35 @@ pub(crate) mod bodies {
         let persist_kid = register(d, &persist, &[it::SUBSTRATE_PERSIST]).await;
         let other_kid = register(d, &other, &[it::USER]).await;
         let score = serde_json::json!({ "score": 1.0 });
-        let stem = crate::federation::row_type::type_stem(FAMILY);
-        let count = || {
-            crate::federation::row_type::substrate_self_report_would_refuse_total()
-                .into_iter()
-                .find(|(l, _)| *l == stem)
-                .map_or(0, |(_, n)| n)
+        let names_another = |e: &Error, what: &str| {
+            assert_eq!(e.kind(), "federation_dimension_rejected", "{what}: {e}");
+            assert!(
+                e.to_string()
+                    .contains(crate::federation::admission::SUBSTRATE_SELF_REPORT_SUBJECT_REASON),
+                "{what}: {e}"
+            );
         };
         for form in FORMS {
-            let before = count();
             let r = row(form, FAMILY, &persist, &other, &[], &score);
             let id = r.attestation_id.clone();
-            put(d, r)
+            let err = put(d, r)
                 .await
-                .unwrap_or_else(|e| panic!("I1607 {form:?}: a peer's row is admitted: {e}"));
-            assert!(held(d, &id).await, "I1607 {form:?}: held");
+                .expect_err("I1607: a peer's self-report about another key");
+            names_another(&err, &format!("I1607 {form:?}: the peer door"));
+            assert!(
+                !held(d, &id).await,
+                "I1607 {form:?}: not stored (peer door)"
+            );
             let r = row(form, FAMILY, &persist, &other, &[], &score);
             let id = r.attestation_id.clone();
-            let outcome = d
+            let err = d
                 .apply_replicated_attestation(SignedAttestation { attestation: r })
                 .await
-                .unwrap_or_else(|e| panic!("I1607 {form:?}: a replicated row is admitted: {e}"));
-            assert_eq!(
-                outcome,
-                crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted,
-                "I1607 {form:?}"
-            );
-            assert!(held(d, &id).await, "I1607 {form:?}: held");
+                .expect_err("I1607: a replicated self-report about another key");
+            names_another(&err, &format!("I1607 {form:?}: the replicated door"));
             assert!(
-                count() >= before + 2,
-                "I1607 {form:?}: both admissions are counted as reported"
+                !held(d, &id).await,
+                "I1607 {form:?}: not stored (replicated)"
             );
         }
         // The local-tier door is this node's own write: refused.
@@ -456,7 +463,7 @@ pub(crate) mod bodies {
 #[cfg(test)]
 mod unit {
     use crate::federation::admission::{
-        default_reserved_prefix_rules, trace_family_token, HARD_CASE_FAMILY_PREFIX,
+        default_reserved_prefix_rules, trace_family_token, DutyConferrer, HARD_CASE_FAMILY_PREFIX,
         SUBSTRATE_SELF_REPORT_PREFIXES,
     };
     use crate::federation::row_type::claim_token_of;
@@ -484,12 +491,20 @@ mod unit {
     }
 
     /// I1595 — the attester rule's families are the rule table's
-    /// `substrate_persist`-only rows, exactly.
+    /// owner-conferred rows, exactly (v62.0.0, D1: they name no identity
+    /// type, and no rule names `substrate_persist`).
     #[test]
     fn i1595_substrate_self_report_prefixes_are_the_tables() {
+        assert!(
+            default_reserved_prefix_rules().iter().all(|r| !r
+                .required_identity_types
+                .iter()
+                .any(|t| t == identity_type::SUBSTRATE_PERSIST)),
+            "I1595: no rule opens a family on the substrate_persist label (CC 3.4.7)"
+        );
         let mut table: Vec<String> = default_reserved_prefix_rules()
             .into_iter()
-            .filter(|r| r.required_identity_types == [identity_type::SUBSTRATE_PERSIST])
+            .filter(|r| r.conferred_by == DutyConferrer::Owner)
             .map(|r| r.pattern_prefix)
             .collect();
         table.sort();
@@ -582,7 +597,7 @@ mod tests {
     );
     on_every_backend!(
         i1607,
-        bodies::i1607_a_peers_self_report_is_reported_not_refused
+        bodies::i1607_a_peers_self_report_about_another_key_is_refused
     );
     on_every_backend!(
         i1594,

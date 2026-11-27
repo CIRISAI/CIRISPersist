@@ -331,7 +331,7 @@ pub(crate) mod bodies {
         // v62.0.0 (P8-fix8) — an unconferred emitter of a reserved family is
         // a FOLD condition (CC 2.7.3: G0/GC1 hold it, they never refuse it):
         // the statement is kept and the row HELD under
-        // `reserved_prefix_emitter_mismatch`, so it is neither seated nor
+        // `reserved_family_unseated` (D4), so it is neither seated nor
         // projected. Pinned to the reason, never `is_err`.
         let x_row =
             crate::derived::detection_row::state_detection(b, &ts::local_signer(&rogue), &x)
@@ -352,7 +352,7 @@ pub(crate) mod bodies {
         .expect("I961: the unconferred detection is held");
         assert_eq!(
             held.reason,
-            crate::federation::edition2::fold::reason::gc1::RESERVED_PREFIX_EMITTER_MISMATCH,
+            crate::federation::edition2::fold::reason::gc1::RESERVED_FAMILY_UNSEATED,
             "I961: held for the missing infra:detect conferral: {held:?}"
         );
         assert!(

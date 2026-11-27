@@ -262,7 +262,7 @@ fn i3994_the_emit_side_states_row_names_under_refs() {
 /// I4000: bodies take decimals; everything else still refuses floats.
 #[test]
 fn i4000_a_body_states_its_numbers_exactly() {
-    let fam = "evidence:.suite:.kind:.cell:.prefix";
+    let fam = "coherence_standing:.cohort";
     let n = |t: &str| -> serde_json::Value { serde_json::from_str(t).unwrap() };
     let env = serde_json::json!({
         "body": { "ratio": n("0.5"), "whole": n("2.0"), "big": n("1e2"), "list": [n("1.25")] },
@@ -320,7 +320,7 @@ fn i4000_a_body_states_its_numbers_exactly() {
     let mut keys = HeldKeys::new();
     keys.insert_record(key_record(&k, &["user"], 0, None));
     let env = serde_json::json!({
-        "dimension": "evidence:safety_battery:capture:a:b:v1",
+        "dimension": "coherence_standing:cab:v1",
         "score": n("0.75"),
         "body": { "ratio": n("1.25") },
     });

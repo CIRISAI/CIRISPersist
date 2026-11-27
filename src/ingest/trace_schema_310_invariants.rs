@@ -244,6 +244,9 @@ fn row_of(seed: &str, blob: &[u8]) -> Vec<u8> {
     let iss = e2::kid(seed);
     let parsed: CompleteTrace = serde_json::from_slice(blob).expect("a CompleteTrace");
     let payload = trace_row_payload(&parsed, blob, &iss).expect("the row payload");
+    // v62.0.0 (HEAD-fix1) — an agent's trace names its owner binding.
+    let payload = crate::ingest::trace_anchor::with_agent_trace_head(&iss, payload)
+        .expect("the trace row head");
     ciris_verify_core::edition2::sign_row_statement(
         &e2::signing_key(seed),
         &iss,
@@ -408,7 +411,7 @@ where
     D: Backend + FederationDirectory + BlobStorage + crate::ceg::ReadEngine,
 {
     let agent = unique("agent");
-    let kid = e2::put_key(d, &agent, &["agent"]).await;
+    let kid = crate::ingest::trace_anchor::put_agent_trace_key(d, &agent).await;
     let at = dated_ms(&agent);
     let mut manifest = context_manifest(segments);
     // v62.0.0 (P7-fix11) — a 3.1.1 agent's manifest carries `facts`.
@@ -739,7 +742,7 @@ where
     D: Backend + FederationDirectory + BlobStorage,
 {
     let agent = unique("agent-mock");
-    let kid = e2::put_key(d, &agent, &["agent"]).await;
+    let kid = crate::ingest::trace_anchor::put_agent_trace_key(d, &agent).await;
     let at = dated_ms(&agent);
     let blob_of = |trace_id: &str, kinds: [&str; 2]| {
         canonical_trace_blob(&trace_at("3.1.0", trace_id, at, None, Some(kinds)))
@@ -770,7 +773,8 @@ where
             &kid,
             TRACE_ROW_TYPE,
             TRACE_FAMILY_ID,
-            &Value::Map(members),
+            &crate::ingest::trace_anchor::with_agent_trace_head(&kid, Value::Map(members))
+                .expect("the trace row head"),
             vec![],
         )
         .expect("sign")
@@ -880,7 +884,7 @@ where
     D: Backend + FederationDirectory + BlobStorage,
 {
     let agent = unique("agent-mock-at");
-    e2::put_key(d, &agent, &["agent"]).await;
+    crate::ingest::trace_anchor::put_agent_trace_key(d, &agent).await;
     let at = dated_ms(&agent);
     let mut manifest = context_manifest(13);
     manifest["facts"] = manifest_facts();

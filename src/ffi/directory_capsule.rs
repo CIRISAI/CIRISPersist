@@ -9066,15 +9066,16 @@ mod tests {
             for i in 0..3 {
                 // v62.0.0 (E0 fix 2) — a registered family (`i1578:` is
                 // open vocabulary, refused at the edition-2 door).
-                ids.push(
-                    f::put_dim(dir.as_ref(), &a, &k, &format!("watchlist:i1578_{i}:v1")).await,
-                );
+                // v62.0.0 (FS-sig-a) — `need:` (the serve feeds' own fixture
+                // family), not `watchlist:`, whose rows now count only from
+                // a group's `moderate` / `takedown` holder.
+                ids.push(f::put_dim(dir.as_ref(), &a, &k, &format!("need:i1578n{i}:x:v1")).await);
             }
             let (owner, node) = f::owner_and_node(dir.as_ref(), "cap1578").await;
             f::bind(dir.as_ref(), &owner, &node, cohort_scope::FEDERATION).await;
             (ids, owner, node)
         });
-        let dims = vec!["watchlist:".to_owned()];
+        let dims = vec!["need:".to_owned()];
         let direct = rt
             .block_on(dir.list_attestations_since_by_prefixes(None, &dims, 2))
             .expect("direct");
@@ -10613,7 +10614,7 @@ mod tests {
             &[crate::federation::types::identity_type::USER],
         ));
         rt.block_on(
-            dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
+            dir.test_seam_put_identity_occurrence(crate::federation::IdentityOccurrence {
                 identity_key_id: identity.clone(),
                 occurrence_key_id: phone.clone(),
                 // v62.0.0 (P1-fix4; CC rc21 3.3.6) — a person's phone, not an
@@ -10652,7 +10653,7 @@ mod tests {
         }
 
         // Revoke → the SAME proxy call fail-secure excludes the occurrence.
-        rt.block_on(dir.put_identity_occurrence_revocation_local(
+        rt.block_on(dir.put_identity_occurrence_revocation_edition2(
             crate::federation::IdentityOccurrenceRevocation {
                 identity_key_id: identity.clone(),
                 occurrence_key_id: phone.clone(),
@@ -10662,6 +10663,7 @@ mod tests {
                 witness_set: vec![identity.clone()],
                 persist_row_hash: String::new(),
             },
+            crate::federation::DoorToken::new(),
         ))
         .expect("seed revocation");
         let resolved = rt
@@ -11935,7 +11937,7 @@ mod tests {
                 asserted_at: now,
                 expires_at: None,
                 attestation_envelope: serde_json::json!({
-                    "dimension": "evidence:safety_battery:capture:a:b:v1",
+                    "dimension": "coherence_standing:cab:v1",
                     "score": 1.0,
                     "confidence": 0.9,
                     "label": label,
@@ -12222,6 +12224,7 @@ mod tests {
                 reason: None,
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Removal,
             },
         );
         // v62.0.0 (round 3, E7; T1 §3) — the widening and the revocation are
@@ -12421,6 +12424,7 @@ mod tests {
                 reason: None,
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Removal,
             },
         )
     }
@@ -12450,6 +12454,7 @@ mod tests {
                 reason: None,
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Removal,
             },
         )
     }
@@ -13384,6 +13389,7 @@ mod tests {
                 reason: None,
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Removal,
             },
         );
         let widening = ts::sign_community_membership_widening(
@@ -13891,18 +13897,12 @@ mod tests {
         };
         vec![
             (
-                "trust_root_valid key root",
+                "trust_root_valid bundle root",
                 answer_1774(trust_root_valid(d, &q.node, &q.root, crate::host::clock::now()).await),
             ),
             (
                 "trust_root_valid self root",
                 answer_1774(trust_root_valid(d, &q.node, &q.node, crate::host::clock::now()).await),
-            ),
-            (
-                "trust_root_valid family-quorum root",
-                answer_1774(
-                    trust_root_valid(d, &q.node, &q.root_f, crate::host::clock::now()).await,
-                ),
             ),
             (
                 "trust_root_valid unknown root",
@@ -13911,7 +13911,7 @@ mod tests {
                 ),
             ),
             (
-                "capability key root",
+                "capability bundle root",
                 answer_1774(
                     capability_roots_to_trusted_root(
                         d,
@@ -13924,7 +13924,7 @@ mod tests {
                 ),
             ),
             (
-                "capability family root",
+                "capability second subject",
                 answer_1774(
                     capability_roots_to_trusted_root(
                         d,
@@ -14045,14 +14045,16 @@ mod tests {
     /// reach: it finds them.
     ///
     /// v62.0.0 (JSON cut, E7) — the roots are edition 2: W1b's rooted trust
-    /// root (the community arm, `put_conferral` to its subject) and E9's
-    /// chartered root (`seed_chartered_e2_root`, `confer_e2`); the asking party
-    /// is THIS node (the runner sets its key). The `ciris-canonical` community
+    /// root (`put_conferral` to its subject); the asking party is THIS node
+    /// (the runner sets its key). v62.0.0 (R2-fixture; CC 3.2 T5): E9's
+    /// chartered KEYED root (`seed_chartered_e2_root`, `confer_e2`) is deleted
+    /// with the keyed root; the bundle's lineage is the one root, so the
+    /// "family-quorum root" questions go and the halt, role and roster reads
+    /// ask about the lineage and a second conferred subject. The `ciris-canonical` community
     /// arm is gone (wave-3 rule 1: canonical = `serve_nodes` of the bundle in
     /// force). The withdraws names a HELD row (`seed_withdraws_e2`).
     fn exercise_i1774(rt: &Arc<tokio::runtime::Runtime>, concrete: Arc<dyn FederationDirectory>) {
         use crate::federation::edition2::fixture_switch as e2;
-        use crate::federation::operational::test_support as ops;
         use crate::federation::trust_root::INFRA_SERVE_SCOPE;
         let q = rt.block_on(async {
             let node = concrete
@@ -14072,29 +14074,20 @@ mod tests {
             )
             .await
             .expect("the key root confers");
-            let f = ops::seed_chartered_e2_root(concrete.as_ref(), "eqf-root", &node)
-                .await
-                .expect("the chartered root");
-            e2::put_key(
+            crate::federation::edition2::fixture_trust_root::put_conferral(
                 concrete.as_ref(),
-                "eqf-subject",
-                &[crate::federation::types::identity_type::USER],
-            )
-            .await;
-            ops::confer_e2(
-                concrete.as_ref(),
-                &f.seed,
+                &r,
                 "eqf-subject",
                 &[INFRA_SERVE_SCOPE],
             )
             .await
-            .expect("the chartered root confers");
+            .expect("the root confers on a second subject");
             Eq1774 {
                 node,
-                root: r.root.clone(),
+                root: r.lineage.clone(),
                 subject_a: e2::kid("eqa-subject"),
-                holder: f.founders.first().cloned().unwrap_or_default(),
-                root_f: f.root,
+                holder: r.founders.first().cloned().unwrap_or_default(),
+                root_f: r.lineage.clone(),
                 subject_f: e2::kid("eqf-subject"),
                 wid: String::new(),
                 target: String::new(),
@@ -14107,11 +14100,8 @@ mod tests {
         let mut red = Vec::new();
         let (r, seeded) = diff_1774(rt, &concrete, &proxy, &q, "seeded");
         red.extend(r);
-        // The fixture is not trivial: both roots answer VALID.
-        for name in [
-            "trust_root_valid key root",
-            "trust_root_valid family-quorum root",
-        ] {
+        // The fixture is not trivial: the root answers VALID.
+        for name in ["trust_root_valid bundle root"] {
             let a = &seeded.iter().find(|(n, _)| *n == name).unwrap().1;
             assert!(
                 a.contains("valid: true"),
@@ -14344,14 +14334,27 @@ mod tests {
         ("record_role_withdrawal", RETIRED_FOR_EDGE_PX),
         ("put_touch_claim", RETIRED_FOR_EDGE_PX),
         ("put_identity_occurrence_local", RETIRED_FOR_EDGE_PX),
+        // v62.0.0 (WD-fix9; WD-fix11: `cfg(test)` only, never in a
+        // `test-anchor` build) — a TEST seam: the storage the retired
+        // trusted-local write had; no op carries it.
+        (
+            "test_seam_put_identity_occurrence",
+            "v62.0.0 (WD-fix9) — test-only seeding of an occurrence row (the retired \
+             trusted-local write's storage); never compiled into a production build",
+        ),
         // v62.0.0 (PX-fix1) — the `Err(Backend)` defaults, now refusing.
         ("put_edition2_object", REFUSED_DEFAULT_PX),
         ("put_edition2_statement", REFUSED_DEFAULT_PX),
         ("upsert_edition2_key_projection", REFUSED_DEFAULT_PX),
         ("put_family_local", REFUSED_DEFAULT_PX),
+        // v62.0.0 (WD-fix8) — the retired trusted-local revocation now refuses
+        // by name on every directory (not `Unsupported`); its store is the
+        // edition-2 eviction door's, which runs on the host's store.
         (
-            "put_identity_occurrence_revocation_local",
-            REFUSED_DEFAULT_PX,
+            "put_identity_occurrence_revocation_edition2",
+            "v62.0.0 (WD-fix8) — the edition-2 occurrence revocation is written by the \
+             node's own eviction door (`edition2::typed` / `occurrence::land_held_eviction`), \
+             reached through `put_edition2_statement`; no DirectoryOp carries the typed write",
         ),
         ("grant_trust", REFUSED_DEFAULT_PX),
         ("revoke_trust", REFUSED_DEFAULT_PX),
@@ -14380,6 +14383,16 @@ mod tests {
             "drop_group_tips",
             "v62.0.0 (wave T1): the merge's tip retirement is the edition-2 \
           roster door's own write; no DirectoryOp carries it",
+        ),
+        (
+            "put_group_lineage_end",
+            "v62.0.0 (LINEAGE-L3d): a lineage end is the edition-2 group door's own \
+          write, reached through `put_edition2_statement`; no DirectoryOp carries it",
+        ),
+        (
+            "put_group_lineage_node",
+            "v62.0.0 (LINEAGE-L1): a lineage node is the edition-2 group door's own \
+          write, reached through `put_edition2_statement`; no DirectoryOp carries it",
         ),
         // v61 (CIRISPersist#991): the group framed kinds retired; their ops
         // left the capsule at ABI 12 and the records replicate as rows.
@@ -14419,6 +14432,19 @@ mod tests {
         ("note_self_roster_proposal", INHERITED_DEFAULT),
         ("list_open_self_roster_proposals", INHERITED_DEFAULT),
         ("settle_self_roster_proposal", INHERITED_DEFAULT),
+        // v62.0.0 (CONTENT-A4) — the room-content series index: a host drafts
+        // on its own store; through the proxy a draft names no predecessor
+        // (a conformant first row of a branch, CC rc22 3.1.3.2).
+        ("edition2_room_series", INHERITED_DEFAULT),
+        ("edition2_room_tips", INHERITED_DEFAULT),
+        ("edition2_held_bound_put", INHERITED_DEFAULT),
+        ("edition2_held_bound_remove", INHERITED_DEFAULT),
+        ("edition2_held_bound_usage", INHERITED_DEFAULT),
+        ("edition2_held_bound_expired", INHERITED_DEFAULT),
+        ("edition2_content_ends", INHERITED_DEFAULT),
+        ("edition2_put_content_answers", INHERITED_DEFAULT),
+        ("edition2_put_content_answer", INHERITED_DEFAULT),
+        ("edition2_content_answer", INHERITED_DEFAULT),
         // v61.3.0 (CIRISPersist#1252) — the cosign hold's node-local ledgers
         // and the group pointer read: a proxy has no store of its own, so no
         // hold is taken behind one (`cosign::hold` needs the receipt).
@@ -14447,6 +14473,10 @@ mod tests {
         ("list_purge_executions_since", INHERITED_DEFAULT),
         ("purge_delete_tombstoned_attestation", INHERITED_DEFAULT),
         ("purge_delete_tombstoned_trace", INHERITED_DEFAULT),
+        // v62.0.0 (WD-fix1) — the withdrawn-content sweep's read and the
+        // descent's statement delete: the host's own store's, never proxied.
+        ("list_withdrawals_since", INHERITED_DEFAULT),
+        ("purge_delete_tombstoned_statements", INHERITED_DEFAULT),
         ("purge_mark_finalized", INHERITED_DEFAULT),
         (
             "put_identity_occurrence_edition2",
@@ -14494,6 +14524,18 @@ mod tests {
             "put_fold_reason",
             "v62.0.0 (wave G0 fix4) — the re-fold's marker and its restore run in the \
              process that owns the store (`edition2::fold`); no DirectoryOp carries it",
+        ),
+        (
+            "fold_slot_all_rows",
+            "v62.0.0 (GID-tips) — the roster door's read of every row under one group id \
+             runs in the process that owns the store (`edition2::group`, inside the \
+             statement door the proxy carries whole); no DirectoryOp carries it",
+        ),
+        (
+            "drop_held_row",
+            "v62.0.0 (KR-fix20) — the door's drop of a held row it now refuses for good \
+             runs in the process that owns the store (`edition2::ingest`, \
+             `edition2::fold`); no DirectoryOp carries it",
         ),
         // v62.0.0 (RL-fix1, ruling (B)) — the accord-rescan watermark store
         // is written and read by the free doors persist runs over its own
@@ -15806,10 +15848,7 @@ mod wait_relay {
             ("author", Value::Text(me.clone())),
             ("score", Value::Uint(750_000)),
             ("confidence", Value::Uint(900_000)),
-            (
-                "dimension",
-                Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-            ),
+            ("dimension", Value::Text("coherence_standing:cab:v1".into())),
             (
                 "refs",
                 map(vec![(
@@ -15823,7 +15862,7 @@ mod wait_relay {
             &me,
             &me,
             "scores",
-            "evidence:.suite:.kind:.cell:.prefix",
+            "coherence_standing:.cohort",
             &payload,
             vec![],
         )

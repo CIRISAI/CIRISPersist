@@ -99,26 +99,27 @@ Rules beyond the list (refused `edition2_payload_invalid`):
 
 ### `membership:{stage}`
 
-- **Replaces:** Signed{Family,Community}MembershipRevocation (stage `removal`), Signed{Family,Community}MembershipWidening (stage `widening`)
-- **Authorship:** counted (stages widening, removal)
+- **Replaces:** Signed{Family,Community}MembershipRevocation (stage `removal`; stage `resignation` when its leaf is the member's own), Signed{Family,Community}MembershipWidening (stage `widening`)
+- **Authorship:** counted (stages widening, removal); authored by the leaving member (stage resignation)
 - **`sub`:** the member's identity-ref
 - **Lands in:** federation_{family,community}_membership_{revocations,widenings}
-- **Leaves mapped:** `widening`, `removal` (another leaf's payload is OPEN, not this table's)
+- **Leaves mapped:** `widening`, `removal`, `resignation` (another leaf's payload is OPEN, not this table's)
 
 | member | CBOR type | presence | maps from |
 |---|---|---|---|
 | `group_kind` | `tstr` | required | "family" \| "community" (which struct) |
-| `group` | `identity-ref` | required | family_key_id / community_key_id |
-| `member` | `identity-ref` | required | removal: removed_identity_key_id; widening: member_key_id (equals sub) |
-| `removed_at` | `uint (ms)` | required when `dimension` is `removal` | MembershipRevocation.removed_at |
+| `group` | `group-ref` | required | family_key_id / community_key_id (GID-prod: a group-ref) |
+| `member` | `identity-ref` | required | removal, resignation: removed_identity_key_id (a resignation: its author); widening: member_key_id (equals sub) |
+| `removed_at` | `uint (ms)` | required when `dimension` is `removal` or `resignation` | MembershipRevocation.removed_at |
 | `joined_at` | `uint (ms)` | required when `dimension` is `widening` | MembershipWidening.joined_at |
 | `effective_at` | `uint (ms)` | required | effective_at |
 | `valid_until` | `uint (ms)` | optional | a time-boxed guest's widening (CC 3.3.4) |
 | `reason` | `uint` | optional | MembershipRevocation.reason, as a code of the closed registry (free text: body.note) |
 | `role` | `tstr` | optional | MembershipWidening.role |
 | `witness_set` | `[* identity-ref]` | optional | MembershipRevocation.witness_set (vouching key ids, not signatures) |
-| `refs.head` | `row-ref` | required | the roster version the change is counted over (CC 2.6.1.9; earlier: the signed instant) |
+| `refs.head` | `row-ref` | required | the roster version the change is counted over (CC 2.6.1.9; earlier: the signed instant); a resignation: the head it acts from (CC 2.4.1.1) |
 | `refs.also.cites` | `row-ref` | optional | a widening: the acceptance it spends (CC 3.1.3.2); a node's widening has none |
+| `refs.trusted_through` | `row-ref` | optional | a removal or a resignation: the ending member's content tips, 1..64 (CC 3.1.3.2 "The tips"); never waited on |
 
 | earlier-form co-signature (not a payload member) | now |
 |---|---|
@@ -316,7 +317,7 @@ Co-signatures now counted voices: none (the author's statement alone).
 ### `admission:unit`
 
 - **Replaces:** nothing: new in rc21 (CC 2.7.11, the code scope of kernel admission; wire admission:unit:v1, row type scores)
-- **Authorship:** counted where refs.head is present (act = group), authored otherwise; one person's (authored) row naming an effect is at cohort_scope self and admits only on a host that person owns; every signer a person (identity_type holds user or accord_holder); no delegate role
+- **Authorship:** counted where the payload carries no author (act = group; it names its roster head in refs.head), authored otherwise (naming no head); one person's (authored) row naming an effect is at cohort_scope self and admits only on a host that person owns; every signer a person (identity_type holds user or accord_holder); no delegate role
 - **`sub`:** the unit digest as tagged text, canonical:sha256:{hex} (not an identity-ref)
 - **Lands in:** ceg_statements + federation_attestations (the mapped scores row), held count_short until a counted row's count is met; no typed plane: the host's answer (admission_unit_runnable) reads the conclusion, the lease, the withdrawal, the standing and the receipt
 
@@ -468,7 +469,7 @@ Rules beyond the list (refused `edition2_payload_invalid`):
 ### Every mapped family
 
 - **Common members** (any family): `asserted_at`, `author`, `body`, `cohort_scope`, `community_id`, `confidence`, `delivery_mode`, `dimension`, `evidence_refs`, `expires_at`, `family_id`, `passed`, `reason`, `refs`, `salt`, `score`, `seat_commitment`, `subject_key_ids`, `total`, `valid_from`, `valid_until`, `weight`
-- **Hash-digest members** (any family; the earlier gates read each as 64 hex): `evidence_refs`, `carried`, `seat_commitment`, `amendment_digest`, `call_fingerprint`
+- **Hash-digest members** (any family; the earlier gates read each as 64 hex): `evidence_refs`, `carried`, `seat_commitment`, `amendment_digest`, `call_fingerprint`, `attached_head_digest`
 - every `refs.also` role is `ack` or `cites` (a closed registry, CC 2.6.1.3)
 - `body.note`, when present, is text of at most 2048 bytes
 - a composer (`withdraws`, `recants`, `supersedes`) carries its target's family but its own payload: the common members and `refs.target`, never the target family's list

@@ -58,7 +58,7 @@ use sha2::Digest as _;
 
 use super::door::AdmittedRow;
 use super::group::{composite_signature_b64, run_vouched, Landing, Vouch};
-use super::ingest::{attestation_of, json_of, StatementOutcome, COMPOSER_ROW_TYPES};
+use super::ingest::{attestation_of, json_of, StatementOutcome};
 use super::names::{single, RowId};
 use crate::federation::blobs::GrantWrap;
 use crate::federation::custody_ack::CustodyState;
@@ -1269,7 +1269,7 @@ where
 /// which reads [`occurrence_revocation_of`]). A proposal no answer can mend
 /// is `SelfRosterNotLanded` (the voice stays held: the gate counts held
 /// voices, so it is stored first). Landing writes the revocation the carrier
-/// feeds (`put_identity_occurrence_revocation_local`) unless the pair is
+/// feeds (`put_identity_occurrence_revocation_edition2`) unless the pair is
 /// already revoked: the first route to land fixes the instants.
 async fn put_occurrence_revocation<F>(dir: &F, row: &AdmittedRow) -> Result<StatementOutcome, Error>
 where
@@ -1320,8 +1320,11 @@ where
         .iter()
         .any(|r| r.occurrence_key_id == revocation.occurrence_key_id);
     if !held {
-        dir.put_identity_occurrence_revocation_local(revocation)
-            .await?;
+        dir.put_identity_occurrence_revocation_edition2(
+            revocation,
+            crate::federation::DoorToken::new(),
+        )
+        .await?;
     }
     Ok(StatementOutcome::Row {
         row_id: row.row_id,
@@ -1556,7 +1559,7 @@ where
         crate::federation::replication::admission::WriteOrigin::Wire,
     ))
     .await?;
-    let edge = if COMPOSER_ROW_TYPES.contains(&row.row_type.as_str()) {
+    let edge = if super::emit::names_a_target(&row.row_type) {
         match single(&row.names, TARGET_ROLE) {
             Some(t) => dir.get_attestation(&t.hex()).await?,
             None => None,
@@ -1900,6 +1903,42 @@ pub fn takedown_payload(
     Ok(det_map(m))
 }
 
+/// LEAD-root2 (CC 2.4.1.1 "A purge is a tombstone"; CC 3.1.1's
+/// `takedown_notice` row; CC 3.2 T5) — **the payload of a STEWARD PURGE
+/// notice**: a row COUNTED over the holders of the bundle `head` (its
+/// `refs.head`), with no `author` and no `claimant` (a counted row has no one
+/// issuer; its `sub` is the lineage's name). Every other member is
+/// [`takedown_payload`]'s.
+///
+/// # Errors
+/// As [`takedown_payload`].
+pub fn steward_purge_payload(
+    head: &ciris_verify_core::edition2::Digest32,
+    content_sha256: &[u8; 32],
+    content_holders: &[String],
+    notice: &NoticeText,
+    expires_at_ms: u64,
+    asserted_at_ms: u64,
+) -> Result<Value, Error> {
+    let basis = crate::federation::steward_purge::STEWARD_PURGE_BASIS;
+    Ok(det_map(vec![
+        ("asserted_at", Value::Uint(asserted_at_ms)),
+        ("dimension", text(&format!("takedown_notice:{basis}:v1"))),
+        ("legal_basis", text(basis)),
+        ("content_sha256", hash_digest_value(content_sha256)),
+        ("content_holders", identity_set(content_holders)),
+        ("claim_text", text(&notice.claim_text)),
+        ("good_faith_statement", text(&notice.good_faith_statement)),
+        ("jurisdiction", text(&notice.jurisdiction)),
+        ("expires_at", Value::Uint(expires_at_ms)),
+        ("score", fixed6(-1_000_000)),
+        (
+            "refs",
+            det_map(vec![("head", ciris_verify_core::edition2::row_ref(head))]),
+        ),
+    ]))
+}
+
 /// The CC 2.1 cohort-target member a scope names its group by:
 /// `community_id` at a room, `family_id` at a family, none otherwise.
 fn cohort_target_member(scope: &str) -> Option<&'static str> {
@@ -2077,16 +2116,17 @@ pub fn cosign_payload(author: &str, state: &str, event: &RowId, asserted_at_ms: 
 }
 
 /// The payload of a `trust:accepts:v1` acceptance edge (a `delegates_to`
-/// from `granter` to the trusted key or root, the row's `sub`): the edge's
-/// `scope`, its `trust_classes` (the v1.3 `trust_domains`), its
-/// `valid_until` (the v1.3 `expires_at`), placed at `cohort_scope` (`self`
-/// for an anonymous grant). `trust_type` is no member (CC: structure
-/// carries it).
+/// from `granter` to the trusted key or root, the row's `sub`): its
+/// `trust_classes` (the v1.3 `trust_domains`), its `valid_until` (the v1.3
+/// `expires_at`), placed at `cohort_scope` (`self` for an anonymous grant).
+/// `trust_type` is no member (CC: structure carries it).
 ///
+/// v62.0.0 (R2-accept; the Constitution's `trust-accepts` rule) — the edge
+/// **carries no `scope`**. An edge to a root names the bundle it attaches on
+/// (`attached_head_digest`, a hash digest); a caller that names one adds it.
 #[must_use]
 pub fn trust_accepts_payload(
     granter: &str,
-    scope: &[&str],
     trust_classes: &[String],
     valid_until_ms: Option<u64>,
     cohort_scope: &str,
@@ -2098,10 +2138,6 @@ pub fn trust_accepts_payload(
         (
             "dimension",
             text(crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION),
-        ),
-        (
-            "scope",
-            Value::Array(scope.iter().map(|s| text(s)).collect()),
         ),
         ("cohort_scope", text(cohort_scope)),
     ];

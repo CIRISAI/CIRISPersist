@@ -79,6 +79,11 @@ pub struct ConsentExpirySweepReport {
     pub emitted: usize,
     /// Lapsed grants the emit refused (logged); re-tried next pass.
     pub skipped: usize,
+    /// v62.0.0 (D2) — the pass did not run: this node is an UNOWNED node,
+    /// which records no lapse (`consent:state:expired` is a node's report
+    /// under `infra:attest` from its owner, CC 3.4.7). Every count is 0.
+    #[serde(default)]
+    pub unowned: bool,
     /// The scan filled every page — grants beyond were not examined.
     pub scan_truncated: bool,
 }

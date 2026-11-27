@@ -297,6 +297,9 @@ pub mod bodies {
     }
 
     async fn put(d: &dyn FederationDirectory, a: Attestation) -> Result<(), Error> {
+        // v62.0.0 (HEAD-fix1; CC 2.4.1.1) — the row names its head, as its
+        // producer states it, so the door reaches the gate this asks about.
+        let a = e2::headed_row(d, &a).await?;
         d.put_attestation(SignedAttestation { attestation: a })
             .await
             .map(|_| ())
@@ -529,7 +532,7 @@ pub mod key_grant_arms {
         ts::register_hybrid_key_as(n.backend, recipient, recipient, USER).await;
         let recipient = e2::kid(recipient);
         n.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: e2::kid_or_keep(identity),
                 occurrence_key_id: recipient.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -558,7 +561,7 @@ pub mod key_grant_arms {
         // identity-ref.
         let owner_k = e2::kid(&owner);
         a.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner_k.clone(),
                 occurrence_key_id: a.key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -686,7 +689,7 @@ pub mod key_grant_arms {
         // identity-ref.
         let owner_k = e2::kid(&owner);
         a.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner_k.clone(),
                 occurrence_key_id: a.key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -829,7 +832,7 @@ pub mod key_grant_arms {
         // identity-ref.
         let owner_k = e2::kid(&owner);
         a.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner_k.clone(),
                 occurrence_key_id: a.key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -919,6 +922,30 @@ pub mod key_grant_arms {
                 .unwrap()
                 .is_none(),
             "{tag} I1221: a refused row projects nothing"
+        );
+        // v62.0.0 (HOLD-1d) — I6727: a four-day-old row asked again as a
+        // RE-JUDGEMENT of a row this node first held one second after it was
+        // signed (the chain standing then, inside W): admitted, whatever the
+        // clock reads now; asked at the clock it is stale (the premise).
+        // Kills: the key-grant W bound reading `clock::now()` on a re-fold.
+        let r3 = recipient_of(a, &owner_k, &format!("{tag}-i1221-r3-{run}")).await;
+        let old = sign_row_unstored_at(&delegate, &set_for(&r3), now - chrono::Duration::days(4))
+            .await
+            .attestation;
+        let at_clock = crate::federation::key_grant::check_key_grant_row_admission(dir, &old).await;
+        assert!(
+            matches!(&at_clock, Err(Error::AssertedAtStale { .. })),
+            "{tag} I6727 premise: asked at the clock the row is stale: {at_clock:?}"
+        );
+        let at_receipt = crate::federation::attestation_admit::at_original_receipt(
+            Some(old.asserted_at + chrono::Duration::seconds(1)),
+            crate::federation::key_grant::check_key_grant_row_admission(dir, &old),
+        )
+        .await;
+        assert!(
+            at_receipt.is_ok(),
+            "{tag} I6727 (HOLD-1d): a key-grant row first held inside W is judged at that \
+             receipt: {at_receipt:?}"
         );
         // A row whose attester is not its signer speaks for no one. Kills:
         // the self-signed test weakened from OR to AND.

@@ -850,38 +850,24 @@ pub(crate) async fn i549_counters_equal_the_probe(
     let local = LocalCounters::install();
     let consent = asb::seed_consent_corpus(d, s).await;
     let (t, node) = (consent.target.as_str(), consent.subjects[0].as_str());
-    let (root, a, b) = (
-        format!("i549-root-{s}"),
-        format!("i549-a-{s}"),
-        format!("i549-b-{s}"),
-    );
+    let (a, b) = (format!("i549-a-{s}"), format!("i549-b-{s}"));
     let (owner, dev) = (format!("i549-owner-{s}"), format!("i549-dev-{s}"));
     let (owner_s, dev_s) = (owner.clone(), dev.clone());
-    asb::keys(
-        d,
-        &[
-            (&root, USER),
-            (&a, USER),
-            (&b, USER),
-            (&owner, USER),
-            (&dev, NODE),
-        ],
-    )
-    .await;
+    asb::keys(d, &[(&a, USER), (&b, USER), (&owner, USER), (&dev, NODE)]).await;
     // v62 (E4): the builders' rows are edition-2 mapped rows; their
     // statements go through the statement door.
-    e2::put_signed(
-        d,
-        &asb::charter(&format!("i549-charter-{s}"), &root, &a, &b),
-    )
-    .await
-    .expect("I549 charter");
-    crate::federation::operational::test_support::emit_trust_edge(d, &a, &root, None)
+    // v62.0.0 (R2-fixture; CC 3.2 T5) — the root is the bundle's LINEAGE (the
+    // bundle in force; its `charter` is no row), and `a` accepts it.
+    crate::federation::operational::test_support::ensure_e2_genesis(d)
+        .await
+        .expect("I549 the bundle in force");
+    crate::federation::operational::test_support::accept_lineage_e2(d, &a)
         .await
         .expect("I549 a trusts the root");
     let _ = read_probe::take();
     // v62 (E4): the folds name each key by its identity-ref.
-    let (root, a, owner, dev) = (e2::kid(&root), e2::kid(&a), e2::kid(&owner), e2::kid(&dev));
+    let root = crate::federation::edition2::fixture_genesis::FAMILY_KEY_ID.to_owned();
+    let (a, owner, dev) = (e2::kid(&a), e2::kid(&owner), e2::kid(&dev));
 
     // The admission of one row, then the folds.
     let mut probe_reads = 0;

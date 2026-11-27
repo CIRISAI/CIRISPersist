@@ -138,17 +138,14 @@ fn weighted(k: &ciris_crypto::composite::CompositeSigningKey, on: &str, at: u64)
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
         ("weight", Value::Uint(2_500_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
     ]);
     sign_row_statement(
         k,
         &iref(k),
         on,
         "scores",
-        "evidence:.suite:.kind:.cell:.prefix",
+        "coherence_standing:.cohort",
         &payload,
         vec![],
     )
@@ -203,7 +200,9 @@ async fn body(d: &dyn FederationDirectory) {
     forged.weight = Some(9.0);
     let e = d
         .put_attestation(SignedAttestation {
-            attestation: forged,
+            attestation: crate::federation::edition2::fixture_switch::headed_row(&*d, &forged)
+                .await
+                .expect("HEAD-fix1: the row names its head"),
         })
         .await
         .unwrap_err();
@@ -256,7 +255,7 @@ fn digest(n: u8) -> Value {
 fn i2924_the_mapping_renders_digests_as_hex() {
     let mut row = delegation(None);
     // A score row of the vector family citing two blobs.
-    row.family = "evidence:.suite:.kind:.cell:.prefix".into();
+    row.family = "coherence_standing:.cohort".into();
     row.row_type = "scores".into();
     row.payload = map(vec![
         ("asserted_at", Value::Uint(5_000)),
@@ -284,7 +283,7 @@ fn i2924_the_mapping_renders_digests_as_hex() {
         "I2924 a family's digest member is hex"
     );
     // A non-digest member of another family is left as it is.
-    row.family = "evidence:.suite:.kind:.cell:.prefix".into();
+    row.family = "coherence_standing:.cohort".into();
     row.payload = map(vec![
         ("asserted_at", Value::Uint(5_000)),
         ("content_sha256", digest(0x72)),
@@ -316,17 +315,14 @@ async fn purge_body(d: &dyn FederationDirectory) {
                 Value::Bytes(blob.to_vec()),
             ])]),
         ),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
     ]);
     let st = sign_row_statement(
         &k,
         &iref(&k),
         &iref(&k),
         "scores",
-        "evidence:.suite:.kind:.cell:.prefix",
+        "coherence_standing:.cohort",
         &payload,
         vec![],
     )
