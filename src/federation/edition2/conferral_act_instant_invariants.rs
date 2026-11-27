@@ -132,12 +132,17 @@ pub(crate) async fn i4319_an_act_is_judged_at_its_own_instant_within_w(
             .await
             .unwrap_or_else(|e| panic!("I4319 {who}: the owner's withdrawal: {e}"));
         for (what, row) in [("the acceptance", &acc), ("the withdrawal", &w)] {
+            let rid = RowId(e2::rid_digest(row));
+            // KR-fix29 — on a red, name where the row went (held, and why;
+            // or no fold record at all).
             assert!(
                 d.get_attestation(&e2::rid(row))
                     .await
                     .expect("I4319: reads")
                     .is_some(),
-                "I4319 {who}: {what} LANDED"
+                "I4319 {who}: {what} LANDED; fold state {:?}; held {:?}",
+                d.fold_state(&rid).await,
+                fold::why_held(d, &rid).await
             );
         }
     }
@@ -203,6 +208,183 @@ pub(crate) async fn i4319_an_act_is_judged_at_its_own_instant_within_w(
     }
 }
 
+/// **I4344** (KR-fix33b; KR-fix33 (1), CC 3.1.2.1, G0 v3 §4). Two halves of
+/// the production build-signing predicate
+/// (`admission::pipeline_has_infra_attest_standing`, asked with
+/// `BUILD_MANIFEST_STANDING_DIMENSION` exactly as `namespace::is_trust_root`
+/// asks it):
+///
+/// - a worker under a counted root grant of `infra:attest`, accepted by its
+///   owner, HAS the standing for an act signed while the conferral stands (the
+///   positive case the versionless constant made silently false), and had none
+///   before the acceptance;
+/// - the same act received more than W later, the acceptance withdrawn: the
+///   predicate answers `false` and leaves NO hold mark on the running fold
+///   attempt, while `conferred_for_act` itself, asked the same, marks
+///   `asserted_at_stale` (so the mark existed and `fold::unmarked` dropped it).
+///
+/// The late receipt reads the node's clock through the clock seam (nextest
+/// runs each test in its own process; the clock is uninstalled before any
+/// assertion).
+pub(crate) async fn i4344_a_root_granted_pipeline_has_standing(
+    d: &dyn FederationDirectory,
+    node_seed: &str,
+) {
+    use crate::federation::admission::{
+        pipeline_has_infra_attest_standing, BUILD_MANIFEST_STANDING_DIMENSION,
+    };
+    use crate::federation::types::delegation_scope::INFRA_ATTEST;
+    let head = install_v2(d).await.expect("I4344: installs").object_id;
+    let node = accepting_node(d, node_seed).await;
+    assert_eq!(
+        d.node_key_id().as_deref(),
+        Some(node.as_str()),
+        "I4344 premise: the runner gave the store this node's identity"
+    );
+    let (worker, owner) = worker_with_owner(d, "kr-i4344").await;
+    let at = grant_instant(d).await;
+    let grant = land_grant(d, &worker, INFRA_ATTEST, &head, at, "I4344").await;
+    let standing = |act_at: DateTime<Utc>| {
+        let worker = worker.clone();
+        async move {
+            pipeline_has_infra_attest_standing(
+                d,
+                &worker,
+                BUILD_MANIFEST_STANDING_DIMENSION,
+                act_at,
+            )
+            .await
+            .expect("I4344: the predicate reads")
+        }
+    };
+    assert!(
+        !standing(crate::host::clock::now()).await,
+        "I4344: no standing before the owner accepts"
+    );
+    owner_accepts(d, &owner, &grant, "I4344").await;
+    let acc_id = crate::federation::admission::root_grants_for(
+        d,
+        &worker,
+        crate::host::clock::now() + Duration::seconds(1),
+    )
+    .await
+    .expect("I4344: root_grants_for")
+    .first()
+    .and_then(|g| g.acceptance_row_id.clone())
+    .expect("I4344: the acceptance that gives the consent");
+    let acc = d
+        .get_attestation(&acc_id)
+        .await
+        .expect("I4344: reads")
+        .expect("I4344: the acceptance is held");
+    let t0 = acc.asserted_at;
+    let live = t0 + Duration::seconds(1);
+    assert!(
+        standing(live).await,
+        "I4344: an act signed while the accepted root grant stands HAS the build-signing \
+         standing through the production predicate"
+    );
+
+    // The acceptance withdrawn at T0 + 2 s; the act received more than W after
+    // its signed instant.
+    let w = e2::composer_of_at(
+        attestation_type::WITHDRAWS,
+        &acc,
+        &owner,
+        t0 + Duration::seconds(2),
+    );
+    e2::put_signed(d, &w)
+        .await
+        .unwrap_or_else(|e| panic!("I4344: the owner's withdrawal: {e}"));
+    let late = live + Duration::seconds(PAST_FRESHNESS_W_SECS) + Duration::hours(1);
+    let scope = crate::federation::trust_root::attest_scope_for_dimension(
+        BUILD_MANIFEST_STANDING_DIMENSION,
+    )
+    .expect("I4344: the build-manifest family scope");
+    crate::host::clock::install(std::sync::Arc::new(crate::host::clock::FixedClock::new(
+        late,
+    )));
+    let (answer, att) = fold::attempt(
+        RowId([0x44; 32]),
+        None,
+        pipeline_has_infra_attest_standing(d, &worker, BUILD_MANIFEST_STANDING_DIMENSION, live),
+    )
+    .await;
+    let (raw, raw_att) = fold::attempt(
+        RowId([0x45; 32]),
+        None,
+        conferred_for_act(d, &node, &worker, &scope, live, late),
+    )
+    .await;
+    crate::host::clock::uninstall();
+    assert_eq!(
+        raw_att.held.as_ref().map(|(r, _)| r.as_str()),
+        Some(reason::ASSERTED_AT_STALE),
+        "I4344 premise: the conferral read itself marks asserted_at_stale ({raw:?})"
+    );
+    assert!(
+        !answer.expect("I4344: the predicate answers"),
+        "I4344: a stale act has no standing"
+    );
+    assert!(
+        att.held.is_none(),
+        "I4344: the predicate's swallowed stale answer leaves no hold mark on the running \
+         attempt: {:?}",
+        att.held
+    );
+}
+
+/// **I4345** (KR-fix33b; KR-fix33 (2)'s bound). A `Pending` outcome re-folds
+/// the readers of its own row only when the kept statement is NEW
+/// (`fold::pending_refold_keys`): a re-offer of a statement already kept, or
+/// any other outcome, re-runs nothing on that path. A row that stays
+/// `Pending` therefore re-runs its readers once per new voice, never on every
+/// later touch; the cascade after it is bounded by `fold::MAX_REFOLD_STEPS`
+/// and enqueues dependents only on a change. Pure.
+#[test]
+fn i4345_a_pending_row_refolds_its_readers_only_when_new() {
+    use super::ingest::StatementOutcome;
+    let row = RowId([0x46; 32]);
+    let keys = fold::pending_refold_keys(&StatementOutcome::Pending {
+        row_id: row,
+        new: true,
+    })
+    .expect("I4345: a NEW keep re-folds its readers");
+    assert_eq!(
+        keys,
+        [fold::Dep::Row(row).read_key()].into_iter().collect(),
+        "I4345: exactly the row's own readers"
+    );
+    assert!(
+        fold::pending_refold_keys(&StatementOutcome::Pending {
+            row_id: row,
+            new: false
+        })
+        .is_none(),
+        "I4345: a re-offer of a kept statement re-runs nothing"
+    );
+    for other in [
+        StatementOutcome::Row {
+            row_id: row,
+            new: true,
+        },
+        StatementOutcome::Voice {
+            row_id: row,
+            new: true,
+        },
+        StatementOutcome::KeyPlane {
+            row_id: row,
+            new: true,
+        },
+    ] {
+        assert!(
+            fold::pending_refold_keys(&other).is_none(),
+            "I4345: not this path's: {other:?}"
+        );
+    }
+    assert!(fold::MAX_REFOLD_STEPS > 0, "I4345: one pass is bounded");
+}
+
 #[cfg(feature = "sqlite")]
 mod sqlite {
     async fn store() -> crate::store::sqlite::SqliteBackend {
@@ -212,6 +394,17 @@ mod sqlite {
             .unwrap();
         b.run_migrations().await.unwrap();
         b
+    }
+
+    #[tokio::test]
+    async fn i4344_a_root_granted_pipeline_has_standing_sqlite() {
+        let b = store().await;
+        b.set_node_key_id(super::e2::kid("kr-i4344-node"));
+        Box::pin(super::i4344_a_root_granted_pipeline_has_standing(
+            &b,
+            "kr-i4344-node",
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -234,6 +427,19 @@ mod postgres {
             .unwrap();
         b.run_migrations().await.unwrap();
         Some(b)
+    }
+
+    #[tokio::test]
+    async fn i4344_a_root_granted_pipeline_has_standing_postgres() {
+        let Some(b) = store().await else {
+            return;
+        };
+        b.set_node_key_id(super::e2::kid("kr-i4344-node"));
+        Box::pin(super::i4344_a_root_granted_pipeline_has_standing(
+            &b,
+            "kr-i4344-node",
+        ))
+        .await;
     }
 
     #[tokio::test]

@@ -36,10 +36,7 @@ fn score_row(k: &ciris_crypto::composite::CompositeSigningKey, at: u64) -> Vec<u
         ("author", Value::Text(iref(k))),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
         (
             "refs",
             map(vec![(
@@ -53,7 +50,7 @@ fn score_row(k: &ciris_crypto::composite::CompositeSigningKey, at: u64) -> Vec<u
         &iref(k),
         &iref(k),
         "scores",
-        "evidence:.suite:.kind:.cell:.prefix",
+        "coherence_standing:.cohort",
         &payload,
         vec![],
     )
@@ -141,8 +138,7 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
     let st2 = score_row(&k, 6_000);
     let admitted = admit_row(&st2, &keys, None, SelectContext::default()).unwrap();
     let mut forged = attestation_of(&admitted, INGEST_TIER).unwrap();
-    forged.attestation_envelope["dimension"] =
-        serde_json::json!("evidence:safety_battery:capture:a:c:v1");
+    forged.attestation_envelope["dimension"] = serde_json::json!("coherence_standing:cac:v1");
     forged.original_content_hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
         crate::verify::canonical::ceg_produce_canonicalize(&forged.attestation_envelope).unwrap(),
     ));
