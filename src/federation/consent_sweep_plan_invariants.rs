@@ -62,7 +62,7 @@ pub(crate) mod bodies {
     /// v62.0.0 (JSON cut, E7) — a dimension Verify's family matcher
     /// registers (the fixtures' `x:v1` is not; an edition-2 row of it is
     /// refused at the door).
-    const DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
+    const DIMENSION: &str = "coherence_standing:cab:v1";
 
     /// `owner` binds `node`: the owner's row, then the node's own statement
     /// over it (RULINGS C557).

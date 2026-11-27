@@ -85,6 +85,8 @@ fn i3550_reason_tokens_and_read_keys_are_pinned() {
             "withdraws_not_admitted",
             "asserted_at_stale",
             "composer_family_mismatch",
+            // v62.0.0 (FS-class) — appended.
+            "withdraws_class_unread",
         ],
         "I3550: the core reason tokens are appended, never reordered"
     );
@@ -757,7 +759,7 @@ fn age_witness(witness: &str, subject: &str, band: &str, ago: chrono::Duration) 
 }
 
 /// I3559 (v4): the steward-binding exemplar's conclude and un-conclude legs.
-/// A witness conferred `infra:attest:assurance` by a rooted trust root
+/// A witness conferred `assure:age` (v62.0.0, D3) by a rooted trust root
 /// proves the guardian adult; the guardian's custody binding over a person
 /// is held `steward_unproven` until the witness proves the person a minor
 /// (the re-fold concludes it), and un-concludes when a later witness row
@@ -773,7 +775,7 @@ pub(crate) async fn steward_conclude_unconclude_body(d: &dyn FederationDirectory
     let grant = confers_statement(
         &r,
         &witness_kid,
-        &[crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE],
+        &[crate::federation::types::delegation_scope::ASSURE_AGE],
         e2::ms(crate::host::clock::now() - chrono::Duration::minutes(5)),
     );
     e2::put_statement(d, &grant)

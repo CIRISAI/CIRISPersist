@@ -394,7 +394,7 @@ pub(crate) mod bodies {
                 }),
                 persist_row_hash: String::new(),
             };
-            d.put_identity_occurrence_local(row)
+            d.test_seam_put_identity_occurrence(row)
                 .await
                 .expect("I1122-D: the occurrence lands");
             assert_eq!(

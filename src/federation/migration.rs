@@ -605,6 +605,9 @@ impl ExclusionClass {
 /// the protective direction). It inherits the refusal from this table, on
 /// both purge doors and on the serve read, rather than from a special case in
 /// any door.
+///
+/// Replaced by the family model's `accountability_record` column when
+/// CIRISConstitution adds it (after v62.0).
 pub const ACCOUNTABILITY_RECORD_PREFIXES: &[&str] = &[
     "revocation:",
     "key:revocation",

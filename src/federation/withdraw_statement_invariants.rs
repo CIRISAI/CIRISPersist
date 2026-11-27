@@ -27,6 +27,9 @@
 //! - **I4311** a COUNTED row is rule 0's: rules 1 to 4 do not reach it (not a
 //!   voice of it, not a subject it names).
 //! - **I4312** a subject takes back their OWN act (the consent they gave).
+//! - **I4330** (KR-fix30) room write standing is judged at the row's own
+//!   instant: before joining refused; inside the membership lands in either
+//!   arrival order and stays landed after leaving; after leaving refused.
 //!
 //! sqlite and postgres.
 
@@ -433,15 +436,11 @@ pub(crate) async fn i4299_a_retraction_placed_outside_any_room(e: &crate::Engine
     };
     // A third party: not the attester, not a subject, no member.
     for scope in [SELF, FEDERATION] {
-        // KR-fix21 — the shared emit path answers `Ok(row id)` for a held
-        // statement too: the row's state is read back.
-        let result = match e
+        // KR-fix21 / VD-step2 — the shared emit path answers the row's
+        // STATE (landed / held), never a bare `Ok(row id)`.
+        let result = e
             .emit_attestation(&ts::local_signer(&stranger_seed), outside(scope))
-            .await
-        {
-            Ok(id) => e.voice_status(&id).await,
-            Err(err) => Err(err),
-        };
+            .await;
         not_retracted(
             d,
             result,
@@ -621,10 +620,25 @@ pub(crate) async fn i4310_a_former_member_retracts_their_own_row(
     .await;
 
     // Their OWN row: retracted, in the room.
+    // KR-fix29 — on a red, name the own row's fold state (the build of
+    // 01ba09cb found it no longer landed: see P/KR-red-4vt.md).
+    let mine_rid = crate::federation::edition2::names::RowId(e2::rid_digest(&mine));
+    let mine_state = (
+        d.get_attestation(&e2::rid(&mine))
+            .await
+            .map(|r| r.is_some()),
+        d.fold_state(&mine_rid).await,
+    );
     let wid = landed_id(
         e.withdraw_statement(&k_signer, &e2::rid(&mine))
             .await
-            .expect("I4310: a former member retracts their own room row"),
+            .unwrap_or_else(|err| {
+                panic!(
+                    "I4310: a former member retracts their own room row: {err:?}; the row: \
+                     landed {:?}, fold state {:?}",
+                    mine_state.0, mine_state.1
+                )
+            }),
         "I4310",
     );
     let w = d
@@ -1143,6 +1157,103 @@ async fn i4310_sqlite() {
         &sqlite_engine("i4310-b").await,
     ))
     .await;
+}
+
+/// Let the clock move past every millisecond stamped so far.
+async fn tick() {
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+}
+
+/// **I4330** (KR-fix30; the lead's ruling of 2026-11-22 on I4310: "a row a
+/// member wrote while a member counted when it was made"). Room write
+/// standing is judged at the ROW's own instant (within W), never "now":
+///
+/// - a row dated BEFORE K joined is refused (nothing lands), even offered
+///   after K joined;
+/// - a row dated INSIDE K's membership lands whether it arrives while K is
+///   a member or after K left (both arrival orders, the same answer), and a
+///   row that landed while K was a member stays landed after K leaves;
+/// - a row dated AFTER K left is refused.
+pub(crate) async fn i4330_write_standing_at_the_rows_own_instant(e: &crate::Engine) {
+    use crate::federation::open_admission_invariants::bodies::remove;
+    let dir = e.federation_directory();
+    let d: &dyn FederationDirectory = dir.as_dyn_directory();
+    let s = suffix();
+    let (cid, founder, k, _p) = room_with_accepted_proposal(d, "i4330", &s).await;
+    let landed = |row: Attestation| async move {
+        d.get_attestation(&e2::rid(&row))
+            .await
+            .expect("I4330: reads")
+            .is_some()
+    };
+
+    // Dated before K joins.
+    let before = room_row(&k, &founder, &cid);
+    tick().await;
+    assert_eq!(grows(d, &cid, &founder, &k).await, Ok(()), "I4330: K joins");
+    tick().await;
+    let _ = put_e2(d, &before).await;
+    assert!(
+        !landed(before.clone()).await,
+        "I4330: a row dated before K joined is refused, though offered after"
+    );
+
+    // Dated inside the membership: one put now, one held back.
+    let early = room_row(&k, &founder, &cid);
+    let late = room_row(&k, &founder, &cid);
+    put_e2(d, &early)
+        .await
+        .expect("I4330: a member's row, while a member");
+    assert!(landed(early.clone()).await, "I4330: it lands");
+
+    // K leaves.
+    tick().await;
+    let left = remove(d, &cid, &[&k], &k, Utc::now()).await;
+    assert!(
+        matches!(
+            left,
+            Ok(crate::federation::edition2::ingest::StatementOutcome::Row { .. })
+        ),
+        "I4330: K resigns: {left:?}"
+    );
+    tick().await;
+    assert!(
+        landed(early.clone()).await,
+        "I4330: the row K wrote while a member stays landed after K leaves (no re-fold by now)"
+    );
+    put_e2(d, &late)
+        .await
+        .expect("I4330: a row dated inside the membership, arriving after K left");
+    assert!(
+        landed(late.clone()).await,
+        "I4330: it lands, as the one that arrived while K was a member did"
+    );
+
+    // Dated after K left.
+    let after = room_row(&k, &founder, &cid);
+    let _ = put_e2(d, &after).await;
+    assert!(
+        !landed(after.clone()).await,
+        "I4330: a row dated after K left is refused"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i4330_sqlite() {
+    Box::pin(i4330_write_standing_at_the_rows_own_instant(
+        &sqlite_engine("i4330-a").await,
+    ))
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i4330_postgres() {
+    let Some(a) = pg_engine("i4330-a").await else {
+        return;
+    };
+    Box::pin(i4330_write_standing_at_the_rows_own_instant(&a)).await;
 }
 
 #[cfg(feature = "postgres")]

@@ -3,7 +3,8 @@
 //!
 //! Every other root-grant witness uses the fixture bundle, whose charter
 //! carries `infra:attest` and `infra:serve` only. The doors that gate a
-//! worker's statements ask for `infra:detect`, `infra:attest_assurance`,
+//! worker's statements ask for `infra:detect`, `assure:age` (v62.0.0, D3; was
+//! `infra:attest_assurance`),
 //! `infra:record_hard_case` and `slash`, which that charter cannot confer,
 //! so no witness put a real statement through a production door under a root
 //! grant. This one does.
@@ -15,14 +16,15 @@
 //! accept its root; each is its own node identity. Two holders confer, by
 //! counted grants over that bundle:
 //!
-//! - `infra:detect` and `infra:attest_assurance` on a detector (an `agent`
+//! - `infra:detect` and `assure:age` (D3) on a detector (an `agent`
 //!   key; its OWNER accepts);
 //! - `infra:serve` on a `node` worker (its OWNER accepts).
 //!
 //! Then, through the real statement door (`put_statement`):
 //!
 //! - the detector's `detection:{detector}` row (`infra:detect`) LANDS on A;
-//! - its `age_assurance:provider:adult:v1` row (`infra:attest_assurance`)
+//! - its `age_assurance:provider:adult:v1` row (`assure:age`, which the
+//!   baked charter carries beside `assure:capacity`)
 //!   LANDS on A;
 //! - the worker holds a delegation seat for peer rooting (`infra:serve`).
 //!
@@ -40,7 +42,22 @@
 //! "Delivered after W" cannot be driven through the door without moving the
 //! node's clock; I4319 states it at the shared function.
 //!
+//! **I4326** (KR-fix25; CC 3.1.2.1) — a pipeline granted `infra:attest` by
+//! the root and accepted by its owner has build-signing standing on the
+//! delegation plane at its act's instant (`admission::pipeline_has_infra_attest_standing`,
+//! which `namespace::is_trust_root` and `holdings_authority` read); its build
+//! manifest lands; not before the acceptance, not for another capability,
+//! not for an act after the acceptance's withdrawal.
+//!
 //! sqlite and postgres.
+//!
+//! - **I5711** (v62.0.0, FS-sig-b; CC 3.1.5.5, the rc22-pre3 family model's
+//!   `evidence` signer cell, `seat_role(infra:attest)`) — on one node holding
+//!   the fixture ceremony under the production charter scope (as I4320): an
+//!   `evidence:*` row by the detector, conferred `infra:attest` by a counted
+//!   grant its owner accepted (the parent covers the `evidence` family's
+//!   scope, KR-fix25b), LANDS; the same row shape by a registered key with
+//!   no conferral is HELD `reserved_prefix_emitter_mismatch`, no typed row.
 
 use chrono::{DateTime, Duration, Utc};
 use ciris_verify_core::cde::Value;
@@ -60,7 +77,9 @@ use crate::derived::types::{ConformityVariant, DetectionSeverity};
 use crate::derived::DetectionEvent;
 use crate::federation::trust_root::INFRA_SERVE_SCOPE;
 use crate::federation::types::attestation_type;
-use crate::federation::types::delegation_scope::{INFRA_ATTEST_ASSURANCE, INFRA_DETECT};
+use crate::federation::types::delegation_scope::{
+    ASSURE_AGE, ASSURE_CAPACITY, INFRA_ATTEST_ASSURANCE, INFRA_DETECT,
+};
 use crate::federation::{Attestation, FederationDirectory};
 
 const DETECTOR_SEED: &str = "kr-i4320-det";
@@ -254,7 +273,7 @@ pub(crate) async fn i4320_the_production_charter_confers_what_the_doors_check(
     node_b: &str,
 ) {
     let scope = production_charter_scope();
-    for needed in [INFRA_DETECT, INFRA_ATTEST_ASSURANCE, INFRA_SERVE_SCOPE] {
+    for needed in [INFRA_DETECT, ASSURE_AGE, ASSURE_CAPACITY, INFRA_SERVE_SCOPE] {
         assert!(
             scope.iter().any(|s| s == needed),
             "I4320 premise: the baked production charter carries {needed}: {scope:?}"
@@ -272,15 +291,7 @@ pub(crate) async fn i4320_the_production_charter_confers_what_the_doors_check(
 
     // Two holders confer the three scopes on A; the owners accept.
     let detect = land_grant(a, &detector, INFRA_DETECT, &head, grant_at, "I4320 detect").await;
-    let assure = land_grant(
-        a,
-        &detector,
-        INFRA_ATTEST_ASSURANCE,
-        &head,
-        grant_at,
-        "I4320 assure",
-    )
-    .await;
+    let assure = land_grant(a, &detector, ASSURE_AGE, &head, grant_at, "I4320 assure").await;
     let serve = land_grant(
         a,
         &worker,
@@ -317,7 +328,7 @@ pub(crate) async fn i4320_the_production_charter_confers_what_the_doors_check(
     must_land_row(
         a,
         &age_live,
-        "I4320 A: an age_assurance row by a key conferred infra:attest_assurance by the root",
+        "I4320 A: an age_assurance row by a key conferred assure:age by the root",
     )
     .await;
     let v = rooted(a, &reader_a, &worker, at(live)).await;
@@ -350,7 +361,7 @@ pub(crate) async fn i4320_the_production_charter_confers_what_the_doors_check(
     // only then the acts dated before them (late, inside W) ────────────────
     for (g, scope, grantee, what) in [
         (&detect, INFRA_DETECT, &detector, "I4320 B detect"),
-        (&assure, INFRA_ATTEST_ASSURANCE, &detector, "I4320 B assure"),
+        (&assure, ASSURE_AGE, &detector, "I4320 B assure"),
         (&serve, INFRA_SERVE_SCOPE, &worker, "I4320 B serve"),
     ] {
         let on_b = land_grant(b, grantee, scope, &head, grant_at, what).await;
@@ -404,9 +415,16 @@ pub(crate) async fn i4320_the_production_charter_confers_what_the_doors_check(
     for (who, d, reader) in [("A", a, &reader_a), ("B", b, &reader_b)] {
         let before = rooted(d, reader, &worker, at(live)).await;
         let from = rooted(d, reader, &worker, at(after)).await;
+        // KR-fix29 — on a red, name the serve acceptance's fold state.
+        let acc_rid = RowId(e2::rid_digest(&acc_serve));
         assert!(
             matches!(before, PeerRooting::Rooted { .. }),
-            "I4320 {who}: the seat as of before the withdrawal: {before:?}"
+            "I4320 {who}: the seat as of before the withdrawal: {before:?}; the serve acceptance: \
+             row {:?}, fold state {:?}",
+            d.get_attestation(&acc_serve.attestation_id)
+                .await
+                .map(|r| r.is_some()),
+            d.fold_state(&acc_rid).await
         );
         assert!(
             matches!(from, PeerRooting::NotRooted { .. }),
@@ -589,6 +607,257 @@ pub(crate) async fn i4321_the_holders_withdrawal_ends_the_grant_from_its_instant
     }
 }
 
+/// A `provenance:build_manifest:{target}` Contribution by the pipeline
+/// `seed` (CC 3.1.2.1: a `scores` row at `cohort_scope: federation`), its
+/// instant stated.
+fn build_manifest(seed: &str, ts: DateTime<Utc>) -> Attestation {
+    let mut a = crate::federation::genesis::ordinary_scores_row(
+        &uuid::Uuid::new_v4().to_string(),
+        &e2::kid(seed),
+    );
+    a.attested_key_id = e2::kid(seed);
+    a.asserted_at = ts;
+    a.scrub_timestamp = ts;
+    a.cohort_scope = crate::federation::types::cohort_scope::FEDERATION.to_owned();
+    a.attestation_envelope = serde_json::json!({
+        "id": a.attestation_id,
+        "dimension": "provenance:build_manifest:ciris-agent-x86_64",
+        "score": 1.0,
+    });
+    e2::row_of(&a, seed)
+}
+
+/// The build-manifest dimension I4326's pipelines sign.
+const MANIFEST_DIM: &str = "provenance:build_manifest:ciris-agent-x86_64";
+
+/// Does `key` hold `infra:attest` standing for `dimension`'s family at `t`
+/// (KR-fix25's one predicate)?
+async fn standing_for(
+    d: &dyn FederationDirectory,
+    key: &str,
+    dimension: &str,
+    t: DateTime<Utc>,
+) -> bool {
+    crate::federation::admission::pipeline_has_infra_attest_standing(d, key, dimension, t)
+        .await
+        .expect("KR-fix25: the standing reads")
+}
+
+/// [`standing_for`] a build manifest.
+async fn standing(d: &dyn FederationDirectory, key: &str, t: DateTime<Utc>) -> bool {
+    standing_for(d, key, MANIFEST_DIM, t).await
+}
+
+/// **I4326** (KR-fix25, KR-fix25b; CC 3.1.2.1, CC 4.5.5, as ruled
+/// 2026-11-22: the family is part of the scope string,
+/// `infra:attest:{dimension_family}`; a held parent covers its child). A
+/// root grant (a counted `trust:confers:v1` grant over the bundle in force)
+/// ACCEPTED by the grantee's owner is build-signing standing on the
+/// delegation plane at the act's own instant when its scope covers
+/// `infra:attest:provenance:build_manifest` (the exact string
+/// `attest_scope_for_dimension` returns for a `provenance:build_manifest:*`
+/// dimension):
+///
+/// - `infra:attest` (the parent) confers, for build manifests and for any
+///   other attest family;
+/// - `infra:attest:provenance:build_manifest` confers for build manifests
+///   and for no other family;
+/// - a sibling family (`infra:attest:detection`) does not;
+/// - `infra:attest_assurance` does not, nor `infra:serve`.
+///
+/// The reader predicate says so, `namespace::is_trust_root` and
+/// `holdings_authority` follow it, and the family-scoped pipeline's build
+/// manifest lands through the real door. Not before the owner's acceptance;
+/// not for an act dated after the owner withdrew it (an act dated before it
+/// keeps its standing).
+///
+/// The bundle is the fixture ceremony with a charter of `infra:attest`,
+/// `infra:attest_assurance` and `infra:serve`
+/// (`fixture_genesis::ceremony_v2_with_scope`), so every grant here lies
+/// inside it. There is no ceremony-plane arm to drive (KR-fix27: one grant
+/// family; an edition-2 key record carries no role).
+pub(crate) async fn i4326_a_root_grant_of_infra_attest_is_pipeline_standing(
+    d: &dyn FederationDirectory,
+    node_seed: &str,
+) {
+    use crate::federation::namespace::{holdings_authority, is_trust_root, AuthorityClass};
+    use crate::federation::types::delegation_scope::INFRA_ATTEST;
+    const FAMILY: &str = "infra:attest:provenance:build_manifest";
+    const OTHER_DIM: &str = "build:registered:id1:v1";
+    assert_eq!(
+        crate::federation::trust_root::attest_scope_for_dimension(MANIFEST_DIM)
+            .expect("I4326: the family scope"),
+        FAMILY,
+        "I4326 premise: the build-manifest family's scope string"
+    );
+    assert_ne!(
+        crate::federation::trust_root::attest_scope_for_dimension(OTHER_DIM)
+            .expect("I4326: another family's scope"),
+        FAMILY,
+        "I4326 premise: OTHER_DIM is another attest family"
+    );
+    let scope: Vec<String> = [INFRA_ATTEST, INFRA_ATTEST_ASSURANCE, INFRA_SERVE_SCOPE]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    let c = ceremony_v2_with_scope(&bundle_v2().spec, &scope);
+    install_ceremony_v2(d, &c)
+        .await
+        .expect("I4326: the bundle installs");
+    accepting_node(d, node_seed).await;
+    let head = c.object_id;
+    let grant_at = grant_instant(d).await;
+    // (tag, scope granted, standing for a build manifest, for another family)
+    let cases = [
+        ("kr-i4326-bare", INFRA_ATTEST, true, true),
+        ("kr-i4326-ci", FAMILY, true, false),
+        ("kr-i4326-sib", "infra:attest:detection", false, false),
+        ("kr-i4326-assure", INFRA_ATTEST_ASSURANCE, false, false),
+        ("kr-i4326-serve", INFRA_SERVE_SCOPE, false, false),
+    ];
+    let mut keys = Vec::new();
+    for (tag, granted, _, _) in cases {
+        let (key, owner) = worker_with_owner(d, tag).await;
+        let grant = land_grant(d, &key, granted, &head, grant_at, tag).await;
+        assert!(
+            !standing(d, &key, crate::host::clock::now()).await,
+            "I4326 {tag}: no standing before the grantee's owner accepts"
+        );
+        owner_accepts(d, &owner, &grant, tag).await;
+        let acc = acceptance_of(d, &key, &grant).await;
+        keys.push((key, owner, acc));
+    }
+    let t0 = keys
+        .iter()
+        .map(|(_, _, acc)| acc.asserted_at)
+        .max()
+        .expect("I4326: acceptances");
+
+    // The four scopes, at the act's instant.
+    for ((tag, granted, for_manifest, for_other), (key, _, _)) in cases.iter().zip(&keys) {
+        assert_eq!(
+            standing(d, key, t0).await,
+            *for_manifest,
+            "I4326 {tag}: a grant of {granted:?} for a build manifest"
+        );
+        assert_eq!(
+            standing_for(d, key, OTHER_DIM, t0).await,
+            *for_other,
+            "I4326 {tag}: a grant of {granted:?} for another attest family"
+        );
+        assert_eq!(
+            is_trust_root(d, key).await.expect("is_trust_root"),
+            *for_manifest,
+            "I4326 {tag}: is_trust_root asks the build-manifest family"
+        );
+    }
+
+    // The family-scoped pipeline: its manifest lands; the readers follow.
+    let (pipe, pipe_owner, acc) = &keys[1];
+    let manifest = build_manifest("w-kr-i4326-ci", t0);
+    must_land_row(d, &manifest, "I4326: the pipeline's build manifest").await;
+    assert!(
+        standing(d, pipe, manifest.asserted_at).await,
+        "I4326: the manifest's signer had standing at its instant"
+    );
+    assert_eq!(
+        holdings_authority(d, pipe)
+            .await
+            .expect("holdings_authority"),
+        AuthorityClass::AccordCoScrub,
+        "I4326: holdings_authority follows the predicate"
+    );
+
+    // The owner withdraws the acceptance, dated just after `t0`.
+    let cut = t0 + Duration::milliseconds(1);
+    let after = t0 + Duration::milliseconds(2);
+    let w = e2::composer_of_at(attestation_type::WITHDRAWS, acc, pipe_owner, cut);
+    must_land_row(d, &w, "I4326: the owner's withdrawal of the acceptance").await;
+    while crate::host::clock::now() <= after {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !standing(d, pipe, after).await,
+        "I4326: an act dated after the withdrawal has no standing"
+    );
+    assert!(
+        standing(d, pipe, t0).await,
+        "I4326: an act dated before it keeps its standing"
+    );
+    assert!(
+        !is_trust_root(d, pipe).await.expect("is_trust_root"),
+        "I4326: and is_trust_root, read now, drops it"
+    );
+    assert_eq!(
+        holdings_authority(d, pipe)
+            .await
+            .expect("holdings_authority"),
+        AuthorityClass::ProducerSteward,
+        "I4326: holdings_authority falls back to the negative default"
+    );
+}
+
+/// An `evidence:safety_battery:capture:{cell}:0123456789abcdef:v1` row by
+/// the key of `seed` about itself, its instant stated.
+fn evidence_row(seed: &str, cell: &str, ts: DateTime<Utc>) -> Attestation {
+    let mut a = crate::federation::genesis::ordinary_scores_row(
+        &uuid::Uuid::new_v4().to_string(),
+        &e2::kid(seed),
+    );
+    a.attested_key_id = e2::kid(seed);
+    a.asserted_at = ts;
+    a.scrub_timestamp = ts;
+    a.attestation_envelope = serde_json::json!({
+        "id": a.attestation_id,
+        "dimension": format!("evidence:safety_battery:capture:{cell}:0123456789abcdef:v1"),
+        "score": 1.0,
+    });
+    e2::row_of(&a, seed)
+}
+
+/// **I5711** — see the module header. The runner gave the store its node
+/// identity (`set_node_key_id`), the key of `node`.
+pub(crate) async fn i5711_an_evidence_row_needs_infra_attest(
+    d: &dyn FederationDirectory,
+    node: &str,
+) {
+    use crate::federation::types::delegation_scope::INFRA_ATTEST;
+    let scope = production_charter_scope();
+    assert!(
+        scope.iter().any(|s| s == INFRA_ATTEST),
+        "I5711 premise: the baked production charter carries infra:attest: {scope:?}"
+    );
+    let c = ceremony_v2_with_scope(&bundle_v2().spec, &scope);
+    let head = c.object_id;
+    let _ = stand_up(d, &c, node).await;
+    let detector = e2::kid(DETECTOR_SEED);
+    let grant_at = grant_instant(d).await;
+    let grant = land_grant(d, &detector, INFRA_ATTEST, &head, grant_at, "I5711").await;
+    owner_accepts(d, DETECTOR_OWNER, &grant, "I5711").await;
+    let accepted = acceptance_of(d, &detector, &grant).await;
+    let live = accepted.asserted_at + Duration::seconds(1);
+
+    must_land_row(
+        d,
+        &evidence_row(DETECTOR_SEED, "c1", live),
+        "I5711: an evidence row by a key conferred infra:attest by the root",
+    )
+    .await;
+
+    let unconferred = evidence_row(SUBJECT, "c2", live);
+    let _ = e2::put_signed(d, &unconferred).await;
+    let st = statement_of(&unconferred);
+    assert!(
+        !landed(d, &st).await,
+        "I5711: an evidence row by a key with no infra:attest does not land"
+    );
+    assert_eq!(
+        why(d, &st).await.map(|(reason, _)| reason).as_deref(),
+        Some(super::fold::reason::gc1::RESERVED_PREFIX_EMITTER_MISMATCH),
+        "I5711: held, by name"
+    );
+}
+
 #[cfg(feature = "sqlite")]
 mod sqlite {
     use crate::federation::edition2::fixture_switch as e2;
@@ -616,6 +885,25 @@ mod sqlite {
                 "kr-i4320-node-b",
             ),
         )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i4326_a_root_grant_of_infra_attest_is_pipeline_standing_sqlite() {
+        let (d, _) = store("kr-i4326-node").await;
+        Box::pin(
+            super::i4326_a_root_grant_of_infra_attest_is_pipeline_standing(&d, "kr-i4326-node"),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i5711_an_evidence_row_needs_infra_attest_sqlite() {
+        let (a, _) = store("fs-i5711-node").await;
+        Box::pin(super::i5711_an_evidence_row_needs_infra_attest(
+            &a,
+            "fs-i5711-node",
+        ))
         .await;
     }
 
@@ -668,6 +956,30 @@ mod postgres {
             ),
         )
         .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i4326_a_root_grant_of_infra_attest_is_pipeline_standing_postgres() {
+        let Some((d, _)) = store("kr-i4326-node").await else {
+            return;
+        };
+        Box::pin(
+            super::i4326_a_root_grant_of_infra_attest_is_pipeline_standing(&d, "kr-i4326-node"),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i5711_an_evidence_row_needs_infra_attest_postgres() {
+        let Some((a, _)) = store("fs-i5711-node").await else {
+            return;
+        };
+        Box::pin(super::i5711_an_evidence_row_needs_infra_attest(
+            &a,
+            "fs-i5711-node",
+        ))
+        .await;
+        eprintln!("i5711 postgres: RAN");
     }
 
     #[tokio::test(flavor = "multi_thread")]

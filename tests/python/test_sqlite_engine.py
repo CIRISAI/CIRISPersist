@@ -727,10 +727,11 @@ def test_put_blob_scoped_aad_b64_binds_the_seal_831() -> None:
 def test_put_blob_scoped_reports_the_roster_partition_843() -> None:
     """#843 (BLOB_ENCRYPTION_AT_REST.md §12.11, I54) — the JSON a Python
     caller reads partitions the ROSTER. The founder of a community write who
-    has no occurrence is ``absent`` and ``readable_by_nobody`` is true — the
-    case CIRISServer#590 / CIRISEdge#599 hit, where ``excluded`` was the only
-    field to read and it said nothing about her. One identity walks
-    absent → excluded → granted; a commons write is readable by everyone.
+    has no occurrence (the case CIRISServer#590 / CIRISEdge#599 hit) or only a
+    bare one is, since v62.0.0 (KR-fix31, CC 5.2), REFUSED by name
+    (``write_author_has_no_wrap_target``, a ValueError) rather than sealed
+    for nobody. Keyed, the founder is granted; a commons write is readable by
+    everyone.
     Skips on a non-sqlite wheel."""
     import base64
     import json
@@ -796,19 +797,18 @@ def test_put_blob_scoped_reports_the_roster_partition_843() -> None:
                 }
             )
 
-        # 1. The founder has NO occurrence: absent, and nobody can read.
-        r = json.loads(eng.put_blob_scoped("community", body, kid))
-        assert r["tier"] == "community_dek", r
-        assert r["granted"] == [] and r["excluded"] == [], r
-        assert r["roster"] == {"granted": [], "excluded": [], "absent": [kid]}, r
-        assert r["readable_by_nobody"] is True, r
+        # 1. The founder (the write's author) has NO occurrence. v62.0.0
+        # (KR-fix31; CC 5.2 "a write its own author cannot open is refused"):
+        # the write is refused by name, a ValueError, not sealed for nobody.
+        with pytest.raises(ValueError) as ei:
+            eng.put_blob_scoped("community", body, kid)
+        assert "blob_invalid_argument: write_author_has_no_wrap_target:" in str(ei.value), ei.value
 
-        # 2. A bare occurrence: the member is excluded, still nobody.
+        # 2. A bare occurrence: still no wrap target for the author, refused.
         eng.put_identity_occurrence_json(occurrence(None))
-        r = json.loads(eng.put_blob_scoped("community", body, kid))
-        assert r["granted"] == [] and r["excluded"] == [kid], r
-        assert r["roster"] == {"granted": [], "excluded": [kid], "absent": []}, r
-        assert r["readable_by_nobody"] is True, r
+        with pytest.raises(ValueError) as ei:
+            eng.put_blob_scoped("community", body, kid)
+        assert "write_author_has_no_wrap_target" in str(ei.value), ei.value
 
         # 3. Keyed: granted, and the content is readable.
         keys = eng.self_enc_pubkeys()

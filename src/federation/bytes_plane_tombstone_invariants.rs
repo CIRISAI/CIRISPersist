@@ -221,14 +221,15 @@ pub mod bodies {
             &[(&alice, &alice_occ)],
         )
         .await;
-        let minter = crate::federation::at_rest_cascade::blob_invariants::node_signer(
+        // v62 (E4-fix6; cut B): the minter is named by the signer's
+        // federation id (its composite identity-ref). v62.0.0 (KR-fix31b;
+        // CC 5.2) — it is alice's owned, keyed device, so the write's author
+        // holds a wrap target.
+        let (_, minter) = crate::federation::community_dek::lifecycle_support::seat_minter(
             b,
+            &alice,
             &format!("i149-minter-{s}"),
         )
-        .await
-        // v62 (E4-fix6; cut B): the minter is named by the signer's
-        // federation id (its composite identity-ref).
-        .federation_id()
         .await;
         let sealed = crate::federation::community_dek::orchestrate::encrypt_and_cascade_community(
             b,
@@ -276,6 +277,30 @@ pub mod bodies {
             matches!(&r, Err(BlobError::NotGranted { .. })),
             "I149: a stranger is NotGranted FIRST on a sealed blob and never sees the tombstone: {r:?}"
         );
+
+        // v62.0.0 (WD-fix1 rev 3; CC 6.1.5 N5) — both withdrawals came in
+        // through the directory door, which has no Engine hook: the
+        // withdrawn-content sweep reaches them. One pass descends both rows
+        // (`file:v1`, content) and the bytes each alone bound.
+        loop {
+            let t = engine
+                .sweep_withdrawn_content_once(64)
+                .await
+                .expect("I149: the sweep runs");
+            if t.exhausted {
+                break;
+            }
+        }
+        for (id, blob) in [(&row, &sha), (&sealed_row, &sealed)] {
+            assert!(
+                b.get_attestation(id).await.unwrap().is_none(),
+                "I149: the sweep descended the withdrawn row {id}"
+            );
+            assert!(
+                !b.has_blob(blob).await.unwrap(),
+                "I149: and the bytes it alone bound"
+            );
+        }
     }
 
     // v62 (E4): I150 ("the stored rule is not consulted") is deleted. Its

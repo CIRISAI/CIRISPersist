@@ -480,8 +480,7 @@ mod behaviour {
         let id = uuid::Uuid::new_v4().to_string();
         // v62.0.0 (E5) — a registered dimension (`i1660:probe:v1` was open
         // vocabulary, which the edition-2 door refuses).
-        let env =
-            serde_json::json!({ "dimension": "evidence:safety_battery:capture:a:b:v1", "n": id });
+        let env = serde_json::json!({ "dimension": "coherence_standing:cab:v1", "n": id });
         let mut row = ts::bare_attestation(&id, attester, attester, &env);
         row.attestation_type = attestation_type::SCORES.into();
         row.weight = None;

@@ -296,6 +296,18 @@ pub mod orchestrate {
         // anything is sealed; the chunk floor never screens.
         let plain_sha: [u8; 32] = Sha256::digest(plaintext).into();
         backend.screen_inline_body(&plain_sha, plaintext).await?;
+        // v62.0.0 (KR-fix31c; CC 5.2) — a segment its own writer cannot open
+        // is refused before anything is sealed or stored (every sealed leg:
+        // the per-chunk self / family DEK, the community epoch DEK, a stream
+        // epoch's DEK).
+        refuse_unless_author_has_wrap_target(
+            backend,
+            tier,
+            cohort_scope,
+            community_key_id,
+            &owner_key_id,
+        )
+        .await?;
         let plaintext_size = plaintext.len() as u64;
         // #838 (§12.10) — a sealed chunk's AAD is its POSITION.
         let bound_aad = chunk_aad(aad, stream_id, seq);
@@ -693,6 +705,49 @@ pub mod orchestrate {
     /// self/family fan-out (`resolve_cohort_targets`) for a self or family
     /// stream, the room's fan-out (the community DEK cascade's own roster
     /// fold and audience rule) for a community or affiliations stream.
+    /// v62.0.0 (KR-fix31c; CC 5.2 "a write its own author cannot open is
+    /// refused") — **the chunk doors' author check**: at a sealed tier, the
+    /// write's recipients as the seal will wrap them ([`stream_targets`]: the
+    /// room's fan-out for `community` / `affiliations`, the owner's or
+    /// family's for `self` / `family`) must grant a wrap to the author
+    /// (`community_dek::orchestrate::author_granted_in`). A plaintext tier
+    /// has no recipients and is not asked; a sealed tier with no group key
+    /// is left to the door's own refusal. Reads only.
+    async fn refuse_unless_author_has_wrap_target<B>(
+        backend: &B,
+        tier: CryptoTier,
+        cohort_scope: &str,
+        group_key_id: Option<&str>,
+        author_key_id: &str,
+    ) -> Result<(), BlobError>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        if tier == CryptoTier::Plaintext {
+            return Ok(());
+        }
+        let Some(group) = group_key_id else {
+            return Ok(());
+        };
+        let (_, report) = stream_targets(backend, cohort_scope, group).await?;
+        if crate::federation::community_dek::orchestrate::author_granted_in(
+            backend,
+            author_key_id,
+            &report,
+        )
+        .await?
+        {
+            Ok(())
+        } else {
+            Err(
+                crate::federation::blobs::write_author_has_no_wrap_target_refusal(
+                    group,
+                    author_key_id,
+                ),
+            )
+        }
+    }
+
     async fn stream_targets<B>(
         backend: &B,
         cohort_scope: &str,
@@ -1465,6 +1520,17 @@ pub mod orchestrate {
             &signer_key_id,
             "seal_stream_scoped",
         )?;
+        // v62.0.0 (KR-fix31c; CC 5.2) — the manifest (and the terminators that
+        // close each stream epoch below) is a write its own sealer must be
+        // able to open: refused by name, before anything is sealed or stored.
+        refuse_unless_author_has_wrap_target(
+            backend,
+            tier,
+            cohort_scope,
+            community_key_id,
+            &signer_key_id,
+        )
+        .await?;
         // v53.0.0 (#969, CC 5.3.3.1) — a stream-keyed stream: every epoch is
         // closed by its terminator BEFORE the manifest lists the chunks, so
         // the manifest names each epoch's last chunk, and every chunk must
@@ -4377,17 +4443,26 @@ pub mod invariants {
     /// EXISTING row into a stream (the blob insert is `ON CONFLICT DO
     /// NOTHING`, so the row keeps its `community_dek` tier). Before #832 the
     /// commons seal happily wrote a public manifest over it. RED on 170cc89.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i32_commons_seal_refuses_a_sealed_chunk_row<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let minter = format!("{tag}-minter-{run}");
         let comm = format!("{tag}-comm-{run}");
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — the minter (the write's author) is
+        // alice's owned, keyed device, so it holds a wrap target.
+        let (_minter_signer, minter) =
+            crate::federation::community_dek::lifecycle_support::seat_minter(
+                backend,
+                &alice,
+                &format!("{tag}-minter-{run}"),
+            )
+            .await;
         let comm = crate::federation::community_dek::lifecycle_support::id_of(&comm);
         let sealed =
             encrypt_and_cascade_community(backend, &comm, b"segment 0", None, Some(&minter))
@@ -6262,7 +6337,7 @@ pub mod invariants {
         let (_xp, x_pub, _mp, ml_pub) =
             crate::federation::identity_aggregate::mint_content_kem_keypair().expect("mint kem");
         backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: crate::federation::community_dek::lifecycle_support::id_of(
                     identity_key_id,
                 ),

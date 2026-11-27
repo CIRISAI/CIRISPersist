@@ -602,10 +602,61 @@ pub(crate) async fn refusals(d: &dyn FederationDirectory) {
     );
     let e = put_lifecycle_at(d, &outsider, now).await.unwrap_err();
     assert!(waits(&e), "I2344: a key the roster lacks waits: {e:?}");
+    // v62.0.0 (HEAD-6a; Constitution's halt ruling, CC 4.2.1.1) — a
+    // lifecycle row's `refs.head` (the bundle) and `refs.target` (the halt)
+    // are both REQUIRED: one naming only the other is refused by name,
+    // nothing kept. (The halt invocation above names no `refs` at all and
+    // lands: an invocation names no head.)
+    let one_ref = |refs: Value, nonce: u8| {
+        let m = map(vec![
+            ("refs", refs),
+            (
+                "dimension",
+                Value::Text("accord:lifecycle:confirmed:v1".into()),
+            ),
+            ("accord_root", Value::Text(ACCORD.into())),
+            (
+                "invocation_id",
+                Value::Text(format!("c2-refuse-ref-{nonce}")),
+            ),
+            ("nonce", Value::Bytes(vec![nonce; 32])),
+            ("asserted_at", Value::Uint(at + 1)),
+            ("valid_until", Value::Uint(at + 1 + HOUR_MS)),
+        ]);
+        sign_row_statement(
+            &s.holder_key(1),
+            s.holder_identity_ref(1),
+            ACCORD,
+            "scores",
+            FAMILY_LIFECYCLE,
+            &m,
+            vec![],
+        )
+        .unwrap()
+    };
+    let no_head = one_ref(map(vec![("target", row_ref(&hid.0))]), 0x75);
+    let no_target = one_ref(map(vec![("head", row_ref(&s.object_id))]), 0x76);
+    for (what, st, member) in [
+        ("no head", &no_head, "head"),
+        ("no target", &no_target, "target"),
+    ] {
+        let e = put_lifecycle_at(d, st, now).await.unwrap_err();
+        assert_eq!(
+            reason(&e),
+            malformed_row::ACCORD_INVOCATION_INVALID,
+            "I2344 {what}: refused by name: {e:?}"
+        );
+        assert!(
+            e.to_string().contains(&format!("refused:member:{member}")),
+            "I2344 {what}: names the member: {e}"
+        );
+    }
     for (what, st) in [
         ("iss_not_holder", &forged_iss),
         ("paused", &paused),
         ("outsider", &outsider),
+        ("no head", &no_head),
+        ("no target", &no_target),
     ] {
         assert!(
             d.edition2_voices(&row_of(st)).await.unwrap().is_empty(),
