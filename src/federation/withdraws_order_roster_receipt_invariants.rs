@@ -13,7 +13,7 @@
 //! its target (cut A), so it is judged when the target lands and both arrival
 //! orders now give the in-order verdict; the witnesses below assert that.
 //!
-//! - **I1600** (pure: the fold) — against each of the eight adverse classes
+//! - **I1600** (pure: the fold) — against each of the eleven adverse classes
 //!   of CC 2.4.1.1 and a cosigned act, a subject's `withdraws` retires
 //!   nothing, whether it arrived first (no rule), was refused at the door
 //!   (absent), or carries a subject rule 2-4 an earlier door stamped. The
@@ -27,6 +27,50 @@
 //!   group-plane row keeps its own plane's quorum rule (4); a type-slot
 //!   `capacity:*` row is carved out as its `scores` twin is (D12). The
 //!   retired set is the same for every permutation of the rows.
+//! - **I5709** (v62.0.0, FS-mtr; sqlite, postgres; CIRISConstitution's
+//!   ruling of 2026-11-22 on CC 2.4.1.1) — through the real door, in both
+//!   arrival orders: the subject's `withdraws` of a
+//!   `moderation_track_record:{community_key_id}` row naming them is refused
+//!   `federation_withdraws_not_admitted` and the row stays live for all four
+//!   readers (the SQL Live listing among them: the carve-out's SQL twin); its
+//!   attester's `withdraws` retires it for all four.
+//! - **I5710** (v62.0.0, FS-mtr.rev2; sqlite, postgres; CC 2.4.1.1's kept
+//!   list names "a `quarantine:*` marker") — the same two legs for a
+//!   `quarantine:withheld:v1` marker a room's `slash` holder (a founder)
+//!   files about a member.
+//! - **I5712** (v62.0.0, FS-kept; CIRISConstitution's answer of 2026-11-22:
+//!   "an agent's own `trace:*`") — a person named in an agent's own
+//!   `trace:complete:v1` row (inline form, self-emitted) withdraws it:
+//!   refused `federation_withdraws_not_admitted`, live for all four readers;
+//!   the agent's own `withdraws` (rule 1) retires it.
+//! - **I5713** (v62.0.0, FS-kept, FS-kept.fix1.rev3; "An affiliation
+//!   withdraws no statement about itself, whatever the statement") — an
+//!   affiliation founded under an id that is no key's: a peer's plain row
+//!   naming it is not withdrawn by one of its seats (refused, live for all
+//!   four readers); the row's signer (rule 1) retires it; a row naming a
+//!   MEMBER is withdrawn by that member (rule 2). FORM FIRST (GID-prod.rev2,
+//!   superseding fix1.rev3's key-record-first leg): the affiliation's id is
+//!   its derived group-ref, a person's key id never is one, so a person's
+//!   key withdraws a peer's row about it under rule 2, for all four readers.
+//! - **I5714** (v62.0.0, FS-kept.fix1, .rev3; never admitted on absence) —
+//!   a person-subject `withdraws` lands at once (its key record resolves
+//!   it); a stranger's `withdraws` of a row naming a subject id with NO
+//!   record of either kind is refused at once, never held (the subject alone
+//!   would not admit it). The wait itself has no path through the door
+//!   today (an id with no key signs nothing and is no chain's grantee).
+//! - **I5716** (v62.0.0, FS-class; CC 2.4.1.1 "an act of a body under a
+//!   declared legal-weight class", the narrow fail-safe form for v62.0) — a
+//!   peer's plain row (no `licensure:` / `revocation:` family) carrying a
+//!   `class` member: its subject's `withdraws` is HELD
+//!   `withdraws_class_unread`, the row live for all four readers; the
+//!   signer's own `withdraws` (rule 1) retires it; the same row without
+//!   `class` is withdrawn by its subject (rule 2) as before.
+//! - **I5715** (v62.0.0, FS-kept.fix1; CC 3.1.5 "Who erases a trace", as
+//!   ruled 2026-11-22) — a node's own trace, the node OWNED by a person:
+//!   the OWNER's `withdraws` (once rule 1 lifted to the producer's
+//!   principal) is refused, the trace live for all four readers; a named
+//!   person's is refused; the node's own key withdraws it (rule 1): it
+//!   retires for all four readers and its content descends.
 //! - **I1601** (sqlite, postgres) — through the real door, in both arrival
 //!   orders: a room member's `withdraws` of a `moderation:*` act naming them,
 //!   and of a cosigned act naming them, retires neither, and four readers
@@ -74,7 +118,7 @@ mod fold {
 
     /// The eight adverse classes, spelled here and not read from the
     /// constant, so a class dropped from it reds this witness.
-    const ADVERSE: [&str; 8] = [
+    const ADVERSE: [&str; 11] = [
         "capacity:",
         "detection:",
         "licensure:",
@@ -83,6 +127,9 @@ mod fold {
         "hard_case:",
         "slashing:",
         "takedown_notice:",
+        "moderation_track_record:",
+        "quarantine:",
+        "trace:",
     ];
 
     /// A `scores` row by [`PRODUCER`] under `dimension`, naming [`SUBJECT`].
@@ -626,23 +673,493 @@ pub(crate) mod bodies {
             arrive(d, order, &peer_row, &w)
                 .await
                 .expect("I1601: the subject withdraws a plain row");
-            let (rule, readers_say) = (Some(2), [true; 4]);
             assert_eq!(
                 d.get_attestation(&w.attestation_id)
                     .await
                     .unwrap()
                     .expect("held")
                     .withdraws_admission_rule,
-                rule,
+                Some(2),
                 "I1601 {what}: stamped by the door that saw the target"
             );
-            assert_eq!(
-                readers(d, &author, &peer_row.attestation_id, &w.attestation_id).await,
-                readers_say,
-                "I1601 {what}: a plain row's subject withdraws it in either order \
-                 ([fold, Live rule, bytes-plane re-derivation, SQL Live])"
+            // v62.0.0 (WD-fix5; CC 6.1.5 N5, the lead's ruling) — a plain row
+            // is a CLAIM: its admitted rule-2 withdrawal descends it at the
+            // door, in either order. Gone for every reader, its id a
+            // tombstone naming the withdrawal, a later copy refused.
+            assert!(
+                d.get_attestation(&peer_row.attestation_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "I1601 {what}: the plain row descended in either order"
+            );
+            match crate::federation::withdrawn_content::held_row_state(d, &peer_row.attestation_id)
+                .await
+                .unwrap()
+            {
+                crate::federation::withdrawn_content::HeldRowState::Withdrawn {
+                    withdraws_attestation_id,
+                    ..
+                } => assert_eq!(withdraws_attestation_id, w.attestation_id, "I1601 {what}"),
+                other => panic!("I1601 {what}: Withdrawn, not {other:?}"),
+            }
+            let late = d
+                .put_attestation(SignedAttestation {
+                    attestation: peer_row.clone(),
+                })
+                .await
+                .expect_err("I1601: a later copy is refused");
+            assert!(
+                late.to_string()
+                    .contains(crate::federation::steward_purge::token::TOMBSTONED),
+                "I1601 {what}: by the tombstone: {late}"
             );
         }
+    }
+
+    /// **I5709** — see the module header.
+    pub(crate) async fn i5709_a_track_record_is_not_the_subjects_to_withdraw(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let [_moderator, author, member, room] = room(d, "i5709", s).await;
+        let dimension = format!("moderation_track_record:{}:v1", e2::kid_thumb(&room));
+        for order in [Order::TargetFirst, Order::WithdrawsFirst] {
+            let what = format!("{order:?}");
+            // The subject's withdraws of a track record about them.
+            let record = about(&member, &dimension, &author, &room, None);
+            let w = withdraws(&author, &record);
+            let e = arrive(d, order, &record, &w)
+                .await
+                .expect_err("I5709: the door refuses it, in either order");
+            assert_eq!(e.kind(), "federation_withdraws_not_admitted", "I5709: {e}");
+            assert_eq!(
+                readers(d, &author, &record.attestation_id, &w.attestation_id).await,
+                [false; 4],
+                "I5709 {what}: a track record stays live for every reader"
+            );
+            // Its attester withdraws it (rule 1), in either order.
+            let record = about(&member, &dimension, &author, &room, None);
+            let w = withdraws(&member, &record);
+            arrive(d, order, &record, &w)
+                .await
+                .expect("I5709: the attester withdraws its track record");
+            assert_eq!(
+                readers(d, &author, &record.attestation_id, &w.attestation_id).await,
+                [true; 4],
+                "I5709 {what}: the attester's withdraws retires it for every reader"
+            );
+        }
+    }
+
+    /// **I5710** — see the module header.
+    pub(crate) async fn i5710_a_quarantine_marker_is_not_the_subjects_to_withdraw(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let [moderator, author, _member, room] = room(d, "i5710", s).await;
+        for order in [Order::TargetFirst, Order::WithdrawsFirst] {
+            let what = format!("{order:?}");
+            // The subject's withdraws of a marker about them.
+            let marker = about(&moderator, "quarantine:withheld:v1", &author, &room, None);
+            let w = withdraws(&author, &marker);
+            let e = arrive(d, order, &marker, &w)
+                .await
+                .expect_err("I5710: the door refuses it, in either order");
+            assert_eq!(e.kind(), "federation_withdraws_not_admitted", "I5710: {e}");
+            assert_eq!(
+                readers(d, &author, &marker.attestation_id, &w.attestation_id).await,
+                [false; 4],
+                "I5710 {what}: a quarantine marker stays live for every reader"
+            );
+            // Its attester withdraws it (rule 1), in either order.
+            let marker = about(&moderator, "quarantine:withheld:v1", &author, &room, None);
+            let w = withdraws(&moderator, &marker);
+            arrive(d, order, &marker, &w)
+                .await
+                .expect("I5710: the attester withdraws its marker");
+            assert_eq!(
+                readers(d, &author, &marker.attestation_id, &w.attestation_id).await,
+                [true; 4],
+                "I5710 {what}: the attester's withdraws retires it for every reader"
+            );
+        }
+    }
+
+    /// `agent`'s own `trace:complete:v1` row (the inline form), naming
+    /// `person` among its subjects beside the agent itself (a trace is
+    /// self-emitted).
+    fn own_trace(agent: &str, person: &str) -> Attestation {
+        let id = uuid::Uuid::new_v4().to_string();
+        let env = serde_json::json!({
+            "dimension": crate::ingest::TRACE_ATTESTATION_DIMENSION,
+            "trace_id": format!("trace-{id}"),
+            "agent_id_hash": "deadbeef",
+            "trace": { "trace_id": format!("trace-{id}"), "components": [] },
+        });
+        let mut r = ts::bare_attestation(&id, agent, agent, &env);
+        r.attestation_type = attestation_type::SCORES.into();
+        r.weight = None;
+        r.cohort_scope = cohort_scope::FEDERATION.into();
+        r.subject_key_ids = vec![agent.to_owned(), person.to_owned()];
+        ts::seal_row_in_place(agent, &mut r);
+        r
+    }
+
+    /// **I5712** — see the module header.
+    pub(crate) async fn i5712_an_agents_own_trace_is_not_a_named_persons_to_withdraw(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let agent = format!("i5712-agent-{s}");
+        let person = format!("i5712-person-{s}");
+        ts::register_hybrid_key_as(d, &agent, &agent, identity_type::AGENT).await;
+        ts::register_hybrid_key_as(d, &person, &person, identity_type::USER).await;
+        for order in [Order::TargetFirst, Order::WithdrawsFirst] {
+            let what = format!("{order:?}");
+            let trace = own_trace(&agent, &person);
+            let w = withdraws(&person, &trace);
+            let e = arrive(d, order, &trace, &w)
+                .await
+                .expect_err("I5712: the door refuses it, in either order");
+            assert_eq!(e.kind(), "federation_withdraws_not_admitted", "I5712: {e}");
+            assert_eq!(
+                readers(d, &person, &trace.attestation_id, &w.attestation_id).await,
+                [false; 4],
+                "I5712 {what}: the agent's trace stays live for every reader"
+            );
+            let trace = own_trace(&agent, &person);
+            let w = withdraws(&agent, &trace);
+            arrive(d, order, &trace, &w)
+                .await
+                .expect("I5712: the agent withdraws its own trace");
+            assert_eq!(
+                readers(d, &person, &trace.attestation_id, &w.attestation_id).await,
+                [true; 4],
+                "I5712 {what}: the agent's withdraws retires it for every reader"
+            );
+        }
+    }
+
+    /// A federation-scope plain row by `by` naming `subject`.
+    fn plain_about(by: &str, subject: &str) -> Attestation {
+        let id = uuid::Uuid::new_v4().to_string();
+        let env = serde_json::json!({
+            "id": id,
+            "dimension": PLAIN,
+            "score": crate::federation::namespace::registry::in_class_score(PLAIN),
+            "confidence": 0.9,
+        });
+        let mut r = ts::bare_attestation(&id, by, by, &env);
+        r.attestation_type = attestation_type::SCORES.into();
+        r.weight = None;
+        r.cohort_scope = cohort_scope::FEDERATION.into();
+        r.subject_key_ids = vec![subject.to_owned()];
+        ts::seal_row_in_place(by, &mut r);
+        r
+    }
+
+    /// A federation-scope plain row by `by` naming `subject`, carrying a
+    /// `class` member when `class` is given.
+    fn plain_classed(by: &str, subject: &str, class: Option<&str>) -> Attestation {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut env = serde_json::json!({
+            "id": id,
+            "dimension": PLAIN,
+            "score": crate::federation::namespace::registry::in_class_score(PLAIN),
+            "confidence": 0.9,
+        });
+        if let Some(c) = class {
+            env["class"] = serde_json::json!(c);
+        }
+        let mut r = ts::bare_attestation(&id, by, by, &env);
+        r.attestation_type = attestation_type::SCORES.into();
+        r.weight = None;
+        r.cohort_scope = cohort_scope::FEDERATION.into();
+        r.subject_key_ids = vec![subject.to_owned()];
+        ts::seal_row_in_place(by, &mut r);
+        r
+    }
+
+    /// **I5716** — see the module header.
+    pub(crate) async fn i5716_a_classed_act_is_kept_from_its_subject(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::edition2::fold;
+        use crate::federation::edition2::voices::carried_row_id;
+        let k = |n: &str| format!("i5716-{n}-{s}");
+        let (body, person) = (k("body"), k("person"));
+        for u in [&body, &person] {
+            ts::register_hybrid_key_as(d, u, u, identity_type::USER).await;
+        }
+        for order in [Order::TargetFirst, Order::WithdrawsFirst] {
+            let what = format!("{order:?}");
+            // The subject's withdrawal of a classed act: held, never admitted.
+            let act = plain_classed(&body, &person, Some("conviction"));
+            let w = withdraws(&person, &act);
+            let _ = arrive(d, order, &act, &w).await;
+            assert!(
+                d.get_attestation(&w.attestation_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "I5716 {what}: the subject's withdrawal is not admitted"
+            );
+            let rid = carried_row_id(&w).expect("an edition-2 row");
+            assert_eq!(
+                fold::why_held(d, &rid)
+                    .await
+                    .unwrap()
+                    .map(|h| h.reason)
+                    .as_deref(),
+                Some(fold::reason::WITHDRAWS_CLASS_UNREAD),
+                "I5716 {what}: held by name"
+            );
+            assert_eq!(
+                readers(d, &person, &act.attestation_id, &w.attestation_id).await,
+                [false; 4],
+                "I5716 {what}: the classed act stays live for every reader"
+            );
+            // Its signer takes back its own words (rule 1).
+            let act = plain_classed(&body, &person, Some("conviction"));
+            let w = withdraws(&body, &act);
+            arrive(d, order, &act, &w)
+                .await
+                .expect("I5716: the signer withdraws its own act");
+            assert_eq!(
+                readers(d, &person, &act.attestation_id, &w.attestation_id).await,
+                [true; 4],
+                "I5716 {what}: the signer's withdrawal retires it for every reader"
+            );
+            // No `class`: an ordinary row, its subject withdraws it (rule 2).
+            let plain = plain_classed(&body, &person, None);
+            let w = withdraws(&person, &plain);
+            arrive(d, order, &plain, &w)
+                .await
+                .expect("I5716: the subject withdraws an unclassed row");
+            assert_eq!(
+                readers(d, &person, &plain.attestation_id, &w.attestation_id).await,
+                [true; 4],
+                "I5716 {what}: an unclassed row retires for every reader"
+            );
+        }
+    }
+
+    /// **I5713** — see the module header.
+    pub(crate) async fn i5713_an_affiliation_withdraws_no_statement_about_itself(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::membership_acceptance_invariants::bodies::found_affiliation;
+        let k = |n: &str| format!("i5713-{n}-{s}");
+        let (seat, member, peer, aff, both) =
+            (k("seat"), k("member"), k("peer"), k("aff"), k("both"));
+        for u in [&seat, &member, &peer] {
+            ts::register_hybrid_key_as(d, u, u, identity_type::USER).await;
+        }
+        // GID-prod.rev2 — `aff` is founded under its DERIVED id (a
+        // group-ref); `both` is a person's key and nothing else: under the
+        // derived id no affiliation can be founded under a key's id, so the
+        // state the earlier key-record-first order decided cannot be built,
+        // and the FORM decides.
+        ts::register_hybrid_key_as(d, &both, &both, identity_type::USER).await;
+        let aff_id = found_affiliation(d, &aff, "quorum:1/1", &[&seat, &member], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            aff_id,
+            e2::room_id(&aff),
+            "I5713 premise: founded under its derived id"
+        );
+        assert!(
+            crate::federation::edition2::group_id::is_group_ref(&aff_id)
+                && !crate::federation::edition2::group_id::is_group_ref(&e2::kid(&both)),
+            "I5713 premise: the body's id is a group-ref and the person's key id is not"
+        );
+        assert!(
+            d.lookup_community(&aff_id)
+                .await
+                .unwrap()
+                .is_some_and(|c| matches!(
+                    crate::federation::affiliation_config::declared_cohort(&c),
+                    Ok(crate::federation::cohort::Cohort::Affiliations)
+                )),
+            "I5713 premise: the record declares `affiliations`"
+        );
+        for order in [Order::TargetFirst, Order::WithdrawsFirst] {
+            let what = format!("{order:?}");
+            // A seat does not withdraw a statement about the body.
+            let about_body = plain_about(&peer, &aff);
+            let w = withdraws(&seat, &about_body);
+            let e = arrive(d, order, &about_body, &w)
+                .await
+                .expect_err("I5713: the door refuses it, in either order");
+            assert_eq!(e.kind(), "federation_withdraws_not_admitted", "I5713: {e}");
+            assert_eq!(
+                readers(d, &seat, &about_body.attestation_id, &w.attestation_id).await,
+                [false; 4],
+                "I5713 {what}: a statement about the affiliation stays live for every reader"
+            );
+            // The row's signer takes back its own words (rule 1).
+            let about_body = plain_about(&peer, &aff);
+            let w = withdraws(&peer, &about_body);
+            arrive(d, order, &about_body, &w)
+                .await
+                .expect("I5713: the signer withdraws its own row");
+            assert_eq!(
+                readers(d, &peer, &about_body.attestation_id, &w.attestation_id).await,
+                [true; 4],
+                "I5713 {what}: the signer's withdraws retires it for every reader"
+            );
+            // A statement about a MEMBER: the member's standing is untouched.
+            let about_member = plain_about(&peer, &member);
+            let w = withdraws(&member, &about_member);
+            arrive(d, order, &about_member, &w)
+                .await
+                .expect("I5713: a member withdraws a peer's row about them");
+            assert_eq!(
+                readers(d, &member, &about_member.attestation_id, &w.attestation_id).await,
+                [true; 4],
+                "I5713 {what}: a member-subject row retires for every reader"
+            );
+            // FORM first: an id that is not a group-ref is no body's.
+            let about_key = plain_about(&peer, &both);
+            let w = withdraws(&both, &about_key);
+            arrive(d, order, &about_key, &w)
+                .await
+                .expect("I5713: the key's person withdraws a peer's row about them");
+            assert_eq!(
+                readers(d, &both, &about_key.attestation_id, &w.attestation_id).await,
+                [true; 4],
+                "I5713 {what}: form first: the row retires for every reader"
+            );
+        }
+    }
+
+    /// **I5715** — see the module header.
+    pub(crate) async fn i5715_only_the_signers_own_key_erases_a_trace(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let k = |n: &str| format!("i5715-{n}-{s}");
+        let (node, owner, person) = (k("node"), k("owner"), k("person"));
+        ts::register_hybrid_key_as(d, &owner, &owner, identity_type::USER).await;
+        ts::register_hybrid_key_as(d, &person, &person, identity_type::USER).await;
+        e2::put_key(d, &node, &["node"]).await;
+        crate::federation::admission::steward_liveness_test_support::bind_machine_owner(
+            d, &owner, &node,
+        )
+        .await;
+        assert_eq!(
+            crate::federation::admission::owner_of(d, &e2::kid(&node))
+                .await
+                .expect("owner_of")
+                .as_deref(),
+            Some(e2::kid(&owner).as_str()),
+            "I5715 premise: the node is the owner's"
+        );
+        for order in [Order::TargetFirst, Order::WithdrawsFirst] {
+            let what = format!("{order:?}");
+            let trace = own_trace(&node, &person);
+            for (by, who) in [(&owner, "the owner"), (&person, "a named person")] {
+                let w = withdraws(by, &trace);
+                let e = arrive(d, order, &trace, &w)
+                    .await
+                    .expect_err("I5715: refused, in either order");
+                assert_eq!(
+                    e.kind(),
+                    "federation_withdraws_not_admitted",
+                    "I5715 {who}: {e}"
+                );
+                assert_eq!(
+                    readers(d, &owner, &trace.attestation_id, &w.attestation_id).await,
+                    [false; 4],
+                    "I5715 {what}: {who} does not erase the trace"
+                );
+            }
+            let w = withdraws(&node, &trace);
+            arrive(d, Order::TargetFirst, &trace, &w)
+                .await
+                .expect("I5715: the signer's own key withdraws its trace");
+            assert_eq!(
+                readers(d, &owner, &trace.attestation_id, &w.attestation_id).await,
+                [true; 4],
+                "I5715 {what}: the signer's withdraws retires it for every reader"
+            );
+            let held_w = d
+                .get_attestation(&w.attestation_id)
+                .await
+                .unwrap()
+                .expect("I5715: the withdrawal is held");
+            let descent = crate::federation::withdrawn_content::descend(
+                d,
+                &held_w,
+                "i5715",
+                None,
+                crate::federation::withdrawn_content::KeepPolicy::default(),
+            )
+            .await
+            .expect("I5715: the descent reads");
+            assert!(
+                matches!(
+                    descent,
+                    crate::federation::withdrawn_content::Descent::Descended { .. }
+                        | crate::federation::withdrawn_content::Descent::AlreadyDescended
+                ),
+                "I5715 {what}: the trace's content descends: {descent:?}"
+            );
+        }
+    }
+
+    /// **I5714** — see the module header.
+    pub(crate) async fn i5714_an_unresolved_subject_waits_never_admits(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::edition2::fold;
+        use crate::federation::edition2::voices::carried_row_id;
+        let k = |n: &str| format!("i5714-{n}-{s}");
+        let (peer, person, stranger) = (k("peer"), k("person"), k("stranger"));
+        for u in [&peer, &person, &stranger] {
+            ts::register_hybrid_key_as(d, u, u, identity_type::USER).await;
+        }
+        // A person subject resolves by its key record: nothing to wait for.
+        let about_person = plain_about(&peer, &person);
+        let w = withdraws(&person, &about_person);
+        arrive(d, Order::TargetFirst, &about_person, &w)
+            .await
+            .expect("I5714: a person withdraws a peer's row about them at once");
+        assert_eq!(
+            readers(d, &person, &about_person.attestation_id, &w.attestation_id).await,
+            [true; 4],
+            "I5714: a person-subject withdrawal retires for every reader"
+        );
+        // A subject id with no record of either kind: a stranger is refused at
+        // once, not held (it would not admit even with the subject counted).
+        let nobody = e2::kid(&k("nobody"));
+        let about_nobody = plain_about(&peer, &nobody);
+        let w = withdraws(&stranger, &about_nobody);
+        let e = arrive(d, Order::TargetFirst, &about_nobody, &w)
+            .await
+            .expect_err("I5714: a stranger is refused");
+        assert_eq!(e.kind(), "federation_withdraws_not_admitted", "I5714: {e}");
+        let rid = carried_row_id(&w).expect("an edition-2 row");
+        assert!(
+            fold::why_held(d, &rid).await.unwrap().is_none(),
+            "I5714: refused at once, never held on the unresolved subject"
+        );
+        assert_eq!(
+            readers(
+                d,
+                &stranger,
+                &about_nobody.attestation_id,
+                &w.attestation_id
+            )
+            .await,
+            [false; 4],
+            "I5714: live for every reader"
+        );
     }
 
     /// How a row reaches the node: its own door, or the replication apply.
@@ -903,6 +1420,28 @@ mod runners {
     }
 
     on_sqlite_and_postgres!(i1601, bodies::i1601_both_arrival_orders_agree);
+    on_sqlite_and_postgres!(
+        i5709,
+        bodies::i5709_a_track_record_is_not_the_subjects_to_withdraw
+    );
+    on_sqlite_and_postgres!(
+        i5710,
+        bodies::i5710_a_quarantine_marker_is_not_the_subjects_to_withdraw
+    );
+    on_sqlite_and_postgres!(
+        i5712,
+        bodies::i5712_an_agents_own_trace_is_not_a_named_persons_to_withdraw
+    );
+    on_sqlite_and_postgres!(
+        i5713,
+        bodies::i5713_an_affiliation_withdraws_no_statement_about_itself
+    );
+    on_sqlite_and_postgres!(
+        i5714,
+        bodies::i5714_an_unresolved_subject_waits_never_admits
+    );
+    on_sqlite_and_postgres!(i5715, bodies::i5715_only_the_signers_own_key_erases_a_trace);
+    on_sqlite_and_postgres!(i5716, bodies::i5716_a_classed_act_is_kept_from_its_subject);
     on_sqlite_and_postgres!(i1603, bodies::i1603_a_forged_stamp_is_never_kept);
     on_sqlite_and_postgres!(i1604, bodies::i1604_a_node_cannot_outrun_its_owner);
 }

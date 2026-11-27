@@ -2324,6 +2324,25 @@ pub trait BlobStorage: Send + Sync {
         limit: u32,
     ) -> impl Future<Output = Result<Vec<[u8; 32]>, BlobError>> + Send;
 
+    /// v62.0.0 (HEAD-6, bounded by HEAD-7; Constitution, head cases (3)) —
+    /// **one window of the claim backlog**: the next `limit` blobs this node
+    /// stores (`federation_blobs`, sha order after `after`), each with
+    /// whether `holder` has ever stated a custody report about it (a
+    /// `custody:ack:v1` row it signed citing the blob, any state, retired or
+    /// not). ONE statement per backend: the window seeks the blob table's
+    /// primary key and stops at `limit`; each blob's report is one seek of a
+    /// citation index (`federation_attestations_attester_dimension_citation`
+    /// on sqlite; a citation index on postgres, `LIMIT 1` per row). It never
+    /// walks the holder's custody history. The re-ack sweep's claim pass
+    /// ([`reack_own_claims`](crate::federation::holding_claim::reack_own_claims))
+    /// pages through it once per process after the node is owned.
+    fn held_blob_claim_window(
+        &self,
+        after: Option<[u8; 32]>,
+        limit: u32,
+        holder: &str,
+    ) -> impl Future<Output = Result<Vec<([u8; 32], bool)>, BlobError>> + Send;
+
     /// v54.0.0 (CIRISPersist#994) — write the V176 relation of `manifest_sha`
     /// IFF the stream `stream_id` holds EXACTLY `chunks` (the manifest's own
     /// `(seq, sha)` list): the same rows, at the same seqs, with the same shas,

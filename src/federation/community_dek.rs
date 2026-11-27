@@ -1999,7 +1999,7 @@ pub mod lifecycle_support {
         let (_xp, x_pub, _mp, ml_pub) =
             crate::federation::identity_aggregate::mint_content_kem_keypair().expect("mint kem");
         backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: id_of(identity_key_id),
                 occurrence_key_id: id_of(occurrence_key_id),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -2183,7 +2183,7 @@ pub mod lifecycle_support {
                 None
             };
             backend
-                .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                     identity_key_id: id_of(identity_key_id),
                     occurrence_key_id: id_of(occurrence_key_id),
                     device_class: crate::federation::types::device_class::LAPTOP.into(),

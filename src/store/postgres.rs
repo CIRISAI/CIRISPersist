@@ -8718,6 +8718,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         crate::federation::edition2::fold::put_reason_postgres(&client, row_id, held.as_ref()).await
     }
 
+    async fn drop_held_row(
+        &self,
+        row_id: &crate::federation::edition2::names::RowId,
+    ) -> Result<u64, crate::federation::Error> {
+        // v62.0.0 (KR-fix20) — one transaction, gated in the statement.
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::fold::drop_held_row_postgres(&mut client, row_id).await
+    }
+
     async fn fold_slot_rows(
         &self,
         slot: &str,
@@ -8735,6 +8747,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(crate::store::Error::into_federation)?;
         crate::federation::edition2::fold::slot_held_postgres(&client, slot).await
+    }
+
+    async fn fold_slot_all_rows(
+        &self,
+        slot: &str,
+    ) -> Result<Vec<crate::federation::edition2::names::RowId>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        crate::federation::edition2::fold::slot_all_rows_postgres(&client, slot).await
     }
 
     async fn fold_any_refolding(&self) -> Result<bool, crate::federation::Error> {
@@ -9266,7 +9289,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                            WHERE plane = 'attestation' AND record_ref = $1::text) \
                AND NOT {} AND NOT {}",
             crate::federation::migration::accountability_record_sql("fa.dimension"),
-            crate::federation::steward_purge::person_subject_sql("fa", "cirislens.")
+            // v62.0.0 (WD-fix1) — the person-subject void, lifted only by an
+            // admitted withdrawal's descent re-derived here from stored rows.
+            crate::federation::steward_purge::person_void_sql(
+                "fa",
+                "cirislens.",
+                crate::federation::attestation_query::Dialect::Postgres,
+            )
         );
         let n = client
             .execute(sql.as_str(), &[&attestation_id])
@@ -9277,6 +9306,89 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 ))
             })?;
         Ok(n > 0)
+    }
+
+    async fn list_withdrawals_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedAttestation>, crate::federation::Error> {
+        // v62.0.0 (WD-fix1) — the withdrawn-content sweep's read: every held
+        // withdrawal in admission order, no serve rule.
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        let limit = i64::from(limit);
+        let since_at = since.as_ref().map(|(t, _)| *t);
+        let since_id = since.as_ref().map(|(_, id)| id.clone());
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT attestation_id::text, attesting_key_id, attested_key_id, \
+                        attestation_type, \
+                        weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                        subject_key_ids, withdraws_admission_rule, cohort_scope, tier, \
+                        promoted_at, additional_scrubs, admitted_at \
+                     FROM cirislens.federation_attestations fa \
+                     WHERE attestation_type IN ('{w}', '{r}') \
+                       AND (admitted_at, attestation_id) > \
+                           (COALESCE($1::timestamptz, '-infinity'::timestamptz), \
+                            COALESCE($2::text, '')) \
+                     ORDER BY admitted_at ASC, attestation_id ASC LIMIT $3",
+                    w = crate::federation::types::attestation_type::WITHDRAWS,
+                    r = crate::federation::types::attestation_type::RECANTS,
+                ),
+                &[&since_at, &since_id, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_withdrawals_since: {e}"))
+            })?;
+        rows.into_iter()
+            .map(|row| {
+                let admitted_at =
+                    row.safe_get_with("admitted_at", crate::federation::Error::Backend)?;
+                Ok(crate::federation::ServedAttestation {
+                    attestation: pg_row_to_attestation(row)?,
+                    admitted_at,
+                })
+            })
+            .collect()
+    }
+
+    async fn purge_delete_tombstoned_statements(
+        &self,
+        attestation_id: &str,
+    ) -> Result<u64, crate::federation::Error> {
+        // v62.0.0 (WD-fix1) — the door's own gate, in the statement: a row an
+        // `attestation` tombstone names whose attestation row is already gone
+        // (so a void the attestation door kept keeps its statements too).
+        let mut row_id = [0u8; 32];
+        if hex::decode_to_slice(attestation_id, &mut row_id).is_err() {
+            return Ok(0);
+        }
+        let client = self
+            .get_client()
+            .await
+            .map_err(crate::store::Error::into_federation)?;
+        client
+            .execute(
+                "DELETE FROM cirislens.ceg_statements WHERE row_id = $1 \
+                   AND EXISTS (SELECT 1 FROM cirislens.purge_tombstones \
+                               WHERE plane = 'attestation' AND record_ref = $2::text) \
+                   AND NOT EXISTS (SELECT 1 FROM cirislens.federation_attestations \
+                                   WHERE attestation_id = $2::text)",
+                &[&row_id.as_slice(), &attestation_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "purge_delete_tombstoned_statements: {e}"
+                ))
+            })
     }
 
     async fn purge_delete_tombstoned_trace(
@@ -9509,6 +9621,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
 
     fn node_key_id(&self) -> Option<String> {
         self.node_key_id.read().expect("node_key_id lock").clone()
+    }
+    // v62.0.0 (WD-fix3 rev 2) — this backend evicts its own bytes for the
+    // descent a statement door runs in its own admission.
+    fn withdrawn_bytes_evictor(
+        &self,
+    ) -> Option<&dyn crate::federation::steward_purge::BytesEvictor> {
+        Some(self)
     }
     // v23.1.0 (CIRISPersist#554) — surface THIS backend's configured policy on
     // the trait so `genesis::verify_bundle_quorum` gates holder evidence with
@@ -10956,7 +11075,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         crate::federation::occurrence_admit::put_identity_occurrence_planned(self, occurrence).await
     }
 
-    async fn put_identity_occurrence_local(
+    // v62.0.0 (WD-fix9) — the retired trusted-local write survives as a
+    // TEST seam only; `put_identity_occurrence_local` refuses (trait default).
+    #[cfg(any(test, feature = "test-anchor"))]
+    async fn test_seam_put_identity_occurrence(
         &self,
         occurrence: crate::federation::IdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
@@ -10967,6 +11089,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     async fn put_identity_occurrence_edition2(
         &self,
         bind: crate::federation::edition2::occurrence::OccurrenceBind,
+        _door: crate::federation::DoorToken,
     ) -> Result<bool, crate::federation::Error> {
         // v62.0.0 (wave O1) — the gates are the edition-2 door's.
         crate::federation::occurrence_admit::put_identity_occurrence_edition2_planned(self, bind)
@@ -11771,9 +11894,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
 
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.
 
-    async fn put_identity_occurrence_revocation_local(
+    // v62.0.0 (WD-fix8) — the edition-2 eviction's STORE (the retired
+    // trusted-local verb `put_identity_occurrence_revocation_local` refuses
+    // by name, the trait default).
+    async fn put_identity_occurrence_revocation_edition2(
         &self,
         revocation: crate::federation::IdentityOccurrenceRevocation,
+        _door: crate::federation::DoorToken,
     ) -> Result<(), crate::federation::Error> {
         // #421 — trusted-local (grandfathered) write: NO signature gate, signed
         // columns NULL. Mirrors `put_identity_occurrence_local`.
@@ -18243,6 +18370,38 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .collect()
     }
 
+    async fn held_blob_claim_window(
+        &self,
+        after: Option<[u8; 32]>,
+        limit: u32,
+        holder: &str,
+    ) -> Result<Vec<([u8; 32], bool)>, crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let client = self
+            .checkout()
+            .await
+            .map_err(|e| BlobError::Backend(format!("held_blob_claim_window pool: {e}")))?;
+        let after = after.map(|a| a.to_vec()).unwrap_or_default();
+        let lim = i64::from(limit);
+        let dimension = crate::federation::custody_ack::CUSTODY_ACK_DIMENSION;
+        let rows = client
+            .query(
+                &pg_held_blob_claim_window_sql(),
+                &[&after, &lim, &holder, &dimension],
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("held_blob_claim_window: {e}")))?;
+        rows.iter()
+            .map(|r| {
+                let v: Vec<u8> = r.safe_get_with("sha256", BlobError::Backend)?;
+                let claimed: bool = r.safe_get_with("claimed", BlobError::Backend)?;
+                <[u8; 32]>::try_from(v.as_slice())
+                    .map(|sha| (sha, claimed))
+                    .map_err(|_| BlobError::Backend("held_blob_claim_window: a 32-byte sha".into()))
+            })
+            .collect()
+    }
+
     async fn link_dag_chunks_if_exact(
         &self,
         manifest_sha: &[u8; 32],
@@ -21904,6 +22063,30 @@ const PG_ATTESTATION_COLUMNS: &str = "attestation_id::text, attesting_key_id, at
     original_content_hash, scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
     scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, \
     withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs";
+
+/// v62.0.0 (HEAD-7) — `held_blob_claim_window`'s statement (`$1` the
+/// cursor, `$2` the window, `$3` the holder, `$4` the custody dimension).
+/// A LATERAL `LIMIT 1` per window row, never `EXISTS`: postgres turns an
+/// `EXISTS` over this correlation into a HASHED subplan that reads the
+/// holder's whole custody slice (CHECKED: 10,800 rows for a 256-row window
+/// on 18,000 seeded reports). Plan (CHECKED, `EXPLAIN (ANALYZE, BUFFERS)`
+/// on V300 with 20,000 blobs, statistics fresh): `Nested Loop Left Join` /
+/// `Limit` over `Index Only Scan using federation_blobs_pkey (sha256 > $1)`
+/// / per row `Limit` over `Index Scan using
+/// federation_attestations_dimension_citation` (`dimension` and
+/// `evidence_refs[0]` in the index condition), 256 loops, 1,500 buffers.
+pub(crate) fn pg_held_blob_claim_window_sql() -> String {
+    "SELECT b.sha256, c.one IS NOT NULL AS claimed \
+       FROM (SELECT sha256 FROM cirislens.federation_blobs WHERE sha256 > $1 \
+              ORDER BY sha256 LIMIT $2) b \
+       LEFT JOIN LATERAL ( \
+            SELECT 1 AS one FROM cirislens.federation_attestations a \
+             WHERE a.attesting_key_id = $3 AND a.dimension COLLATE \"C\" = $4 \
+               AND (a.attestation_envelope::jsonb->'evidence_refs'->>0) = encode(b.sha256, 'hex') \
+               AND a.tier = 'federation' \
+             LIMIT 1) c ON true"
+        .to_owned()
+}
 
 /// v61 — `list_attestations_by_dimension_citing`'s statement (`$1` the
 /// attester, `$2` the dimension, `$3` the cited blob), spelled once so the
@@ -28885,6 +29068,26 @@ pub(crate) mod postgres_serial_scan {
     }
 }
 
+/// v62.0.0 (WD-fix3 rev 2; CC 6.1.5 N5) — the backend's own bytes plane for a
+/// door's descent ([`FederationDirectory::withdrawn_bytes_evictor`](crate::federation::FederationDirectory::withdrawn_bytes_evictor)):
+/// the purge's one eviction (`engine::purge_evict_blob_on`: the bytes, then
+/// the DAG children no live manifest keeps), with no signer, so no holding
+/// claim is retracted (an Engine door supplies its own, which does).
+#[async_trait::async_trait]
+impl crate::federation::steward_purge::BytesEvictor for PostgresBackend {
+    async fn evict(
+        &self,
+        sha256: &[u8; 32],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, String> {
+        let node = crate::federation::FederationDirectory::node_key_id(self).unwrap_or_default();
+        crate::engine::purge_evict_blob_on(self, &node, None, sha256, now)
+            .await
+            .map(|r| r.blob_deleted)
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -30585,6 +30788,9 @@ mod tests {
             &[(&format!("{tag}-alice"), &format!("{tag}-alice-occ"))],
         )
         .await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         let signer = crate::federation::at_rest_cascade::blob_invariants::node_signer(
             backend.as_ref(),
             &node_alias,
@@ -33932,7 +34138,7 @@ mod tests {
                 persist_row_hash: String::new(),
             };
         backend
-            .put_identity_occurrence_local(occ(
+            .test_seam_put_identity_occurrence(occ(
                 &keyed,
                 Some(EncryptionPubkeys {
                     x25519_base64: B64.encode(x_pub),
@@ -33942,7 +34148,7 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_identity_occurrence_local(occ(&bare, None))
+            .test_seam_put_identity_occurrence(occ(&bare, None))
             .await
             .unwrap();
 
@@ -34092,7 +34298,7 @@ mod tests {
 
         // alice founds the family + writes a family blob.
         backend
-            .put_identity_occurrence_local(keyed(&alice_p, &alice, 0x11))
+            .test_seam_put_identity_occurrence(keyed(&alice_p, &alice, 0x11))
             .await
             .unwrap();
         let family = |members: Vec<&str>| {
@@ -34134,7 +34340,7 @@ mod tests {
 
         // bob registers a KEYED occurrence → gains access via the walk.
         backend
-            .put_identity_occurrence_local(keyed(&bob_p, &bob, 0x22))
+            .test_seam_put_identity_occurrence(keyed(&bob_p, &bob, 0x22))
             .await
             .unwrap();
         let observed = chrono::Utc::now();
@@ -34157,7 +34363,7 @@ mod tests {
 
         // carol registers a KEYLESS occurrence → fail-secure excluded.
         backend
-            .put_identity_occurrence_local(bare(&carol_p, &carol))
+            .test_seam_put_identity_occurrence(bare(&carol_p, &carol))
             .await
             .unwrap();
         let observed2 = chrono::Utc::now();
@@ -34302,11 +34508,11 @@ mod tests {
             persist_row_hash: String::new(),
         };
         backend
-            .put_identity_occurrence_local(keyed(&alice_p, &alice, 0x11))
+            .test_seam_put_identity_occurrence(keyed(&alice_p, &alice, 0x11))
             .await
             .unwrap();
         backend
-            .put_identity_occurrence_local(bare(&bob_p, &bob))
+            .test_seam_put_identity_occurrence(bare(&bob_p, &bob))
             .await
             .unwrap();
 
@@ -34899,7 +35105,7 @@ mod tests {
             }
         };
         backend
-            .put_identity_occurrence_local(keyed(&alice_p, &alice, 0x11))
+            .test_seam_put_identity_occurrence(keyed(&alice_p, &alice, 0x11))
             .await
             .unwrap();
         // Roster starts with alice ONLY — bob is genuinely new.
@@ -34935,7 +35141,7 @@ mod tests {
         assert_eq!(blob1.granted, vec![alice_p.clone()]);
 
         backend
-            .put_identity_occurrence_local(keyed(&bob_p, &bob, 0x22))
+            .test_seam_put_identity_occurrence(keyed(&bob_p, &bob, 0x22))
             .await
             .unwrap();
         // v31.0.0 (CIRISPersist#654) — PG parity for the ORDER: the key-less
@@ -41117,7 +41323,9 @@ mod tests {
 
         // Canonical 0.2 shape — still admitted. Without this leg a refuse-branch
         // that matched `attestation:` broadly would look correct.
-        let att = pg_scores_attestation(&steward, &agent_k, &steward, "attestation:self_verify");
+        // v62.0.0 (FS-sig-a; CC 3.1.2.1) — `attestation:self_verify` is a
+        // key's row about itself: the canonical leg signs about its signer.
+        let att = pg_scores_attestation(&steward, &steward, &steward, "attestation:self_verify");
         let canonical_id = att.attestation_id.clone();
         backend
             .put_attestation(crate::federation::SignedAttestation { attestation: att })
@@ -45944,25 +46152,28 @@ mod tests {
             persist_row_hash: String::new(),
         };
         backend
-            .put_identity_occurrence_local(occ(&phone))
+            .test_seam_put_identity_occurrence(occ(&phone))
             .await
             .unwrap();
         backend
-            .put_identity_occurrence_local(occ(&laptop))
+            .test_seam_put_identity_occurrence(occ(&laptop))
             .await
             .unwrap();
 
         // Past-effective revocation of phone (trusted-local, #421).
         backend
-            .put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-                identity_key_id: root.clone(),
-                occurrence_key_id: phone.clone(),
-                revoked_at: t_rev,
-                effective_at: t_rev,
-                reason: Some("lost".into()),
-                witness_set: vec![root.clone(), laptop.clone()],
-                persist_row_hash: String::new(),
-            })
+            .put_identity_occurrence_revocation_edition2(
+                IdentityOccurrenceRevocation {
+                    identity_key_id: root.clone(),
+                    occurrence_key_id: phone.clone(),
+                    revoked_at: t_rev,
+                    effective_at: t_rev,
+                    reason: Some("lost".into()),
+                    witness_set: vec![root.clone(), laptop.clone()],
+                    persist_row_hash: String::new(),
+                },
+                crate::federation::DoorToken::new(),
+            )
             .await
             .unwrap();
 
@@ -45991,15 +46202,18 @@ mod tests {
         // (`LinkNotHeld`, the SQLSTATE read by `pg_fk_link_unheld`): a missing
         // parent is a dependency, not a malformed row.
         let err = backend
-            .put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-                identity_key_id: root.clone(),
-                occurrence_key_id: format!("ghost-{}", uuid_like()),
-                revoked_at: t_rev,
-                effective_at: t_rev,
-                reason: None,
-                witness_set: vec![],
-                persist_row_hash: String::new(),
-            })
+            .put_identity_occurrence_revocation_edition2(
+                IdentityOccurrenceRevocation {
+                    identity_key_id: root.clone(),
+                    occurrence_key_id: format!("ghost-{}", uuid_like()),
+                    revoked_at: t_rev,
+                    effective_at: t_rev,
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+                crate::federation::DoorToken::new(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -46434,7 +46648,7 @@ mod tests {
         let x25519 = B64.encode([7u8; 32]);
         let ml_kem = B64.encode([9u8; 1184]);
         backend
-            .put_identity_occurrence_local(crate::federation::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::IdentityOccurrence {
                 identity_key_id: pg_id(&root),
                 occurrence_key_id: pg_id(&occ),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),

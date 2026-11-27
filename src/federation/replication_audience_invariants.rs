@@ -159,7 +159,7 @@ pub(crate) mod bodies {
     }
 
     async fn claim_earlier(d: &dyn FederationDirectory, owner: &str, node: &str, class: &str) {
-        d.put_identity_occurrence_local(IdentityOccurrence {
+        d.test_seam_put_identity_occurrence(IdentityOccurrence {
             identity_key_id: owner.to_owned(),
             occurrence_key_id: node.to_owned(),
             device_class: class.to_owned(),
@@ -185,15 +185,18 @@ pub(crate) mod bodies {
     }
 
     async fn unclaim_earlier(d: &dyn FederationDirectory, owner: &str, node: &str) {
-        d.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-            identity_key_id: owner.to_owned(),
-            occurrence_key_id: node.to_owned(),
-            revoked_at: ago(1),
-            effective_at: ago(1),
-            reason: None,
-            witness_set: vec![owner.to_owned()],
-            persist_row_hash: String::new(),
-        })
+        d.put_identity_occurrence_revocation_edition2(
+            IdentityOccurrenceRevocation {
+                identity_key_id: owner.to_owned(),
+                occurrence_key_id: node.to_owned(),
+                revoked_at: ago(1),
+                effective_at: ago(1),
+                reason: None,
+                witness_set: vec![owner.to_owned()],
+                persist_row_hash: String::new(),
+            },
+            crate::federation::DoorToken::new(),
+        )
         .await
         .unwrap_or_else(|e| panic!("unclaim {owner} → {node}: {e}"));
     }

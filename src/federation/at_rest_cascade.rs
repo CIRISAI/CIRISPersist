@@ -6599,7 +6599,7 @@ pub mod blob_invariants {
         let (_xp, x_pub, _mp, ml_pub) =
             crate::federation::identity_aggregate::mint_content_kem_keypair().expect("mint kem");
         backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 // v62.0.0 (wave 3, E5) — keyed as the directory keys them
                 // (identity-refs under the switch, `lifecycle_support::id_of`).
                 identity_key_id: crate::federation::community_dek::lifecycle_support::id_of(

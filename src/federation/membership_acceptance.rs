@@ -662,21 +662,27 @@ where
                     return Ok(());
                 }
             }
+            // v62.0.0 (KR-fix30) — standing at the row's own instant.
             return dir
-                .check_write_cohort_scope_for(
+                .check_write_cohort_scope_for_at(
                     &row.attesting_key_id,
                     write_path,
                     &placed.cohort_scope,
                     placed.target.as_deref(),
+                    Some(row.asserted_at),
                 )
                 .await;
         }
+        // v62.0.0 (KR-fix30; the lead's ruling on I4310) — a row a member
+        // wrote while a member counted when it was made: standing at the
+        // row's own instant, within W, never "now".
         return dir
-            .check_write_cohort_scope_for(
+            .check_write_cohort_scope_for_at(
                 &row.attesting_key_id,
                 write_path,
                 &row.cohort_scope,
                 super::admission::envelope_cohort_target(&row.attestation_envelope)?,
+                Some(row.asserted_at),
             )
             .await;
     };
@@ -719,11 +725,14 @@ where
             if !group_is_held(dir, &row.cohort_scope, &group).await? {
                 return Ok(());
             }
-            dir.check_write_cohort_scope_for(
+            // v62.0.0 (KR-fix30) — the proposer's standing at the
+            // proposal's own instant.
+            dir.check_write_cohort_scope_for_at(
                 &row.attesting_key_id,
                 write_path,
                 &row.cohort_scope,
                 Some(&group),
+                Some(row.asserted_at),
             )
             .await
             .map_err(|e| hold_unless_storage(reason::MEMBERSHIP_PROPOSER_OUT_OF_SCOPE, e))?;
@@ -954,7 +963,11 @@ where
 /// signed FOR the grantee (its person, or a machine grantee's owner at the
 /// acceptance's own instant: `admission::signs_for_root_grantee`), asserted
 /// by `t`, and NOT WITHDRAWN BY ITS OWN SIGNER by `t`
-/// ([`acceptance_withdrawn_by`]). No decline of the grant by `t`.
+/// ([`acceptance_withdrawn_by`]). No decline of the grant by `t`. KR-fix28:
+/// for a machine grantee, the owner binding in force at the acceptance's
+/// instant is the one in force at `t` (`admission::machine_owner_binding_at`):
+/// after a re-binding the grant confers again only once the new owner
+/// accepts it.
 ///
 /// - **From then on.** A withdrawal counts from its own signed
 ///   `asserted_at`: read at an instant before it, the acceptance still
@@ -976,12 +989,57 @@ pub async fn root_grant_acceptance_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    root_grant_acceptance_for(dir, grant, t, None).await
+}
+
+/// v62.0.0 (HEAD-4.rev3; KR-fix28's marked move, CC 2.4.1.1 "an act names
+/// its head") — [`root_grant_acceptance_at`] for an ACT IN HAND: `act_head`
+/// is the act's `refs.head`. For a machine grantee, a node's or agent's act
+/// names its owner-binding row (`edition2::head_rule`), so the acceptance
+/// stands for the act exactly when that binding row is among the bindings in
+/// force at the acceptance's own instant: "the binding an act names" is read
+/// from the act, not from the binding in force at its instant. `None` (no
+/// act in hand: the grant listing, `admission::root_grants_for`; or an act
+/// naming no head) keeps the instant form below.
+///
+/// # Errors
+/// Directory reads.
+pub async fn root_grant_acceptance_for<F>(
+    dir: &F,
+    grant: &Attestation,
+    t: chrono::DateTime<chrono::Utc>,
+    act_head: Option<&crate::federation::edition2::names::RowId>,
+) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let grantee = grant.attested_key_id.as_str();
     let held = replies_of(dir, grantee).await?;
     let replies: Vec<&Attestation> = replies_to(&held, &grant.attestation_id)
         .into_iter()
         .filter(|r| r.asserted_at <= t && is_root_grant_reply(r))
         .collect();
+    // v62.0.0 (KR-fix28; CC 3.2, as the Constitution ruled 2026-11-22) — a
+    // machine grantee's acceptance is its owner's consent AS BOUND AT THE
+    // ACCEPTANCE'S OWN INSTANT, and it stands only for acts under THAT
+    // binding: a re-binding is a new owner-binding row, rows under it stand
+    // on the new owner, who has consented to nothing until they accept the
+    // grant themselves (the old owner's acceptance does not carry over, and
+    // the old owner cannot withdraw or renew on the new owner's behalf).
+    // v62.0.0 (HEAD-4.rev3) — "the binding an act names" is the act's
+    // `refs.head` when the act is in hand (`act_head`); with no act in hand,
+    // the binding in force at `t`.
+    let binding_at_t = super::admission::machine_owner_binding_at(dir, grantee, t).await?;
+    let names_the_binding = |at_acceptance: &super::admission::MachineOwner| match act_head {
+        Some(h) => match at_acceptance {
+            super::admission::MachineOwner::Bound { bindings, .. } => {
+                bindings.iter().any(|b| *b == h.hex())
+            }
+            super::admission::MachineOwner::NotAMachine => true,
+            super::admission::MachineOwner::Unbound => false,
+        },
+        None => *at_acceptance == binding_at_t,
+    };
     if replies
         .iter()
         .any(|r| membership_row(r) == Some(MembershipRow::Decline))
@@ -999,6 +1057,9 @@ where
             r.asserted_at,
         )
         .await?
+            && names_the_binding(
+                &super::admission::machine_owner_binding_at(dir, grantee, r.asserted_at).await?,
+            )
             && !acceptance_withdrawn_by(dir, r, t).await?
         {
             return Ok(Some(r.attestation_id.clone()));
@@ -1355,17 +1416,27 @@ where
 }
 
 /// **A node gives no acceptance** (CIRISPersist#972; CC 3.1.3.2: "a node
-/// member of an `infrastructure` community is seated by the founders' quorum
-/// … the seat is valid when the founders' quorum signed the record and the
-/// node's own key record carries the conferring family's m-of-n scrub").
+/// member of an `infrastructure` community is seated by the founders' quorum";
+/// CC 4.4.3.19: in an infrastructure room a node "gives NO acceptance: seated
+/// by the founders' count alone, for the canonical room with the bundle's
+/// conferral").
 ///
 /// The ONE predicate both the growth gate and the founding rule read: `member`
 /// needs no acceptance in `community` at `at` iff the community is
 /// `infrastructure`, the key is node-bearing at `at` (#925's predicate), and
-/// its own key record carries the accord's m-of-n scrub. The founders' quorum
-/// is the caller's roster-authority check and is not weakened here. A person
-/// in the same community, and a node anywhere else, still needs what they
-/// needed.
+///
+/// - v62.0.0 (KR-fix23) — the community is any infrastructure room but the
+///   canonical one: nothing more (the founders' count seats it);
+/// - the community is THE CANONICAL room
+///   ([`CIRIS_CANONICAL_COMMUNITY_KEY_ID`](super::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID)):
+///   the bundle's conferral, which on v62 is a serve SEAT of the genesis
+///   bundle in force (KR-fix13). (The earlier co-scrub on the node's own key
+///   record is gone, KR-fix27.)
+///
+/// The founders' quorum is the caller's roster-authority check and is not
+/// weakened here. A person in the same community, and a node in any room
+/// that is not `infrastructure`, still needs what they needed (CC 4.4.3.19:
+/// there a node is never a member; its owner is).
 ///
 /// v61 (CIRISPersist#1101) — the announced-owner leg is the growth
 /// gate's ([`check_growth_accepted`]), not this predicate's: the founding
@@ -1387,21 +1458,27 @@ where
     if !super::is_node_bearing_key_at(dir, member, at).await? {
         return Ok(false);
     }
+    // v62.0.0 (KR-fix23; CC 4.4.3.19, the text as written: "seated by the
+    // founders' count alone") — in an infrastructure room that is not the
+    // canonical one, a node is seated by the founders' count and nothing
+    // else. (KR-fix13 asked every infrastructure room for the bundle's seat:
+    // narrower than the text, so no other node could be seated without its
+    // own voice, which KR-fix10 refuses.)
+    if community.community_key_id != super::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID {
+        return Ok(true);
+    }
     // v62.0.0 (KR-fix13; CC 3.1.3.2, CC 4.4.3.19: in an infrastructure room
     // a node "gives NO acceptance: seated by the founders' count alone, for
     // the canonical room with the bundle's conferral") — THE CONFERRAL ON
     // v62 IS THE BUNDLE'S SEAT. A canonical install is a serve seat of the
     // genesis bundle in force (`is_canonical_by_bundle`). The earlier
-    // conferral (the accord's co-scrub on the node's own key record) can
-    // never pass on v62 (`verify_accord_family_coscrub` answers
-    // `accord_conferral_awaits_trust_blessing_card`, TR-fix1), so before this
-    // line NO node was ever seated without its own voice, and after KR-fix10
-    // a node's acceptance of a named invitation is refused: a canonical
-    // install could not be added to the room at all.
-    if super::edition2::genesis::is_canonical_by_bundle(dir, member).await? {
-        return Ok(true);
-    }
-    super::admission::key_record_carries_accord_scrub(dir, member).await
+    // conferral (the accord's co-scrub on the node's own key record) is gone
+    // (KR-fix27: an edition-2 key record carries no capability role; it
+    // could never pass on v62), so before KR-fix13 NO node was ever seated
+    // without its own voice, and after KR-fix10 a node's acceptance of a
+    // named invitation is refused: a canonical install could not be added to
+    // the room at all.
+    super::edition2::genesis::is_canonical_by_bundle(dir, member).await
 }
 
 /// **The growth gate** (FSD §5): `member` joins `group` at `growth_instant`

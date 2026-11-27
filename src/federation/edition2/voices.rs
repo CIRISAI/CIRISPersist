@@ -502,6 +502,9 @@ where
                 att.reads,
             )
             .await?;
+            // v62.0.0 (WD-fix4 rev 2) — the gate's own error, for a door that
+            // answers a held row with it (the routed JSON door).
+            super::fold::keep_hold_error(admitted.row_id, e);
             Ok(StatementOutcome::Pending {
                 row_id: admitted.row_id,
                 new,

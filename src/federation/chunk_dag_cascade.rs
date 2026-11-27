@@ -6262,7 +6262,7 @@ pub mod invariants {
         let (_xp, x_pub, _mp, ml_pub) =
             crate::federation::identity_aggregate::mint_content_kem_keypair().expect("mint kem");
         backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: crate::federation::community_dek::lifecycle_support::id_of(
                     identity_key_id,
                 ),

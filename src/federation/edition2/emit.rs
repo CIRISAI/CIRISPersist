@@ -260,6 +260,20 @@ pub fn carries_no_dimension(row_type: &str) -> bool {
     ciris_verify_core::edition2::is_composer(row_type)
 }
 
+/// v62.0.0 (FS-step1) — **the row types that NAME a target** (`refs.target`):
+/// the two retractions ([`carries_no_dimension`]) and a `supersedes` (CC
+/// 2.4.1: a full replacement statement, judged by its own family, that names
+/// the row it replaces). This is the predicate the target-held wait, the
+/// composer's placement and the family-equals-target check ask. It is NOT
+/// [`carries_no_dimension`]: the two differ by exactly `supersedes`, and
+/// asking one where the other is meant drops or adds it silently. One
+/// definition each, here; no site spells either set.
+#[must_use]
+pub fn names_a_target(row_type: &str) -> bool {
+    carries_no_dimension(row_type)
+        || row_type == crate::federation::types::attestation_type::SUPERSEDES
+}
+
 /// **The JSON members of a row as its edition-2 payload.**
 ///
 /// v62.0.0 (wave P1e) — `family` is the family id the row is stated under
@@ -488,7 +502,7 @@ pub fn family_for(
             DELEGATES_TO_FAMILY
         }
         .to_owned()),
-        t::WITHDRAWS | t::RECANTS | t::SUPERSEDES => target_statement
+        _ if names_a_target(row_type) => target_statement
             .and_then(family_of_statement)
             .map(|(f, _)| f)
             .ok_or_else(|| {
@@ -806,16 +820,53 @@ where
     } else {
         floor_counted(dir, &family, envelope, iss, asserted_at_ms).await?
     };
-    draft_from_envelope_as(
-        kid,
-        iss,
-        sub,
+    let (family, payload) = draft_payload_as(
         row_type,
         envelope,
         asserted_at_ms,
+        iss,
         target,
         counted.map(|c| !c),
-    )
+    )?;
+    // v62.0.0 (HEAD-1; CC 2.4.1.1, "an act names its head") — the head the
+    // drafted act is at, resolved against this directory before the first
+    // voice signs (`head_rule::state_head`); a head the envelope names is
+    // kept. The undirected [`draft_from_envelope`] resolves none.
+    let payload = super::head_rule::state_head(dir, row_type, &family, iss, payload).await?;
+    // v62.0.0 (HEAD-3) — a drafted `withdraws` names the head it acts from,
+    // read from its target (`head_rule::state_end_head`); the root's counted
+    // withdrawal already names its bundle and keeps it.
+    let payload = match target {
+        Some((t, _)) if row_type == crate::federation::types::attestation_type::WITHDRAWS => {
+            super::head_rule::state_end_head(dir, &super::names::RowId(*t), None, payload).await?
+        }
+        _ => payload,
+    };
+    draft_row(kid, iss, sub, row_type, &family, &payload).map_err(|e| produce_error("draft", e))
+}
+
+/// v62.0.0 (HEAD-3; CC 2.4.1.1) — [`draft_from_envelope`] naming `head` in
+/// `refs.head` (joined, never replacing one the envelope names): for a sync
+/// drafter that already knows the head it acts from (an end whose record is
+/// its target, `ownership_reclaim::draft_reclaim_withdraws`).
+///
+/// # Errors
+/// As [`draft_from_envelope`].
+#[allow(clippy::too_many_arguments)]
+pub fn draft_from_envelope_naming_head(
+    kid: &Digest32,
+    iss: &str,
+    sub: &str,
+    row_type: &str,
+    envelope: &serde_json::Value,
+    asserted_at_ms: u64,
+    target: Option<(&Digest32, &str)>,
+    head: &super::names::RowId,
+) -> Result<Draft, Error> {
+    let (family, payload) =
+        draft_payload_as(row_type, envelope, asserted_at_ms, iss, target, None)?;
+    let payload = super::head_rule::with_head(payload, head)?;
+    draft_row(kid, iss, sub, row_type, &family, &payload).map_err(|e| produce_error("draft", e))
 }
 
 /// v62.0.0 (SL-fix3c; CC 4.4.3.12) — **is a floor family's act COUNTED
@@ -943,7 +994,7 @@ pub fn row_payload(
     author: Option<&str>,
     target: Option<&Digest32>,
 ) -> Result<Value, Error> {
-    let composer = super::payloads::COMPOSER_ROW_TYPES.contains(&row_type);
+    let composer = names_a_target(row_type);
     // v62.0.0 (PIN-fix2 rev 2) — a `withdraws` / `recants` states no
     // `dimension` ([`carries_no_dimension`]); a `supersedes` keeps its own.
     let retraction_drop: Vec<&str> = COMPOSER_EARLIER_MEMBERS
@@ -1010,34 +1061,68 @@ fn draft_from_envelope_as(
     target: Option<(&Digest32, &str)>,
     authored_override: Option<bool>,
 ) -> Result<Draft, Error> {
+    let (family, payload) = draft_payload_as(
+        row_type,
+        envelope,
+        asserted_at_ms,
+        iss,
+        target,
+        authored_override,
+    )?;
+    draft_row(kid, iss, sub, row_type, &family, &payload).map_err(|e| produce_error("draft", e))
+}
+
+/// v62.0.0 (HEAD-1) — the family and payload [`draft_from_envelope_as`]
+/// signs: the authorship decided, then [`row_payload`]. Split out so the
+/// directed draft ([`draft_from_envelope_in`]) states the head between the
+/// two.
+fn draft_payload_as(
+    row_type: &str,
+    envelope: &serde_json::Value,
+    asserted_at_ms: u64,
+    iss: &str,
+    target: Option<(&Digest32, &str)>,
+    authored_override: Option<bool>,
+) -> Result<(String, Value), Error> {
     let family = family_for(row_type, target.map(|(_, f)| f), envelope, None)?;
-    // v62.0.0 (AU-fix2; CC 2.7.11 P2:952) — an `admission:unit` row that
-    // names its roster head (`head`) is COUNTED: "absent on a counted row,
-    // whose voices are its statements", so no `author` is stated for it (the
-    // vendored cell is `act=group => counted ; authored`, and a draft has no
-    // statement to read `act` from).
-    let counted_admission =
-        family == super::payloads::ADMISSION_UNIT_FAMILY && envelope.get("head").is_some();
-    // v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21) — a row of the trust
-    // family that names the bundle it is counted over (`head`) is the ROOT's
-    // act, COUNTED over that bundle's holders: a grant from the root
-    // (`trust:confers:v1`), or the root's counted withdrawal of one. No
-    // `author` is stated for it (the vendored cell is `act=group => counted ;
-    // authored`, and a draft has no statement to read `act` from). A trust
-    // row with no `head` stays authored (an acceptance edge, a keyed root's
-    // own grant). KR-fix18: a grantee does not withdraw the grant; it
-    // withdraws its acceptance (`Engine::withdraw_statement`).
-    let counted_root = super::typed::is_trust_family(&family) && envelope.get("head").is_some();
-    let authored = !counted_admission
-        && !counted_root
-        && authored_override.unwrap_or_else(|| {
-            family_is_authored(
-                &family,
-                envelope
-                    .get("dimension")
-                    .and_then(serde_json::Value::as_str),
-            )
-        });
+    // v62.0.0 (HEAD-4; Constitution's ruling of 2026-11-22, CC 2.6.1.9) —
+    // COUNTED vs AUTHORED is decided by whether the payload carries
+    // `author`, NEVER by whether it names `refs.head` (an act names the head
+    // it is at, CC 2.4.1.1). A draft's payload carries what the envelope
+    // says: the envelope's own `author` stands (`"author": null` states a
+    // counted row, `payload_from_envelope` keeps the key and drops the
+    // null); with no `author` member, the caller's override
+    // ([`floor_counted`]), else the family's vendored cell. Before HEAD-4 an
+    // `admission:unit` or trust-family draft naming `head` was drafted
+    // counted by that alone (AU-fix2, KR-fix2).
+    //
+    // Such a draft that names `head` and no `author` member is REFUSED, not
+    // re-read: its authorship was signalled by the head, which the ruling
+    // forbids, and silently drafting it authored would turn a host's counted
+    // root grant or counted unit into one signer's row.
+    let counted_by_head_family =
+        family == super::payloads::ADMISSION_UNIT_FAMILY || super::typed::is_trust_family(&family);
+    if counted_by_head_family && envelope.get("head").is_some() && envelope.get("author").is_none()
+    {
+        return Err(Error::InvalidArgument(format!(
+            "edition2_payload_invalid: a {family} draft names `head` and no `author`: counted vs \
+             authored is the payload's `author` (CC 2.6.1.9), never its head. State \
+             `\"author\": null` for a counted row, or the author for an authored one"
+        )));
+    }
+    let authored = envelope.get("author").map_or_else(
+        || {
+            authored_override.unwrap_or_else(|| {
+                family_is_authored(
+                    &family,
+                    envelope
+                        .get("dimension")
+                        .and_then(serde_json::Value::as_str),
+                )
+            })
+        },
+        |a| !a.is_null(),
+    );
     let payload = row_payload(
         "draft",
         row_type,
@@ -1047,7 +1132,7 @@ fn draft_from_envelope_as(
         authored.then_some(iss),
         target.map(|(t, _)| t),
     )?;
-    draft_row(kid, iss, sub, row_type, &family, &payload).map_err(|e| produce_error("draft", e))
+    Ok((family, payload))
 }
 
 #[cfg(test)]

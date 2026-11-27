@@ -221,6 +221,9 @@ pub mod bodies {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         let minter = crate::federation::at_rest_cascade::blob_invariants::node_signer(
             b,
             &format!("i149-minter-{s}"),
@@ -276,6 +279,30 @@ pub mod bodies {
             matches!(&r, Err(BlobError::NotGranted { .. })),
             "I149: a stranger is NotGranted FIRST on a sealed blob and never sees the tombstone: {r:?}"
         );
+
+        // v62.0.0 (WD-fix1 rev 3; CC 6.1.5 N5) — both withdrawals came in
+        // through the directory door, which has no Engine hook: the
+        // withdrawn-content sweep reaches them. One pass descends both rows
+        // (`file:v1`, content) and the bytes each alone bound.
+        loop {
+            let t = engine
+                .sweep_withdrawn_content_once(64)
+                .await
+                .expect("I149: the sweep runs");
+            if t.exhausted {
+                break;
+            }
+        }
+        for (id, blob) in [(&row, &sha), (&sealed_row, &sealed)] {
+            assert!(
+                b.get_attestation(id).await.unwrap().is_none(),
+                "I149: the sweep descended the withdrawn row {id}"
+            );
+            assert!(
+                !b.has_blob(blob).await.unwrap(),
+                "I149: and the bytes it alone bound"
+            );
+        }
     }
 
     // v62 (E4): I150 ("the stored rule is not consulted") is deleted. Its

@@ -239,7 +239,9 @@ where
 
     // 2. The root's key.
     // (RT-fix1: a root key the caller already registered is kept as held.)
-    let root = e2::kid(root_seed);
+    // GID-fixtures-sites — the root's KEY by its own spelling (`key_id`):
+    // after the founding below, `kid(root_seed)` answers the ROOM.
+    let root = e2::key_id(root_seed);
     if root_seed == ROOT_SEED || dir.lookup_public_key(&root).await?.is_none() {
         e2::put_key(dir, root_seed, &["user"]).await;
     }
@@ -293,6 +295,9 @@ where
         .collect();
     let key_refs: Vec<&CompositeSigningKey> = keys.iter().collect();
     let voices = roster_voices(&GroupRecord::Community(community), 1, None, at, &key_refs);
+    // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+    // panics if it was not).
+    let root = crate::federation::edition2::fixture_switch::room_id(&root);
     let birth = row_id_of(&voices[0]);
     let charter = charter_statement(root_seed, &root, at)?;
     // RT-fix1 — the node's acceptance, inside the node's own key window.

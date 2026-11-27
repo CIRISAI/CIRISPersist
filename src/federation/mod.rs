@@ -330,6 +330,11 @@ mod retraction_invariants;
 /// v61 S2 (CIRISPersist#1161) — I1512: room moderation in CC's shape.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod room_moderation_invariants;
+/// v62.0.0 (FS-sig-a) — I5704–I5707: the `self` signer cells
+/// (`attestation:self_verify`, `hardware_custody`, `age_self_declared`) and
+/// the watchlist's `moderate`-or-`takedown` cell.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod signer_cells_invariants;
 /// v62.0.0 (SL-fix2; CC 4.4.3.12) — I4130–I4135: a one-seat affiliation's
 /// `slash` act counts only countersigned from outside the seat.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -974,6 +979,11 @@ pub mod subject_erasure;
 #[cfg(test)]
 pub(crate) mod subject_erasure_invariants;
 pub mod trust_root;
+/// v62.0.0 (WD-fix1) — an admitted withdrawal's target descends.
+pub mod withdrawn_content;
+/// v62.0.0 (WD-fix1) — I4400–I4406: the descent, the void lift, the sweep.
+#[cfg(test)]
+pub(crate) mod withdrawn_content_invariants;
 // CIRISPersist#210 — cross-process leader election (RNS shared-instance
 // owner; CIRISEdge#100). Backend-agnostic types + staleness helper; the
 // atomic acquire/heartbeat/release live in the backends.
@@ -3650,6 +3660,14 @@ pub fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(), Error>
         // to it. The prefix is lowercase and the segment one spelling per key
         // (`namespace::key_segment::segment_of`); anything else under that
         // prefix is malformed.
+        // v62.0.0 (GID-prod) — a group-ref (a body named as a subject) is
+        // canonical with its segment's case, as an identity-ref is.
+        if sid.starts_with(edition2::group_id::GROUP_REF_PREFIX) {
+            if !edition2::group_id::is_group_ref(sid) {
+                return malformed("group-ref is not `group-` and one 43-char base64url segment");
+            }
+            continue;
+        }
         let prefix = namespace::key_segment::IDENTITY_REF_PREFIX;
         if sid.len() >= prefix.len()
             && sid.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
@@ -4169,6 +4187,24 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
+    /// v62.0.0 (KR-fix20; CC 2.4.1.1 rule 0) — **drop a HELD row the door
+    /// now refuses for good**: hard-delete its statements
+    /// (`ceg_statements`), its names (`ceg_row_names`) and its fold record
+    /// (`ceg_fold_state`, `ceg_fold_reads`), in one transaction, only while
+    /// it is held (its fold state names a reason) and no attestation row
+    /// stands under its id (the gate is in the statement). The number of
+    /// statements deleted; 0 when the gate holds nothing to drop. Called by
+    /// the door alone, for a row whose re-run met
+    /// [`edition2::fold::never_retracts`] (a withdrawal that waited for its
+    /// target and can never retract it). Storage only. A directory with no
+    /// edition-2 store refuses (`Unsupported`).
+    async fn drop_held_row(&self, row_id: &edition2::names::RowId) -> Result<u64, Error> {
+        let _ = row_id;
+        Err(Error::Unsupported {
+            method: "drop_held_row",
+        })
+    }
+
     /// v62.0.0 (wave G0 v4) — the CONCLUDED rows of one projection slot
     /// (`ceg_fold_state.slot`), in row-id order. Refuses by default
     /// (`Unsupported`, PX-fix1); the proxy routes it (`FoldSlotRows`).
@@ -4176,6 +4212,19 @@ pub trait FederationDirectory: Send + Sync {
         let _ = slot;
         Err(Error::Unsupported {
             method: "fold_slot_rows",
+        })
+    }
+
+    /// v62.0.0 (GID-tips) — EVERY row of one projection slot, held or
+    /// concluded, in row-id order: the roster door's read of the other first
+    /// versions under one group id (`edition2::group`). Store-internal, like
+    /// [`Self::drop_held_row`]: every edition-2 statement door crosses the
+    /// capsule whole and the fold runs store-side, so no DirectoryOp carries
+    /// it. Refuses by default (`Unsupported`).
+    async fn fold_slot_all_rows(&self, slot: &str) -> Result<Vec<edition2::names::RowId>, Error> {
+        let _ = slot;
+        Err(Error::Unsupported {
+            method: "fold_slot_all_rows",
         })
     }
 
@@ -4446,6 +4495,18 @@ pub trait FederationDirectory: Send + Sync {
     /// host sets it, the trait exposes it, and no gate reaches past the host to
     /// invent one.
     fn node_key_id(&self) -> Option<String> {
+        None
+    }
+
+    /// v62.0.0 (WD-fix3 rev 2; CC 6.1.5 N5) — this directory's own bytes
+    /// plane, for the descent a statement door runs in its own admission
+    /// (`withdrawn_content::descend_at_admission`) when its caller supplied
+    /// none: the sqlite and postgres backends evict their own bytes (no
+    /// holding claim is retracted: a directory holds no signer). `None` (the
+    /// default) for a directory with no bytes plane: a descent of a row that
+    /// binds bytes then records its execution and stops at
+    /// `retraction_inadmissible`, the row kept, and the next open finishes it.
+    fn withdrawn_bytes_evictor(&self) -> Option<&dyn steward_purge::BytesEvictor> {
         None
     }
 
@@ -6217,14 +6278,37 @@ pub trait FederationDirectory: Send + Sync {
     /// the gate closes. Grandfathered: the `attesting_key_id`/`signed_envelope`/
     /// `signature` columns are stored NULL. **Never reachable from the
     /// replication apply** (the bridge only calls the gated path), so a peer
-    /// cannot forge a local write. Default impl errors; backends override.
+    /// cannot forge a local write.
+    ///
+    /// v62.0.0 (WD-fix9; the lead's ruling) — **RETIRED on every
+    /// directory** (no backend overrides it): an unsigned, statement-less
+    /// occurrence conferred self-DEK grants, a roster seat with no two-path
+    /// and `signer_acts_for`, an authority with no signature behind it. A
+    /// device binds by its edition-2 `identity:occurrence` (its own voice,
+    /// then the identity's: `Engine::self_at_login` / `publish_self_occurrence`
+    /// state what they can and return the rest as drafts).
     async fn put_identity_occurrence_local(
         &self,
         occurrence: types::IdentityOccurrence,
     ) -> Result<(), Error> {
         let _ = occurrence;
         Err(Error::Unsupported {
-            method: "put_identity_occurrence_local — retired from the capsule at v62.0.0: an occurrence is the edition-2 identity:occurrence bind (edition2::occurrence::bind_draft, signed, then the statement door PutEdition2Statement)",
+            method: "put_identity_occurrence_local — retired at v62.0.0 on every directory (an unsigned occurrence is an authority with no signature): an occurrence is the edition-2 identity:occurrence bind (edition2::occurrence::bind_draft, signed, then the statement door PutEdition2Statement)",
+        })
+    }
+
+    /// v62.0.0 (WD-fix9) — TESTS ONLY: seed an occurrence row directly,
+    /// the storage the retired [`Self::put_identity_occurrence_local`] wrote,
+    /// for witnesses whose subject is a reader of occurrences rather than how
+    /// one is admitted. Never compiled into a production build.
+    #[cfg(any(test, feature = "test-anchor"))]
+    async fn test_seam_put_identity_occurrence(
+        &self,
+        occurrence: types::IdentityOccurrence,
+    ) -> Result<(), Error> {
+        let _ = occurrence;
+        Err(Error::Unsupported {
+            method: "test_seam_put_identity_occurrence",
         })
     }
 
@@ -6242,8 +6326,9 @@ pub trait FederationDirectory: Send + Sync {
     async fn put_identity_occurrence_edition2(
         &self,
         bind: edition2::occurrence::OccurrenceBind,
+        door: DoorToken,
     ) -> Result<bool, Error> {
-        let _ = bind;
+        let _ = (bind, door);
         Err(Error::Unsupported {
             method: "put_identity_occurrence_edition2",
         })
@@ -6987,13 +7072,43 @@ pub trait FederationDirectory: Send + Sync {
     /// (you can only signed-replicate what was signed-put). **Never reachable
     /// from the replication apply.** Default impl errors; backends override.
     /// Mirrors [`Self::put_identity_occurrence_local`].
+    ///
+    /// v62.0.0 (WD-fix8; the lead's ruling) — **RETIRED**: an unsigned,
+    /// statement-less eviction with no roster gate is the earlier form. It is
+    /// refused by name on every directory; a device leaves a self's roster
+    /// only by its edition-2 `identity:occurrence_revocation` (draft, sign and
+    /// submit it through the statement door). The store write the edition-2
+    /// eviction door makes is
+    /// [`Self::put_identity_occurrence_revocation_edition2`].
     async fn put_identity_occurrence_revocation_local(
         &self,
         revocation: types::IdentityOccurrenceRevocation,
     ) -> Result<(), Error> {
         let _ = revocation;
+        // The one shared earlier-form refusal (gated from disk:
+        // `scripts/earlier_form_doors.tsv`), named for this verb.
+        edition2::door::refuse_earlier_form("identity_occurrence_revocation")
+            .map_err(|_| occurrence_revocation_local_retired())?;
+        Err(occurrence_revocation_local_retired())
+    }
+
+    /// v62.0.0 (WD-fix8) — **write an admitted edition-2 occurrence
+    /// revocation** to `federation_identity_occurrence_revocations` (and
+    /// retire the route its occurrence projected): STORAGE ONLY, the
+    /// projection of an `identity:occurrence_revocation` the edition-2 door
+    /// (`edition2::typed`, `edition2::occurrence::land_held_eviction`)
+    /// already judged, the roster gate included. Signature columns NULL (the
+    /// statements are held in `ceg_statements`), as
+    /// [`Self::put_identity_occurrence_edition2`] for a bind. Default impl
+    /// errors; backends override.
+    async fn put_identity_occurrence_revocation_edition2(
+        &self,
+        revocation: types::IdentityOccurrenceRevocation,
+        door: DoorToken,
+    ) -> Result<(), Error> {
+        let _ = (revocation, door);
         Err(Error::Unsupported {
-            method: "put_identity_occurrence_revocation_local",
+            method: "put_identity_occurrence_revocation_edition2",
         })
     }
 
@@ -7768,6 +7883,36 @@ pub trait FederationDirectory: Send + Sync {
         let _ = attestation_id;
         Err(Error::Unsupported {
             method: "purge_delete_tombstoned_attestation",
+        })
+    }
+
+    /// v62.0.0 (WD-fix1) — the held `withdraws` / `recants` rows admitted
+    /// after `since` (THIS node's `admitted_at`, then `attestation_id`), in
+    /// that order, at most `limit`: every tier, no serve rule (the
+    /// withdrawn-content sweep's read, never a serve). Bounded by the
+    /// withdrawals held, through the partial index on those two types
+    /// (WD-fix1.schema). Refuses by default.
+    async fn list_withdrawals_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedAttestation>, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_withdrawals_since",
+        })
+    }
+
+    /// v62.0.0 (WD-fix1) — hard-delete the held edition-2 statements of the
+    /// row `attestation_id` (its row statement and every further voice) —
+    /// only if an `attestation` purge tombstone names the row AND its
+    /// attestation row is gone (the door's own gate, in the same statement):
+    /// a row the delete door kept (a void) keeps its statements. The number
+    /// deleted; 0 when the gate holds nothing to delete.
+    async fn purge_delete_tombstoned_statements(&self, attestation_id: &str) -> Result<u64, Error> {
+        let _ = attestation_id;
+        Err(Error::Unsupported {
+            method: "purge_delete_tombstoned_statements",
         })
     }
 
@@ -8842,10 +8987,11 @@ pub trait FederationDirectory: Send + Sync {
                 .await?;
             }
             cohort::Cohort::SelfId => {
-                // v16.0.0 (#421): the rostered-group removal is an ENGINE-
-                // INTERNAL op on behalf of the local user (never peer-received),
-                // so it takes the trusted-local path — the gated
-                // `put_identity_occurrence_revocation` is for the wire.
+                // v62.0.0 (WD-fix8; the lead's ruling) — the `self` cohort's
+                // removal was an unsigned trusted-local eviction with no
+                // roster gate: the retired verb now refuses it by name
+                // (`earlier_form_object`). A device leaves a self's roster
+                // only by its edition-2 `identity:occurrence_revocation`.
                 self.put_identity_occurrence_revocation_local(
                     types::IdentityOccurrenceRevocation {
                         identity_key_id: group_key_id.to_string(),
@@ -9829,13 +9975,52 @@ pub trait FederationDirectory: Send + Sync {
     /// `persist_refused_write_scope_total` event is emitted.
     ///
     /// Provided method (not per-backend SQL): composes the existing
-    /// resolution methods. Both backends inherit it.
+    /// resolution methods. Both backends inherit it. The writer's standing is
+    /// read as the roster stands NOW; a gate judging a ROW passes the row's
+    /// own instant ([`Self::check_write_cohort_scope_for_at`]).
     async fn check_write_cohort_scope_for(
         &self,
         writer_occurrence_key_id: &str,
         write_path: &'static str,
         claimed_cohort_scope: &str,
         claimed_target_id: Option<&str>,
+    ) -> Result<(), Error> {
+        self.check_write_cohort_scope_for_at(
+            writer_occurrence_key_id,
+            write_path,
+            claimed_cohort_scope,
+            claimed_target_id,
+            None,
+        )
+        .await
+    }
+
+    /// v62.0.0 (KR-fix30; the lead's ruling of 2026-11-22 on I4310, the
+    /// "valid when made" rule of the standing-end text) — **the write-scope
+    /// gate, with the writer's standing judged at the ROW's own point**.
+    /// `act_at: Some(t)` (the row's `asserted_at`): the writer must be on the
+    /// target's roster AS IT STOOD AT `t`, read by the one as-of roster fold
+    /// (`cosign::active_members_at` → `authorized_{community,family}_roster_at`),
+    /// so a later departure does not un-conclude a row written while a
+    /// member, on a re-fold or a late arrival. Bounded by the ONE W rule
+    /// (`self_roster::outside_past_freshness_window`, as
+    /// `trust_root::conferred_for_act` and the cosign door apply it): a row
+    /// dated outside W whose writer is no member NOW is held
+    /// `asserted_at_stale`, so a departed member cannot backdate a new row
+    /// into their membership. A row dated before the writer joined, or after
+    /// they left, is refused as before. `None`: the roster as it stands now
+    /// (the earlier reading, kept for a caller with no row in hand).
+    ///
+    /// THE HEAD RULE (marked for the standing-end lane): when the head
+    /// patches stack on top, "the row's own point" is the roster version the
+    /// row names as `refs.head`, and this as-of read by instant moves to it.
+    async fn check_write_cohort_scope_for_at(
+        &self,
+        writer_occurrence_key_id: &str,
+        write_path: &'static str,
+        claimed_cohort_scope: &str,
+        claimed_target_id: Option<&str>,
+        act_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), Error> {
         use crate::federation::types::cohort_scope::{self as cs, TargetPlane};
         // Fast path: `self` + the commons need no membership resolution.
@@ -9942,26 +10127,49 @@ pub trait FederationDirectory: Send + Sync {
                         Error::WriteScopeRefused(reason),
                     ));
                 }
-                match plane {
-                    TargetPlane::Family => {
-                        if self
-                            .active_family_members(target)
+                // v62.0.0 (KR-fix30) — every roster read here is the ONE
+                // as-of fold (`cosign::active_members_at`): at the row's own
+                // instant, and at THIS node's receipt only for the W rule's
+                // "member still" half (as `trust_root::conferred_for_act`
+                // reads its conferral at `received_at`). With no row in hand
+                // (`act_at: None`) the receipt instant is the reading, as the
+                // earlier `active_*_members` read was.
+                let kind = match plane {
+                    TargetPlane::Family => group_plane::GroupKind::Family,
+                    TargetPlane::Room => group_plane::GroupKind::Community,
+                };
+                let received_at = crate::host::clock::now();
+                let member_now = cosign::active_members_at(self, kind, target, received_at)
+                    .await?
+                    .contains(&identity);
+                let member = match act_at {
+                    None => member_now,
+                    Some(t) => {
+                        let then = cosign::active_members_at(self, kind, target, t)
                             .await?
-                            .iter()
-                            .any(|m| m.key_id == identity)
+                            .contains(&identity);
+                        if then
+                            && !member_now
+                            && self_roster::outside_past_freshness_window(t, received_at)
                         {
-                            family_key_ids.push(target.to_owned());
+                            return Err(edition2::fold::hold(
+                                edition2::fold::reason::ASSERTED_AT_STALE,
+                                Error::AssertedAtStale {
+                                    author: identity.clone(),
+                                    standing_for: target.to_owned(),
+                                    plane: "write_scope",
+                                    asserted_at: t,
+                                    w_secs: self_roster::PAST_FRESHNESS_W_SECS,
+                                },
+                            ));
                         }
+                        then
                     }
-                    TargetPlane::Room => {
-                        if self
-                            .active_community_members(target)
-                            .await?
-                            .iter()
-                            .any(|m| m.key_id == identity)
-                        {
-                            community_key_ids.push(target.to_owned());
-                        }
+                };
+                if member {
+                    match plane {
+                        TargetPlane::Family => family_key_ids.push(target.to_owned()),
+                        TargetPlane::Room => community_key_ids.push(target.to_owned()),
                     }
                 }
             }
@@ -14650,6 +14858,52 @@ pub mod malformed_row {
     /// unit readers do not yet honour a replacement, so it would land with no
     /// effect while looking admitted). Refused; nothing is kept.
     pub const SUPERSEDES_UNSUPPORTED: &str = "supersedes_unsupported";
+    /// v62.0.0 (KR-fix20; CC 2.4.1.1 rule 0, CC 3.1.3 and the Constitution's
+    /// ruling of 2026-11-22: "the count always wins") — a `withdraws` (or a
+    /// `recants`) that can never retract the row it names, judged against
+    /// that HELD row:
+    ///
+    /// - the row is of a family that is never withdrawn (an entity
+    ///   revocation, an occurrence revocation, a `key:revocation`, a key
+    ///   grant, a cosignature already sent);
+    /// - or the row is a COUNTED row (a quorum's act, no `author`) and the
+    ///   withdrawal is not itself a count: a lone voice's, a subject's or a
+    ///   stranger's authored withdrawal. A counted row is reached only by a
+    ///   count, and a voice is never withdrawn.
+    ///
+    /// Refused at the door; nothing is kept. A withdrawal that waited for its
+    /// target (`link_unheld`) and meets this refusal when the target arrives
+    /// is DROPPED: its statements, names and fold record are deleted
+    /// (`FederationDirectory::drop_held_row`). The plane is
+    /// `admission::WITHDRAWS_PLANE`.
+    pub const WITHDRAWS_NEVER_RETRACTS: &str = "withdraws_never_retracts";
+    /// v62.0.0 (HEAD-2; CC 2.4.1.1, "A row that exercises a standing and
+    /// names no head concludes nothing") — a NEW statement that exercises a
+    /// standing (`edition2::head_rule::head_kind` names a head) and states
+    /// no `refs.head`: a row placed in a room or a family that names no
+    /// roster version; an owned node's or agent's row that names no owner
+    /// binding; a delegate's duty row that names no delegation. Refused at
+    /// the statement door (`edition2::head_rule::require_head_named`); a row
+    /// already held is never re-judged by it.
+    pub const ACT_NAMES_NO_HEAD: &str = "act_names_no_head";
+    /// v62.0.0 (HEAD-3; CC 2.4.1.1, "an end with a newer head in its own
+    /// past concludes nothing") — a `withdraws` naming `refs.head` h whose
+    /// target names a head that DESCENDS from h (a later version of the same
+    /// roster, a successor bundle): the end acts from a head older than one
+    /// it has in its own past. Read structurally (the roster's and the
+    /// bundles' own lineage), never by an instant.
+    pub const END_NAMES_OLD_HEAD: &str = "end_names_old_head";
+    /// v62.0.0 (HEAD-3; CC 2.4.1.1, "One's own end lifts nothing, and `lifts`
+    /// on it is refused") — a `lifts` member on an AUTHORED end (one signer's
+    /// own withdrawal or unseating): only a counted end may state it.
+    pub const LIFTS_ON_OWN_END: &str = "lifts_on_own_end";
+    /// v62.0.0 (GID-prod; CIRISConstitution "THE DERIVED GROUP ID") — a
+    /// first `group:roster` version (no `refs.head`) whose `group` is not
+    /// the id derived from its own members
+    /// (`edition2::group_id::check_group_roster_founding`). One spelling:
+    /// the group-id module's (Verify 23.5.1's at the pin step).
+    pub const GROUP_ID_NOT_OF_FOUNDING: &str =
+        crate::federation::edition2::group_id::GROUP_ID_NOT_OF_FOUNDING;
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
         NO_SIGNER,
@@ -14735,7 +14989,64 @@ pub mod malformed_row {
         SUPERSEDES_UNSUPPORTED,
         // v62.0.0 (PIN-fix9b.rev2) — appended.
         SUPERSEDES_NOT_A_REPLACEMENT,
+        // v62.0.0 (KR-fix20) — appended.
+        WITHDRAWS_NEVER_RETRACTS,
+        // v62.0.0 (HEAD-2) — appended.
+        ACT_NAMES_NO_HEAD,
+        // v62.0.0 (HEAD-3) — appended.
+        END_NAMES_OLD_HEAD,
+        LIFTS_ON_OWN_END,
+        // v62.0.0 (GID-prod) — appended.
+        GROUP_ID_NOT_OF_FOUNDING,
     ];
+}
+
+/// v62.0.0 (WD-fix9 rev 2; the lead's ruling) — **the seal on a
+/// storage-only write behind the edition-2 door.** A directory method that
+/// stores what a door already judged (an occurrence bind,
+/// [`FederationDirectory::put_identity_occurrence_edition2`]; an occurrence
+/// revocation, [`FederationDirectory::put_identity_occurrence_revocation_edition2`])
+/// takes one. Its field is private and its only constructor is
+/// `pub(crate)`, so a host crate can name the type (to implement the trait)
+/// but never produce a value: it cannot call the write. Only the edition-2
+/// doors in this crate construct it. Gated from disk by
+/// `scripts/earlier_form_doors.py` (verdict `sealed`).
+///
+/// A host crate cannot make one (the external-crate witness, run by
+/// `cargo test --doc`):
+///
+/// ```compile_fail
+/// let _door = ciris_persist::federation::DoorToken::new();
+/// ```
+///
+/// ```compile_fail
+/// let _door = ciris_persist::federation::DoorToken { _sealed: () };
+/// ```
+#[derive(Debug)]
+pub struct DoorToken {
+    _sealed: (),
+}
+
+impl DoorToken {
+    /// The token, for the edition-2 door that judged the write.
+    pub(crate) const fn new() -> Self {
+        Self { _sealed: () }
+    }
+}
+
+/// v62.0.0 (WD-fix8) — the refusal of the retired trusted-local occurrence
+/// revocation ([`FederationDirectory::put_identity_occurrence_revocation_local`]),
+/// naming the edition-2 path.
+pub(crate) fn occurrence_revocation_local_retired() -> Error {
+    Error::malformed_row(
+        "identity_occurrence_revocation",
+        edition2::token::EARLIER_FORM_OBJECT,
+        "an unsigned trusted-local occurrence revocation (the earlier form): a node of this \
+         form evicts a device from a self's roster only by its edition-2 \
+         `identity:occurrence_revocation`: draft it (`Engine::statement_draft`), sign it, and \
+         submit it through the statement door (`Engine::submit_voice` / \
+         `Engine::put_edition2_statement`); CC 2.6.1.12, 3.3.6.4",
+    )
 }
 
 impl Error {
