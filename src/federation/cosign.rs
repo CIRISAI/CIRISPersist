@@ -10,7 +10,12 @@
 //!
 //! # When an event is held
 //!
-//! Only when every condition holds ([`hold`]):
+//! v62.0.0 (WD-fix7): the earlier-form hold this section describes (the
+//! minted pending row, `cosign::hold`) is retired; an edition-2 group change
+//! is counted voices, kept and `Pending` at the statement door (T1). The
+//! conditions below are the earlier form's, kept as the record of the rule.
+//!
+//! Only when every condition held (the retired `cosign::hold`):
 //!
 //! - the standing verdict is [`StandingVerdict::ConsensusShort`]
 //!   (`roster_event_verdict`): detected structurally, every signer an ACTIVE
@@ -856,108 +861,6 @@ pub fn check_community_record_window(row: &super::types::Community) -> Result<()
     Ok(())
 }
 
-/// **The hold, at a typed door** whose standing check returned
-/// [`RosterAuthority::ConsensusShort`](super::RosterAuthority::ConsensusShort)
-/// and whose later checks were all met. `signed` is the event as offered;
-/// `shortfall` the refusal the door returns when it does not hold.
-///
-/// Holds — mints the pending row and a signature row for every cosignature
-/// the event carries, through the attestation door, and returns
-/// [`Error::RosterChangeNotLanded`] — only at the LOCAL door, outside the
-/// executor, on the node that speaks for the primary, with no other open hold
-/// of the primary in the group. Otherwise returns `shortfall`: exactly the
-/// pre-#1252 refusal.
-pub(crate) async fn hold<D>(dir: &D, signed: GroupSigned, shortfall: Error) -> Error
-where
-    D: FederationDirectory + ?Sized,
-{
-    match hold_inner(dir, &signed).await {
-        Ok(Some(held)) => held,
-        Ok(None) => shortfall,
-        Err(e) => {
-            tracing::warn!(error = %e, group = signed.group_key_id(), "cosign hold not taken");
-            match e {
-                // A policy refusal of the window is the door's answer.
-                Error::GovernancePolicyRefused { .. } => e,
-                _ => shortfall,
-            }
-        }
-    }
-}
-
-async fn hold_inner<D>(dir: &D, signed: &GroupSigned) -> Result<Option<Error>, Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    if !is_cosignable(signed)
-        || super::group_plane::applying_replicated_group_row()
-        || executing_received_at().is_some()
-    {
-        return Ok(None);
-    }
-    let Some(me) = dir.node_key_id() else {
-        return Ok(None);
-    };
-    let primary = signed.authority_key_id().to_owned();
-    if !super::self_collective::speaks_for(dir, &me, &primary).await? {
-        return Ok(None);
-    }
-    // The window is read (and a bad one refused) before anything is held.
-    let blob = match signed.kind() {
-        GroupKind::Community => dir
-            .lookup_community(signed.group_key_id())
-            .await?
-            .and_then(|c| c.policy_blob),
-        GroupKind::Family => None,
-    };
-    window_secs(signed.kind(), signed.family(), blob.as_ref())?;
-    let pending = pending_row(signed)?;
-    let quorum_key = pending.attestation_id.clone();
-    if let Some(r) = dir.cosign_receipt(&quorum_key).await? {
-        if r.outcome.is_some() {
-            return Ok(None);
-        }
-    }
-    let open = dir.list_open_cosign_receipts().await?;
-    if open.iter().any(|r| {
-        r.group_key_id == signed.group_key_id()
-            && r.group_kind == signed.kind().as_str()
-            && r.proposer_key_id == primary
-            && r.quorum_key != quorum_key
-    }) {
-        tracing::info!(
-            group = signed.group_key_id(),
-            proposer = %primary,
-            "cosign: the proposer holds another open hold in the group; refused as before"
-        );
-        return Ok(None);
-    }
-    if dir.get_attestation(&quorum_key).await?.is_none() {
-        dir.put_attestation(super::SignedAttestation {
-            attestation: pending,
-        })
-        .await?;
-    }
-    for c in signed.cosignatures() {
-        let row = signature_row(signed, c)?;
-        if dir.get_attestation(&row.attestation_id).await?.is_none() {
-            dir.put_attestation(super::SignedAttestation { attestation: row })
-                .await?;
-        }
-    }
-    let signers = 1 + dir.list_cosign_signatures(&quorum_key).await?.len();
-    Ok(Some(Error::RosterChangeNotLanded {
-        group_key_id: signed.group_key_id().to_owned(),
-        member_key_id: subject_of(signed)?.to_owned(),
-        direction: match signed.family() {
-            GroupPlaneFamily::Removal => "removal",
-            _ => "widening",
-        },
-        quorum_key,
-        signers,
-    }))
-}
-
 /// A door's later check refused under a short verdict: the short event keeps
 /// the shortfall refusal it met first before the split (`e` otherwise).
 pub(crate) fn keep_shortfall(short: &mut Option<Error>, e: Error) -> Error {
@@ -965,12 +868,13 @@ pub(crate) fn keep_shortfall(short: &mut Option<Error>, e: Error) -> Error {
 }
 
 /// The door's step after its plan: with no shortfall, the event goes on to
-/// the write (`Ok(signed)`); with one, it is [`hold`]'s answer
-/// (`RosterChangeNotLanded`, or the shortfall refusal unchanged).
+/// the write (`Ok(signed)`); with one, the shortfall refusal unchanged (the
+/// edition-2 door reads it, `edition2::group::note_short`). v62.0.0
+/// (WD-fix7): the earlier-form hold is retired.
 ///
 /// # Errors
 ///
-/// [`hold`]'s answer.
+/// The shortfall refusal.
 pub(crate) async fn hold_if_short<D>(
     dir: &D,
     short: Option<Error>,
@@ -985,11 +889,18 @@ where
         // never held as an earlier-form object: its voices are kept in
         // `ceg_statements`, and the edition-2 door reads the shortfall
         // (`edition2::group`).
-        Some(shortfall) if super::edition2::group::vouched() => {
-            super::edition2::group::note_short();
+        // v62.0.0 (WD-fix7; the lead's ruling) — the earlier-form hold
+        // (`hold` / `hold_inner`: a minted pending row and signature rows, no
+        // statement) is retired: this door runs only under the edition-2
+        // vouch (`door::refuse_earlier_form` refuses every other caller
+        // first), where a short change is counted voices, kept and `Pending`.
+        Some(shortfall) => {
+            if super::edition2::group::vouched() {
+                super::edition2::group::note_short();
+            }
+            let _ = (dir, signed);
             Err(shortfall)
         }
-        Some(shortfall) => Err(hold(dir, signed, shortfall).await),
     }
 }
 
@@ -1221,6 +1132,17 @@ where
 /// **The sweep**: [`execute_for`] every open hold on this node — what met
 /// its protocol lands, what lapsed expires, what was withdrawn ends. Returns
 /// how many landed.
+///
+/// v62.0.0 (KR-fix24; CC 3.3.4) — the same sweep lapses the EDITION-2
+/// counted rows short of their count whose hold window has run on this
+/// node's clock ([`edition2::fold::lapse_short_counted_rows`](super::edition2::fold::lapse_short_counted_rows)
+/// at [`crate::host::clock::now`]): edition 2 mints no pending row, so its
+/// holds are the rows themselves. Their voices are dropped and nothing is
+/// refused. The count returned is still the earlier-form holds that landed;
+/// the lapses are logged.
+///
+/// # Errors
+/// Directory reads and writes.
 pub async fn execute_due<D>(dir: &D) -> Result<usize, Error>
 where
     D: FederationDirectory + ?Sized,
@@ -1230,6 +1152,18 @@ where
         if Box::pin(execute_for(dir, &r.quorum_key)).await? == Executed::Landed {
             landed += 1;
         }
+    }
+    let lapsed = Box::pin(super::edition2::fold::lapse_short_counted_rows(
+        dir,
+        crate::host::clock::now(),
+    ))
+    .await?;
+    if !lapsed.lapsed.is_empty() {
+        tracing::info!(
+            rows = lapsed.lapsed.len(),
+            statements = lapsed.statements,
+            "cosign sweep: edition-2 counted rows short of their count lapsed (CC 3.3.4)"
+        );
     }
     Ok(landed)
 }

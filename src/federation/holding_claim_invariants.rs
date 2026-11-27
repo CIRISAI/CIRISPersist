@@ -74,6 +74,11 @@
 //! - **I721** — from disk: no production source builds a `holds_bytes` row
 //!   type; the stem is named only by the retired list
 //!   (`registry::RETIRED_CARRIER_STEMS`).
+//! - **I5708** (v62.0.0, FS-sig-a; CC 3.4.7: `community:listing` is signed
+//!   by "a holder of the community's `moderate` duty") — a founder lists its
+//!   room only as a `moderate`-holder: a founder who is not steward-bound (a
+//!   self-declared minor with no steward edge) roots no duty, and its listing
+//!   is never the room's live listing; a steward-bound founder's is.
 
 #[cfg(test)]
 mod pure {
@@ -371,15 +376,20 @@ pub(crate) mod dyn_bodies {
     /// (T1); the room id the tests pass is already an identity-ref
     /// (`e2::kid`), the key the typed row is held under. The rows are
     /// now-relative (the room is founded a day ago).
-    async fn put_room(d: &dyn FederationDirectory, c: Community) -> Result<(), Error> {
+    /// v62.0.0 (GID-fixtures-mech, .rev2) — returns the room's DERIVED id
+    /// (`e2::room_id`: the codec records the name the test chose for it,
+    /// and an unrecorded founding panics here). The id the test passed in
+    /// names the room only until this returns: use the returned id after.
+    async fn put_room(d: &dyn FederationDirectory, c: Community) -> Result<String, Error> {
         let founder = c.members[0].key_id.clone();
+        let name = c.community_key_id.clone();
         let at = u64::try_from(c.founded_at.timestamp_millis()).expect("ms");
         e2::put_voices(
             d,
             &e2::community_voices(&ts::sign_community(&founder, c), 1, None, at),
         )
-        .await
-        .map(|_| ())
+        .await?;
+        Ok(e2::room_id(&name))
     }
 
     fn rule_of(e: &Error) -> String {
@@ -435,10 +445,20 @@ pub(crate) mod dyn_bodies {
             crate::federation::public_room::PUBLIC_RULE_ADMISSION_MEMBER_RETIRED,
             "I712 {e}"
         );
-        let id = e2::kid(&format!("i712-pub-{tag}"));
-        put_room(d, room(&id, &founder, None, open_policy(), OPEN))
-            .await
-            .expect("I712 an open public room is admitted");
+        // GID-fixtures-sites — the room's id is the DERIVED one `put_room`
+        // returns, never the name it was founded under.
+        let id = put_room(
+            d,
+            room(
+                &e2::kid(&format!("i712-pub-{tag}")),
+                &founder,
+                None,
+                open_policy(),
+                OPEN,
+            ),
+        )
+        .await
+        .expect("I712 an open public room is admitted");
         // A later version that leaves the `public` side is refused, before
         // anything about the amendment itself is asked.
         // v62 (E4): a later version is the roster's own next version
@@ -489,15 +509,23 @@ pub(crate) mod dyn_bodies {
             &format!("i713o-{tag}"),
         )
         .await;
-        let id = e2::kid(&format!("i713-pub-{tag}"));
-        put_room(d, room(&id, &founder, None, open_policy(), OPEN))
-            .await
-            .unwrap();
-        let shut = e2::kid(&format!("i713-shut-{tag}"));
-        put_room(
+        // GID-fixtures-sites — the derived ids `put_room` returns.
+        let id = put_room(
             d,
             room(
-                &shut,
+                &e2::kid(&format!("i713-pub-{tag}")),
+                &founder,
+                None,
+                open_policy(),
+                OPEN,
+            ),
+        )
+        .await
+        .unwrap();
+        let shut = put_room(
+            d,
+            room(
+                &e2::kid(&format!("i713-shut-{tag}")),
                 &founder,
                 None,
                 serde_json::json!({"cohort_subkind": COHORT_SUBKIND_PUBLIC}),
@@ -584,14 +612,28 @@ pub(crate) mod dyn_bodies {
         use crate::federation::replication_audience::{is_public_group, may_receive};
         let (founder, _) = key(d, "i775f", tag).await;
         let (outsider, _) = key(d, "i775o", tag).await;
-        let id = e2::kid(&format!("i775-pub-{tag}"));
-        put_room(d, room(&id, &founder, None, open_policy(), OPEN))
-            .await
-            .unwrap();
-        let private = e2::kid(&format!("i775-priv-{tag}"));
-        put_room(
+        // GID-fixtures-sites — the derived ids `put_room` returns.
+        let id = put_room(
             d,
-            room(&private, &founder, None, serde_json::json!({}), CLOSED),
+            room(
+                &e2::kid(&format!("i775-pub-{tag}")),
+                &founder,
+                None,
+                open_policy(),
+                OPEN,
+            ),
+        )
+        .await
+        .unwrap();
+        let private = put_room(
+            d,
+            room(
+                &e2::kid(&format!("i775-priv-{tag}")),
+                &founder,
+                None,
+                serde_json::json!({}),
+                CLOSED,
+            ),
         )
         .await
         .unwrap();
@@ -647,7 +689,20 @@ pub(crate) mod dyn_bodies {
     /// after the record lands, is admitted.
     pub(crate) async fn i724_a_listing_waits_for_its_room(d: &dyn FederationDirectory, tag: &str) {
         let (founder, _) = key(d, "i724f", tag).await;
-        let id = e2::kid(&format!("i724-pub-{tag}"));
+        // GID-fixtures-sites — the listing names the room BEFORE it is
+        // founded, so its id is PREDICTED from the record the founding will
+        // state (`fixture_group_id`; the registry is not written until the
+        // founding), and the founding below must derive exactly it.
+        let record = room(
+            &e2::kid(&format!("i724-pub-{tag}")),
+            &founder,
+            None,
+            open_policy(),
+            OPEN,
+        );
+        let id = crate::federation::edition2::group_fixtures::fixture_group_id(
+            &crate::federation::edition2::group::GroupRecord::Community(record.clone()),
+        );
         let env = serde_json::json!({
             "dimension": LISTING_DIMENSION, "score": 1.0, "confidence": 1.0,
             "community_key_id": id, "cohort_subkind": COHORT_SUBKIND_PUBLIC,
@@ -673,9 +728,11 @@ pub(crate) mod dyn_bodies {
             d.get_attestation(&e2::rid(&row)).await.unwrap().is_none(),
             "I724 it concludes nothing"
         );
-        put_room(d, room(&id, &founder, None, open_policy(), OPEN))
-            .await
-            .unwrap();
+        assert_eq!(
+            put_room(d, record).await.unwrap(),
+            id,
+            "I724 premise: the founding derives the predicted id"
+        );
         e2::put_signed(d, &row)
             .await
             .expect("I724 the same listing, re-offered after the record, is admitted");
@@ -697,10 +754,19 @@ pub(crate) mod dyn_bodies {
         tag: &str,
     ) {
         let (founder, _) = key(d, "i776f", tag).await;
-        let id = e2::kid(&format!("i776-pub-{tag}"));
-        put_room(d, room(&id, &founder, None, open_policy(), OPEN))
-            .await
-            .unwrap();
+        // GID-fixtures-sites — the derived id `put_room` returns.
+        let id = put_room(
+            d,
+            room(
+                &e2::kid(&format!("i776-pub-{tag}")),
+                &founder,
+                None,
+                open_policy(),
+                OPEN,
+            ),
+        )
+        .await
+        .unwrap();
         let now = Utc::now();
         let put = |n: &str, asserted: chrono::DateTime<Utc>, expires: chrono::DateTime<Utc>| {
             let env = serde_json::json!({
@@ -769,17 +835,28 @@ pub(crate) mod dyn_bodies {
     pub(crate) async fn i714_the_listing_door(d: &dyn FederationDirectory, tag: &str) {
         let (founder, founder_alias) = key(d, "i714f", tag).await;
         let (other, other_alias) = key(d, "i714o", tag).await;
-        let pubroom = e2::kid(&format!("i714-pub-{tag}"));
-        put_room(
+        // GID-fixtures-sites — the derived ids `put_room` returns.
+        let pubroom = put_room(
             d,
-            room(&pubroom, &founder, Some(&other), open_policy(), OPEN),
+            room(
+                &e2::kid(&format!("i714-pub-{tag}")),
+                &founder,
+                Some(&other),
+                open_policy(),
+                OPEN,
+            ),
         )
         .await
         .unwrap();
-        let private = e2::kid(&format!("i714-priv-{tag}"));
-        put_room(
+        let private = put_room(
             d,
-            room(&private, &founder, None, serde_json::json!({}), CLOSED),
+            room(
+                &e2::kid(&format!("i714-priv-{tag}")),
+                &founder,
+                None,
+                serde_json::json!({}),
+                CLOSED,
+            ),
         )
         .await
         .unwrap();
@@ -843,13 +920,93 @@ pub(crate) mod dyn_bodies {
             "I714 the room's one live listing"
         );
     }
+
+    /// **I5708** (v62.0.0, FS-sig-a) — see the module header. The listing
+    /// verb answers `Ok` for a held row too, so the verdict is read from the
+    /// one live-listing reader.
+    pub(crate) async fn i5708_a_founder_lists_only_as_a_moderate_holder(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let (minor, minor_alias) = key(d, "i5708m", tag).await;
+        let (adult, adult_alias) = key(d, "i5708a", tag).await;
+        // GID-fixtures.rev2 — the rooms are NAMED before founding and their
+        // ids are the DERIVED ones `put_room` returns (`e2::room_id`); a
+        // `kid(name)` kept from before founding would be a key.
+        let minors_name = e2::kid(&format!("i5708-minors-{tag}"));
+        let adults_name = e2::kid(&format!("i5708-adults-{tag}"));
+        let minors_room = put_room(d, room(&minors_name, &minor, None, open_policy(), OPEN))
+            .await
+            .unwrap();
+        let adults_room = put_room(d, room(&adults_name, &adult, None, open_policy(), OPEN))
+            .await
+            .unwrap();
+        assert_eq!(
+            minors_room,
+            e2::room_id(&minors_name),
+            "I5708 premise: the room is founded under its derived id"
+        );
+        // After founding, the minor founder declares itself a minor (the self
+        // rung): with no steward edge it is no longer steward-bound, so it
+        // roots no room duty, while the roster still names it founder.
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut age = ts::bare_attestation(&id, &minor, &minor, &serde_json::json!({ "id": id }));
+        age.attestation_type = "age_self_declared:band:minor:v1".to_owned();
+        age.asserted_at = Utc::now() - Duration::hours(3);
+        age.scrub_timestamp = age.asserted_at;
+        ts::seal_row_in_place(&minor, &mut age);
+        e2::put_signed(d, &age)
+            .await
+            .expect("I5708: the minor's own declaration");
+        assert!(
+            !crate::federation::admission::is_steward_bound(d, &minor)
+                .await
+                .expect("is_steward_bound"),
+            "I5708 premise: a self-declared minor with no steward is not steward-bound"
+        );
+        assert!(
+            crate::federation::admission::is_steward_bound(d, &adult)
+                .await
+                .expect("is_steward_bound"),
+            "I5708 premise: an adult user is its own steward"
+        );
+        let good = |room: &str| {
+            serde_json::json!({
+                "community_key_id": room, "cohort_subkind": COHORT_SUBKIND_PUBLIC,
+                "admission": ADMISSION_OPEN, "moderator": "m", "name": "n", "description": "d",
+            })
+        };
+        // Held (or refused) under its token: never the live listing.
+        if let Err(e) = listing(d, &minor_alias, cs::FEDERATION, good(&minors_room)).await {
+            assert!(
+                e.to_string()
+                    .contains("community_listing_signer_not_authorized"),
+                "I5708: {e}"
+            );
+        }
+        assert!(
+            live_listing(d, &minors_room).await.unwrap().is_none(),
+            "I5708: a founder that holds no `moderate` duty does not list its room"
+        );
+        let listed = listing(d, &adult_alias, cs::FEDERATION, good(&adults_room))
+            .await
+            .expect("I5708: the steward-bound founder's listing");
+        assert_eq!(
+            live_listing(d, &adults_room)
+                .await
+                .unwrap()
+                .map(|r| r.attestation_id),
+            Some(listed),
+            "I5708: a steward-bound founder (a `moderate`-holder) lists its room"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod blob_bodies {
     use crate::federation::custody_ack::{CustodyState, CUSTODY_ACK_DIMENSION};
     use crate::federation::key_grant_invariants::two_node::{
-        introduce_as, node_as, seed_community_everywhere,
+        introduce_as, node_owned_as, seed_community_everywhere,
     };
     use crate::federation::types::cohort_scope::{self as cs, CryptoTier};
     use crate::federation::types::identity_type::NODE;
@@ -932,7 +1089,7 @@ pub(crate) mod blob_bodies {
         B: BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::attestation_query::test_support::AllAttestations as _;
-        let n = node_as(b, &format!("i715-holder-{s}"), NODE).await;
+        let n = node_owned_as(b, &format!("i715-holder-{s}"), NODE).await;
         let bytes = format!("i715 public bytes {s}").into_bytes();
         let sha = sha256_of(&bytes);
         b.put_blob_signing_scoped(
@@ -997,9 +1154,9 @@ pub(crate) mod blob_bodies {
     {
         use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
         use crate::federation::replication::hold::is_audience;
-        let na = node_as(a, &format!("i716-a-{s}"), NODE).await;
-        let nb = node_as(b, &format!("i716-b-{s}"), NODE).await;
-        let outsider = node_as(b, &format!("i716-o-{s}"), NODE).await;
+        let na = node_owned_as(a, &format!("i716-a-{s}"), NODE).await;
+        let nb = node_owned_as(b, &format!("i716-b-{s}"), NODE).await;
+        let outsider = node_owned_as(b, &format!("i716-o-{s}"), NODE).await;
         introduce_as(
             &[&na, &nb],
             &[&format!("i716-a-{s}"), &format!("i716-b-{s}")],
@@ -1014,6 +1171,9 @@ pub(crate) mod blob_bodies {
             &[(&alice, Some(&na)), (&bob, Some(&nb))],
         )
         .await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         let put = put_blob_scoped(
             a,
             &na.signer,
@@ -1075,9 +1235,9 @@ pub(crate) mod blob_bodies {
         B: BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::replication::hold::is_audience;
-        let na = node_as(a, &format!("i723-a-{s}"), NODE).await;
-        let nb = node_as(b, &format!("i723-b-{s}"), NODE).await;
-        let stranger = node_as(b, &format!("i723-s-{s}"), NODE).await;
+        let na = node_owned_as(a, &format!("i723-a-{s}"), NODE).await;
+        let nb = node_owned_as(b, &format!("i723-b-{s}"), NODE).await;
+        let stranger = node_owned_as(b, &format!("i723-s-{s}"), NODE).await;
         introduce_as(
             &[&na, &nb],
             &[&format!("i723-a-{s}"), &format!("i723-b-{s}")],
@@ -1144,7 +1304,7 @@ pub(crate) mod blob_bodies {
         B: BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::holding_claim::{live_holders, reack_own_claims};
-        let n = node_as(b, &format!("i725-holder-{s}"), NODE).await;
+        let n = node_owned_as(b, &format!("i725-holder-{s}"), NODE).await;
         let now = chrono::Utc::now();
         let then = now - chrono::Duration::hours(70);
         let mut shas = Vec::new();
@@ -1229,7 +1389,7 @@ pub(crate) mod blob_bodies {
         };
         use crate::federation::read_probe;
         assert_eq!(CAP, 2, "I910 the test cap");
-        let n = node_as(b, &format!("i910-holder-{s}"), NODE).await;
+        let n = node_owned_as(b, &format!("i910-holder-{s}"), NODE).await;
         let now = chrono::Utc::now();
         let passes = [
             now - chrono::Duration::hours(2),
@@ -1325,7 +1485,7 @@ pub(crate) mod blob_bodies {
         B: BlobStorage + FederationDirectory + Sync + AccessSeam,
     {
         use crate::federation::holding_claim::reack_own_claims;
-        let n = node_as(b, &format!("i771-holder-{s}"), NODE).await;
+        let n = node_owned_as(b, &format!("i771-holder-{s}"), NODE).await;
         let now = chrono::Utc::now();
         let mut shas = Vec::new();
         for (i, at) in [now - chrono::Duration::hours(70), now]
@@ -1387,7 +1547,7 @@ pub(crate) mod blob_bodies {
     {
         use crate::federation::doors_takedown_invariants::bodies::{claimant, establish, notice};
         use crate::federation::holding_claim::emit_holding_claim;
-        let n = node_as(b, &format!("i778-holder-{s}"), NODE).await;
+        let n = node_owned_as(b, &format!("i778-holder-{s}"), NODE).await;
         let bytes = format!("i778 bytes {s}").into_bytes();
         let sha = sha256_of(&bytes);
         b.put_blob_signing_scoped(
@@ -1551,10 +1711,13 @@ pub(crate) mod blob_bodies {
         B: BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
-        let n = node_as(b, &format!("i717-a-{s}"), NODE).await;
+        let n = node_owned_as(b, &format!("i717-a-{s}"), NODE).await;
         let comm = crate::federation::edition2::fixture_switch::kid(&format!("i717-comm-{s}")); // v62 (E4): the typed row is keyed by identity-ref
         let alice = format!("i717-alice-{s}");
         seed_community_everywhere(&[&n], &comm, &[(&alice, Some(&n))]).await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         let put = put_blob_scoped(b, &n.signer, cs::COMMUNITY, Some(&comm), b"x", None, None)
             .await
             .unwrap();
@@ -1613,8 +1776,8 @@ pub(crate) mod blob_bodies {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
-        let n = node_as(b, &format!("i719-node-{s}"), NODE).await;
-        let p = node_as(b, &format!("i719-peer-{s}"), NODE).await;
+        let n = node_owned_as(b, &format!("i719-node-{s}"), NODE).await;
+        let p = node_owned_as(b, &format!("i719-peer-{s}"), NODE).await;
         let bytes = format!("i719 bytes {s}").into_bytes();
         let sha = sha256_of(&bytes);
         b.put_blob_signing_scoped(
@@ -1692,7 +1855,7 @@ pub(crate) mod blob_bodies {
     {
         use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
         use crate::federation::tier_ingest::test_support as ts;
-        let n = node_as(b, &format!("i720-node-{s}"), NODE).await;
+        let n = node_owned_as(b, &format!("i720-node-{s}"), NODE).await;
         let comm = crate::federation::edition2::fixture_switch::kid(&format!("i720-pub-{s}")); // v62 (E4): the typed row is keyed by identity-ref
         let alice = format!("i720-alice-{s}");
         seed_community_everywhere(&[&n], &comm, &[(&alice, Some(&n))]).await;
@@ -1717,6 +1880,9 @@ pub(crate) mod blob_bodies {
         )
         .await
         .unwrap();
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm2 = crate::federation::edition2::fixture_switch::room_id(&comm2);
         assert_eq!(
             crate::federation::at_rest_cascade::resolve_write_tier(b, cs::COMMUNITY, Some(&comm2))
                 .await
@@ -1845,6 +2011,7 @@ mod runners {
                 case!(i714_the_listing_door);
                 case!(i776_an_expired_listing_is_not_live);
                 case!(i724_a_listing_waits_for_its_room);
+                case!(i5708_a_founder_lists_only_as_a_moderate_holder);
             }
         };
     }

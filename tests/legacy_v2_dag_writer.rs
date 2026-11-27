@@ -127,7 +127,7 @@ async fn pull_a_legacy_v2_dag(aad: Option<Vec<u8>>) {
         ts::register_hybrid_key_as(n.backend, &owner, &owner, USER).await;
         for dev in [&na, &nb] {
             n.backend
-                .put_identity_occurrence_local(IdentityOccurrence {
+                .test_seam_put_identity_occurrence(IdentityOccurrence {
                     identity_key_id: owner.clone(),
                     occurrence_key_id: dev.key.clone(),
                     device_class: LAPTOP.to_owned(),
