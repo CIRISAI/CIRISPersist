@@ -316,7 +316,7 @@ Co-signatures now counted voices: none (the author's statement alone).
 ### `admission:unit`
 
 - **Replaces:** nothing: new in rc21 (CC 2.7.11, the code scope of kernel admission; wire admission:unit:v1, row type scores)
-- **Authorship:** counted where refs.head is present (act = group), authored otherwise; one person's (authored) row naming an effect is at cohort_scope self and admits only on a host that person owns; every signer a person (identity_type holds user or accord_holder); no delegate role
+- **Authorship:** counted where the payload carries no author (act = group; it names its roster head in refs.head), authored otherwise (naming no head); one person's (authored) row naming an effect is at cohort_scope self and admits only on a host that person owns; every signer a person (identity_type holds user or accord_holder); no delegate role
 - **`sub`:** the unit digest as tagged text, canonical:sha256:{hex} (not an identity-ref)
 - **Lands in:** ceg_statements + federation_attestations (the mapped scores row), held count_short until a counted row's count is met; no typed plane: the host's answer (admission_unit_runnable) reads the conclusion, the lease, the withdrawal, the standing and the receipt
 
