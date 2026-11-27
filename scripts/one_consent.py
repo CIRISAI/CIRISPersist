@@ -31,7 +31,6 @@ WRITERS = {
     "src/federation/mod.rs": (1, "check_write_cohort_scope_for: may this writer write to the room"),
     "src/ingest.rs": (1, "writer_admission: whose memberships a signed trace exercises"),
     "src/engine.rs": (1, "seal_trace_as: whose trace it is (attribution)"),
-    "src/federation/lineage_witness.rs": (2, "grouping witness keys by person: the lift only collapses voices"),
     "src/federation/blob_custody.rs": (1, "grouping devices by person: the lift only collapses"),
 }
 

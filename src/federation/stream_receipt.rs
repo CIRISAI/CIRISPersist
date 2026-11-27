@@ -1,4 +1,4 @@
-//! Streaming delivery receipts — `delivery_receipt:{stream_id}`
+//! Streaming delivery receipts — `delivery_ack:{stream_id}`
 //! (CIRISPersist#142 Cut C4, CEG 0.15 §10.5.4).
 //!
 //! A delivery receipt is a subscriber's **signed acknowledgement** that
@@ -69,7 +69,7 @@ pub struct DeliveryReceipt {
     pub chunk_root: [u8; 32],
     /// v62.0.0 (VA-pair-carriers) — the subscriber's ONE composite
     /// signature (ML-DSA-65-Ed25519, CC 2.6.1.7, 3373 bytes): its
-    /// `delivery_receipt:{stream_id}` statement's signature, verified by the
+    /// `delivery_ack:{stream_id}` statement's signature, verified by the
     /// edition-2 door. It replaces the earlier `signature`, a
     /// `ciris_crypto::HybridSignature` holding the two halves and the two
     /// public keys.
@@ -201,7 +201,7 @@ pub fn stored_receipt_composite(bytes: Vec<u8>) -> Result<Vec<u8>, crate::federa
 // receipt's bound-hybrid verify (`verify_receipt_signature`, Ed25519 +
 // ML-DSA-65 by `subscriber_key_id` through `verify_hybrid_via_directory`) is
 // DELETED with the earlier receipt door's admission: a receipt is a
-// `delivery_receipt:{stream_id}` statement, verified by the edition-2 door.
+// `delivery_ack:{stream_id}` statement, verified by the edition-2 door.
 
 /// A receipt field one byte longer than a `u32` length prefix can carry
 /// (CIRISPersist#1132). Zero-filled, so the 4 GiB allocation maps the zero

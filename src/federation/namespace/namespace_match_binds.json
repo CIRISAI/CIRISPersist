@@ -1,9 +1,9 @@
 {
  "_meta": {
-  "cc_commit": "6c879e324f4471c37be5056fcbb162bda6e5ba6b",
+  "cc_commit": "e84a2cf87cf72e75d4d889513bd64bf815b42ef1",
   "generator": "scripts/gen_namespace_match_binds.py",
   "reference": "tools/cc_namespace_match.py",
-  "vectors_sha256": "6bed6efa3b4d95d63cfc07844cc4c2eacd68511097fcf72c970962895646f198"
+  "vectors_sha256": "f727ab232b0ebe540229a4edb74445d160aa56985c6b713fd908ea0e394f8f88"
  },
  "binds": [
   {
@@ -330,6 +330,44 @@
    "dimension": "accord:lifecycle:not_a_listed_value:v1",
    "family": "accord:lifecycle:{kind}",
    "refusal": "namespace_vocab_value_unregistered"
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "act:ack:v1",
+   "family": "act:ack",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "act:ack:V1",
+   "family": "act:ack",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "act:ack:v1:v2",
+   "family": "act:ack",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "act:ack:v1beta",
+   "family": "act:ack",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Act:ack:v1",
+   "family": "act:ack",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "act:ack",
+   "family": "act:ack",
+   "refusal": "missing_version_segment"
   },
   {
    "binds": {
@@ -3211,72 +3249,6 @@
   },
   {
    "binds": {
-    "state": "pending",
-    "version": "v1"
-   },
-   "dimension": "cosign:pending:v1",
-   "family": "cosign:{state}",
-   "refusal": null
-  },
-  {
-   "binds": {},
-   "dimension": "cosign:pending:V1",
-   "family": "cosign:{state}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "cosign:pending:v1:v2",
-   "family": "cosign:{state}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "cosign:pending:v1beta",
-   "family": "cosign:{state}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "Cosign:pending:v1",
-   "family": "cosign:{state}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {
-    "state": "pending"
-   },
-   "dimension": "cosign:pending",
-   "family": "cosign:{state}",
-   "refusal": "missing_version_segment"
-  },
-  {
-   "binds": {
-    "state": "PENDING"
-   },
-   "dimension": "cosign:PENDING:v1",
-   "family": "cosign:{state}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {
-    "state": "signature",
-    "version": "v1"
-   },
-   "dimension": "cosign:signature:v1",
-   "family": "cosign:{state}",
-   "refusal": null
-  },
-  {
-   "binds": {
-    "state": "not_a_listed_value"
-   },
-   "dimension": "cosign:not_a_listed_value:v1",
-   "family": "cosign:{state}",
-   "refusal": "namespace_vocab_value_unregistered"
-  },
-  {
-   "binds": {
     "domain": "sample",
     "language": "sample",
     "subject": "id1",
@@ -3577,40 +3549,40 @@
     "stream_id": "id1",
     "version": "v1"
    },
-   "dimension": "delivery_receipt:id1:v1",
-   "family": "delivery_receipt:{stream_id}",
+   "dimension": "delivery_ack:id1:v1",
+   "family": "delivery_ack:{stream_id}",
    "refusal": null
   },
   {
    "binds": {},
-   "dimension": "delivery_receipt:id1:V1",
-   "family": "delivery_receipt:{stream_id}",
+   "dimension": "delivery_ack:id1:V1",
+   "family": "delivery_ack:{stream_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "delivery_receipt:id1:v1:v2",
-   "family": "delivery_receipt:{stream_id}",
+   "dimension": "delivery_ack:id1:v1:v2",
+   "family": "delivery_ack:{stream_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "delivery_receipt:id1:v1beta",
-   "family": "delivery_receipt:{stream_id}",
+   "dimension": "delivery_ack:id1:v1beta",
+   "family": "delivery_ack:{stream_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "Delivery_receipt:id1:v1",
-   "family": "delivery_receipt:{stream_id}",
+   "dimension": "Delivery_ack:id1:v1",
+   "family": "delivery_ack:{stream_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {
     "stream_id": "id1"
    },
-   "dimension": "delivery_receipt:id1",
-   "family": "delivery_receipt:{stream_id}",
+   "dimension": "delivery_ack:id1",
+   "family": "delivery_ack:{stream_id}",
    "refusal": "missing_version_segment"
   },
   {
@@ -5025,6 +4997,44 @@
   },
   {
    "binds": {
+    "version": "v1"
+   },
+   "dimension": "holon:claim:v1",
+   "family": "holon:claim",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "holon:claim:V1",
+   "family": "holon:claim",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "holon:claim:v1:v2",
+   "family": "holon:claim",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "holon:claim:v1beta",
+   "family": "holon:claim",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Holon:claim:v1",
+   "family": "holon:claim",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "holon:claim",
+   "family": "holon:claim",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
     "canonical_hash": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
    },
    "dimension": "identity:canonical_binding:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
@@ -5795,81 +5805,6 @@
   },
   {
    "binds": {
-    "stage": "proposal",
-    "version": "v1"
-   },
-   "dimension": "lineage_witness:proposal:v1",
-   "family": "lineage_witness:{stage}",
-   "refusal": null
-  },
-  {
-   "binds": {},
-   "dimension": "lineage_witness:proposal:V1",
-   "family": "lineage_witness:{stage}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "lineage_witness:proposal:v1:v2",
-   "family": "lineage_witness:{stage}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "lineage_witness:proposal:v1beta",
-   "family": "lineage_witness:{stage}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "Lineage_witness:proposal:v1",
-   "family": "lineage_witness:{stage}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {
-    "stage": "proposal"
-   },
-   "dimension": "lineage_witness:proposal",
-   "family": "lineage_witness:{stage}",
-   "refusal": "missing_version_segment"
-  },
-  {
-   "binds": {
-    "stage": "PROPOSAL"
-   },
-   "dimension": "lineage_witness:PROPOSAL:v1",
-   "family": "lineage_witness:{stage}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {
-    "stage": "acceptance",
-    "version": "v1"
-   },
-   "dimension": "lineage_witness:acceptance:v1",
-   "family": "lineage_witness:{stage}",
-   "refusal": null
-  },
-  {
-   "binds": {
-    "stage": "decline",
-    "version": "v1"
-   },
-   "dimension": "lineage_witness:decline:v1",
-   "family": "lineage_witness:{stage}",
-   "refusal": null
-  },
-  {
-   "binds": {
-    "stage": "not_a_listed_value"
-   },
-   "dimension": "lineage_witness:not_a_listed_value:v1",
-   "family": "lineage_witness:{stage}",
-   "refusal": "namespace_vocab_value_unregistered"
-  },
-  {
-   "binds": {
     "scale": "local",
     "version": "v1"
    },
@@ -6091,6 +6026,15 @@
     "version": "v1"
    },
    "dimension": "membership:resignation:v1",
+   "family": "membership:{stage}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "stage": "keeps",
+    "version": "v1"
+   },
+   "dimension": "membership:keeps:v1",
    "family": "membership:{stage}",
    "refusal": null
   },
@@ -6542,52 +6486,69 @@
   },
   {
    "binds": {
-    "state": "proposal",
+    "state": "assent",
     "version": "v1"
    },
-   "dimension": "objection:proposal:v1",
+   "dimension": "objection:assent:v1",
    "family": "objection:{state}",
    "refusal": null
   },
   {
    "binds": {},
-   "dimension": "objection:proposal:V1",
+   "dimension": "objection:assent:V1",
    "family": "objection:{state}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "objection:proposal:v1:v2",
+   "dimension": "objection:assent:v1:v2",
    "family": "objection:{state}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "objection:proposal:v1beta",
+   "dimension": "objection:assent:v1beta",
    "family": "objection:{state}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "Objection:proposal:v1",
+   "dimension": "Objection:assent:v1",
    "family": "objection:{state}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {
-    "state": "proposal"
+    "state": "assent"
    },
-   "dimension": "objection:proposal",
+   "dimension": "objection:assent",
    "family": "objection:{state}",
    "refusal": "missing_version_segment"
   },
   {
    "binds": {
-    "state": "PROPOSAL"
+    "state": "ASSENT"
    },
-   "dimension": "objection:PROPOSAL:v1",
+   "dimension": "objection:ASSENT:v1",
    "family": "objection:{state}",
    "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "state": "raised",
+    "version": "v1"
+   },
+   "dimension": "objection:raised:v1",
+   "family": "objection:{state}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "state": "not_a_listed_value"
+   },
+   "dimension": "objection:not_a_listed_value:v1",
+   "family": "objection:{state}",
+   "refusal": "namespace_vocab_value_unregistered"
   },
   {
    "binds": {
@@ -8651,123 +8612,6 @@
    "binds": {
     "version": "v1"
    },
-   "dimension": "transparency_log:consistency:v1",
-   "family": "transparency_log:consistency",
-   "refusal": null
-  },
-  {
-   "binds": {},
-   "dimension": "transparency_log:consistency:V1",
-   "family": "transparency_log:consistency",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "transparency_log:consistency:v1:v2",
-   "family": "transparency_log:consistency",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "transparency_log:consistency:v1beta",
-   "family": "transparency_log:consistency",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "Transparency_log:consistency:v1",
-   "family": "transparency_log:consistency",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "transparency_log:consistency",
-   "family": "transparency_log:consistency",
-   "refusal": "missing_version_segment"
-  },
-  {
-   "binds": {
-    "tree_size": "42",
-    "version": "v1"
-   },
-   "dimension": "transparency_log:cosigned:42:v1",
-   "family": "transparency_log:cosigned:{tree_size}",
-   "refusal": null
-  },
-  {
-   "binds": {},
-   "dimension": "transparency_log:cosigned:42:V1",
-   "family": "transparency_log:cosigned:{tree_size}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "transparency_log:cosigned:42:v1:v2",
-   "family": "transparency_log:cosigned:{tree_size}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "transparency_log:cosigned:42:v1beta",
-   "family": "transparency_log:cosigned:{tree_size}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "Transparency_log:cosigned:42:v1",
-   "family": "transparency_log:cosigned:{tree_size}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {
-    "tree_size": "42"
-   },
-   "dimension": "transparency_log:cosigned:42",
-   "family": "transparency_log:cosigned:{tree_size}",
-   "refusal": "missing_version_segment"
-  },
-  {
-   "binds": {
-    "version": "v1"
-   },
-   "dimension": "transparency_log:inclusion:v1",
-   "family": "transparency_log:inclusion",
-   "refusal": null
-  },
-  {
-   "binds": {},
-   "dimension": "transparency_log:inclusion:V1",
-   "family": "transparency_log:inclusion",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "transparency_log:inclusion:v1:v2",
-   "family": "transparency_log:inclusion",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "transparency_log:inclusion:v1beta",
-   "family": "transparency_log:inclusion",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "Transparency_log:inclusion:v1",
-   "family": "transparency_log:inclusion",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "transparency_log:inclusion",
-   "family": "transparency_log:inclusion",
-   "refusal": "missing_version_segment"
-  },
-  {
-   "binds": {
-    "version": "v1"
-   },
    "dimension": "transport:canonical_rebind:v1",
    "family": "transport:canonical_rebind",
    "refusal": null
@@ -8850,44 +8694,6 @@
    "dimension": "transport:SAMPLE:v1",
    "family": "transport:{kind}",
    "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {
-    "version": "v1"
-   },
-   "dimension": "trust:blessing:v1",
-   "family": "trust:blessing",
-   "refusal": null
-  },
-  {
-   "binds": {},
-   "dimension": "trust:blessing:V1",
-   "family": "trust:blessing",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "trust:blessing:v1:v2",
-   "family": "trust:blessing",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "trust:blessing:v1beta",
-   "family": "trust:blessing",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "Trust:blessing:v1",
-   "family": "trust:blessing",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "trust:blessing",
-   "family": "trust:blessing",
-   "refusal": "missing_version_segment"
   },
   {
    "binds": {
@@ -9335,14 +9141,6 @@
   },
   {
    "binds": {
-    "tree_size": "zz_unminted_leaf"
-   },
-   "dimension": "transparency_log:cosigned:zz_unminted_leaf:v1",
-   "family": "transparency_log:cosigned:{tree_size}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {
     "detector": "zz_unminted_leaf"
    },
    "dimension": "detection:zz_unminted_leaf:v1",
@@ -9406,6 +9204,42 @@
    "dimension": "takedown_notice:zz_unminted_leaf:v1",
    "family": "takedown_notice:{basis}",
    "refusal": "namespace_vocab_value_unregistered"
+  },
+  {
+   "binds": {},
+   "dimension": "transparency_log:cosigned:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_family_unregistered"
+  },
+  {
+   "binds": {},
+   "dimension": "transparency_log:inclusion:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_family_unregistered"
+  },
+  {
+   "binds": {},
+   "dimension": "transparency_log:consistency:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_family_unregistered"
+  },
+  {
+   "binds": {},
+   "dimension": "lineage_witness:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_family_unregistered"
+  },
+  {
+   "binds": {},
+   "dimension": "delivery_receipt:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_family_unregistered"
+  },
+  {
+   "binds": {},
+   "dimension": "cosign:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_family_unregistered"
   },
   {
    "binds": {},
@@ -9505,12 +9339,6 @@
   },
   {
    "binds": {},
-   "dimension": "Transparency_log:cosigned:zz_unminted_leaf:v1",
-   "family": "transparency_log:cosigned:{tree_size}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
    "dimension": "Detection:zz_unminted_leaf:v1",
    "family": "detection:{detector}",
    "refusal": "namespace_dimension_case_malformed"
@@ -9567,6 +9395,42 @@
    "binds": {},
    "dimension": "Takedown_notice:zz_unminted_leaf:v1",
    "family": "takedown_notice:{basis}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Transparency_log:cosigned:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Transparency_log:inclusion:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Transparency_log:consistency:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Lineage_witness:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Delivery_receipt:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Cosign:zz_unminted_leaf:v1",
+   "family": null,
    "refusal": "namespace_dimension_case_malformed"
   }
  ]

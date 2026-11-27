@@ -35,7 +35,7 @@
 //!   is of that stream; any other stream is refused.
 //! - **I1407** (sqlite, postgres; v60.1.0, CIRISPersist#1006) — `received` is
 //!   ordered by the instant the subscriber SIGNED on its
-//!   `delivery_receipt:{stream}` row: a v1 receipt stored after the device's
+//!   `delivery_ack:{stream}` row: a v1 receipt stored after the device's
 //!   later `none` no longer outranks it; a signed receipt row before the
 //!   `none` keeps `none`, one after reads `received` at its instant, and a
 //!   withdrawn or expired row does not count.
@@ -990,7 +990,8 @@ mod engine_bodies {
                 let id = e
                     .put_custody_ack(&sha, CustodyState::Here, Some(scope), named, None)
                     .await
-                    .unwrap_or_else(|e| panic!("I512 {what} target {named:?}: {e}"));
+                    .unwrap_or_else(|e| panic!("I512 {what} target {named:?}: {e}"))
+                    .into_row_id();
                 let row = stored(ba, &id).await;
                 // v62.0.0 (T2) — the projected custody envelope names a family by
                 // `family_id` (T2-fix2), a room by `community_id`.
@@ -1019,7 +1020,7 @@ mod engine_bodies {
     }
 
     /// v62.0.0 (T2) — node B's signed delivery receipt for `sid` (epoch 0,
-    /// k 1, `root`), signed at `at`: one edition-2 `delivery_receipt:{stream}`
+    /// k 1, `root`), signed at `at`: one edition-2 `delivery_ack:{stream}`
     /// statement, which lands both the receipt row and its signed row
     /// (`signed_receipt_at` reads it). Its row id.
     async fn receipt<B>(
@@ -1058,7 +1059,7 @@ mod engine_bodies {
     /// signed instant; withdrawn by the device it no longer counts.
     ///
     /// v62.0.0 (wave 5, E6) — every receipt is an edition-2
-    /// `delivery_receipt:{stream}` statement, so the earlier legs are gone:
+    /// `delivery_ack:{stream}` statement, so the earlier legs are gone:
     /// the v1 receipt stored with NO signed instant (there is no unsigned
     /// receipt now) and the receipt row's `expires_at` (the T2 payload has no
     /// end). B's `none` is its edition-2 custody statement.
@@ -1336,7 +1337,8 @@ mod engine_bodies {
         let id = e
             .put_custody_ack(&p.at_rest_sha256, CustodyState::Here, None, None, None)
             .await
-            .unwrap_or_else(|e| panic!("I525 plaintext room, at the content's scope: {e}"));
+            .unwrap_or_else(|e| panic!("I525 plaintext room, at the content's scope: {e}"))
+            .into_row_id();
         let row = stored(ba, &id).await;
         assert_eq!(
             row.cohort_scope,
@@ -1499,7 +1501,8 @@ mod engine_bodies {
         let id = e
             .put_custody_ack(&sha, CustodyState::Here, None, None, None)
             .await
-            .unwrap_or_else(|e| panic!("I579 the report at the content's scope: {e}"));
+            .unwrap_or_else(|e| panic!("I579 the report at the content's scope: {e}"))
+            .into_row_id();
         let row = stored(ba, &id).await;
         assert_eq!(
             row.cohort_scope,
@@ -1729,7 +1732,8 @@ mod engine_bodies {
         let id = shared
             .put_custody_ack(&root, CustodyState::Here, None, None, None)
             .await
-            .unwrap_or_else(|e| panic!("I514 the node reports a DAG it holds whole: {e}"));
+            .unwrap_or_else(|e| panic!("I514 the node reports a DAG it holds whole: {e}"))
+            .into_row_id();
         let row = stored(l.ba.as_ref(), &id).await;
         assert_eq!(
             row.attesting_key_id, l.node_a,

@@ -24,9 +24,10 @@
 //!   `geographic_member_unlocated`, never refused.
 //!   EXPECTED RED until the Verify 23.3.1 re-pin (lead's ruling): a
 //!   `location_proof:v1` row is not admitted at the edition-2 door before it.
-//! - **I3834** (CC27 item 3) a `cosign:signature` over a group event from a
-//!   key that is no member is KEPT (a voice), never refused, and changes
-//!   nothing the group holds.
+//! - **I3834** (v62.0.0 PRE4-cosign) a `cosign:signature` over a group event
+//!   from a key that is no member is REFUSED `family_retired` (the family is
+//!   retired), nothing is kept, and the group is unchanged. (It was kept as a
+//!   voice counting nothing: the finding PRE4-cosign closes.)
 //!
 //! - **I3835** (lead's ruling (b)) the charter rides `refs.also.cites`
 //!   beside a geographic version's proofs; the record's `charter_digest` is
@@ -121,11 +122,19 @@ fn at(ms: i64) -> chrono::DateTime<Utc> {
 }
 
 fn roster(rec: &GroupRecord, version: u64, head: Option<&RowId>, at_ms: u64, k: &K) -> Vec<u8> {
-    let group = match rec {
-        GroupRecord::Family(f) => f.family_key_id.clone(),
-        GroupRecord::Community(c) => c.community_key_id.clone(),
+    use crate::federation::edition2::group_fixtures::{fixture_founding, fixture_record};
+    // GID-fixtures-sites — a first version is founded under its DERIVED id
+    // (the record's id is the room's NAME); a later one names that id.
+    let (group, p) = if version == 1 && head.is_none() {
+        fixture_founding(rec, at_ms)
+    } else {
+        let rec = &fixture_record(rec);
+        let group = match rec {
+            GroupRecord::Family(f) => f.family_key_id.clone(),
+            GroupRecord::Community(c) => c.community_key_id.clone(),
+        };
+        (group, roster_payload(rec, version, head, at_ms).unwrap())
     };
-    let p = roster_payload(rec, version, head, at_ms).unwrap();
     ciris_verify_core::edition2::sign_row_statement(
         k,
         &iref(k),
@@ -174,8 +183,10 @@ async fn group_order_body(d: &dyn FederationDirectory, v2_first: bool) -> (Strin
             .await
             .unwrap();
     }
-    let gid = iref(&g);
     let v1 = family(&g, "fam one", &[&a, &b, &c]);
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&v1);
     let v1_voices: Vec<Vec<u8>> = [&a, &b, &c]
         .iter()
         .map(|k| roster(&v1, 1, None, 2_000, k))
@@ -387,14 +398,17 @@ fn geographic_room(g: &K, constraint: &str, members: &[&K]) -> GroupRecord {
 }
 
 fn citing(rec: &GroupRecord, proofs: &[RowId], k: &K) -> Vec<u8> {
-    let GroupRecord::Community(c) = rec else {
+    let GroupRecord::Community(_) = rec else {
         unreachable!("a community")
     };
-    let p = roster_payload_citing(rec, 1, None, proofs, 2_000).unwrap();
+    // GID-fixtures-sites — a first version citing its proofs, founded under
+    // its DERIVED id.
+    let (gid, p) =
+        crate::federation::edition2::group_fixtures::fixture_founding_citing(rec, proofs, 2_000);
     ciris_verify_core::edition2::sign_row_statement(
         k,
         &iref(k),
-        &c.community_key_id,
+        &gid,
         "scores",
         &ciris_verify_core::namespace_match::family_id(GROUP_ROSTER_PREFIX),
         &p,
@@ -421,7 +435,7 @@ async fn geographic_order_body(d: &dyn FederationDirectory, proofs_first: bool) 
     let room = geographic_room(&g, &constraint, &[&a, &b]);
     let voices = [citing(&room, &ids, &a), citing(&room, &ids, &b)];
     let room_id = RowId::of_statement(&voices[0]).unwrap();
-    let gid = iref(&g);
+    let gid = crate::federation::edition2::fixture_switch::room_id(&iref(&g)); // GID-fixtures-sites: founded above
     if proofs_first {
         for p in &proofs {
             put_statement(d, p, None, INGEST_TIER).await.unwrap();
@@ -492,7 +506,14 @@ async fn geographic_outside_body(d: &dyn FederationDirectory) {
         "I3833: a member outside the constraint"
     );
     assert!(
-        d.lookup_community(&iref(&g)).await.unwrap().is_none(),
+        // GID-fixtures-sites — asked under the DERIVED id (the raw name
+        // would answer `None` whatever concluded).
+        d.lookup_community(&crate::federation::edition2::fixture_switch::room_id(
+            &iref(&g)
+        ))
+        .await
+        .unwrap()
+        .is_none(),
         "I3833: concludes nothing"
     );
 }
@@ -555,7 +576,7 @@ fn i3835_a_geographic_charter_is_told_apart_at_the_chain_head() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-//  I3834 — a non-member's cosign is kept
+//  I3834 — a non-member's cosign is refused by name (PRE4-cosign)
 // ─────────────────────────────────────────────────────────────────────────
 
 async fn cosign_non_member_body(d: &dyn FederationDirectory) {
@@ -565,9 +586,11 @@ async fn cosign_non_member_body(d: &dyn FederationDirectory) {
             .await
             .unwrap();
     }
-    let gid = iref(&g);
     let v1 = family(&g, "fam", &[&a, &b, &c]);
     let mut event = None;
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&v1);
     for k in [&a, &b, &c] {
         let st = roster(&v1, 1, None, 2_000, k);
         put_statement(d, &st, None, INGEST_TIER).await.unwrap();
@@ -579,33 +602,47 @@ async fn cosign_non_member_body(d: &dyn FederationDirectory) {
         .await
         .unwrap()
         .expect("I3834: founded");
-    let p = super::typed::cosign_payload(&iref(&x), "signature", &event, 3_000);
+    // v62.0.0 (PRE4-cosign; CC v1.0-rc22-pre4 retires `cosign:{state}`) — the
+    // statement a peer still sends is REFUSED by name and nothing of it is
+    // kept (until PRE4-cosign it was kept as a voice counting nothing).
+    let p = map(vec![
+        ("asserted_at", Value::Uint(3_000)),
+        ("author", Value::Text(iref(&x))),
+        ("dimension", Value::Text("cosign:signature:v1".to_owned())),
+        (
+            "refs",
+            map(vec![(
+                super::typed::TARGET_ROLE,
+                ciris_verify_core::edition2::row_ref(&event.0),
+            )]),
+        ),
+    ]);
     let st = ciris_verify_core::edition2::sign_row_statement(
         &x,
         &iref(&x),
         &gid,
         "scores",
-        &ciris_verify_core::namespace_match::family_id(super::typed::COSIGN_PREFIX),
+        &ciris_verify_core::namespace_match::family_id(
+            super::typed_fixtures::RETIRED_COSIGN_PREFIX,
+        ),
         &p,
         vec![],
     )
     .unwrap();
-    let o = put_statement(d, &st, None, INGEST_TIER)
-        .await
-        .expect("I3834: a non-member's cosign is never refused");
-    assert!(
-        matches!(
-            o,
-            StatementOutcome::Voice { new: true, .. } | StatementOutcome::Pending { new: true, .. }
+    match put_statement(d, &st, None, INGEST_TIER).await {
+        Err(crate::federation::Error::MalformedRow { reason, .. }) => assert_eq!(
+            reason,
+            malformed_row::FAMILY_RETIRED,
+            "I3834: refused family_retired"
         ),
-        "I3834: kept: {o:?}"
-    );
+        other => panic!("I3834: a cosign statement is refused by name, got {other:?}"),
+    }
     assert!(
-        !d.edition2_voices(&RowId::of_statement(&st).unwrap())
+        d.edition2_voices(&RowId::of_statement(&st).unwrap())
             .await
             .unwrap()
             .is_empty(),
-        "I3834: in ceg_statements"
+        "I3834: nothing kept"
     );
     assert_eq!(
         d.lookup_family(&gid)

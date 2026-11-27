@@ -11,6 +11,11 @@
 //! | `edition2/row_statements_v4.json` (**Verify 23.3.2**, R1-v2332; v3 retired) | `src/ciris-verify-core/tests/vectors/edition2/` |
 //! | `edition2/key_of_iss_v1.json` (**Verify 23.3.0**, 24 cases) | `src/ciris-verify-core/tests/vectors/edition2/` |
 //! | `edition2/key_of_iss_v3.json` (**Verify 23.3.2**, 32 cases; R1-v2332; v2 retired) | `src/ciris-verify-core/tests/vectors/edition2/` |
+//! | `edition2/group_id_v1.json` (**Verify 23.6.0**, PIN-verify-23.6) | `src/ciris-verify-core/tests/vectors/edition2/` |
+//! | `edition2/conferral_end_v1.json` (**Verify 23.6.0**, PIN-verify-23.6) | `src/ciris-verify-core/tests/vectors/edition2/` |
+//! | `edition2/row_statements_v5.json` (**Verify 23.6.0**, PIN-verify-23.6) | `src/ciris-verify-core/tests/vectors/edition2/` |
+//! | `edition2/row_statements_v5_refusals.json` (**Verify 23.6.0**, PIN-verify-23.6) | `src/ciris-verify-core/tests/vectors/edition2/` |
+//! | `edition2/reply_shapes_v1.json` (**Verify 23.6.0**, PIN-verify-23.6) | `src/ciris-verify-core/tests/vectors/edition2/` |
 //! | `accord_halt/accord_halt_v2.json` (**Verify 23.3.0**; v1 retired) | `src/ciris-verify-core/tests/vectors/accord_halt/` |
 //! | `composite/mldsa65_ed25519_draft_kats.json` | `src/ciris-crypto/tests/vectors/composite/` |
 //! | `substrate_composite/composite_signatures_v1.json` | `src/ciris-verify-core/tests/vectors/substrate_composite/` |
@@ -62,6 +67,33 @@ const PINNED: &[(&str, &[u8], &str)] = &[
         "edition2/key_of_iss_v3.json",
         include_bytes!("../../tests/vectors/verify_v23/edition2/key_of_iss_v3.json"),
         "371eebcb647e802d522bf44fd979d7faa338d87c42a6af0377e5ab4aaab3a8f9",
+    ),
+    // v62.0.0 (PIN-verify-23.6) — CIRISVerify 23.6.0's new edition-2 files,
+    // byte-identical to the tag (bdd73335); each digest is the tag notice's.
+    (
+        "edition2/group_id_v1.json",
+        include_bytes!("../../tests/vectors/verify_v23/edition2/group_id_v1.json"),
+        "c796353db656a32110fdb7e9c429c9f3e015f396d992751d13030723e49c1249",
+    ),
+    (
+        "edition2/conferral_end_v1.json",
+        include_bytes!("../../tests/vectors/verify_v23/edition2/conferral_end_v1.json"),
+        "702be508ff60ebbb80979e0720a5e4359cc4a4a94dc8ed948b1cccb7fa5aedd7",
+    ),
+    (
+        "edition2/row_statements_v5.json",
+        include_bytes!("../../tests/vectors/verify_v23/edition2/row_statements_v5.json"),
+        "5c77d14e4346f99ce68661bfb1a4c3d53c95f1829515e043203d8ebbfe282339",
+    ),
+    (
+        "edition2/row_statements_v5_refusals.json",
+        include_bytes!("../../tests/vectors/verify_v23/edition2/row_statements_v5_refusals.json"),
+        "26b1d03a4d87970c5d08d0c83bc270a2224fa075b2d150ed3b002ed0bd1f06cd",
+    ),
+    (
+        "edition2/reply_shapes_v1.json",
+        include_bytes!("../../tests/vectors/verify_v23/edition2/reply_shapes_v1.json"),
+        "731a8bf380d1f454652978223442f9225f430db1d989de8d47e61d26467f1367",
     ),
     (
         "accord_halt/accord_halt_v2.json",

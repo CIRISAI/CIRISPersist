@@ -688,14 +688,14 @@ pub(crate) async fn put_delivery_receipt_planned<D: BlobFloorStore>(
     let _ = (dir, receipt);
     Err(BlobError::InvalidArgument(
         "put_delivery_receipt: the earlier-form receipt (a bound-hybrid \
-         signature) admits nothing; send a delivery_receipt:{stream_id} statement \
+         signature) admits nothing; send a delivery_ack:{stream_id} statement \
          (v62.0.0)"
             .into(),
     ))
 }
 
 /// v62.0.0 (wave T2) — **the receipt door for an edition-2
-/// `delivery_receipt:{stream_id}` statement** (`edition2::typed`). The
+/// `delivery_ack:{stream_id}` statement** (`edition2::typed`). The
 /// edition-2 door verified the subscriber's composite statement (its step
 /// 1); the JOIN and equivocation steps are this door's own
 /// ([`store_receipt_checked`]), the same ones the earlier form meets.

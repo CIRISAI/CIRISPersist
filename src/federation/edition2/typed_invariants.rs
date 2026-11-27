@@ -68,10 +68,12 @@
 //! - **I3164** a second root at the same `k` is kept and concludes nothing
 //!   (held, `receipt_equivocation`; v62.0.0 wave GC7), the first receipt
 //!   standing.
-//! - **I3165** a cosign statement is kept beside its event in
-//!   `ceg_statements` only (`Voice`), never in `federation_attestations`.
-//! - **I3166** a cosign of an event not held WAITS: kept and `Pending`
-//!   (a fold hold, `link_unheld`), never refused.
+//! - **I3165** (v62.0.0 PRE4-cosign; CC v1.0-rc22-pre4 retires
+//!   `cosign:{state}`) a cosign statement naming a HELD event is refused
+//!   `family_retired` and kept nowhere (until PRE4-cosign it was kept beside
+//!   the event, counting nothing: the finding this closes).
+//! - **I3166** (PRE4-cosign) the same for one naming an event not held: refused
+//!   by name, never kept waiting.
 //! - **I3167** a `steward_purge` notice is kept, voice by voice, `Pending`,
 //!   never as an attestation row.
 //! - **I3168** a `dmca512` notice passes the notice shape on its projected
@@ -130,7 +132,6 @@ use super::door_invariants::fixture::{iref, key, key_record, map};
 use super::ingest::{put_statement, StatementOutcome, INGEST_TIER};
 use super::names::RowId;
 use super::typed::{
-    cosign_payload,
     custody_payload,
     delivery_receipt_payload,
     key_grant_payload,
@@ -141,7 +142,6 @@ use super::typed::{
     trust_accepts_payload,
     withdraws_payload,
     NoticeText,
-    COSIGN_PREFIX,
     CUSTODY_PREFIX,
     DELIVERY_RECEIPT_PREFIX,
     KEY_GRANT_PREFIX,
@@ -883,41 +883,44 @@ async fn custody_cosign_body<D: FederationDirectory + ?Sized>(d: &D) {
     assert_eq!(ack.blob_sha256_hex, hex::encode(blob), "I3157");
     assert_eq!(ack.size, Some(4096), "I3157");
 
-    // I3166 — a cosign of an event not held WAITS (CC 2.7.3): kept,
-    // `Pending`, never refused.
-    let ghost = RowId([7; 32]);
-    let c = sign(
-        &other,
-        &di,
-        COSIGN_PREFIX,
-        &cosign_payload(&iref(&other), "signature", &ghost, t),
-    );
-    let out = put(d, &c)
-        .await
-        .expect("I3166 a row naming an unheld row is never refused");
-    assert!(
-        matches!(out, StatementOutcome::Pending { .. }),
-        "I3166 it waits for the event: {out:?}"
-    );
-    assert!(kept(d, &c).await, "I3166 kept while it waits");
-
-    // I3165 — a cosign is kept beside its event only.
-    let c = sign(
-        &other,
-        &di,
-        COSIGN_PREFIX,
-        &cosign_payload(&iref(&other), "signature", &rid(&st), t),
-    );
-    let out = put(d, &c).await.unwrap();
-    assert!(
-        matches!(out, StatementOutcome::Voice { new: true, .. }),
-        "I3165 {out:?}"
-    );
-    assert!(kept(d, &c).await, "I3165 in ceg_statements");
-    assert!(
-        d.get_attestation(&rid(&c).hex()).await.unwrap().is_none(),
-        "I3165 never an attestation row"
-    );
+    // I3166 / I3165 (PRE4-cosign) — a `cosign:{state}` statement, naming an
+    // event not held or the held custody row, is refused by name at the
+    // door (`family_retired`) and nothing of it is kept.
+    let cosign_of = |event: &RowId| {
+        sign(
+            &other,
+            &di,
+            crate::federation::edition2::typed_fixtures::RETIRED_COSIGN_PREFIX,
+            &map(vec![
+                ("asserted_at", Value::Uint(t)),
+                ("author", Value::Text(iref(&other))),
+                ("dimension", Value::Text("cosign:signature:v1".to_owned())),
+                (
+                    "refs",
+                    map(vec![(
+                        super::typed::TARGET_ROLE,
+                        ciris_verify_core::edition2::row_ref(&event.0),
+                    )]),
+                ),
+            ]),
+        )
+    };
+    for (event, tag) in [(RowId([7; 32]), "I3166"), (rid(&st), "I3165")] {
+        let c = cosign_of(&event);
+        let e = put(d, &c)
+            .await
+            .expect_err("a cosign statement is refused by name");
+        assert_eq!(
+            reason(&e),
+            crate::federation::malformed_row::FAMILY_RETIRED,
+            "{tag} refused family_retired"
+        );
+        assert!(!kept(d, &c).await, "{tag} nothing kept");
+        assert!(
+            d.get_attestation(&rid(&c).hex()).await.unwrap().is_none(),
+            "{tag} no attestation row"
+        );
+    }
 }
 
 /// I2439: a replacement custody report is judged by the custody plane.
@@ -1039,7 +1042,8 @@ async fn never_replaced_body<D: FederationDirectory + ?Sized>(d: &D) {
         ),
     ]);
     for (prefix, sub) in [
-        (COSIGN_PREFIX, oi.as_str()),
+        // v62.0.0 (PRE4-cosign) — `cosign:{state}` left this list: the
+        // family is retired and refused by name before any supersedes rule.
         (KEY_GRANT_PREFIX, oi.as_str()),
         (REVOCATION_PREFIX, oi.as_str()),
         (OCCURRENCE_REVOCATION_PREFIX, oi.as_str()),

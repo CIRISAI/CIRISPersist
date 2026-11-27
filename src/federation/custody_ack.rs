@@ -517,7 +517,7 @@ pub struct DeviceCustody {
     pub reported_at: Option<DateTime<Utc>>,
     /// The latest delivery receipt's instant, when one was consulted: since
     /// v60.1.0 (CIRISPersist#1006) the instant the SUBSCRIBER signed on its
-    /// `delivery_receipt:{stream_id}` row ([`signed_receipt_at`]), never this
+    /// `delivery_ack:{stream_id}` row ([`signed_receipt_at`]), never this
     /// node's storage stamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub received_at: Option<DateTime<Utc>>,
@@ -633,13 +633,13 @@ where
 
 /// v60.1.0 (CIRISPersist#1006, CC 3.4.6) — the dimension of a subscriber's
 /// signed delivery receipt row for `stream_id`: CC's
-/// `delivery_receipt:{stream_id}` family with the version segment the
-/// namespace grammar requires, `delivery_receipt:{stream_id}:v1` — the
+/// `delivery_ack:{stream_id}` family with the version segment the
+/// namespace grammar requires, `delivery_ack:{stream_id}:v1` — the
 /// spelling CIRISEdge's receiver already emits (`receipts.rs`,
 /// `RECEIPT_DIMENSION_VERSION`), signed by the receiving node.
 #[must_use]
 pub fn delivery_receipt_dimension(stream_id: &str) -> String {
-    format!("delivery_receipt:{stream_id}:v1")
+    format!("delivery_ack:{stream_id}:v1")
 }
 
 /// v60.1.0 (CIRISPersist#1006, CC 3.1.3.3 / CC 3.4.6) — **`device`'s latest
@@ -830,7 +830,7 @@ where
     if let Some(stream) = stream_id {
         // The stream's subscribers are devices to fold (a stored receipt
         // names one); v60.1.0 (CIRISPersist#1006) — but `received` is ordered
-        // only by an instant each device SIGNED, its `delivery_receipt:` row,
+        // only by an instant each device SIGNED, its `delivery_ack:` row,
         // never by this node's storage stamp on the stored receipt.
         devices.extend(
             backend

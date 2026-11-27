@@ -4690,30 +4690,120 @@ pub(crate) async fn transit_eligibility_walk(
     Ok((TransitEligibility::denied(), roots_walked))
 }
 /// #973 (CC 3.2 T6) — the refusal token for a charter whose non-zero
-/// `witness_quorum` is below a strict majority of its witness directory.
+/// `witness_quorum` was below a strict majority of its witness directory.
+/// v62.0.0 (PRE4-charter) — no longer produced (the member is renamed and the
+/// rule is [`CHARTER_RULE_RECEIPT_QUORUM_MISMATCH`]); kept in place, a token
+/// list is append-only.
 pub const CHARTER_RULE_WITNESS_QUORUM_BELOW_MAJORITY: &str =
     "charter_witness_quorum_below_majority";
 
-/// #973 (CC 3.2 T6) — a charter's `witness_quorum` is `0` / absent (witnessed
-/// mode off) or a strict majority of its witness directory and at least 2.
-/// The directory (`witnesses[]`, the parent-directory rule) is not built yet
-/// (FSD `TRUST_ROOT_RC6.md`, "not yet built"), so the one value refusable
-/// without it is refused here: `1`, which no directory makes a majority ≥ 2.
+/// v62.0.0 (PRE4-charter; CC v1.0-rc22-pre4, `manifests/scitt_names.tsv`:
+/// `witness_members_partial` → `transparency_members_partial`) — a charter
+/// naming one of `transparency_services` / `receipt_quorum` /
+/// `receipt_cadence_secs` without the others (all three or none).
+pub const CHARTER_RULE_TRANSPARENCY_MEMBERS_PARTIAL: &str = "transparency_members_partial";
+
+/// v62.0.0 (PRE4-charter; scitt_names: `witness_quorum_mismatch` →
+/// `receipt_quorum_mismatch`) — a stated `receipt_quorum` that is not the
+/// strict majority ⌊n/2⌋ + 1 of the n named services.
+pub const CHARTER_RULE_RECEIPT_QUORUM_MISMATCH: &str = "receipt_quorum_mismatch";
+
+/// v62.0.0 (PRE4-charter) — a charter carrying a member under its name before
+/// CC v1.0-rc22-pre4 (`witnesses`, `witness_quorum`, `witness_cadence_secs`).
+/// Refused by name: read silently, it would be a charter naming no services.
+pub const CHARTER_RULE_MEMBER_RENAMED: &str = "charter_member_renamed";
+
+/// v62.0.0 (PRE4-charter) — each charter member renamed by CC
+/// v1.0-rc22-pre4, `(earlier name, name)`. The earlier names are no longer
+/// read; a charter carrying one is refused [`CHARTER_RULE_MEMBER_RENAMED`].
+pub const RENAMED_CHARTER_MEMBERS: &[(&str, &str)] = &[
+    ("witnesses", super::admission::TRANSPARENCY_SERVICES_MEMBER),
+    ("witness_quorum", super::envelope::paths::RECEIPT_QUORUM),
+    (
+        "witness_cadence_secs",
+        super::envelope::paths::RECEIPT_CADENCE_SECS,
+    ),
+];
+
+/// v62.0.0 (PRE4-charter; CC v1.0-rc22-pre4 3.2 T6) — **the shape of a
+/// charter's transparency-service members**: `transparency_services`,
+/// `receipt_quorum` and `receipt_cadence_secs` together or not at all, the
+/// directory non-empty, and `receipt_quorum` exactly ⌊n/2⌋ + 1 of the n
+/// services named. An earlier member name is refused by name. Returns whether
+/// the charter NAMES services: persist builds no Receipt checking in v62.0,
+/// so a caller HOLDS such a charter (`genesis_bundle_receipts_unchecked`, the
+/// head-adoption plane only), as the import door holds such a bundle.
 ///
 /// # Errors
 ///
-/// [`Error::CharterInvalid`] naming [`CHARTER_RULE_WITNESS_QUORUM_BELOW_MAJORITY`].
-pub fn check_charter_witness_quorum(envelope: &serde_json::Value) -> Result<(), Error> {
-    match envelope.get(super::envelope::paths::WITNESS_QUORUM) {
-        Some(v) if v.as_u64() == Some(1) => Err(Error::CharterInvalid {
+/// [`Error::CharterInvalid`] naming [`CHARTER_RULE_MEMBER_RENAMED`],
+/// [`CHARTER_RULE_TRANSPARENCY_MEMBERS_PARTIAL`] or
+/// [`CHARTER_RULE_RECEIPT_QUORUM_MISMATCH`].
+pub fn check_charter_receipt_members(envelope: &serde_json::Value) -> Result<bool, Error> {
+    use super::envelope::paths;
+    if let Some((was, is)) = RENAMED_CHARTER_MEMBERS
+        .iter()
+        .find(|(was, _)| envelope.get(*was).is_some())
+    {
+        return Err(Error::CharterInvalid {
             detail: format!(
-                "{CHARTER_RULE_WITNESS_QUORUM_BELOW_MAJORITY}: `witness_quorum` 1 is not a \
-                 valid charter value — declare 0 (witnessed mode off) or a strict majority \
-                 of the witness directory, at least 2 (CC 3.2 T6)"
+                "{CHARTER_RULE_MEMBER_RENAMED}: `{was}` is `{is}` since CC v1.0-rc22-pre4 \
+                 (manifests/scitt_names.tsv); the earlier name is not read"
             ),
-        }),
-        _ => Ok(()),
+        });
     }
+    let services = envelope.get(super::admission::TRANSPARENCY_SERVICES_MEMBER);
+    let quorum = envelope.get(paths::RECEIPT_QUORUM);
+    let cadence = envelope.get(paths::RECEIPT_CADENCE_SECS);
+    let named = [services, quorum, cadence]
+        .iter()
+        .filter(|m| m.is_some())
+        .count();
+    if named == 0 {
+        return Ok(false);
+    }
+    let n = services
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    if named < 3 || n == 0 {
+        return Err(Error::CharterInvalid {
+            detail: format!(
+                "{CHARTER_RULE_TRANSPARENCY_MEMBERS_PARTIAL}: a charter names \
+                 `transparency_services` (a non-empty directory), `receipt_quorum` and \
+                 `receipt_cadence_secs` together or none of them (CC 3.2 T6)"
+            ),
+        });
+    }
+    let majority = super::admission::strict_majority(n) as u64;
+    if quorum.and_then(serde_json::Value::as_u64) != Some(majority) {
+        return Err(Error::CharterInvalid {
+            detail: format!(
+                "{CHARTER_RULE_RECEIPT_QUORUM_MISMATCH}: `receipt_quorum` must be {majority}, \
+                 the strict majority of the {n} named services (CC 3.2 T6)"
+            ),
+        });
+    }
+    Ok(true)
+}
+
+/// v62.0.0 (PRE4-charter) — [`check_charter_receipt_members`] at a charter
+/// door: a malformed member set is refused; a charter that names services is
+/// HELD `genesis_bundle_receipts_unchecked` (no Receipt checking in v62.0: it
+/// is never read as current; the node keeps what it holds, CC 3.2 T4).
+fn hold_a_charter_naming_services(envelope: &serde_json::Value) -> Result<(), Error> {
+    if check_charter_receipt_members(envelope)? {
+        return Err(super::edition2::fold::hold(
+            super::edition2::fold::reason::RECEIPTS_UNCHECKED,
+            Error::CharterInvalid {
+                detail: format!(
+                    "{}: the charter names transparency services; it is current only with \
+                     their Receipts (CC 3.2 T6), which this node cannot check: held",
+                    super::edition2::fold::reason::RECEIPTS_UNCHECKED
+                ),
+            },
+        ));
+    }
+    Ok(())
 }
 
 /// v24.0.0 (CIRISPersist#557) — the FAMILY-charter admission gate: a charter
@@ -4796,7 +4886,7 @@ where
         return Ok(());
     }
     let refuse = |detail: String| Err(Error::CharterInvalid { detail });
-    check_charter_witness_quorum(&row.attestation_envelope)?;
+    hold_a_charter_naming_services(&row.attestation_envelope)?;
 
     // v62.0.0 (wave GC6; CC 2.7.3) — everything below reads the family this
     // charter names (its record, roster, protocol): declared on every path,
@@ -4911,7 +5001,7 @@ where
         return Ok(());
     }
     let refuse = |detail: String| Err(Error::CharterInvalid { detail });
-    check_charter_witness_quorum(envelope)?;
+    hold_a_charter_naming_services(envelope)?;
 
     // 1. Pre-rotation commitment: present + well-formed, always.
     if !charter_commitment_well_formed(envelope) {
@@ -6611,5 +6701,66 @@ pub(crate) mod v53_1_6_reference {
                 && job_dimension_admits(&a.attestation_envelope, TRUST_CONFERS_DIMENSION)
                 && scope_contains(&a.attestation_envelope, scope)
         }))
+    }
+}
+
+#[cfg(test)]
+mod charter_receipt_members_tests {
+    use super::*;
+
+    /// I6406 (PRE4-charter; CC v1.0-rc22-pre4 3.2 T6) — the shape of a
+    /// charter's transparency-service members: none → names no services; the
+    /// three with ⌊n/2⌋ + 1 → names services (held by the caller); one or two
+    /// of them, or an empty directory → `transparency_members_partial`; another
+    /// quorum → `receipt_quorum_mismatch`; an earlier name →
+    /// `charter_member_renamed`, never read as "no services".
+    #[test]
+    fn i6406_charter_receipt_members_shape() {
+        let three = |n: usize, q: u64| {
+            let s: Vec<String> = (0..n).map(|i| format!("svc-{i}")).collect();
+            serde_json::json!({
+                "transparency_services": s,
+                "receipt_quorum": q,
+                "receipt_cadence_secs": 3600,
+            })
+        };
+        let detail = |e: Result<bool, Error>| match e {
+            Err(Error::CharterInvalid { detail }) => detail,
+            other => panic!("I6406: expected a refusal, got {other:?}"),
+        };
+        assert!(!check_charter_receipt_members(&serde_json::json!({})).unwrap());
+        for (n, q) in [(1, 1), (2, 2), (3, 2), (4, 3), (5, 3)] {
+            assert!(
+                check_charter_receipt_members(&three(n, q)).unwrap(),
+                "I6406: {n} services, quorum {q}"
+            );
+        }
+        for (n, q) in [(3, 3), (3, 1), (4, 2)] {
+            assert!(
+                detail(check_charter_receipt_members(&three(n, q)))
+                    .starts_with(CHARTER_RULE_RECEIPT_QUORUM_MISMATCH),
+                "I6406: {n} services, quorum {q}"
+            );
+        }
+        for partial in [
+            serde_json::json!({ "receipt_quorum": 2 }),
+            serde_json::json!({ "receipt_cadence_secs": 3600 }),
+            serde_json::json!({ "transparency_services": ["a", "b"], "receipt_quorum": 2 }),
+            three(0, 1),
+        ] {
+            assert!(
+                detail(check_charter_receipt_members(&partial))
+                    .starts_with(CHARTER_RULE_TRANSPARENCY_MEMBERS_PARTIAL),
+                "I6406: {partial}"
+            );
+        }
+        for (was, _) in RENAMED_CHARTER_MEMBERS {
+            let mut v = three(3, 2);
+            v[*was] = serde_json::json!(1);
+            assert!(
+                detail(check_charter_receipt_members(&v)).starts_with(CHARTER_RULE_MEMBER_RENAMED),
+                "I6406: {was}"
+            );
+        }
     }
 }

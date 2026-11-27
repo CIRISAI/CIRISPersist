@@ -239,10 +239,6 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         Bound::Schema("one key's replaced registrations: one per same-key rebind ceremony"),
     ),
     (
-        "list_lineage_head_cosigns_for",
-        Bound::Open("every cosign held for one lineage, across its heads"),
-    ),
-    (
         "list_live_consent_grants_by",
         Bound::Schema("one node's LIVE replication grants about itself (rows with a V109 projection row)"),
     ),

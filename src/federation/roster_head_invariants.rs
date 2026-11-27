@@ -14,13 +14,14 @@
 //! - **I453** the one comparison on the community arm: a revocation of a room
 //!   names exactly its key until a record reflects it, and only while it is
 //!   after the floor (the held head's instant) and effective at the instant.
-//! - **I454** (ii) a row older than one `witness_cadence_secs` that no version
-//!   covers lags the head (`lineage_head_lags_roster`, served on the witness
-//!   view with its keys and instant); a younger row does not; the covering
-//!   version clears it.
-//! - **I455** (ii) with witnessed mode on a witness's cosign of the lagging held
-//!   head is refused `lineage_head_lags_roster`; with it off the cosign is
-//!   stored and the lag is still reported.
+//! - **I454** (v62.0.0 PRE4-charter) a charter's transparency-service
+//!   members at the charter door: the earlier name refused
+//!   `charter_member_renamed`, one member alone `transparency_members_partial`,
+//!   a wrong quorum `receipt_quorum_mismatch`, the three held
+//!   `genesis_bundle_receipts_unchecked` (the cadence-in-force arm is deleted:
+//!   no cadence is ever in force in v62.0).
+//! - **I455** (ii) a lagging held head: the lag is reported. (v62.0.0
+//!   PRE4-witness: the witnessed-mode arm is deleted with the mode.)
 //! - **I456** (iii) the removal takes effect at its `effective_at`, before any
 //!   version covers it: the fold drops the seat while the head still lists it.
 //! - **I457** the accord's version needs signatures from a strict majority of
@@ -55,7 +56,7 @@
 pub(crate) mod bodies {
     use ciris_crypto::composite::CompositeSigningKey;
 
-    use crate::federation::canonical_community::root_witness_view;
+    use crate::federation::canonical_community::root_head_view;
     use crate::federation::edition2::fixture_switch as e2;
     use crate::federation::edition2::group::{GroupRecord, MembershipRecord};
     use crate::federation::edition2::ingest::StatementOutcome;
@@ -589,73 +590,107 @@ pub(crate) mod bodies {
         fam
     }
 
-    /// **I454** — (ii) an uncovered row older than one cadence lags the head.
-    pub async fn i454_an_uncovered_row_lags_the_head(d: &dyn FederationDirectory, tag: &str) {
+    /// **I454** — v62.0.0 (PRE4-charter; CC v1.0-rc22-pre4 3.2 T6) — a
+    /// charter's transparency-service members, at the real charter door. The
+    /// cadence arm that stood here (a `witness_cadence_secs` charter in force,
+    /// judged after one cadence) is DELETED: a cadence now rides only with
+    /// named services, and a charter naming services is held, so no cadence is
+    /// ever in force in v62.0 (the lag with none is I455). What stays:
+    /// - the earlier name (`witness_cadence_secs`) is refused
+    ///   `charter_member_renamed`, never read as "no services";
+    /// - one member alone is refused `transparency_members_partial`;
+    /// - a quorum other than ⌊n/2⌋ + 1 is refused `receipt_quorum_mismatch`;
+    /// - the three, well formed, are HELD `genesis_bundle_receipts_unchecked`
+    ///   and put no charter in force.
+    pub async fn i454_charter_service_members(d: &dyn FederationDirectory, tag: &str) {
         let keys = holders(d, tag).await;
-        let fam = chartered(
+        let fam = found(d, &format!("rs-{tag}"), &keys, "").await;
+        let mut services = keys.clone();
+        services.sort();
+        for (extra, token) in [
+            (
+                serde_json::json!({ "witness_cadence_secs": 3600 }),
+                crate::federation::trust_root::CHARTER_RULE_MEMBER_RENAMED,
+            ),
+            (
+                serde_json::json!({ "receipt_cadence_secs": 3600 }),
+                crate::federation::trust_root::CHARTER_RULE_TRANSPARENCY_MEMBERS_PARTIAL,
+            ),
+            (
+                serde_json::json!({
+                    "transparency_services": services,
+                    "receipt_quorum": 1,
+                    "receipt_cadence_secs": 3600,
+                }),
+                crate::federation::trust_root::CHARTER_RULE_RECEIPT_QUORUM_MISMATCH,
+            ),
+        ] {
+            let out = offer_charter(d, &fam, &keys, extra).await;
+            let why = format!("{out:?}");
+            assert!(
+                out.is_err() && why.contains(token),
+                "{tag} I454: refused {token}, got {why}"
+            );
+        }
+        let out = offer_charter(
             d,
-            tag,
+            &fam,
             &keys,
-            serde_json::json!({ "witness_cadence_secs": 3600 }),
+            serde_json::json!({
+                "transparency_services": services,
+                "receipt_quorum": 2,
+                "receipt_cadence_secs": 3600,
+            }),
         )
         .await;
-        let now = chrono::Utc::now();
         assert!(
-            roster_lag(d, &fam, now).await.unwrap().is_none(),
-            "{tag} I454: a covered head does not lag"
+            matches!(out, Ok(StatementOutcome::Pending { .. })),
+            "{tag} I454: a charter naming services is held, got {out:?}"
         );
-        // A row younger than one cadence does not lag yet.
-        leave(d, &fam, &keys[2], now - chrono::Duration::minutes(10)).await;
         assert!(
-            roster_lag(d, &fam, now).await.unwrap().is_none(),
-            "{tag} I454: younger than the cadence"
-        );
-        // One cadence after THIS node admitted it, it does.
-        let admitted = chrono::Utc::now();
-        assert!(
-            roster_lag(d, &fam, admitted + chrono::Duration::minutes(59))
+            crate::federation::canonical_community::charter_members_for(d, &fam)
                 .await
                 .unwrap()
                 .is_none(),
-            "{tag} I454: the cadence runs from admission, not the row's instant"
-        );
-        let later = admitted + hours(1) + chrono::Duration::minutes(1);
-        let lag = roster_lag(d, &fam, later)
-            .await
-            .unwrap()
-            .expect("an hour on, the uncovered leave lags");
-        assert_eq!(lag.token, LINEAGE_HEAD_LAGS_ROSTER, "{tag} I454");
-        assert_eq!(lag.uncovered_keys, vec![keys[2].clone()], "{tag} I454");
-        assert_eq!(lag.cadence_secs, 3600, "{tag} I454");
-        assert_eq!(
-            lag.head_digest,
-            head(d, &fam).await.persist_row_hash,
-            "{tag} I454: the head that lags"
-        );
-        assert!(
-            lag.since >= now && lag.since <= admitted,
-            "{tag} I454: since this node admitted the row: {lag:?}"
-        );
-        let view = root_witness_view(d, &fam, later).await.unwrap().unwrap();
-        assert_eq!(
-            view.roster_lag.as_ref(),
-            Some(&lag),
-            "{tag} I454: served on the witness view"
-        );
-        let held = head(d, &fam).await;
-        landed(
-            version(d, &fam, without(&held, &keys[2]), &with_leaver(&keys)).await,
-            &format!("{tag} I454: the covering version"),
-        );
-        assert!(
-            roster_lag(d, &fam, later).await.unwrap().is_none(),
-            "{tag} I454: the covering version clears the lag"
+            "{tag} I454: the held charter puts nothing in force"
         );
     }
 
-    /// **I455** — (ii) a lagging head, in either witnessed mode: the lag is
-    /// reported (and served on the witness view), and the covering version
-    /// clears it.
+    /// The first voice of a charter of `fam` carrying `extra`, as the door
+    /// answers it (I454).
+    async fn offer_charter(
+        d: &dyn FederationDirectory,
+        fam: &str,
+        keys: &[String],
+        extra: serde_json::Value,
+    ) -> Result<StatementOutcome, Error> {
+        let seed = e2::seed_of(fam);
+        let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&[
+            format!("{seed}-succ-a"),
+            format!("{seed}-succ-b"),
+        ])
+        .unwrap();
+        let mut env = serde_json::json!({
+            "dimension": TRUST_CHARTER_DIMENSION,
+            "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+            "pre_rotation_commitment": commitment,
+        });
+        if let (Some(e), Some(x)) = (env.as_object_mut(), extra.as_object()) {
+            for (k, v) in x {
+                e.insert(k.clone(), v.clone());
+            }
+        }
+        let mut a = ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), &keys[0], fam, &env);
+        a.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+        e2::put_signed(d, &e2::counted_row_of(&a, &keys[0])).await
+    }
+
+    /// **I455** — (ii) a lagging head: the lag is reported (and served on the
+    /// head view), and the covering version clears it.
+    ///
+    /// v62.0.0 (PRE4-witness; CC v1.0-rc22-pre4 3.2 T6) — the "witnessed mode
+    /// on" arm (a charter declaring `witness_quorum: 2`) is DELETED: witnessed
+    /// mode is gone and `witness_quorum` is read by nothing. One arm stays.
     ///
     /// v62.0.0 (E13 fix2; CP2, ruling 4) — the witness-COSIGN arms are
     /// DELETED: `put_lineage_head_cosign` takes a `LineageHeadCosign`, a JSON
@@ -664,10 +699,8 @@ pub(crate) mod bodies {
     /// cosign door yet. What stays is the lag, which every node computes from
     /// its own held rows.
     pub async fn i455_a_lagging_head_is_not_cosigned(d: &dyn FederationDirectory, tag: &str) {
-        for (mode, extra) in [
-            ("on", serde_json::json!({ "witness_quorum": 2 })),
-            ("off", serde_json::json!({})),
-        ] {
+        {
+            let (mode, extra) = ("", serde_json::json!({}));
             let tag = format!("{tag}{mode}");
             let keys = holders(d, &tag).await;
             let fam = chartered(d, &tag, &keys, extra).await;
@@ -675,13 +708,13 @@ pub(crate) mod bodies {
             leave(d, &fam, &keys[2], chrono::Utc::now() - hours(1)).await;
             let held = head(d, &fam).await;
             let lag = roster_lag(d, &fam, chrono::Utc::now()).await.unwrap();
-            assert!(lag.is_some(), "{tag} I455: lags in either mode");
+            assert!(lag.is_some(), "{tag} I455: lags");
             assert_eq!(
                 lag.as_ref().map(|l| l.token.as_str()),
                 Some(LINEAGE_HEAD_LAGS_ROSTER),
                 "{tag} I455: the token CC names"
             );
-            let view = root_witness_view(d, &fam, chrono::Utc::now())
+            let view = root_head_view(d, &fam, chrono::Utc::now())
                 .await
                 .unwrap()
                 .unwrap();
@@ -961,14 +994,13 @@ mod pure {
             check < b.find("supersede_group_row(").expect("writes"),
             "I458: the chain apply judges before it writes"
         );
-        // v62.0.0 (F0-cp9) — the cosign door (`admit_lineage_head_cosign`) is
-        // deleted with the earlier form; the witnessed-head fold keeps the
-        // shared lag predicate.
-        let lw = code_of("src/federation/lineage_witness.rs");
-        let h = body(&lw, "pub async fn head_lags_roster_at");
+        // v62.0.0 (PRE4-witness) — the witnessed-head fold and its shared lag
+        // predicate (`lineage_witness::head_lags_roster_at`) are deleted with
+        // witnessed mode; the lag is read by `root_head_view` alone.
+        let h = body(&cc, "pub async fn root_head_view");
         assert!(
             h.contains("roster_head::roster_lag("),
-            "I458: the shared predicate reads the roster lag"
+            "I458: the head view reads the roster lag"
         );
         // v62.0.0 (RL-fix7) — the accord head door (`is_accord_head_version`)
         // is deleted: every version of the accord is refused by name at
@@ -1011,7 +1043,7 @@ mod run {
                 #[tokio::test]
                 async fn i454() {
                     let Some(b) = $fresh.await else { return };
-                    bodies::i454_an_uncovered_row_lags_the_head(&b, &suffix()).await
+                    bodies::i454_charter_service_members(&b, &suffix()).await
                 }
                 #[tokio::test]
                 async fn i455() {

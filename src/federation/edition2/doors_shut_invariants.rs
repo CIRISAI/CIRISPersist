@@ -55,7 +55,6 @@ const PLANES: &[&str] = &[
     "identity_occurrence_revocation",
     "key_grant",
     "key_record",
-    "lineage_head_cosign",
     "location_proof",
     "purge",
     "revocation",
@@ -106,17 +105,14 @@ fn score_row(k: &ciris_crypto::composite::CompositeSigningKey, at: u64) -> Vec<u
         ("author", Value::Text(iref(k))),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
     ]);
     sign_row_statement(
         k,
         &iref(k),
         &iref(k),
         "scores",
-        "evidence:.suite:.kind:.cell:.prefix",
+        "coherence_standing:.cohort",
         &payload,
         vec![],
     )

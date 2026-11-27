@@ -256,6 +256,19 @@ pub enum StampPolicy {
     Any,
 }
 
+/// v62.0.0 (WD-fix1) — **the ONE read of the admitting rule**: the stamp
+/// this node's withdraws door wrote on a held `withdraws` / `recants`
+/// (`withdraws_admission_rule`), `None` for any other row and for an
+/// unstamped (deferred) one. [`stamp_entitles`] and the content descent
+/// (`withdrawn_content::rule_descends`) both read it here.
+#[must_use]
+pub fn admitting_stamp(g: &Attestation) -> Option<u8> {
+    if !super::edition2::emit::carries_no_dimension(&g.attestation_type) {
+        return None;
+    }
+    g.withdraws_admission_rule
+}
+
 /// v61.1.0 (CIRISPersist#1218 H1, as ruled) — does a non-producer composer
 /// `g` retract a target under `policy`? Only a `withdraws` (a `recants` is
 /// the attester's act alone, v53.1.2 CIRISPersist#984 row 12, CC 2.4.1.1),
@@ -271,7 +284,7 @@ pub fn stamp_entitles(g: &Attestation, policy: StampPolicy) -> bool {
     if g.attestation_type != attestation_type::WITHDRAWS {
         return false;
     }
-    let Some(rule) = g.withdraws_admission_rule else {
+    let Some(rule) = admitting_stamp(g) else {
         return false;
     };
     match policy {
@@ -293,7 +306,9 @@ pub fn stamp_entitles(g: &Attestation, policy: StampPolicy) -> bool {
 /// True for a row whose claim token lies on one of the adverse classes
 /// ([`SUBJECT_WITHDRAWS_CARVE_OUT`](super::admission::SUBJECT_WITHDRAWS_CARVE_OUT):
 /// `capacity:`, `detection:`, `licensure:`, `revocation:`, `moderation:`,
-/// `hard_case:`, `slashing:`, `takedown_notice:`), and for a cosigned act: a
+/// `hard_case:`, `slashing:`, `takedown_notice:`, `moderation_track_record:`,
+/// `quarantine:`, `trace:`),
+/// and for a cosigned act: a
 /// co-signature by a key other than the attester that is not a node's
 /// tier-crossing co-scrub (stamped `cosigned_at`, CC 2.6.7, custody and not a
 /// voice in the act).
@@ -438,7 +453,7 @@ pub(crate) mod test_support {
     /// The family whose vendored `ci_axes.data_subject.wire_fields` names
     /// `references_attestation_id` ("the load-bearing pointer … resolving to
     /// the certified attestation") — i.e. the exact place the dropped reading
-    /// would have applied. Registered at CC 3.1.2, unreserved.
+    /// would have applied. Registered (CC 3.1.6 since PRE4-retire), unreserved.
     ///
     /// The `:v1` is persist's, not the catalogue's: the catalogued stem carries
     /// no `:v<N>` segment and the CEG §13.1 four-test gate refuses a `scores`
@@ -446,7 +461,12 @@ pub(crate) mod test_support {
     /// here at all. (Same for the other three families whose `data_subject`
     /// axis names the pointer — a second, independent reason the dropped
     /// reading was unreachable in persist; recorded for the re-vendor.)
-    const DIMENSION: &str = "transparency_log:inclusion:v1";
+    ///
+    /// v62.0.0 (PRE4-retire) — was `transparency_log:inclusion:v1`, a family
+    /// CC v1.0-rc22-pre4 retired (refused by name). The other unreserved
+    /// family whose `data_subject.wire_fields` names
+    /// `references_attestation_id` (vendored supersets) carries the test.
+    const DIMENSION: &str = "ratchet:flag:expertise_attestation_anomaly:v1";
 
     fn row(
         id: &str,
@@ -533,14 +553,15 @@ pub(crate) mod test_support {
 
         // P — the row that genuinely names `subject` as its data subject.
         let p_id = uuid::Uuid::new_v4().to_string();
+        let p_row = row(
+            &p_id,
+            &producer,
+            &[&subject],
+            attestation_type::SCORES,
+            serde_json::json!({ "dimension": DIMENSION, "score": 1.0 }),
+        );
         dir.put_attestation(SignedAttestation {
-            attestation: row(
-                &p_id,
-                &producer,
-                &[&subject],
-                attestation_type::SCORES,
-                serde_json::json!({ "dimension": DIMENSION, "score": 1.0 }),
-            ),
+            attestation: p_row.clone(),
         })
         .await
         .expect("P admits");
@@ -719,11 +740,40 @@ pub(crate) mod test_support {
         )
         .await
         {
+            // v62.0.0 (WD-fix5; CC 6.1.5 N5, the lead's ruling) — an admitted
+            // rule-2 withdrawal of a CLAIM row descends it at the door: P is
+            // gone, not merely withdrawn, so no lifecycle lists it.
             assert!(
-                ids.contains(&p_id),
-                "P is withdrawn, not gone: IncludeWithdrawn still lists it: {ids:?}"
+                !ids.contains(&p_id),
+                "P descended at the door: IncludeWithdrawn no longer lists it: {ids:?}"
             );
         }
+        assert!(
+            dir.get_attestation(&p_id).await.expect("get P").is_none(),
+            "P descended: the row is gone"
+        );
+        match crate::federation::withdrawn_content::held_row_state(dir, &p_id)
+            .await
+            .expect("P's state")
+        {
+            crate::federation::withdrawn_content::HeldRowState::Withdrawn {
+                withdraws_attestation_id,
+                ..
+            } => assert_eq!(
+                withdraws_attestation_id, wp_id,
+                "P's id names the subject's withdrawal"
+            ),
+            other => panic!("P reads Withdrawn, not {other:?}"),
+        }
+        let late = dir
+            .put_attestation(SignedAttestation { attestation: p_row })
+            .await
+            .expect_err("a later copy of P is refused");
+        assert!(
+            late.to_string()
+                .contains(crate::federation::steward_purge::token::TOMBSTONED),
+            "by the tombstone: {late}"
+        );
     }
 }
 

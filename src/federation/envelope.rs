@@ -210,14 +210,16 @@ pub mod paths {
     /// (seconds) a WITNESSED lineage head may be for a consumer to ATTACH the
     /// root. Attached is never gated by it (T4).
     pub const ATTACH_WINDOW_SECS: &str = "attach_window_secs";
-    /// v51.0.0 (CIRISPersist#938, T6) — a charter member: the re-commit cadence
-    /// (seconds) of the lineage's witness cosigns; older = silent (a liveness
-    /// signal, never a validity leg).
-    pub const WITNESS_CADENCE_SECS: &str = "witness_cadence_secs";
-    /// v51.0.0 (CIRISPersist#938) — a charter member: how many independent
-    /// witnesses make a head "witnessed". Absent or `0` is witnessed mode off
-    /// (#973, CC 3.2 T6); no default is substituted.
-    pub const WITNESS_QUORUM: &str = "witness_quorum";
+    /// v62.0.0 (PRE4-charter; CC v1.0-rc22-pre4 `manifests/scitt_names.tsv`:
+    /// `witness_cadence_secs` → `receipt_cadence_secs`) — a charter member:
+    /// how often a named transparency service re-registers an unchanged head
+    /// (seconds). One of the three service members, all or none
+    /// (`trust_root::check_charter_receipt_members`).
+    pub const RECEIPT_CADENCE_SECS: &str = "receipt_cadence_secs";
+    /// v62.0.0 (PRE4-charter; scitt_names: `witness_quorum` → `receipt_quorum`)
+    /// — a charter member: how many of the named transparency services must
+    /// issue a Receipt; exactly ⌊n/2⌋ + 1 of the n named.
+    pub const RECEIPT_QUORUM: &str = "receipt_quorum";
     /// v51.0.0 (CIRISPersist#937) — on a `trust:accepts:v1` acceptance edge:
     /// the lineage head (its `persist_row_hash`) the consumer attaches under.
     pub const ATTACHED_HEAD_DIGEST: &str = "attached_head_digest";
@@ -495,12 +497,14 @@ pub struct EnvelopeCore {
     /// [`paths::ATTACH_WINDOW_SECS`] — v51.0.0 (#937).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attach_window_secs: Option<u64>,
-    /// [`paths::WITNESS_CADENCE_SECS`] — v51.0.0 (#938).
+    /// [`paths::RECEIPT_CADENCE_SECS`] — v62.0.0 (PRE4-charter; was
+    /// `witness_cadence_secs`, v51.0.0 #938).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub witness_cadence_secs: Option<u64>,
-    /// [`paths::WITNESS_QUORUM`] — v51.0.0 (#938).
+    pub receipt_cadence_secs: Option<u64>,
+    /// [`paths::RECEIPT_QUORUM`] — v62.0.0 (PRE4-charter; was
+    /// `witness_quorum`, v51.0.0 #938).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub witness_quorum: Option<u32>,
+    pub receipt_quorum: Option<u32>,
     /// [`paths::ATTACHED_HEAD_DIGEST`] — v51.0.0 (#937).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attached_head_digest: Option<String>,
@@ -943,8 +947,8 @@ fn fully_populated_core() -> EnvelopeCore {
         }),
         accord_root: Some("humanity-accord".into()),
         attach_window_secs: Some(604_800),
-        witness_cadence_secs: Some(86_400),
-        witness_quorum: Some(1),
+        receipt_cadence_secs: Some(86_400),
+        receipt_quorum: Some(1),
         attached_head_digest: Some("cd".repeat(32)),
         recovery_commitments: Some(std::collections::BTreeMap::from([(
             "A1".to_owned(),
@@ -986,8 +990,8 @@ mod tests {
             (paths::ROW, true),
             (paths::ACCORD_ROOT, true),
             (paths::ATTACH_WINDOW_SECS, true),
-            (paths::WITNESS_CADENCE_SECS, true),
-            (paths::WITNESS_QUORUM, true),
+            (paths::RECEIPT_CADENCE_SECS, true),
+            (paths::RECEIPT_QUORUM, true),
             (paths::ATTACHED_HEAD_DIGEST, true),
             (paths::RECOVERY_COMMITMENTS, true),
         ] {
@@ -1172,14 +1176,16 @@ pub fn envelope_vocabulary_json() -> serde_json::Value {
             // them once enforcement is on.
             paths::ACCORD_ROOT,
             // v51.0.0 (CIRISPersist#937/#938, CC 3.2 T4a/T6 rc6) — RE-PINNED:
-            // the charter's attach window, witness cadence and witness quorum
-            // are scrub-signed charter members (changing one is a re-scrub, not
-            // a config edit), and the acceptance edge names the head it attaches
-            // under. All four DECIDE whether a consumer attaches, so they are
-            // vocabulary both sides agree on.
+            // the charter's attach window, cadence and quorum are scrub-signed
+            // charter members (changing one is a re-scrub, not a config edit),
+            // and the acceptance edge names the head it attaches under. All
+            // four DECIDE whether a consumer attaches, so they are vocabulary
+            // both sides agree on. v62.0.0 (PRE4-charter) — RE-PINNED: the
+            // cadence and the quorum take CC v1.0-rc22-pre4's names
+            // (`receipt_cadence_secs`, `receipt_quorum`).
             paths::ATTACH_WINDOW_SECS,
-            paths::WITNESS_CADENCE_SECS,
-            paths::WITNESS_QUORUM,
+            paths::RECEIPT_CADENCE_SECS,
+            paths::RECEIPT_QUORUM,
             paths::ATTACHED_HEAD_DIGEST,
             // v53.0.0 (CC 4.2.6, rc7) — RE-PINNED: each accord holder's
             // pre-committed recovery key is a scrub-signed charter member, and
@@ -1291,6 +1297,7 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// re-pin.
 /// v51.0.0 (CIRISPersist#937/#938, CC 3.2 T4a/T6 rc6) — RE-PINNED. The
 /// charter's `attach_window_secs`, `witness_cadence_secs` and `witness_quorum`
+/// (renamed `receipt_cadence_secs` / `receipt_quorum` at PRE4-charter)
 /// and the acceptance edge's `attached_head_digest` joined `universal_paths`:
 /// they decide whether a consumer ATTACHES a root. Previous pin:
 /// `a6a84cc9d5f4d6bd6295cfc78b42bce35145d2bb9ff14391bfe32ab027116a6a`.
@@ -1303,8 +1310,14 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// `8064aafe07646acefad93f51fbf7e79cb8ac421bd49318c5aad50ded142295b1`:
 /// `listed` leaves `universal_paths` and `EnvelopeCore`, with the listing
 /// plane it was typed for. Persist no longer emits it.
+/// v62.0.0 (PRE4-charter; CC v1.0-rc22-pre4 `manifests/scitt_names.tsv`) —
+/// **RE-PINNED** from
+/// `4c5a5e8a019bc8c9c895a5b91693438aafe9066237305d07e04dd31d36596eff`:
+/// `witness_cadence_secs` / `witness_quorum` become `receipt_cadence_secs` /
+/// `receipt_quorum` (computed by a port of [`envelope_vocabulary_sha256`]
+/// that first reproduced the previous pin).
 pub const ENVELOPE_VOCABULARY_SHA256: &str =
-    "4c5a5e8a019bc8c9c895a5b91693438aafe9066237305d07e04dd31d36596eff";
+    "0cac7adff85031e4773e3c2d0785ccb03e5667566291e0458c84d8bb104f0bee";
 
 #[cfg(test)]
 mod vocab_tests {

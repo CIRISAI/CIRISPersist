@@ -31,9 +31,7 @@
 //! - **I2906** — `reason` is a uint code, never text, on every family;
 //!   free text rides `body.note` (at most 2048 bytes).
 //! - **I2907** — a time-boxed widening carries `valid_until`.
-//! - **I2908** — the cosign states are `pending` | `signature`, with no
-//!   member of their own (the payload is the event's); no `lineage_head`
-//!   state.
+//! - **I2908** — (deleted v62.0.0 PRE4-cosign: the cosign family is retired.)
 //! - **I2909** — a takedown notice: `legal_basis` is CC 3.3.2's closed set
 //!   and equals the leaf; a steward purge carries no `author`;
 //!   `perceptual_hash` and `counter_notice_channel` ride; `evidence_refs`
@@ -347,11 +345,7 @@ fn i2102_check_reads_the_member_lists() {
         "unsorted",
     );
     // A family the module does not map passes.
-    check(
-        "evidence:.suite:.kind:.cell:.prefix",
-        &map(vec![("x", ms(1))]),
-    )
-    .unwrap();
+    check("coherence_standing:.cohort", &map(vec![("x", ms(1))])).unwrap();
 }
 
 // ---- group:roster ------------------------------------------------------
@@ -690,50 +684,9 @@ fn i2907_a_widening_carries_valid_until() {
 }
 
 // ---- cosign:{state} -------------------------------------------------------
-
-/// I2908: the cosign states are `pending` | `signature`, with no member of
-/// their own; no `lineage_head` state.
-#[test]
-fn i2908_cosign_states_are_pending_and_signature() {
-    let fam = "cosign:{state}";
-    // The statement is over the event's own payload: its members are the
-    // event family's, not this table's.
-    ok(fam, &widening(vec![]), "I2908 the event's payload");
-    for state in ["pending", "signature"] {
-        ok(
-            fam,
-            &map(vec![
-                ("asserted_at", ms(1_000)),
-                ("dimension", txt(leak(&format!("cosign:{state}:v1")))),
-            ]),
-            "I2908 a closed state",
-        );
-    }
-    let lineage = map(vec![
-        ("asserted_at", ms(1_000)),
-        ("author", txt(&id(140))),
-        ("dimension", txt("cosign:lineage_head:v1")),
-        ("lineage", txt(&id(140))),
-        ("head_asserted_at", ms(900)),
-        ("refs", refs(vec![("head", ref2(&[0x44; 32]))])),
-    ]);
-    bad(fam, &lineage, "I2908 no lineage_head state");
-    bad(
-        fam,
-        &with(
-            &widening(vec![]),
-            vec![(
-                "refs",
-                refs(vec![
-                    ("head", ref2(&[0x40; 32])),
-                    ("also", map(vec![("event", ref_set(0x53))])),
-                ]),
-            )],
-            &[],
-        ),
-        "I2908 the also roles stay closed",
-    );
-}
+// v62.0.0 (PRE4-cosign) — I2908 is DELETED: CC v1.0-rc22-pre4 retires
+// `cosign:{state}`, so the payload table maps no cosign state (a statement of
+// the family is refused by name at the door, I6403).
 
 // ---- takedown_notice:{basis} ---------------------------------------------
 
@@ -1020,16 +973,16 @@ fn i2911_a_key_grant() {
     );
 }
 
-// ---- delivery_receipt:{stream_id} -----------------------------------------
+// ---- delivery_ack:{stream_id} -----------------------------------------
 
 /// I2912: the chunk index is `k`; no inner signature member.
 #[test]
 fn i2912_a_delivery_receipt() {
-    let fam = "delivery_receipt:{stream_id}";
+    let fam = "delivery_ack:{stream_id}";
     let r = map(vec![
         ("asserted_at", ms(1_000)),
         ("author", txt(&id(180))),
-        ("dimension", txt("delivery_receipt:s-1:v1")),
+        ("dimension", txt("delivery_ack:s-1:v1")),
         ("stream_id", txt("s-1")),
         ("epoch", ms(2)),
         ("k", ms(17)),
@@ -1220,18 +1173,11 @@ fn receipt() -> Value {
     map(vec![
         ("asserted_at", ms(1_000)),
         ("author", txt(&id(180))),
-        ("dimension", txt("delivery_receipt:s-1:v1")),
+        ("dimension", txt("delivery_ack:s-1:v1")),
         ("stream_id", txt("s-1")),
         ("epoch", ms(2)),
         ("k", ms(17)),
         ("chunk_root", digest(0x80)),
-    ])
-}
-
-fn cosign_pending() -> Value {
-    map(vec![
-        ("asserted_at", ms(1_000)),
-        ("dimension", txt("cosign:pending:v1")),
     ])
 }
 
@@ -1267,16 +1213,6 @@ fn door_cases() -> Vec<(&'static str, Value, Value, &'static str)> {
             "a wrong type (reason is a code)",
         ),
         (
-            "cosign:{state}",
-            cosign_pending(),
-            with(
-                &cosign_pending(),
-                vec![("dimension", txt("cosign:lineage_head:v1"))],
-                &[],
-            ),
-            "a leaf outside the closed states",
-        ),
-        (
             "revocation:{entity_type}:{reason}",
             revocation(),
             with(&revocation(), vec![], &["revoked_at"]),
@@ -1301,7 +1237,7 @@ fn door_cases() -> Vec<(&'static str, Value, Value, &'static str)> {
             "a wrong type",
         ),
         (
-            "delivery_receipt:{stream_id}",
+            "delivery_ack:{stream_id}",
             receipt(),
             with(&receipt(), vec![("K", ms(17))], &["k"]),
             "an unknown member (and k missing)",
@@ -1876,7 +1812,7 @@ mod door {
         let e = put_statement(
             &dir,
             &signed(
-                "evidence:.suite:.kind:.cell:.prefix",
+                "coherence_standing:.cohort",
                 &map(vec![("asserted_at", ms(1_000)), ("anything", ms(1))]),
             ),
             None,
@@ -2147,11 +2083,11 @@ fn i2926_a_composer_is_checked_by_the_composer_rule() {
         check_by_id(&occ, "scores", &composer()).is_err(),
         "I2926 a non-composer is the family's list"
     );
-    // One list of composer types.
-    assert_eq!(
-        super::payloads::COMPOSER_ROW_TYPES,
-        &super::ingest::COMPOSER_ROW_TYPES[..],
-        "I2926 the door's composer types are ingest's"
+    // One predicate for the rows that name a target (FS-step1:
+    // `emit::names_a_target`, no list): the door's payload rule asks it.
+    assert!(
+        super::emit::names_a_target("supersedes") && super::emit::names_a_target("withdraws"),
+        "I2926 the door's composer types are the one predicate's"
     );
 }
 
@@ -2669,7 +2605,7 @@ fn i3996_a_non_normalised_decimal_is_refused() {
         ("asserted_at", ms(1_000)),
         ("body", map(vec![("ratio", tag4(-1, 50))])),
     ]);
-    let e = check_by_id("evidence:.suite:.kind:.cell:.prefix", "scores", &p).unwrap_err();
+    let e = check_by_id("coherence_standing:.cohort", "scores", &p).unwrap_err();
     assert_eq!(
         reason(&e),
         malformed_row::EDITION2_PAYLOAD_INVALID,
@@ -2679,7 +2615,7 @@ fn i3996_a_non_normalised_decimal_is_refused() {
         ("asserted_at", ms(1_000)),
         ("body", map(vec![("ratio", tag4(-1, 5))])),
     ]);
-    check_by_id("evidence:.suite:.kind:.cell:.prefix", "scores", &ok_p).expect("I3996 ok");
+    check_by_id("coherence_standing:.cohort", "scores", &ok_p).expect("I3996 ok");
 }
 
 /// I3997: the pair room is `community_id` (FINAL, CC).
@@ -2809,7 +2745,7 @@ fn i3999_a_decimal_reads_back_exactly() {
     // The mapping reads a body's decimal as a JSON number.
     let a = super::ingest::attestation_of(
         &admitted(
-            "evidence:.suite:.kind:.cell:.prefix",
+            "coherence_standing:.cohort",
             map(vec![
                 ("asserted_at", ms(1_000)),
                 ("body", map(vec![("ratio", tag4(-2, 125))])),
@@ -2823,15 +2759,9 @@ fn i3999_a_decimal_reads_back_exactly() {
         "1.25",
         "I3999 the mapping's body number"
     );
-    assert!(is_body_member(
-        "evidence:.suite:.kind:.cell:.prefix",
-        "body"
-    ));
+    assert!(is_body_member("coherence_standing:.cohort", "body"));
     assert!(is_body_member(&family_id("hard_case:{kind}"), "hard_case"));
-    assert!(!is_body_member(
-        "evidence:.suite:.kind:.cell:.prefix",
-        "hard_case"
-    ));
+    assert!(!is_body_member("coherence_standing:.cohort", "hard_case"));
     assert!(!is_body_member(&family_id("hard_case:{kind}"), "score"));
 }
 

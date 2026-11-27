@@ -14,7 +14,7 @@
 //! | `custody_ack_envelope` + an emitted `custody:ack:v1` row | [`custody_statement`] |
 //! | `KeyGrantRow::emit_input` | [`key_grant_statement`] |
 //! | a `DeliveryReceipt` literal (`put_delivery_receipt`) | [`delivery_receipt_statement`] |
-//! | a `cosign:{pending,signature}:v1` row | [`cosign_statement`] (kept beside the event only) |
+//! | a `cosign:{pending,signature}:v1` row | none: the family is retired (PRE4-cosign); [`retired_cosign_statement`] builds the statement a peer still sends, to see it refused |
 
 use ciris_verify_core::cde::Value;
 use ciris_verify_core::edition2::{identity_ref, sign_row_statement, thumbprint};
@@ -23,11 +23,10 @@ use ciris_verify_core::namespace_match;
 use super::fixture_switch::{kid_or_keep, signing_key};
 use super::names::RowId;
 use super::typed::{
-    cosign_payload, custody_payload, delivery_receipt_payload, key_grant_payload,
-    occurrence_revocation_payload, revocation_payload, takedown_payload, trust_accepts_payload,
-    withdraws_payload, NoticeText, COSIGN_PREFIX, CUSTODY_PREFIX, DELIVERY_RECEIPT_PREFIX,
-    KEY_GRANT_PREFIX, OCCURRENCE_REVOCATION_PREFIX, REVOCATION_PREFIX, TAKEDOWN_PREFIX,
-    TRUST_PREFIX,
+    custody_payload, delivery_receipt_payload, key_grant_payload, occurrence_revocation_payload,
+    revocation_payload, takedown_payload, trust_accepts_payload, withdraws_payload, NoticeText,
+    CUSTODY_PREFIX, DELIVERY_RECEIPT_PREFIX, KEY_GRANT_PREFIX, OCCURRENCE_REVOCATION_PREFIX,
+    REVOCATION_PREFIX, TAKEDOWN_PREFIX, TRUST_PREFIX,
 };
 use crate::federation::blobs::GrantWrap;
 use crate::federation::custody_ack::CustodyState;
@@ -360,7 +359,7 @@ pub fn key_grant_statement(signer: &str, row: &KeyGrantRow, asserted_at_ms: u64)
     typed_statement(signer, None, &recipient, KEY_GRANT_PREFIX, &p)
 }
 
-/// A `delivery_receipt:{stream_id}:v1` statement by `subscriber` (the
+/// A `delivery_ack:{stream_id}:v1` statement by `subscriber` (the
 /// row's `sub`).
 #[must_use]
 pub fn delivery_receipt_statement(
@@ -382,28 +381,82 @@ pub fn delivery_receipt_statement(
     typed_statement(subscriber, None, subscriber, DELIVERY_RECEIPT_PREFIX, &p)
 }
 
-/// A `cosign:{state}:v1` statement by `signer` naming the held event
-/// `event` (its row id); `sub` is the event's group.
+/// PRE4-rename (CC v1.0-rc22-pre4) — the family's EARLIER wire name, which
+/// no alias admits. Only the refusal witnesses (I6401) offer it.
+pub const EARLIER_DELIVERY_RECEIPT_PREFIX: &str = "delivery_receipt:{stream_id}";
+
+/// A receipt statement under the EARLIER family name and dimension
+/// (`delivery_receipt:{stream_id}`, `delivery_receipt:<stream_id>:v1`), every
+/// other member as [`delivery_receipt_statement`] states it: what a node that
+/// has not moved to CC v1.0-rc22-pre4 would send.
 #[must_use]
-pub fn cosign_statement(
+pub fn earlier_delivery_receipt_statement(
+    subscriber: &str,
+    stream_id: &str,
+    epoch: u64,
+    k: u64,
+    chunk_root: &[u8; 32],
+    asserted_at_ms: u64,
+) -> Vec<u8> {
+    let mut p = delivery_receipt_payload(
+        &kid_or_keep(subscriber),
+        stream_id,
+        epoch,
+        k,
+        chunk_root,
+        asserted_at_ms,
+    );
+    if let Value::Map(entries) = &mut p {
+        for (key, v) in entries.iter_mut() {
+            if matches!(key, Value::Text(t) if t == "dimension") {
+                *v = Value::Text(format!("delivery_receipt:{stream_id}:v1"));
+            }
+        }
+    }
+    typed_statement(
+        subscriber,
+        None,
+        subscriber,
+        EARLIER_DELIVERY_RECEIPT_PREFIX,
+        &p,
+    )
+}
+
+/// PRE4-cosign (CC v1.0-rc22-pre4) — the retired family's registry prefix,
+/// which no producer of this node writes any more.
+pub const RETIRED_COSIGN_PREFIX: &str = "cosign:{state}";
+
+/// A `cosign:{state}:v1` statement by `signer` naming `event` (its row id)
+/// by `refs.target`, `sub` the event's group, in the shape a node before CC
+/// v1.0-rc22-pre4 sent it (`author`, `dimension`, `refs`, `asserted_at`).
+/// The family is retired: only the refusal witnesses (I6403) offer it.
+#[must_use]
+pub fn retired_cosign_statement(
     signer: &str,
     state: &str,
     sub: &str,
     event: &RowId,
     asserted_at_ms: u64,
 ) -> Vec<u8> {
-    typed_statement(
-        signer,
-        None,
-        sub,
-        COSIGN_PREFIX,
-        &cosign_payload(
-            &identity_ref(&thumbprint(signing_key(signer).public_key())),
-            state,
-            event,
-            asserted_at_ms,
+    let text = |s: &str| Value::Text(s.to_owned());
+    let mut m = vec![
+        ("asserted_at", Value::Uint(asserted_at_ms)),
+        (
+            "author",
+            text(&identity_ref(&thumbprint(signing_key(signer).public_key()))),
         ),
-    )
+        ("dimension", text(&format!("cosign:{state}:v1"))),
+        (
+            "refs",
+            Value::Map(vec![(
+                text(super::typed::TARGET_ROLE),
+                ciris_verify_core::edition2::row_ref(&event.0),
+            )]),
+        ),
+    ];
+    m.sort_by_key(|(k, _)| ciris_verify_core::cde::encode(&text(*k)));
+    let payload = Value::Map(m.into_iter().map(|(k, v)| (text(k), v)).collect());
+    typed_statement(signer, None, sub, RETIRED_COSIGN_PREFIX, &payload)
 }
 
 /// [`typed_statement`] at a row type other than `scores`.

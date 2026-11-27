@@ -156,6 +156,14 @@ pub fn invalid_label(i: &Invalid) -> String {
         // v62.0.0 (CE-fix3; CIRISVerify 23.3.3) — a known dial-hint type with a
         // bad body: Verify's token.
         Invalid::DialHintMalformed => "dial_hint_malformed".into(),
+        // v62.0.0 (PIN-verify-23.6; CIRISVerify 23.6.0) — the six new
+        // variants, by Verify's own tokens (`Invalid::token`).
+        Invalid::GroupIdNotOfFounding => "group_id_not_of_founding".into(),
+        Invalid::TrustedThroughTooMany => "trusted_through_too_many".into(),
+        Invalid::KeepsCitesNoEnd => "keeps_cites_no_end".into(),
+        Invalid::AckNamesTooMany => "ack_names_too_many".into(),
+        Invalid::TrustAcceptsClassesMalformed => "trust_accepts_classes_malformed".into(),
+        Invalid::TrustAcceptsDepthOutOfRange => "trust_accepts_depth_out_of_range".into(),
         other => format!("{other:?}"),
     }
 }
@@ -366,6 +374,17 @@ pub fn pure_statement_gates(bytes: &[u8], keys: &dyn KeyDirectory) -> Result<(),
         // No family in the header: Verify's verdict names that fault.
         return Ok(());
     };
+    // v62.0.0 (PRE4-retire; CC v1.0-rc22-pre4) — a family the Constitution
+    // retired is refused BY NAME, before any other rule reads the row.
+    if let Some(retired) = crate::federation::namespace::registry::retired_by_name(family) {
+        return Err(refuse(
+            token::FAMILY_RETIRED,
+            format!(
+                "a row of `{retired}`, a family CC v1.0-rc22-pre4 retired \
+                 (manifests/scitt_names.tsv); nothing is kept"
+            ),
+        ));
+    }
     // v62.0.0 (wave P1e) — a composer carries its target's family but its
     // own payload shape: the row type (-70001) selects the composer rule.
     let row_type = protected
@@ -393,8 +412,9 @@ pub fn pure_statement_gates(bytes: &[u8], keys: &dyn KeyDirectory) -> Result<(),
         ));
     }
     // v62.0.0 (RL-fix19; CC 2.6.1.11) — a group-plane statement about the
-    // accord is refused BY NAME before its shape is judged (the accord's id
-    // is no identity-ref: the shape check would name it payload-invalid).
+    // accord is refused BY NAME before its shape is judged (the accord's
+    // name is a root lineage's, no group-ref: the shape check or the
+    // founding check would name it payload-invalid).
     if super::group::group_plane_of(row_type, family, &payload).is_some() {
         let sub = protected
             .get_int(15)
@@ -402,6 +422,36 @@ pub fn pure_statement_gates(bytes: &[u8], keys: &dyn KeyDirectory) -> Result<(),
             .and_then(Value::as_text)
             .unwrap_or_default();
         super::group::refuse_accord_group_statement(sub, &payload)?;
+    }
+    // v62.0.0 (GID-prod; CIRISConstitution "THE DERIVED GROUP ID", the rule
+    // Verify 23.5.1's statement reader applies) — every `group:roster`
+    // statement that is not a retraction meets the founding check: a first
+    // version (no `refs.head`) names the id its own members derive and
+    // carries its 32-byte `nonce`; a later version carries none. It reads
+    // the row alone, so it is a refusal.
+    if family == ciris_verify_core::namespace_match::family_id(super::group::GROUP_ROSTER_PREFIX)
+        && !super::emit::carries_no_dimension(row_type)
+    {
+        use super::group_id::{check_group_roster_founding, Invalid as GroupIdInvalid};
+        match check_group_roster_founding(&payload) {
+            Ok(()) => {}
+            Err(GroupIdInvalid::GroupIdNotOfFounding) => {
+                return Err(refuse(
+                    crate::federation::malformed_row::GROUP_ID_NOT_OF_FOUNDING,
+                    "group:roster: a first version's `group` is not the id derived from its own \
+                     group_kind, members, founded_at and nonce",
+                ));
+            }
+            Err(GroupIdInvalid::Malformed { member }) => {
+                return Err(refuse(
+                    crate::federation::malformed_row::EDITION2_PAYLOAD_INVALID,
+                    format!(
+                        "group:roster: `{member}` is missing or not at its type (the founding \
+                         check: a first version carries a 32-byte `nonce`, a later one none)"
+                    ),
+                ));
+            }
+        }
     }
     super::payloads::check_by_id(family, row_type, &payload)?;
     // v62.0.0 (wave P1e; CC rc21 CC 2.7.11) — the verifier's pure rules over
@@ -745,12 +795,6 @@ pub struct SecondSignerRole {
     pub parties: Vec<SecondSignerParty>,
 }
 
-/// v62.0.0 (WD-fix1) — the composer row types that RETRACT their target
-/// (CC 2.4.1.1): each concludes on its own author's voice and takes no
-/// second-signer role from the target's family ([`second_signer_roles`]).
-/// The third composer, `supersedes`, restates content and keeps the roles.
-pub const RETRACTION_ROW_TYPES: &[&str] = &["withdraws", "recants"];
-
 /// v62.0.0 (K2-fix4, K2-fix6; CC 2.6.1.9 (P2:1147): "The second consent of a
 /// scoped delegates_to is a second statement over the same payload, signed
 /// by the delegate, the row's sub. A scoped delegation seats only with that
@@ -838,7 +882,10 @@ pub fn second_signer_roles_with(
     // `supersedes` is a composer too but restates content, so it keeps the
     // family's roles.
     let row_type = protected.get_int(-70001).and_then(Value::as_text);
-    if row_type.is_some_and(|t| RETRACTION_ROW_TYPES.contains(&t)) {
+    // v62.0.0 (FS-step1) — a retraction (CC 2.4.1.1) concludes on its own
+    // author's voice and takes no second-signer role from the target's
+    // family: the two-type predicate, `emit::carries_no_dimension`.
+    if row_type.is_some_and(super::emit::carries_no_dimension) {
         return Vec::new();
     }
     let ctx = door_context(bytes, SelectContext::default());

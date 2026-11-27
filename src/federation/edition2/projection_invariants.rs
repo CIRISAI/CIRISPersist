@@ -20,17 +20,16 @@
 //!   `tier_ingest::verify_row_hybrid_signature`,
 //!   `register::verify_key_registration`, `register::verify_proof_of_possession`
 //!   (→ `verify_record_signed_by`), `key_plane::verify_plane_row`,
-//!   `group_plane::verify_plane_row`, `self_roster::verify_proposal_row`,
-//!   `cosign::verify_row`, `occurrence_revocation_carrier::verify_carrier_row`,
+//!   `group_plane::verify_plane_row`, `cosign::verify_row`, `occurrence_revocation_carrier::verify_carrier_row`,
 //!   `admission::verify_consent_record_transit_ingest`,
 //!   `admission::verify_caller_signed_local_row`. The same rows under an
 //!   earlier-form key id are never refused by that name, and the mapped row
 //!   (carrying its statement) passes the guard.
 //! - **I2004 (revocation readers).** The self-revocation is seen by
 //!   `revocations_for` / `revocations_for_subject`, by the key-statement fold
-//!   (`resolve_key_statement_standing`), by the lineage witness gate
-//!   (`witness_standing_at`), and the subject read (`wire_refs_for_subject`)
-//!   still answers.
+//!   (`resolve_key_statement_standing`), and the subject read
+//!   (`wire_refs_for_subject`) still answers. (v62.0.0 PRE4-witness: the
+//!   lineage witness gate is deleted with witnessed mode.)
 //! - **I2005 (revocation authority).** A stranger's `key:revocation` is held
 //!   and projects nothing; an owner's projects nothing under [`SelfOnly`] and
 //!   projects (with the owner's key row, its FK target) only under a
@@ -74,17 +73,14 @@ fn score_row(k: &ciris_crypto::composite::CompositeSigningKey, at_ms: u64) -> Ve
         ("author", Value::Text(iref(k))),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
     ]);
     sign_row_statement(
         k,
         &iref(k),
         &iref(k),
         "scores",
-        "evidence:.suite:.kind:.cell:.prefix",
+        "coherence_standing:.cohort",
         &payload,
         vec![],
     )
@@ -503,21 +499,8 @@ pub(crate) async fn body(d: &dyn FederationDirectory, raw: &Raw<'_>) {
         KeyStatementStanding::SuspectAfterBound,
         "I2004: the key-statement fold, after the bound"
     );
-    use crate::federation::lineage_witness::{witness_standing_at, WitnessStanding};
-    assert!(
-        matches!(
-            witness_standing_at(d, &ik, at(10_500)).await.unwrap(),
-            WitnessStanding::Counts { .. }
-        ),
-        "I2004: the witness gate, before the bound"
-    );
-    assert!(
-        matches!(
-            witness_standing_at(d, &ik, at(11_500)).await.unwrap(),
-            WitnessStanding::NotValidAt
-        ),
-        "I2004: the witness gate refuses the revoked key"
-    );
+    // v62.0.0 (PRE4-witness) — the lineage witness gate
+    // (`lineage_witness::witness_standing_at`) is deleted with witnessed mode.
     crate::federation::wire_index::wire_refs_for_subject(d, &ik)
         .await
         .expect("I2004: the subject read answers over a projected revocation");
@@ -743,7 +726,7 @@ async fn cross_form(
 ) {
     use crate::federation::{
         admission, cosign, group_plane, key_plane, occurrence_revocation_carrier, register,
-        self_roster, tier_ingest,
+        tier_ingest,
     };
     let token = malformed_row::EARLIER_FORM_SIGNER_IS_EDITION2;
     // Each site refuses under its own plane, so a site whose guard is gone
@@ -793,11 +776,6 @@ async fn cross_form(
         "group_plane::verify_plane_row",
         "group_plane",
         b(group_plane::verify_plane_row(d, row).await),
-    );
-    check(
-        "self_roster::verify_proposal_row",
-        "self_roster",
-        b(self_roster::verify_proposal_row(d, row).await),
     );
     check(
         "cosign::verify_row",

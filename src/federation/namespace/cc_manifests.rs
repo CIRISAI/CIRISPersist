@@ -34,12 +34,13 @@
 //! | `csd4_chain.json` | the CSD/4 chain as data | `scripts/csd4_coverage.py` (report) |
 //! | `topology_vocabulary.json` | the CSD/4 atom vocabulary | `scripts/csd4_coverage.py`, the chain's own vocabulary pin |
 //! | `signed_object_vectors.json` | 2.6.1.8 at rc20 (2.6.1.7 at rc18; the earlier form's register row is 8.11.9), the 13 signed-object vectors | the signed-object replay (test) |
+//! | `family_model.json` | 3.1, the family model (189 rows; v62.0.0 FS-step1) | [`super::family_table`] at runtime ([`FAMILY_MODEL_JSON`](super::family_table::FAMILY_MODEL_JSON)) |
 //!
-//! Only the policy table is compiled in: the other four have no runtime
-//! reader, so they live here as data with their pins and are read from disk
-//! by the report script and the witnesses.
+//! The policy table and the family model are compiled in: the other four
+//! have no runtime reader, so they live here as data with their pins and are
+//! read from disk by the report script and the witnesses.
 //!
-//! JSON carries no comments, so this doc is the five files' header. Do not
+//! JSON carries no comments, so this doc is the six files' header. Do not
 //! hand-edit them: re-copy from the commit (or tag) CC names, move each pin
 //! below and [`VENDORED_CC_COMMIT`](super::registry::VENDORED_CC_COMMIT) in
 //! the same commit, and run `scripts/check_vendored_cc.sh`.
@@ -54,20 +55,20 @@ pub(crate) const GOVERNANCE_POLICY_JSON: &str = include_str!("governance_policy.
 
 /// SHA-256 of the vendored `governance_policy.json` FILE bytes.
 pub const VENDORED_GOVERNANCE_POLICY_FILE_SHA256: &str =
-    "72c1cc376461433e7abf78de9b921f7e43fabf5129a4c1c53c7fc46f2bcd5119";
+    "205b9133715f4d1d248348723636418292d952809ea0787c7e00e4d86a96cc5d";
 
 /// The table's own `_meta.policy_sha256` (CC's hash over the rows; the
 /// vectors carry the same value, so a vector set is tied to its table).
 pub const VENDORED_GOVERNANCE_POLICY_SHA256: &str =
-    "96edc650156b080724037c9ac7b6cf42a8386a577fd935713b02b77bd8554eaf";
+    "e0b21aea5959b3098e9392d23a7de823d5363fd88aa2084e5d739cecb53b1f00";
 
 /// SHA-256 of the vendored `governance_policy_vectors.json` FILE bytes.
 pub const VENDORED_GOVERNANCE_POLICY_VECTORS_FILE_SHA256: &str =
-    "0ea7e2313becd3a7456d667738432eaea966028a3a4b5e82594deb018908c801";
+    "ce54deea16522735d8bc962b3f690d60ddcf9d82a35a8f21ae8162f317533300";
 
 /// SHA-256 of the vendored `csd4_chain.json` FILE bytes.
 pub const VENDORED_CSD4_CHAIN_FILE_SHA256: &str =
-    "a83070c81779945b878650f5460490519c4f627c45de4bed0859d92e53b4f592";
+    "bdd3d9f2cd4da5d57a0dea05cac3cab413dfd6c05e32a934fa4fa96c6bf6b8a6";
 
 /// SHA-256 of the vendored `topology_vocabulary.json` FILE bytes. The chain's
 /// `_meta.pins.vocabulary_sha256` and CIRISServer's catalogue pin
@@ -90,7 +91,20 @@ pub const VENDORED_SIGNED_OBJECT_VECTORS_FILE_SHA256: &str =
 pub const VENDORED_WIRE_VOCABULARY_FILE_SHA256: &str =
     "279b282e5d565d3d4378820770f71179dddbe1c8d397ab8f7fbe0e8f51299e77";
 
-/// The five files, `(file under src/federation/namespace/, pinned sha256)`,
+/// v62.0.0 (FS-step1) — SHA-256 of the vendored `family_model.json` FILE
+/// bytes (CC `v1.0-rc22-pre4`, the family model: 185 rows; pre3's
+/// `shape` and `descends_on_withdrawal`), compiled in by
+/// [`super::family_table`].
+pub const VENDORED_FAMILY_MODEL_FILE_SHA256: &str =
+    "241eb46feee7c6b4ffc1c8c321680f7759596ac067e8af495a2e867cb4ea75c4";
+
+/// v62.0.0 (PIN-pre4) — SHA-256 of the vendored `refusal_tokens.tsv` FILE
+/// bytes (CC `v1.0-rc22-pre4`, added at pre4: the 317 refusal names the
+/// Constitution's texts state, one row each).
+pub const VENDORED_REFUSAL_TOKENS_FILE_SHA256: &str =
+    "20bf3b6fe85cd318a39faa91faa6d22aa93d7257448576b2030e757f731a438e";
+
+/// The seven files, `(file under src/federation/namespace/, pinned sha256)`,
 /// in the order `scripts/check_vendored_cc.sh` compares them.
 pub const VENDORED_CC_MANIFEST_FILES: &[(&str, &str)] = &[
     (
@@ -110,6 +124,8 @@ pub const VENDORED_CC_MANIFEST_FILES: &[(&str, &str)] = &[
         "signed_object_vectors.json",
         VENDORED_SIGNED_OBJECT_VECTORS_FILE_SHA256,
     ),
+    ("family_model.json", VENDORED_FAMILY_MODEL_FILE_SHA256),
+    ("refusal_tokens.tsv", VENDORED_REFUSAL_TOKENS_FILE_SHA256),
 ];
 
 /// The six CC `formal/self_roster/traces/*.json` files the two-path replay
@@ -194,7 +210,7 @@ mod tests {
     }
 
     /// **I1300** — the vendored bytes are the pinned bytes: every CC file
-    /// persist vendors (the registry, its vectors, the five manifests here and
+    /// persist vendors (the registry, its vectors, the six manifests here and
     /// the six self-roster traces) hashes to its constant, and the compiled-in
     /// policy table is the file on disk.
     #[test]
@@ -202,8 +218,8 @@ mod tests {
         let all = every_pinned_file();
         assert_eq!(
             all.len(),
-            13,
-            "two registry files, five manifests, six traces"
+            14,
+            "two registry files, six manifests, six traces"
         );
         for (_, local, pin) in &all {
             let bytes = std::fs::read(local).unwrap_or_else(|e| panic!("{local:?}: {e}"));
@@ -433,7 +449,7 @@ mod tests {
             "manifests/WIRE_VOCABULARY.md at {rev} is not the pinned byte string"
         );
         eprintln!(
-            "I1302: 13 files equal {rev} ({VENDORED_CC_COMMIT}, {VENDORED_CC_TAG:?}), and \
+            "I1302: 14 files equal {rev} ({VENDORED_CC_COMMIT}, {VENDORED_CC_TAG:?}), and \
              WIRE_VOCABULARY.md hashes to its pin: RAN"
         );
     }

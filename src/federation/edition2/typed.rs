@@ -18,8 +18,7 @@
 //! | `takedown_notice:steward_purge` | none: its row door is held shut (CIRISPersist#988); the purge door counts the stewards' voices | `ceg_statements` |
 //! | `custody:{kind}` | `put_attestation` (the custody gate; the holding-claim fold reads the row) | `federation_attestations` |
 //! | `key_grant:{axis}` | `put_attestation`, then the grant projection the typed doors run (`project_key_grant_row`) | `federation_attestations` + the grant tables |
-//! | `delivery_receipt:{stream_id}` | the receipt door's JOIN and equivocation steps; the signed receipt row through `put_attestation` (`custody_ack::signed_receipt_at` reads it) | `federation_stream_delivery_receipts` + `federation_attestations` |
-//! | `cosign:{state}` | none: the hold IS the counted row (CC 3.1.3; [`crate::federation::cosign`]) | `ceg_statements` |
+//! | `delivery_ack:{stream_id}` | the receipt door's JOIN and equivocation steps; the signed receipt row through `put_attestation` (`custody_ack::signed_receipt_at` reads it) | `federation_stream_delivery_receipts` + `federation_attestations` |
 //!
 //! # Counted voices
 //!
@@ -58,7 +57,7 @@ use sha2::Digest as _;
 
 use super::door::AdmittedRow;
 use super::group::{composite_signature_b64, run_vouched, Landing, Vouch};
-use super::ingest::{attestation_of, json_of, StatementOutcome, COMPOSER_ROW_TYPES};
+use super::ingest::{attestation_of, json_of, StatementOutcome};
 use super::names::{single, RowId};
 use crate::federation::blobs::GrantWrap;
 use crate::federation::custody_ack::CustodyState;
@@ -75,8 +74,10 @@ pub const PLANE: &str = "edition2_typed";
 
 /// `identity:occurrence_revocation` (a family with no parameter).
 pub const OCCURRENCE_REVOCATION_PREFIX: &str = "identity:occurrence_revocation";
-/// `cosign:{state}`.
-pub const COSIGN_PREFIX: &str = "cosign:{state}";
+// v62.0.0 (PRE4-cosign; CC v1.0-rc22-pre4) — `cosign:{state}` is retired
+// whole: edition 2 keeps a counted row's voices as statements of the event
+// itself and mints no cosign row. A statement of the family is refused by
+// name at the door (`registry::RETIRED_BY_NAME`, `family_retired`).
 /// `revocation:{entity_type}:{reason}`.
 pub const REVOCATION_PREFIX: &str = "revocation:{entity_type}:{reason}";
 /// `takedown_notice:{basis}`.
@@ -85,10 +86,18 @@ pub const TAKEDOWN_PREFIX: &str = "takedown_notice:{basis}";
 pub const CUSTODY_PREFIX: &str = "custody:{kind}";
 /// `key_grant:{axis}`.
 pub const KEY_GRANT_PREFIX: &str = "key_grant:{axis}";
-/// `delivery_receipt:{stream_id}`.
-pub const DELIVERY_RECEIPT_PREFIX: &str = "delivery_receipt:{stream_id}";
+/// `delivery_ack:{stream_id}`.
+///
+/// v62.0.0 (PRE4-rename; CC v1.0-rc22-pre4, `manifests/scitt_names.tsv`) —
+/// the family was `delivery_receipt:{stream_id}`; the wire name moves with no
+/// alias (header -70002 and the payload's `dimension`), the members do not.
+/// Persist's own names (this constant, the `put_/list_delivery_receipt*`
+/// verbs, the `delivery_receipt` door, the `federation_stream_delivery_receipts`
+/// table) keep theirs: scitt_names puts "SQL names, a component's own verbs
+/// and identifiers" out of scope.
+pub const DELIVERY_RECEIPT_PREFIX: &str = "delivery_ack:{stream_id}";
 
-/// The `refs` role a cosign statement names the event it cosigns by.
+/// The `refs` role a composer or a typed row names its target row by.
 pub const TARGET_ROLE: &str = "target";
 
 /// v62.0.0 (wave T2; CC27 item 2) — the `refs` role an `identity:occurrence`
@@ -102,8 +111,6 @@ pub const SELF_ROSTER_HEAD_ROLE: &str = "head";
 pub enum TypedPlane {
     /// `identity:occurrence_revocation`.
     OccurrenceRevocation,
-    /// `cosign:{state}` (`pending` | `signature`).
-    Cosign,
     /// `revocation:{entity_type}:{reason}`.
     Revocation,
     /// `takedown_notice:{basis}`.
@@ -112,17 +119,16 @@ pub enum TypedPlane {
     Custody,
     /// `key_grant:{axis}`.
     KeyGrant,
-    /// `delivery_receipt:{stream_id}`.
+    /// `delivery_ack:{stream_id}`.
     DeliveryReceipt,
 }
 
 /// Each typed plane's registry prefix.
-pub const PLANES: [(&str, TypedPlane); 7] = [
+pub const PLANES: [(&str, TypedPlane); 6] = [
     (
         OCCURRENCE_REVOCATION_PREFIX,
         TypedPlane::OccurrenceRevocation,
     ),
-    (COSIGN_PREFIX, TypedPlane::Cosign),
     (REVOCATION_PREFIX, TypedPlane::Revocation),
     (TAKEDOWN_PREFIX, TypedPlane::Takedown),
     (CUSTODY_PREFIX, TypedPlane::Custody),
@@ -178,7 +184,7 @@ pub fn never_replaced(family: &str, payload: &Value) -> bool {
             .get_text("dimension")
             .and_then(Value::as_text)
             .is_some_and(crate::federation::admission::is_peer_deadmission_dimension),
-        TypedPlane::OccurrenceRevocation | TypedPlane::Cosign | TypedPlane::KeyGrant => true,
+        TypedPlane::OccurrenceRevocation | TypedPlane::KeyGrant => true,
         TypedPlane::Takedown | TypedPlane::Custody | TypedPlane::DeliveryReceipt => false,
     }
 }
@@ -697,7 +703,7 @@ pub fn project_envelope(row: &AdmittedRow, o: &mut serde_json::Map<String, serde
             }
         }
         TypedPlane::DeliveryReceipt => put_digest_hex(row, o, "chunk_root"),
-        TypedPlane::OccurrenceRevocation | TypedPlane::Cosign | TypedPlane::Revocation => {}
+        TypedPlane::OccurrenceRevocation | TypedPlane::Revocation => {}
     }
 }
 
@@ -734,7 +740,6 @@ pub fn unproject_payload(family_id: &str, m: &mut Vec<(Value, Value)>) {
         // from the earlier envelope.
         TypedPlane::KeyGrant
         | TypedPlane::OccurrenceRevocation
-        | TypedPlane::Cosign
         | TypedPlane::Revocation
         | TypedPlane::DeliveryReceipt => &[],
     };
@@ -868,7 +873,7 @@ fn composite_signature(statement: &[u8]) -> Option<Vec<u8>> {
     Some(sig)
 }
 
-/// **A `delivery_receipt:{stream_id}` statement as the [`DeliveryReceipt`]
+/// **A `delivery_ack:{stream_id}` statement as the [`DeliveryReceipt`]
 /// it states**: `stream_id` (equal to the `{stream_id}` leaf), the
 /// subscriber (`iss`, equal to `sub`), `epoch`, `k`, `chunk_root`. The
 /// receipt carries the statement's composite signature WHOLE, as one field
@@ -1012,7 +1017,6 @@ where
         TypedPlane::OccurrenceRevocation => Box::pin(put_occurrence_revocation(dir, row)).await,
         TypedPlane::Revocation => Box::pin(put_revocation_statement(dir, row)).await,
         TypedPlane::DeliveryReceipt => Box::pin(put_delivery_receipt(dir, row, tier)).await,
-        TypedPlane::Cosign => Box::pin(put_cosign(dir, row)).await,
         TypedPlane::Takedown if is_steward_purge(row) => {
             let new = dir.put_edition2_statement(row).await?;
             Ok(StatementOutcome::Pending {
@@ -1269,7 +1273,7 @@ where
 /// which reads [`occurrence_revocation_of`]). A proposal no answer can mend
 /// is `SelfRosterNotLanded` (the voice stays held: the gate counts held
 /// voices, so it is stored first). Landing writes the revocation the carrier
-/// feeds (`put_identity_occurrence_revocation_local`) unless the pair is
+/// feeds (`put_identity_occurrence_revocation_edition2`) unless the pair is
 /// already revoked: the first route to land fixes the instants.
 async fn put_occurrence_revocation<F>(dir: &F, row: &AdmittedRow) -> Result<StatementOutcome, Error>
 where
@@ -1320,8 +1324,11 @@ where
         .iter()
         .any(|r| r.occurrence_key_id == revocation.occurrence_key_id);
     if !held {
-        dir.put_identity_occurrence_revocation_local(revocation)
-            .await?;
+        dir.put_identity_occurrence_revocation_edition2(
+            revocation,
+            crate::federation::DoorToken::new(),
+        )
+        .await?;
     }
     Ok(StatementOutcome::Row {
         row_id: row.row_id,
@@ -1414,7 +1421,7 @@ where
     Ok(())
 }
 
-/// **`delivery_receipt:{stream_id}`**: the subscriber's key (held, else the
+/// **`delivery_ack:{stream_id}`**: the subscriber's key (held, else the
 /// retryable unknown signer), the receipt it states
 /// ([`delivery_receipt_of`]) through the receipt door's JOIN and
 /// equivocation steps (`put_delivery_receipt_edition2`), then the signed
@@ -1441,29 +1448,6 @@ where
     // the statement instead of losing it. (Their owner converts them.)
     dir.put_delivery_receipt_edition2(receipt).await?;
     put_attestation_row(dir, row, tier).await
-}
-
-/// **`cosign:{pending,signature}`**: the hold IS the counted row (CC 3.1.3,
-/// `cosign`'s module doc), so a cosign statement is kept beside the event
-/// it names (`refs.target`, held, else the retryable ordering gap) in
-/// `ceg_statements` only, never mapped into `federation_attestations`
-/// ([`StatementOutcome::Voice`]). The event's count is its own family's
-/// (`edition2::group`, `cosign::edition2_voices`).
-async fn put_cosign<F>(dir: &F, row: &AdmittedRow) -> Result<StatementOutcome, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let Some(target) = single(&row.names, TARGET_ROLE) else {
-        return Err(invalid(format!(
-            "{COSIGN_PREFIX}: a cosign statement names the event it cosigns by `refs.target`"
-        )));
-    };
-    require_held(dir, row, &target).await?;
-    let new = dir.put_edition2_statement(row).await?;
-    Ok(StatementOutcome::Voice {
-        row_id: row.row_id,
-        new,
-    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1556,7 +1540,7 @@ where
         crate::federation::replication::admission::WriteOrigin::Wire,
     ))
     .await?;
-    let edge = if COMPOSER_ROW_TYPES.contains(&row.row_type.as_str()) {
+    let edge = if super::emit::names_a_target(&row.row_type) {
         match single(&row.names, TARGET_ROLE) {
             Some(t) => dir.get_attestation(&t.hex()).await?,
             None => None,
@@ -1900,6 +1884,42 @@ pub fn takedown_payload(
     Ok(det_map(m))
 }
 
+/// LEAD-root2 (CC 2.4.1.1 "A purge is a tombstone"; CC 3.1.1's
+/// `takedown_notice` row; CC 3.2 T5) — **the payload of a STEWARD PURGE
+/// notice**: a row COUNTED over the holders of the bundle `head` (its
+/// `refs.head`), with no `author` and no `claimant` (a counted row has no one
+/// issuer; its `sub` is the lineage's name). Every other member is
+/// [`takedown_payload`]'s.
+///
+/// # Errors
+/// As [`takedown_payload`].
+pub fn steward_purge_payload(
+    head: &ciris_verify_core::edition2::Digest32,
+    content_sha256: &[u8; 32],
+    content_holders: &[String],
+    notice: &NoticeText,
+    expires_at_ms: u64,
+    asserted_at_ms: u64,
+) -> Result<Value, Error> {
+    let basis = crate::federation::steward_purge::STEWARD_PURGE_BASIS;
+    Ok(det_map(vec![
+        ("asserted_at", Value::Uint(asserted_at_ms)),
+        ("dimension", text(&format!("takedown_notice:{basis}:v1"))),
+        ("legal_basis", text(basis)),
+        ("content_sha256", hash_digest_value(content_sha256)),
+        ("content_holders", identity_set(content_holders)),
+        ("claim_text", text(&notice.claim_text)),
+        ("good_faith_statement", text(&notice.good_faith_statement)),
+        ("jurisdiction", text(&notice.jurisdiction)),
+        ("expires_at", Value::Uint(expires_at_ms)),
+        ("score", fixed6(-1_000_000)),
+        (
+            "refs",
+            det_map(vec![("head", ciris_verify_core::edition2::row_ref(head))]),
+        ),
+    ]))
+}
+
 /// The CC 2.1 cohort-target member a scope names its group by:
 /// `community_id` at a room, `family_id` at a family, none otherwise.
 fn cohort_target_member(scope: &str) -> Option<&'static str> {
@@ -2033,7 +2053,7 @@ pub fn key_grant_payload(
     Ok(det_map(m))
 }
 
-/// The payload of a `delivery_receipt:{stream_id}` row by `subscriber`.
+/// The payload of a `delivery_ack:{stream_id}` row by `subscriber`.
 #[must_use]
 pub fn delivery_receipt_payload(
     subscriber: &str,
@@ -2056,23 +2076,6 @@ pub fn delivery_receipt_payload(
         ("epoch", Value::Uint(epoch)),
         ("k", Value::Uint(k)),
         ("chunk_root", hash_digest_value(chunk_root)),
-    ])
-}
-
-/// The payload of a `cosign:{state}` statement naming the event it cosigns.
-///
-/// v62.0.0 (T2-fix5) — `cosign:{state}` is an AUTHORED family (Verify's
-/// family model, `family_authorship.json`; CC 3.1.3's per-leaf rule:
-/// `pending` is the event's primary signer, `signature` the member whose
-/// signature it carries), so the payload carries `author`: the statement's
-/// signer (`iss`). Without it the door refuses `author_column`.
-#[must_use]
-pub fn cosign_payload(author: &str, state: &str, event: &RowId, asserted_at_ms: u64) -> Value {
-    det_map(vec![
-        ("asserted_at", Value::Uint(asserted_at_ms)),
-        ("author", text(author)),
-        ("dimension", text(&format!("cosign:{state}:v1"))),
-        ("refs", refs_naming(TARGET_ROLE, event)),
     ])
 }
 

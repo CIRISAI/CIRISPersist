@@ -196,6 +196,16 @@ impl PeerKeyRecord {
     }
 }
 
+/// CC 3.2 T4a — the attach-time token for a root's head short of its quorum,
+/// as produced from CC v1.0-rc22-pre4 on (PRE4-token).
+pub const TRUST_ROOT_HEAD_UNRECEIPTED: &str = "trust_root_head_unreceipted";
+
+/// The same reason's earlier spelling (before CC v1.0-rc22-pre4). Kept: no
+/// longer produced, still read as [`NotRootedReason::HeadUnreceipted`]
+/// (PRE4-token: a token list is append-only; nothing refuses the earlier
+/// spelling).
+pub const TRUST_ROOT_HEAD_UNWITNESSED: &str = "trust_root_head_unwitnessed";
+
 /// Why a peer is not Rooted for this reader. Each variant serializes with its
 /// [`Self::as_str`] token under `"token"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,10 +263,18 @@ pub enum NotRootedReason {
     #[serde(rename = "key_invalid")]
     Invalid,
     /// Attach time only ([`attach_reading`], never [`peer_rooting`]): the
-    /// root's head carries fewer than its witness quorum of counted
-    /// cosignatures (CC 3.2 T4a `trust_root_head_unwitnessed`).
-    #[serde(rename = "trust_root_head_unwitnessed")]
-    HeadDewitnessed {
+    /// root's head carries fewer than its quorum (CC 3.2 T4a
+    /// [`TRUST_ROOT_HEAD_UNRECEIPTED`]).
+    ///
+    /// v62.0.0 (PRE4-token; CC v1.0-rc22-pre4) — the token is APPENDED:
+    /// [`TRUST_ROOT_HEAD_UNRECEIPTED`] is the one produced;
+    /// [`TRUST_ROOT_HEAD_UNWITNESSED`] is no longer produced and is still
+    /// read into this same reason (nothing refuses the earlier spelling).
+    #[serde(
+        rename = "trust_root_head_unreceipted",
+        alias = "trust_root_head_unwitnessed"
+    )]
+    HeadUnreceipted {
         /// The root.
         root: String,
     },
@@ -290,7 +308,7 @@ impl NotRootedReason {
             Self::PubkeyMismatch => "pubkey_mismatch",
             Self::Revoked => "key_revoked",
             Self::Invalid => "key_invalid",
-            Self::HeadDewitnessed { .. } => "trust_root_head_unwitnessed",
+            Self::HeadUnreceipted { .. } => TRUST_ROOT_HEAD_UNRECEIPTED,
             Self::HeadStale { .. } => "trust_root_head_stale",
             Self::LineageFrozen { .. } => "lineage_equivocation",
         }
@@ -807,8 +825,7 @@ pub async fn peer_rooting<F: FederationDirectory + ?Sized>(
 ///
 /// The freshness rule is the acceptance edge's own write gate
 /// ([`canonical_community::check_attach_freshness`], the head the edge would
-/// name: the witnessed head, or the held head in witnessed mode off); the
-/// freeze is the witness fold's equivocation.
+/// name: the held head).
 ///
 /// # Errors
 ///
@@ -820,26 +837,15 @@ pub async fn attach_reading<F: FederationDirectory + ?Sized>(
     at_ms: u64,
 ) -> Result<Option<NotRootedReason>, Error> {
     let t = instant(at_ms)?;
-    let Some(view) = canonical_community::root_witness_view(dir, root, t).await? else {
+    let Some(view) = canonical_community::root_head_view(dir, root, t).await? else {
         return Ok(None);
     };
-    if view
-        .community
-        .as_ref()
-        .is_some_and(|c| c.equivocation.is_some())
-    {
-        return Ok(Some(NotRootedReason::LineageFrozen {
-            root: root.to_owned(),
-        }));
-    }
-    let witnessed_mode_on = crate::federation::lineage_witness::witnessed_mode_on(view.quorum);
-    let head = if witnessed_mode_on {
-        view.witnessed_head.as_ref()
-    } else {
-        view.held_head.as_ref()
-    };
-    let Some((head, _)) = head else {
-        return Ok(Some(NotRootedReason::HeadDewitnessed {
+    // v62.0.0 (PRE4-witness; CC v1.0-rc22-pre4 3.2 T6) — witnessed mode is
+    // gone: the head an attach names is the held one. `HeadUnreceipted` and
+    // `LineageFrozen` are no longer produced here (their tokens stay: the
+    // receipts plane, not built in v62.0, is where they return).
+    let Some((head, _)) = view.held_head.as_ref() else {
+        return Ok(Some(NotRootedReason::HeadStale {
             root: root.to_owned(),
         }));
     };
@@ -1080,5 +1086,28 @@ mod tests {
             Err(NotACompositeKey),
             "I2215: three bytes are no composite key"
         );
+    }
+
+    /// I6400 (PRE4-token; CC v1.0-rc22-pre4) — the head-short-of-quorum
+    /// reason serializes the appended token, and the earlier spelling still
+    /// reads into the same reason: nothing refuses it.
+    #[test]
+    fn i6400_head_unreceipted_is_produced_and_the_earlier_spelling_still_reads() {
+        let r = NotRootedReason::HeadUnreceipted {
+            root: "r".to_owned(),
+        };
+        assert_eq!(r.as_str(), TRUST_ROOT_HEAD_UNRECEIPTED);
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "token": "trust_root_head_unreceipted", "root": "r" }),
+            "I6400 the produced token is the appended one"
+        );
+        for token in [TRUST_ROOT_HEAD_UNRECEIPTED, TRUST_ROOT_HEAD_UNWITNESSED] {
+            let read: NotRootedReason =
+                serde_json::from_value(serde_json::json!({ "token": token, "root": "r" }))
+                    .unwrap_or_else(|e| panic!("I6400 {token} must still read: {e}"));
+            assert_eq!(read, r, "I6400 {token} reads as the same reason");
+        }
     }
 }

@@ -45,8 +45,8 @@ use ciris_verify_core::namespace_match;
 
 use super::door::{admit_row, AdmittedRow};
 use super::ingest::{
-    attestation_of, StatementOutcome, COMPOSER_ROW_TYPES, INGEST_TIER, INSTANT_MEMBERS,
-    REFERENCES_MEMBER, SCALED_MEMBERS, STATEMENT_MEMBER,
+    attestation_of, StatementOutcome, INGEST_TIER, INSTANT_MEMBERS, REFERENCES_MEMBER,
+    SCALED_MEMBERS, STATEMENT_MEMBER,
 };
 use super::liveness::{statement_parts, HeldKeys};
 use super::names::RowId;
@@ -236,7 +236,7 @@ fn remember_row(statement: &[u8], literal_id: &str, family: &str, row_type: &str
         let mut aliases = row_aliases().lock().expect("alias map");
         if !is_hex64(literal_id) {
             aliases.insert(literal_id.to_owned(), hex);
-        } else if !COMPOSER_ROW_TYPES.contains(&row_type) {
+        } else if !super::emit::names_a_target(row_type) {
             let earlier = literal_id.to_ascii_lowercase();
             if earlier != hex {
                 for v in aliases.values_mut() {
@@ -255,7 +255,11 @@ fn remember_row(statement: &[u8], literal_id: &str, family: &str, row_type: &str
 #[must_use]
 pub fn resolve_target(name: &str) -> Option<String> {
     if is_hex64(name) {
-        return Some(name.to_ascii_lowercase());
+        // v62.0.0 (HEAD-2) — a sealed row re-signed with its head is held
+        // under the re-signed id ([`with_head_resolved`]).
+        let id = name.to_ascii_lowercase();
+        let moved = reheaded().lock().expect("rehead map").get(&id).cloned();
+        return Some(moved.unwrap_or(id));
     }
     row_aliases().lock().expect("alias map").get(name).cloned()
 }
@@ -320,9 +324,26 @@ pub fn signing_key(seed: &str) -> CompositeSigningKey {
 
 /// The identity-ref of [`signing_key`]`(seed)`: what persist stores and
 /// compares as an edition-2 key id. An identity-ref is returned unchanged.
+///
+/// v62.0.0 (GID-fixtures) — **or a founded room's DERIVED id.** A name a
+/// fixture FOUNDED a group under (a seed, or the identity-ref a test computed
+/// from one) answers that group's derived id ([`founded_group_id`]); a
+/// group-ref is returned unchanged. The name → id map is **per test
+/// process** and is written ONLY by the founding helpers
+/// (`group_fixtures::roster_voices` / `fixture_switch::roster_statement` at
+/// version 1, through [`note_founded_group`]).
+///
+/// **The trap:** `kid(name)` called BEFORE the room is founded returns the
+/// KEY thumbprint of `name`, and a value kept from that call stays the key
+/// (it is a plain `String`; nothing re-reads it). Where a test means the
+/// ROOM, call [`room_id`] after founding: it panics instead of answering a
+/// key. `kid` stays for the bulk of the sites, which ask after founding.
 #[must_use]
 pub fn kid(seed: &str) -> String {
-    if is_identity_ref(seed) {
+    if let Some(g) = founded_group_id(seed) {
+        return g;
+    }
+    if is_identity_ref(seed) || super::group_id::is_group_ref(seed) {
         return seed.to_owned();
     }
     // Cached: a kid is asked for far more often than a key signs, and an
@@ -331,13 +352,193 @@ pub fn kid(seed: &str) -> String {
     let kids = KIDS.get_or_init(Default::default);
     let cached = kids.lock().expect("kid cache").get(seed).cloned();
     if let Some(k) = cached {
-        return k;
+        // The cache holds the KEY thumbprint; a room founded under that
+        // identity-ref since it was cached answers its derived id.
+        return founded_group_id(&k).unwrap_or(k);
     }
     let k = identity_ref(&thumbprint(signing_key(seed).public_key()));
     kids.lock()
         .expect("kid cache")
         .insert(seed.to_owned(), k.clone());
-    k
+    founded_group_id(&k).unwrap_or(k)
+}
+
+// ── v62.0.0 (GID-fixtures) — the derived group id, for fixtures ───────────
+//
+// A group's id is derived from its first version (`edition2::group_id`), so a
+// fixture cannot choose it. A fixture still NAMES its room (a seed, or the
+// identity-ref it computed from one); the codec founds the room under the
+// derived id and records the name here, so every later `kid(name)` /
+// `kid_or_keep(name)` answers the derived id. The id's two fixture-chosen
+// inputs are functions of the NAME, never of the wall clock: the nonce
+// (`fixture_group_nonce`) and `founded_at` (`fixture_founded_at_ms`), so
+// founding the same record on a second node derives the same id.
+
+/// One founded room: its derived id, nonce and `founded_at` (ms).
+type FoundedGroup = (String, [u8; 32], u64);
+
+fn founded_groups() -> &'static Mutex<HashMap<String, FoundedGroup>> {
+    static G: OnceLock<Mutex<HashMap<String, FoundedGroup>>> = OnceLock::new();
+    G.get_or_init(Default::default)
+}
+
+/// v62.0.0 (GID-fixtures-mech.rev2) — how many days before the fixture day
+/// anchor every fixture room is founded.
+pub const FIXTURE_FOUNDING_BACK_DAYS: u64 = 2;
+
+/// v62.0.0 (GID-fixtures-mech.rev2) — **the base of every fixture room's
+/// `founded_at`**, FIXED once per test process: the day anchor the default
+/// node / agent key windows are cut from (today 00:00 UTC, the frame of
+/// [`NODE_DEFAULT_BACK_DAYS`]) less [`FIXTURE_FOUNDING_BACK_DAYS`], read
+/// ONCE and kept. `founded_at` is an input of the derived id, so a
+/// per-call wall-clock instant derived a different id on each node that
+/// founds "the same room"; this base is one value for every node and every
+/// call of the process.
+///
+/// Why not an absolute constant: the founding is read against the members'
+/// key windows (`membership_acceptance::node_seated_without_acceptance` at
+/// the record's `founded_at`, I4290), and a default node key lives
+/// [`NODE_DEFAULT_BACK_DAYS`] before today to 185 days after (the 365-day
+/// key maximum). A constant instant falls out of that window as the
+/// calendar moves: coverage that decays on a date. Swapping this body for a
+/// constant is the one line to change if that is ruled.
+///
+/// RULED (lead, 11-22): this per-process pinned base stands, never an
+/// absolute constant. Three conditions:
+///
+/// 1. **Read ONCE per process, and the only clock read for a fixture's
+///    `founded_at`.** No fixture reads the clock for `founded_at` anywhere
+///    else: the codec REPLACES whatever `founded_at` a fixture's record
+///    carries (`group_fixtures::fixture_founding`,
+///    [`roster_statement`]) before the id is derived. A first version
+///    built outside the codec reads no clock for it either: I5717/I5718
+///    take this base, and the hand-built ones (`group_serve`,
+///    `group_invariants`, `gc5_fold`, `group_codec`, `verdict` invariants)
+///    use fixed instants until the compile loop moves them onto the codec.
+///    I5719 witnesses the property.
+/// 2. **No test pins a derived FIXTURE group id as a literal**: it changes
+///    daily. The only literal group ids are CIRISConstitution's two known
+///    answers (`group_id::tests::the_known_group_ids`), which use their own
+///    fixed `founded_at` through the production
+///    [`derive_group_id`](super::group_id::derive_group_id), not this base.
+/// 3. **Nothing that crosses processes may assume two processes derive the
+///    same fixture id** (the Python suite's engines, `tests/` binaries, a
+///    shared store file, a baked fixture): two processes started on two
+///    days derive two ids. Such sites are listed as `needs judgement` in
+///    the GID-fixtures worklist.
+#[must_use]
+pub fn fixture_founding_base_ms() -> u64 {
+    static BASE: OnceLock<u64> = OnceLock::new();
+    *BASE.get_or_init(|| {
+        let now = ms(crate::host::clock::now());
+        (now / DAY_MS * DAY_MS).saturating_sub(FIXTURE_FOUNDING_BACK_DAYS * DAY_MS)
+    })
+}
+
+/// The derived id of the group a fixture founded under the name `alias`
+/// (`None` before its founding).
+#[must_use]
+pub fn founded_group_id(alias: &str) -> Option<String> {
+    founded_groups()
+        .lock()
+        .expect("founded groups")
+        .get(alias)
+        .map(|(g, _, _)| g.clone())
+}
+
+/// v62.0.0 (GID-fixtures) — **the derived id of the room a fixture founded
+/// under `name`** (a seed, its identity-ref, or the derived id itself).
+/// Unlike [`kid`], never a key: it PANICS when no room was founded under
+/// `name` in this test process (the map [`note_founded_group`] writes), so
+/// an id asked for before its founding fails where it is asked, not at a
+/// later lookup that finds nothing.
+///
+/// # Panics
+/// When `name` (or, for a seed, its identity-ref) names no room founded in
+/// this process.
+#[must_use]
+#[track_caller]
+pub fn room_id(name: &str) -> String {
+    if let Some(g) = founded_group_id(name) {
+        return g;
+    }
+    if !is_identity_ref(name) && !super::group_id::is_group_ref(name) {
+        if let Some(g) = founded_group_id(&kid(name)) {
+            return g;
+        }
+    }
+    panic!(
+        "fixture_switch::room_id: no room was founded under {name:?} in this process \
+         (found it first; kid() before founding answers a KEY, not the room)"
+    )
+}
+
+/// The founding nonce a fixture uses for the room named `alias`: the one it
+/// was founded under, or SHA-256 of a fixed label and the name.
+#[must_use]
+pub fn fixture_group_nonce(alias: &str) -> [u8; 32] {
+    use sha2::Digest as _;
+    if let Some((_, n, _)) = founded_groups().lock().expect("founded groups").get(alias) {
+        return *n;
+    }
+    let mut h = sha2::Sha256::new();
+    h.update(b"CIRISPersist fixture group nonce/1\0");
+    h.update(alias.as_bytes());
+    h.finalize().into()
+}
+
+/// v62.0.0 (GID-fixtures-mech.rev2) — **the `founded_at` (ms) a fixture
+/// founds the room named `alias` at**: the one it was founded at, else
+/// [`fixture_founding_base_ms`] plus an offset under one day from SHA-256 of
+/// a fixed label and the name. Never a per-call wall-clock instant, and
+/// never the instant a test passes for the founding (that is the row's `asserted_at`, the test's
+/// clock seam, which a freshness window reads; the id does not).
+#[must_use]
+pub fn fixture_founded_at_ms(alias: &str) -> u64 {
+    use sha2::Digest as _;
+    if let Some((_, _, at)) = founded_groups().lock().expect("founded groups").get(alias) {
+        return *at;
+    }
+    let mut h = sha2::Sha256::new();
+    h.update(b"CIRISPersist fixture group founded_at/1\0");
+    h.update(alias.as_bytes());
+    let d: [u8; 32] = h.finalize().into();
+    fixture_founding_base_ms() + u64::from(u32::from_be_bytes([d[0], d[1], d[2], d[3]])) % DAY_MS
+}
+
+/// [`fixture_founded_at_ms`] as an instant.
+///
+/// # Panics
+/// Never for a fixture instant (it is in range).
+#[must_use]
+pub fn fixture_founded_at(alias: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+        i64::try_from(fixture_founded_at_ms(alias)).expect("fixture instant"),
+    )
+    .expect("fixture instant")
+}
+
+/// Record that the room named by each of `aliases` was founded as `group_id`
+/// under `nonce` at `founded_at_ms` (the derived id is an alias of itself).
+pub fn note_founded_group(aliases: &[&str], group_id: &str, nonce: [u8; 32], founded_at_ms: u64) {
+    let mut g = founded_groups().lock().expect("founded groups");
+    for a in aliases.iter().copied().chain(std::iter::once(group_id)) {
+        g.insert(a.to_owned(), (group_id.to_owned(), nonce, founded_at_ms));
+    }
+}
+
+/// v62.0.0 (GID-fixtures-mech.rev2.fix2) — **the identity-ref of
+/// [`signing_key`]`(seed)`, ALWAYS the key**: unlike [`kid`], never the
+/// derived id of a room a fixture founded under that identity-ref. For a
+/// fixture whose seed names both a key it registers and a room it founds
+/// (the earlier "a group signs with its own key" shape), the KEY is spelled
+/// `key_id(seed)` and the ROOM [`room_id`].
+#[must_use]
+pub fn key_id(seed: &str) -> String {
+    if is_identity_ref(seed) {
+        return seed.to_owned();
+    }
+    identity_ref(&thumbprint(signing_key(seed).public_key()))
 }
 
 /// The thumbprint (the COSE `kid`) of [`signing_key`]`(seed)`.
@@ -781,7 +982,7 @@ fn try_family_of(row: &Attestation) -> Result<String, String> {
         };
     }
     let ty = row.attestation_type.as_str();
-    if COMPOSER_ROW_TYPES.contains(&ty) {
+    if super::emit::names_a_target(ty) {
         let target = env
             .get(REFERENCES_MEMBER)
             .and_then(serde_json::Value::as_str)
@@ -859,7 +1060,7 @@ fn payload_of(row: &Attestation, family: &str, signer_iref: &str) -> Value {
     o.remove("asserted_at");
     o.remove("expires_at");
     let has_refs = o.contains_key("refs");
-    let composer = COMPOSER_ROW_TYPES.contains(&row.attestation_type.as_str());
+    let composer = super::emit::names_a_target(&row.attestation_type);
     let target = o.remove(REFERENCES_MEMBER).filter(|t| {
         // v62.0.0 (E0 fix 8) — an earlier-form SELF-reference (a trust
         // charter's, a delegation's: `references_attestation_id` = the row's
@@ -907,6 +1108,12 @@ fn payload_of(row: &Attestation, family: &str, signer_iref: &str) -> Value {
         }
     } else {
         for (role, member, _) in payloads::ref_members(family) {
+            // v62.0.0 (KR-fix32) — a composer's `references_attestation_id`
+            // is its target (`refs.target` below), never the `answers` a
+            // reply of its family states it as.
+            if member == REFERENCES_MEMBER && composer {
+                continue;
+            }
             let taken = if member == REFERENCES_MEMBER {
                 target.take()
             } else {
@@ -1077,7 +1284,7 @@ fn payload_of(row: &Attestation, family: &str, signer_iref: &str) -> Value {
 /// and the common ones (`payloads::check`). `None` when the list is open (a
 /// family with no list; one whose payload is the event's).
 fn closed_members(family: &str, row_type: &str) -> Option<Vec<&'static str>> {
-    if COMPOSER_ROW_TYPES.contains(&row_type) {
+    if super::emit::names_a_target(row_type) {
         return Some(payloads::COMMON.to_vec());
     }
     let f = payloads::family_by_id(family)?;
@@ -1212,7 +1419,7 @@ pub fn counted_row_of(a: &Attestation, seed: &str) -> Attestation {
 /// unsealed until its target is set.
 #[must_use]
 pub fn is_untargeted_composer(row: &Attestation) -> bool {
-    if !COMPOSER_ROW_TYPES.contains(&row.attestation_type.as_str()) {
+    if !super::emit::names_a_target(&row.attestation_type) {
         return false;
     }
     let env = &row.attestation_envelope;
@@ -1501,7 +1708,7 @@ pub fn composer_of_at(
     at: chrono::DateTime<chrono::Utc>,
 ) -> Attestation {
     assert!(
-        COMPOSER_ROW_TYPES.contains(&kind),
+        super::emit::names_a_target(kind),
         "fixture_switch: {kind} is not a composer"
     );
     let family = carried_statement(target)
@@ -2156,6 +2363,11 @@ pub struct RosterMember<'a> {
 
 /// A `group:roster` row (counted: no author), as `signer_seed`'s voice.
 /// Each further member's voice is [`voice_of`].
+///
+/// v62.0.0 (GID-fixtures-mech.rev2) — `asserted_at_ms` is the row's
+/// `asserted_at` only. Its `founded_at` is the room's fixture instant
+/// ([`fixture_founded_at_ms`] of `group_seed`), never the instant passed in:
+/// it is an input of the derived id.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn roster_statement(
@@ -2165,11 +2377,12 @@ pub fn roster_statement(
     version: u64,
     members: &[RosterMember<'_>],
     consensus_protocol: &str,
-    founded_at_ms: u64,
+    asserted_at_ms: u64,
     prev: Option<Digest32>,
     signer_seed: &str,
 ) -> Vec<u8> {
     let group = kid(group_seed);
+    let founded_at_ms = fixture_founded_at_ms(group_seed);
     let mut ms_: Vec<Value> = members
         .iter()
         .map(|m| {
@@ -2186,7 +2399,7 @@ pub fn roster_statement(
     // Sorted by each entry's full encoding (P1's set rule), not by `key`.
     ms_.sort_by_key(cde::encode);
     let mut p = vec![
-        (text("asserted_at"), Value::Uint(founded_at_ms)),
+        (text("asserted_at"), Value::Uint(asserted_at_ms)),
         (text("group_kind"), text(group_kind)),
         (text("group"), text(&group)),
         (text("name"), text(name)),
@@ -2204,6 +2417,27 @@ pub fn roster_statement(
                 ciris_verify_core::edition2::row_ref(&d),
             )]),
         ));
+    }
+    // v62.0.0 (GID-fixtures) — a FIRST version is founded under its DERIVED
+    // id (the name's fixture nonce), and a roster "signed by the group's own
+    // key" (a fiction: a group has no key) is signed by its first member.
+    let mut group = group;
+    let mut signer_seed = signer_seed;
+    if version == 1 && prev.is_none() {
+        let founders: Vec<String> = members.iter().map(|m| kid(m.seed)).collect();
+        let refs: Vec<&str> = founders.iter().map(String::as_str).collect();
+        let nonce = fixture_group_nonce(group_seed);
+        let gid = super::group_id::derive_group_id(group_kind, &refs, founded_at_ms, &nonce);
+        note_founded_group(&[group_seed, &group], &gid, nonce, founded_at_ms);
+        p.push((text("nonce"), Value::Bytes(nonce.to_vec())));
+        p.retain(|(k, _)| k.as_text() != Some("group"));
+        p.push((text("group"), text(&gid)));
+        group = gid;
+    }
+    if kid(signer_seed) == group {
+        if let Some(first) = members.first() {
+            signer_seed = first.seed;
+        }
     }
     let key = signing_key(signer_seed);
     let iref = identity_ref(&thumbprint(key.public_key()));
@@ -2329,7 +2563,26 @@ pub async fn put_statement<D: FederationDirectory + ?Sized>(
     dir: &D,
     statement: &[u8],
 ) -> Result<StatementOutcome, Error> {
-    super::ingest::put_statement(dir, statement, None, INGEST_TIER).await
+    // v62.0.0 (HEAD-5; CC 2.4.1.1) — the fixtures' ONE head step
+    // ([`with_head_resolved`]): an author's act states the head the producer
+    // would have stated, before the door.
+    let statement = with_head_resolved(dir, statement, None).await?;
+    super::ingest::put_statement(dir, &statement, None, INGEST_TIER).await
+}
+
+/// v62.0.0 (HEAD-5) — [`put_statement`] for a statement signed by a key
+/// the fixture seeds do not name (`door_invariants::fixture::key`): the head
+/// step re-signs with `key` when it states a head.
+///
+/// # Errors
+/// The door's and the gates' refusals.
+pub async fn put_statement_by<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    statement: &[u8],
+    key: &CompositeSigningKey,
+) -> Result<StatementOutcome, Error> {
+    let statement = with_head_resolved(dir, statement, Some(key)).await?;
+    super::ingest::put_statement(dir, &statement, None, INGEST_TIER).await
 }
 
 /// v62.0.0 (FX-fix2) — **put `statement` and assert it LANDED**: a key-plane
@@ -2340,6 +2593,12 @@ pub async fn put_statement<D: FederationDirectory + ?Sized>(
 /// # Panics
 /// The door refuses it, or it is held (or kept only as a voice).
 pub async fn put_landed(dir: &dyn FederationDirectory, statement: &[u8], what: &str) -> RowId {
+    // v62.0.0 (HEAD-5) — the id of the statement as it is put (its head
+    // stated, [`with_head_resolved`]).
+    let headed = with_head_resolved(dir, statement, None)
+        .await
+        .unwrap_or_else(|e| panic!("{what}: put_landed: the head read: {e}"));
+    let statement = headed.as_slice();
     let id = RowId::of_statement(statement)
         .unwrap_or_else(|| panic!("{what}: put_landed: not a row statement"));
     let out = put_statement(dir, statement)
@@ -2467,7 +2726,106 @@ pub async fn put_signed<D: FederationDirectory + ?Sized>(
         )
     });
     check_default_window(&st);
+    // v62.0.0 (HEAD-2; CC 2.4.1.1) — the head the act is at, stated as the
+    // producer states it, before the put (`with_head_resolved`).
+    let st = with_head_resolved(dir, &st, None).await?;
     super::ingest::put_statement(dir, &st, None, tier_of(row)).await
+}
+
+/// v62.0.0 (HEAD-2) — sealed row id → the id of its re-signed twin that
+/// names its head ([`with_head_resolved`]): [`resolve_target`] follows it, so
+/// a fixture naming the row it sealed (a composer's target, `held_row_id`)
+/// names the row the door holds.
+fn reheaded() -> &'static Mutex<HashMap<String, String>> {
+    static REHEADED: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    REHEADED.get_or_init(Default::default)
+}
+
+/// v62.0.0 (HEAD-2; CC 2.4.1.1, "an act names its head") — **a sealed
+/// statement as the producer would have signed it**: when the head rule
+/// (`head_rule::state_head`, over this directory) states a head the statement
+/// lacks, the statement is re-signed by its own fixture key with that head
+/// joined into `refs`, and the sealed id is re-pointed to the new one
+/// ([`reheaded`], [`remember_row`]). A statement that needs no head, already
+/// names one, is COUNTED (its further voices are signed over the sealed
+/// payload), or whose signer no fixture seed names (a key a test built by
+/// hand) is returned as it is: the door then judges it.
+///
+/// The seal itself (`tier_ingest::test_support::seal_row_in_place`,
+/// [`seal`]) is synchronous and holds no directory, so it cannot read a head;
+/// this async put is where the fixture path first meets one.
+///
+/// # Errors
+/// The head rule's directory reads.
+pub async fn with_head_resolved<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    statement: &[u8],
+    key: Option<&CompositeSigningKey>,
+) -> Result<Vec<u8>, Error> {
+    let Some((protected, payload)) = statement_parts(statement) else {
+        return Ok(statement.to_vec());
+    };
+    let text_at = |label: i64| {
+        protected
+            .get_int(label)
+            .and_then(Value::as_text)
+            .map(str::to_owned)
+    };
+    let (Some(row_type), Some(family), Some(iss)) =
+        (text_at(-70001), text_at(-70002), statement_iss(statement))
+    else {
+        return Ok(statement.to_vec());
+    };
+    let Some(sub) = protected
+        .get_int(15)
+        .and_then(|c| c.get_int(2))
+        .and_then(Value::as_text)
+        .map(str::to_owned)
+    else {
+        return Ok(statement.to_vec());
+    };
+    // A COUNTED statement (no `author`) is left as sealed: its further voices
+    // are signed over the sealed payload (`voice_of`, `land_owner_binding`),
+    // and re-signing only this one would split the row.
+    if payload.get_text("author").is_none() {
+        return Ok(statement.to_vec());
+    }
+    // v62.0.0 (HEAD-5) — only the AUTHOR's own statement is re-signed: a
+    // second signer's voice over an authored row signs the author's payload.
+    if payload.get_text("author").and_then(Value::as_text) != Some(iss.as_str()) {
+        return Ok(statement.to_vec());
+    }
+    let stated =
+        super::head_rule::state_head(dir, &row_type, &family, &iss, payload.clone()).await?;
+    if stated == payload {
+        return Ok(statement.to_vec());
+    }
+    // v62.0.0 (HEAD-5) — the signer's key: the one the caller passes (a
+    // hand-built key, `door_invariants::fixture::key`), checked to be
+    // `iss`'s, else the fixture seed `iss` was minted from.
+    let owned;
+    let key = match key {
+        Some(k) if identity_ref(&thumbprint(k.public_key())) == iss => k,
+        Some(_) => return Ok(statement.to_vec()),
+        None => {
+            let known = seeds().lock().expect("seed map").get(&iss).cloned();
+            let Some(seed) = known else {
+                return Ok(statement.to_vec());
+            };
+            owned = signing_key(&seed);
+            &owned
+        }
+    };
+    let st = sign_row_statement(key, &iss, &sub, &row_type, &family, &stated, vec![])
+        .expect("fixture_switch: re-sign a statement with its head");
+    if let (Some(old), Some(new)) = (RowId::of_statement(statement), RowId::of_statement(&st)) {
+        remember_row(&st, &old.hex(), &family, &row_type);
+        reheaded()
+            .lock()
+            .expect("rehead map")
+            .insert(old.hex(), new.hex());
+    }
+    Ok(st)
 }
 
 /// v62.0.0 (K2, red round 3; CC 3.2 *The first binding (MUST)*, C557; CC 2.7.5
@@ -2709,6 +3067,11 @@ pub async fn try_put_row<D: FederationDirectory + ?Sized>(
     seed: &str,
 ) -> Result<Attestation, Error> {
     let st = try_statement_of_door(a, seed)?;
+    // LEAD-head1 (CC 2.4.1.1) — as the producer would have signed it: the
+    // head the row acts at is stated before the door judges it
+    // ([`with_head_resolved`]). This path stated none, so every agent's or
+    // node's row put through it was refused `act_names_no_head`.
+    let st = with_head_resolved(dir, &st, Some(&signing_key(seed))).await?;
     check_default_window(&st);
     super::ingest::put_statement(dir, &st, None, tier_of(a)).await?;
     try_row_of_statement(&st, tier_of(a))
@@ -3100,7 +3463,7 @@ mod tests {
     /// the same statement, byte for byte.
     #[test]
     fn i2540_the_codec_round_trips() {
-        let dim = "evidence:safety_battery:capture:a:b:v1";
+        let dim = "coherence_standing:cab:v1";
         let a = literal(dim, "2026-01-02T03:04:05.678Z");
         let st = statement_of(&a, "e0-signer");
         let row = row_of(&a, "e0-signer");
@@ -3118,7 +3481,7 @@ mod tests {
         // Re-sealing under the row's own (kid) signer is the same statement.
         let signer = row.attesting_key_id.clone();
         assert_eq!(statement_of(&row, &signer), st, "I2540: re-seal by kid");
-        assert_eq!(family_of(&a), "evidence:.suite:.kind:.cell:.prefix");
+        assert_eq!(family_of(&a), "coherence_standing:.cohort");
     }
 
     /// **I2543 (a composer carries its target's family)**: `composer_of`
@@ -3128,10 +3491,7 @@ mod tests {
     #[test]
     fn i2543_a_composer_names_its_target_and_family() {
         let target = row_of(
-            &literal(
-                "evidence:safety_battery:capture:a:b:v1",
-                "2026-01-02T03:04:05Z",
-            ),
+            &literal("coherence_standing:cab:v1", "2026-01-02T03:04:05Z"),
             "e0-signer",
         );
         let w = composer_of("withdraws", &target, "e0-signer");
@@ -3144,13 +3504,13 @@ mod tests {
         let (p, _) = statement_parts(&carried_statement(&w).unwrap()).unwrap();
         assert_eq!(
             p.get_int(-70002).and_then(Value::as_text),
-            Some("evidence:.suite:.kind:.cell:.prefix"),
+            Some("coherence_standing:.cohort"),
             "I2543: the target's family"
         );
         let mut lit = target.clone();
         lit.attestation_type = "withdraws".into();
         lit.attestation_envelope = serde_json::json!({ REFERENCES_MEMBER: rid(&target) });
-        assert_eq!(family_of(&lit), "evidence:.suite:.kind:.cell:.prefix");
+        assert_eq!(family_of(&lit), "coherence_standing:.cohort");
     }
 
     /// **I2544 (a further voice is a voice of the same row)**: a counted
@@ -3190,6 +3550,69 @@ mod tests {
         assert_eq!(
             super::super::door::raw_payload(&v),
             super::super::door::raw_payload(&st)
+        );
+    }
+
+    /// **I5719 (v62.0.0, GID-fixtures-mech.rev2; the derived id's fixture
+    /// inputs are functions of the NAME)**: one room record founded twice
+    /// with two different wall-clock `founded_at` values (as two nodes'
+    /// fixtures build it) derives ONE id, and its first version states the
+    /// name's fixture instant, not the record's; the row's `asserted_at`
+    /// (the test's clock seam) is kept.
+    #[test]
+    fn i5719_a_fixture_founding_derives_one_id_whatever_the_clock() {
+        use crate::federation::edition2::group::GroupRecord;
+        use crate::federation::edition2::group_fixtures::fixture_founding;
+        use crate::federation::types::{Community, CommunityMember};
+        let name = kid("i5719-room");
+        let record = |founded: chrono::DateTime<chrono::Utc>| {
+            GroupRecord::Community(Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                community_key_id: name.clone(),
+                community_name: "I5719".into(),
+                members: vec![CommunityMember {
+                    key_id: kid("i5719-founder"),
+                    joined_at: founded,
+                    role: Some("founder".into()),
+                }],
+                founded_at: founded,
+                consensus_protocol: "majority".into(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            })
+        };
+        let t0 = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_000).unwrap();
+        let t1 = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(9_000_000).unwrap();
+        let fixed = fixture_founded_at_ms(&name);
+        let (a, pa) = fixture_founding(&record(t0), 5_000);
+        let (b, pb) = fixture_founding(&record(t1), 6_000);
+        assert_eq!(
+            a, b,
+            "I5719: one name, one derived id, whatever founded_at the record carried"
+        );
+        assert!(
+            super::super::group_id::is_group_ref(&a),
+            "I5719: a group-ref"
+        );
+        for (p, asserted) in [(&pa, 5_000), (&pb, 6_000)] {
+            assert_eq!(
+                p.get_text("founded_at").and_then(Value::as_u64),
+                Some(fixed),
+                "I5719: the first version states the name's fixture instant"
+            );
+            assert_eq!(
+                p.get_text("asserted_at").and_then(Value::as_u64),
+                Some(asserted),
+                "I5719: the row's own instant is kept"
+            );
+        }
+        assert_eq!(founded_group_id(&name).as_deref(), Some(a.as_str()));
+        assert_eq!(room_id(&name), a, "I5719: room_id answers the founded room");
+        assert_eq!(
+            fixture_founded_at_ms(&a),
+            fixed,
+            "I5719: the derived id keeps the instant"
         );
     }
 
@@ -3251,10 +3674,7 @@ mod tests {
     fn i2549_a_default_key_outside_its_window_names_the_fix() {
         let seed = "e0-window-node";
         note_window(seed, default_window(&["node"]));
-        let mut a = literal(
-            "evidence:safety_battery:capture:a:b:v1",
-            "2020-01-01T00:00:00Z",
-        );
+        let mut a = literal("coherence_standing:cab:v1", "2020-01-01T00:00:00Z");
         a.attested_key_id = seed.into();
         let st = statement_of(&a, seed);
         let msg = std::panic::catch_unwind(|| check_default_window(&st))
@@ -3306,10 +3726,7 @@ mod tests {
     /// (2.5 → 2_500_000), and an envelope `weight` wins over the column.
     #[test]
     fn i2552_the_weight_column_is_carried() {
-        let mut a = literal(
-            "evidence:safety_battery:capture:a:b:v1",
-            "2026-01-02T03:04:05Z",
-        );
+        let mut a = literal("coherence_standing:cab:v1", "2026-01-02T03:04:05Z");
         a.weight = Some(2.5);
         let (_, p) = statement_parts(&statement_of(&a, "e0-signer")).unwrap();
         assert_eq!(
@@ -3362,10 +3779,7 @@ mod tests {
     /// not list) ride `body`; a name no sealed row carries is no target.
     #[test]
     fn i2554_literal_ids_and_closed_payloads() {
-        let mut target = literal(
-            "evidence:safety_battery:capture:a:b:v1",
-            "2026-01-02T03:04:05Z",
-        );
+        let mut target = literal("coherence_standing:cab:v1", "2026-01-02T03:04:05Z");
         target.attestation_id = "i2554-target".into();
         let sealed = row_of(&target, "e0-signer");
         assert_eq!(
@@ -3386,7 +3800,7 @@ mod tests {
         let (p, payload) = statement_parts(&st).unwrap();
         assert_eq!(
             p.get_int(-70002).and_then(Value::as_text),
-            Some("evidence:.suite:.kind:.cell:.prefix"),
+            Some("coherence_standing:.cohort"),
             "I2554: the target's family"
         );
         let body = payload.get_text("body").expect("I2554: a body");
@@ -3415,10 +3829,7 @@ mod tests {
     #[test]
     fn i2546_seal_row_reads_the_switch() {
         use crate::federation::tier_ingest::test_support::seal_row;
-        let a = literal(
-            "evidence:safety_battery:capture:a:b:v1",
-            "2026-01-02T03:04:05Z",
-        );
+        let a = literal("coherence_standing:cab:v1", "2026-01-02T03:04:05Z");
         let on = seal_row("e0-signer", a.clone());
         assert_eq!(on.attesting_key_id, kid("e0-signer"));
         assert!(carried_statement(&on).is_some(), "I2546: edition 2");
@@ -3483,7 +3894,7 @@ mod store_tests {
             "attestation_type": "scores",
             "asserted_at": now,
             "attestation_envelope": {
-                "dimension": "evidence:safety_battery:capture:a:b:v1",
+                "dimension": "coherence_standing:cab:v1",
                 "score": 0.5,
                 "confidence": 0.5,
             },
@@ -3527,7 +3938,7 @@ mod store_tests {
             "attestation_type": "scores",
             "asserted_at": now,
             "attestation_envelope": {
-                "dimension": "evidence:safety_battery:capture:a:b:v1",
+                "dimension": "coherence_standing:cab:v1",
                 "score": 0.5,
                 "confidence": 0.5,
             },
@@ -3709,9 +4120,8 @@ pub use super::fixture_occurrence::{
 // v62.0.0 (wave T2) — the remaining typed planes' edition-2 twins
 // (`revocation_statement`, `occurrence_revocation_voice`,
 // `takedown_statement`, `custody_statement`, `key_grant_statement`,
-// `delivery_receipt_statement`, `cosign_statement`), as `e2::..`.
+// `delivery_receipt_statement`; `retired_cosign_statement` since
+// PRE4-cosign), as `e2::..`.
 pub use super::typed_fixtures::*;
 // v62.0.0 (wave W1b) — a ROOTED edition-2 trust root (`W1.api.md`).
-pub use super::fixture_trust_root::{
-    rooted_trust_root, try_rooted_trust_root, try_rooted_trust_root_at_seed, RootedTrustRoot,
-};
+pub use super::fixture_trust_root::{rooted_trust_root, try_rooted_trust_root, RootedTrustRoot};

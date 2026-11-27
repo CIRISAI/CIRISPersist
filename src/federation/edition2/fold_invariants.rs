@@ -85,6 +85,9 @@ fn i3550_reason_tokens_and_read_keys_are_pinned() {
             "withdraws_not_admitted",
             "asserted_at_stale",
             "composer_family_mismatch",
+            // v62.0.0 (FS-class) — appended.
+            "withdraws_class_unread",
+            "genesis_bundle_receipts_unchecked",
         ],
         "I3550: the core reason tokens are appended, never reordered"
     );
@@ -427,6 +430,16 @@ pub(crate) async fn count_short_body(d: &dyn FederationDirectory) {
     let binding = owner_binding(owner, node);
     let o = e2::put_signed(d, &binding).await.expect("I3553: kept");
     assert!(pending(&o), "I3553: held: {o:?}");
+    // v62.0.0 (PRE4-cosign) — short of its count, the row holds its OWN
+    // voice (a statement of the event itself, under its row id): no cosign
+    // row is minted.
+    let held = e2::carried_statement(&binding).expect("I3553: statement");
+    let id = super::names::RowId::of_statement(&held).expect("I3553: row id");
+    assert_eq!(
+        d.edition2_voices(&id).await.unwrap().len(),
+        1,
+        "I3553: the owner's voice is kept under the event's own row id"
+    );
     assert_eq!(
         held_reason(d, &binding).await.as_deref(),
         Some(reason::COUNT_SHORT),
@@ -764,24 +777,23 @@ fn age_witness(witness: &str, subject: &str, band: &str, ago: chrono::Duration) 
 /// proves the person an adult (the minor-guardianship path no longer
 /// applies).
 pub(crate) async fn steward_conclude_unconclude_body(d: &dyn FederationDirectory) {
-    use super::fixture_trust_root::{confers_statement, rooted_trust_root};
+    use super::fixture_trust_root::{put_conferral, rooted_trust_root};
     let (guardian, person, witness) = ("g0-sw-g", "g0-sw-p", "g0-sw-w");
     let r = rooted_trust_root(d, &super::fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
     let _ = e2::put_key(d, guardian, &[identity_type::USER]).await;
     let _ = e2::put_key(d, person, &[identity_type::USER]).await;
     let witness_kid = e2::put_key(d, witness, &[identity_type::WITNESS]).await;
-    let grant = confers_statement(
+    // LEAD-root1 — the grant is COUNTED over the bundle's holders and
+    // accepted by the witness.
+    let _ = &witness_kid;
+    put_conferral(
+        d,
         &r,
-        &witness_kid,
+        witness,
         &[crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE],
-        e2::ms(crate::host::clock::now() - chrono::Duration::minutes(5)),
-    );
-    e2::put_statement(d, &grant)
-        .await
-        .expect("I3559: the root confers assurance");
-    e2::put_statement(d, &e2::voice_of(&grant, witness))
-        .await
-        .expect("I3559: the witness's own voice on the conferral");
+    )
+    .await
+    .expect("I3559: the root confers assurance");
     e2::put_signed(
         d,
         &age_witness(witness, guardian, "adult", chrono::Duration::minutes(4)),

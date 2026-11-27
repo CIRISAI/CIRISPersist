@@ -41,8 +41,9 @@
 //! declares is already enforced** — `accord:*` (accord_holder), the four
 //! `substrate-self-report` families (`audit_chain:` / `corpus_health:` /
 //! `identity_continuity:` / `federation_directory:` → substrate_persist),
-//! `hard_case:{kind}` (substrate_persist), `capacity_assurance:*` and
-//! `transparency_log:cosigned:*` (witness), and all six
+//! `hard_case:{kind}` (substrate_persist), `capacity_assurance:*`
+//! (witness; `transparency_log:cosigned:*` was retired by CC
+//! v1.0-rc22-pre4, PRE4-retire), and all six
 //! `detection:*` leaves (lenscore_detector) — see
 //! [`tests::manifest_reserved_invariants_match_persist_admission`] for the
 //! executed proof. **That witness is this cut's primary value**: no new
@@ -433,12 +434,6 @@ mod tests {
             manifest_marker: identity_type::SUBSTRATE_PERSIST,
         },
         ReservedFact {
-            family: "transparency_log:cosigned:{tree_size}",
-            sample_attestation_type: "transparency_log:cosigned:100",
-            required_identity_type: identity_type::WITNESS,
-            manifest_marker: identity_type::WITNESS,
-        },
-        ReservedFact {
             family: "capacity_assurance:*",
             // v50.0.0 (CIRISPersist#924): the registry row's arity
             // (`capacity_assurance:{level}:{domain}:{band}:{version}`). The old
@@ -665,41 +660,9 @@ mod tests {
         }
     }
 
-    /// The "vice versa" direction on a concrete, manifest-named case: the
-    /// manifest explicitly says `transparency_log:inclusion` is NOT
-    /// witness-reserved ("admission MUST NOT require witness in
-    /// identity_type for inclusion/consistency; that gate applies solely to
-    /// cosigned:*"). Confirms persist agrees — an ordinary `agent` key's
-    /// `transparency_log:inclusion` attestation must NOT be rejected for
-    /// identity reasons (an over-restrictive persist rule here would be
-    /// drift the other direction: code more restrictive than the governance
-    /// record permits).
-    #[tokio::test]
-    async fn transparency_log_inclusion_is_not_witness_reserved() {
-        use crate::federation::admission::check_reserved_prefix_admission;
-        let invs = invariants_for("transparency_log:inclusion");
-        assert!(
-            invs.iter()
-                .any(|i| i.primitive_constraint.contains("MUST NOT require witness")),
-            "manifest text for transparency_log:inclusion changed — re-verify this witness"
-        );
-
-        let backend = crate::store::test_backend::test_backend();
-        register(&backend, "tli-agent", identity_type::AGENT).await;
-        register(&backend, "tli-target", identity_type::AGENT).await;
-        let row = fix_attestation(
-            "tli-att",
-            "transparency_log:inclusion",
-            "tli-agent",
-            "tli-target",
-        );
-        check_reserved_prefix_admission(&backend, &row)
-            .await
-            .expect(
-                "transparency_log:inclusion must NOT be identity-reserved — \
-                 the manifest is explicit that only cosigned:* is",
-            );
-    }
+    // v62.0.0 (PRE4-retire) — `transparency_log_inclusion_is_not_witness_reserved`
+    // is deleted: CC v1.0-rc22-pre4 retired `transparency_log:inclusion`, and
+    // a row of it is refused by name at the door (I6402).
 
     // ── §2 the one newly-enforced invariant ──────────────────────────────
 

@@ -529,7 +529,7 @@ pub(crate) mod bodies {
             .unwrap();
         l.ba.put_stream_sth(sth.clone(), &l.node_a).await.unwrap();
         // v62.0.0 (T2-fix9; F0-cp5 open item c) — B's receipt is its
-        // edition-2 `delivery_receipt:{stream_id}` statement, signed by B's
+        // edition-2 `delivery_ack:{stream_id}` statement, signed by B's
         // seed (the ladder's node B key), through A's statement door: the
         // earlier hybrid receipt drove the door F0-cp2 shut. The subject
         // (the stored instant and the two listings) is unchanged.

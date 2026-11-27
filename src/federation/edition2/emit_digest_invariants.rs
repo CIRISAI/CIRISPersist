@@ -55,7 +55,7 @@ fn is_digest(v: Option<&Value>, n: u8) -> bool {
 fn i2925_the_emit_side_states_every_family_digest() {
     for (pattern, member) in [
         ("takedown_notice:{basis}", "content_sha256"),
-        ("delivery_receipt:{stream_id}", "chunk_root"),
+        ("delivery_ack:{stream_id}", "chunk_root"),
         ("key_grant:{axis}", "at_rest_sha256"),
         ("admission:unit", "unit"),
         ("identity:occurrence", "build_manifest_hash"),
@@ -97,9 +97,9 @@ fn i2925_a_family_digest_round_trips_through_the_door() {
     let k = key(220);
     let mut keys = HeldKeys::new();
     keys.insert_record(key_record(&k, &["user"], 0, None));
-    let family = family_id("delivery_receipt:{stream_id}");
+    let family = family_id("delivery_ack:{stream_id}");
     let env = serde_json::json!({
-        "dimension": "delivery_receipt:s-1:v1",
+        "dimension": "delivery_ack:s-1:v1",
         "stream_id": "s-1",
         "epoch": 2,
         "k": 17,
@@ -262,7 +262,7 @@ fn i3994_the_emit_side_states_row_names_under_refs() {
 /// I4000: bodies take decimals; everything else still refuses floats.
 #[test]
 fn i4000_a_body_states_its_numbers_exactly() {
-    let fam = "evidence:.suite:.kind:.cell:.prefix";
+    let fam = "coherence_standing:.cohort";
     let n = |t: &str| -> serde_json::Value { serde_json::from_str(t).unwrap() };
     let env = serde_json::json!({
         "body": { "ratio": n("0.5"), "whole": n("2.0"), "big": n("1e2"), "list": [n("1.25")] },
@@ -320,7 +320,7 @@ fn i4000_a_body_states_its_numbers_exactly() {
     let mut keys = HeldKeys::new();
     keys.insert_record(key_record(&k, &["user"], 0, None));
     let env = serde_json::json!({
-        "dimension": "evidence:safety_battery:capture:a:b:v1",
+        "dimension": "coherence_standing:cab:v1",
         "score": n("0.75"),
         "body": { "ratio": n("1.25") },
     });

@@ -13,7 +13,7 @@
 //!   rows effective up to it is refused
 //!   ([`Error::LineageVersionDisagreesWithFold`], `kind()`
 //!   `federation_lineage_version_disagrees_with_roster_fold`);
-//! - **(ii)** a roster row older than one `witness_cadence_secs` that no
+//! - **(ii)** a roster row older than one `receipt_cadence_secs` that no
 //!   version covers marks the head **lagging** ([`RosterLag`], token
 //!   [`LINEAGE_HEAD_LAGS_ROSTER`]); witnesses do not cosign a lagging head, so
 //!   attaching on it goes stale through the T4a freshness gate. With witnessed
@@ -439,7 +439,7 @@ pub struct RosterLag {
     /// The earliest instant THIS node admitted an uncovered row (a decision
     /// counts at its window's close).
     pub since: chrono::DateTime<chrono::Utc>,
-    /// The charter's `witness_cadence_secs` the lag was judged with (`0` when
+    /// The charter's `receipt_cadence_secs` the lag was judged with (`0` when
     /// the charter declares none: an uncovered row lags from its effective
     /// instant).
     pub cadence_secs: u64,
@@ -451,7 +451,7 @@ pub struct RosterLag {
 ///
 /// The judgment is the held head against the fold at `at` over the rows it
 /// answers for — those effective after its instant or admitted here after it —
-/// that this node admitted at least one `witness_cadence_secs` (the charter in
+/// that this node admitted at least one `receipt_cadence_secs` (the charter in
 /// force) before `at`. A row younger here than one cadence never lags, a row
 /// the head reflects never does, and a backdated row does not escape.
 ///
@@ -481,7 +481,7 @@ where
     }
     let cadence_secs = super::canonical_community::charter_members_for(directory, root)
         .await?
-        .and_then(|c| c.witness_cadence_secs)
+        .and_then(|c| c.receipt_cadence_secs)
         .unwrap_or(0);
     let cutoff = i64::try_from(cadence_secs)
         .ok()

@@ -353,6 +353,14 @@ pub enum RetiredHybridPolicy {
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
+///
+/// v62.0.0 (PRE4-witness; CC v1.0-rc22-pre4 3.2 T6) — removing
+/// `PutLineageHeadCosign`, `ListLineageHeadCosignsFor` and their results
+/// (`LineageCosignOutcome`, `LineageHeadCosigns`) is a break by this doc's
+/// rule (the v9 / v11 / v12 removals bumped). It rides 14, the v62.0 move:
+/// the last shipped version is 13 (v61.4.2), so every consumer that could
+/// call them is refused at load already; no second number for one
+/// unshipped release.
 pub const DIRECTORY_ABI_VERSION: u32 = 14;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
@@ -1029,14 +1037,10 @@ pub enum DirectoryOp {
         /// The identity the TRANSPORT authenticated — never the row's claim.
         authenticated_peer_key_id: String,
     },
-    /// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) —
-    /// [`FederationDirectory::put_lineage_head_cosign`], the witness plane's
-    /// door: a replication bridge forwards a `ciris.lineage_head_cosign.v1`
-    /// object. Result rides `LineageCosignOutcome`. APPEND-ONLY (Growth).
-    PutLineageHeadCosign {
-        /// The cosign received from a peer or a witness.
-        cosign: crate::federation::lineage_witness::LineageHeadCosign,
-    },
+    // v62.0.0 (PRE4-witness; CC v1.0-rc22-pre4 3.2 T6) — `PutLineageHeadCosign`
+    // is REMOVED (the one exception to append-only, ruled with witnessed
+    // mode's deletion): its object type is gone. An older consumer's op fails
+    // to deserialize and is answered `Err`, never misdispatched.
     /// v50.0.0 (CIRISPersist#928, final check) —
     /// [`FederationDirectory::withdraws_admission_depth`]: the depth a stored
     /// `withdraws` was admitted under, so a capsule consumer re-deriving it at
@@ -1318,13 +1322,8 @@ pub enum DirectoryOp {
         /// `family_key_id`.
         family_key_id: String,
     },
-    /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
-    /// [`FederationDirectory::list_lineage_head_cosigns_for`]: `canonical_community` read `Unsupported` as no cosigns. Result rides
-    /// `LineageHeadCosigns`. APPEND-ONLY (Growth).
-    ListLineageHeadCosignsFor {
-        /// `lineage_key_id`.
-        lineage_key_id: String,
-    },
+    // v62.0.0 (PRE4-witness) — `ListLineageHeadCosignsFor` is REMOVED with
+    // its trait method (witnessed mode is gone).
     /// v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read) —
     /// [`FederationDirectory::lookup_signed_community`]: the signed community record. Result rides
     /// `SignedCommunity`. APPEND-ONLY (Growth).
@@ -2263,9 +2262,7 @@ pub enum DirectoryOpResult {
     /// nothing was recorded (a pre-V157 row reads as the 16-hop walk).
     /// APPEND-ONLY (Growth).
     WithdrawsAdmissionDepth(Option<u32>),
-    /// v51.0.0 (CIRISPersist#938) — `PutLineageHeadCosign`'s typed outcome.
-    /// APPEND-ONLY (Growth).
-    LineageCosignOutcome(crate::federation::lineage_witness::LineageCosignOutcome),
+    // v62.0.0 (PRE4-witness) — `LineageCosignOutcome` is REMOVED with its op.
     /// v59.1.2 (CIRISPersist#1162) — `execute_attestation_query`: the rows in
     /// the query's order (at most `limit + 1`), the envelope bytes decoded and
     /// the backend that ran it. APPEND-ONLY (Growth).
@@ -2313,8 +2310,7 @@ pub enum DirectoryOpResult {
     FamilyMembershipRevocations(Vec<FamilyMembershipRevocation>),
     /// v61.4.0 (CIRISPersist#1244 round 2) — `list_family_membership_widenings_for`. APPEND-ONLY (Growth).
     FamilyMembershipWidenings(Vec<types::FamilyMembershipWidening>),
-    /// v61.4.0 (CIRISPersist#1244 round 2) — `list_lineage_head_cosigns_for`. APPEND-ONLY (Growth).
-    LineageHeadCosigns(Vec<crate::federation::lineage_witness::LineageHeadCosign>),
+    // v62.0.0 (PRE4-witness) — `LineageHeadCosigns` is REMOVED with its op.
     /// v61.4.0 (CIRISPersist#1244 round 2) — `lookup_signed_community`. APPEND-ONLY (Growth).
     SignedCommunity(Option<SignedCommunity>),
     /// v61.4.0 (CIRISPersist#1244 round 2) — `lookup_canonical_withdrawal`. APPEND-ONLY (Growth).
@@ -3164,7 +3160,6 @@ pub fn earlier_form_op_plane(op: &DirectoryOp) -> Option<&'static str> {
         DirectoryOp::PutTransportDestination { .. }
         | DirectoryOp::PutSignedTransportDestination { .. } => Some("transport_destination"),
         DirectoryOp::ApplyReplicatedAccordEvidence { .. } => Some("accord_evidence"),
-        DirectoryOp::PutLineageHeadCosign { .. } => Some("lineage_head_cosign"),
         DirectoryOp::PutAttestation { .. }
         | DirectoryOp::PutAttestationAuthored { .. }
         | DirectoryOp::PutAttestationSynced { .. }
@@ -3288,7 +3283,6 @@ pub fn earlier_form_op_plane(op: &DirectoryOp) -> Option<&'static str> {
         | DirectoryOp::ListLiveConsentGrantsBy { .. }
         | DirectoryOp::ListSettledEdition2RosterProposals { .. }
         | DirectoryOp::Edition2RosterProposal { .. }
-        | DirectoryOp::ListLineageHeadCosignsFor { .. }
         | DirectoryOp::LookupSignedCommunity { .. }
         | DirectoryOp::LookupCanonicalWithdrawal { .. }
         | DirectoryOp::ListCanonicalWithdrawals { .. }
@@ -4146,12 +4140,6 @@ pub async fn dispatch_directory_op(
                 Err(e) => op_err(&e),
             }
         }
-        DirectoryOp::ListLineageHeadCosignsFor { lineage_key_id } => {
-            match dir.list_lineage_head_cosigns_for(&lineage_key_id).await {
-                Ok(v) => DirectoryOpResult::LineageHeadCosigns(v),
-                Err(e) => op_err(&e),
-            }
-        }
         DirectoryOp::LookupSignedCommunity { community_key_id } => {
             match dir.lookup_signed_community(&community_key_id).await {
                 Ok(v) => DirectoryOpResult::SignedCommunity(v),
@@ -4705,15 +4693,6 @@ pub async fn dispatch_directory_op(
             Ok(o) => DirectoryOpResult::ReplicatedAttestationOutcome(o),
             Err(e) => op_err(&e),
         },
-        // v62.0.0 (F0-cp9) — RETIRED: the lineage-head cosign door was the
-        // earlier form (a bound-hybrid witness signature) with no edition-2
-        // form (CC: OPEN). The op keeps its fields (ABI 14); it refuses.
-        DirectoryOp::PutLineageHeadCosign { cosign } => {
-            let _ = cosign;
-            op_err(&crate::federation::Error::Unsupported {
-                method: "put_lineage_head_cosign",
-            })
-        }
         DirectoryOp::WithdrawsAdmissionDepth { attestation_id } => {
             match dir.withdraws_admission_depth(&attestation_id).await {
                 Ok(d) => DirectoryOpResult::WithdrawsAdmissionDepth(
@@ -6456,24 +6435,6 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::RosterSigners(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-    async fn list_lineage_head_cosigns_for(
-        &self,
-        lineage_key_id: &str,
-    ) -> Result<Vec<crate::federation::lineage_witness::LineageHeadCosign>, Error> {
-        // v61.4.0 (CIRISPersist#1244 round 2, a fail-open trust read).
-        match self
-            .run_op(&DirectoryOp::ListLineageHeadCosignsFor {
-                lineage_key_id: lineage_key_id.to_string(),
-            })
-            .await?
-        {
-            DirectoryOpResult::LineageHeadCosigns(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -9066,15 +9027,16 @@ mod tests {
             for i in 0..3 {
                 // v62.0.0 (E0 fix 2) — a registered family (`i1578:` is
                 // open vocabulary, refused at the edition-2 door).
-                ids.push(
-                    f::put_dim(dir.as_ref(), &a, &k, &format!("watchlist:i1578_{i}:v1")).await,
-                );
+                // v62.0.0 (FS-sig-a) — `need:` (the serve feeds' own fixture
+                // family), not `watchlist:`, whose rows now count only from
+                // a group's `moderate` / `takedown` holder.
+                ids.push(f::put_dim(dir.as_ref(), &a, &k, &format!("need:i1578n{i}:x:v1")).await);
             }
             let (owner, node) = f::owner_and_node(dir.as_ref(), "cap1578").await;
             f::bind(dir.as_ref(), &owner, &node, cohort_scope::FEDERATION).await;
             (ids, owner, node)
         });
-        let dims = vec!["watchlist:".to_owned()];
+        let dims = vec!["need:".to_owned()];
         let direct = rt
             .block_on(dir.list_attestations_since_by_prefixes(None, &dims, 2))
             .expect("direct");
@@ -9286,7 +9248,9 @@ mod tests {
             DIRECTORY_ABI_VERSION, 14,
             "v62.0.0 (CC 2.7): the result wire gained TypedErr, and an existing op's failure \
              now answers it (the error's kind and wait cross the capsule) — a consumer built \
-             against 13 fails to decode it on the hot path. Previous move: \
+             against 13 fails to decode it on the hot path. The same unshipped move carries \
+             PRE4-witness's removal of PutLineageHeadCosign / ListLineageHeadCosignsFor and \
+             their results (CC v1.0-rc22-pre4 3.2 T6: witnessed mode is gone). Previous move: \
              v61.3.0 (CIRISPersist#1252): ReplicatedAttestationOutcome gained HeldEquivalent \
              (the same act held under another row) — a consumer built against 12 fails to \
              decode it on the hot path. Previous move: \
@@ -10613,7 +10577,7 @@ mod tests {
             &[crate::federation::types::identity_type::USER],
         ));
         rt.block_on(
-            dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
+            dir.test_seam_put_identity_occurrence(crate::federation::IdentityOccurrence {
                 identity_key_id: identity.clone(),
                 occurrence_key_id: phone.clone(),
                 // v62.0.0 (P1-fix4; CC rc21 3.3.6) — a person's phone, not an
@@ -10652,7 +10616,7 @@ mod tests {
         }
 
         // Revoke → the SAME proxy call fail-secure excludes the occurrence.
-        rt.block_on(dir.put_identity_occurrence_revocation_local(
+        rt.block_on(dir.put_identity_occurrence_revocation_edition2(
             crate::federation::IdentityOccurrenceRevocation {
                 identity_key_id: identity.clone(),
                 occurrence_key_id: phone.clone(),
@@ -10662,6 +10626,7 @@ mod tests {
                 witness_set: vec![identity.clone()],
                 persist_row_hash: String::new(),
             },
+            crate::federation::DoorToken::new(),
         ))
         .expect("seed revocation");
         let resolved = rt
@@ -11617,13 +11582,6 @@ mod tests {
                 },
             ),
             (
-                "list_lineage_head_cosigns_for",
-                DirectoryOp::ListLineageHeadCosignsFor {
-                    lineage_key_id: "x".into(),
-                },
-                |p| Box::pin(async move { p.list_lineage_head_cosigns_for("x").await.map(|_| ()) }),
-            ),
-            (
                 "lookup_signed_community",
                 DirectoryOp::LookupSignedCommunity {
                     community_key_id: "x".into(),
@@ -11935,7 +11893,7 @@ mod tests {
                 asserted_at: now,
                 expires_at: None,
                 attestation_envelope: serde_json::json!({
-                    "dimension": "evidence:safety_battery:capture:a:b:v1",
+                    "dimension": "coherence_standing:cab:v1",
                     "score": 1.0,
                     "confidence": 0.9,
                     "label": label,
@@ -14091,7 +14049,7 @@ mod tests {
             .expect("the chartered root confers");
             Eq1774 {
                 node,
-                root: r.root.clone(),
+                root: r.lineage.clone(),
                 subject_a: e2::kid("eqa-subject"),
                 holder: f.founders.first().cloned().unwrap_or_default(),
                 root_f: f.root,
@@ -14344,14 +14302,26 @@ mod tests {
         ("record_role_withdrawal", RETIRED_FOR_EDGE_PX),
         ("put_touch_claim", RETIRED_FOR_EDGE_PX),
         ("put_identity_occurrence_local", RETIRED_FOR_EDGE_PX),
+        // v62.0.0 (WD-fix9) — a TEST seam (cfg(test) / test-anchor): the
+        // storage the retired trusted-local write had; no op carries it.
+        (
+            "test_seam_put_identity_occurrence",
+            "v62.0.0 (WD-fix9) — test-only seeding of an occurrence row (the retired \
+             trusted-local write's storage); never compiled into a production build",
+        ),
         // v62.0.0 (PX-fix1) — the `Err(Backend)` defaults, now refusing.
         ("put_edition2_object", REFUSED_DEFAULT_PX),
         ("put_edition2_statement", REFUSED_DEFAULT_PX),
         ("upsert_edition2_key_projection", REFUSED_DEFAULT_PX),
         ("put_family_local", REFUSED_DEFAULT_PX),
+        // v62.0.0 (WD-fix8) — the retired trusted-local revocation now refuses
+        // by name on every directory (not `Unsupported`); its store is the
+        // edition-2 eviction door's, which runs on the host's store.
         (
-            "put_identity_occurrence_revocation_local",
-            REFUSED_DEFAULT_PX,
+            "put_identity_occurrence_revocation_edition2",
+            "v62.0.0 (WD-fix8) — the edition-2 occurrence revocation is written by the \
+             node's own eviction door (`edition2::typed` / `occurrence::land_held_eviction`), \
+             reached through `put_edition2_statement`; no DirectoryOp carries the typed write",
         ),
         ("grant_trust", REFUSED_DEFAULT_PX),
         ("revoke_trust", REFUSED_DEFAULT_PX),
@@ -14447,6 +14417,10 @@ mod tests {
         ("list_purge_executions_since", INHERITED_DEFAULT),
         ("purge_delete_tombstoned_attestation", INHERITED_DEFAULT),
         ("purge_delete_tombstoned_trace", INHERITED_DEFAULT),
+        // v62.0.0 (WD-fix1) — the withdrawn-content sweep's read and the
+        // descent's statement delete: the host's own store's, never proxied.
+        ("list_withdrawals_since", INHERITED_DEFAULT),
+        ("purge_delete_tombstoned_statements", INHERITED_DEFAULT),
         ("purge_mark_finalized", INHERITED_DEFAULT),
         (
             "put_identity_occurrence_edition2",
@@ -14494,6 +14468,18 @@ mod tests {
             "put_fold_reason",
             "v62.0.0 (wave G0 fix4) — the re-fold's marker and its restore run in the \
              process that owns the store (`edition2::fold`); no DirectoryOp carries it",
+        ),
+        (
+            "fold_slot_all_rows",
+            "v62.0.0 (GID-tips) — the roster door's read of every row under one group id \
+             runs in the process that owns the store (`edition2::group`, inside the \
+             statement door the proxy carries whole); no DirectoryOp carries it",
+        ),
+        (
+            "drop_held_row",
+            "v62.0.0 (KR-fix20) — the door's drop of a held row it now refuses for good \
+             runs in the process that owns the store (`edition2::ingest`, \
+             `edition2::fold`); no DirectoryOp carries it",
         ),
         // v62.0.0 (RL-fix1, ruling (B)) — the accord-rescan watermark store
         // is written and read by the free doors persist runs over its own
@@ -15001,8 +14987,6 @@ mod proxy_gate {
         // v62.0.0 (round 6) — the accord proposal / participation / decision
         // trait doors are deleted (JSON-cut slice F; a roster change is a later
         // genesis bundle); their append-only ops stay as refusing arms.
-        // v62.0.0 (PX-fix3, 4g merge) — PX-fix3's `PutLineageHeadCosign` row is
-        // the one 4f-regen already carries (below); one row per op.
         (
             "PutAccordDecision",
             "retired at v62.0.0 (slice F): its trait door is deleted; the op stays so an \
@@ -15033,13 +15017,6 @@ mod proxy_gate {
         (
             "BuildDelegationGraph",
             "a free walk persist runs over its own directory; no trait method to proxy",
-        ),
-        // v62.0.0 (4f-regen) — F0-cp9r deleted the lineage-head cosign door
-        // (one verify path); the op stays as a refusing arm for the ABI.
-        (
-            "PutLineageHeadCosign",
-            "retired at v62.0.0 (F0-cp9r): its trait door is deleted and its arm \
-             refuses; the op stays for the ABI, never issued by a current proxy",
         ),
         // v62.0.0 (RL-fix1, ruling (B)) — free doors and reads persist runs
         // over its own directory.
@@ -15806,10 +15783,7 @@ mod wait_relay {
             ("author", Value::Text(me.clone())),
             ("score", Value::Uint(750_000)),
             ("confidence", Value::Uint(900_000)),
-            (
-                "dimension",
-                Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-            ),
+            ("dimension", Value::Text("coherence_standing:cab:v1".into())),
             (
                 "refs",
                 map(vec![(
@@ -15823,7 +15797,7 @@ mod wait_relay {
             &me,
             &me,
             "scores",
-            "evidence:.suite:.kind:.cell:.prefix",
+            "coherence_standing:.cohort",
             &payload,
             vec![],
         )

@@ -110,9 +110,9 @@ pub mod identity_type {
     /// this.
     pub const SUBSTRATE_PERSIST: &str = "substrate_persist";
     /// v3.0.0 (CIRISPersist#116, CEG 0.2 §7.6 / §10.3) — registered
-    /// transparency-log witnesses. Only `federation_keys` rows with
-    /// this identity_type may emit `transparency_log:cosigned:*`
-    /// attestations. The substrate-conformance migration path moves
+    /// transparency-log witnesses (the identity type is kept by CC ruling;
+    /// the `transparency_log:cosigned:*` family it once emitted was retired by
+    /// CC v1.0-rc22-pre4, PRE4-retire). The substrate-conformance migration path moves
     /// the 0.x interim per-region `registry_witnesses` table over to
     /// `federation_keys` rows with this identity_type, per CEG §10.3.
     pub const WITNESS: &str = "witness";
@@ -830,7 +830,8 @@ pub mod delegation_scope {
 
     /// v30.2.0 (CIRISPersist#607) — `infra:attest_assurance` — issue
     /// **assurance attestations about third parties**: the `age_assurance:` and
-    /// `capacity_assurance:` rungs, and `transparency_log:cosigned:`.
+    /// `capacity_assurance:` rungs (`transparency_log:cosigned:` was retired by
+    /// CC v1.0-rc22-pre4, PRE4-retire).
     ///
     /// The scope a `witness` must hold from a trust root before those doors
     /// open. It is deliberately NOT `infra:attest` — that scope already

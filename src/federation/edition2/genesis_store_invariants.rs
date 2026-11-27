@@ -789,6 +789,71 @@ async fn i2322_postgres() {
     Box::pin(body_named_rows(&d)).await;
 }
 
+/// I6404 (PRE4-witness; CC v1.0-rc22-pre4 3.2 T6, the lead's safety rule) —
+/// a bundle whose charter names transparency services is never read as
+/// current by a node that cannot check Receipts: it is HELD
+/// `genesis_bundle_receipts_unchecked` (not placed, not in force), on a
+/// fresh node (still pre-genesis) and on a node that holds a bundle (that
+/// bundle stays the head: an attached node never detaches, CC 3.2 T4).
+pub(crate) async fn body_receipts_unchecked(
+    fresh: &dyn FederationDirectory,
+    attached: &dyn FederationDirectory,
+) {
+    register_roots();
+    let f = vectors::v2();
+    let witnessed = case(f, "first_valid_witnessed");
+    let held = |out: &super::genesis::GenesisAdmission, what: &str| {
+        assert!(out.placed.is_empty(), "I6404 {what}: nothing placed");
+        assert!(
+            out.not_placed.iter().any(|n| n.object_id == oid(witnessed)
+                && n.token == malformed_row::GENESIS_BUNDLE_RECEIPTS_UNCHECKED),
+            "I6404 {what}: held by name: {:?}",
+            out.not_placed
+        );
+    };
+    // A fresh node: held, and still pre-genesis.
+    let out = put_genesis_bundle(fresh, &offered(f, witnessed), anchor(witnessed).as_ref())
+        .await
+        .expect("I6404: held, not refused");
+    held(&out, "fresh");
+    assert!(
+        !genesis_in_force(fresh).await.unwrap().is_held(),
+        "I6404 fresh: no bundle naming services is in force"
+    );
+    // An attached node: the bundle it holds stays in force.
+    place(attached, f, "first_valid").await;
+    let out = put_genesis_bundle(attached, &offered(f, witnessed), anchor(witnessed).as_ref())
+        .await
+        .expect("I6404: held, not refused");
+    held(&out, "attached");
+    let g = genesis_in_force(attached).await.unwrap();
+    assert_eq!(
+        g.head.as_ref().map(|h| h.object_id),
+        Some(oid(case(f, "first_valid"))),
+        "I6404 attached: the held bundle stays the head"
+    );
+    assert!(
+        g.valid.iter().all(|p| p.object_id != oid(witnessed)),
+        "I6404 attached: the bundle naming services is not in force"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i6404_receipts_unchecked_sqlite() {
+    let (a, b) = (sqlite().await, sqlite().await);
+    Box::pin(body_receipts_unchecked(&a, &b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i6404_receipts_unchecked_postgres() {
+    let (Some(a), Some(b)) = (postgres().await, postgres().await) else {
+        return;
+    };
+    Box::pin(body_receipts_unchecked(&a, &b)).await;
+}
+
 /// One op through the capsule's wire: the op and its result each cross as
 /// serialized bytes (the C-ABI's encoding), dispatched by persist over `d`.
 async fn through_capsule(

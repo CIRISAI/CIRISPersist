@@ -101,14 +101,14 @@ impl CcTag {
 /// `scripts/check_vendored_cc.sh` and `scripts/release_ship.sh` read this
 /// line's text (`pub const VENDORED_CC_TAG: CcTag = CcTag::Pending;` or
 /// `... CcTag::Recorded("<tag>");`): keep it on one line.
-pub const VENDORED_CC_TAG: CcTag = CcTag::Recorded("v1.0-rc22-pre3");
+pub const VENDORED_CC_TAG: CcTag = CcTag::Recorded("v1.0-rc22-pre4");
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "0d91fa0eacc968739cc0eb0d8ac776d3ee7020de39701c549c4691e95f50d21d";
+    "5e94686ca41a57ea9aafa1e22cba90484cac149137d5b0f3e8d4145b2c82997c";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 189;
+pub const VENDORED_N_FAMILIES: usize = 185;
 
 /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the manifest's
 /// `_meta.registry_sha256`: the hash of the GRAMMAR (families + `_meta` minus
@@ -122,9 +122,16 @@ pub const VENDORED_N_FAMILIES: usize = 189;
 /// `namespace_match_vectors.json` from the same commit. JSON carries no
 /// comments, so this doc is the vendored files' header.
 pub const VENDORED_REGISTRY_SHA256: &str =
-    "23a4e129f09532b3b896f39522da88995e8453c4b15ba9d9012da1f75e9795c4";
+    "60ba665dd9a888589bf9a7c2a31268c842e176659c4dabe20615a03938c6bd34";
 
 /// The CIRISConstitution commit every vendored CC manifest was copied from.
+/// v62.0.0 (PIN-pre4): `e84a2cf8`, the commit the `v1.0-rc22-pre4` tag
+/// (object `eda1cf8e`) names. The registry goes 189 → 185 (+`act:ack`,
+/// +`delivery_ack:{stream_id}`, +`holon:claim`; −`delivery_receipt`, the
+/// five retired by name, −`cosign:{state}`); the match vectors, the family
+/// model, the CSD/4 chain and the governance table and its vectors move; the
+/// signed-object vectors, the topology vocabulary and the self-roster traces
+/// do not. Every file pin below is the tag's bytes (CONSTITUTION-pre4-handover).
 /// v62.0.0 (PIN-pre3): `6c879e32`, the commit the `v1.0-rc22-pre3` tag names.
 /// From pre2 no vendored file's bytes move (under `manifests/` the family
 /// model, its authorship extract (`_meta.source_sha256` only), the select
@@ -159,17 +166,17 @@ pub const VENDORED_REGISTRY_SHA256: &str =
 /// `scripts/check_vendored_cc.sh` byte-compares all of them against the
 /// commit (pending) or the tag (recorded) before a persist release is tagged,
 /// and refuses the release while the tag is pending.
-pub const VENDORED_CC_COMMIT: &str = "6c879e324f4471c37be5056fcbb162bda6e5ba6b";
+pub const VENDORED_CC_COMMIT: &str = "e84a2cf87cf72e75d4d889513bd64bf815b42ef1";
 
 /// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
 /// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).
 /// What `scripts/check_vendored_cc.sh` compares against the tag.
 pub const VENDORED_REGISTRY_FILE_SHA256: &str =
-    "054ed9efc3c3f88dbe89f53453bdd43905b95592273d0e30742cf157389927bb";
+    "d9c9338d2a00fd717d4f39693abdc0c8303cda820e19a31e3be67c4bfdc56f62";
 
 /// SHA-256 of the vendored `namespace_match_vectors.json` FILE bytes.
 pub const VENDORED_VECTORS_FILE_SHA256: &str =
-    "6bed6efa3b4d95d63cfc07844cc4c2eacd68511097fcf72c970962895646f198";
+    "f727ab232b0ebe540229a4edb74445d160aa56985c6b713fd908ea0e394f8f88";
 
 /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the case class of one dimension
 /// SEGMENT, read from the manifest rather than inferred from `{...}` in prose.
@@ -1064,7 +1071,7 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "credits:{domain}:{language}:{subject}",
     "cw_class:{class}",
     "delivery:{class}",
-    "delivery_receipt:{stream_id}",
+    "delivery_ack:{stream_id}",
     "detection:correlated_action:{axis}",
     "detection:distributive:access:{resource_type}",
     "detection:hash_chain_integrity",
@@ -1087,6 +1094,8 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "hard_case:{kind}",
     "hardware_custody:{platform}",
     "health:liveness:{version}",
+    // v62.0.0 (PIN-pre4; CC v1.0-rc22-pre4: provisional, CC 3.1.11) — added.
+    "holon:claim",
     "identity:canonical_binding:{canonical_hash}",
     "identity_continuity:relational_anchor",
     "image:*",
@@ -1135,9 +1144,6 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "topical_relation:{kind}",
     "trace:{form}:{version}",
     "trace_summary:{kind}",
-    "transparency_log:consistency",
-    "transparency_log:cosigned:{tree_size}",
-    "transparency_log:inclusion",
     "transport:{kind}",
     "trust:{job}:{version}",
     "truth_grounding:{subject}",
@@ -1151,7 +1157,6 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "custody:{kind}",
     "device:label",
     "file:{version}",
-    "lineage_witness:{stage}",
     "membership:{stage}",
     "observation:reachability",
     "self:delegates_to",
@@ -1215,7 +1220,6 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     // Every CC file is vendored at the tag (CIRISPersist#1252).
     "ballot:moderator",
     "ballot:moderator_acceptance",
-    "cosign:{state}",
     // rc20 (CIRISConstitution v1.0-rc20 @ d4bd2a6b; v62.0.0) — five families
     // added. Three are the folds of eleven literal leaves into one
     // closed-vocabulary row each (the leaves are in RETIRED_FAMILIES; every
@@ -1224,10 +1228,11 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     // five detectors. The other two are the v62 kinds: the location proof as
     // a row (CC 3.3.3) and the blessing trust family.
     "accord:lifecycle:{kind}",
+    // v62.0.0 (PIN-pre4; CC v1.0-rc22-pre4: an act's acknowledgement) — added.
+    "act:ack",
     "capacity:{factor}",
     "detection:{detector}",
     "location_proof:{version}",
-    "trust:blessing",
     // rc21 (CIRISConstitution v1.0-rc21-wire @ e6fd7c60; v62.0.0 R1c) — one
     // family added, none retired: the kernel admission unit (CC 3.1.3,
     // CC 2.7.11; reserved, `substrate-self-report`). Two rows gain a segment
@@ -1287,7 +1292,81 @@ pub const RETIRED_FAMILIES: &[&str] = &[
     // `credits:{domain}:{language}:substrate_building:v1` dimension is the
     // open `{subject}` of `credits:{domain}:{language}:{subject}`.
     "credits:{domain}:{language}:substrate_building",
+    // pre4 (CIRISConstitution v1.0-rc22-pre4; `manifests/scitt_names.tsv`;
+    // PRE4-retire) — five families retired, the transparency plane moving to
+    // Signed Statements, Transparency Services and Receipts (RFC 9943, RFC
+    // 9942): a witness cosignature on a tree head and the proofs as rows give
+    // way to a Receipt, and the witnessing ceremony and the blessing go with
+    // them. A row of each is refused at the door BY NAME
+    // ([`RETIRED_BY_NAME`]); no log persist keeps (the audit log, the
+    // per-stream tree, the receipts) is touched.
+    "transparency_log:cosigned:{tree_size}",
+    "transparency_log:inclusion",
+    "transparency_log:consistency",
+    "lineage_witness:{stage}",
+    "trust:blessing",
+    // v62.0.0 (PRE4-cosign; CC v1.0-rc22-pre4, the sixth retirement) —
+    // `cosign:{state}`, both leaves: edition 2 keeps a counted row's voices
+    // as statements of the event itself and mints no cosign row.
+    "cosign:{state}",
 ];
+
+/// v62.0.0 (PRE4-retire; CIRISConstitution v1.0-rc22-pre4,
+/// `manifests/scitt_names.tsv`) — **the retired families a row is refused
+/// under BY NAME** (`family_retired`, at the statement door and the
+/// attestation door), `(registry prefix, why)`. Each is also in
+/// [`RETIRED_FAMILIES`]. Nothing of a refused row is kept.
+pub const RETIRED_BY_NAME: &[(&str, &str)] = &[
+    (
+        "transparency_log:cosigned:{tree_size}",
+        "a witness's cosignature on a tree head: a Receipt replaces it (RFC 9943)",
+    ),
+    (
+        "transparency_log:inclusion",
+        "an inclusion proof as a row: it rides inside a Receipt",
+    ),
+    (
+        "transparency_log:consistency",
+        "a consistency proof as a row: it is submission material beside a head (RFC 9942)",
+    ),
+    (
+        "lineage_witness:{stage}",
+        "the witnessing ceremony: a lineage names its transparency services in its charter",
+    ),
+    (
+        "trust:blessing",
+        "retired by CIRISConstitution v1.0-rc22-pre4",
+    ),
+    (
+        "cosign:{state}",
+        "a cosignature as a row: a counted row's voices are statements of the event itself",
+    ),
+];
+
+/// **Is `name` under a family retired by name ([`RETIRED_BY_NAME`])?** `name`
+/// is a header family id (label -70002: `trust:blessing`,
+/// `lineage_witness:.stage`), a dimension (`transparency_log:inclusion:v1`,
+/// `transparency_log:cosigned:42:v1`) or an `attestation_type`. A segment
+/// boundary is required: `trust:blessings:v1` is not `trust:blessing`. Returns
+/// the retired registry prefix.
+#[must_use]
+pub fn retired_by_name(name: &str) -> Option<&'static str> {
+    RETIRED_BY_NAME.iter().map(|(p, _)| *p).find(|prefix| {
+        if ciris_verify_core::namespace_match::family_id(prefix) == name {
+            return true;
+        }
+        // The literal segments before the first placeholder.
+        let literal: Vec<&str> = prefix
+            .split(':')
+            .take_while(|seg| !seg.starts_with('{'))
+            .collect();
+        let stem = literal.join(":");
+        name == stem
+            || name
+                .strip_prefix(stem.as_str())
+                .is_some_and(|r| r.starts_with(':'))
+    })
+}
 
 #[cfg(test)]
 mod tests {

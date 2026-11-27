@@ -35,12 +35,8 @@
 //!   - a statement that states no scope reads as `federation` (the
 //!     attestation default; ruling), so it is served as the commons.
 //!
-//! - **a `cosign:{pending,signature}` voice** carries no scope of its own:
-//!   it is served exactly to the audience of the event it cosigns, the row
-//!   its `refs.target` names (a group voice, or a held row under its row's
-//!   rule), read through `serve::servable_to` on that event's statement. A
-//!   cosign naming a cosign is followed to its event, at most
-//!   [`MAX_COSIGN_HOPS`]. An event this node does not hold is withheld.
+//! - (v62.0.0 PRE4-cosign) the `cosign:{state}` arm is deleted: the family
+//!   is retired, and no node holds a statement of it.
 //! - **`admission:unit`** (CC ruling): served by its OWN `cohort_scope`,
 //!   like any scores row, through the scope rule below: an owner-alone unit
 //!   is at `self` (its author's own hosts only), a counted unit at whatever
@@ -62,7 +58,6 @@ use super::group::{
 };
 use super::ingest::json_of;
 use super::liveness::statement_parts;
-use super::names::{names_of, single};
 use crate::federation::types::cohort_scope as cs;
 use crate::federation::{Error, FederationDirectory};
 
@@ -104,9 +99,6 @@ where
     let claims = protected.get_int(15);
     let sub = claims.and_then(|c| c.get_int(2)).and_then(Value::as_text);
     let iss = claims.and_then(|c| c.get_int(1)).and_then(Value::as_text);
-    if family == ciris_verify_core::namespace_match::family_id(super::typed::COSIGN_PREFIX) {
-        return cosign_servable(dir, &payload, requester).await;
-    }
     if let Some(plane) = group_plane_of(row_type, family, &payload) {
         let Some(sub) = sub else {
             return Ok(false);
@@ -192,58 +184,6 @@ where
     )
 }
 
-/// How many `cosign` statements a cosign's `refs.target` chain follows to
-/// reach the event.
-pub const MAX_COSIGN_HOPS: usize = 4;
-
-/// `serve::servable_to` behind a named, `Send` trait object: the cosign rule
-/// asks it of the event a cosign names, and `servable_to` reaches the cosign
-/// rule again only through this box, so the future's type is not recursive.
-fn event_servable<'a, F>(
-    dir: &'a F,
-    statement: &'a [u8],
-    requester: Option<&'a str>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, Error>> + Send + 'a>>
-where
-    F: FederationDirectory + ?Sized,
-{
-    Box::pin(super::serve::servable_to(dir, statement, requester))
-}
-
-/// A cosign voice's audience: the audience of the event it cosigns.
-async fn cosign_servable<F>(
-    dir: &F,
-    payload: &Value,
-    requester: Option<&str>,
-) -> Result<bool, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let cosign = ciris_verify_core::namespace_match::family_id(super::typed::COSIGN_PREFIX);
-    let mut payload = payload.clone();
-    for _ in 0..MAX_COSIGN_HOPS {
-        let Ok(names) = names_of(&payload) else {
-            return Ok(false);
-        };
-        let Some(target) = single(&names, super::typed::TARGET_ROLE) else {
-            return Ok(false);
-        };
-        let held = dir.edition2_voices(&target).await?;
-        let Some(event) = held.first() else {
-            return Ok(false);
-        };
-        let Some((protected, next)) = statement_parts(event) else {
-            return Ok(false);
-        };
-        if protected.get_int(-70002).and_then(Value::as_text) == Some(cosign.as_str()) {
-            payload = next;
-            continue;
-        }
-        return event_servable(dir, event, requester).await;
-    }
-    Ok(false)
-}
-
 /// A group voice's audience.
 async fn group_servable<F>(
     dir: &F,
@@ -288,9 +228,13 @@ where
     {
         return Ok(true);
     }
-    // The members at the named head.
+    // The members at the named head. VD-step1 — only a CONCLUDED version
+    // lists members ([`super::verdict::row_state`]): a version kept short of
+    // its count (or a lone voice of one) is no version yet, and its listed
+    // members are no party of the rows that name it.
     if let Some(h) = head {
-        if let Some(st) = dir.edition2_voices(&h).await?.first() {
+        let concluded = super::verdict::row_state(dir, &h).await?.is_concluded();
+        if let Some(st) = dir.edition2_voices(&h).await?.first().filter(|_| concluded) {
             if let Ok(v) = roster_view_of_statement(st) {
                 if v.group == group && v.kind == kind {
                     party.extend(listed_members(&v.payload));
@@ -553,7 +497,8 @@ where
 /// row's audience." For each held row `C` that names this statement's row
 /// (under any [`NAMING_ROLES`] role, from `ceg_row_names`):
 ///
-/// - `C` is concluded: no fold hold is recorded for it (`fold_held`);
+/// - `C` is concluded ([`super::verdict::row_state`]; VD-step1: not merely
+///   "no fold hold is recorded");
 /// - `C` sits in the same room ([`room_of`]);
 /// - `C`'s signer is in this statement's audience by its own rule
 ///   (`serve::servable_by_own_rule` with the signer as the party);
@@ -588,7 +533,10 @@ where
             if !seen.insert(citer) {
                 continue;
             }
-            if dir.fold_held(&citer).await?.is_some() {
+            // VD-step1 — "concluded" is the one verdict's, never "no fold
+            // hold": a citer kept as a lone voice (or never folded here) has
+            // no hold and concludes nothing, so carries nothing.
+            if !super::verdict::row_state(dir, &citer).await?.is_concluded() {
                 continue;
             }
             let voices = dir.edition2_voices(&citer).await?;

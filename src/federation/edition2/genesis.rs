@@ -78,9 +78,10 @@ pub mod token {
     pub use crate::federation::malformed_row::{
         GENESIS_BUNDLE_COUNT_UNMET as COUNT_UNMET, GENESIS_BUNDLE_MALFORMED as MALFORMED,
         GENESIS_BUNDLE_NOT_ANCHORED as NOT_ANCHORED,
-        GENESIS_BUNDLE_PREV_NOT_VALID as PREV_NOT_VALID, GENESIS_BUNDLE_ROW_INVALID as ROW_INVALID,
-        GENESIS_BUNDLE_ROW_UNPLACED as ROW_UNPLACED, GENESIS_HOLDER_CUSTODY as HOLDER_CUSTODY,
-        HOLDER_DEVICE_SHARED as DEVICE_SHARED,
+        GENESIS_BUNDLE_PREV_NOT_VALID as PREV_NOT_VALID,
+        GENESIS_BUNDLE_RECEIPTS_UNCHECKED as RECEIPTS_UNCHECKED,
+        GENESIS_BUNDLE_ROW_INVALID as ROW_INVALID, GENESIS_BUNDLE_ROW_UNPLACED as ROW_UNPLACED,
+        GENESIS_HOLDER_CUSTODY as HOLDER_CUSTODY, HOLDER_DEVICE_SHARED as DEVICE_SHARED,
     };
 
     /// The label of a bundle that waits on a named row or its predecessor
@@ -462,6 +463,18 @@ pub struct GenesisInForce {
     /// The Valid lineage as served (CC 2.6.1.2): each bundle's named rows,
     /// then its voices, in lineage order, as received.
     pub statements: Vec<Vec<u8>>,
+    /// v62.0.0 (KR-fix27, KR-fix27b; the Constitution's ruling of
+    /// 2026-11-22: one lineage per store is a v62.0 limit, and "a first
+    /// bundle with a DIFFERENT `family_key_id` is ANOTHER ROOT, not a fork")
+    /// — the Valid FIRST bundles (object ids, sorted) of a family other than
+    /// this store's root, the PINNED anchor's family (all of them, when two
+    /// families are held and the pinned bundle is not one): "not a root this
+    /// store holds". They are left out of
+    /// [`Self::valid`], the head, the forks, the tips and the served
+    /// statements (with every later bundle of their lineage), never called a
+    /// fork and never refused as one. Only two Valid first bundles of the
+    /// SAME `family_key_id` are a fork ([`Fork::Genesis`]).
+    pub other_roots: Vec<Digest32>,
 }
 
 impl GenesisInForce {
@@ -644,11 +657,30 @@ impl GenesisInForce {
 pub(crate) fn in_force_of(
     r: &LineageReading,
     rows: &BTreeMap<Digest32, Vec<u8>>,
+    root: RootChoice<'_>,
 ) -> GenesisInForce {
+    // v62.0.0 (KR-fix27, KR-fix27b) — a store roots in ONE family: every
+    // Valid bundle of another family is "not a root this store holds"
+    // (`other_roots`), not a fork sibling.
+    let of_root = |p: &GenesisPlacement| match root {
+        RootChoice::Every => true,
+        RootChoice::Family(f) => p.family_key_id == f,
+        RootChoice::Unresolved => false,
+    };
+    let mut other_roots: Vec<Digest32> = r
+        .objects
+        .iter()
+        .filter_map(|o| o.reading.verdict.placement())
+        .filter(|p| !of_root(p) && p.prev.is_none())
+        .map(|p| p.object_id)
+        .collect();
+    other_roots.sort();
+    other_roots.dedup();
     let valid: Vec<GenesisPlacement> = r
         .objects
         .iter()
         .filter_map(|o| o.reading.verdict.placement().cloned())
+        .filter(|p| of_root(p))
         .collect();
     let refs: Vec<&GenesisPlacement> = valid.iter().collect();
     let (head, forks) = match follow_to_head(&refs) {
@@ -660,7 +692,7 @@ pub(crate) fn in_force_of(
     let mut statements = Vec::new();
     let mut served_rows = BTreeSet::new();
     for o in &r.objects {
-        if o.reading.verdict.placement().is_none() {
+        if !o.reading.verdict.placement().is_some_and(of_root) {
             continue;
         }
         for id in &o.named {
@@ -679,6 +711,60 @@ pub(crate) fn in_force_of(
         forks,
         common,
         statements,
+        other_roots,
+    }
+}
+
+/// v62.0.0 (KR-fix27b) — which Valid bundles a reading roots in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootChoice<'a> {
+    /// The Valid first bundles name at most one family: every Valid bundle
+    /// is read (one family, or a same-family fork).
+    Every,
+    /// Only the bundles of this family: the family of the PINNED anchor's
+    /// bundle.
+    Family(&'a str),
+    /// Two or more families and no pinned anchor among them: no family is
+    /// this store's root, and nothing is in force.
+    Unresolved,
+}
+
+/// v62.0.0 (KR-fix27, corrected by KR-fix27b as the lead ruled 2026-11-22) —
+/// **the family this store roots in**, decided by what the store holds
+/// independently of ARRIVAL ORDER: the ANCHOR. When the Valid first bundles
+/// name more than one `family_key_id`:
+///
+/// - one of them is the bundle the PINNED anchor names
+///   ([`baked_genesis_anchor`], [`BAKED_GENESIS_OBJECT_ID`], what persist
+///   imports at Engine open): the store roots in ITS family, and every Valid
+///   first bundle of another family is `other_roots`, whichever arrived first;
+/// - none is: [`RootChoice::Unresolved`]. No family is the root and nothing
+///   is in force (every first bundle is `other_roots`; the head is `None`, as
+///   a store holding no bundle reads). An operator import's anchor is the
+///   argument of that one import call and is not kept by the store
+///   (`put_genesis_bundle`), so it cannot choose between two families
+///   without depending on which import came first; that is a recorded v62.0
+///   limit, not decided by arrival.
+///
+/// At most one family among them: [`RootChoice::Every`], the reading as it
+/// was (one lineage, or a same-family fork).
+fn store_root_family(r: &LineageReading) -> RootChoice<'_> {
+    let firsts: Vec<&GenesisPlacement> = r
+        .objects
+        .iter()
+        .filter_map(|o| o.reading.verdict.placement())
+        .filter(|p| p.prev.is_none())
+        .collect();
+    let families: BTreeSet<&str> = firsts.iter().map(|p| p.family_key_id.as_str()).collect();
+    if families.len() < 2 {
+        return RootChoice::Every;
+    }
+    let Anchor::ObjectId(pinned) = baked_genesis_anchor() else {
+        return RootChoice::Unresolved;
+    };
+    match firsts.iter().find(|p| p.object_id == pinned) {
+        Some(p) => RootChoice::Family(p.family_key_id.as_str()),
+        None => RootChoice::Unresolved,
     }
 }
 
@@ -796,6 +882,45 @@ fn cache_put(key: Digest32, f: &GenesisInForce) {
     c.push((key, f.clone()));
 }
 
+/// LEAD-gate1 — **one NAMED bundle of the held lineage, as a counted row
+/// reads it** (a grant from the root, a steward purge): the lineage's name,
+/// the bundle's holders in its own order, and the instant of the next bundle
+/// of the lineage this node holds after it (a voice dated at or after that
+/// instant no longer counts). `None`: `bundle` is not a Valid placement of
+/// the lineage this node holds.
+///
+/// The bundle's holders are read HERE and nowhere else for such a row
+/// (`scripts/one_standing.py`, rule `bundle`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamedBundle {
+    /// The lineage's `family_key_id`.
+    pub family_key_id: String,
+    /// The holders' identity-refs, in the bundle's order.
+    pub holders: Vec<String>,
+    /// [`GenesisInForce::successor_instant`] of the bundle.
+    pub successor_at_ms: Option<u64>,
+}
+
+/// [`NamedBundle`] of `bundle` on this node.
+///
+/// # Errors
+/// Directory read failures.
+pub async fn named_bundle<F>(dir: &F, bundle: &Digest32) -> Result<Option<NamedBundle>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let state = genesis_in_force(dir).await?;
+    Ok(state
+        .valid
+        .iter()
+        .find(|p| p.object_id == *bundle)
+        .map(|p| NamedBundle {
+            family_key_id: p.family_key_id.clone(),
+            holders: p.holders.iter().map(|h| h.identity_ref.clone()).collect(),
+            successor_at_ms: state.successor_instant(bundle),
+        }))
+}
+
 /// **The genesis in force** on this node: every held voice and the rows it
 /// names, read by Verify's reader in lineage order (each held first bundle
 /// rooted by its own object id).
@@ -826,7 +951,10 @@ where
         anchor: None,
         attestation_roots: &roots,
     });
-    let f = in_force_of(&reading, &rows);
+    // v62.0.0 (KR-fix27b) — a store whose Valid first bundles name two
+    // families roots in the PINNED anchor's (`store_root_family`): a pure
+    // function of the held content, so the reading is cached as before.
+    let f = in_force_of(&reading, &rows, store_root_family(&reading));
     cache_put(key, &f);
     Ok(f)
 }
@@ -877,6 +1005,58 @@ where
     reads_bundle_in_force();
     let f = genesis_in_force(dir).await?;
     Ok(f.tips().into_iter().cloned().collect())
+}
+
+/// v62.0.0 (HEAD-1; CC 2.4.1.1, "for a grant from a root it is the bundle in
+/// force") — **the head a root's act names**: the object id of the bundle in
+/// force, the head of the held Valid lineage ([`GenesisInForce::head`]).
+/// `None` with no bundle held, or on a fork (no head). Read by the producer's
+/// head rule (`head_rule::resolve`), never by a gate.
+///
+/// # Errors
+/// Directory read failures.
+pub async fn bundle_head_in_force<F>(dir: &F) -> Result<Option<Digest32>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(genesis_in_force(dir).await?.head.map(|p| p.object_id))
+}
+
+/// v62.0.0 (HEAD-3; CC 2.4.1.1, "an end with a newer head in its own past")
+/// — **does the held Valid bundle `from` descend from `to`** (follow `prev`
+/// from `from`, never an instant)? `false` when either is not a held Valid
+/// bundle, or `from == to`.
+///
+/// # Errors
+/// Directory read failures.
+pub async fn bundle_descends<F>(dir: &F, from: &Digest32, to: &Digest32) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let state = genesis_in_force(dir).await?;
+    let prev_of = |id: &Digest32| {
+        state
+            .valid
+            .iter()
+            .find(|p| p.object_id == *id)
+            .map(|p| p.prev)
+    };
+    if prev_of(to).is_none() {
+        return Ok(false);
+    }
+    let mut at = prev_of(from).flatten();
+    let mut steps = 0usize;
+    while let Some(id) = at {
+        if id == *to {
+            return Ok(true);
+        }
+        steps += 1;
+        if steps > state.valid.len() {
+            return Ok(false);
+        }
+        at = prev_of(&id).flatten();
+    }
+    Ok(false)
 }
 
 /// **Canonical standing under ruling C** over the held lineage: the
@@ -1048,7 +1228,7 @@ where
             Some(o) => match short_of.get(&o) {
                 Some(b) => *b,
                 None => {
-                    let b = dir.fold_held(&RowId(o)).await?.is_some();
+                    let b = super::fold::why_held(dir, &RowId(o)).await?.is_some();
                     short_of.insert(o, b);
                     b
                 }
@@ -2545,6 +2725,46 @@ where
         let Some(p) = o.reading.verdict.placement() else {
             continue;
         };
+        // v62.0.0 (PRE4-witness; CC v1.0-rc22-pre4 3.2 T6, the lead's safety
+        // rule) — a bundle whose charter names transparency services is
+        // current only with Receipts from them, which this node cannot check
+        // yet (not built in v62.0). It is never read as current: its voices
+        // are HELD by a named reason on the head-adoption plane (a held
+        // bundle is never in force and never rooted by its own id), its named
+        // rows are not admitted, and the node keeps the bundle it holds (CC
+        // 3.2 T4). "Fail closed" names that plane only.
+        if !p.charter.transparency_services.is_empty() {
+            let oid = hex::encode(o.reading.object_id);
+            let detail = format!(
+                "bundle {oid}'s charter names {} transparency service(s): it is current only \
+                 with their Receipts (CC 3.2 T6), which this node cannot check; held, and the \
+                 bundle this node holds stays in force (CC 3.2 T4)",
+                p.charter.transparency_services.len()
+            );
+            let objects: Vec<HeldObject> = o
+                .kept
+                .iter()
+                .filter_map(|v| held_object(o.reading.object_id, v))
+                .collect();
+            if !objects.is_empty() {
+                short_bundles.push((
+                    o.reading.object_id,
+                    objects,
+                    token::RECEIPTS_UNCHECKED.to_owned(),
+                    detail.clone(),
+                ));
+            }
+            if fresh.contains(&o.reading.object_id) {
+                refused.push(NotPlaced {
+                    object_id: o.reading.object_id,
+                    token: token::RECEIPTS_UNCHECKED,
+                    detail: Some(detail),
+                    waiting: false,
+                    refused: Vec::new(),
+                });
+            }
+            continue;
+        }
         // v62.0.0 (DV-fix1) — one device per holder (CC 4.2.3) is Verify's
         // reader's (`holder_device_shared`, judged before a placement exists);
         // persist keeps no second check.
@@ -2653,7 +2873,7 @@ where
     // read as concluded before they are stored).
     for p in &placed {
         let id = RowId(p.object_id);
-        if dir.fold_held(&id).await?.is_some() {
+        if super::fold::why_held(dir, &id).await?.is_some() {
             record_bundle(dir, p.object_id, None).await?;
         }
     }

@@ -455,8 +455,12 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("fold_state", ConnClass::Read),
     ("fold_slot_rows", ConnClass::Read),
     ("put_fold_reason", ConnClass::Write),
+    // v62.0.0 (KR-fix20) — the door's drop of a held row refused for good.
+    ("drop_held_row", ConnClass::Write),
     ("fold_any_refolding", ConnClass::Read),
     ("fold_slot_held", ConnClass::Read),
+    // v62.0.0 (GID-tips) — the roster door's read of a slot's every row.
+    ("fold_slot_all_rows", ConnClass::Read),
     ("clear_occurrence_projection", ConnClass::Write),
     // v62.0.0 (slice J0) — the edition-2 read models, the cross-form
     // refusal's edition read, and the statement serve listing.
@@ -782,7 +786,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("lookup_shared_instance_lease", ConnClass::Read),
     ("lookup_signed_community", ConnClass::Read),
     // v51.0.0 (CIRISPersist#938) — the witness plane (V159).
-    ("list_lineage_head_cosigns_for", ConnClass::Read),
     ("lookup_signed_record_by_content_hash", ConnClass::Read),
     ("lookup_trust", ConnClass::Read),
     ("mark_ack_received", ConnClass::Write),
@@ -849,6 +852,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v54.0.0 (#994) — the V176 backfill: the candidate list, the exact
     // check-and-link in one transaction, and the stream-row test seam.
     ("list_unlinked_chunk_dags", ConnClass::Read),
+    // v62.0.0 (HEAD-6/HEAD-7) — the re-ack sweep's claim window.
+    ("held_blob_claim_window", ConnClass::Read),
     ("link_dag_chunks_if_exact", ConnClass::Write),
     ("test_drop_stream_chunk_row", ConnClass::Write),
     // v54.0.0 (#994, Codex on PR #1050) — the V185 resume cursor.
@@ -873,6 +878,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_purge_executions_since", ConnClass::Read),
     ("purge_delete_tombstoned_attestation", ConnClass::Write),
     ("purge_delete_tombstoned_trace", ConnClass::Write),
+    // v62.0.0 (WD-fix1) — the withdrawn-content sweep's read; the descent's
+    // statement delete.
+    ("list_withdrawals_since", ConnClass::Read),
+    ("purge_delete_tombstoned_statements", ConnClass::Write),
     ("purge_mark_finalized", ConnClass::Write),
     ("test_seam_set_key_identity_type", ConnClass::Write),
     ("test_seam_drop_purge_tombstone", ConnClass::Write),
@@ -881,7 +890,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v55.0.0 (CIRISPersist#989) — announce a holding claim for a held row.
     ("put_calibration_bundle", ConnClass::Write),
     ("put_edge_detection_event", ConnClass::Write),
-    ("put_identity_occurrence_revocation_local", ConnClass::Write),
+    (
+        "put_identity_occurrence_revocation_edition2",
+        ConnClass::Write,
+    ),
     ("put_installed_storage_budget", ConnClass::Write),
     // v50.0.0 (#928, V157) — the recorded admission depth of a `withdraws`.
     ("withdraws_admission_depth", ConnClass::Read),

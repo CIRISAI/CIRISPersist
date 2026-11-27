@@ -115,8 +115,19 @@ pub mod genesis;
 pub mod group;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod group_fixtures;
+// v62.0.0 (GID-prod) — the derived group id: one module, swapped for Verify
+// 23.5.1's export at the pin step.
+pub mod group_id;
 pub mod group_serve;
+// v62.0.0 (GID-tips) — I5717, I5718: a contested founding concludes nothing.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod group_tips_invariants;
 pub mod halt;
+// v62.0.0 (HEAD-1; CC 2.4.1.1) — the head rule: which head a row names.
+pub mod head_rule;
+// v62.0.0 (HEAD-2) — the head rule at the statement door (sqlite + pg).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod head_rule_invariants;
 pub mod ingest;
 pub mod liveness;
 pub mod names;
@@ -159,6 +170,11 @@ pub mod trust_root_group;
 pub mod typed;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod typed_fixtures;
+// v62.0.0 (VD-step1) — the one row-state verdict: "is this row concluded".
+pub mod verdict;
+// v62.0.0 (VD-step1b) — I6300–I6305: the one row-state verdict's findings.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod verdict_invariants;
 pub mod voices;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod voices_invariants;
@@ -315,6 +331,10 @@ mod window_invariants;
 // merged and served, and the receipt leg, on sqlite and postgres.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod receipts_invariants;
+// v62.0.0 (PRE4-retire) — I6403: the five retired families are refused by
+// name at the statement door, on sqlite and postgres.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod pre4_retired_invariants;
 
 pub use ciris_verify_core::edition2::Digest32;
 
@@ -329,6 +349,7 @@ pub mod token {
         EDITION2_FAMILY_INVALID as FAMILY_INVALID, EDITION2_NOT_A_ROW as NOT_A_ROW,
         EDITION2_ROW_ID_MISMATCH as ROW_ID_MISMATCH,
         EDITION2_ROW_REF_EDITION_1 as ROW_REF_EDITION_1,
-        EDITION2_STATEMENT_INVALID as STATEMENT_INVALID, KEY_RECORD_OUT_OF_WINDOW, KID_NOT_OF_ISS,
+        EDITION2_STATEMENT_INVALID as STATEMENT_INVALID, FAMILY_RETIRED, KEY_RECORD_OUT_OF_WINDOW,
+        KID_NOT_OF_ISS,
     };
 }

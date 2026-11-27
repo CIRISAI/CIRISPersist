@@ -178,7 +178,8 @@ pub(crate) mod bodies {
             id_of(&q),
             id_of(&solo),
         );
-        found_room_with_blob(
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let solo = found_room_with_blob(
             d,
             &solo,
             "founder_only",

@@ -13,6 +13,8 @@
 #   manifests/csd4_chain.json                  -> src/federation/namespace/csd4_chain.json
 #   manifests/topology_vocabulary.json         -> src/federation/namespace/topology_vocabulary.json
 #   manifests/signed_object_vectors.json       -> src/federation/namespace/signed_object_vectors.json  (v61.0.0)
+#   manifests/family_model.json                -> src/federation/namespace/family_model.json           (v62.0.0, FS-step1)
+#   manifests/refusal_tokens.tsv               -> src/federation/namespace/refusal_tokens.tsv          (v62.0.0, PIN-pre4)
 #   formal/self_roster/traces/*.json           -> tests/fixtures/self_roster/*.json (the six traces)
 #
 # (pins: registry.rs and cc_manifests.rs; the from-disk witness I1302 checks
@@ -106,7 +108,7 @@ compare() {  # <path in CC at the tag> <local path>
 }
 for f in namespace_registry.json namespace_match_vectors.json governance_policy.json \
          governance_policy_vectors.json csd4_chain.json topology_vocabulary.json \
-         signed_object_vectors.json; do
+         signed_object_vectors.json family_model.json refusal_tokens.tsv; do
   compare "manifests/$f" "$dir/$f"
 done
 for f in "$root"/tests/fixtures/self_roster/*.json; do

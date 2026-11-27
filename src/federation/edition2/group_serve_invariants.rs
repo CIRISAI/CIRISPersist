@@ -22,9 +22,8 @@
 //!   payload states (CC: `admission:unit` like any scores row): `self` to
 //!   its author only (not another key, not anonymous), `federation` to
 //!   anyone, and no stated scope as `federation` (the attestation default).
-//! - **I3009** a `cosign:pending` voice (no scope of its own) is served to
-//!   the audience of the group event it cosigns: a member, not a stranger,
-//!   not an anonymous read.
+//! - **I3009** (deleted v62.0.0 PRE4-cosign: `cosign:{state}` is retired;
+//!   no cosign voice is held to serve).
 
 use chrono::{TimeZone, Utc};
 use ciris_crypto::composite::CompositeSigningKey;
@@ -32,8 +31,7 @@ use ciris_verify_core::cde::Value;
 
 use super::door_invariants::fixture::{iref, key, key_record};
 use super::group::{
-    membership_payload, roster_payload, GroupRecord, MembershipRecord, GROUP_ROSTER_PREFIX,
-    MEMBERSHIP_PREFIX,
+    membership_payload, GroupRecord, MembershipRecord, GROUP_ROSTER_PREFIX, MEMBERSHIP_PREFIX,
 };
 use super::ingest::{put_statement, StatementOutcome, INGEST_TIER};
 use super::serve::servable_to;
@@ -95,7 +93,8 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
         charter_digest: String::new(),
         persist_row_hash: String::new(),
     });
-    let p = roster_payload(&record, 1, None, 2_000).unwrap();
+    // GID-fixtures-sites — founded under its DERIVED id (`gid` was its name).
+    let (gid, p) = crate::federation::edition2::group_fixtures::fixture_founding(&record, 2_000);
     let voices: Vec<Vec<u8>> = [&a, &b, &c]
         .iter()
         .map(|k| sign(k, &gid, GROUP_ROSTER_PREFIX, &p))
@@ -160,29 +159,8 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
         assert!(!served(d, v, Some(&stranger)).await, "I3008 a stranger");
     }
 
-    // I3009 — a cosign over the roster event follows the event's audience.
-    super::fixture_switch::put_key(d, "t1-cosigner", &["user"]).await;
-    let cosign =
-        super::typed_fixtures::cosign_statement("t1-cosigner", "pending", &gid, &head, 6_000);
-    put_statement(d, &cosign, None, INGEST_TIER)
-        .await
-        .unwrap_or_else(|e| panic!("I3009 the cosign is held: {e:?}"));
-    assert!(
-        d.get_attestation(&super::names::RowId::of_statement(&cosign).unwrap().hex())
-            .await
-            .unwrap()
-            .is_none(),
-        "I3009 a cosign maps to no attestation row"
-    );
-    assert!(
-        served(d, &cosign, Some(&a)).await,
-        "I3009 a member of the event's group"
-    );
-    assert!(
-        !served(d, &cosign, Some(&stranger)).await,
-        "I3009 a stranger"
-    );
-    assert!(!served(d, &cosign, None).await, "I3009 anonymous");
+    // I3009 — DELETED (v62.0.0 PRE4-cosign): `cosign:{state}` is retired, so
+    // no node holds a cosign voice to serve; one is refused by name (I6403).
 }
 
 #[cfg(feature = "sqlite")]
@@ -352,7 +330,8 @@ pub(crate) async fn invitee_body(d: &dyn FederationDirectory) {
         charter_digest: String::new(),
         persist_row_hash: String::new(),
     });
-    let p = roster_payload(&record, 1, None, 2_000).unwrap();
+    // GID-fixtures-sites — founded under its DERIVED id (`gid` was its name).
+    let (gid, p) = crate::federation::edition2::group_fixtures::fixture_founding(&record, 2_000);
     let o = put(d, &sign(&kf, &gid, GROUP_ROSTER_PREFIX, &p)).await;
     assert!(
         matches!(o, StatementOutcome::Row { .. }),
@@ -437,7 +416,8 @@ pub(crate) async fn carried_body(d: &dyn FederationDirectory) {
         charter_digest: String::new(),
         persist_row_hash: String::new(),
     });
-    let p = roster_payload(&record, 1, None, 2_000).unwrap();
+    // GID-fixtures-sites — founded under its DERIVED id (`gid` was its name).
+    let (gid, p) = crate::federation::edition2::group_fixtures::fixture_founding(&record, 2_000);
     let head_st = sign(&kf, &gid, GROUP_ROSTER_PREFIX, &p);
     let StatementOutcome::Row { row_id: head, .. } = put(d, &head_st).await else {
         panic!("I3013 founded");
@@ -569,7 +549,9 @@ pub(crate) async fn held_citer_body(dir: std::sync::Arc<dyn FederationDirectory>
         charter_digest: String::new(),
         persist_row_hash: String::new(),
     });
-    let payload = roster_payload(&record, 1, None, 2_000).unwrap();
+    // GID-fixtures-sites — founded under its DERIVED id (`gid` was its name).
+    let (gid, payload) =
+        crate::federation::edition2::group_fixtures::fixture_founding(&record, 2_000);
     let head_st = sign(&kf, &gid, GROUP_ROSTER_PREFIX, &payload);
     let StatementOutcome::Row { row_id: head, .. } = put(d, &head_st).await else {
         panic!("I2186 founded");

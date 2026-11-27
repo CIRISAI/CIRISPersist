@@ -1430,30 +1430,13 @@ where
         h.update(b"\x00");
     };
     feed("row", &serde_json::to_value(signed).unwrap_or_default());
-    // v51.0.0 (#938) — every cosign held for the lineage (a stored input the
-    // witnessed-head fold reads; propagates its failure like every read here).
-    let cosigns = match directory
-        .list_lineage_head_cosigns_for(&signed.community.community_key_id)
-        .await
-    {
-        Ok(c) => Some(c),
-        Err(e) => return Err(e),
-    };
-    feed(
-        "lineage_cosigns",
-        &serde_json::to_value(&cosigns).unwrap_or_default(),
-    );
-    // PR #943 review — the charter members the witnessed-head fold reads
-    // (`witness_quorum`; with the window and cadence for completeness): a
-    // quorum-authorized charter that raises the quorum must change the key.
+    // The charter members a standing read can reach (the window and the
+    // cadence). v62.0.0 (PRE4-witness; CC v1.0-rc22-pre4 3.2 T6) — witnessed
+    // mode is gone: no cosign and no witness quorum is an input any more.
     let charter = charter_members_for(directory, &signed.community.community_key_id).await?;
     feed(
         "charter_members",
-        &serde_json::json!(charter.map(|c| (
-            c.attach_window_secs,
-            c.witness_cadence_secs,
-            c.witness_quorum
-        ))),
+        &serde_json::json!(charter.map(|c| (c.attach_window_secs, c.receipt_cadence_secs))),
     );
     // v62.0.0 (wave W1) — the edition-2 inputs: the holders of the genesis
     // bundle in force (the holder arm and the birth's count) and the held
@@ -1931,20 +1914,9 @@ where
         }
         Err(e) => return Err(e),
     }
-    // v51.0.0 (CIRISPersist#938, CC 3.2 T6) — the current head is the latest
-    // WITNESSED version of the chain this node holds; an unwitnessed tail is
-    // held, not adopted; two witnessed heads freeze the lineage at their last
-    // common ancestor. A lineage never witnessed is judged as before
-    // (`ever_witnessed` — the upgrade cannot un-root every node at once).
-    let witness = witnessed_head(directory, &chain, now).await?;
-    let signed = match witness.judged {
-        Some(i) if i + 1 < chain.len() => {
-            let mut judged = chain[i].clone();
-            judged.lineage = chain[..i].to_vec();
-            judged
-        }
-        _ => signed,
-    };
+    // v62.0.0 (PRE4-witness; CC v1.0-rc22-pre4 3.2 T6) — witnessed mode is
+    // gone: the head is the chain's own head, current on the founders' count
+    // and its descent; nothing cosigns a head.
     // v62.0.0 (TR-fix1; CC rc21 3.2 T7 l.1232, T8 l.1257) — Stalled is the
     // MARGIN, never "a recorded founder stopped counting": live while the
     // active founder set holds at least M + 1 (M the absolute first number
@@ -2009,49 +1981,18 @@ where
     Ok((active, m, not_counting))
 }
 
-/// v51.0.0 (CIRISPersist#938) — what the witness plane says about a chain this
-/// node holds (FSD `TRUST_ROOT_RC6.md` §3.2–§3.3).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct WitnessedHead {
-    /// The chain index the standing is judged at: the latest witnessed
-    /// version, or the fork point under equivocation. `None` when the lineage
-    /// has never been witnessed (judged at its head, as before rc6).
-    pub judged: Option<usize>,
-    /// Versions past the judged one this node holds but does not adopt.
-    pub unwitnessed_tail: usize,
-    /// A competing witnessed head, when the lineage is frozen.
-    pub equivocation: Option<Equivocation>,
-    /// The latest cosign instant this node holds for the lineage, if any.
-    pub latest_cosign_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-/// Two witnessed heads for one lineage (T6): the evidence object.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Equivocation {
-    /// This node's witnessed head.
-    pub held_head_digest: String,
-    /// The competing witnessed head the witness plane names.
-    pub competing_head_digest: String,
-    /// The last common ancestor both descend from — the frozen head.
-    pub fork_digest: String,
-    /// The witnesses of each.
-    pub held_witnesses: Vec<String>,
-    /// The witnesses of the competing head.
-    pub competing_witnesses: Vec<String>,
-}
-
 /// v51.0.0 (CIRISPersist#937/#938) — the charter members of a root
 /// (`trust:charter:v1`, the self-loop `delegates_to` the root signed with an
-/// `infra:` scope): `attach_window_secs`, `witness_cadence_secs`,
-/// `witness_quorum`. `None` when the root has no charter row here.
+/// `infra:` scope): `attach_window_secs`, `receipt_cadence_secs`. `None` when
+/// the root has no charter row here. v62.0.0 (PRE4-witness; CC
+/// v1.0-rc22-pre4 3.2 T6) — `witness_quorum` is no longer read: witnessed
+/// mode is gone.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CharterMembers {
     /// [`super::envelope::paths::ATTACH_WINDOW_SECS`].
     pub attach_window_secs: Option<u64>,
-    /// [`super::envelope::paths::WITNESS_CADENCE_SECS`].
-    pub witness_cadence_secs: Option<u64>,
-    /// [`super::envelope::paths::WITNESS_QUORUM`].
-    pub witness_quorum: Option<u32>,
+    /// [`super::envelope::paths::RECEIPT_CADENCE_SECS`].
+    pub receipt_cadence_secs: Option<u64>,
 }
 
 /// v53.0.0 (CC 3.2 T6, operator ruling B-1 on CIRISConstitution#136) —
@@ -2123,7 +2064,7 @@ pub fn stored_row_hash(charter: &super::Attestation) -> Result<String, Error> {
 ///
 /// Returns the key id the charter rows name (`attested_key_id`) with the
 /// verdict. Every reader of a root's charter — the trust-root charter leg,
-/// the charter members (attach window, witness cadence and quorum) — routes
+/// the charter members (attach window, witness cadence) — routes
 /// through here, so they cannot disagree about which charter stands.
 ///
 /// # Errors
@@ -2300,194 +2241,9 @@ where
         let e = &a.attestation_envelope;
         CharterMembers {
             attach_window_secs: e.get(paths::ATTACH_WINDOW_SECS).and_then(|v| v.as_u64()),
-            witness_cadence_secs: e.get(paths::WITNESS_CADENCE_SECS).and_then(|v| v.as_u64()),
-            witness_quorum: e
-                .get(paths::WITNESS_QUORUM)
-                .and_then(|v| v.as_u64())
-                .map(|q| q.min(u32::MAX as u64) as u32),
+            receipt_cadence_secs: e.get(paths::RECEIPT_CADENCE_SECS).and_then(|v| v.as_u64()),
         }
     }))
-}
-
-/// The witness quorum a lineage's charter declares; `0` when the charter is
-/// silent or declares zero — witnessed mode off (#973, CC 3.2 T6).
-async fn witness_quorum_for<F>(directory: &F, community: &Community) -> Result<u32, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    Ok(super::lineage_witness::declared_witness_quorum(
-        charter_members_for(directory, &community.community_key_id)
-            .await?
-            .and_then(|c| c.witness_quorum),
-    ))
-}
-
-/// The witnessed-head computation over the chain this node holds and every
-/// cosign held for the lineage. Emits `hard_case:lineage_equivocation` (once
-/// per pair, idempotent by event id) when two witnessed heads are found.
-async fn witnessed_head<F>(
-    directory: &F,
-    chain: &[SignedCommunity],
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<WitnessedHead, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    use super::lineage_witness::{effective_cosigns, principals_of, witnessed, witnesses_of};
-    let Some(head) = chain.last() else {
-        return Ok(WitnessedHead {
-            judged: None,
-            unwitnessed_tail: 0,
-            equivocation: None,
-            latest_cosign_at: None,
-        });
-    };
-    let id = head.community.community_key_id.as_str();
-    let cosigns = directory.list_lineage_head_cosigns_for(id).await?;
-    let known: Vec<(String, chrono::DateTime<chrono::Utc>)> = chain
-        .iter()
-        .map(|v| Ok((row_hash(&v.community)?, head_instant(v))))
-        .collect::<Result<_, Error>>()?;
-    let digests: Vec<String> = known.iter().map(|(d, _)| d.clone()).collect();
-    // PR #943 review: only cosigns that COUNT (the witness key valid at its
-    // instant; a deferred cosign re-checked against the version it names).
-    let effective = effective_cosigns(directory, &cosigns, &known).await?;
-    let latest_cosign_at = effective.iter().map(|c| c.signed_at).max();
-    let founders_all: Vec<String> = chain
-        .iter()
-        .flat_map(|v| founders(&v.community).into_iter().map(str::to_owned))
-        .collect();
-    let founder_principals = principals_of(directory, &founders_all).await?;
-    let quorum = witness_quorum_for(directory, &head.community).await?;
-    // #973 (CC 3.2 T6) — witnessed mode OFF: the head is current on the
-    // founders' quorum and its descent, exactly as before rc6. Cosigns held
-    // are evidence and judge nothing: no witnessed prefix, no equivocation.
-    if !super::lineage_witness::witnessed_mode_on(quorum) {
-        return Ok(WitnessedHead {
-            judged: None,
-            unwitnessed_tail: 0,
-            equivocation: None,
-            latest_cosign_at,
-        });
-    }
-    // Witnessed mode engages only once some version of this chain has actually
-    // reached the QUORUM (PR #943 review: one cosign under a quorum of two
-    // must not roll a multi-version lineage back to its birth). Until then the
-    // lineage is judged as before rc6.
-    let Some(mut judged) = (0..chain.len())
-        .rev()
-        .find(|&i| witnessed(&effective, &digests[i], &founder_principals, quorum))
-    else {
-        return Ok(WitnessedHead {
-            judged: None,
-            unwitnessed_tail: 0,
-            equivocation: None,
-            latest_cosign_at,
-        });
-    };
-    // Equivocation: a WITNESSED head not in this chain whose ancestry, walked
-    // back through the priors the witness plane names, reaches this chain at
-    // or before the judged version (PR #943 review: walk the whole competing
-    // ancestry, not only the immediate prior — H1→H2′→H3′ against H1→H2→H3
-    // forks at H1).
-    let priors: std::collections::BTreeMap<&str, Vec<&str>> = {
-        let mut m: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
-        for c in &effective {
-            if let Some(p) = c.prior.as_deref() {
-                m.entry(c.head_digest.as_str()).or_default().push(p);
-            }
-        }
-        m
-    };
-    let fork_point = |start: &str| -> Option<usize> {
-        let mut frontier = vec![start];
-        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        let mut best: Option<usize> = None;
-        while let Some(d) = frontier.pop() {
-            if !seen.insert(d) || seen.len() > effective.len() + 1 {
-                continue;
-            }
-            for p in priors.get(d).into_iter().flatten() {
-                match digests.iter().position(|x| x == p) {
-                    Some(i) => best = Some(best.map_or(i, |b: usize| b.min(i))),
-                    None => frontier.push(p),
-                }
-            }
-        }
-        best
-    };
-    let mut equivocation = None;
-    let mut competing: Vec<&str> = effective
-        .iter()
-        .filter(|c| !digests.contains(&c.head_digest))
-        .map(|c| c.head_digest.as_str())
-        .collect();
-    competing.sort_unstable();
-    competing.dedup();
-    for d in competing {
-        if !witnessed(&effective, d, &founder_principals, quorum) {
-            continue;
-        }
-        let Some(fork_i) = fork_point(d) else {
-            continue;
-        };
-        if fork_i < judged {
-            let e = Equivocation {
-                held_head_digest: digests[judged].clone(),
-                competing_head_digest: d.to_owned(),
-                fork_digest: digests[fork_i].clone(),
-                held_witnesses: witnesses_of(&effective, &digests[judged], &founder_principals),
-                competing_witnesses: witnesses_of(&effective, d, &founder_principals),
-            };
-            emit_lineage_equivocation(directory, id, &e, now).await?;
-            judged = fork_i;
-            equivocation = Some(e);
-        }
-    }
-    Ok(WitnessedHead {
-        judged: Some(judged),
-        unwitnessed_tail: chain.len() - 1 - judged,
-        equivocation,
-        latest_cosign_at,
-    })
-}
-
-/// `hard_case:lineage_equivocation:{lineage}` under the substrate emitter
-/// rule; idempotent per (lineage, pair) by event id.
-async fn emit_lineage_equivocation<F>(
-    directory: &F,
-    lineage_key_id: &str,
-    e: &Equivocation,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<(), Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let (a, b) = if e.held_head_digest <= e.competing_head_digest {
-        (&e.held_head_digest, &e.competing_head_digest)
-    } else {
-        (&e.competing_head_digest, &e.held_head_digest)
-    };
-    let event = super::hard_case::HardCaseEvent {
-        event_id: format!(
-            "lineage_equivocation:{lineage_key_id}:{}:{}",
-            &a[..16],
-            &b[..16]
-        ),
-        kind: super::hard_case::kind::LINEAGE_EQUIVOCATION.to_owned(),
-        target_key_id: Some(lineage_key_id.to_owned()),
-        subject_key_id: Some(lineage_key_id.to_owned()),
-        detail: serde_json::to_value(e).unwrap_or_default(),
-        emitted_at: now,
-        emitter_key_id: String::new(),
-    };
-    match super::hard_case::record_observation(directory, event).await {
-        Ok(()) => Ok(()),
-        // a backend with no hard-case plane (the fault double's inner, a bare
-        // memory in a unit) still judges; the evidence is the cosign rows
-        Err(Error::Backend(m)) if m.contains("not implemented") => Ok(()),
-        Err(e) => Err(e),
-    }
 }
 
 /// #973 — which door an acceptance edge is arriving through at
@@ -2518,10 +2274,9 @@ impl AttachDoor {
 /// `trust:accepts:v1` whose `attested_key_id` is a root this node holds a
 /// LINEAGE for (a trust-root community, or a family): the edge must name the
 /// head it attaches under (`attached_head_digest`); that head must be the one
-/// this node holds, WITNESSED (the charter's quorum of independent witnesses),
-/// and no older than the charter's `attach_window_secs` measured against the
-/// head's signer-stamped instant under the CC 2.6.7 skew rule. A charter with
-/// no window admits only an edge naming the head (the T5 anchor). Refusals are
+/// this node holds (the T5 anchor; v62.0.0 PRE4-witness, CC v1.0-rc22-pre4
+/// 3.2 T6: witnessed mode is gone, so no head is fresh by cosignature and the
+/// charter's window does not apply to a named head). Refusals are
 /// `Error::TrustRootHeadStale`. A root with no lineage here (a KEY root) is
 /// not this gate's business; nothing on the ATTACHED side reads this.
 ///
@@ -2580,7 +2335,7 @@ where
     }
     let root = attested_key_id;
     // v62.0.0 (wave GC8; CC 2.7.3) — freshness reads the root's lineage
-    // (its held head, its witness cosigns, its charter's window), which are
+    // (its held head and its charter's window), which are
     // other rows: an edge that is not fresh against them is HELD with
     // `trust_root_head_stale` and re-folds when the root's rows change. The
     // edge naming no head at all (`TrustRootHeadUnnamed`) is the row's own
@@ -2649,11 +2404,12 @@ where
             )),
         };
     }
-    // The lineage head the attach is judged against is the WITNESSED head the
-    // fold serves (PR #943 review): with a witnessed H1 and an unwitnessed H2
-    // held, a consumer attaches under H1 — comparing with the raw stored H2
-    // made every witness-lag interval un-attachable.
-    let Some(view) = root_witness_view(directory, root, now).await? else {
+    // v62.0.0 (PRE4-witness; CC v1.0-rc22-pre4 3.2 T6) — the lineage head
+    // the attach is judged against is the head this node holds: witnessed
+    // mode is gone, so no head is fresh by cosignature and an attach names
+    // the held head as its out-of-band anchor (T5). The charter's window does
+    // not apply to a named head.
+    let Some(view) = root_head_view(directory, root, now).await? else {
         return Ok(());
     };
     // T4a: "the gate runs on the edge's first admission only".
@@ -2667,16 +2423,14 @@ where
         .get(paths::ATTACHED_HEAD_DIGEST)
         .and_then(|v| v.as_str());
     // A new edge that NAMES itself `trust:accepts:v1` names the head it
-    // attaches on, in every mode. A row with no job label reaches this gate
-    // by direction inference only, and the same inference covers a family's
-    // charter and the baked genesis plane (the unlabeled `genesis-charter`),
-    // which are not acceptance edges and carry no head: for those the
+    // attaches on. A row with no job label reaches this gate by direction
+    // inference only, and the same inference covers a family's charter,
+    // which is not an acceptance edge and carries no head: for those the
     // pre-#973 reading is kept exactly — armed by the charter's window.
     let labeled = super::admission::envelope_dimension(envelope)
         == Some(super::trust_root::TRUST_ACCEPTS_DIMENSION);
-    let off = !super::lineage_witness::witnessed_mode_on(view.quorum);
-    // Another node's attach: the shape rule only. Which head it named, and
-    // whether that head was fresh and witnessed, was its own door's question.
+    // Another node's attach: the shape rule only. Which head it named was its
+    // own door's question.
     if door == AttachDoor::Replicated && (presented.is_some() || !labeled) {
         return Ok(());
     }
@@ -2686,8 +2440,7 @@ where
                 root_key_id: root.to_owned(),
                 detail: format!(
                     "a new acceptance edge must name the lineage head it attaches on (`{}`): the \
-                     witnessed head, or the anchored head this node holds while witnessed mode is \
-                     off (CC 3.2 T4a)",
+                     anchored head this node holds (CC 3.2 T4a)",
                     paths::ATTACHED_HEAD_DIGEST
                 ),
             });
@@ -2695,66 +2448,18 @@ where
         if charter.attach_window_secs.is_none() {
             return Ok(());
         }
-        return if off {
-            refuse(format!(
-                "the lineage of {root} is in witnessed mode off: attaching requires an \
-                 out-of-band anchor naming the head (`{}`), never a cosignature (CC 3.2 T6)",
-                paths::ATTACHED_HEAD_DIGEST
-            ))
-        } else {
-            refuse(format!(
-                "the root's charter declares an attach window of {}s: attaching requires the \
-                 witnessed lineage head (`{}`) inside it — never attach on a stale or absent one",
-                charter.attach_window_secs.unwrap_or_default(),
-                paths::ATTACHED_HEAD_DIGEST
-            ))
-        };
-    };
-    // #973 (CC 3.2 T6, witnessed mode off) — no head is fresh by cosignature,
-    // so none is attachable by cosignature: an attach is by an out-of-band
-    // anchor to the head this node holds (T5), and the window does not apply.
-    if off {
-        return match view.held_head.as_ref() {
-            Some((held, _)) if presented == held => Ok(()),
-            _ => refuse(format!(
-                "the presented head {presented} is not the head this node holds for {root}: in \
-                 witnessed mode off an attach names the current head as its anchor"
-            )),
-        };
-    }
-    let Some((head_digest, head_at)) = view.witnessed_head.clone() else {
         return refuse(format!(
-            "the lineage of {root} is not witnessed ({} independent witness cosign(s) required, \
-             founders excluded): never attach on an unwitnessed head (CC 3.2 T6)",
-            view.quorum
+            "attaching to {root} requires an out-of-band anchor naming the head (`{}`), never a \
+             cosignature (CC 3.2 T6)",
+            paths::ATTACHED_HEAD_DIGEST
         ));
     };
-    if presented != head_digest {
-        return refuse(format!(
-            "the presented head {presented} is not the witnessed head this node serves for \
-             {root} ({head_digest}): fetch the current witnessed head, never attach on a stale one"
-        ));
-    }
-    match charter.attach_window_secs {
-        None => Ok(()), // no window: the named head IS the T5 anchor
-        Some(window) => {
-            // PR #943 review: checked conversion and date arithmetic — a
-            // window beyond what an instant can express is no bound at all.
-            let latest_ok = i64::try_from(window)
-                .ok()
-                .and_then(chrono::Duration::try_seconds)
-                .and_then(|w| head_at.checked_add_signed(w))
-                .and_then(|t| t.checked_add_signed(super::operational::CLOCK_SKEW_TOLERANCE));
-            match latest_ok {
-                Some(latest_ok) if now > latest_ok => refuse(format!(
-                    "the head {head_digest} was asserted at {} — older than the root's attach \
-                     window of {window}s (measured against the signer-stamped instant, ±skew): \
-                     fetch a fresher witnessed head or refuse to attach",
-                    head_at.to_rfc3339()
-                )),
-                _ => Ok(()),
-            }
-        }
+    match view.held_head.as_ref() {
+        Some((held, _)) if presented == held => Ok(()),
+        _ => refuse(format!(
+            "the presented head {presented} is not the head this node holds for {root}: an \
+             attach names the current head as its anchor"
+        )),
     }
 }
 
@@ -2791,99 +2496,59 @@ where
     Ok(canonical(&held.attestation_envelope)? == canonical(envelope)?)
 }
 
-/// The witness plane's view of a ROOT this node holds a lineage for — a
-/// trust-root community (its chain) or a conferring family (its record) —
-/// in the one shape the attach gate and the trust surfaces read (PR #943
-/// review: families are lineages too).
+/// The head view of a ROOT this node holds a lineage for — a trust-root
+/// community (its chain) or a conferring family (its record) — in the one
+/// shape the attach gate and the trust surfaces read (PR #943 review:
+/// families are lineages too).
+///
+/// v62.0.0 (PRE4-witness; CC v1.0-rc22-pre4 3.2 T6) — was `RootWitnessView`:
+/// witnessed mode is gone, so the witnessed head, the quorum, the community
+/// fold's witness detail and the latest cosign are deleted; the head is the
+/// one this node holds.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct RootWitnessView {
-    /// The served head when witnessed: digest and signer-stamped instant.
-    pub witnessed_head: Option<(String, chrono::DateTime<chrono::Utc>)>,
-    /// The head this node holds for the lineage, witnessed or not: the anchor
-    /// an attach names while witnessed mode is off (#973).
+pub struct RootHeadView {
+    /// The head this node holds for the lineage: the anchor an attach names.
     pub held_head: Option<(String, chrono::DateTime<chrono::Utc>)>,
-    /// The charter's quorum; `0` = witnessed mode off (a silent charter, or
-    /// one declaring zero — no default is substituted).
-    pub quorum: u32,
-    /// The community fold's detail (`None` for a family root).
-    pub community: Option<WitnessedHead>,
-    /// The latest instant a counting cosign was signed.
-    pub latest_cosign_at: Option<chrono::DateTime<chrono::Utc>>,
     /// v53.0.0 (CC 3.2 T6, consequence (ii)) — the held head lags its roster:
-    /// a roster row older than one `witness_cadence_secs` that no version
-    /// covers (`lineage_head_lags_roster`). Reported whatever the witness
-    /// quorum; with witnessed mode on, witnesses do not cosign it.
+    /// a roster row older than one `receipt_cadence_secs` that no version
+    /// covers (`lineage_head_lags_roster`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub roster_lag: Option<super::roster_head::RosterLag>,
 }
 
-/// See [`RootWitnessView`]. `None` when this node holds no lineage for `root`.
-pub async fn root_witness_view<F>(
+/// See [`RootHeadView`]. `None` when this node holds no lineage for `root`.
+pub async fn root_head_view<F>(
     directory: &F,
     root: &str,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<RootWitnessView>, Error>
+) -> Result<Option<RootHeadView>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    use super::lineage_witness::{effective_cosigns, principals_of, witnessed};
-    let quorum = super::lineage_witness::declared_witness_quorum(
-        charter_members_for(directory, root)
-            .await?
-            .and_then(|c| c.witness_quorum),
-    );
     if let Some(signed) = lookup_signed_community(directory, root).await? {
         let chain = chain_of(&signed);
         let held_head = match chain.last() {
             Some(h) => Some((row_hash(&h.community)?, head_instant(h))),
             None => None,
         };
-        let w = witnessed_head(directory, &chain, now).await?;
-        let witnessed_head = match w.judged {
-            Some(i) => Some((row_hash(&chain[i].community)?, head_instant(&chain[i]))),
-            None => None,
-        };
-        let latest = w.latest_cosign_at;
         let roster_lag = super::roster_head::roster_lag(directory, root, now).await?;
-        return Ok(Some(RootWitnessView {
-            witnessed_head,
+        return Ok(Some(RootHeadView {
             held_head,
-            quorum,
-            community: Some(w),
-            latest_cosign_at: latest,
             roster_lag,
         }));
     }
     let Some(fam) = directory.lookup_family(root).await? else {
         return Ok(None);
     };
-    let cosigns = directory.list_lineage_head_cosigns_for(root).await?;
-    let known = vec![(fam.persist_row_hash.clone(), fam.founded_at)];
-    let effective = effective_cosigns(directory, &cosigns, &known).await?;
-    let members: Vec<String> = fam.members.iter().map(|m| m.key_id.clone()).collect();
-    let founder_principals = principals_of(directory, &members).await?;
-    let witnessed_head = witnessed(
-        &effective,
-        &fam.persist_row_hash,
-        &founder_principals,
-        quorum,
-    )
-    .then(|| (fam.persist_row_hash.clone(), fam.founded_at));
-    Ok(Some(RootWitnessView {
-        witnessed_head,
+    Ok(Some(RootHeadView {
         held_head: Some((fam.persist_row_hash.clone(), fam.founded_at)),
-        quorum,
-        community: None,
-        latest_cosign_at: effective.iter().map(|c| c.signed_at).max(),
         roster_lag: super::roster_head::roster_lag(directory, root, now).await?,
     }))
 }
 
 /// #973 (CC 3.2 T4a) — **the head a NEW acceptance edge must name** for
-/// `root`, as this node sees it now: the witnessed head while witnessed mode
-/// is on (`None` while the held head is not yet witnessed — nothing is
-/// attachable), the held head as the out-of-band anchor while it is off.
-/// `None` also when this node holds no lineage for `root` (a key root: the
+/// `root`, as this node sees it now: the held head, the out-of-band anchor
+/// (v62.0.0 PRE4-witness: witnessed mode is gone). `None` when this node holds no lineage for `root` (a key root: the
 /// gate does not apply and no head is named). A host building an acceptance
 /// edge writes the returned digest as `attached_head_digest`.
 pub async fn attach_head_for<F>(
@@ -2894,15 +2559,10 @@ pub async fn attach_head_for<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let Some(view) = root_witness_view(directory, root, now).await? else {
+    let Some(view) = root_head_view(directory, root, now).await? else {
         return Ok(None);
     };
-    let head = if super::lineage_witness::witnessed_mode_on(view.quorum) {
-        view.witnessed_head
-    } else {
-        view.held_head
-    };
-    Ok(head.map(|(digest, _)| digest))
+    Ok(view.held_head.map(|(digest, _)| digest))
 }
 
 /// #973 (CC 3.2 T3 / T4a) — **the signed envelope of a NEW acceptance edge**
@@ -2924,9 +2584,7 @@ where
 ///
 /// # Errors
 ///
-/// A directory read failure. `Ok` with no head while a witnessed lineage has
-/// no witnessed head yet: the edge is then refused at the write door, which is
-/// the honest answer (nothing is attachable).
+/// A directory read failure.
 pub async fn acceptance_edge_envelope<F>(
     directory: &F,
     root: &str,
@@ -2944,26 +2602,6 @@ where
         envelope[super::envelope::paths::ATTACHED_HEAD_DIGEST] = serde_json::Value::String(head);
     }
     Ok(envelope)
-}
-
-/// v51.0.0 (CIRISPersist#938) — the witness plane's view of a held trust-root
-/// lineage, for the trust surfaces (`resolve_community`, the bundle response):
-/// the judged index, the unwitnessed tail, any equivocation, and `silent_since`
-/// — the latest cosign older than the charter's cadence (a liveness signal,
-/// never a validity leg).
-pub async fn lineage_witness_view<F>(
-    directory: &F,
-    community_key_id: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<WitnessedHead>, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    // PR #943 review — ONE path: the community arm of [`root_witness_view`],
-    // the same fold the attach gate and the bundle surface read.
-    Ok(root_witness_view(directory, community_key_id, now)
-        .await?
-        .and_then(|v| v.community))
 }
 
 /// `Some(accord family id)` when `community_key_id` is a ROOTED earlier-form
@@ -3342,16 +2980,16 @@ fn extends(held: &SignedCommunity, chain: &[SignedCommunity]) -> Result<Extends,
 
 /// v62.0.0 (wave GC8; CC 3.2 T6, rc21 ruling 16) — a chain that does not
 /// extend the held version is a competing TIP: it waits (held, concluding
-/// nothing, reason `trust_root_chain`), and a reader that holds the witnessed
-/// head holds it void for itself. "No lineage is settled by which version a
+/// nothing, reason `trust_root_chain`), and a reader that holds its own head
+/// holds it void for itself. "No lineage is settled by which version a
 /// node saw first." Every caller wraps this in `fold::hold`.
 fn does_not_extend(id: &str) -> Error {
     violation(
         id,
         super::admission::TRUST_ROOT_RULE_CHAIN,
         "the offered chain does not extend the version this node holds: it is a competing tip \
-         and waits (held, concluding nothing); a reader holding the witnessed head holds it \
-         void (CC 3.2 T6)",
+         and waits (held, concluding nothing); a reader holding its own head holds it void \
+         (CC 3.2 T6)",
     )
 }
 
@@ -3566,11 +3204,9 @@ where
     let standing = chain_standing_at(directory, &id, now).await?;
     match standing.held() {
         Some(held) => {
-            // v51.0.0 (CIRISPersist#938, T6 §3) — restore discipline: the
-            // witness plane knows a head this node does not hold (a cosign
-            // whose prior is OUR head) — a founder writing over it would fork
-            // silently; fetch the witnessed head first.
-            check_not_behind_witness_plane(directory, held).await?;
+            // v62.0.0 (PRE4-witness; CC v1.0-rc22-pre4 3.2 T6) — the
+            // witness plane's restore check is deleted with witnessed mode
+            // (nothing cosigns a head, so no cosign can show this node behind).
             verify_founders_link(directory, &chain_of(held), &new, now).await?;
             check_founders_eligible(directory, &new.community, now).await?;
             new.lineage = chain_of(held);
@@ -3599,65 +3235,6 @@ where
         )),
         _ => Ok(new),
     }
-}
-
-/// v51.0.0 (CIRISPersist#938) — `lineage_head_behind_witness`: this node holds
-/// a cosign for a head digest it does not hold, whose `prior` is a version it
-/// holds — the witness plane is ahead of this node (a restore, a lag). A
-/// founder extending from here would write a detectable non-descendant; the
-/// door refuses until the witnessed head is fetched.
-async fn check_not_behind_witness_plane<F>(
-    directory: &F,
-    held: &SignedCommunity,
-) -> Result<(), Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let id = held.community.community_key_id.as_str();
-    // v62.0.0 (wave GC8) — the witness plane's cosigns are other rows.
-    fold::reads(Dep::key(id));
-    let cosigns = directory.list_lineage_head_cosigns_for(id).await?;
-    // PR #943 review (I193b) — two chains: `held` is the judged (witnessed)
-    // prefix the next amendment follows; the node may also STORE an
-    // unwitnessed tail beyond it. A cosign shows the node is behind when it
-    // names a head the node does not STORE whose prior is a stored version at
-    // or after the judged one — never for cosigns on the node's own tail.
-    let judged_len = chain_of(held).len();
-    let stored = lookup_signed_community(directory, id).await?;
-    let chain = chain_of(stored.as_ref().unwrap_or(held));
-    let digests: Vec<String> = chain
-        .iter()
-        .map(|v| row_hash(&v.community))
-        .collect::<Result<_, _>>()?;
-    let anchors = &digests[judged_len.saturating_sub(1).min(digests.len())..];
-    let head_digest = digests.last().cloned().unwrap_or_default();
-    if let Some(c) = cosigns.iter().find(|c| {
-        !digests.contains(&c.head_digest_sha256_hex)
-            && c.prior_head_digest_sha256_hex
-                .as_deref()
-                .is_some_and(|p| anchors.iter().any(|a| a == p))
-    }) {
-        return Err(fold::hold(
-            fold::reason::gc8::LINEAGE_HEAD_BEHIND_WITNESS,
-            violation(
-                id,
-                super::admission::TRUST_ROOT_RULE_BEHIND_WITNESS,
-                format!(
-                    "the witness plane holds a cosign by {} for head {} whose prior {} is a \
-                 version this node holds (its head is {}): this node is behind the witnessed \
-                 lineage (a restore or a lag) — fetch the witnessed head before extending \
-                 (CC 3.2 T6 rc6, restore discipline)",
-                    c.witness_key_id,
-                    c.head_digest_sha256_hex,
-                    c.prior_head_digest_sha256_hex
-                        .as_deref()
-                        .unwrap_or_default(),
-                    head_digest
-                ),
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// **The roster-plane guard** (CIRISPersist#926 re-check, HIGH-3 ruling), run
@@ -3818,24 +3395,9 @@ pub struct ResolvedCommunity {
     /// `true` for an ordinary room.
     #[serde(default)]
     pub live: bool,
-    /// v51.0.0 (CIRISPersist#938, T6) — the served head is a WITNESSED version
-    /// (`false` for a lineage the witness plane has never cosigned, which is
-    /// judged as before rc6, and for an ordinary room).
-    #[serde(default)]
-    pub witnessed: bool,
-    /// v51.0.0 (#938) — versions this node holds past the witnessed head, held
-    /// and not adopted.
-    #[serde(default)]
-    pub unwitnessed_tail: usize,
-    /// v51.0.0 (#938) — the lineage is frozen at the last common ancestor of
-    /// two witnessed heads; the evidence object.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub equivocation: Option<Equivocation>,
-    /// v51.0.0 (#938 §3.2) — the latest cosign instant when it is older than
-    /// the charter's `witness_cadence_secs`: SILENT, a liveness signal, never a
-    /// validity leg.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub witness_silent_since: Option<chrono::DateTime<chrono::Utc>>,
+    // v62.0.0 (PRE4-witness; CC v1.0-rc22-pre4 3.2 T6) — `witnessed`,
+    // `unwitnessed_tail`, `equivocation` and `witness_silent_since` are
+    // deleted with witnessed mode: the served head is the held one.
 }
 
 /// Resolve `community_key_id` from THIS node's state. `None` when no row is
@@ -3868,14 +3430,8 @@ where
             _ => return Ok(None),
         }
     }
-    // v51.0.0 (#938) — a trust root resolves to its WITNESSED head (the
-    // judged version), which may be an ancestor of the stored row.
+    // A trust root resolves to its rooted head.
     let community = rooted_head.unwrap_or(community);
-    let witness = if trust_root {
-        lineage_witness_view(directory, community_key_id, now).await?
-    } else {
-        None
-    };
     let roster = super::effective_roster(directory, &community).await?;
     let recorded: Vec<String> = founders(&community)
         .into_iter()
@@ -3912,27 +3468,6 @@ where
         consensus_protocol: community.consensus_protocol.clone(),
         consensus_protocol_entrenched: declares_entrenched(&community),
         live: live_now.unwrap_or(true),
-        witnessed: witness.as_ref().is_some_and(|w| w.judged.is_some()),
-        unwitnessed_tail: witness.as_ref().map_or(0, |w| w.unwitnessed_tail),
-        equivocation: witness.as_ref().and_then(|w| w.equivocation.clone()),
-        witness_silent_since: match &witness {
-            Some(w) => {
-                let cadence = charter_members_for(directory, community_key_id)
-                    .await?
-                    .and_then(|c| c.witness_cadence_secs);
-                // PR #943 review: checked conversion and arithmetic.
-                let horizon = cadence
-                    .and_then(|c| i64::try_from(c).ok())
-                    .and_then(chrono::Duration::try_seconds);
-                match (w.latest_cosign_at, horizon) {
-                    (Some(at), Some(h)) if at.checked_add_signed(h).is_some_and(|t| now > t) => {
-                        Some(at)
-                    }
-                    _ => None,
-                }
-            }
-            None => None,
-        },
     }))
 }
 

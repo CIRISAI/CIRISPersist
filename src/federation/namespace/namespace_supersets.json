@@ -14117,16 +14117,6 @@
    },
    {
     "decimal_id": "3.1.2",
-    "claim_id": "CLM-nsproc-witness-key-id-transparency-log-cosigned-tree-size",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/admission.rs#default_reserved_prefix_rules",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "witness_key_id",
-    "prefix": "transparency_log:cosigned:{tree_size}"
-   },
-   {
-    "decimal_id": "3.1.2",
     "claim_id": "CLM-nsproc-restrictions-attestation-license-validity",
     "repo": "CIRISPersist",
     "crate": "ciris-persist@21.4.0",
@@ -15525,22 +15515,6 @@
    },
    {
     "decimal_id": "3.2",
-    "claim_id": "CLM-witnessed-lineage",
-    "repo": "CIRISPersist",
-    "path#symbol": "src/federation/lineage_witness.rs#witnessed",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "manifest_round": "backfill-1052"
-   },
-   {
-    "decimal_id": "3.2",
-    "claim_id": "CLM-witnessed-lineage",
-    "repo": "CIRISPersist",
-    "path#symbol": "src/federation/canonical_community.rs#witnessed_head",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "manifest_round": "backfill-1052"
-   },
-   {
-    "decimal_id": "3.2",
     "claim_id": "CLM-liveness-margin",
     "repo": "CIRISPersist",
     "path#symbol": "src/federation/admission.rs#INFRA_RULE_LIVENESS_MARGIN_AT_FOUNDING",
@@ -16763,14 +16737,6 @@
     "manifest_round": "cc-rc8-1091"
    },
    {
-    "decimal_id": "3.4.10",
-    "claim_id": "CLM-witness-emitter",
-    "repo": "CIRISPersist",
-    "path#symbol": "src/federation/admission.rs#default_reserved_prefix_rules",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "manifest_round": "cc-rc8-1091"
-   },
-   {
     "decimal_id": "4.4.3.29",
     "claim_id": "CLM-multi-subject",
     "repo": "CIRISPersist",
@@ -16982,7 +16948,7 @@
     "decimal_id": "3.3.6.4",
     "claim_id": "CLM-self-roster-two-paths",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/self_roster.rs#gate",
+    "path#symbol": "src/federation/self_roster.rs#gate_edition2",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc9-1099"
    },
@@ -17435,7 +17401,7 @@
     "decimal_id": "3.3.4",
     "claim_id": "CLM-cosign-collection-held",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/cosign.rs#hold",
+    "path#symbol": "src/federation/cosign.rs#hold_if_short",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc18-1252"
    },
