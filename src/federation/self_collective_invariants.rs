@@ -48,7 +48,7 @@ pub(crate) mod bodies {
         occurrence: &str,
         kem: Option<EncryptionPubkeys>,
     ) {
-        d.put_identity_occurrence_local(IdentityOccurrence {
+        d.test_seam_put_identity_occurrence(IdentityOccurrence {
             identity_key_id: identity.to_owned(),
             occurrence_key_id: occurrence.to_owned(),
             // v53.0.0 (#963, CC 3.3.7) — the owner's PERSONAL device: a

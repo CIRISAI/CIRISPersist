@@ -55,7 +55,7 @@ mod tests {
             "i578",
             "a",
             "b",
-            &serde_json::json!({ "dimension": "evidence:safety_battery:capture:a:b:v1" }),
+            &serde_json::json!({ "dimension": "coherence_standing:cab:v1" }),
         );
         let sizes = [
             (

@@ -1379,6 +1379,49 @@ pub fn bundle_v2() -> &'static TestCeremonyV2 {
     STANDARD.get_or_init(|| ceremony_v2(&CeremonySpec::standard()))
 }
 
+/// LEAD-root1 — the charter scope of the baked PRODUCTION genesis: the
+/// `charter.scope` of the first bundle statement in
+/// [`super::genesis::BAKED_BUNDLES`]. Read, never typed.
+///
+/// # Panics
+/// The baked bundle does not decode, or carries no charter scope.
+#[must_use]
+pub fn production_charter_scope() -> Vec<String> {
+    let (name, bytes) = super::genesis::BAKED_BUNDLES
+        .first()
+        .expect("fixture_genesis: a baked bundle");
+    let statements = super::genesis::baked_statements(bytes)
+        .unwrap_or_else(|| panic!("fixture_genesis: the baked bundle {name} decodes"));
+    for st in &statements {
+        let Some((_, payload)) = super::liveness::statement_parts(st) else {
+            continue;
+        };
+        if let Some(ciris_verify_core::cde::Value::Array(scope)) = payload
+            .get_text("charter")
+            .and_then(|c| c.get_text("scope"))
+        {
+            return scope
+                .iter()
+                .filter_map(|v| v.as_text().map(str::to_owned))
+                .collect();
+        }
+    }
+    panic!("fixture_genesis: no statement of the baked bundle {name} carries charter.scope")
+}
+
+/// LEAD-root1 — [`bundle_v2`]'s ceremony (the same holders, seats and keys)
+/// whose charter carries the PRODUCTION scope list
+/// ([`production_charter_scope`]): the bundle a fixture stands a node up
+/// under when it will ask the root for grants (`infra:detect`, the assurance
+/// scopes, …). A grant outside a bundle's charter scope is refused, and the
+/// standard fixture bundle's charter carries two scopes only.
+pub fn bundle_v2_wide() -> &'static TestCeremonyV2 {
+    static WIDE: OnceLock<TestCeremonyV2> = OnceLock::new();
+    WIDE.get_or_init(|| {
+        ceremony_v2_with_scope(&CeremonySpec::standard(), &production_charter_scope())
+    })
+}
+
 /// What an install placed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstalledV2 {

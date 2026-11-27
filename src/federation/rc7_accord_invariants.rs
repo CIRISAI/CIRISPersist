@@ -81,7 +81,7 @@ pub(crate) mod bodies {
             .await
             .expect("the second root stands up");
         assert!(
-            trust_root_valid(d, &node, &r1.root, crate::host::clock::now())
+            trust_root_valid(d, &node, &r1.lineage, crate::host::clock::now())
                 .await
                 .unwrap()
                 .edge_exists,
@@ -119,7 +119,7 @@ pub(crate) mod bodies {
             .expect("the node's successor edge naming r2");
         Edges {
             node,
-            r1: r1.root,
+            r1: r1.lineage,
             r2: r2.root,
         }
     }
@@ -198,7 +198,7 @@ pub(crate) mod bodies {
         let node = ops::e2_node(d, tag);
         let r = e2::rooted_trust_root(d, &HOLDER_SEEDS, "quorum:2/3").await;
         assert!(
-            trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+            trust_root_valid(d, &node, &r.lineage, crate::host::clock::now())
                 .await
                 .unwrap()
                 .valid,
@@ -251,7 +251,7 @@ pub(crate) mod bodies {
         .unwrap()
         .expect("I439: the root's own grant confers");
         assert_eq!(
-            g.root_key_id, r.root,
+            g.root_key_id, r.lineage,
             "I439: the threshold root is the root"
         );
         assert_eq!(

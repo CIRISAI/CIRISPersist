@@ -54,7 +54,7 @@ fn voice(r: &RootedTrustRoot, i: usize, digest: &[u8; 32], at_ms: u64) -> Vec<u8
     };
     let p = takedown_payload(
         "steward_purge",
-        &r.root,
+        &r.lineage,
         digest,
         &[],
         &notice,
@@ -65,7 +65,7 @@ fn voice(r: &RootedTrustRoot, i: usize, digest: &[u8; 32], at_ms: u64) -> Vec<u8
     ciris_verify_core::edition2::sign_row_statement(
         &r.founder_key(i),
         &r.founders[i],
-        &r.root,
+        &r.lineage,
         "scores",
         &ciris_verify_core::namespace_match::family_id(TAKEDOWN_PREFIX),
         &p,
@@ -116,7 +116,7 @@ async fn receive_root<D: FederationDirectory + ?Sized>(a: &D, b: &D, r: &RootedT
         .expect("B holds the genesis bundle in force");
     // The root's key, and any founder's key B does not hold yet: A's own
     // `key:record` statements, replayed (never re-minted on B).
-    let keys = std::iter::once(&r.root).chain(r.founders.iter());
+    let keys = std::iter::once(&r.lineage).chain(r.founders.iter());
     for k in keys {
         if b.lookup_public_key(k).await.unwrap().is_some() {
             continue;
@@ -133,7 +133,8 @@ async fn receive_root<D: FederationDirectory + ?Sized>(a: &D, b: &D, r: &RootedT
                 .expect("B admits A's key record");
         }
     }
-    for row in [&r.birth, &r.charter] {
+    // LEAD-root1 — the root is the bundle: A's acceptance edge is the row.
+    for row in [&r.acceptance] {
         let voices = a.edition2_voices(row).await.unwrap();
         assert!(!voices.is_empty(), "A holds the root's rows");
         for st in voices {
@@ -152,7 +153,7 @@ async fn receive_root<D: FederationDirectory + ?Sized>(a: &D, b: &D, r: &RootedT
         .expect("B's own acceptance edge");
     // T2-fix5 — the verdict is printed: `NotRooted` names which half of the
     // read failed (the chain, B's own acceptance edge, or the charter).
-    let standing = crate::federation::canonical_community::stored_standing(b, &r.root)
+    let standing = crate::federation::canonical_community::stored_standing(b, &r.lineage)
         .await
         .unwrap();
     assert!(
