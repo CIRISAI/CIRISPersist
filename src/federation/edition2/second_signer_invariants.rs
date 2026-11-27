@@ -485,11 +485,16 @@ async fn i2848_body(d: &dyn FederationDirectory, s: &str) {
             lookup: true,
             listed: true,
             reachable: true,
-            standing: true,
+            // v62.0.0 (WD-fix23; CC 3.4.7.3) — a node's steward set is its one
+            // owner: the granter of a seated delegation of another purpose is
+            // no steward of the node, so the custody read stays false (it
+            // read true when clause (3) gave a node every live delegating
+            // person).
+            standing: false,
             point_served: true,
             listing_served: true,
         },
-        "I2848 (surfaces): voiced, the delegation is in every read surface"
+        "I2848 (surfaces): voiced, the delegation is in every read surface but the custody read"
     );
 }
 
@@ -588,10 +593,7 @@ async fn i2849_body(d: &dyn FederationDirectory, s: &str) {
         ("author", Value::Text(pk.clone())),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
         (
             "refs",
             map(vec![(
@@ -605,7 +607,7 @@ async fn i2849_body(d: &dyn FederationDirectory, s: &str) {
         &pk,
         &pk,
         "scores",
-        "evidence:.suite:.kind:.cell:.prefix",
+        "coherence_standing:.cohort",
         &payload,
         vec![],
     )

@@ -12,6 +12,7 @@
 #![cfg(all(feature = "test-anchor", feature = "sqlite"))]
 
 use ciris_persist::federation::chunk_dag_cascade::test_support::write_legacy_v2_dag;
+use ciris_persist::federation::edition2::fixture_occurrence::put_occurrence_signed;
 use ciris_persist::federation::key_grant_invariants::two_node::{
     introduce_as, key_grant_rows_for, Node,
 };
@@ -120,15 +121,26 @@ async fn pull_a_legacy_v2_dag(aad: Option<Vec<u8>>) {
         kem: kem(&sb).await,
     };
     introduce_as(&[&na, &nb], &[&alias_a, &alias_b], NODE).await;
-    // One person owning both nodes, both bound on both nodes as personal
-    // devices (a server-class occurrence gets none of its owner's self keys).
+    // One person owning both nodes, on both nodes. v62.0.0 (WD-fix11; CC
+    // 3.3.6, rc21 way (d)) — a node key is never a person's occurrence (the
+    // trusted-local row this wrote is retired, and the door refuses it
+    // `occurrence_mixes_person_and_machine`): each node is the owner's device
+    // by its OWNER BINDING, and carries its content-KEM keys on its own self
+    // pair (author = identity = occurrence = the node, one pen), which is
+    // where `devices_of` reads an owned node's keys from. Class `laptop`: a
+    // person's device node (`replication_audience::owned_device` gives a
+    // `server`-class node none of its owner's self keys, so a SELF write
+    // would have no wrap target: the build lane's
+    // `write_author_has_no_wrap_target`).
     let owner = format!("v2w-owner-{run}");
     for n in [&na, &nb] {
         ts::register_hybrid_key_as(n.backend, &owner, &owner, USER).await;
         for dev in [&na, &nb] {
-            n.backend
-                .put_identity_occurrence_local(IdentityOccurrence {
-                    identity_key_id: owner.clone(),
+            ts::put_owner_binding(n.backend, &owner, &dev.key).await;
+            put_occurrence_signed(
+                n.backend,
+                IdentityOccurrence {
+                    identity_key_id: dev.key.clone(),
                     occurrence_key_id: dev.key.clone(),
                     device_class: LAPTOP.to_owned(),
                     hardware_attestation: None,
@@ -137,10 +149,10 @@ async fn pull_a_legacy_v2_dag(aad: Option<Vec<u8>>) {
                     encryption_pubkeys: Some(dev.kem.clone()),
                     transport_binding: None,
                     persist_row_hash: String::new(),
-                })
-                .await
-                .expect("bind");
-            ts::put_owner_binding(n.backend, &owner, &dev.key).await;
+                },
+            )
+            .await
+            .expect("the node's own self pair");
         }
     }
 

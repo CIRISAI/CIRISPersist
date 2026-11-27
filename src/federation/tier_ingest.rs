@@ -173,11 +173,8 @@ where
     if super::group_plane::verify_plane_row(directory, row).await? {
         return Ok(());
     }
-    // v59.0.0 (CIRISPersist#1099) — a self-roster proposal row is minted from
-    // the signed object it carries, under the same rule.
-    if super::self_roster::verify_proposal_row(directory, row).await? {
-        return Ok(());
-    }
+    // v62.0.0 (WD-fix7) — the self-roster proposal row (minted, earlier form)
+    // is retired: no door stores one, so its signature rule went with it.
     // v61.3.0 (CIRISPersist#1252) — a cosign row is minted from the event it
     // carries; its one statement is over the event's own signing bytes.
     if super::cosign::verify_row(directory, row).await? {
@@ -2154,17 +2151,20 @@ pub mod test_support {
             );
         } else {
             register_user_role_key(dir, &device).await;
-            dir.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                identity_key_id: bob_observer.clone(),
-                occurrence_key_id: device.clone(),
-                device_class: crate::federation::types::device_class::SERVER.into(),
-                hardware_attestation: None,
-                asserted_at: crate::host::clock::now(),
-                valid_until: None,
-                encryption_pubkeys: None,
-                transport_binding: None,
-                persist_row_hash: String::new(),
-            })
+            crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+                dir,
+                crate::federation::types::IdentityOccurrence {
+                    identity_key_id: bob_observer.clone(),
+                    occurrence_key_id: device.clone(),
+                    device_class: crate::federation::types::device_class::SERVER.into(),
+                    hardware_attestation: None,
+                    asserted_at: crate::host::clock::now(),
+                    valid_until: None,
+                    encryption_pubkeys: None,
+                    transport_binding: None,
+                    persist_row_hash: String::new(),
+                },
+            )
             .await
             .unwrap_or_else(|e| panic!("({suffix}) bind device occurrence: {e}"));
         }
@@ -2274,7 +2274,7 @@ pub mod test_support {
                 .await
                 .unwrap_or_else(|e| panic!("({suffix}) revoke device binding: {e}"));
         } else {
-            dir.put_identity_occurrence_revocation_local(
+            dir.put_identity_occurrence_revocation_edition2(
                 crate::federation::types::IdentityOccurrenceRevocation {
                     identity_key_id: bob_observer.clone(),
                     occurrence_key_id: device.clone(),
@@ -2284,6 +2284,7 @@ pub mod test_support {
                     witness_set: vec![],
                     persist_row_hash: String::new(),
                 },
+                crate::federation::DoorToken::new(),
             )
             .await
             .unwrap_or_else(|e| panic!("({suffix}) revoke device binding: {e}"));
@@ -2370,125 +2371,150 @@ pub mod test_support {
         .map(|_| ())
     }
 
-    /// v38.6.0 (#773) — a live custody claim `delegates_to(steward → subject)`.
-    ///
-    /// Carries the ownership dimension MARKER deliberately: an agent
-    /// `can_accept_for_itself`, so `steward_bindings_of` counts only
-    /// marker-bearing edges for it. An unmarked delegation to a party that
-    /// can accept for itself is a capability conferral — giving them a job,
-    /// not custody of them — and would not make the granter a steward.
-    pub(crate) async fn put_steward_binding(
-        dir: &dyn crate::federation::FederationDirectory,
-        steward: &str,
-        subject: &str,
-    ) {
-        use crate::federation::types::{attestation_type, delegation_scope as ds};
-        let id = uuid::Uuid::new_v4().to_string();
-        let mut row = bare_attestation(
-            &id,
-            steward,
-            subject,
-            &serde_json::json!({
-                "id": id,
-                "kind": "delegates_to",
-                "dimension": crate::federation::types::owner_binding::DIMENSION,
-                "delegation_purpose": crate::federation::types::owner_binding::PURPOSE,
-                "scope": [ds::AGENCY_ACT_ON_BEHALF],
-            }),
-        );
-        row.attestation_type = attestation_type::DELEGATES_TO.to_owned();
-        seal_row_in_place(steward, &mut row);
-        dir.put_attestation(crate::federation::SignedAttestation { attestation: row })
-            .await
-            .expect("put steward-binding");
-    }
-
     /// v38.6.0 (CIRISPersist#773, CC 3.4.7.3 Clause D) — **may_act_through:
-    /// the node's ONE owner must appear in the agent's steward set.**
+    /// the node's ONE owner must be the agent's ONE owner.**
     ///
-    /// Four arms, and the last two are the point. The asymmetry is
-    /// load-bearing (ownership single-valued, stewardship multi-parent), so
-    /// co-stewardship must SUFFICE — that is what makes the community-server
-    /// case expressible without new grammar. And the fail-closed half is
-    /// normative: "different humans" and "could not resolve the owner" must
-    /// NOT share a return value, because on the person/node axis the
-    /// signature failure is a silent withhold, where an unresolved walk
-    /// reads as permission.
+    /// v62.0.0 (WD-fix22; Constitution 11-24, EXACTLY ONE OWNER) — rewritten.
+    /// The earlier witness built "co-stewardship" from an agent bound as an
+    /// OCCURRENCE of a second person plus one custody claim; an agent is
+    /// never a person's occurrence (the door refuses it,
+    /// `occurrence_mixes_person_and_machine`) and an agent's steward set has
+    /// at most one member. Now:
+    ///
+    /// 1. two persons (`owner`, `other`) each sign an owner binding of ONE
+    ///    agent key (the edition-2 agent binding, both voices): the agent has
+    ///    NO owner (`agent_owner_of` refuses `AmbiguousNodeOwner`), an empty
+    ///    steward set, is not steward-bound, and acts through `owner`'s node
+    ///    as `Ok(false)` (fail-secure, a resolved answer);
+    /// 2. `other` WITHDRAWS its binding: the agent is owned by `owner` alone,
+    ///    steward-bound to `owner` only, and may act through `owner`'s node;
+    /// 3. an agent owned by `other` alone may not (`Ok(false)`);
+    /// 4. an UNOWNED node is an ERROR naming the walk, never `false`: "could
+    ///    not tell" and "no" are different values.
     pub(crate) async fn exercise_may_act_through(
         dir: &dyn crate::federation::FederationDirectory,
         suffix: &str,
     ) {
-        use crate::federation::admission::may_act_through;
+        use crate::federation::admission::{
+            agent_owner_of, is_steward_bound, may_act_through, steward_bindings_of,
+        };
+        use crate::federation::edition2::fixture_occurrence::put_agent_owner_binding_placed;
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::types::{cohort_scope, identity_type};
 
-        let owner = format!("mat-owner-{suffix}");
-        let other = format!("mat-other-{suffix}");
-        let node = format!("mat-node-{suffix}");
-        let unowned = format!("mat-unowned-{suffix}");
-        let agent_ok = format!("mat-agent-ok-{suffix}");
-        let agent_no = format!("mat-agent-no-{suffix}");
-        for k in [&owner, &other] {
-            register_user_role_key(dir, k).await;
-        }
-        for k in [&node, &unowned, &agent_ok, &agent_no] {
-            register_hybrid_key(dir, k).await;
-        }
+        let owner_s = format!("mat-owner-{suffix}");
+        let other_s = format!("mat-other-{suffix}");
+        let node_s = format!("mat-node-{suffix}");
+        let unowned_s = format!("mat-unowned-{suffix}");
+        let agent_s = format!("mat-agent-{suffix}");
+        let agent_no_s = format!("mat-agent-no-{suffix}");
+        let owner = e2::put_key(dir, &owner_s, &[identity_type::USER]).await;
+        let other = e2::put_key(dir, &other_s, &[identity_type::USER]).await;
+        let node = e2::put_key(dir, &node_s, &[identity_type::NODE]).await;
+        let unowned = e2::put_key(dir, &unowned_s, &[identity_type::NODE]).await;
+        let agent = e2::put_key(dir, &agent_s, &[identity_type::AGENT]).await;
+        let agent_no = e2::put_key(dir, &agent_no_s, &[identity_type::AGENT]).await;
+        let now_ms =
+            || u64::try_from(crate::host::clock::now().timestamp_millis()).expect("after 1970");
+        let back = |min: u64| now_ms() - min * 60_000;
 
         // owner --owner-binding--> node
-        put_owner_binding(dir, &owner, &node).await;
+        put_owner_binding(dir, &owner_s, &node_s).await;
 
-        // CO-STEWARDSHIP, built the way this substrate actually expresses it.
-        //
-        // `steward_bindings_of` has TWO halves, and only together do they
-        // give the multi-parent set CC 3.4.7.3 Clause D relies on:
-        //
-        //  1. the OCCURRENCE half — an agent that is an identity-occurrence
-        //     of a USER is stewarded by that user;
-        //  2. the DELEGATION half — for a party that
-        //     `can_accept_for_itself` (an agent does), only a MARKER-bearing
-        //     custody claim counts; an unmarked delegation is a capability
-        //     conferral, giving them a job rather than custody of them.
-        //
-        // Two marker-bearing claims on ONE key is not a way to build it: the
-        // owner seat reads two counted owners as unowned (v62.0.0; until then
-        // the single-owner gate refused the second). Hence occurrence + one
-        // custody claim.
-        dir.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-            identity_key_id: other.clone(),
-            occurrence_key_id: agent_ok.clone(),
-            device_class: crate::federation::types::device_class::SERVER.into(),
-            hardware_attestation: None,
-            asserted_at: crate::host::clock::now(),
-            valid_until: None,
-            encryption_pubkeys: None,
-            transport_binding: None,
-            persist_row_hash: String::new(),
-        })
-        .await
-        .expect("bind agent_ok as an occurrence of `other`");
-        put_steward_binding(dir, &owner, &agent_ok).await;
-
-        // This agent's only steward is someone who owns no relevant node.
-        put_steward_binding(dir, &other, &agent_no).await;
-
-        // (1) Co-stewardship SUFFICES — the community-server case.
+        // (1) Two persons each bind the ONE agent key.
+        let _ = put_agent_owner_binding_placed(
+            dir,
+            &owner_s,
+            &agent_s,
+            back(5),
+            cohort_scope::SELF,
+            None,
+        )
+        .await;
+        let others = put_agent_owner_binding_placed(
+            dir,
+            &other_s,
+            &agent_s,
+            back(4),
+            cohort_scope::SELF,
+            None,
+        )
+        .await;
+        match agent_owner_of(dir, &agent, now_ms()).await {
+            Err(crate::federation::Error::AmbiguousNodeOwner { owners, .. }) => {
+                let mut want = vec![owner.clone(), other.clone()];
+                want.sort();
+                let mut got = owners.clone();
+                got.sort();
+                assert_eq!(got, want, "({suffix}) #773: the two bindings' authors");
+            }
+            got => panic!(
+                "({suffix}) #773 EXACTLY ONE OWNER: two persons' live bindings leave the agent \
+                 with no owner, got {got:?}"
+            ),
+        }
         assert!(
-            may_act_through(dir, &agent_ok, &node).await.unwrap(),
-            "({suffix}) #773 Clause D: the node's owner appears in the agent's steward set, \
-             which is the whole rule — requiring a SINGLE shared human would wrongly imply \
-             an agent has exactly one steward"
+            steward_bindings_of(dir, &agent).await.unwrap().is_empty(),
+            "({suffix}) #773: two owners make NO steward (fail-secure), never two"
+        );
+        assert!(
+            !is_steward_bound(dir, &agent).await.unwrap(),
+            "({suffix}) #773: the doubly bound agent is not steward-bound"
+        );
+        assert!(
+            !may_act_through(dir, &agent, &node).await.unwrap(),
+            "({suffix}) #773: the doubly bound agent acts through no node (a resolved `false`)"
         );
 
-        // (2) A steward set that EXCLUDES the node owner is inadmissible.
+        // (2) `other` withdraws: owned by `owner` alone.
+        let binding = dir
+            .get_attestation(&others.hex())
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("({suffix}) #773: other's binding is stored"));
+        e2::put_signed(dir, &e2::composer_of("withdraws", &binding, &other_s))
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) #773: other withdraws its binding: {e}"));
+        assert_eq!(
+            agent_owner_of(dir, &agent, now_ms() + 1_000)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(owner.as_str()),
+            "({suffix}) #773: after the withdrawal the agent is owned by the other person"
+        );
+        assert_eq!(
+            steward_bindings_of(dir, &agent).await.unwrap(),
+            vec![owner.clone()],
+            "({suffix}) #773: one steward, the one owner"
+        );
+        assert!(
+            is_steward_bound(dir, &agent).await.unwrap(),
+            "({suffix}) #773: is_steward_bound agrees"
+        );
+        assert!(
+            may_act_through(dir, &agent, &node).await.unwrap(),
+            "({suffix}) #773 Clause D: the node's owner is the agent's owner"
+        );
+
+        // (3) An agent whose one owner owns no relevant node.
+        let _ = put_agent_owner_binding_placed(
+            dir,
+            &other_s,
+            &agent_no_s,
+            back(3),
+            cohort_scope::SELF,
+            None,
+        )
+        .await;
         assert!(
             !may_act_through(dir, &agent_no, &node).await.unwrap(),
-            "({suffix}) #773: hosting an agent whose stewards exclude the node owner stays \
-             inadmissible — CC defers that case to an explicit node-owner conferral"
+            "({suffix}) #773: an agent owned by someone else stays inadmissible: CC defers \
+             that case to an explicit node-owner conferral"
         );
 
-        // (3) An UNOWNED node is an ERROR, not `false`. Fail-closed, and
-        // distinguishable from arm (2): a caller that cannot tell "no" from
-        // "could not tell" will eventually treat one as the other.
-        let err = may_act_through(dir, &agent_ok, &unowned)
+        // (4) An UNOWNED node is an ERROR, not `false`.
+        let err = may_act_through(dir, &agent, &unowned)
             .await
             .err()
             .unwrap_or_else(|| {
@@ -2501,8 +2527,6 @@ pub mod test_support {
             format!("{err}").contains("no live owner-binding"),
             "({suffix}) and the refusal says which walk failed: {err}"
         );
-
-        // (4) The two negative answers are DIFFERENT VALUES.
         assert!(
             may_act_through(dir, &agent_no, &node).await.is_ok(),
             "({suffix}) #773: 'different humans' is a resolved `Ok(false)` — it must not \
@@ -3647,13 +3671,16 @@ pub mod test_support {
     }
 
     /// v38.2.0 — seed a community authored by its first member.
+    /// v62.0.0 (GID-fixtures-mech) — returns the room's DERIVED id (the
+    /// codec founds it under that id and records the name
+    /// `community_key_id` for it, `fixture_switch::kid`).
     pub(crate) async fn seed_two_member_community(
         dir: &dyn crate::federation::FederationDirectory,
         community_key_id: &str,
         member_a: &str,
         member_b: &str,
-    ) {
-        seed_two_member_group(dir, community_key_id, member_a, member_b, None).await;
+    ) -> String {
+        seed_two_member_group(dir, community_key_id, member_a, member_b, None).await
     }
 
     /// v54.0.0 (CIRISPersist#1034) — [`seed_two_member_community`] declaring
@@ -3664,7 +3691,7 @@ pub mod test_support {
         community_key_id: &str,
         member_a: &str,
         member_b: &str,
-    ) {
+    ) -> String {
         seed_two_member_group(
             dir,
             community_key_id,
@@ -3674,7 +3701,7 @@ pub mod test_support {
                 crate::federation::affiliation_config::POLICY_COHORT_FIELD: "affiliations"
             })),
         )
-        .await;
+        .await
     }
 
     async fn seed_two_member_group(
@@ -3683,7 +3710,7 @@ pub mod test_support {
         member_a: &str,
         member_b: &str,
         policy_blob: Option<serde_json::Value>,
-    ) {
+    ) -> String {
         let member = |k: &str| crate::federation::types::CommunityMember {
             key_id: k.to_owned(),
             joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
@@ -3715,6 +3742,7 @@ pub mod test_support {
         )
         .await
         .expect("seed community");
+        crate::federation::edition2::fixture_switch::room_id(community_key_id)
     }
 
     /// v38.2.0 (CIRISPersist#758) — **the convergent-community re-put,
@@ -5092,15 +5120,36 @@ pub mod test_support {
         owner: &str,
         node: &str,
     ) -> crate::federation::Attestation {
-        use crate::federation::types::{
-            attestation_tier, attestation_type, delegation_scope as ds, owner_binding,
-        };
+        use crate::federation::types::delegation_scope as ds;
+        owner_binding_attestation_scoped(
+            id,
+            owner,
+            node,
+            &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+        )
+    }
+
+    /// v62.0.0 (D1) — [`owner_binding_attestation`] carrying `scopes` as its
+    /// `scope` member (the member an owner-conferred duty is read from,
+    /// `admission::owner_confers_for_act`).
+    pub fn owner_binding_attestation_scoped(
+        id: &str,
+        owner: &str,
+        node: &str,
+        scopes: &[&str],
+    ) -> crate::federation::Attestation {
+        use crate::federation::types::{attestation_tier, attestation_type, owner_binding};
+        // v62.0.0 (BIND-1; CC rc22 rule `owner-binding`) — the producer's
+        // members only (no `kind`), the scope a set in CDE order
+        // (`self_at_login::scope_set`).
+        let scopes = crate::federation::self_at_login::scope_set(
+            &scopes.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+        );
         let envelope = serde_json::json!({
             "id": id,
-            "kind": "delegates_to",
             "dimension": owner_binding::DIMENSION,
             "delegation_purpose": owner_binding::PURPOSE,
-            "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+            "scope": scopes,
         });
         let (och, classical, pqc) = sign_envelope(owner, &envelope);
         // v62.0.0 (K2, red round 3; CC 2.4.1.1) — under the switch the
@@ -5205,7 +5254,7 @@ mod tests {
                 attester,
                 attester,
                 &serde_json::json!({
-                    "dimension": "evidence:safety_battery:capture:a:b:v1",
+                    "dimension": "coherence_standing:cab:v1",
                     "score": 1.0,
                     "confidence": 0.9,
                 }),

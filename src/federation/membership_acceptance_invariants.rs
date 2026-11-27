@@ -59,7 +59,7 @@ pub(crate) mod bodies {
         protocol: &str,
         founders: &[&str],
         unsigned: &[&str],
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         found_room(d, cid, protocol, founders, unsigned, None).await
     }
 
@@ -71,7 +71,7 @@ pub(crate) mod bodies {
         protocol: &str,
         founders: &[&str],
         unsigned: &[&str],
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         let blob = serde_json::json!({
             crate::federation::affiliation_config::POLICY_COHORT_FIELD: "affiliations"
         });
@@ -86,7 +86,7 @@ pub(crate) mod bodies {
         protocol: &str,
         founders: &[&str],
         unsigned: &[&str],
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         let blob = serde_json::json!({
             "cohort_subkind": crate::federation::public_room::COHORT_SUBKIND_PUBLIC
         });
@@ -102,7 +102,7 @@ pub(crate) mod bodies {
         founders: &[&str],
         unsigned: &[&str],
         policy_blob: Option<serde_json::Value>,
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         found_room(d, cid, protocol, founders, unsigned, policy_blob).await
     }
 
@@ -115,7 +115,7 @@ pub(crate) mod bodies {
         protocol: &str,
         founders: &[&str],
         founded_at: DateTime<Utc>,
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         let blob = serde_json::json!({
             "cohort_subkind": crate::federation::public_room::COHORT_SUBKIND_PUBLIC
         });
@@ -129,7 +129,7 @@ pub(crate) mod bodies {
         founders: &[&str],
         unsigned: &[&str],
         policy_blob: Option<serde_json::Value>,
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         let founded_at = Utc::now() - Duration::days(1);
         found_room_at(
             d,
@@ -151,7 +151,7 @@ pub(crate) mod bodies {
         unsigned: &[&str],
         policy_blob: Option<serde_json::Value>,
         founded_at: DateTime<Utc>,
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         let members = founders
             .iter()
             .map(|k| ((*k).to_owned(), Some("founder".to_owned())))
@@ -189,9 +189,13 @@ pub(crate) mod bodies {
                 None,
                 crate::federation::edition2::fixture_switch::ms(founded_at),
             );
-            return gf::put_voices(d, &voices).await.map(|_| ());
+            // v62.0.0 (GID-fixtures-mech, .rev2) — the room's DERIVED id,
+            // which the codec recorded for the name `cid`
+            // (`fixture_switch::room_id`: it panics if no founding did).
+            gf::put_voices(d, &voices).await?;
+            return Ok(crate::federation::edition2::fixture_switch::room_id(cid));
         }
-        d.put_community(signed).await.map(|_| ())
+        d.put_community(signed).await.map(|_| cid.to_owned())
     }
 
     pub(crate) async fn found_family<D: FederationDirectory + ?Sized>(
@@ -200,7 +204,7 @@ pub(crate) mod bodies {
         protocol: &str,
         founders: &[&str],
         unsigned: &[&str],
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         let members = founders
             .iter()
             .map(|k| ((*k).to_owned(), Some("founder".to_owned())))
@@ -233,9 +237,10 @@ pub(crate) mod bodies {
             let at =
                 crate::federation::edition2::fixture_switch::ms(Utc::now() - Duration::days(1));
             let voices = gf::family_voices(&signed, 1, None, at);
-            return gf::put_voices(d, &voices).await.map(|_| ());
+            gf::put_voices(d, &voices).await?;
+            return Ok(crate::federation::edition2::fixture_switch::room_id(fid));
         }
-        d.put_family(signed).await
+        d.put_family(signed).await.map(|()| fid.to_owned())
     }
 
     fn row(
@@ -332,7 +337,6 @@ pub(crate) mod bodies {
             "group_kind": group_kind(&p.cohort_scope),
             target_key(&p.cohort_scope): group,
             "references_attestation_id": p.attestation_id,
-            "proposal_hash": p.original_content_hash,
         });
         if accept {
             if let Some(role) = p.attestation_envelope.get("role").filter(|v| !v.is_null()) {
@@ -560,7 +564,8 @@ pub(crate) mod bodies {
         // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
         let (cid, founder, k, stranger) =
             (id_of(&cid), id_of(&founder), id_of(&k), id_of(&stranger));
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .expect("I210: the founder founds the room");
         let p = proposal(
@@ -649,7 +654,8 @@ pub(crate) mod bodies {
         // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
         let (cid, founder, k, stranger) =
             (id_of(&cid), id_of(&founder), id_of(&k), id_of(&stranger));
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let p = proposal(
@@ -711,7 +717,8 @@ pub(crate) mod bodies {
             id_of(&k),
             id_of(&j),
         );
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -828,7 +835,8 @@ pub(crate) mod bodies {
         reg(d, &[&cid, &founder, &k]).await;
         // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
         let (cid, founder, k) = (id_of(&cid), id_of(&founder), id_of(&k));
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -931,7 +939,8 @@ pub(crate) mod bodies {
             id_of(&j),
             id_of(&m),
         );
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let t0 = Utc::now() - Duration::days(20);
@@ -1035,7 +1044,8 @@ pub(crate) mod bodies {
         reg(d, &[&cid, &founder, &k]).await;
         // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
         let (cid, founder, k) = (id_of(&cid), id_of(&founder), id_of(&k));
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -1094,28 +1104,32 @@ pub(crate) mod bodies {
             format!("i216-k-{s}"),
         );
         reg(d, &[&c1, &c2, &f1, &f2, &founder, &cofounder, &k]).await;
-        found_community(d, &c1, "majority", &[&founder], &[&k])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let c1 = found_community(d, &c1, "majority", &[&founder], &[&k])
             .await
             .expect("I216: an unsigned founding member leaves the roster pending");
         assert!(
             d.lookup_community(&id_of(&c1)).await.unwrap().is_none(),
             "I216: nothing stored"
         );
-        found_community(d, &c2, "majority", &[&founder, &cofounder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let c2 = found_community(d, &c2, "majority", &[&founder, &cofounder], &[])
             .await
             .expect("I216: every founding member signed");
         assert!(
             d.lookup_community(&id_of(&c2)).await.unwrap().is_some(),
             "I216: the fully voiced room lands"
         );
-        found_family(d, &f1, "majority", &[&founder], &[&k])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let f1 = found_family(d, &f1, "majority", &[&founder], &[&k])
             .await
             .expect("I216: an unsigned founding family member leaves it pending");
         assert!(
             d.lookup_family(&id_of(&f1)).await.unwrap().is_none(),
             "I216: nothing stored"
         );
-        found_family(d, &f2, "majority", &[&founder, &cofounder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let f2 = found_family(d, &f2, "majority", &[&founder, &cofounder], &[])
             .await
             .expect("I216: a co-signed family founding");
         assert!(
@@ -1135,7 +1149,8 @@ pub(crate) mod bodies {
         reg(d, &[&cid, &founder, &k]).await;
         // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
         let (cid, founder, k) = (id_of(&cid), id_of(&founder), id_of(&k));
-        found_community(d, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let mut c = d.lookup_community(&cid).await.unwrap().unwrap();
@@ -1194,7 +1209,8 @@ pub(crate) mod bodies {
         reg(d, &[&cid, &a, &b, &c, &k]).await;
         // v62.0.0 (wave 3, E5) — named by the ids the directory keys them by.
         let (cid, a, b, c, k) = (id_of(&cid), id_of(&a), id_of(&b), id_of(&c), id_of(&k));
-        found_community(d, &cid, "majority", &[&a, &b, &c], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(d, &cid, "majority", &[&a, &b, &c], &[])
             .await
             .unwrap();
         let now = Utc::now();
@@ -1274,7 +1290,8 @@ pub(crate) mod bodies {
         for n in [a, b] {
             reg(n, &[&cid, &founder, &k]).await;
         }
-        found_community(a, &cid, "quorum:1/1", &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_community(a, &cid, "quorum:1/1", &[&founder], &[])
             .await
             .unwrap();
         let (cid, founder, k) = (id_of(&cid), id_of(&founder), id_of(&k));
@@ -1339,6 +1356,616 @@ pub(crate) mod bodies {
         assert_eq!(rule_of(&e), RULE_ACCEPTANCE_UNRESOLVED, "I219: {e}");
         let _ = RULE_DECLINED;
     }
+
+    /// v62.0.0 (WD-fx4; WD-fix16 part 2's shared step, I4419's flow) — **one
+    /// person joins a PUBLIC room through the identity-key join carriage**,
+    /// its node placed at nothing public. Preconditions: the room is held on
+    /// `founder_store` with `voters` (`voters[0]` the inviter) able to widen
+    /// it; the joiner's node is placed at `self` on `joiner_store`
+    /// (`two_node::place_device_at_groups(.., &[])`); both persons' keys are
+    /// registered on both stores. The steps, every crossing through a
+    /// production producer or the serve rule:
+    /// 1. the inviter's proposal on `founder_store`; THE INVITATION
+    ///    (`join_invitation_rows`) admitted on `joiner_store` row by row;
+    /// 2. the joiner's acceptance on `joiner_store`, and its node re-signed at
+    ///    the room (held there: no roster yet);
+    /// 3. THE ANSWER (`join_answer_rows`) admitted on `founder_store`: the
+    ///    owner fold there names the joiner as its node's owner;
+    /// 4. the widening on `founder_store`, then `founder_store` serves
+    ///    `joiner_store` (as the joiner's node): the room is held there.
+    ///
+    /// A private room is refused by both producers (WD-fix16e): this is the
+    /// identity-key carriage only.
+    ///
+    /// # Panics
+    /// A step does not land as described.
+    pub(crate) async fn join_room_by_carriage<D: FederationDirectory + ?Sized>(
+        founder_store: &D,
+        voters: &[&str],
+        room: &str,
+        joiner_store: &D,
+        joiner: &str,
+        joiner_node: &str,
+        joiner_node_seed: &str,
+    ) {
+        use crate::federation::key_grant_invariants::two_node::{
+            deliver_served, deliver_statements, re_sign_owner_binding,
+        };
+        use crate::federation::membership_acceptance::{join_answer_rows, join_invitation_rows};
+        let now = Utc::now();
+        let p = proposal(
+            voters[0],
+            COMMUNITY,
+            room,
+            joiner,
+            None,
+            now,
+            Some(Duration::days(7)),
+        );
+        put(founder_store, &p)
+            .await
+            .unwrap_or_else(|e| panic!("join_room_by_carriage: the proposal of {joiner}: {e}"));
+        let invitation = join_invitation_rows(founder_store, &p.attestation_id)
+            .await
+            .unwrap_or_else(|e| panic!("join_room_by_carriage: the invitation's rows: {e}"));
+        deliver_statements(joiner_store, &invitation)
+            .await
+            .unwrap_or_else(|e| panic!("join_room_by_carriage: the invitation lands: {e}"));
+        let acc = reply(joiner, joiner, &p, true, now);
+        put(joiner_store, &acc)
+            .await
+            .unwrap_or_else(|e| panic!("join_room_by_carriage: {joiner} accepts: {e}"));
+        let _ = re_sign_owner_binding(
+            joiner_store.as_dyn_directory(),
+            joiner,
+            joiner_node,
+            joiner_node_seed,
+            COMMUNITY,
+            Some(room),
+        )
+        .await;
+        let answer = join_answer_rows(joiner_store, &acc.attestation_id, room)
+            .await
+            .unwrap_or_else(|e| panic!("join_room_by_carriage: the answer's rows: {e}"));
+        deliver_statements(founder_store, &answer)
+            .await
+            .unwrap_or_else(|e| panic!("join_room_by_carriage: the answer lands: {e}"));
+        assert_eq!(
+            crate::federation::admission::owner_of(founder_store, joiner_node)
+                .await
+                .unwrap(),
+            Some(joiner.to_owned()),
+            "join_room_by_carriage: the answer's R-placed binding names {joiner} as the owner \
+             of {joiner_node} on the founder's store"
+        );
+        widen_community(founder_store, room, voters, joiner, None, now)
+            .await
+            .unwrap_or_else(|e| panic!("join_room_by_carriage: {joiner} is seated: {e}"));
+        deliver_served(founder_store, joiner_store, joiner_node).await;
+        assert!(
+            joiner_store.lookup_community(room).await.unwrap().is_some(),
+            "join_room_by_carriage: seated, {joiner}'s node is served the room"
+        );
+    }
+
+    /// v62.0.0 (WD-fx5; WD-fix16 part 2's FAMILY twin of
+    /// [`join_room_by_carriage`]) — **one person joins a FAMILY through the
+    /// identity-key join carriage**, its node placed at nothing public. The
+    /// same steps, at `family` scope: the proposal by `inviter` on
+    /// `founder_store`; THE INVITATION admitted row by row on
+    /// `joiner_store`; the acceptance, and the joiner's node re-signed at the
+    /// family (held there: no roster yet); THE ANSWER admitted row by row on
+    /// `founder_store` (the invitee gate admits a family placement as a room
+    /// one: `owner_binding_placed_by_an_invitee`), where the owner fold then
+    /// names the joiner; the widening by `inviter`; then `founder_store`
+    /// serves `joiner_store` (as the joiner's node) and the family is held
+    /// there.
+    ///
+    /// # Panics
+    /// A step does not land as described.
+    pub(crate) async fn join_family_by_carriage<D: FederationDirectory + ?Sized>(
+        founder_store: &D,
+        inviter: &str,
+        family: &str,
+        joiner_store: &D,
+        joiner: &str,
+        joiner_node: &str,
+        joiner_node_seed: &str,
+    ) {
+        use crate::federation::key_grant_invariants::two_node::{
+            deliver_served, deliver_statements, re_sign_owner_binding,
+        };
+        use crate::federation::membership_acceptance::{join_answer_rows, join_invitation_rows};
+        let now = Utc::now();
+        let p = proposal(
+            inviter,
+            FAMILY,
+            family,
+            joiner,
+            None,
+            now,
+            Some(Duration::days(7)),
+        );
+        put(founder_store, &p)
+            .await
+            .unwrap_or_else(|e| panic!("join_family_by_carriage: the proposal of {joiner}: {e}"));
+        let invitation = join_invitation_rows(founder_store, &p.attestation_id)
+            .await
+            .unwrap_or_else(|e| panic!("join_family_by_carriage: the invitation's rows: {e}"));
+        deliver_statements(joiner_store, &invitation)
+            .await
+            .unwrap_or_else(|e| panic!("join_family_by_carriage: the invitation lands: {e}"));
+        let acc = reply(joiner, joiner, &p, true, now);
+        put(joiner_store, &acc)
+            .await
+            .unwrap_or_else(|e| panic!("join_family_by_carriage: {joiner} accepts: {e}"));
+        let _ = re_sign_owner_binding(
+            joiner_store.as_dyn_directory(),
+            joiner,
+            joiner_node,
+            joiner_node_seed,
+            FAMILY,
+            Some(family),
+        )
+        .await;
+        let answer = join_answer_rows(joiner_store, &acc.attestation_id, family)
+            .await
+            .unwrap_or_else(|e| panic!("join_family_by_carriage: the answer's rows: {e}"));
+        deliver_statements(founder_store, &answer)
+            .await
+            .unwrap_or_else(|e| panic!("join_family_by_carriage: the answer lands: {e}"));
+        assert_eq!(
+            crate::federation::admission::owner_of(founder_store, joiner_node)
+                .await
+                .unwrap(),
+            Some(joiner.to_owned()),
+            "join_family_by_carriage: the answer's family-placed binding names {joiner} as the \
+             owner of {joiner_node} on the founder's store"
+        );
+        widen_family(founder_store, family, inviter, joiner, None, now)
+            .await
+            .unwrap_or_else(|e| panic!("join_family_by_carriage: {joiner} is seated: {e}"));
+        deliver_served(founder_store, joiner_store, joiner_node).await;
+        assert!(
+            joiner_store.lookup_family(family).await.unwrap().is_some(),
+            "join_family_by_carriage: seated, {joiner}'s node is served the family"
+        );
+    }
+
+    // ── I4419 ─────────────────────────────────────────────────────────────
+    /// **I4419** (WD-fix16; the join carriage as Constitution ruled 11-23) —
+    /// alice's node NA (store A) and bob's node NB (store B) are placed at
+    /// NOTHING public: NA at `self` + room R, NB at `self` only. Everything
+    /// crosses by the serve rule (`deliver_served`), except the two
+    /// envelopes, which are built by the producers and admitted row by row
+    /// through the receiver's ordinary door:
+    /// - B pulls A: nothing of R (no roster, no proposal, no occurrence of
+    ///   alice);
+    /// - THE INVITATION (`join_invitation_rows`) on B: the proposal is held
+    ///   (R's roster is not), and alice's occurrence is held;
+    /// - bob accepts on B and re-signs NB at R: HELD on B (no roster there);
+    /// - THE ANSWER (`join_answer_rows`) on A: bob's occurrence, the
+    ///   acceptance, and NB's R-placed binding are admitted (the invitee who
+    ///   answered places its node: `owner_binding_placed_by_an_invitee`);
+    ///   A's owner fold names bob as NB's owner;
+    /// - A widens R to bob; B pulls A: B now holds R and bob is a member;
+    /// - a third node C, handed the same link traffic (every pull from A and
+    ///   B, as C's node) but no envelope, holds nothing naming R.
+    pub async fn i4419_the_join_carriage<D: FederationDirectory + ?Sized>(
+        a: &D,
+        b: &D,
+        c: &D,
+        s: &str,
+    ) {
+        use crate::federation::edition2::fixture_occurrence::put_occurrence_signed;
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::key_grant_invariants::two_node::{
+            deliver_served, deliver_statements, place_device_at_groups, re_sign_owner_binding,
+        };
+        use crate::federation::membership_acceptance::{join_answer_rows, join_invitation_rows};
+        use crate::federation::types::identity_type::NODE;
+        use crate::federation::types::{device_class, IdentityOccurrence};
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let k = |n: &str| format!("i4419-{n}-{s}");
+        let (cid, alice, bob) = (k("room"), k("alice"), k("bob"));
+        for n in [a, b, c] {
+            reg(n, &[&cid, &alice, &bob]).await;
+        }
+        let room = found_community(a, &cid, "quorum:1/1", &[&alice], &[])
+            .await
+            .unwrap();
+        let (room, alice, bob) = (id_of(&room), id_of(&alice), id_of(&bob));
+        let kem = || {
+            let (_xp, x, _mp, ml) =
+                crate::federation::identity_aggregate::mint_content_kem_keypair().unwrap();
+            crate::federation::EncryptionPubkeys {
+                x25519_base64: B64.encode(x),
+                ml_kem_768_base64: B64.encode(&ml),
+            }
+        };
+        // The nodes and the persons' devices, each on its own store.
+        let (na_seed, nb_seed, nc_seed) = (k("nodea"), k("nodeb"), k("nodec"));
+        ts::register_hybrid_key_as(a, &na_seed, &na_seed, NODE).await;
+        ts::register_hybrid_key_as(b, &nb_seed, &nb_seed, NODE).await;
+        ts::register_hybrid_key_as(c, &nc_seed, &nc_seed, NODE).await;
+        let (na, nb, nc) = (e2::kid(&na_seed), e2::kid(&nb_seed), e2::kid(&nc_seed));
+        let (da_seed, db_seed) = (k("deva"), k("devb"));
+        ts::register_hybrid_key_as(a, &da_seed, &da_seed, USER).await;
+        ts::register_hybrid_key_as(b, &db_seed, &db_seed, USER).await;
+        let (da, db) = (e2::kid(&da_seed), e2::kid(&db_seed));
+        let occ = |identity: &str, device: &str| IdentityOccurrence {
+            identity_key_id: identity.to_owned(),
+            occurrence_key_id: device.to_owned(),
+            device_class: device_class::PHONE.into(),
+            hardware_attestation: None,
+            asserted_at: Utc::now(),
+            valid_until: None,
+            encryption_pubkeys: Some(kem()),
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        };
+        put_occurrence_signed(a, occ(&alice, &da))
+            .await
+            .expect("I4419: alice's device on A");
+        put_occurrence_signed(b, occ(&bob, &db))
+            .await
+            .expect("I4419: bob's device on B");
+        place_device_at_groups(
+            a.as_dyn_directory(),
+            &alice,
+            &na,
+            &na_seed,
+            device_class::SERVER,
+            Some(kem()),
+            &[(COMMUNITY, &room)],
+        )
+        .await;
+        place_device_at_groups(
+            b.as_dyn_directory(),
+            &bob,
+            &nb,
+            &nb_seed,
+            device_class::SERVER,
+            Some(kem()),
+            &[],
+        )
+        .await;
+        async fn holds<E: FederationDirectory + ?Sized>(
+            d: &E,
+            identity: &str,
+            device: &str,
+        ) -> bool {
+            d.list_identity_occurrences_for(identity)
+                .await
+                .unwrap()
+                .iter()
+                .any(|o| o.occurrence_key_id == device)
+        }
+        // The link traffic: every pull, by the serve rule.
+        deliver_served(a, b, &nb).await;
+        deliver_served(b, a, &na).await;
+        assert!(
+            b.lookup_community(&room).await.unwrap().is_none(),
+            "I4419: before the invitation B holds nothing of R"
+        );
+        assert!(
+            !holds(b, &alice, &da).await,
+            "I4419: before the invitation B holds no occurrence of alice"
+        );
+        // THE INVITATION, built on A, admitted on B row by row.
+        let now = Utc::now();
+        let p = proposal(
+            &alice,
+            COMMUNITY,
+            &room,
+            &bob,
+            None,
+            now,
+            Some(Duration::days(7)),
+        );
+        put(a, &p).await.expect("I4419: alice invites bob on A");
+        let invitation = join_invitation_rows(a, &p.attestation_id)
+            .await
+            .expect("I4419: the invitation's rows");
+        deliver_statements(b, &invitation)
+            .await
+            .unwrap_or_else(|e| panic!("I4419: B admits the invitation's rows: {e}"));
+        assert!(
+            b.get_attestation(&p.attestation_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "I4419: the proposal is held on B (R's roster is not)"
+        );
+        assert!(
+            b.lookup_community(&room).await.unwrap().is_none(),
+            "I4419: the invitee holds nothing of R's roster (CC 2.7.8)"
+        );
+        assert!(
+            holds(b, &alice, &da).await,
+            "I4419: alice's occurrence rode the invitation"
+        );
+        // bob answers on B and re-signs NB at R (held there).
+        let acc = reply(&bob, &bob, &p, true, now);
+        put(b, &acc).await.expect("I4419: bob accepts on B");
+        let resigned = re_sign_owner_binding(
+            b.as_dyn_directory(),
+            &bob,
+            &nb,
+            &nb_seed,
+            COMMUNITY,
+            Some(&room),
+        )
+        .await;
+        assert!(
+            !matches!(
+                resigned,
+                crate::federation::edition2::ingest::StatementOutcome::Row { .. }
+            ),
+            "I4419: on B, with no roster of R, the R-placed binding is held: {resigned:?}"
+        );
+        // THE ANSWER, built on B, admitted on A row by row.
+        let answer = join_answer_rows(b, &acc.attestation_id, &room)
+            .await
+            .expect("I4419: the answer's rows");
+        deliver_statements(a, &answer)
+            .await
+            .unwrap_or_else(|e| panic!("I4419: A admits the answer's rows: {e}"));
+        assert!(
+            a.get_attestation(&acc.attestation_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "I4419: the acceptance is held on A"
+        );
+        assert!(
+            holds(a, &bob, &db).await,
+            "I4419: bob's occurrence rode the answer"
+        );
+        assert_eq!(
+            crate::federation::admission::owner_of(a, &nb)
+                .await
+                .unwrap(),
+            Some(bob.clone()),
+            "I4419: NB's R-placed binding is admitted on A: its owner is bob"
+        );
+        // The widening seats bob; the welcome is ordinary cohort delivery.
+        widen_community(a, &room, &[&alice], &bob, None, now)
+            .await
+            .expect("I4419: A seats bob");
+        deliver_served(a, b, &nb).await;
+        assert!(
+            b.lookup_community(&room).await.unwrap().is_some(),
+            "I4419: seated, B is served R"
+        );
+        assert!(
+            active_in_community(b, &room, &bob).await,
+            "I4419: B holds bob as a member of R"
+        );
+        // The third node: the same link traffic, no envelope.
+        deliver_served(a, c, &nc).await;
+        deliver_served(b, c, &nc).await;
+        assert!(
+            c.lookup_community(&room).await.unwrap().is_none(),
+            "I4419: C holds no roster of R"
+        );
+        assert!(
+            c.get_attestation(&p.attestation_id)
+                .await
+                .unwrap()
+                .is_none()
+                && c.get_attestation(&acc.attestation_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+            "I4419: C holds neither the proposal nor the answer"
+        );
+        assert!(
+            !holds(c, &alice, &da).await && !holds(c, &bob, &db).await,
+            "I4419: C holds no person's occurrence placed at R"
+        );
+        assert_ne!(
+            crate::federation::admission::owner_of(c, &nb)
+                .await
+                .unwrap(),
+            Some(bob.clone()),
+            "I4419: C cannot name NB's owner"
+        );
+    }
+
+    // ── I4420 ─────────────────────────────────────────────────────────────
+    /// **I4420** (WD-fix16 part 2; the negatives of WD-fix16a's gate
+    /// `owner_binding_placed_by_an_invitee`) — on the store that holds room
+    /// R's roster, an owner binding placed at R is NOT admitted, but HELD
+    /// (the generic write-scope gate's hold, `write_scope_refused`: a row
+    /// naming a held group whose owner is no member waits for the roster to
+    /// change, CC 2.7.3, never refused), when its owner is:
+    /// - not an invitee of R at all;
+    /// - an invitee with NO held acceptance (it has not answered);
+    /// - an invitee whose invitation LAPSED (a proposal past its expiry: the
+    ///   acceptance of it is not held, and it is no live invitation).
+    ///
+    /// In each case the owner fold does not name the owner for the node.
+    pub async fn i4420_the_invitee_gate_admits_only_an_answered_invitation<
+        D: FederationDirectory + ?Sized,
+    >(
+        a: &D,
+        s: &str,
+    ) {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::edition2::ingest::StatementOutcome;
+        use crate::federation::key_grant_invariants::two_node::re_sign_owner_binding;
+        use crate::federation::types::identity_type::NODE;
+        let k = |n: &str| format!("i4420-{n}-{s}");
+        let (cid, alice, x, y, z) = (k("room"), k("alice"), k("xout"), k("ynoans"), k("zlapsed"));
+        reg(a, &[&cid, &alice, &x, &y, &z]).await;
+        let room = found_community(a, &cid, "quorum:1/1", &[&alice], &[])
+            .await
+            .unwrap();
+        let (room, alice, x, y, z) = (id_of(&room), id_of(&alice), id_of(&x), id_of(&y), id_of(&z));
+        let now = Utc::now();
+        // y: invited, never answers.
+        let py = proposal(
+            &alice,
+            COMMUNITY,
+            &room,
+            &y,
+            None,
+            now,
+            Some(Duration::days(7)),
+        );
+        put(a, &py).await.expect("I4420: y is invited");
+        // z: invited by a proposal that had lapsed when z answered.
+        let pz = proposal(
+            &alice,
+            COMMUNITY,
+            &room,
+            &z,
+            None,
+            now - Duration::days(8),
+            Some(Duration::days(7)),
+        );
+        let _ = put_e2(a, &pz).await;
+        let _ = put_e2(a, &reply(&z, &z, &pz, true, now)).await;
+        for (owner, label) in [(&x, "not an invitee"), (&y, "unanswered"), (&z, "lapsed")] {
+            let node_seed = k(&format!("node{label}").replace(' ', ""));
+            ts::register_hybrid_key_as(a, &node_seed, &node_seed, NODE).await;
+            let node = e2::kid(&node_seed);
+            let out = re_sign_owner_binding(
+                a.as_dyn_directory(),
+                owner,
+                &node,
+                &node_seed,
+                COMMUNITY,
+                Some(&room),
+            )
+            .await;
+            assert!(
+                !matches!(out, StatementOutcome::Row { .. }),
+                "I4420: a binding placed at R by an owner who is {label} is not admitted: {out:?}"
+            );
+            assert_ne!(
+                crate::federation::admission::owner_of(a, &node)
+                    .await
+                    .unwrap(),
+                Some(owner.clone()),
+                "I4420: {label}: the owner fold does not name the owner"
+            );
+        }
+    }
+
+    // ── I4422 ─────────────────────────────────────────────────────────────
+    /// **I4422** (WD-fix16e; CC 3.1.3.2, the room-key form) — a PRIVATE room
+    /// (`membership: private`) takes no identity-key carriage:
+    /// - `join_invitation_rows` refuses its proposal by name (InvalidArgument
+    ///   naming the private room), where the same producer serves a room
+    ///   with no `membership` (absent reads public);
+    /// - `join_answer_rows` refuses on a node that holds the room's record;
+    /// - the proposer's invitee gate admits no identity-key owner binding at
+    ///   it, although the invitee has answered: `owner_of` does not name the
+    ///   owner.
+    pub async fn i4422_a_private_room_takes_no_identity_carriage<
+        D: FederationDirectory + ?Sized,
+    >(
+        a: &D,
+        s: &str,
+    ) {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::key_grant_invariants::two_node::re_sign_owner_binding;
+        use crate::federation::membership_acceptance::{join_answer_rows, join_invitation_rows};
+        use crate::federation::types::identity_type::NODE;
+        let k = |n: &str| format!("i4422-{n}-{s}");
+        let (pcid, vcid, alice, bob) = (k("private"), k("visible"), k("alice"), k("bob"));
+        reg(a, &[&pcid, &vcid, &alice, &bob]).await;
+        let private = found_room_with_blob(
+            a,
+            &pcid,
+            "quorum:1/1",
+            &[&alice],
+            &[],
+            Some(serde_json::json!({ "membership": "private" })),
+        )
+        .await
+        .unwrap();
+        let visible = found_community(a, &vcid, "quorum:1/1", &[&alice], &[])
+            .await
+            .unwrap();
+        let (private, visible, alice, bob) =
+            (id_of(&private), id_of(&visible), id_of(&alice), id_of(&bob));
+        let now = Utc::now();
+        // The visible room: the producer serves the invitation.
+        let pv = proposal(
+            &alice,
+            COMMUNITY,
+            &visible,
+            &bob,
+            None,
+            now,
+            Some(Duration::days(7)),
+        );
+        put(a, &pv)
+            .await
+            .expect("I4422: the visible room's invitation");
+        join_invitation_rows(a, &pv.attestation_id)
+            .await
+            .expect("I4422: an identity-seated room's invitation is produced");
+        // The private room: refused by name.
+        let pp = proposal(
+            &alice,
+            COMMUNITY,
+            &private,
+            &bob,
+            None,
+            now,
+            Some(Duration::days(7)),
+        );
+        put(a, &pp)
+            .await
+            .expect("I4422: the private room's invitation row");
+        let e = join_invitation_rows(a, &pp.attestation_id)
+            .await
+            .expect_err("I4422: no identity-key invitation for a private room");
+        assert!(
+            matches!(&e, Error::InvalidArgument(m) if m.contains("PRIVATE room")),
+            "I4422: refused by name: {e:?}"
+        );
+        // bob answers; the answer producer and the invitee gate both refuse.
+        let acc = reply(&bob, &bob, &pp, true, now);
+        let _ = put_e2(a, &acc).await;
+        let e = join_answer_rows(a, &acc.attestation_id, &private)
+            .await
+            .expect_err("I4422: no identity-key answer for a private room");
+        assert!(
+            matches!(&e, Error::InvalidArgument(m) if m.contains("PRIVATE room")),
+            "I4422: refused by name: {e:?}"
+        );
+        let nb_seed = k("nodeb");
+        ts::register_hybrid_key_as(a, &nb_seed, &nb_seed, NODE).await;
+        let nb = e2::kid(&nb_seed);
+        let out = re_sign_owner_binding(
+            a.as_dyn_directory(),
+            &bob,
+            &nb,
+            &nb_seed,
+            COMMUNITY,
+            Some(&private),
+        )
+        .await;
+        assert!(
+            !matches!(
+                out,
+                crate::federation::edition2::ingest::StatementOutcome::Row { .. }
+            ),
+            "I4422: an identity-key binding at a private room is not admitted: {out:?}"
+        );
+        assert_ne!(
+            crate::federation::admission::owner_of(a, &nb)
+                .await
+                .unwrap(),
+            Some(bob.clone()),
+            "I4422: the owner fold does not name bob"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1393,6 +2020,40 @@ mod run {
                 async fn i218() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i218_accepted_awaiting_the_group(&b, &bodies::suffix()).await
+                }
+                #[tokio::test]
+                async fn i4422() {
+                    let Some(a) = $fresh.await else { return };
+                    Box::pin(bodies::i4422_a_private_room_takes_no_identity_carriage(
+                        &a,
+                        &bodies::suffix(),
+                    ))
+                    .await
+                }
+                #[tokio::test]
+                async fn i4420() {
+                    let Some(a) = $fresh.await else { return };
+                    Box::pin(
+                        bodies::i4420_the_invitee_gate_admits_only_an_answered_invitation(
+                            &a,
+                            &bodies::suffix(),
+                        ),
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i4419() {
+                    let (Some(a), Some(b), Some(c)) = ($fresh.await, $fresh.await, $fresh.await)
+                    else {
+                        return;
+                    };
+                    Box::pin(bodies::i4419_the_join_carriage(
+                        &a,
+                        &b,
+                        &c,
+                        &bodies::suffix(),
+                    ))
+                    .await
                 }
                 #[tokio::test]
                 async fn i219() {

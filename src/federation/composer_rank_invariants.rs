@@ -237,7 +237,8 @@ pub(crate) mod bodies {
                 .await;
         }
         reg(d, &[&room]).await;
-        found_community(d, &room, "quorum:1/1", &[&author], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let room = found_community(d, &room, "quorum:1/1", &[&author], &[])
             .await
             .unwrap();
         let prior = self_row(d, &author).await;

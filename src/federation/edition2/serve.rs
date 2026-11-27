@@ -241,8 +241,9 @@ where
 /// of a page a node that is not rooted ([`node_is_rooted`]) withholds, by
 /// the same rule as [`commons_servable`] (the page carries no requester, so
 /// no party exemption). A commons row waits unless it is an allegiance fact
-/// (an owner binding) or a bootstrap kind by its dimension (`identity:occurrence*`,
-/// `revocation:*`, `ownership:*`). Rows at any other placement pass
+/// (v62.0.0 BIND-4: an owner binding placed at `federation`,
+/// [`is_allegiance_binding`]) or a bootstrap kind by its dimension
+/// (`identity:occurrence*`, `revocation:*`). Rows at any other placement pass
 /// untouched (their audience rule is the serve path's own).
 ///
 /// # Errors
@@ -336,24 +337,41 @@ where
 }
 
 /// v62.0.0 (RL-fix2b) — the dimension prefixes of the attestation-plane
-/// bootstrap kinds (CC part_5 l.1129: occurrences, revocations, a sender's
-/// own allegiance rows): ONE list, read by the Rust row test
-/// ([`row_waits_unrooted`]) and by the SQL serve rule
-/// (`read_plan::served_while_unrooted_sql`).
-pub(crate) const BOOTSTRAP_DIMENSION_PREFIXES: [&str; 3] =
-    ["identity:occurrence", "revocation:", "ownership:"];
+/// bootstrap kinds (CC part_5 l.1129: occurrences, revocations): ONE list,
+/// read by the Rust row test ([`row_waits_unrooted`]) and by the SQL serve
+/// rule (`read_plan::served_while_unrooted_sql`).
+///
+/// v62.0.0 (BIND-4; Constitution: an ALLEGIANCE row is the owner's
+/// acceptance edge(s), and the node's owner binding ONLY where placed at
+/// federation) — `ownership:` is no longer a bootstrap prefix: an owner
+/// binding is exempt from the wait only as an allegiance row
+/// ([`is_allegiance_binding`]), i.e. placed at `federation`.
+pub(crate) const BOOTSTRAP_DIMENSION_PREFIXES: [&str; 2] = ["identity:occurrence", "revocation:"];
+
+/// v62.0.0 (BIND-4) — **is `a` an owner binding that is an ALLEGIANCE row?**
+/// Constitution: "the node's owner binding ONLY where placed at federation"
+/// (not `species`, `biosphere`, `self`, `family` or a room). The owner-binding
+/// marker is the SQL serve rule's own (`admission::owner_binding_marker`,
+/// `read_plan::owner_binding_marker_sql`: the node dimension, or
+/// `delegation_purpose: owner_binding`), so the Rust test and the SQL twin
+/// are the same decision.
+#[must_use]
+pub(crate) fn is_allegiance_binding(a: &crate::federation::Attestation) -> bool {
+    a.cohort_scope == crate::federation::types::cohort_scope::FEDERATION
+        && crate::federation::admission::owner_binding_marker(&a.attestation_envelope)
+}
 
 /// v62.0.0 (RL-fix2b) — **does an attestation row WAIT on a node that is not
-/// rooted?** A commons-scope row that is neither an owner binding
-/// (`admission::is_owner_binding_envelope`) nor a bootstrap kind by its
-/// dimension ([`BOOTSTRAP_DIMENSION_PREFIXES`]). The SQL form is
-/// `read_plan::served_while_unrooted_sql`; the two are the same decision.
+/// rooted?** A commons-scope row that is neither an allegiance row
+/// ([`is_allegiance_binding`]: an owner binding at `federation`, BIND-4) nor
+/// a bootstrap kind by its dimension ([`BOOTSTRAP_DIMENSION_PREFIXES`]). The
+/// SQL form is `read_plan::served_while_unrooted_sql`; the two are the same
+/// decision.
 #[must_use]
 pub(crate) fn row_waits_unrooted(a: &crate::federation::Attestation) -> bool {
     let commons =
         cs::Scope::parse(&a.cohort_scope).map(cs::Scope::placement) == Some(cs::Placement::Commons);
-    if !commons || crate::federation::admission::is_owner_binding_envelope(&a.attestation_envelope)
-    {
+    if !commons || is_allegiance_binding(a) {
         return false;
     }
     let dim =
@@ -572,6 +590,9 @@ where
 /// voice is counted. Every other family: `false` (a second-signer row with no
 /// typed row is never inferred concluded from the absence of a hold).
 ///
+/// VD-step1 — the conclusion is the one verdict's
+/// ([`super::verdict::row_state`]); this keeps RL-fix23's family scope.
+///
 /// # Errors
 /// Directory reads.
 pub(crate) async fn bootstrap_bind_concluded<F>(dir: &F, statement: &[u8]) -> Result<bool, Error>
@@ -579,7 +600,7 @@ where
     F: FederationDirectory + ?Sized,
 {
     use ciris_verify_core::namespace_match::family_id;
-    let Some((protected, payload)) = statement_parts(statement) else {
+    let Some((protected, _)) = statement_parts(statement) else {
         return Ok(false);
     };
     let family = protected.get_int(-70002).and_then(Value::as_text);
@@ -587,22 +608,160 @@ where
     if family != Some(occ_family) && family != Some(family_id(occ_family).as_str()) {
         return Ok(false);
     }
-    let text = |k: &str| payload.get_text(k).and_then(Value::as_text);
-    let (Some(identity), Some(occurrence), Some(at)) = (
-        text("identity_key_id"),
-        text("occurrence_key_id"),
-        payload.get_text("asserted_at").and_then(Value::as_u64),
-    ) else {
+    let Some(rid) = super::names::RowId::of_statement(statement) else {
         return Ok(false);
     };
-    Ok(dir
-        .list_identity_occurrences_by_occurrence_key(occurrence)
+    Ok(super::verdict::row_state(dir, &rid).await?.is_concluded())
+}
+
+/// v62.0.0 (WD-fix14; CC 5.4.6 "An occurrence follows its bindings", Eric's
+/// ruling via Constitution, 11-22) — **the audience of a concluded
+/// `identity:occurrence` bind**, by the identity's kind:
+///
+/// - a NODE's own self pair (author = identity = occurrence; its transport
+///   destination binding): `None`, the statement's scope rule as before
+///   (public, a bootstrap kind before Rooted; the Constitution's standing
+///   answer for a node, unchanged);
+/// - any other MACHINE occurrence (an AGENT identity's; a key bound under a
+///   NODE identity): `Some`: served to a requester in the audience of
+///   `self` (the identity's own) or of a placement of one of the identity's
+///   owner bindings in force now (`cohort_scope` + `community_id` /
+///   `family_id`, [`envelope_cohort_target`]: the same members the binding
+///   gate reads), and to no one else; a binding placed at `federation` (the
+///   owner announced it, [`is_allegiance_binding`]) is the public one, the
+///   only one an anonymous read is served (WD-fix20: a `species` /
+///   `biosphere` placement is a commons scope but makes nothing public, on
+///   every arm below);
+/// - a PERSON's occurrence (Constitution, 11-23): `Some`, by the same rule
+///   over the UNION of the placements of the owner bindings of EVERY node
+///   the person owns (`admission::nodes_owned_by`), plus `self`. Placement
+///   is per person at a group, never per device; a seat in a room places
+///   nothing. A person who placed no node's binding at a room has no
+///   occurrence held by that room's co-members (they wrap nothing to the
+///   person there) until one is placed.
+///
+/// Not an occurrence bind: `None`.
+///
+/// [`envelope_cohort_target`]: crate::federation::admission::envelope_cohort_target
+///
+/// # Errors
+/// Directory reads; a binding with two cohort targets.
+pub(crate) async fn occurrence_follows_its_bindings<F>(
+    dir: &F,
+    statement: &[u8],
+    requester: Option<&str>,
+) -> Result<Option<bool>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use crate::federation::types::identity_type::{set_contains, AGENT, NODE};
+    use ciris_verify_core::namespace_match::family_id;
+    let Some((protected, payload)) = statement_parts(statement) else {
+        return Ok(None);
+    };
+    let occ_family = super::occurrence::OCCURRENCE_FAMILY;
+    let family = protected.get_int(-70002).and_then(Value::as_text);
+    if family != Some(occ_family) && family != Some(family_id(occ_family).as_str()) {
+        return Ok(None);
+    }
+    let text = |m: &str| payload.get_text(m).and_then(Value::as_text);
+    let (Some(identity), Some(occurrence)) = (text("identity_key_id"), text("occurrence_key_id"))
+    else {
+        return Ok(None);
+    };
+    let types = dir
+        .lookup_public_key(identity)
         .await?
-        .iter()
-        .any(|o| {
-            o.identity_key_id == identity
-                && u64::try_from(o.asserted_at.timestamp_millis()).ok() == Some(at)
-        }))
+        .map(|r| r.identity_type)
+        .unwrap_or_default();
+    let (node, agent) = (set_contains(&types, NODE), set_contains(&types, AGENT));
+    // A node's own self pair: public (unchanged).
+    if node && identity == occurrence {
+        return Ok(None);
+    }
+    // The bindings whose placements are the occurrence's audience: a
+    // machine's own owner bindings; for a PERSON, the owner bindings of
+    // EVERY node the person owns (Constitution, 11-23: "each of a person's
+    // devices is held wherever one of them is placed"; a seat in a room
+    // places nothing: membership alone is no placement). A key of neither
+    // kind (no person, no machine record held): the scope rule as before.
+    let now = crate::host::clock::now();
+    let bindings = if agent {
+        // An AGENT's binding is read by its own fold (BIND-1:
+        // `is_owner_binding_envelope` marks a NODE binding only), the one
+        // `agent_owner_of` reads: each live binding's row.
+        let at_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
+        let mut rows = Vec::new();
+        for (_, rid) in
+            crate::federation::admission::agent_owner_bindings_at(dir, identity, at_ms).await?
+        {
+            if let Some(row) = dir.get_attestation(&rid).await? {
+                rows.push(row);
+            }
+        }
+        rows
+    } else if node {
+        crate::federation::admission::owner_bindings_in_force_at(dir, identity, now).await?
+    } else if super::occurrence::is_person_key(dir, identity).await? {
+        let mut all = Vec::new();
+        for owned in crate::federation::admission::nodes_owned_by(dir, identity).await? {
+            all.extend(
+                crate::federation::admission::owner_bindings_in_force_at(dir, &owned, now).await?,
+            );
+        }
+        all
+    } else {
+        return Ok(None);
+    };
+    let Some(peer) = requester.filter(|p| !p.is_empty()) else {
+        // An anonymous read: the public placement only. v62.0.0 (WD-fix20;
+        // BIND-4's rule, Constitution: the node's owner binding is an
+        // allegiance fact ONLY where placed at federation) — a binding at
+        // `species` / `biosphere` is a commons scope but no announcement: it
+        // makes no occurrence public.
+        return Ok(Some(bindings.iter().any(is_allegiance_binding)));
+    };
+    if crate::federation::replication::hold::is_audience(
+        dir,
+        cs::SELF,
+        None,
+        identity,
+        |author| author == peer,
+        peer,
+    )
+    .await?
+    {
+        return Ok(Some(true));
+    }
+    for b in &bindings {
+        if cs::Scope::parse(&b.cohort_scope).map(cs::Scope::placement)
+            == Some(cs::Placement::Commons)
+        {
+            // v62.0.0 (WD-fix20) — public only at federation
+            // ([`is_allegiance_binding`]); a `species` / `biosphere` binding
+            // is ADMITTED and INERT (BIND-4): it widens the audience to no
+            // one. Never asked of `hold::is_audience`, whose commons arm
+            // answers yes for every requester.
+            if is_allegiance_binding(b) {
+                return Ok(Some(true));
+            }
+            continue;
+        }
+        let target = crate::federation::admission::envelope_cohort_target(&b.attestation_envelope)?;
+        if crate::federation::replication::hold::is_audience(
+            dir,
+            &b.cohort_scope,
+            target,
+            &b.attesting_key_id,
+            |author| author == peer,
+            peer,
+        )
+        .await?
+        {
+            return Ok(Some(true));
+        }
+    }
+    Ok(Some(false))
 }
 
 /// **The statement's own serve rule**, before any row naming it carries
@@ -685,6 +844,15 @@ where
         {
             return Ok(false);
         }
+        // v62.0.0 (WD-fix14; CC 5.4.6 "An occurrence follows its bindings")
+        // — an occurrence (other than a node's own self pair) is served only to
+        // the audiences its identity's owner bindings are placed at (a
+        // person's: every owned node's), and `self`.
+        if let Some(decision) =
+            Box::pin(occurrence_follows_its_bindings(dir, statement, requester)).await?
+        {
+            return Ok(decision);
+        }
         return Box::pin(super::group_serve::servable_without_row(
             dir, statement, requester,
         ))
@@ -734,12 +902,29 @@ where
         // v62.0.0 (RL-fix1; CC 5.3.4) — a federation-tier row waits for a
         // root on a node that reaches none, unless the text lets it cross.
         (Some(cs::Placement::Commons), _) => {
+            let parties = [row.attesting_key_id.as_str(), row.attested_key_id.as_str()];
+            // v62.0.0 (BIND-4; Constitution: an ALLEGIANCE row is the owner's
+            // acceptance edge(s), and the node's owner binding ONLY where
+            // placed at federation) — an owner binding at another commons
+            // scope (`species`, `biosphere`) is no allegiance fact and no
+            // bootstrap row: it reaches its own parties only.
+            let owner_binding =
+                crate::federation::admission::is_any_owner_binding_envelope(
+                    &row.attestation_envelope,
+                ) || crate::federation::admission::owner_binding_marker(&row.attestation_envelope);
+            if owner_binding && !is_allegiance_binding(&row) {
+                return match requester.filter(|p| !p.is_empty()) {
+                    Some(peer) => Box::pin(is_party_to_row(dir, statement, peer, &parties)).await,
+                    None => Ok(false),
+                };
+            }
             Box::pin(commons_servable(
                 dir,
                 statement,
                 requester,
-                &[row.attesting_key_id.as_str(), row.attested_key_id.as_str()],
-                crate::federation::admission::is_owner_binding_envelope(&row.attestation_envelope),
+                &parties,
+                // v62.0.0 (BIND-4) — an allegiance fact only at federation.
+                is_allegiance_binding(&row),
             ))
             .await
         }

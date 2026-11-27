@@ -683,6 +683,15 @@ pub fn release_envelope(
 /// Verify-before-mutation (AV-9): every gate below runs BEFORE any row is
 /// written, and a refusal writes nothing.
 ///
+/// v62.0.0 (WD-fix6) — a HOLD is not a refusal: when the final put's
+/// statement door HOLDS the row (a fold condition not yet met; WD-fix4 routes
+/// a statement-carrying row through the statement funnel), the answer is the
+/// gate's error, as before, but the statement is KEPT and concludes when what
+/// it waits for arrives. Told apart structurally by
+/// [`kept_waiting`](super::attestation_admit::kept_waiting) (the fold's held
+/// state, `fold::why_held`), never by the error's text; a re-offer is a no-op
+/// on the statement id.
+///
 /// The `slash` authority check is
 /// [`check_delegated_duty_scores_admission`](super::admission::check_delegated_duty_scores_admission)
 /// — the same gate `put_attestation` runs on all three backends. It is called
@@ -1447,7 +1456,7 @@ pub(crate) mod test_support {
     }
 
     /// v62.0.0 (K2-fix11, K2-fix13) — the shared minor/adult fixture: a
-    /// `witness` key conferred `infra:attest_assurance` by W1b's ROOTED
+    /// `witness` key conferred `assure:age` (v62.0.0, D3) by W1b's ROOTED
     /// edition-2 trust root (`fixture_trust_root::rooted_trust_root`: an
     /// `infrastructure` community founded by the bundle's holders, its
     /// charter, and THIS node's acceptance naming the held head), through
@@ -1457,7 +1466,7 @@ pub(crate) mod test_support {
     /// K2-fix13: the earlier fixture (`confer_scope_from_trusted_root_at`: a
     /// bare key chartering itself) stands up no rooted trust root, so since
     /// the pinned bundle's deletion (C5-fix1) its grant roots nowhere, the
-    /// age row is held `reserved_prefix_emitter_mismatch`, and no band
+    /// age row is held `reserved_family_unseated` (D4), and no band
     /// resolves. The grant is dated as W1b dates its own
     /// (`put_conferral`): the bundle in force's newest tip + 90 s.
     ///
@@ -1485,8 +1494,7 @@ pub(crate) mod test_support {
         tags: &[&str],
     ) -> Vec<String> {
         use crate::federation::edition2::fixture_genesis::HOLDER_SEEDS;
-        use crate::federation::edition2::fixture_trust_root::confers_statement;
-        use crate::federation::types::delegation_scope::INFRA_ATTEST_ASSURANCE;
+        use crate::federation::types::delegation_scope::ASSURE_AGE;
         let node = e2::kid(node_seed);
         assert_eq!(
             dir.node_key_id().as_deref(),
@@ -1512,32 +1520,31 @@ pub(crate) mod test_support {
                 crate::federation::types::identity_type::WITNESS,
             )
             .await;
-            let grant = confers_statement(
+            // LEAD-root1 — the grant is COUNTED over the bundle's holders and
+            // accepted by the witness (`fixture_trust_root::put_conferral`).
+            let _ = (first, i);
+            crate::federation::edition2::fixture_trust_root::put_conferral(
+                dir,
                 &r,
-                &e2::kid(&witness),
-                &[INFRA_ATTEST_ASSURANCE],
-                first + i * 1_000,
-            );
-            e2::put_statement(dir, &grant)
-                .await
-                .unwrap_or_else(|e| panic!("confer_age_witness: the root's grant: {e}"));
-            e2::put_statement(dir, &e2::voice_of(&grant, &witness))
-                .await
-                .unwrap_or_else(|e| panic!("confer_age_witness: the witness's voice: {e}"));
+                &witness,
+                &[ASSURE_AGE],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("confer_age_witness: the root's grant: {e}"));
             let rooted = crate::federation::trust_root::capability_roots_to_trusted_root(
                 dir,
                 &node,
                 &e2::kid(&witness),
-                INFRA_ATTEST_ASSURANCE,
+                ASSURE_AGE,
                 crate::host::clock::now(),
             )
             .await
             .expect("capability_roots_to_trusted_root");
             assert!(
-                rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
-                "confer_age_witness: the witness's {INFRA_ATTEST_ASSURANCE} roots at {} through \
+                rooted.as_ref().is_some_and(|g| g.root_key_id == r.lineage),
+                "confer_age_witness: the witness's {ASSURE_AGE} roots at {} through \
                  this node: {rooted:?}",
-                r.root
+                r.lineage
             );
             out.push(witness);
         }
@@ -1627,7 +1634,7 @@ pub(crate) mod test_support {
             return founder_scoped_edge(founder, community_k, grantee, DELEGATION_SCOPE_SLASH, at);
         }
         let mut envelope = serde_json::json!({
-            "delegation_purpose": crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE,
+            "delegation_purpose": crate::federation::types::owner_binding::PURPOSE,
             "scope": [crate::federation::types::delegation_scope::INFRA_SERVE],
         });
         crate::federation::admission::with_test_term(&mut envelope, at);
@@ -3195,9 +3202,8 @@ pub(crate) mod test_support {
                 "community_id": community_k,
             });
             if custody {
-                envelope["delegation_purpose"] = serde_json::json!(
-                    crate::federation::types::owner_binding::CC_DELEGATION_PURPOSE
-                );
+                envelope["delegation_purpose"] =
+                    serde_json::json!(crate::federation::types::owner_binding::PURPOSE);
             }
             crate::federation::admission::with_test_term(&mut envelope, at);
             let a = unsigned_row(

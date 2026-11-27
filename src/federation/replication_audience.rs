@@ -1153,6 +1153,19 @@ where
         }
         return Ok(Verdict::No(Reason::NotInAudience));
     }
+    // v62.0.0 (BIND-4; Constitution: an ALLEGIANCE row is the owner's
+    // acceptance edge(s), and the node's owner binding ONLY where placed at
+    // federation) — an owner binding placed at another commons scope
+    // (`species`, `biosphere`) reaches its own parties (above) and nobody
+    // else: it is not the public audience's.
+    if (super::admission::is_any_owner_binding_envelope(&row.attestation_envelope)
+        || super::admission::owner_binding_marker(&row.attestation_envelope))
+        && cs::Scope::parse(&row.cohort_scope).map(cs::Scope::placement)
+            == Some(cs::Placement::Commons)
+        && row.cohort_scope != super::types::cohort_scope::FEDERATION
+    {
+        return Ok(Verdict::No(Reason::NotInAudience));
+    }
     let target = match super::admission::envelope_cohort_target(&row.attestation_envelope) {
         Ok(t) => t,
         Err(_) => return Ok(Verdict::No(Reason::Malformed)),

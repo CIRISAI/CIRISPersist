@@ -32,13 +32,16 @@
 //!   `membership:acceptance`; both, the officer resolves to the authority.
 //! - **I3296** (wave V1b, CC 2.4.1.1) the withdrawal of a counted
 //!   appointment is counted at the affiliation's protocol over the head it
-//!   names: a lone member's authored retraction is refused; the counted one
+//!   names: a lone member's authored retraction is refused by name
+//!   (`withdraws_never_retracts`, KR-fix20: nothing kept); the counted one
 //!   is `Pending` until met (a non-member's voice never completes it); met,
 //!   the officer's seat ends.
 //! - **I3297** (wave V1b, CC 2.4.1.1, CLM-licence-contest) the group's
 //!   withdrawal of a counted licence is counted at the authority community
 //!   its dimension names: the licensee's own and a lone member's are
-//!   refused; the counted one is `Pending` until the quorum, then lands, and
+//!   refused (an AUTHORED one by name, `withdraws_never_retracts`, nothing
+//!   kept, KR-fix20; the licensee's COUNTED one held `withdraws_not_admitted`);
+//!   the counted one is `Pending` until the quorum, then lands, and
 //!   the licence stops counting (`licensure::status_set_for` drops `issued`).
 //! - **I3298** (wave V1b; E13) a withdrawn owner binding ends ownership at
 //!   the edition-2 door: bind (`owner_of` = A), A's `withdraws` lands
@@ -107,6 +110,9 @@ pub(crate) async fn found_family(
     put_voices(d, &roster_voices(&rec, 1, None, 2_000, &signers))
         .await
         .expect("V1: the family's founding voices");
+    // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+    // panics if it was not).
+    let gid = crate::federation::edition2::fixture_switch::room_id(&gid);
     d.lookup_family(&gid)
         .await
         .unwrap()
@@ -147,6 +153,9 @@ pub(crate) async fn found_community(
     put_voices(d, &roster_voices(&rec, 1, None, 2_000, &signers))
         .await
         .expect("V1: the community's founding voices");
+    // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+    // panics if it was not).
+    let gid = crate::federation::edition2::fixture_switch::room_id(&gid);
     d.lookup_community(&gid)
         .await
         .unwrap()
@@ -350,7 +359,7 @@ pub(crate) async fn owner_seat_body(d: &dyn FederationDirectory) {
     );
 }
 
-/// An owner binding of `owner` over `agent` that names the affiliation `c`
+/// An owner binding of `owner` over `agent` on behalf of the affiliation `c`
 /// at its held roster head (`refs.head`), as `owner`'s statement.
 async fn affiliation_binding(
     d: &dyn FederationDirectory,
@@ -366,7 +375,10 @@ async fn affiliation_binding(
         owner,
         agent,
     );
-    a.attestation_envelope["community_id"] = serde_json::json!(c.community_key_id);
+    // v62.0.0 (BIND-1; CC rc22 rule `owner-binding`) — on behalf of the
+    // affiliation (`on_behalf_of`), never by its placement.
+    a.attestation_envelope[crate::federation::admission::ON_BEHALF_OF_FIELD] =
+        serde_json::json!(c.community_key_id);
     a.attestation_envelope["refs"] = serde_json::json!({ "head": [2, [-16, head.hex()]] });
     redate(&mut a);
     e2::row_of(&a, owner)
@@ -698,24 +710,17 @@ pub(crate) async fn officer_appointment_body(d: &dyn FederationDirectory) {
     // group's counted one waits until the quorum at the head it names, and a
     // non-member's voice never completes it; met, the seat ends.
     let lone = e2::composer_of(attestation_type::WITHDRAWS, &held, m3);
-    // v62.0.0 (wave GC1; CC 2.7.3) — its standing reads the target: HELD
-    // `withdraws_not_admitted`, kept and concluding nothing.
-    let o = e2::put_signed(d, &lone)
-        .await
-        .expect("I3296 a lone member's retraction is kept (held)");
-    assert!(
-        pending(&o) && d.get_attestation(&e2::rid(&lone)).await.unwrap().is_none(),
-        "I3296 a lone member's retraction of a counted appointment never lands: {o:?}"
-    );
-    assert_eq!(
-        super::fold::why_held(d, &super::names::RowId(e2::rid_digest(&lone)))
-            .await
-            .unwrap()
-            .map(|h| h.reason)
-            .as_deref(),
-        Some(super::fold::reason::WITHDRAWS_NOT_ADMITTED),
-        "I3296 held, and says why"
-    );
+    // v62.0.0 (KR-fix20; CC 2.4.1.1 rule 0, the count always wins) — a
+    // counted row is reached only by a count: one member's authored
+    // retraction is REFUSED by name and nothing is kept (it was held
+    // `withdraws_not_admitted` for ever before).
+    never_retracts_kept_nothing(
+        d,
+        e2::put_signed(d, &lone).await,
+        &e2::rid(&lone),
+        "I3296 a lone member's retraction of a counted appointment",
+    )
+    .await;
     let mut w = held.clone();
     w.attestation_type = attestation_type::WITHDRAWS.to_owned();
     w.attesting_key_id = e2::kid(m1);
@@ -778,6 +783,43 @@ async fn licence_issued(d: &dyn FederationDirectory, holder: &str, authority: &s
         .await
         .unwrap()
         .contains(&crate::federation::licensure::LicensureStatus::Issued)
+}
+
+/// v62.0.0 (KR-fix20) — `out` is the refusal `withdraws_never_retracts`
+/// (by the error's variant and token), and nothing of the withdrawal `id`
+/// is kept: no row, no fold record, no statement.
+async fn never_retracts_kept_nothing(
+    d: &dyn FederationDirectory,
+    out: Result<StatementOutcome, Error>,
+    id: &str,
+    what: &str,
+) {
+    assert!(
+        matches!(
+            &out,
+            Err(Error::MalformedRow { reason, .. })
+                if *reason == crate::federation::malformed_row::WITHDRAWS_NEVER_RETRACTS
+        ),
+        "{what}: refused withdraws_never_retracts: {out:?}"
+    );
+    let row_id = super::names::RowId(
+        hex::decode(id)
+            .expect("a hex row id")
+            .try_into()
+            .expect("32 bytes"),
+    );
+    assert!(
+        d.get_attestation(id).await.unwrap().is_none(),
+        "{what}: no row"
+    );
+    assert!(
+        d.fold_state(&row_id).await.unwrap().is_none(),
+        "{what}: no fold record"
+    );
+    assert!(
+        d.edition2_voices(&row_id).await.unwrap().is_empty(),
+        "{what}: no statement kept"
+    );
 }
 
 /// I3297: the group's withdrawal of a COUNTED licence is itself counted, at
@@ -881,8 +923,9 @@ pub(crate) async fn licence_withdrawal_body(d: &dyn FederationDirectory) {
     };
 
     // The licensee's own withdrawal: never concludes, counted or authored.
-    // v62.0.0 (wave GC1; CC 2.7.3) — its standing reads the target: each is
-    // HELD `withdraws_not_admitted` (kept, no typed row), never refused.
+    // v62.0.0 (wave GC1; CC 2.7.3) — the COUNTED one's standing reads the
+    // target: HELD `withdraws_not_admitted` (kept, no typed row). The
+    // AUTHORED one is refused by name (KR-fix20, below).
     let held_not_admitted = |o: &StatementOutcome, id: String, what: &str| {
         assert!(pending(o), "{what}: held: {o:?}");
         id
@@ -898,25 +941,27 @@ pub(crate) async fn licence_withdrawal_body(d: &dyn FederationDirectory) {
             .hex(),
         "I3297 the licensee's own counted withdrawal never lands (CLM-licence-contest)",
     );
+    // v62.0.0 (KR-fix20) — an AUTHORED withdrawal of the counted licence,
+    // the licensee's or a lone member's, is no count: REFUSED by name,
+    // nothing kept.
     let la = e2::composer_of(attestation_type::WITHDRAWS, &held, holder);
-    let o = e2::put_signed(d, &la)
-        .await
-        .expect("I3297 the licensee's authored withdrawal is kept (held)");
-    let la_id = held_not_admitted(
-        &o,
-        e2::rid(&la),
-        "I3297 the licensee's own withdrawal never lands (CLM-licence-contest)",
-    );
-    // A lone member's authored withdrawal: never lands.
+    let la_id = e2::rid(&la);
+    never_retracts_kept_nothing(
+        d,
+        e2::put_signed(d, &la).await,
+        &la_id,
+        "I3297 the licensee's own authored withdrawal (CLM-licence-contest)",
+    )
+    .await;
     let lm = e2::composer_of(attestation_type::WITHDRAWS, &held, m3);
-    let o = e2::put_signed(d, &lm)
-        .await
-        .expect("I3297 a lone member's withdrawal is kept (held)");
-    let lm_id = held_not_admitted(
-        &o,
-        e2::rid(&lm),
-        "I3297 a lone member's retraction of a counted licence never lands",
-    );
+    let lm_id = e2::rid(&lm);
+    never_retracts_kept_nothing(
+        d,
+        e2::put_signed(d, &lm).await,
+        &lm_id,
+        "I3297 a lone member's authored retraction of a counted licence",
+    )
+    .await;
     for id in [&lw_id, &la_id, &lm_id] {
         assert!(
             d.get_attestation(id).await.unwrap().is_none(),

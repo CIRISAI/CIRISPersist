@@ -228,7 +228,7 @@ pub(crate) mod bodies {
         tag: &str,
     ) {
         let k = keys(d, tag).await;
-        d.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
+        d.test_seam_put_identity_occurrence(crate::federation::IdentityOccurrence {
             identity_key_id: k.node.clone(),
             occurrence_key_id: k.install.clone(),
             device_class: crate::federation::types::device_class::SERVER.into(),

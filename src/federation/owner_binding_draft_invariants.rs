@@ -168,7 +168,6 @@ pub(crate) async fn i4286_the_draft_states_the_software_producers_row(e: &crate:
     let mut input = crate::federation::EmitAttestationInput::with_envelope(
         attestation_type::DELEGATES_TO,
         crate::federation::envelope::EnvelopeCore::from_value(owner_binding_delegates_to_envelope(
-            &node,
             &scopes(),
         ))
         .expect("I4286: the envelope"),

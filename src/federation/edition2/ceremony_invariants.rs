@@ -506,7 +506,12 @@ fn i2282_the_offer_check_refuses_what_the_door_refuses() {
     terms.cites.clear();
     let uncited = sign(
         &s.key,
-        &super::occurrence::bind_draft(&terms, &terms.occurrence_key_id).expect("drafted"),
+        &super::occurrence::bind_draft(
+            &terms,
+            &terms.occurrence_key_id,
+            &super::occurrence::own_kid(&terms.occurrence_key_id).expect("an identity-ref"),
+        )
+        .expect("drafted"),
     );
     let mut bt = off.terms.clone();
     let old = super::names::RowId::of_statement(&s.binding).unwrap().0;

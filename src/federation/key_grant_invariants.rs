@@ -121,6 +121,44 @@ pub mod two_node {
         }
     }
 
+    /// v62.0.0 (HEAD-6; Constitution, head cases (3): "owned-but-rootless
+    /// runs the mesh; unowned is only reachable") — **own `n`**: the person
+    /// `owner_alias` binds the node `alias` (a [`node_as`] `NODE`) through the
+    /// real owner-binding door (`fixture_switch::land_owner_binding`: the
+    /// owner's statement, then the node's own voice), on the node's own
+    /// backend. From then on its reports and holding claims name the binding.
+    ///
+    /// # Panics
+    /// The binding does not land.
+    pub async fn own<B>(n: &Node<'_, B>, alias: &str, owner_alias: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        e2::put_key(n.backend, owner_alias, &[USER]).await;
+        let binding = ts::owner_binding_attestation(
+            &format!("own-{alias}-{owner_alias}"),
+            owner_alias,
+            &n.key,
+        );
+        e2::land_owner_binding(n.backend, &binding, alias)
+            .await
+            .unwrap_or_else(|e| panic!("own({alias}): the owner binding lands: {e:?}"));
+    }
+
+    /// v62.0.0 (HEAD-7; Constitution, head cases (3)) — [`node_as`], then
+    /// [`own`]: a `role` node OWNED by the person `{alias}-owner` through the
+    /// real owner-binding door. The fixture for a node that is to sign reports
+    /// and holding claims; [`node_as`] stays the fixture for a test about an
+    /// unowned node, or one that binds the node itself.
+    pub async fn node_owned_as<'a, B>(backend: &'a B, alias: &str, role: &str) -> Node<'a, B>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let n = node_as(backend, alias, role).await;
+        own(&n, alias, &format!("{alias}-owner")).await;
+        n
+    }
+
     /// Every node learns every other node's key — the ONE piece of shared
     /// knowledge two real nodes have after a key-record exchange: each
     /// alias's edition-2 `key:record` (`kid(alias)`), registered as a USER
@@ -161,6 +199,74 @@ pub mod two_node {
         key: &str,
         key_seed: &str,
     ) {
+        own_key_placed(
+            d,
+            owner,
+            key,
+            key_seed,
+            crate::federation::types::cohort_scope::FEDERATION,
+            None,
+        )
+        .await;
+    }
+
+    /// v62.0.0 (WD-fx2; CC 5.4.6, CC 3.2 "Where the row is placed") — **an
+    /// owner binding PLACED at `scope`**: [`own_key`]'s row and voice path,
+    /// at `scope` (`self`: tier `local`; `community` / `affiliations` naming
+    /// `group` in `community_key_id`; `family` naming it in `family_key_id`).
+    /// [`own_key`] is this at `federation` with no group (an ANNOUNCED
+    /// binding, as every fixture placed before CC 5.4.6). A second call at
+    /// another scope is the owner's RE-SIGNING beside the first, never a
+    /// `supersedes`.
+    ///
+    /// # Panics
+    /// The binding does not land.
+    pub async fn own_key_placed(
+        d: &dyn crate::federation::FederationDirectory,
+        owner: &str,
+        key: &str,
+        key_seed: &str,
+        scope: &str,
+        group: Option<&str>,
+    ) {
+        let row = placed_binding_row(d, owner, key, key_seed, scope, group).await;
+        ts::put_sealed_owner_binding(d, &row, key_seed)
+            .await
+            .unwrap_or_else(|e| panic!("{owner} owns {key}: {e}"));
+    }
+
+    /// v62.0.0 (WD-fix16) — **[`own_key_placed`] without asserting that the
+    /// binding lands**: the door's outcome. A binding re-signed at a room
+    /// the node does not hold yet (a joiner's, CC 2.7.8) is HELD there
+    /// (`Pending`), its statements kept for the answer envelope
+    /// (`membership_acceptance::join_answer_rows`).
+    ///
+    /// # Panics
+    /// The door refuses the binding.
+    pub async fn re_sign_owner_binding(
+        d: &dyn crate::federation::FederationDirectory,
+        owner: &str,
+        key: &str,
+        key_seed: &str,
+        scope: &str,
+        group: Option<&str>,
+    ) -> StatementOutcome {
+        let row = placed_binding_row(d, owner, key, key_seed, scope, group).await;
+        e2::land_owner_binding(d, &row, key_seed)
+            .await
+            .unwrap_or_else(|e| panic!("{owner} re-signs {key} at {scope}: {e}"))
+    }
+
+    /// The owner-binding row [`own_key_placed`] puts, placed and dated.
+    async fn placed_binding_row(
+        d: &dyn crate::federation::FederationDirectory,
+        owner: &str,
+        key: &str,
+        key_seed: &str,
+        scope: &str,
+        group: Option<&str>,
+    ) -> crate::federation::Attestation {
+        use crate::federation::types::{attestation_tier, cohort_scope};
         // v62.0.0 (P1-fix10) — the bound key's own record FIRST: its voice
         // over the binding is checked against it.
         key_live(d, key_seed).await;
@@ -170,6 +276,23 @@ pub mod two_node {
         // the binding lands, and the builder dates it inside the bound key's
         // window). In the earlier form it is `put_attestation`, as before.
         let mut row = ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), owner, key);
+        // v62.0.0 (WD-fx2) — the placement: the row's scope, and the group it
+        // names (the same members `envelope_cohort_target` reads).
+        if scope != cohort_scope::FEDERATION || group.is_some() {
+            row.cohort_scope = scope.to_owned();
+            if scope == cohort_scope::SELF {
+                row.tier = attestation_tier::LOCAL.to_owned();
+            }
+            if let Some(g) = group {
+                let member = if scope == cohort_scope::FAMILY {
+                    "family_key_id"
+                } else {
+                    "community_key_id"
+                };
+                row.attestation_envelope[member] = serde_json::json!(g);
+            }
+            ts::reseal(&mut row);
+        }
         // v62.0.0 (E11-fix4) — dated from the bound key's record AS THIS
         // DIRECTORY HOLDS IT ([`owner_binding_instant`]), then re-sealed. The
         // builder dates from the process-wide default window of `key`'s seed,
@@ -193,9 +316,7 @@ pub mod two_node {
             }
             ts::reseal(&mut row);
         }
-        ts::put_sealed_owner_binding(d, &row, key_seed)
-            .await
-            .unwrap_or_else(|e| panic!("{owner} owns {key}: {e}"));
+        row
     }
 
     /// v62.0.0 (E11-fix4) — the offset past the bound key's record start at
@@ -286,20 +407,331 @@ pub mod two_node {
         // v62.0.0 (P1-fix10) — the node's record before its self-occurrence
         // and its owner binding.
         key_live(d, node_seed).await;
-        d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-            identity_key_id: node.to_owned(),
-            occurrence_key_id: node.to_owned(),
-            device_class: device_class.to_owned(),
-            hardware_attestation: None,
-            asserted_at: chrono::Utc::now(),
-            valid_until: None,
-            encryption_pubkeys: kem,
-            transport_binding: None,
-            persist_row_hash: String::new(),
-        })
+        crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+            d,
+            crate::federation::types::IdentityOccurrence {
+                identity_key_id: node.to_owned(),
+                occurrence_key_id: node.to_owned(),
+                device_class: device_class.to_owned(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: kem,
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            },
+        )
         .await
         .unwrap_or_else(|e| panic!("{node}'s self-occurrence: {e}"));
         own_key(d, owner, node, node_seed).await;
+    }
+
+    /// v62.0.0 (WD-fx2; CC 5.4.6) — **[`place_device`] for an UNANNOUNCED
+    /// node**: the node's record and self pair as there, then `owner`'s
+    /// binding of it at `self` ([`own_key_placed`]) and the owner's
+    /// re-signing at each `(scope, group)` of `groups` (a room: `community`;
+    /// a family: `family`). Nothing at `federation`: the node's owner and,
+    /// through it, the owner's occurrences (WD-fix14b) are held only by the
+    /// audiences of those groups.
+    pub async fn place_device_at_groups(
+        d: &dyn crate::federation::FederationDirectory,
+        owner: &str,
+        node: &str,
+        node_seed: &str,
+        device_class: &str,
+        kem: Option<EncryptionPubkeys>,
+        groups: &[(&str, &str)],
+    ) {
+        use crate::federation::types::cohort_scope;
+        key_live(d, node_seed).await;
+        crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+            d,
+            crate::federation::types::IdentityOccurrence {
+                identity_key_id: node.to_owned(),
+                occurrence_key_id: node.to_owned(),
+                device_class: device_class.to_owned(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: kem,
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{node}'s self-occurrence: {e}"));
+        own_key_placed(d, owner, node, node_seed, cohort_scope::SELF, None).await;
+        for (scope, group) in groups {
+            own_key_placed(d, owner, node, node_seed, scope, Some(*group)).await;
+        }
+    }
+
+    /// v62.0.0 (WD-fx4; WD-fix16 part 2) — **[`seed_community_everywhere`]
+    /// with every member's node placed at the ROOM only, joined through the
+    /// carriage**: the room is PUBLIC (`found_community`: no `membership`
+    /// stated), founded on `founder`'s store by `founder_person`, whose node
+    /// is placed at `self` + the room there; each `(node, person)` of
+    /// `joiners` places its node at `self` on its own store and joins by
+    /// `membership_acceptance_invariants::bodies::join_room_by_carriage`.
+    /// Nothing is announced and nothing is copied by hand: after the joins,
+    /// every node pulls every other through the serve rule
+    /// ([`deliver_served`], twice, so a binding that needs its node's key
+    /// record lands on the second pass). Returns the room's id.
+    ///
+    /// # Panics
+    /// A join step fails, or a node does not then name every member node's
+    /// owner (the premise every room-placed variant stands on).
+    pub async fn seed_room_by_carriage<B>(
+        founder: &Node<'_, B>,
+        founder_person: &str,
+        joiners: &[(&Node<'_, B>, &str)],
+        cid: &str,
+    ) -> String
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::membership_acceptance_invariants::bodies::{
+            found_community, id_of, join_room_by_carriage, reg,
+        };
+        use crate::federation::types::cohort_scope::COMMUNITY;
+        use crate::federation::types::device_class::LAPTOP;
+        // Seeds register and found (as I4419); every later step names the
+        // persons by the id the directory keys them under (`id_of`).
+        let mut seeds: Vec<&str> = vec![cid, founder_person];
+        seeds.extend(joiners.iter().map(|(_, p)| *p));
+        reg(founder.backend, &seeds).await;
+        for (j, _) in joiners {
+            reg(j.backend, &seeds).await;
+        }
+        let room = found_community(founder.backend, cid, "quorum:1/1", &[founder_person], &[])
+            .await
+            .unwrap_or_else(|e| panic!("seed_room_by_carriage: the room {cid}: {e}"));
+        let room = id_of(&room);
+        let founder_id = id_of(founder_person);
+        let mut members: Vec<(&Node<'_, B>, String)> = vec![(founder, founder_id.clone())];
+        members.extend(joiners.iter().map(|(j, p)| (*j, id_of(p))));
+        place_device_at_groups(
+            founder.backend,
+            &founder_id,
+            &founder.key,
+            &founder.key,
+            LAPTOP,
+            Some(founder.kem.clone()),
+            &[(COMMUNITY, room.as_str())],
+        )
+        .await;
+        for (j, person) in &members[1..] {
+            place_device_at_groups(
+                j.backend,
+                person,
+                &j.key,
+                &j.key,
+                LAPTOP,
+                Some(j.kem.clone()),
+                &[],
+            )
+            .await;
+            // The link traffic before the join: keys and node self pairs.
+            deliver_served(founder.backend, j.backend, &j.key).await;
+            deliver_served(j.backend, founder.backend, &founder.key).await;
+            join_room_by_carriage(
+                founder.backend,
+                &[founder_id.as_str()],
+                &room,
+                j.backend,
+                person,
+                &j.key,
+                &j.key,
+            )
+            .await;
+        }
+        for _ in 0..2 {
+            for (from, _) in &members {
+                for (to, _) in &members {
+                    if from.key != to.key {
+                        deliver_served(from.backend, to.backend, &to.key).await;
+                    }
+                }
+            }
+        }
+        for (n, _) in &members {
+            for (m, person) in &members {
+                assert_eq!(
+                    crate::federation::admission::owner_of(n.backend, &m.key)
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some(person.as_str()),
+                    "seed_room_by_carriage premise: {} names {person} as the owner of {} \
+                     (placed at the room only, served to members)",
+                    n.key,
+                    m.key
+                );
+            }
+        }
+        room
+    }
+
+    /// v62.0.0 (WD-fx5; WD-fix16 part 2) — **[`seed_room_by_carriage`]'s
+    /// FAMILY twin**: a family founded on `founder`'s store by
+    /// `founder_person` (`found_family`), whose node is placed at `self` + the
+    /// family there; each `(node, person)` of `joiners` places its node at
+    /// `self` on its own store and joins by
+    /// `membership_acceptance_invariants::bodies::join_family_by_carriage`.
+    /// Every node is a PERSONAL-class device (`laptop`: a server-class owned
+    /// node holds no family content by default, CC 3.3.7). Then every node
+    /// pulls every other through [`deliver_served`], twice. Returns the
+    /// family's id.
+    ///
+    /// # Panics
+    /// A join step fails, or a node does not then name every member node's
+    /// owner.
+    pub async fn seed_family_by_carriage<B>(
+        founder: &Node<'_, B>,
+        founder_person: &str,
+        joiners: &[(&Node<'_, B>, &str)],
+        fid: &str,
+    ) -> String
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::membership_acceptance_invariants::bodies::{
+            found_family, id_of, join_family_by_carriage, reg,
+        };
+        use crate::federation::types::cohort_scope::FAMILY;
+        use crate::federation::types::device_class::LAPTOP;
+        let mut seeds: Vec<&str> = vec![fid, founder_person];
+        seeds.extend(joiners.iter().map(|(_, p)| *p));
+        reg(founder.backend, &seeds).await;
+        for (j, _) in joiners {
+            reg(j.backend, &seeds).await;
+        }
+        let family = found_family(founder.backend, fid, "quorum:1/1", &[founder_person], &[])
+            .await
+            .unwrap_or_else(|e| panic!("seed_family_by_carriage: the family {fid}: {e}"));
+        let family = id_of(&family);
+        let founder_id = id_of(founder_person);
+        let mut members: Vec<(&Node<'_, B>, String)> = vec![(founder, founder_id.clone())];
+        members.extend(joiners.iter().map(|(j, p)| (*j, id_of(p))));
+        place_device_at_groups(
+            founder.backend,
+            &founder_id,
+            &founder.key,
+            &founder.key,
+            LAPTOP,
+            Some(founder.kem.clone()),
+            &[(FAMILY, family.as_str())],
+        )
+        .await;
+        for (j, person) in &members[1..] {
+            place_device_at_groups(
+                j.backend,
+                person,
+                &j.key,
+                &j.key,
+                LAPTOP,
+                Some(j.kem.clone()),
+                &[],
+            )
+            .await;
+            deliver_served(founder.backend, j.backend, &j.key).await;
+            deliver_served(j.backend, founder.backend, &founder.key).await;
+            join_family_by_carriage(
+                founder.backend,
+                &founder_id,
+                &family,
+                j.backend,
+                person,
+                &j.key,
+                &j.key,
+            )
+            .await;
+        }
+        for _ in 0..2 {
+            for (from, _) in &members {
+                for (to, _) in &members {
+                    if from.key != to.key {
+                        deliver_served(from.backend, to.backend, &to.key).await;
+                    }
+                }
+            }
+        }
+        for (n, _) in &members {
+            for (m, person) in &members {
+                assert_eq!(
+                    crate::federation::admission::owner_of(n.backend, &m.key)
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some(person.as_str()),
+                    "seed_family_by_carriage premise: {} names {person} as the owner of {} \
+                     (placed at the family only, served to members)",
+                    n.key,
+                    m.key
+                );
+            }
+        }
+        family
+    }
+
+    /// v62.0.0 (WD-fx2; the lead's shape finding) — **the crossing THROUGH
+    /// THE SERVE RULE**: every statement `from` serves `requester`
+    /// (`edition2::serve::statements_served_to`, the filtered listing a peer
+    /// pulls), offered to `to`'s replicated statement door, re-offered while
+    /// a pass lands something (a voice before its key, as a puller retries a
+    /// held cursor). What the serve rule withholds never reaches `to`: a
+    /// two-node witness of an AUDIENCE property must deliver through this,
+    /// never through [`deliver_statements`] over a hand-picked set, which
+    /// bypasses the rule and so cannot fail. Returns the outcomes `to`
+    /// admitted; a statement that never lands is left, as a puller moves on.
+    ///
+    /// # Panics
+    /// The serve listing errs.
+    pub async fn deliver_served<D, E>(
+        from: &D,
+        to: &E,
+        requester: &str,
+    ) -> Vec<ReplicatedStatementOutcome>
+    where
+        D: FederationDirectory + ?Sized,
+        E: FederationDirectory + ?Sized,
+    {
+        let mut served = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = crate::federation::edition2::serve::statements_served_to(
+                from,
+                cursor.as_ref(),
+                1000,
+                Some(requester),
+            )
+            .await
+            .expect("the serve listing");
+            served.extend(page.statements.into_iter().map(|st| st.bytes));
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        let mut pending: Vec<&Vec<u8>> = served.iter().collect();
+        let mut out = Vec::new();
+        loop {
+            let landed_before = out.len();
+            let mut waiting = Vec::new();
+            for st in pending {
+                let Some(id) = RowId::of_statement(st) else {
+                    continue;
+                };
+                match Box::pin(apply_replicated_statement(to, st, &id.0)).await {
+                    Ok(o) => out.push(o),
+                    Err(_) => waiting.push(st),
+                }
+            }
+            if waiting.is_empty() || out.len() == landed_before {
+                return out;
+            }
+            pending = waiting;
+        }
     }
 
     /// v62.0.0 (E11) — POSIX ms of an instant (`e2::ms`).
@@ -573,9 +1005,12 @@ pub mod two_node {
             persist_row_hash: String::new(),
         };
         if !machine {
-            dir.put_identity_occurrence_local(occurrence(member))
-                .await
-                .unwrap_or_else(|e| panic!("occurrence {device} of {member}: {e}"));
+            crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+                dir,
+                occurrence(member),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("occurrence {device} of {member}: {e}"));
             return;
         }
         for v in owner_binding_voices(
@@ -587,9 +1022,12 @@ pub mod two_node {
                 .await
                 .unwrap_or_else(|e| panic!("{member}'s owner binding of the node {device}: {e}"));
         }
-        dir.put_identity_occurrence_local(occurrence(device))
-            .await
-            .unwrap_or_else(|e| panic!("the node {device}'s own occurrence: {e}"));
+        crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+            dir,
+            occurrence(device),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the node {device}'s own occurrence: {e}"));
     }
 
     /// Seed the same community on every node: the community key, each
@@ -1033,6 +1471,9 @@ pub mod two_node {
         let alice = e2::kid(&format!("{tag}-alice-{run}"));
         let bob = e2::kid(&format!("{tag}-bob-{run}"));
         seed_community_everywhere(&[a, b], &comm, &[(&alice, Some(a)), (&bob, Some(b))]).await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
 
         // Mallory: a registered key on BOTH nodes, a member of nothing.
         let mallory_alias = format!("{tag}-mallory-{run}");
@@ -1184,6 +1625,9 @@ pub mod two_node {
         let alice = e2::kid(&format!("{tag}-alice-{run}"));
         let bob = e2::kid(&format!("{tag}-bob-{run}"));
         seed_community_everywhere(&[a, b], &comm, &[(&alice, Some(a)), (&bob, Some(b))]).await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
 
         // A seals under (C, A, 0) — the fan-out wraps to B's occurrence
         // with B's OWN content-KEM pubkeys, which only B can open.
@@ -1347,6 +1791,9 @@ pub mod two_node {
         let alice = e2::kid(&format!("{tag}-alice-{run}"));
         let bob = e2::kid(&format!("{tag}-bob-{run}"));
         seed_community_everywhere(&[a, b], &comm, &[(&alice, Some(a)), (&bob, Some(b))]).await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         let sealed = encrypt_and_cascade_community(a.backend, &comm, b"v1", None, Some(&a.key))
             .await
             .unwrap();
@@ -1472,6 +1919,9 @@ pub mod two_node {
             &[(&alice, Some(a)), (&bob, Some(b)), (&xavier, None)],
         )
         .await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         // Give X an occurrence with keys on both nodes so B wraps to it.
         let x_occ = e2::kid(&format!("{tag}-x-occ-{run}"));
         for n in [a, b] {
@@ -1570,6 +2020,481 @@ pub mod two_node {
         );
     }
 
+    /// v62.0.0 (WD-fix16h; WD-fix16 part 2, variant 3 of 10) — **I63 with
+    /// every member's node placed at the ROOM only** (room kind: PUBLIC,
+    /// founded by alice on A, no `membership` stated). bob (B) and xavier (C:
+    /// xavier's own node, the wrap target I63 gave by hand as `x_occ`) join
+    /// through the identity-key carriage ([`seed_room_by_carriage`]). Then
+    /// I63's legs: B's first seal wraps to xavier's node (B holds xavier as
+    /// its owner through R only); the removal of xavier is put on A and
+    /// reaches B by the SERVE RULE (B's node pulls A); B's next seal is a new
+    /// B-epoch, the old one disabled, xavier's node absent from the new set,
+    /// and its pre-rotation grant kept (AV-70).
+    pub async fn exercise_i63_rotation_on_admitted_removal_room_placed<B>(
+        a: &Node<'_, B>,
+        b: &Node<'_, B>,
+        c: &Node<'_, B>,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let k = |n: &str| format!("{tag}-rp63-{n}-{run}");
+        let (alice_s, bob_s, xavier_s) = (k("alice"), k("bob"), k("xavier"));
+        let comm = seed_room_by_carriage(
+            a,
+            &alice_s,
+            &[(b, bob_s.as_str()), (c, xavier_s.as_str())],
+            &k("comm"),
+        )
+        .await;
+        let (alice, bob, xavier) = (e2::kid(&alice_s), e2::kid(&bob_s), e2::kid(&xavier_s));
+        let x_node = c.key.clone();
+        let first = encrypt_and_cascade_community(b.backend, &comm, b"before", None, Some(&b.key))
+            .await
+            .unwrap();
+        assert!(
+            first.granted.contains(&x_node),
+            "{tag} I63rp: xavier's node granted at B's first epoch (held through the room)"
+        );
+        let e0_minted = b
+            .backend
+            .community_dek_minted_at(&comm, &b.key, first.epoch)
+            .await
+            .unwrap()
+            .expect("minted_at recorded");
+        let removed_at = chrono::Utc::now();
+        assert!(
+            removed_at >= e0_minted,
+            "{tag} I63rp: the removal is newer than the mint"
+        );
+        let rev = community_removal_voices(
+            a.backend,
+            &comm,
+            &xavier,
+            removed_at,
+            removed_at,
+            &[&xavier, &alice, &bob],
+        )
+        .await;
+        match e2::put_voices(a.backend, &rev).await {
+            Ok(StatementOutcome::Row { .. }) => {}
+            other => panic!("{tag} I63rp: A holds the removal: {other:?}"),
+        }
+        // The removal crosses by the serve rule, as B's node pulls A.
+        deliver_served(a.backend, b.backend, &b.key).await;
+        let second = encrypt_and_cascade_community(b.backend, &comm, b"after", None, Some(&b.key))
+            .await
+            .unwrap();
+        assert!(
+            second.epoch > first.epoch,
+            "{tag} I63rp: B's next seal is under a new B-epoch ({} -> {})",
+            first.epoch,
+            second.epoch
+        );
+        assert_eq!(
+            b.backend
+                .community_dek_key_state(&comm, &b.key, first.epoch)
+                .await
+                .unwrap(),
+            Some(crate::federation::DekKeyState::Disabled),
+            "{tag} I63rp: the old B-epoch is disabled"
+        );
+        assert!(
+            !second.granted.contains(&x_node),
+            "{tag} I63rp: xavier's node is absent from B's new set: {:?}",
+            second.granted
+        );
+        assert!(
+            b.backend
+                .community_dek_has_member_grant(&comm, &b.key, first.epoch, &x_node)
+                .await
+                .unwrap(),
+            "{tag} I63rp: xavier keeps its pre-rotation grant (AV-70)"
+        );
+    }
+
+    /// v62.0.0 (WD-fix16k; the lead's ask: one two-node witness standing in
+    /// for I390–I399's PROPERTY) — **I4427: the audience resolver's answer is
+    /// what arrives.** Three nodes:
+    /// - A: alice's, the founder of PUBLIC room R (no `membership`), her
+    ///   node bound at `self` + R;
+    /// - B: bob's, joined to R through the identity-key carriage, his node
+    ///   bound at `self` + R (WD-fx4);
+    /// - C: carol's, ANNOUNCED (her node's binding at `federation`), in no
+    ///   room.
+    ///
+    /// Every crossing is the serve rule ([`deliver_served`]). For each owner
+    /// binding a node holds as its own, and each other node, the resolver
+    /// (`replication_audience::may_receive`, asked on the holder) says
+    /// whether the row reaches that node, and the witness asserts that this
+    /// is exactly whether the row ARRIVED there, with the expected answers:
+    /// - alice's R-placed binding of A: to B yes (a member's node), to C no
+    ///   (I390's "a private group's planes do not", I391's "a non-member's
+    ///   node is outside");
+    /// - carol's federation binding of C: to A and to B yes (I390's "public
+    ///   reaches every peer");
+    /// - the resolver and the arrival never disagree (I398's "the receiver's
+    ///   view agrees with the cohort's").
+    pub async fn exercise_i4427_the_resolver_is_what_arrives<B>(
+        a: &Node<'_, B>,
+        b: &Node<'_, B>,
+        c: &Node<'_, B>,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::replication_audience::may_receive;
+        use crate::federation::types::cohort_scope::FEDERATION;
+        use crate::federation::types::device_class::LAPTOP;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let k = |n: &str| format!("{tag}-i4427-{n}-{run}");
+        let (alice_s, bob_s, carol_s) = (k("alice"), k("bob"), k("carol"));
+        let room = seed_room_by_carriage(a, &alice_s, &[(b, bob_s.as_str())], &k("comm")).await;
+        // carol: announced, in no room.
+        e2::put_key(c.backend, &carol_s, &[USER]).await;
+        let carol = e2::kid(&carol_s);
+        place_device(
+            c.backend,
+            &carol,
+            &c.key,
+            &c.key,
+            LAPTOP,
+            Some(c.kem.clone()),
+        )
+        .await;
+        for _ in 0..2 {
+            for (from, to) in [(a, c), (b, c), (c, a), (c, b), (a, b), (b, a)] {
+                deliver_served(from.backend, to.backend, &to.key).await;
+            }
+        }
+        let now = chrono::Utc::now();
+        async fn binding_at<B>(
+            holder: &Node<'_, B>,
+            scope: &str,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> crate::federation::Attestation
+        where
+            B: BlobStorage + FederationDirectory + Sync,
+        {
+            crate::federation::admission::owner_bindings_in_force_at(
+                holder.backend,
+                &holder.key,
+                now,
+            )
+            .await
+            .expect("the owner bindings read")
+            .into_iter()
+            .find(|r| r.cohort_scope == scope)
+            .unwrap_or_else(|| {
+                panic!(
+                    "I4427 premise: {} holds its own binding at {scope}",
+                    holder.key
+                )
+            })
+        }
+        let a_at_room = binding_at(a, COMMUNITY, now).await;
+        let c_announced = binding_at(c, FEDERATION, now).await;
+        let _ = room;
+        for (holder, row, receiver, want, what) in [
+            (
+                a,
+                &a_at_room,
+                b,
+                true,
+                "alice's R-placed binding, to bob's node (a member's)",
+            ),
+            (
+                a,
+                &a_at_room,
+                c,
+                false,
+                "alice's R-placed binding, to carol's node (no member)",
+            ),
+            (
+                c,
+                &c_announced,
+                a,
+                true,
+                "carol's announced binding, to alice's node",
+            ),
+            (
+                c,
+                &c_announced,
+                b,
+                true,
+                "carol's announced binding, to bob's node",
+            ),
+        ] {
+            let allowed = may_receive(holder.backend, &receiver.key, row)
+                .await
+                .expect("the resolver reads")
+                .allowed();
+            let arrived = receiver
+                .backend
+                .get_attestation(&row.attestation_id)
+                .await
+                .expect("the receiver reads")
+                .is_some();
+            assert_eq!(
+                allowed, want,
+                "{tag} I4427: the resolver's answer for {what}"
+            );
+            assert_eq!(
+                arrived, allowed,
+                "{tag} I4427: what arrived agrees with the resolver for {what}"
+            );
+        }
+    }
+
+    /// v62.0.0 (WD-fix16m; WD-fix16 part 2, I75 RESTRUCTURED) — **I75, the
+    /// end to end delivered by the planes, with the members' NODES placed at
+    /// the room only.** I75 as built makes each Engine key a person's USER
+    /// device bound by the identity's own voice, with no owner binding, so no
+    /// placement can apply. Here each Engine's key is a NODE (`key:record`
+    /// `node`, as the epoch-minter ladder registers it), OWNED by its person
+    /// at `self` + PUBLIC room R (no `membership`; [`seed_room_by_carriage`]:
+    /// alice founds R on A, bob joins by the carriage). Then, I75's crossing
+    /// with every row through the SERVE RULE ([`deliver_served`]) and the
+    /// replicated statement door, nothing by hand:
+    /// - A seals through the Engine door (`put_blob_scoped`): B's node is in
+    ///   A's fan-out (A holds bob as its owner through the answer);
+    /// - B's node pulls A: A's key-grant row to B arrives, and B's own wrap
+    ///   is projected (B admits it because it holds alice's R-placed binding
+    ///   of A, served to it as a member's node);
+    /// - the bytes are adopted on B, and B's node opens them.
+    pub async fn exercise_i75_delivered_by_the_planes_room_placed<B>(
+        engine_a: &crate::Engine,
+        engine_b: &crate::Engine,
+        a: &Node<'_, B>,
+        b: &Node<'_, B>,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let k = |n: &str| format!("{tag}-rp75-{n}-{run}");
+        let (alice_s, bob_s) = (k("alice"), k("bob"));
+        let comm = seed_room_by_carriage(a, &alice_s, &[(b, bob_s.as_str())], &k("comm")).await;
+        let r = engine_a
+            .put_blob_scoped(COMMUNITY, Some(&comm), b"delivered minutes", None, None)
+            .await
+            .expect("I75rp: A seals through the door");
+        assert!(
+            r.granted.contains(&b.key),
+            "{tag} I75rp: bob's node is in A's fan-out through the room: {:?}",
+            r.granted
+        );
+        let epoch = r.epoch.unwrap_or(0);
+        deliver_served(a.backend, b.backend, &b.key).await;
+        assert!(
+            b.backend
+                .community_dek_has_member_grant(&comm, &a.key, epoch, &b.key)
+                .await
+                .unwrap(),
+            "{tag} I75rp: A's row to B arrived by the serve rule, B's own wrap projected"
+        );
+        let sha = r.at_rest_sha256;
+        let Some(BlobBody::Inline(bytes)) = a.backend.get_blob(&sha).await.unwrap() else {
+            panic!("inline")
+        };
+        engine_b
+            .adopt_sealed_blob(
+                &bytes,
+                BlobProvenance {
+                    author_key_id: a.key.clone(),
+                    cohort_scope: COMMUNITY.into(),
+                    community_key_id: Some(comm.clone()),
+                    epoch: r.epoch,
+                    tier: CryptoTier::CommunityDek,
+                    minter_key_id: None,
+                },
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("I75rp: B adopts");
+        assert_eq!(
+            engine_b
+                .read_blob_as(&sha, &b.key, None)
+                .await
+                .expect("I75rp: bob's node opens"),
+            b"delivered minutes"
+        );
+    }
+
+    /// The [`Node`] of an Engine whose key is registered as a NODE on its own
+    /// backend (WD-fix16m; the epoch-minter ladder's construction).
+    pub async fn engine_node<'a, B>(backend: &'a B, alias: &str) -> Node<'a, B>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        ts::register_hybrid_key_as(
+            backend,
+            alias,
+            alias,
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
+        let signer = ts::local_signer(alias);
+        let key = signer.federation_id().await;
+        let id = backend
+            .load_or_init_content_kem_identity()
+            .await
+            .expect("content-KEM identity");
+        Node {
+            backend,
+            signer,
+            key,
+            kem: EncryptionPubkeys {
+                x25519_base64: id.x25519_pubkey_b64,
+                ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
+            },
+        }
+    }
+
+    /// v62.0.0 (WD-fix16n; WD-occurrence-audience.md §11, "Only minter
+    /// offline") — **I4428: a late joiner reads forward from an online
+    /// member's own epochs, never the offline minter's past.** PUBLIC room R
+    /// (alice founds it on A; no `membership`), every node placed at the room
+    /// only, every crossing the serve rule or a production envelope:
+    /// 1. bob (B) joins by the carriage; A seals under its own epoch e_A and
+    ///    wraps to B;
+    /// 2. carol (C) joins by the carriage AFTER that seal; A then does
+    ///    nothing more (offline);
+    /// 3. B seals: B's OWN epoch (`(R, B, e_B)`), wrapped to C, whose owner B
+    ///    holds through the room; B's row to C arrives by the serve rule and C
+    ///    opens B's content;
+    /// 4. C holds no grant at A's epoch, and neither B nor C holds a wrap for
+    ///    C at `(R, A, e_A)`: nobody re-wraps another minter's epoch (#848),
+    ///    so the joiner holds nothing of the offline minter's past.
+    pub async fn exercise_i4428_a_late_joiner_reads_forward<B>(
+        a: &Node<'_, B>,
+        b: &Node<'_, B>,
+        c: &Node<'_, B>,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::membership_acceptance_invariants::bodies::{
+            id_of, join_room_by_carriage, reg,
+        };
+        use crate::federation::types::device_class::LAPTOP;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let k = |n: &str| format!("{tag}-i4428-{n}-{run}");
+        let (alice_s, bob_s, carol_s) = (k("alice"), k("bob"), k("carol"));
+        let room = seed_room_by_carriage(a, &alice_s, &[(b, bob_s.as_str())], &k("comm")).await;
+        // (1) A seals under its own epoch, B granted.
+        let first =
+            encrypt_and_cascade_community(a.backend, &room, b"before carol", None, Some(&a.key))
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I4428 (1): A seals: {e}"));
+        assert!(
+            first.granted.contains(&b.key),
+            "{tag} I4428 (1): A wraps to B: {:?}",
+            first.granted
+        );
+        let e_a = first.epoch;
+        // (2) carol joins late, by the carriage.
+        for n in [a, b, c] {
+            reg(
+                n.backend,
+                &[alice_s.as_str(), bob_s.as_str(), carol_s.as_str()],
+            )
+            .await;
+        }
+        let (alice, carol) = (id_of(&alice_s), id_of(&carol_s));
+        place_device_at_groups(
+            c.backend,
+            &carol,
+            &c.key,
+            &c.key,
+            LAPTOP,
+            Some(c.kem.clone()),
+            &[],
+        )
+        .await;
+        deliver_served(a.backend, c.backend, &c.key).await;
+        deliver_served(c.backend, a.backend, &a.key).await;
+        join_room_by_carriage(
+            a.backend,
+            &[alice.as_str()],
+            &room,
+            c.backend,
+            &carol,
+            &c.key,
+            &c.key,
+        )
+        .await;
+        for _ in 0..2 {
+            for (from, to) in [(a, b), (b, a), (a, c), (c, a), (b, c), (c, b)] {
+                deliver_served(from.backend, to.backend, &to.key).await;
+            }
+        }
+        assert_eq!(
+            crate::federation::admission::owner_of(b.backend, &c.key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(carol.as_str()),
+            "{tag} I4428 (2) premise: B names carol as C's owner through the room"
+        );
+        // (3) B seals under its OWN epoch, wrapped to C; C opens.
+        let from_b = encrypt_and_cascade_community(b.backend, &room, b"from B", None, Some(&b.key))
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I4428 (3): B seals: {e}"));
+        assert!(
+            from_b.granted.contains(&c.key),
+            "{tag} I4428 (3): B's own epoch wraps to the late joiner: {:?}",
+            from_b.granted
+        );
+        let emitted =
+            emit_epoch_key_grant_with_local_signer(b.backend, &b.signer, &room, from_b.epoch)
+                .await
+                .unwrap()
+                .expect("B holds wraps");
+        assert!(
+            !emitted.attestation_ids.is_empty(),
+            "{tag} I4428 (3): B emitted its rows"
+        );
+        deliver_served(b.backend, c.backend, &c.key).await;
+        assert!(
+            c.backend
+                .community_dek_has_member_grant(&room, &b.key, from_b.epoch, &c.key)
+                .await
+                .unwrap(),
+            "{tag} I4428 (3): B's row to C arrived by the serve rule"
+        );
+        carry_bytes(
+            b,
+            c,
+            &from_b.at_rest_sha256,
+            COMMUNITY,
+            &room,
+            Some(from_b.epoch),
+            CryptoTier::CommunityDek,
+            &[],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I4428 (3): C adopts B's bytes: {e}"));
+        assert_eq!(
+            read_any_for_viewer(c.backend, &from_b.at_rest_sha256, &c.key, None)
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I4428 (3): C opens B's content: {e}")),
+            b"from B"
+        );
+        // (4) nothing of the offline minter's past.
+        for (n, what) in [(a, "A"), (b, "B"), (c, "C")] {
+            assert!(
+                !n.backend
+                    .community_dek_has_member_grant(&room, &a.key, e_a, &c.key)
+                    .await
+                    .unwrap(),
+                "{tag} I4428 (4): {what} holds no wrap for C at A's epoch {e_a}"
+            );
+        }
+    }
+
     // ── I64 ──────────────────────────────────────────────────────────────
     /// **Two minters at the same epoch number coexist**: B's viewer opens A's
     /// content at (C, A, 3) and C's content at (C, C, 3).
@@ -1592,6 +2517,55 @@ pub mod two_node {
             &[(&alice, Some(a)), (&bob, Some(b)), (&carol, Some(c))],
         )
         .await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
+        i64_after_seed(a, b, c, &comm, tag).await;
+    }
+
+    /// v62.0.0 (WD-fix16f; WD-fix16 part 2, variant 1 of 10) — **I64 with
+    /// every member's node placed at the ROOM only** (room kind: PUBLIC,
+    /// founded by alice on A, no `membership` stated). Bob (B) and carol (C)
+    /// join through the identity-key carriage ([`seed_room_by_carriage`]);
+    /// nothing is announced, and every crossing is the serve rule or a
+    /// production envelope. Then I64's legs unchanged: each minter must hold
+    /// the other members' node owners through the room alone to wrap to
+    /// them, and B opens both minters' content at the same epoch number.
+    /// The runner's nodes are NOT pre-owned (`node_as`, not
+    /// `node_owned_as`): an owner announced by the fixture would make the
+    /// placement moot.
+    pub async fn exercise_i64_two_minters_same_epoch_room_placed<B>(
+        a: &Node<'_, B>,
+        b: &Node<'_, B>,
+        c: &Node<'_, B>,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let k = |n: &str| format!("{tag}-rp-{n}-{run}");
+        let (alice, bob, carol) = (k("alice"), k("bob"), k("carol"));
+        let comm = seed_room_by_carriage(
+            a,
+            &alice,
+            &[(b, bob.as_str()), (c, carol.as_str())],
+            &k("comm"),
+        )
+        .await;
+        i64_after_seed(a, b, c, &comm, tag).await;
+    }
+
+    /// I64's legs after its room is seeded (either way).
+    async fn i64_after_seed<B>(
+        a: &Node<'_, B>,
+        b: &Node<'_, B>,
+        c: &Node<'_, B>,
+        comm: &str,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let comm = comm.to_owned();
         // Both A and C advance their OWN counters to 3.
         for n in [a, c] {
             for _ in 0..3 {
@@ -1706,10 +2680,12 @@ pub mod two_node {
             persist_row_hash: String::new(),
         };
         for n in [a, b] {
-            n.backend
-                .put_identity_occurrence_local(occurrence(n))
-                .await
-                .unwrap_or_else(|e| panic!("{tag} I1519: occurrence of A on a node: {e}"));
+            crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+                n.backend,
+                occurrence(n),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I1519: occurrence of A on a node: {e}"));
         }
         let sealed = encrypt_and_cascade(
             a.backend,
@@ -1826,8 +2802,9 @@ pub mod two_node {
         for n in [a, a2] {
             ts::register_hybrid_key_as(n.backend, &owner, &owner, USER).await;
             for dev in [a, a2] {
-                n.backend
-                    .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+                    n.backend,
+                    crate::federation::types::IdentityOccurrence {
                         identity_key_id: owner.clone(),
                         occurrence_key_id: dev.key.clone(),
                         device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -1837,9 +2814,10 @@ pub mod two_node {
                         encryption_pubkeys: Some(dev.kem.clone()),
                         transport_binding: None,
                         persist_row_hash: String::new(),
-                    })
-                    .await
-                    .unwrap();
+                    },
+                )
+                .await
+                .unwrap();
             }
         }
         // A seals a self blob: fresh DEK, wrapped to both devices.
@@ -1871,8 +2849,9 @@ pub mod two_node {
         // occurrence asserted after its revocation as re-established.
         let lost = node_signer(a2.backend, &format!("{tag}-lost-{run}")).await;
         let lost_key = lost.federation_id().await;
-        a2.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+        crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+            a2.backend,
+            crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner.clone(),
                 occurrence_key_id: lost_key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -1882,12 +2861,13 @@ pub mod two_node {
                 encryption_pubkeys: Some(a.kem.clone()),
                 transport_binding: None,
                 persist_row_hash: String::new(),
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         let revoked_at = chrono::Utc::now();
         a2.backend
-            .put_identity_occurrence_revocation_local(
+            .put_identity_occurrence_revocation_edition2(
                 crate::federation::types::IdentityOccurrenceRevocation {
                     identity_key_id: owner.clone(),
                     occurrence_key_id: lost_key.clone(),
@@ -1897,6 +2877,7 @@ pub mod two_node {
                     witness_set: vec![],
                     persist_row_hash: String::new(),
                 },
+                crate::federation::DoorToken::new(),
             )
             .await
             .unwrap_or_else(|e| panic!("{tag} I65: the lost device's occurrence is revoked: {e}"));
@@ -2053,8 +3034,9 @@ pub mod two_node {
         // skips it rather than aborting, and grants it nothing.
         let dev3 = e2::kid(&format!("{tag}-dev3-{run}"));
         ts::register_hybrid_key_as(a2.backend, &dev3, &dev3, USER).await;
-        a2.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+        crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+            a2.backend,
+            crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner.clone(),
                 occurrence_key_id: dev3.clone(),
                 device_class: crate::federation::types::device_class::SERVER.into(),
@@ -2064,9 +3046,10 @@ pub mod two_node {
                 encryption_pubkeys: Some(a.kem.clone()),
                 transport_binding: None,
                 persist_row_hash: String::new(),
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         let rk = crate::federation::at_rest_cascade::orchestrate::rekey_self_occurrence_add(
             a2.backend,
             &owner,
@@ -2109,8 +3092,9 @@ pub mod two_node {
         for n in [a, a2] {
             ts::register_hybrid_key_as(n.backend, &owner, &owner, USER).await;
             for dev in [a, a2] {
-                n.backend
-                    .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+                    n.backend,
+                    crate::federation::types::IdentityOccurrence {
                         identity_key_id: owner.clone(),
                         occurrence_key_id: dev.key.clone(),
                         device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -2120,9 +3104,10 @@ pub mod two_node {
                         encryption_pubkeys: Some(dev.kem.clone()),
                         transport_binding: None,
                         persist_row_hash: String::new(),
-                    })
-                    .await
-                    .unwrap();
+                    },
+                )
+                .await
+                .unwrap();
             }
         }
         let sealed = encrypt_and_cascade(
@@ -2214,8 +3199,6 @@ pub mod two_node {
     ) where
         B: BlobStorage + FederationDirectory + Sync,
     {
-        use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
-        use crate::federation::types::cohort_scope::FAMILY;
         let run = uuid::Uuid::new_v4().simple().to_string();
         let fam = e2::kid(&format!("{tag}-fam-{run}"));
         let alice = e2::kid(&format!("{tag}-alice-{run}"));
@@ -2228,8 +3211,9 @@ pub mod two_node {
                 ts::register_hybrid_key_as(n.backend, ident, ident, USER).await;
                 // v53.0.0 (#963, CC 3.3.7) — a member's PERSONAL device: a
                 // server-class occurrence holds no family content by default.
-                n.backend
-                    .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+                    n.backend,
+                    crate::federation::types::IdentityOccurrence {
                         identity_key_id: ident.clone(),
                         occurrence_key_id: dev.key.clone(),
                         device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -2239,9 +3223,10 @@ pub mod two_node {
                         encryption_pubkeys: Some(dev.kem.clone()),
                         transport_binding: None,
                         persist_row_hash: String::new(),
-                    })
-                    .await
-                    .unwrap_or_else(|e| panic!("{tag} I199: occurrence of {ident}: {e}"));
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I199: occurrence of {ident}: {e}"));
             }
             // v62.0.0 (T1) — the family is ONE `group:roster` version (the
             // authority and both members' voices), the same on every node.
@@ -2249,6 +3234,46 @@ pub mod two_node {
                 .await
                 .unwrap_or_else(|e| panic!("{tag} I199: seed family: {e}"));
         }
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let fam = crate::federation::edition2::fixture_switch::room_id(&fam);
+        i199_after_seed(a, b, &fam, tag).await;
+    }
+
+    /// v62.0.0 (WD-fix16l; WD-fix16 part 2, I199 RESTRUCTURED) — **I199 with
+    /// both members' NODES placed at the FAMILY only, joined through the
+    /// carriage** (group kind: FAMILY, founded by alice on A). I199 as built
+    /// makes each node a person's USER device and puts both occurrences on
+    /// both stores by hand. Here the nodes are NODE keys (the runner's
+    /// `node_as`), each OWNED by its person at `self` + the family
+    /// ([`seed_family_by_carriage`]; personal class, `laptop`), and every
+    /// crossing is the serve rule or a production envelope. A's family seal
+    /// must wrap to bob's node because A holds bob as its owner through the
+    /// answer; B admits A's row and opens the blob. Then I199's legs
+    /// unchanged.
+    pub async fn exercise_i199_family_member_publishes_and_another_opens_family_placed<B>(
+        a: &Node<'_, B>,
+        b: &Node<'_, B>,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let k = |n: &str| format!("{tag}-fp199-{n}-{run}");
+        let (alice_s, bob_s) = (k("alice"), k("bob"));
+        let fam = seed_family_by_carriage(a, &alice_s, &[(b, bob_s.as_str())], &k("fam")).await;
+        i199_after_seed(a, b, &fam, tag).await;
+    }
+
+    /// I199's legs after its family is seeded (either way).
+    async fn i199_after_seed<B>(a: &Node<'_, B>, b: &Node<'_, B>, fam: &str, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+        use crate::federation::types::cohort_scope::FAMILY;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let fam = fam.to_owned();
         let sealed = encrypt_and_cascade(
             a.backend,
             FAMILY,
@@ -2367,6 +3392,9 @@ pub mod two_node {
             &[(&alice, Some(a)), (&bob, Some(b)), (&xavier, None)],
         )
         .await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         let x_occ = e2::kid(&format!("{tag}-x-occ-{run}"));
         for n in [a, b] {
             ts::register_hybrid_key_as(n.backend, &x_occ, &x_occ, USER).await;
@@ -2462,6 +3490,94 @@ pub mod two_node {
         );
     }
 
+    /// v62.0.0 (WD-fix16g; WD-fix16 part 2, variant 2 of 10) — **I77 with
+    /// the minter's principal held through the ROOM only** (room kind:
+    /// PUBLIC, founded by alice on A, no `membership` stated). Bob joins
+    /// through the identity-key carriage ([`seed_room_by_carriage`]): alice's
+    /// binding of A is placed at `self` + R and reaches B ONLY by the serve
+    /// rule, as a member's node pulls it; nothing is announced or handed
+    /// over. Then I77's legs over that state:
+    /// - (2) A's wrap to B is admitted on B: the minter A lifts to alice, an
+    ///   active member, through the R-placed binding;
+    /// - (3) alice removed: a later row of A's is refused by the key-grant
+    ///   rule (`signer_not_active_member`), held by the write-scope gate.
+    ///
+    /// Leg (1) of I77 (no binding held at all) is I77's own: here the seed
+    /// premise already names alice as A's owner on B.
+    pub async fn exercise_i77_owned_node_minter_room_placed<B>(
+        a: &Node<'_, B>,
+        b: &Node<'_, B>,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let k = |n: &str| format!("{tag}-rp77-{n}-{run}");
+        let (alice_s, bob_s) = (k("alice"), k("bob"));
+        let comm = seed_room_by_carriage(a, &alice_s, &[(b, bob_s.as_str())], &k("comm")).await;
+        let (alice, bob) = (e2::kid(&alice_s), e2::kid(&bob_s));
+        let sealed =
+            encrypt_and_cascade_community(a.backend, &comm, b"principal", None, Some(&a.key))
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I77rp: A seals: {e}"));
+        assert!(
+            sealed.granted.contains(&b.key),
+            "{tag} I77rp: A wraps to B, whose owner it holds through the room"
+        );
+        let emitted =
+            emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, sealed.epoch)
+                .await
+                .unwrap()
+                .expect("A holds wraps");
+        let axis = KeyGrantAxis::Epoch {
+            community_key_id: comm.clone(),
+            minter_key_id: a.key.clone(),
+            epoch: sealed.epoch,
+        };
+        let to_b = emitted_row_for(a, &emitted, &b.key).await;
+        // (2) admitted: the principal is held through the R-placed binding.
+        let admission = carry_key_grant(a, b, &to_b.attestation_id)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{tag} I77rp (2): A lifts to alice through the room placement: {e}")
+            });
+        assert!(admission.projected, "{tag} I77rp (2): {admission:?}");
+        assert!(
+            b.backend
+                .community_dek_has_member_grant(&comm, &a.key, sealed.epoch, &b.key)
+                .await
+                .unwrap(),
+            "{tag} I77rp (2): B's own wrap projected"
+        );
+        // (3) alice removed: a later row of A's is refused.
+        let removed_at = chrono::Utc::now();
+        let rev = community_removal_voices(
+            b.backend,
+            &comm,
+            &alice,
+            removed_at,
+            removed_at,
+            &[&alice, &bob],
+        )
+        .await;
+        match e2::put_voices(b.backend, &rev).await {
+            Ok(StatementOutcome::Row { .. }) => {}
+            other => panic!("{tag} I77rp (3): B holds alice's removal: {other:?}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let wrap_to_b = held_row(a, &axis, &b.key).await;
+        let later = sign_row_unstored(&a.signer, &wrap_to_b).await;
+        assert_eq!(
+            rule_reason(b.backend, &later).await,
+            "signer_not_active_member",
+            "{tag} I77rp (3): the key-grant rule's own verdict"
+        );
+        let err = admit_replicated(b.backend, later)
+            .await
+            .expect_err("{tag} I77rp (3): the removed owner's instrument is refused");
+        assert_held_by_write_scope(&err, &format!("{tag} I77rp (3)"));
+    }
+
     /// **I77 (#851 §20.1) — admission asks about the PRINCIPAL.** The
     /// minter is an owned node with NO occurrence row on the admitting node:
     /// refused while no live owner binding lifts it; admitted once the
@@ -2502,6 +3618,9 @@ pub mod two_node {
                 .await
                 .unwrap_or_else(|e| panic!("{tag} I77: seed community: {e}"));
         }
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         let local_occurrence =
             |identity: &str,
              occurrence: &str,
@@ -2658,15 +3777,12 @@ pub mod two_node {
                 &roster,
             )
             .await;
-            let err = c
-                .put_identity_occurrence_local(local_occurrence(
-                    &alice,
-                    &a.key,
-                    &a.kem,
-                    chrono::Utc::now(),
-                ))
-                .await
-                .expect_err("{tag} I77 (4): a node key is never a person's occurrence");
+            let err = crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+                &c,
+                local_occurrence(&alice, &a.key, &a.kem, chrono::Utc::now()),
+            )
+            .await
+            .expect_err("{tag} I77 (4): a node key is never a person's occurrence");
             assert_eq!(
                 token_of(&err),
                 crate::federation::malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE,
@@ -2720,15 +3836,12 @@ pub mod two_node {
                 crate::federation::malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE,
                 "{tag} I77 (7): {err}"
             );
-            let err = e
-                .put_identity_occurrence_local(local_occurrence(
-                    &carol,
-                    &a.key,
-                    &a.kem,
-                    chrono::Utc::now(),
-                ))
-                .await
-                .expect_err("{tag} I77 (7): nor as a trusted-local row");
+            let err = crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+                &e,
+                local_occurrence(&carol, &a.key, &a.kem, chrono::Utc::now()),
+            )
+            .await
+            .expect_err("{tag} I77 (7): nor as a trusted-local row");
             assert_eq!(
                 token_of(&err),
                 crate::federation::malformed_row::OCCURRENCE_MIXES_PERSON_AND_MACHINE,
@@ -2828,6 +3941,7 @@ pub mod two_node {
             PHONE,
             None,
             None,
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I76: the device states its own voice: {e}"));
@@ -2854,6 +3968,7 @@ pub mod two_node {
             PHONE,
             None,
             Some(alice_signer.as_ref()),
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I76: the identity's voice lands the bind: {e}"));
@@ -2885,31 +4000,36 @@ pub mod two_node {
             voices.iter().all(|v| served.contains(v)),
             "{tag} I78: the listing serves every voice of the bind"
         );
-        // I78: a trusted-local row is never advertised.
-        let local_occ = e2::put_key(n.backend, &format!("{tag}-local-{run}"), &[USER]).await;
-        n.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                identity_key_id: alice.clone(),
-                occurrence_key_id: local_occ.clone(),
-                device_class: SERVER.into(),
-                hardware_attestation: None,
-                asserted_at: chrono::Utc::now(),
-                valid_until: None,
-                encryption_pubkeys: Some(n.kem.clone()),
-                transport_binding: None,
-                persist_row_hash: String::new(),
-            })
-            .await
-            .unwrap();
-        assert!(
-            !n.backend
-                .list_signed_identity_occurrences_for(&alice)
+        // I78: a trusted-local row is never advertised. v62.0.0 (WD-fix11) —
+        // its premise is the retired trusted-local row, which only the
+        // `cfg(test)` seam writes: this leg runs in persist's own tests.
+        #[cfg(test)]
+        {
+            let local_occ = e2::put_key(n.backend, &format!("{tag}-local-{run}"), &[USER]).await;
+            n.backend
+                .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
+                    identity_key_id: alice.clone(),
+                    occurrence_key_id: local_occ.clone(),
+                    device_class: SERVER.into(),
+                    hardware_attestation: None,
+                    asserted_at: chrono::Utc::now(),
+                    valid_until: None,
+                    encryption_pubkeys: Some(n.kem.clone()),
+                    transport_binding: None,
+                    persist_row_hash: String::new(),
+                })
                 .await
-                .unwrap()
-                .iter()
-                .any(|s| s.identity_occurrence.occurrence_key_id == local_occ),
-            "{tag} I78: a trusted-local row is not on the plane"
-        );
+                .unwrap();
+            assert!(
+                !n.backend
+                    .list_signed_identity_occurrences_for(&alice)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.identity_occurrence.occurrence_key_id == local_occ),
+                "{tag} I78: a trusted-local row is not on the plane"
+            );
+        }
         // (3)/(6) A bind of alice's device under carol that carol did not
         // author (alice's statement naming carol's identity): refused.
         let err = e2::put_bind(
@@ -2959,6 +4079,7 @@ pub mod two_node {
             SERVER,
             None,
             Some(alice_signer.as_ref()),
+            None,
         )
         .await
         {
@@ -3071,6 +4192,7 @@ pub mod two_node {
                     PHONE,
                     valid_until,
                     Some(alice_signer.as_ref()),
+                    None,
                 )
                 .await
             }
@@ -3146,6 +4268,9 @@ pub mod two_node {
         let alice = e2::kid(&format!("{tag}-alice-{run}"));
         let bob = e2::kid(&format!("{tag}-bob-{run}"));
         seed_community_everywhere(&[a, b], &comm, &[(&alice, Some(a)), (&bob, Some(b))]).await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         encrypt_and_cascade_community(a.backend, &comm, b"while active", None, Some(&a.key))
             .await
             .unwrap_or_else(|e| panic!("{tag} I60b: A seals: {e}"));
@@ -3557,8 +4682,10 @@ mod tests {
         #[tokio::test]
         async fn i60_forged_set_refused_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node_as(&ba, "i60-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i60-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i60-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i60-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i60-a", "i60-b"],
@@ -3571,8 +4698,10 @@ mod tests {
         #[tokio::test]
         async fn i60b_delayed_set_survives_a_later_occurrence_revocation_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node_as(&ba, "i60b-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i60b-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i60b-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i60b-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i60b-a", "i60b-b"],
@@ -3603,8 +4732,10 @@ mod tests {
         #[tokio::test]
         async fn i71_rotation_keys_on_effective_at_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node_as(&ba, "i71-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i71-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i71-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i71-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i71-a", "i71-b"],
@@ -3617,8 +4748,10 @@ mod tests {
         #[tokio::test]
         async fn i61_end_to_end_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node_as(&ba, "i61-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i61-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i61-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i61-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i61-a", "i61-b"],
@@ -3631,8 +4764,10 @@ mod tests {
         #[tokio::test]
         async fn i62_union_order_independent_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node_as(&ba, "i62-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i62-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i62-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i62-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i62-a", "i62-b"],
@@ -3645,8 +4780,10 @@ mod tests {
         #[tokio::test]
         async fn i63_rotation_on_admitted_removal_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node_as(&ba, "i63-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i63-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i63-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i63-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i63-a", "i63-b"],
@@ -3659,9 +4796,12 @@ mod tests {
         #[tokio::test]
         async fn i64_two_minters_same_epoch_sqlite() {
             let (ba, bb, bc) = (fresh().await, fresh().await, fresh().await);
-            let a = node_as(&ba, "i64-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i64-b", crate::federation::types::identity_type::NODE).await;
-            let c = node_as(&bc, "i64-c", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i64-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i64-b", crate::federation::types::identity_type::NODE).await;
+            let c =
+                node_owned_as(&bc, "i64-c", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b, &c],
                 &["i64-a", "i64-b", "i64-c"],
@@ -3669,6 +4809,150 @@ mod tests {
             )
             .await;
             exercise_i64_two_minters_same_epoch(&a, &b, &c, "sqlite").await;
+        }
+
+        /// v62.0.0 (WD-fix16f) — I64, every member's node placed at the room
+        /// only, joined through the carriage (sqlite).
+        #[tokio::test]
+        async fn i64_two_minters_same_epoch_room_placed_sqlite() {
+            let (ba, bb, bc) = (fresh().await, fresh().await, fresh().await);
+            let a = node_as(
+                &ba,
+                "i64rp-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let b = node_as(
+                &bb,
+                "i64rp-b",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let c = node_as(
+                &bc,
+                "i64rp-c",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i64_two_minters_same_epoch_room_placed(&a, &b, &c, "sqlite").await;
+        }
+
+        /// v62.0.0 (WD-fix16g) — I77, the minter's principal held through the
+        /// room only (sqlite).
+        #[tokio::test]
+        async fn i77_owned_node_minter_room_placed_sqlite() {
+            let (ba, bb) = (fresh().await, fresh().await);
+            let a = node_as(
+                &ba,
+                "i77rp-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let b = node_as(
+                &bb,
+                "i77rp-b",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i77_owned_node_minter_room_placed(&a, &b, "sqlite").await;
+        }
+
+        /// v62.0.0 (WD-fix16h) — I63, every member's node placed at the room
+        /// only (sqlite).
+        #[tokio::test]
+        async fn i63_rotation_on_admitted_removal_room_placed_sqlite() {
+            let (ba, bb, bc) = (fresh().await, fresh().await, fresh().await);
+            let a = node_as(
+                &ba,
+                "i63rp-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let b = node_as(
+                &bb,
+                "i63rp-b",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let c = node_as(
+                &bc,
+                "i63rp-c",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i63_rotation_on_admitted_removal_room_placed(&a, &b, &c, "sqlite").await;
+        }
+
+        /// v62.0.0 (WD-fix16k) — I4427, the resolver's answer is what arrives
+        /// (sqlite).
+        #[tokio::test]
+        async fn i4427_the_resolver_is_what_arrives_sqlite() {
+            let (ba, bb, bc) = (fresh().await, fresh().await, fresh().await);
+            let a = node_as(
+                &ba,
+                "i4427-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let b = node_as(
+                &bb,
+                "i4427-b",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let c = node_as(
+                &bc,
+                "i4427-c",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i4427_the_resolver_is_what_arrives(&a, &b, &c, "sqlite").await;
+        }
+
+        /// v62.0.0 (WD-fix16n) — I4428, a late joiner reads forward (sqlite).
+        #[tokio::test]
+        async fn i4428_a_late_joiner_reads_forward_sqlite() {
+            let (ba, bb, bc) = (fresh().await, fresh().await, fresh().await);
+            let a = node_as(
+                &ba,
+                "i4428-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let b = node_as(
+                &bb,
+                "i4428-b",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let c = node_as(
+                &bc,
+                "i4428-c",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i4428_a_late_joiner_reads_forward(&a, &b, &c, "sqlite").await;
+        }
+
+        /// v62.0.0 (WD-fix16l) — I199, both nodes placed at the family only
+        /// (sqlite).
+        #[tokio::test]
+        async fn i199_family_member_publishes_and_another_opens_family_placed_sqlite() {
+            let (ba, bb) = (fresh().await, fresh().await);
+            let a = node_as(
+                &ba,
+                "i199fp-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let b = node_as(
+                &bb,
+                "i199fp-b",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i199_family_member_publishes_and_another_opens_family_placed(&a, &b, "sqlite")
+                .await;
         }
 
         #[tokio::test]
@@ -3756,7 +5040,7 @@ mod tests {
                     transport_binding: None,
                     persist_row_hash: String::new(),
                 };
-            sq.put_identity_occurrence_local(occurrence(
+            sq.test_seam_put_identity_occurrence(occurrence(
                 &me,
                 kem(sq.load_or_init_content_kem_identity().await.unwrap()),
             ))
@@ -3796,7 +5080,7 @@ mod tests {
             let other = fresh().await;
             let dev2 = e2::kid(&format!("i68-dev2-{run}"));
             ts::register_hybrid_key_as(sq.as_ref(), &dev2, &dev2, USER).await;
-            sq.put_identity_occurrence_local(occurrence(
+            sq.test_seam_put_identity_occurrence(occurrence(
                 &dev2,
                 kem(other.load_or_init_content_kem_identity().await.unwrap()),
             ))
@@ -3992,7 +5276,7 @@ mod tests {
             for (engine, ident) in [(&engine_a, &alice), (&engine_b, &bob)] {
                 let pen = ts::local_signer(&e2::seed_of(ident));
                 let out = engine
-                    .publish_self_occurrence(ident, SERVER, None, Some(pen.as_ref()))
+                    .publish_self_occurrence(ident, SERVER, None, Some(pen.as_ref()), None)
                     .await
                     .unwrap_or_else(|e| {
                         panic!("I75: the node publishes its occurrence under {ident}: {e}")
@@ -4074,6 +5358,36 @@ mod tests {
             );
         }
 
+        /// v62.0.0 (WD-fix16m) — I75 restructured, the members' nodes placed
+        /// at the room only (sqlite).
+        #[tokio::test]
+        async fn i75_delivered_by_the_planes_room_placed_sqlite() {
+            let run = uuid::Uuid::new_v4().simple().to_string();
+            let (alias_a, alias_b) = (format!("i75rp-a-{run}"), format!("i75rp-b-{run}"));
+            let engine_a = crate::Engine::with_signer_pre_genesis(
+                ts::local_signer(&alias_a),
+                "sqlite::memory:",
+            )
+            .await
+            .unwrap();
+            let engine_b = crate::Engine::with_signer_pre_genesis(
+                ts::local_signer(&alias_b),
+                "sqlite::memory:",
+            )
+            .await
+            .unwrap();
+            let (sa, sb) = (
+                engine_a.sqlite_backend().unwrap().clone(),
+                engine_b.sqlite_backend().unwrap().clone(),
+            );
+            let a = engine_node(sa.as_ref(), &alias_a).await;
+            let b = engine_node(sb.as_ref(), &alias_b).await;
+            exercise_i75_delivered_by_the_planes_room_placed(
+                &engine_a, &engine_b, &a, &b, "sqlite",
+            )
+            .await;
+        }
+
         /// **I82 (PR #852 round five) — `publish_self_occurrence` publishes
         /// only THIS node's key.** An Engine over a shared backend whose
         /// composed signer is one identity and whose LocalSigner is another
@@ -4100,6 +5414,7 @@ mod tests {
                 .publish_self_occurrence(
                     "i82-owner",
                     crate::federation::types::device_class::SERVER,
+                    None,
                     None,
                     None,
                 )
@@ -4326,39 +5641,58 @@ mod tests {
             let outcome_c = engine_c
                 .self_at_login(input(None))
                 .await
-                .expect("I92: self_at_login without a signer still lands (local)");
-            assert!(outcome_c.occurrences_published.is_empty(), "{outcome_c:?}");
-            assert_eq!(outcome_c.occurrences_local_only.len(), 2, "{outcome_c:?}");
-            let plane_c: Vec<String> =
-                FederationDirectory::list_signed_identity_occurrences_for(sc.as_ref(), &identity)
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .map(|s| s.identity_occurrence.occurrence_key_id)
-                    .collect();
+                .expect("I92: self_at_login without the identity's signer still completes");
+            // v62.0.0 (WD-fix9; the lead's ruling) — no unsigned occurrence
+            // is written. WD-fix9b (the Constitution's ruling of 2026-11-22,
+            // CC 3.3.6: "an UNOWNED agent has no occurrence") — the AGENT is
+            // unowned here (no owner pen, no binding held), so NOTHING is
+            // stated for it: it is pending with no draft. The APP's bind
+            // needs the login identity's voice: its own voice is kept and the
+            // identity's is DRAFTED.
             assert!(
-                !plane_c.contains(&app_key) && !plane_c.contains(&agent_key),
-                "I92: a trusted-local row is never on the plane: {plane_c:?}"
+                outcome_c.occurrences_published.is_empty(),
+                "I92: nothing concludes without the identity's pen: {outcome_c:?}"
             );
-            // But they ARE stored locally, so the node's own cascade sees them.
-            let local_c =
+            let mut pending = outcome_c.occurrences_pending.clone();
+            pending.sort();
+            let mut expected = vec![app_key.clone(), agent_key.clone()];
+            expected.sort();
+            assert_eq!(
+                pending, expected,
+                "I92: the app waits for the identity's voice, the unowned agent for an owner: \
+                 {outcome_c:?}"
+            );
+            assert!(
+                outcome_c.bind_drafts.iter().any(|(k, _)| k == &app_key),
+                "I92: the identity's part of the app's bind is returned as a draft: {outcome_c:?}"
+            );
+            assert!(
+                !outcome_c.bind_drafts.iter().any(|(k, _)| k == &agent_key),
+                "I92: the unowned agent's bind is not drafted (there is no author): {outcome_c:?}"
+            );
+            // First login leaves NO unsigned occurrence row: nothing under the
+            // login identity until the identity's voice lands.
+            assert!(
                 FederationDirectory::list_identity_occurrences_for(sc.as_ref(), &identity)
                     .await
-                    .unwrap();
-            // v62.0.0 (P8 §3) — the login identity lists the APP only; the
-            // agent's occurrence is under the agent's own identity.
-            assert_eq!(
-                local_c.len(),
-                1,
-                "I92: the app, stored locally: {local_c:?}"
+                    .unwrap()
+                    .is_empty(),
+                "I92: no unsigned occurrence row under the identity"
             );
+            // And none for the unowned agent: no row, signed or not.
             assert!(
                 FederationDirectory::list_identity_occurrences_for(sc.as_ref(), &agent_key)
                     .await
                     .unwrap()
-                    .iter()
-                    .any(|o| o.occurrence_key_id == agent_key),
-                "I92: the agent's occurrence, stored locally under the agent"
+                    .is_empty()
+                    && FederationDirectory::list_signed_identity_occurrences_for(
+                        sc.as_ref(),
+                        &agent_key
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "I92: an unowned agent has no occurrence"
             );
         }
 
@@ -4445,8 +5779,10 @@ mod tests {
                 vec![app_key.clone()],
                 "{outcome:?}"
             );
+            // v62.0.0 (WD-fix9) — the agent's bind did not land (no pen of its
+            // own here): pending, drafted, and nothing unsigned written.
             assert_eq!(
-                outcome.occurrences_local_only,
+                outcome.occurrences_pending,
                 vec![agent_key.clone()],
                 "{outcome:?}"
             );
@@ -4661,7 +5997,10 @@ mod tests {
             );
             seed_community_everywhere(&[&node], &comm, &[(&alice, Some(&node)), (&bob, None)])
                 .await;
-            sq.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+            // panics if it was not).
+            let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
+            sq.test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: bob.clone(),
                 occurrence_key_id: member_occ.clone(),
                 device_class: crate::federation::types::device_class::SERVER.into(),
@@ -4745,7 +6084,7 @@ mod tests {
             for k in [&comm2, &bob2, &member_occ2] {
                 ts::register_hybrid_key_as(sq.as_ref(), k, k, USER).await;
             }
-            sq.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            sq.test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: bob2.clone(),
                 occurrence_key_id: member_occ2.clone(),
                 device_class: crate::federation::types::device_class::SERVER.into(),
@@ -4767,6 +6106,9 @@ mod tests {
             )
             .await
             .unwrap();
+            // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+            // panics if it was not).
+            let comm2 = crate::federation::edition2::fixture_switch::room_id(&comm2);
             encrypt_and_cascade_community(sq.as_ref(), &comm2, b"crashed", None, Some(&me))
                 .await
                 .unwrap();
@@ -4854,6 +6196,9 @@ mod tests {
             );
             seed_community_everywhere(&[&a, &b], &comm, &[(&alice, Some(&a)), (&bob, Some(&b))])
                 .await;
+            // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+            // panics if it was not).
+            let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
 
             // A writes through THE door; the set is emitted by the door.
             let r = engine_a
@@ -4970,8 +6315,10 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i61-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i61-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i61-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i61-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i61-a", "i61-b"],
@@ -4997,8 +6344,10 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i60-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i60-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i60-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i60-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i60-a", "i60-b"],
@@ -5014,8 +6363,10 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i60b-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i60b-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i60b-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i60b-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i60b-a", "i60b-b"],
@@ -5052,8 +6403,10 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i71-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i71-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i71-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i71-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i71-a", "i71-b"],
@@ -5069,8 +6422,10 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i62-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i62-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i62-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i62-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i62-a", "i62-b"],
@@ -5086,8 +6441,10 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i63-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i63-b", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i63-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i63-b", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b],
                 &["i63-a", "i63-b"],
@@ -5104,9 +6461,12 @@ mod tests {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
                 return;
             };
-            let a = node_as(&ba, "i64-a", crate::federation::types::identity_type::NODE).await;
-            let b = node_as(&bb, "i64-b", crate::federation::types::identity_type::NODE).await;
-            let c = node_as(&bc, "i64-c", crate::federation::types::identity_type::NODE).await;
+            let a =
+                node_owned_as(&ba, "i64-a", crate::federation::types::identity_type::NODE).await;
+            let b =
+                node_owned_as(&bb, "i64-b", crate::federation::types::identity_type::NODE).await;
+            let c =
+                node_owned_as(&bc, "i64-c", crate::federation::types::identity_type::NODE).await;
             introduce_as(
                 &[&a, &b, &c],
                 &["i64-a", "i64-b", "i64-c"],
@@ -5114,6 +6474,207 @@ mod tests {
             )
             .await;
             exercise_i64_two_minters_same_epoch(&a, &b, &c, "postgres").await;
+        }
+
+        /// v62.0.0 (WD-fix16f) — I64 room-placed (postgres).
+        #[tokio::test]
+        async fn i64_two_minters_same_epoch_room_placed_postgres() {
+            let (Some(ba), Some(bb), Some(bc)) = (fresh().await, fresh().await, fresh().await)
+            else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
+            let a = node_as(
+                &ba,
+                "i64rp-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let b = node_as(
+                &bb,
+                "i64rp-b",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let c = node_as(
+                &bc,
+                "i64rp-c",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i64_two_minters_same_epoch_room_placed(&a, &b, &c, "postgres").await;
+        }
+
+        /// v62.0.0 (WD-fix16g) — I77, the minter's principal held through the
+        /// room only (postgres).
+        #[tokio::test]
+        async fn i77_owned_node_minter_room_placed_postgres() {
+            let (Some(ba), Some(bb)) = (fresh().await, fresh().await) else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
+            let a = node_as(
+                &ba,
+                "i77rp-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let b = node_as(
+                &bb,
+                "i77rp-b",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i77_owned_node_minter_room_placed(&a, &b, "postgres").await;
+        }
+
+        /// v62.0.0 (WD-fix16h) — I63, every member's node placed at the room
+        /// only (postgres).
+        #[tokio::test]
+        async fn i63_rotation_on_admitted_removal_room_placed_postgres() {
+            let (Some(ba), Some(bb), Some(bc)) = (fresh().await, fresh().await, fresh().await)
+            else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
+            let a = node_as(
+                &ba,
+                "i63rp-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let b = node_as(
+                &bb,
+                "i63rp-b",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let c = node_as(
+                &bc,
+                "i63rp-c",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i63_rotation_on_admitted_removal_room_placed(&a, &b, &c, "postgres").await;
+        }
+
+        /// v62.0.0 (WD-fix16k) — I4427, the resolver's answer is what arrives
+        /// (postgres).
+        #[tokio::test]
+        async fn i4427_the_resolver_is_what_arrives_postgres() {
+            let (Some(ba), Some(bb), Some(bc)) = (fresh().await, fresh().await, fresh().await)
+            else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
+            let a = node_as(
+                &ba,
+                "i4427-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let b = node_as(
+                &bb,
+                "i4427-b",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let c = node_as(
+                &bc,
+                "i4427-c",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i4427_the_resolver_is_what_arrives(&a, &b, &c, "postgres").await;
+        }
+
+        /// v62.0.0 (WD-fix16n) — I4428, a late joiner reads forward (postgres).
+        #[tokio::test]
+        async fn i4428_a_late_joiner_reads_forward_postgres() {
+            let (Some(ba), Some(bb), Some(bc)) = (fresh().await, fresh().await, fresh().await)
+            else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
+            let a = node_as(
+                &ba,
+                "i4428-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let b = node_as(
+                &bb,
+                "i4428-b",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let c = node_as(
+                &bc,
+                "i4428-c",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i4428_a_late_joiner_reads_forward(&a, &b, &c, "postgres").await;
+        }
+
+        /// v62.0.0 (WD-fix16m) — I75 restructured, room-placed (postgres).
+        #[tokio::test]
+        async fn i75_delivered_by_the_planes_room_placed_postgres() {
+            let (Some(da), Some(db)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn())
+            else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
+            let run = uuid::Uuid::new_v4().simple().to_string();
+            let (alias_a, alias_b) = (format!("i75rp-a-{run}"), format!("i75rp-b-{run}"));
+            let engine_a = crate::Engine::with_signer_pre_genesis(
+                crate::federation::tier_ingest::test_support::local_signer(&alias_a),
+                &da,
+            )
+            .await
+            .unwrap();
+            let engine_b = crate::Engine::with_signer_pre_genesis(
+                crate::federation::tier_ingest::test_support::local_signer(&alias_b),
+                &db,
+            )
+            .await
+            .unwrap();
+            let (pa, pb) = (
+                engine_a.postgres_backend().unwrap().clone(),
+                engine_b.postgres_backend().unwrap().clone(),
+            );
+            let a = engine_node(pa.as_ref(), &alias_a).await;
+            let b = engine_node(pb.as_ref(), &alias_b).await;
+            exercise_i75_delivered_by_the_planes_room_placed(
+                &engine_a, &engine_b, &a, &b, "postgres",
+            )
+            .await;
+        }
+
+        /// v62.0.0 (WD-fix16l) — I199, both nodes placed at the family only
+        /// (postgres).
+        #[tokio::test]
+        async fn i199_family_member_publishes_and_another_opens_family_placed_postgres() {
+            let (Some(ba), Some(bb)) = (fresh().await, fresh().await) else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
+            let a = node_as(
+                &ba,
+                "i199fp-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            let b = node_as(
+                &bb,
+                "i199fp-b",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i199_family_member_publishes_and_another_opens_family_placed(
+                &a, &b, "postgres",
+            )
+            .await;
         }
 
         #[tokio::test]

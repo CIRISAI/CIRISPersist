@@ -360,12 +360,13 @@ pub(crate) mod bodies {
     }
 
     /// v62.0.0 (JSON cut, E12) — a registered dimension for the content's
-    /// binding rows: `evidence:{suite}:{kind}:{cell}:{prefix}` (Verify
+    /// binding rows: `coherence_standing:{cohort}` (v62.0.0 FS-sig-b; it
+    /// was `evidence:*`, which now needs `infra:attest`; Verify
     /// v23.3.0 `family_authorship.json`; the earlier fixtures'
     /// `content:established:v1` is not registered, so no statement of it can
     /// be signed). It is an open family: `evidence_refs` and the cohort
     /// target ride as they did.
-    pub(crate) const BINDING_DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
+    pub(crate) const BINDING_DIMENSION: &str = "coherence_standing:cab:v1";
 
     // ── I1170 (binding) ───────────────────────────────────────────────────
     /// v60.0.0 (#803) — a takedown notice ROW is about the content, never a
@@ -792,6 +793,14 @@ pub(crate) mod bodies {
         for k in [producer, attested].iter().chain(subjects) {
             key_as(dir, k, AGENT).await;
         }
+        // LEAD-head2 (CC 2.4.1.1; an unowned agent signs nothing) — the
+        // producer is an OWNED agent: its row names its owner binding.
+        crate::federation::admission::r2_test_support::bind_owner_if_machine(
+            dir,
+            producer,
+            crate::host::clock::now() - chrono::Duration::hours(1),
+        )
+        .await;
         let mut env = serde_json::json!({
             "dimension": BINDING_DIMENSION,
             "evidence_refs": [sha_hex],
@@ -1053,6 +1062,78 @@ pub(crate) mod bodies {
         assert_eq!(
             dir.purge_tombstoned("blob", &sha).await.unwrap(),
             Some(ok.notice_id)
+        );
+    }
+
+    // ── I4430 ─────────────────────────────────────────────────────────────
+    /// **I4430** (WD-fix24; THE PROPERTY, the takedown arm) — an EXECUTED
+    /// takedown notice is never un-concluded by a re-fold for the absence of
+    /// the binding its authority was judged over. The content's signed
+    /// subject takes it down (dmca512: executed, the bytes-plane tombstone
+    /// recorded, the notice row concluded); the content's only binding row is
+    /// then WITHDRAWN by its producer, so `content_binding` reads nothing. A
+    /// direct re-fold of the notice leaves it concluded and stored. (On the
+    /// tree before WD-fix24 the re-fold re-asked `takedown_authority`, held
+    /// the notice `takedown_content_unbound` and un-concluded it while its
+    /// tombstone still named it.)
+    pub(crate) async fn i4430_an_executed_takedown_outlives_its_binding<D>(d: &D)
+    where
+        D: FederationDirectory + Sync,
+    {
+        use crate::federation::edition2::fold::refold_rows;
+        use crate::federation::edition2::names::RowId;
+        use crate::federation::edition2::verdict::row_state;
+        let dir = d.as_dyn_directory();
+        let owner = claimant(0x7a);
+        let sha = sha_of("i4430");
+        let producer = "i4430-producer";
+        let binding_id = establish(dir, producer, &owner.id, &sha).await;
+        let report = td::takedown_tombstone(dir, &notice(&owner, &sha, "dmca512"), NODE)
+            .await
+            .expect("I4430: a signed subject of the content takes it down");
+        assert!(report.tombstoned, "I4430 premise: executed: {report:?}");
+        let notice_row_id = report
+            .notice_attestation_id
+            .clone()
+            .expect("I4430 premise: the notice is a row");
+        let notice_row = dir
+            .get_attestation(&notice_row_id)
+            .await
+            .unwrap()
+            .expect("I4430 premise: the notice row is held");
+        let nid = RowId::of_statement(
+            &e2::carried_statement(&notice_row).expect("the notice's statement"),
+        )
+        .expect("a row id");
+        assert!(
+            row_state(dir, &nid).await.unwrap().is_concluded(),
+            "I4430 premise: the notice concluded"
+        );
+        // The content's only binding is withdrawn by its producer.
+        let binding = dir
+            .get_attestation(&binding_id)
+            .await
+            .unwrap()
+            .expect("I4430 premise: the binding row is held");
+        e2::put_signed(dir, &e2::composer_of("withdraws", &binding, producer))
+            .await
+            .expect("I4430: the producer withdraws its binding");
+        assert!(
+            td::content_binding(dir, &sha).await.unwrap().is_none(),
+            "I4430 premise: the content is bound by nothing now"
+        );
+        refold_rows(dir, [nid].into_iter().collect())
+            .await
+            .expect("I4430: the re-fold runs");
+        assert!(
+            row_state(dir, &nid).await.unwrap().is_concluded()
+                && dir.get_attestation(&notice_row_id).await.unwrap().is_some(),
+            "I4430: the executed notice stays concluded and stored"
+        );
+        assert_eq!(
+            dir.purge_tombstoned("blob", &sha).await.unwrap(),
+            Some(report.notice_id),
+            "I4430: its tombstone still names it"
         );
     }
 
@@ -2878,6 +2959,11 @@ mod run {
                 async fn i786() {
                     let Some(d) = $fresh.await else { return };
                     b::i786_a_takedown_is_admitted_by_cc_4_5_5_here(&d).await
+                }
+                #[tokio::test]
+                async fn i4430() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i4430_an_executed_takedown_outlives_its_binding(&d).await
                 }
                 #[tokio::test]
                 async fn i787() {

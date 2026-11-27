@@ -1319,7 +1319,7 @@ class Engine:
     def promote_adopted_manifest_to_dag_json(self, at_rest_sha256_hex: str, viewer_key_id: str, disposition: str, caller_aad_b64: str | None = None) -> str:
         """(derived) deontic — v51.3.0 (CIRISPersist#947) — finish a sealed DAG adopt. adopt_sealed_blob_json stores a received sealed manifest as an inline envelope; until this..."""
 
-    def publish_self_occurrence(self, identity_key_id: str, device_class: str, valid_until_iso: str | None = None) -> str:
+    def publish_self_occurrence(self, identity_key_id: str, device_class: str, valid_until_iso: str | None = None, author_kid_hex: str | None = None) -> str:
         """(derived) deontic — CIRISPersist#851 (BLOB_REPLICATION.md §20.3) — publish this node's own content-only occurrence under identity_key_id (its owner), signed with the L..."""
 
     def purge_finalize_json(self, notice_id: str) -> str:

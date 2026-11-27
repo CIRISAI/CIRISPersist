@@ -289,8 +289,9 @@ pub enum ConsentPrincipalPath {
     /// row naming the subject in [`FOR_KEY_ID`].
     OccurrenceOf,
     /// A steward with a LIVE `delegates_to` to the subject (clause 3: an
-    /// owner-binding to a person, any delegation to a node), on a row naming
-    /// the subject in [`FOR_KEY_ID`].
+    /// owner-binding to a person, any delegation to a minor; for a machine
+    /// subject, v62.0.0 WD-fix23, its ONE owner), on a row naming the
+    /// subject in [`FOR_KEY_ID`].
     DelegatesTo,
 }
 

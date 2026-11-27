@@ -229,6 +229,9 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I1843: v1");
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let fam = crate::federation::edition2::fixture_switch::room_id(&fam);
         let v1 = d.lookup_family(&fam).await.unwrap().expect("held");
         let (h1, _) = e2::held_head(d, &fam)
             .await
@@ -336,6 +339,9 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I1845: the family");
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let fam_s = crate::federation::edition2::fixture_switch::room_id(&fam_s);
         let (head, _) = e2::held_head(d, &fam)
             .await
             .expect("I1845: the roster's head");

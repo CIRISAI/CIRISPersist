@@ -1176,8 +1176,10 @@ pub(crate) mod bodies {
         put(d, composer(&u1, &n[5], attestation_type::SUPERSEDES, &b6))
             .await
             .expect("u1 supersedes n6's binding");
-        // u1's plain (unmarked) delegation to n7: a node has no agency, so it
-        // is a steward binding but not an ownership.
+        // u1's plain (unmarked) delegation to n7: a capability. v62.0.0
+        // (WD-fix23; CC 3.4.7.3) — a node's steward set is its one owner, so
+        // it steward-binds nobody (it once did: a node has no agency); both
+        // bodies confirm through `steward_bindings_of` and agree.
         put(d, plain_delegation(&u1, &n[6]))
             .await
             .expect("u1 → n7 (plain)");

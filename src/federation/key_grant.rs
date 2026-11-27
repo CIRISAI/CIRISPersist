@@ -2103,6 +2103,19 @@ where
     let producer = "key_grant";
     let iss = signer.federation_id().await;
     let payload = crate::federation::edition2::typed::key_grant_payload(&iss, row, asserted_at_ms)?;
+    // v62.0.0 (HEAD-1; Constitution: "key grant → the room's roster version
+    // if the asset is in a room, else none") — a hand builder states its
+    // head as the one builder does (`edition2::head_rule::state_head`).
+    let payload = crate::federation::edition2::head_rule::state_head(
+        backend,
+        crate::federation::types::attestation_type::SCORES,
+        &ciris_verify_core::namespace_match::family_id(
+            crate::federation::edition2::typed::KEY_GRANT_PREFIX,
+        ),
+        &iss,
+        payload,
+    )
+    .await?;
     let statement = crate::federation::edition2::produce::sign_row(
         signer,
         &row.wrap.recipient_key_id,
@@ -2378,6 +2391,7 @@ pub async fn publish_self_occurrence_with_local_signer<B>(
     device_class: &str,
     valid_until: Option<chrono::DateTime<chrono::Utc>>,
     author_signer: Option<&crate::signing::LocalSigner>,
+    author_kid: Option<&ciris_verify_core::edition2::Digest32>,
 ) -> Result<crate::federation::edition2::occurrence::OccurrenceBindOutcome, Error>
 where
     B: BlobStorage + FederationDirectory + Sync,
@@ -2429,7 +2443,7 @@ where
         // CE-fix3: a self-occurrence bind carries no dial hints.
         dial_hints: Vec::new(),
     };
-    publish_bind(backend, Some(signer), author_signer, &terms).await
+    publish_bind(backend, Some(signer), author_signer, author_kid, &terms).await
 }
 
 /// v44.5.0 (§21.3, CIRISPersist#856) — **the one producer of the content-only
