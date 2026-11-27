@@ -144,7 +144,7 @@ pub fn is_bootstrap_kind(statement: &[u8]) -> bool {
 /// ONE standing primitive,
 /// [`stored_standing_at`](crate::federation::canonical_community::stored_standing_at):
 /// the root's chain from an accord birth, its live `trust:charter:v1`, and
-/// THIS node's own T3 chain to it ([`own_chain_to`](crate::federation::trust_root::own_chain_to):
+/// THIS node's own T3 chain to it (`trust_root::own_chain_to`, deleted in R2-rooms-b:
 /// the owner's acceptance edge governs once the owner signed one). A genesis
 /// bundle held with no acceptance edge is no root this node reaches (CC 3.2
 /// T3). `node` is this directory's own node key (`node_key_id`), which
@@ -159,6 +159,9 @@ pub fn is_bootstrap_kind(statement: &[u8]) -> bool {
 /// T7 l.1240). No wall clock: `at_ms` is the caller's instant. It now reads
 /// `node`'s chain, not this directory's node key's.
 ///
+/// v62.0.0 (R2-rooms; CC 3.2 T5) — the root is the bundle's lineage only:
+/// [`rooted_under`] reads `trust_root::bundle_root_accepted`, nothing else.
+///
 /// # Errors
 /// Directory reads.
 pub async fn node_is_rooted<F>(dir: &F, node: &str, at_ms: u64) -> Result<bool, Error>
@@ -170,7 +173,7 @@ where
 
 /// v62.0.0 (KB-fix4) — [`node_is_rooted`], naming the root: the first root
 /// `node`'s governing acceptor names that roots it (the bundle lineage's
-/// `family_key_id`, or a keyed root's id while that arm stands). `None`:
+/// `family_key_id`; v62.0.0 R2-rooms: there is no other kind). `None`:
 /// not rooted. The ONE body `node_is_rooted` and the host's read
 /// (`Engine::root_standing`) share.
 ///
@@ -180,7 +183,6 @@ pub async fn rooted_under<F>(dir: &F, node: &str, at_ms: u64) -> Result<Option<S
 where
     F: FederationDirectory + ?Sized,
 {
-    use crate::federation::canonical_community::{reader_standing, StoredStanding};
     let Some(now) = chrono::TimeZone::timestamp_millis_opt(
         &chrono::Utc,
         i64::try_from(at_ms).unwrap_or(i64::MAX),
@@ -200,13 +202,10 @@ where
         {
             return Ok(Some(root));
         }
-        let (standing, _) = Box::pin(reader_standing(dir, Some(node), &root, now)).await?;
-        if matches!(
-            standing,
-            StoredStanding::Rooted(_) | StoredStanding::Stalled { .. }
-        ) {
-            return Ok(Some(root));
-        }
+        // v62.0.0 (R2-rooms; CC 3.2 T5, "There is no other kind of root") —
+        // the KEYED fallback (a room chain read as a root's,
+        // `canonical_community::reader_standing`) is deleted: an accepted id
+        // that is not the bundle's lineage roots nothing.
     }
     Ok(None)
 }
@@ -572,6 +571,9 @@ where
 /// voice is counted. Every other family: `false` (a second-signer row with no
 /// typed row is never inferred concluded from the absence of a hold).
 ///
+/// VD-step1 — the conclusion is the one verdict's
+/// ([`super::verdict::row_state`]); this keeps RL-fix23's family scope.
+///
 /// # Errors
 /// Directory reads.
 pub(crate) async fn bootstrap_bind_concluded<F>(dir: &F, statement: &[u8]) -> Result<bool, Error>
@@ -579,7 +581,7 @@ where
     F: FederationDirectory + ?Sized,
 {
     use ciris_verify_core::namespace_match::family_id;
-    let Some((protected, payload)) = statement_parts(statement) else {
+    let Some((protected, _)) = statement_parts(statement) else {
         return Ok(false);
     };
     let family = protected.get_int(-70002).and_then(Value::as_text);
@@ -587,22 +589,10 @@ where
     if family != Some(occ_family) && family != Some(family_id(occ_family).as_str()) {
         return Ok(false);
     }
-    let text = |k: &str| payload.get_text(k).and_then(Value::as_text);
-    let (Some(identity), Some(occurrence), Some(at)) = (
-        text("identity_key_id"),
-        text("occurrence_key_id"),
-        payload.get_text("asserted_at").and_then(Value::as_u64),
-    ) else {
+    let Some(rid) = super::names::RowId::of_statement(statement) else {
         return Ok(false);
     };
-    Ok(dir
-        .list_identity_occurrences_by_occurrence_key(occurrence)
-        .await?
-        .iter()
-        .any(|o| {
-            o.identity_key_id == identity
-                && u64::try_from(o.asserted_at.timestamp_millis()).ok() == Some(at)
-        }))
+    Ok(super::verdict::row_state(dir, &rid).await?.is_concluded())
 }
 
 /// **The statement's own serve rule**, before any row naming it carries

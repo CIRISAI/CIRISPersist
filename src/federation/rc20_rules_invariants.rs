@@ -379,6 +379,52 @@ pub(crate) mod bodies {
         );
     }
 
+    /// **I7017** (v62.0.0, ROOMKEY-1d; CC 3.1.3.2 "An `infrastructure`
+    /// community ... MUST declare `public`") — conformance (i) reads the typed
+    /// seating: the same record stating `membership: private` is NOT a
+    /// conformant infrastructure record (so it is reached nowhere), while one
+    /// stating `public`, or none, is. A READ leg: no refusal, no token.
+    pub(crate) async fn i7017_a_private_record_is_no_infrastructure_record(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let base = self_declared(d, tag).await;
+        let conformant = |c: crate::federation::types::Community| async move {
+            crate::federation::admission::is_conformant_infrastructure_record(d, &c)
+                .await
+                .unwrap()
+        };
+        assert!(
+            conformant(base.clone()).await,
+            "I7017: the control (no membership)"
+        );
+        let with = |m: &str| {
+            let mut c = base.clone();
+            c.policy_blob = Some(serde_json::json!({
+                "cohort_subkind": "infrastructure",
+                "membership": m,
+            }));
+            c
+        };
+        assert!(
+            conformant(with("public")).await,
+            "I7017: `membership: public` is conformant"
+        );
+        assert!(
+            !conformant(with("private")).await,
+            "I7017: `membership: private` is no conformant infrastructure record"
+        );
+        assert!(
+            !crate::federation::admission::is_authorized_infrastructure_community(
+                d,
+                &with("private")
+            )
+            .await
+            .unwrap(),
+            "I7017: so it is never an authorized infrastructure community"
+        );
+    }
+
     /// **I1884** — conformance (i): a `founder_only`, `unanimous`, bare
     /// `majority` or malformed protocol is not a conformant infrastructure
     /// record, nor is one whose founder is node- or agent-bearing, nor one
@@ -601,6 +647,7 @@ mod runners {
                 case!(i1871_substrate_persist_confers_nothing);
                 case!(i1883_a_self_declared_community_gets_nothing);
                 case!(i1884_conformance_is_the_record);
+                case!(i7017_a_private_record_is_no_infrastructure_record);
                 #[tokio::test]
                 async fn i1881_a_conformant_rooted_community_is_authorized() {
                     let Some(d) = $fresh.await else { return };

@@ -136,7 +136,7 @@ pub(crate) mod bodies {
     ) {
         use crate::federation::accord_test_support as ops;
         use crate::federation::trust_root::trust_root_valid;
-        let (user, root) = (format!("i1842-user-{s}"), format!("i1842-root-{s}"));
+        let user = format!("i1842-user-{s}");
         e2::put_key(d, &user, &[identity_type::NODE]).await;
         // RT-fix1 — PORTED to an edition-2 trust root (E9's twins, as E5 ported
         // `trust_root_walk_and_tombstone_481`). The earlier-form
@@ -147,14 +147,21 @@ pub(crate) mod bodies {
         // chartered (`stand_up_e2_root`); the user's own `trust:accepts` edge
         // is the edge leg this witness reads. The subject and its conferral
         // were never read here.
-        let r = ops::stand_up_e2_root(d, &root)
+        // v62.0.0 (R2-fixture; CC 3.2 T5) — the root is the bundle's LINEAGE
+        // (the bundle in force, its `charter`); the user's edge is its
+        // acceptance of the lineage.
+        ops::ensure_e2_genesis(d)
             .await
-            .expect("I1842: the root stands up and charters itself");
-        ops::accept_e2_root(d, &user, &r.root)
+            .expect("I1842: the bundle in force");
+        ops::accept_lineage_e2(d, &user)
             .await
             .expect("I1842: the user's acceptance edge");
         // v62 (E4): the store names each key by its identity-ref.
-        let (user_s, user, root) = (user.clone(), e2::kid(&user), r.root.clone());
+        let (user_s, user, root) = (
+            user.clone(),
+            e2::kid(&user),
+            crate::federation::edition2::fixture_genesis::FAMILY_KEY_ID.to_owned(),
+        );
         let v = trust_root_valid(d, &user, &root, crate::host::clock::now())
             .await
             .expect("verdict");
@@ -229,6 +236,9 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I1843: v1");
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let fam = crate::federation::edition2::fixture_switch::room_id(&fam);
         let v1 = d.lookup_family(&fam).await.unwrap().expect("held");
         let (h1, _) = e2::held_head(d, &fam)
             .await
@@ -336,6 +346,9 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I1845: the family");
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let fam_s = crate::federation::edition2::fixture_switch::room_id(&fam_s);
         let (head, _) = e2::held_head(d, &fam)
             .await
             .expect("I1845: the roster's head");

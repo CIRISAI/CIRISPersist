@@ -17,16 +17,18 @@
 //!   concludes. Either arrival order gives the same answer. Outside an attempt
 //!   it is the plain refusal.
 //! - **I3951** `check_founder_eligible`: a founder with no key record is held
-//!   `founder_not_conferred`; once its (human) record lands the fold moves to
-//!   the next leg, held `role_not_accord_conferred` (no accord conferral is
-//!   held). Reads: `key:<founder>`, `key:<accord>`.
+//!   `founder_not_conferred`. v62.0.0 (R2-rooms-b; Constitution 11-24, the
+//!   ONE founder predicate): once its (human) record lands it is STILL held
+//!   `founder_not_conferred` (no holder of the bundle in force; route (a)
+//!   names no founder; the accord-conferred `steward` leg this half witnessed
+//!   is deleted); a holder of the bundle in force is eligible once the bundle
+//!   is installed. Reads: `key:<founder>`, `key:<accord>`.
 //! - **I3952** the key-grant sealer rule, epoch axis: a signer that is not the
 //!   minter and holds no `grant` delegation is held `signer_not_minter`; the
 //!   minter itself over a community this node does not hold is held
 //!   `signer_not_active_member`. Reads name the signer, minter and community.
-//! - **I3953** the trust-root count over voices: a root not held here answers
-//!   `root_not_held` and marks the attempt with the same token, reading
-//!   `key:<root>`.
+//! - **I3953** — DELETED (v62.0.0 R2-rooms): the room-head voice count it
+//!   read is gone (the note at its site).
 //! - **I3954** membership-change structure: a member with no held key record
 //!   marks `member_not_in_directory`; two members on one held key mark
 //!   `duplicate_founder_key`; a change whose `supersedes` names another prior
@@ -156,8 +158,9 @@ pub(crate) async fn founder_eligibility_body(d: &dyn FederationDirectory) {
             att.reads
         );
     }
-    // The founder's human record lands: the fold moves on to the conferral
-    // leg, which no held accord row satisfies — still held, a new reason.
+    // v62.0.0 (R2-rooms-b) — the founder's human record lands: a `user`
+    // key that is no holder is still no founder (the one predicate: route
+    // (b) only; the accord-conferred `steward` leg is deleted).
     let _ = e2::put_key(d, seed, &[identity_type::USER]).await;
     let (out, att) = fold::attempt(
         rid(0x52),
@@ -165,14 +168,22 @@ pub(crate) async fn founder_eligibility_body(d: &dyn FederationDirectory) {
         check_founder_eligible(d, community, &founder, now),
     )
     .await;
-    assert!(
-        matches!(out, Err(Error::RoleNotAccordConferred { .. })),
-        "I3951: the conferral leg answers: {out:?}"
-    );
+    assert!(out.is_err(), "I3951: a user key that is no holder: {out:?}");
     assert_eq!(
         att.held.as_ref().map(|(r, _)| r.as_str()),
-        Some(reason::gc8::ROLE_NOT_ACCORD_CONFERRED),
-        "I3951: held on the next leg (re-folded with the new input)"
+        Some(reason::gc8::FOUNDER_NOT_CONFERRED),
+        "I3951: still held founder_not_conferred (no counted row names a founder yet)"
+    );
+    // CONTROL — a holder of the bundle in force is eligible.
+    super::fixture_genesis::install_v2(d)
+        .await
+        .expect("I3951: the ceremony installs");
+    let holder = super::fixture_genesis::identity_ref_of(super::fixture_genesis::HOLDER_SEEDS[0]);
+    assert!(
+        check_founder_eligible(d, community, &holder, now)
+            .await
+            .is_ok(),
+        "I3951 CONTROL: a holder of the bundle in force is an eligible founder"
     );
 }
 
@@ -225,37 +236,11 @@ pub(crate) async fn sealer_epoch_body(d: &dyn FederationDirectory) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-//  I3953 — the trust-root count
+//  I3953 — DELETED (v62.0.0 R2-rooms; CC 3.2 T5): it witnessed the voice
+//  count over a trust-root ROOM's head (`trust_root_counts_voices`), deleted
+//  with it; the steward purge counts over the bundle's holders
+//  (`steward_purge_invariants` I650).
 // ─────────────────────────────────────────────────────────────────────────
-
-/// I3953.
-pub(crate) async fn trust_root_count_body(d: &dyn FederationDirectory) {
-    let root = "gc8-absent-root";
-    let voices: std::collections::BTreeSet<String> = [e2::kid("gc8-voice")].into_iter().collect();
-    let now = chrono::Utc::now();
-    let (out, att) = Box::pin(fold::attempt(
-        rid(0x55),
-        None,
-        crate::federation::canonical_community::trust_root_counts_voices(d, root, &voices, now),
-    ))
-    .await;
-    let refusal = out.expect("I3953: a read, not a failure");
-    assert_eq!(
-        refusal.as_ref().err().map(|(t, _)| *t),
-        Some(crate::federation::steward_purge::unauthorised_reason::ROOT_NOT_HELD),
-        "I3953: the count answers its refusal pair"
-    );
-    assert_eq!(
-        att.held.as_ref().map(|(r, _)| r.as_str()),
-        Some(reason::gc8::ROOT_NOT_HELD),
-        "I3953: and marks the attempt with the same token"
-    );
-    assert!(
-        att.reads.contains(&Dep::key(root).read_key()),
-        "I3953: key:<root> is declared read: {:?}",
-        att.reads
-    );
-}
 
 // ─────────────────────────────────────────────────────────────────────────
 //  I3954 — membership-change structure (pure)
@@ -606,11 +591,6 @@ both!(
     i3952_sealer_epoch_arm_is_held_sqlite,
     i3952_sealer_epoch_arm_is_held_postgres,
     sealer_epoch_body
-);
-both!(
-    i3953_trust_root_count_marks_its_token_sqlite,
-    i3953_trust_root_count_marks_its_token_postgres,
-    trust_root_count_body
 );
 both!(
     i3955_replicated_row_first_held_concludes_unconcludes_sqlite,

@@ -4,11 +4,10 @@
 //! "Update 9"). Each runs on sqlite and postgres through the one edition-2
 //! entry (`edition2::ingest::put_statement`).
 //!
-//! - **I3230** (was I356, CC 3.2 T4a "a new edge that names no head is
-//!   refused with `trust_root_head_unnamed` in every mode, witnessed mode off
-//!   included") — a NEW `trust:accepts:v1` acceptance edge to a group root
-//!   this node holds, naming no head, is refused `trust_root_head_unnamed` and
-//!   not stored.
+//! - **I3230** (was I356; v62.0.0 R2-accept2, the three kinds) — a NEW
+//!   `trust:accepts:v1` acceptance of the LINEAGE, naming no bundle, is
+//!   refused `trust_root_head_unnamed` and not stored; the same headless edge
+//!   to a held GROUP (kind C) lands.
 //! - **I3231** (was I194 / I359) — the same consumer's edge naming the head
 //!   this node holds (`attached_head_digest` = the family's
 //!   `persist_row_hash`) is admitted and stored.
@@ -92,9 +91,9 @@
 //! - **I3252** (W1b; CC 2.6.1.11) — `duty_holders_for_federation` is the
 //!   holders of the genesis bundle in force; none held, it refuses.
 //!
-//! - **I3253** (W1b; E9 finding 3) — a community root whose count goes short
-//!   is not valid by name on the community arm (never the key arm at its
-//!   identity-ref); the walk and transit eligibility follow.
+//! - **I3253** (v62.0.0 R2-valid; CC 3.2 T5) — a key carrying a complete
+//!   charter self-edge, accepted by this node, is no root, by name, and its
+//!   own conferral roots nothing; the bundle's lineage beside it does.
 //!
 //! - **I3254** (CC rc21) — a re-bind counts at a strict majority of the
 //!   holders of the bundle in force: with four holders, two voices are
@@ -140,7 +139,8 @@ async fn users(d: &dyn FederationDirectory, seeds: &[&str]) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-//  (a) The acceptance edge on a group root (CC 3.2 T4a)
+//  (a) The acceptance edge (CC 3.2 T4a): kind A on the lineage, kind C on a
+//      group (R2-accept2)
 // ─────────────────────────────────────────────────────────────────────────
 
 const ROOT: &str = "w1-root";
@@ -186,15 +186,6 @@ async fn found_root(d: &dyn FederationDirectory) -> crate::federation::edition2:
     row_id_of(&voices[0])
 }
 
-/// The head this node holds for the root (what an edge names).
-async fn held_root_head(d: &dyn FederationDirectory) -> String {
-    d.lookup_family(&e2::kid(ROOT))
-        .await
-        .unwrap()
-        .expect("the root family is held")
-        .persist_row_hash
-}
-
 /// `consumer`'s `trust:accepts:v1` edge to the root, naming `head` when
 /// given, as the consumer's edition-2 statement.
 fn acceptance_edge(consumer: &str, head: Option<&str>) -> Vec<u8> {
@@ -222,65 +213,112 @@ async fn stored(d: &dyn FederationDirectory, statement: &[u8]) -> bool {
         .is_some()
 }
 
-/// **I3230 / I3231** — a new headless edge is refused by name; the edge
-/// naming the held head is admitted.
+/// The newest tip of the lineage in force, hex.
+async fn lineage_tip(d: &dyn FederationDirectory) -> String {
+    hex::encode(
+        crate::federation::edition2::genesis::genesis_in_force(d)
+            .await
+            .expect("the genesis reads")
+            .tips()
+            .iter()
+            .max_by_key(|t| t.asserted_at)
+            .expect("a tip")
+            .object_id,
+    )
+}
+
+/// `consumer`'s `trust:accepts:v1` edge to the lineage, naming `head`.
+fn lineage_acceptance(consumer: &str, head: Option<&str>, at: u64) -> Vec<u8> {
+    crate::federation::edition2::fixture_trust_root::root_acceptance_statement(
+        &e2::signing_key(consumer),
+        &e2::kid(consumer),
+        fixture_genesis::FAMILY_KEY_ID,
+        head,
+        at,
+    )
+    .expect("the acceptance signs")
+}
+
+/// **I3230 / I3231** — v62.0.0 (R2-accept2; the three kinds of
+/// `trust-accepts`, pre4: "A reader that holds a lineage of the name in sub
+/// refuses a new edge without it, trust_root_head_unnamed") — on the
+/// LINEAGE: a new headless acceptance is refused by name and not stored; the
+/// edge naming the held tip is admitted. And kind C: the same headless edge
+/// to a GROUP this node holds (an admission walk's subject, never a root)
+/// lands: T4a gates kind A only. (The earlier I3230 / I3231 read a group as a
+/// root.)
 pub(crate) async fn i3230_i3231_a_new_edge_names_its_head(d: &dyn FederationDirectory) {
+    fixture_genesis::install_v2(d)
+        .await
+        .expect("the ceremony installs");
     found_root(d).await;
     let consumer = "w1-consumer";
     users(d, &[consumer]).await;
+    let at = now_ms();
 
-    // I3230 — witnessed mode off (the root's charter is silent): still refused.
-    let headless = acceptance_edge(consumer, None);
+    // I3230 — headless, on the lineage: refused.
+    let headless = lineage_acceptance(consumer, None, at);
     match e2::put_statement(d, &headless).await {
         Err(e) if e.kind() == "trust_root_head_unnamed" => {}
-        other => panic!("I3230: a new headless acceptance edge, got {other:?}"),
+        other => panic!("I3230: a new headless acceptance of the lineage, got {other:?}"),
     }
     assert!(
         !stored(d, &headless).await,
         "I3230: the refused edge is not stored"
     );
 
-    // I3231 — naming the head this node holds: admitted.
-    let head = held_root_head(d).await;
-    let named = acceptance_edge(consumer, Some(&head));
+    // I3231 — naming the tip this node holds: admitted.
+    let named = lineage_acceptance(consumer, Some(&lineage_tip(d).await), at);
     let o = e2::put_statement(d, &named)
         .await
-        .expect("I3231: the edge naming the held head attaches");
+        .expect("I3231: the edge naming the held tip attaches");
     assert!(
         matches!(o, StatementOutcome::Row { new: true, .. }),
         "I3231: {o:?}"
     );
     assert!(stored(d, &named).await, "I3231: the edge is stored");
+
+    // Kind C — a headless edge to a held GROUP lands (no root, no T4a).
+    let group_edge = acceptance_edge(consumer, None);
+    e2::put_statement(d, &group_edge)
+        .await
+        .expect("I3230 (kind C): a headless edge to a held group is not refused");
+    assert!(
+        stored(d, &group_edge).await,
+        "I3230 (kind C): the group edge is stored"
+    );
 }
 
-/// **I3232** — after the head moves: the attached edge is not re-judged,
-/// and a new edge naming the superseded head is not refused for it.
+/// **I3232** — v62.0.0 (R2-accept2) on the LINEAGE (CC 3.2 T4 "an attached
+/// root stays valid until revoked"; T4a, judged on first admission only):
+/// after a later bundle of the lineage is imported, the attached edge
+/// re-offered is not re-judged (held, not new), and a NEW edge naming the
+/// superseded bundle (a held valid bundle of the lineage) is not refused.
 pub(crate) async fn i3232_attached_stays_attached(d: &dyn FederationDirectory) {
-    let v1 = found_root(d).await;
-    let v1_head = held_root_head(d).await;
+    fixture_genesis::install_v2(d)
+        .await
+        .expect("the ceremony installs");
+    let v1 = lineage_tip(d).await;
     let (early, late) = ("w1-early", "w1-late");
     users(d, &[early, late]).await;
-    let edge = acceptance_edge(early, Some(&v1_head));
+    let at = now_ms();
+    let edge = lineage_acceptance(early, Some(&v1), at);
     e2::put_statement(d, &edge)
         .await
-        .expect("I3232: attaches on version 1");
+        .expect("I3232: attaches on bundle 1");
 
-    // The root's head moves: version 2, counted at majority (two of three).
-    let keys: Vec<_> = MEMBERS[..2].iter().map(|s| e2::signing_key(s)).collect();
-    let refs: Vec<_> = keys.iter().collect();
-    let o = put_voices(
-        d,
-        &roster_voices(&root_family("w1 root v2"), 2, Some(&v1), 3_000, &refs),
-    )
-    .await
-    .expect("I3232: version 2");
-    assert!(
-        matches!(o, StatementOutcome::Row { new: true, .. }),
-        "I3232: version 2 is the head: {o:?}"
+    let later = fixture_genesis::later_v2(
+        fixture_genesis::bundle_v2(),
+        &[1, 2, 4],
+        &[11, 12],
+        &[1, 2, 4],
     );
-    assert_ne!(held_root_head(d).await, v1_head, "I3232: the head moved");
+    fixture_genesis::install_ceremony_v2(d, &later)
+        .await
+        .expect("I3232: the later bundle installs");
+    assert_ne!(lineage_tip(d).await, v1, "I3232: the tip moved");
 
-    // T4 — the attached edge re-offered is not re-judged against the new head.
+    // T4 — the attached edge re-offered is not re-judged.
     let o = e2::put_statement(d, &edge)
         .await
         .expect("I3232: the attached edge re-put");
@@ -293,12 +331,11 @@ pub(crate) async fn i3232_attached_stays_attached(d: &dyn FederationDirectory) {
     );
     assert!(stored(d, &edge).await, "I3232: attached stays attached");
 
-    // T4a — a NEW edge naming the superseded head concludes nothing, and is
-    // never refused for that.
-    let stale = acceptance_edge(late, Some(&v1_head));
+    // T4a — a NEW edge naming the superseded (held, valid) bundle lands.
+    let stale = lineage_acceptance(late, Some(&v1), at);
     e2::put_statement(d, &stale)
         .await
-        .expect("I3232: a new edge naming another head is not refused for it");
+        .expect("I3232: a new edge naming an earlier bundle of the lineage is not refused");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1211,39 +1248,7 @@ async fn read_standing(
         .unwrap()
 }
 
-/// **I3242** — a root founded by the bundle's holders, chartered by its own
-/// key and accepted by this node is ROOTED; both T3 legs hold.
-pub(crate) async fn i3242_a_rooted_edition2_trust_root(d: &dyn FederationDirectory) {
-    use crate::federation::canonical_community::StoredStanding;
-    use crate::federation::edition2::fixture_trust_root::rooted_trust_root;
-    let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
-    assert_eq!(
-        r.root,
-        e2::kid(crate::federation::edition2::fixture_trust_root::ROOT_SEED)
-    );
-    let own = crate::federation::trust_root::own_chain_to(d, &r.root, crate::host::clock::now())
-        .await
-        .unwrap();
-    assert!(
-        own.accepted && own.chartered,
-        "I3242: both T3 legs: {own:?}"
-    );
-    let StoredStanding::Rooted(head) = read_standing(d, &r.root).await else {
-        panic!("I3242: rooted");
-    };
-    let mut founders: Vec<String> =
-        crate::federation::canonical_community::founders(&head.community)
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-    founders.sort();
-    let mut expected = r.founders.clone();
-    expected.sort();
-    assert_eq!(
-        founders, expected,
-        "I3242: the bundle's holders are its founders"
-    );
-}
+// LEAD-root1 (CC 3.2 T5) — I3242 (a root community chartered by its own key and accepted is ROOTED; both T3 legs) DELETED: no row is a charter and no community is a root. The node's acceptance of the bundle is peer_rooting / root_grant_invariants (accepting_node).
 
 /// **I3243** — the same chain is NOT rooted for a node that has not accepted
 /// it, nor once this node withdraws its acceptance; an id never founded has
@@ -1257,7 +1262,7 @@ pub(crate) async fn i3243_unrooted_without_this_nodes_acceptance(
     let node = e2::kid(W1B_NODE);
     let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
     assert!(matches!(
-        read_standing(d, &r.root).await,
+        read_standing(d, &r.lineage).await,
         StoredStanding::Rooted(_)
     ));
     assert!(
@@ -1273,7 +1278,7 @@ pub(crate) async fn i3243_unrooted_without_this_nodes_acceptance(
         matches!(
             crate::federation::canonical_community::chain_standing_at(
                 d,
-                &r.root,
+                &r.lineage,
                 crate::host::clock::now()
             )
             .await
@@ -1284,7 +1289,7 @@ pub(crate) async fn i3243_unrooted_without_this_nodes_acceptance(
     );
     assert!(
         matches!(
-            read_standing(d, &r.root).await,
+            read_standing(d, &r.lineage).await,
             StoredStanding::NotRooted { .. }
         ),
         "I3243: not rooted for a node that never accepted it"
@@ -1292,16 +1297,16 @@ pub(crate) async fn i3243_unrooted_without_this_nodes_acceptance(
     // Back to the accepting node; it withdraws its edge: not rooted.
     set_node(node.clone());
     assert!(matches!(
-        read_standing(d, &r.root).await,
+        read_standing(d, &r.lineage).await,
         StoredStanding::Rooted(_)
     ));
-    let w = e2::trust_withdraws_statement(&node, &r.root, &r.acceptance, now_ms());
+    let w = e2::trust_withdraws_statement(&node, &r.lineage, &r.acceptance, now_ms());
     e2::put_statement(d, &w)
         .await
         .expect("I3243: the node withdraws its acceptance");
     assert!(
         matches!(
-            read_standing(d, &r.root).await,
+            read_standing(d, &r.lineage).await,
             StoredStanding::NotRooted { .. }
         ),
         "I3243: un-trust is one row (CC 3.2 T3)"
@@ -1330,7 +1335,7 @@ pub(crate) async fn i3244_a_purge_under_a_rooted_root(d: &dyn FederationDirector
     let t = now_ms();
     let p = takedown_payload(
         "steward_purge",
-        &r.root,
+        &r.lineage,
         &digest,
         &r.founders,
         &NoticeText {
@@ -1342,7 +1347,7 @@ pub(crate) async fn i3244_a_purge_under_a_rooted_root(d: &dyn FederationDirector
         t,
     )
     .unwrap();
-    let voice = |i: usize| sign_group_payload(&r.founder_key(i), &r.root, TAKEDOWN_PREFIX, &p);
+    let voice = |i: usize| sign_group_payload(&r.founder_key(i), &r.lineage, TAKEDOWN_PREFIX, &p);
     let first = voice(0);
     e2::put_statement(d, &first)
         .await
@@ -1451,7 +1456,7 @@ pub(crate) async fn i3245_i3247_infrastructure_rooted_here(d: &dyn FederationDir
     use crate::federation::types::identity_type;
     let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
     let root = d
-        .lookup_community(&r.root)
+        .lookup_community(&r.lineage)
         .await
         .unwrap()
         .expect("the root is held");
@@ -1461,7 +1466,8 @@ pub(crate) async fn i3245_i3247_infrastructure_rooted_here(d: &dyn FederationDir
         authorized(d, &root).await,
         "I3245: the rooted root is infrastructure here"
     );
-    let shared = found_infra_room(d, "w1b-shared-room", Some(&r.charter)).await;
+    // LEAD-root1 — no row is a charter: the room cites none.
+    let shared = found_infra_room(d, "w1b-shared-room", None).await;
     assert!(
         authorized(d, &shared).await,
         "I3245: a room under the root's charter is infrastructure here"
@@ -1491,7 +1497,7 @@ pub(crate) async fn i3245_i3247_infrastructure_rooted_here(d: &dyn FederationDir
 
     // I3246 — un-trust is one row: the node withdraws its acceptance.
     let node = d.node_key_id().expect("the runner set the node key");
-    let w = e2::trust_withdraws_statement(&node, &r.root, &r.acceptance, now_ms());
+    let w = e2::trust_withdraws_statement(&node, &r.lineage, &r.acceptance, now_ms());
     e2::put_statement(d, &w)
         .await
         .expect("I3246: the node withdraws its acceptance");
@@ -1513,12 +1519,18 @@ pub(crate) async fn i3245_i3247_infrastructure_rooted_here(d: &dyn FederationDir
 /// with no role. It lands: no voice of the node, no acceptance row from the
 /// node or from an owner (the seat has none), and the node is on the roster,
 /// not a founder (it holds no vote). KR-fix10's consent rule is not asked.
-/// Control: the same room listing a `node` key that is NO seat of the bundle
-/// does not land on the holders' voices alone.
+///
+/// v62.0.0 (KR-fix23; CC 4.4.3.19 as written: "seated by the founders' count
+/// alone, for the canonical room with the bundle's conferral") — the same
+/// room listing a `node` key that is NO seat of the bundle ALSO lands on the
+/// holders' voices alone (any infrastructure room seats a node by the
+/// founders' count; before KR-fix23 it did not land). Only THE CANONICAL room
+/// (`ciris-canonical`) asks for the bundle's conferral: the one predicate
+/// answers no for that node there, yes for the seat.
 pub(crate) async fn i4290_a_bundle_seat_is_seated_without_acceptance(d: &dyn FederationDirectory) {
     use crate::federation::edition2::fixture_trust_root::rooted_trust_root;
     use crate::federation::membership_acceptance::node_seated_without_acceptance;
-    let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
+    let _r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
     let seat = fixture_genesis::bundle_v2().seats[0].identity_ref.clone();
     let stray = e2::put_key(d, "i4290-stray-node", &["node"]).await;
     assert!(
@@ -1548,7 +1560,7 @@ pub(crate) async fn i4290_a_bundle_seat_is_seated_without_acceptance(d: &dyn Fed
                     role: None,
                 }))
                 .collect();
-            c.charter_digest = r.charter.hex();
+            // LEAD-root1 — no row is a charter: the room cites none.
         }
         let keys: Vec<_> = fixture_genesis::HOLDER_SEEDS
             .iter()
@@ -1623,18 +1635,50 @@ pub(crate) async fn i4290_a_bundle_seat_is_seated_without_acceptance(d: &dyn Fed
         "I4290: and it has no owner yet (the founding seats it before any owner binding)"
     );
 
-    // Control: a node that is no seat of the bundle is not seated that way.
+    // KR-fix23 — a node that is no seat of the bundle, in an infrastructure
+    // room that is not the canonical one: seated by the founders' count too.
     let (out, _) = found("i4290-stray-room", stray.clone()).await;
     assert!(
-        !matches!(out, Ok(StatementOutcome::Row { .. })),
-        "I4290: a node that is no bundle seat is not seated by others' voices alone: {out:?}"
+        matches!(out, Ok(StatementOutcome::Row { .. })),
+        "I4290 (KR-fix23): any node is seated by the founders' count in an infrastructure \
+         room: {out:?}"
     );
+    let stray_cid = e2::kid("i4290-stray-room");
+    let stray_room = d
+        .lookup_community(&stray_cid)
+        .await
+        .unwrap()
+        .expect("I4290 (KR-fix23): that room landed");
     assert!(
-        d.lookup_community(&e2::kid("i4290-stray-room"))
+        d.active_community_members(&stray_cid)
             .await
             .unwrap()
-            .is_none(),
-        "I4290: that room did not land"
+            .iter()
+            .any(|m| m.key_id == stray && m.role.is_none()),
+        "I4290 (KR-fix23): the node is an active member, with no vote"
+    );
+    assert!(
+        node_seated_without_acceptance(d, &stray_room, &stray, stray_room.founded_at)
+            .await
+            .unwrap(),
+        "I4290 (KR-fix23): the one predicate answers yes for it there"
+    );
+    // The canonical room asks for the bundle's conferral: the same record
+    // under the reserved id seats the bundle's seat and not that node.
+    let mut canonical = stray_room.clone();
+    canonical.community_key_id =
+        crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID.to_owned();
+    assert!(
+        !node_seated_without_acceptance(d, &canonical, &stray, canonical.founded_at)
+            .await
+            .unwrap(),
+        "I4290 (KR-fix23): in the canonical room a node that is no bundle seat is not seated so"
+    );
+    assert!(
+        node_seated_without_acceptance(d, &canonical, &seat, canonical.founded_at)
+            .await
+            .unwrap(),
+        "I4290 (KR-fix23): in the canonical room the bundle's seat is"
     );
 }
 
@@ -1650,14 +1694,14 @@ pub(crate) async fn i3248_i3249_trust_root_valid_and_the_walk(d: &dyn Federation
     let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
     let again = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
     assert_eq!(
-        (again.birth, again.charter, again.acceptance),
-        (r.birth, r.charter, r.acceptance),
+        (again.head, again.acceptance),
+        (r.head, r.acceptance),
         "I3248: rooted_trust_root is idempotent per directory"
     );
     let node = d.node_key_id().expect("the runner set the node key");
 
     // I3248 — trust_root_valid.
-    let v = trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+    let v = trust_root_valid(d, &node, &r.lineage, crate::host::clock::now())
         .await
         .unwrap();
     assert!(
@@ -1671,8 +1715,8 @@ pub(crate) async fn i3248_i3249_trust_root_valid_and_the_walk(d: &dyn Federation
     assert!(v.valid, "I3248: valid: {v:?}");
     assert_eq!(
         v.root_kind,
-        RootKind::Key,
-        "I3248 (KB-fix1): a keyed root at the room's id; the room is no root"
+        RootKind::Family,
+        "I3248 (R2-valid): the root is the bundle's lineage, the one kind"
     );
 
     // I3249 — a capability the root confers reaches it.
@@ -1691,7 +1735,7 @@ pub(crate) async fn i3248_i3249_trust_root_valid_and_the_walk(d: &dyn Federation
     .await
     .unwrap()
     .expect("I3249: the walk reaches a trusted root");
-    assert_eq!(found.root_key_id, r.root, "I3249: the edition-2 root");
+    assert_eq!(found.root_key_id, r.lineage, "I3249: the edition-2 root");
     assert_eq!(
         found.grant_attestation_id,
         // X2 build fix: W1b's `put_conferral` returns the row id itself.
@@ -1700,12 +1744,12 @@ pub(crate) async fn i3248_i3249_trust_root_valid_and_the_walk(d: &dyn Federation
     );
 
     // Un-trust is one row.
-    let w = e2::trust_withdraws_statement(&node, &r.root, &r.acceptance, now_ms());
+    let w = e2::trust_withdraws_statement(&node, &r.lineage, &r.acceptance, now_ms());
     e2::put_statement(d, &w)
         .await
         .expect("I3249: the node withdraws its acceptance");
     assert!(
-        !trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+        !trust_root_valid(d, &node, &r.lineage, crate::host::clock::now())
             .await
             .unwrap()
             .valid,
@@ -1811,36 +1855,135 @@ pub(crate) async fn i3252_federation_duty_holders_are_the_bundles(d: &dyn Federa
     );
 }
 
-/// **I3253** (W1b; E9 finding 3, security) — a community root whose count
-/// goes short (a later bundle seats other holders, so the birth's voices
-/// no longer reach a strict majority of the holders in force) reads NOT
-/// valid, by name, on the COMMUNITY arm: it never falls back to the key arm
-/// at its own identity-ref (which holds a charter self-edge and this node's
-/// acceptance). The capability walk and transit eligibility follow.
-pub(crate) async fn i3253_no_key_arm_for_a_community_root(d: &dyn FederationDirectory) {
-    use crate::federation::canonical_community::{chain_standing_at, StoredStanding};
-    use crate::federation::edition2::fixture_trust_root::{
-        put_acceptance, put_conferral, rooted_trust_root,
-    };
+/// **I3253** — v62.0.0 (R2-valid; CC 3.2 T5, "A key that signs a charter
+/// about itself is no root") — a KEY carrying a complete `trust:charter:v1`
+/// self-edge (`infra:serve` + `infra:attest`, a well-formed pre-rotation
+/// commitment) and THIS node's own `trust:accepts:v1` edge to it is NOT a
+/// root, by name: `trust_root_valid` reads it not valid with `not_rooted`
+/// set, and a conferral the key signs roots nothing in the walk. The
+/// positive control is the bundle's lineage on the same directory. (The
+/// earlier I3253, "a community root whose count goes short is judged on the
+/// community arm, never the key arm", is replaced: both arms are deleted.)
+pub(crate) async fn i3253_a_self_chartered_key_is_no_root(d: &dyn FederationDirectory) {
+    use crate::federation::edition2::fixture_trust_root::{put_conferral, rooted_trust_root};
+    use crate::federation::operational::test_support::e2_trust_edge;
     use crate::federation::trust_root::{
-        capability_roots_to_trusted_root, resolve_transit_eligibility, trust_root_valid, RootKind,
-        INFRA_SERVE_SCOPE,
+        capability_roots_to_trusted_root, trust_root_valid, CHARTER_PRE_ROTATION_FIELD,
+        INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE, TRUST_CHARTER_DIMENSION, TRUST_CONFERS_DIMENSION,
     };
     let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
     let node = d.node_key_id().expect("the runner set the node key");
-    let subject_seed = "w1b-short-subject";
+    let subject_seed = "r2v-keyed-subject";
+    let subject = e2::kid(subject_seed);
     put_conferral(d, &r, subject_seed, &[INFRA_SERVE_SCOPE])
         .await
-        .expect("I3253: the root confers");
-    let subject = e2::kid(subject_seed);
-    // The positive control: valid, and the walk reaches it.
+        .expect("I3253: the lineage confers (the control)");
     assert!(
-        trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+        trust_root_valid(d, &node, &r.lineage, crate::host::clock::now())
             .await
             .unwrap()
             .valid,
-        "I3253: valid first"
+        "I3253 CONTROL: the lineage is a valid root"
     );
+
+    // The keyed shape: a key, its complete charter self-edge, this node's
+    // acceptance of it, and a conferral it signs on a second subject.
+    let key_seed = "r2v-self-chartered-key";
+    let key = e2::put_key(d, key_seed, &["user"]).await;
+    let successor = e2::signing_key(&format!("{key_seed}-successor"));
+    let commitment = ciris_verify_core::edition2::recovery::recovery_commitment(&[successor
+        .public_key()
+        .clone()]);
+    let at = now_ms();
+    let charter = e2_trust_edge(
+        key_seed,
+        &key,
+        &key,
+        vec![
+            ("author", Value::Text(key.clone())),
+            ("asserted_at", Value::Uint(at)),
+            ("dimension", Value::Text(TRUST_CHARTER_DIMENSION.to_owned())),
+            (
+                "scope",
+                Value::Array(vec![
+                    Value::Text(INFRA_SERVE_SCOPE.to_owned()),
+                    Value::Text(INFRA_ATTEST_SCOPE.to_owned()),
+                ]),
+            ),
+            (
+                CHARTER_PRE_ROTATION_FIELD,
+                Value::Bytes(commitment.to_vec()),
+            ),
+        ],
+    );
+    // R2-valid's READ (lead's ruling 4): the charter door
+    // (`check_trust_charter_admission`) still ADMITS a complete self-charter;
+    // no validity reader takes it as a charter any more (it is inert here).
+    e2::put_statement(d, &charter)
+        .await
+        .expect("I3253: the complete self-charter is admitted (inert)");
+    e2::put_statement(
+        d,
+        &e2::trust_accepts_statement(
+            &node,
+            &key,
+            &[],
+            None,
+            crate::federation::types::cohort_scope::FEDERATION,
+            at,
+        ),
+    )
+    .await
+    .expect("I3253: this node's edge to the key lands (it names no lineage)");
+    let keyed_seed = "r2v-keyed-grantee";
+    let keyed = e2::put_key(d, keyed_seed, &["user"]).await;
+    let grant = e2_trust_edge(
+        key_seed,
+        &key,
+        &keyed,
+        vec![
+            ("author", Value::Text(key.clone())),
+            ("asserted_at", Value::Uint(at)),
+            ("dimension", Value::Text(TRUST_CONFERS_DIMENSION.to_owned())),
+            (
+                "scope",
+                Value::Array(vec![Value::Text(INFRA_SERVE_SCOPE.to_owned())]),
+            ),
+        ],
+    );
+    let _ = e2::put_statement(d, &grant).await;
+    let _ = e2::put_statement(d, &e2::voice_of(&grant, keyed_seed)).await;
+
+    let v = trust_root_valid(d, &node, &key, crate::host::clock::now())
+        .await
+        .unwrap();
+    assert!(
+        !v.valid && !v.root_self_declares && v.not_rooted.is_some(),
+        "I3253: a self-chartered key, accepted by this node, is no root, by name: {v:?}"
+    );
+    assert!(
+        capability_roots_to_trusted_root(
+            d,
+            &node,
+            &keyed,
+            INFRA_SERVE_SCOPE,
+            crate::host::clock::now()
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "I3253: the key's own conferral roots nothing"
+    );
+    // The asking node's own id is no root either.
+    assert!(
+        trust_root_valid(d, &node, &node, crate::host::clock::now())
+            .await
+            .unwrap()
+            .not_rooted
+            .is_some(),
+        "I3253: the node's own id is no root"
+    );
+    // The lineage still roots its own grant.
     assert!(
         capability_roots_to_trusted_root(
             d,
@@ -1852,72 +1995,7 @@ pub(crate) async fn i3253_no_key_arm_for_a_community_root(d: &dyn FederationDire
         .await
         .unwrap()
         .is_some(),
-        "I3253: reached first"
-    );
-    // Transit's own positive control: bundle seat 0 is a node, offers
-    // transport (its live transit key, CC 3.3.6.2) and accepts the same root,
-    // so it is an eligible hop for this node while the root roots.
-    let ceremony = fixture_genesis::bundle_v2();
-    let peer = ceremony.serve_node_identity_ref(0).to_owned();
-    put_acceptance(d, &r, &ceremony.serve_node_key(0), &peer)
-        .await
-        .expect("I3253: the seat accepts the root");
-    assert!(
-        resolve_transit_eligibility(d, &node, &peer)
-            .await
-            .unwrap()
-            .eligible,
-        "I3253: transit-eligible while the root roots"
-    );
-    // A later bundle seats holders 1, 4–7 (2 and 3 leave): the root's birth
-    // voices {1, 2, 3} hold one of five; a strict majority is three.
-    let later = fixture_genesis::later_v2(
-        fixture_genesis::bundle_v2(),
-        &[1, 4, 5, 6, 7],
-        &fixture_genesis::SERVE_NODE_SEEDS,
-        &[1, 2, 4, 5, 6, 7],
-    );
-    fixture_genesis::install_ceremony_v2(d, &later)
-        .await
-        .expect("I3253: the later bundle installs");
-    assert!(
-        matches!(
-            chain_standing_at(d, &r.root, crate::host::clock::now())
-                .await
-                .unwrap(),
-            StoredStanding::NotRooted { .. }
-        ),
-        "I3253: the community chain no longer roots"
-    );
-    let v = trust_root_valid(d, &node, &r.root, crate::host::clock::now())
-        .await
-        .unwrap();
-    assert!(!v.valid, "I3253: not valid: {v:?}");
-    assert_eq!(
-        v.root_kind,
-        RootKind::Community,
-        "I3253: judged on the community arm, never the key arm: {v:?}"
-    );
-    assert!(v.not_rooted.is_some(), "I3253: not valid BY NAME: {v:?}");
-    assert!(
-        capability_roots_to_trusted_root(
-            d,
-            &node,
-            &subject,
-            INFRA_SERVE_SCOPE,
-            crate::host::clock::now()
-        )
-        .await
-        .unwrap()
-        .is_none(),
-        "I3253: the walk reaches nothing"
-    );
-    assert!(
-        !resolve_transit_eligibility(d, &node, &peer)
-            .await
-            .unwrap()
-            .eligible,
-        "I3253: the same hop is not eligible once the count is short"
+        "I3253 CONTROL: the lineage's counted grant still roots"
     );
 }
 
@@ -2129,7 +2207,7 @@ pub(crate) async fn i3256_a_holder_reports_the_measured_class_and_a_walked_chain
 
     let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
     let node = d.node_key_id().expect("the runner set the node key");
-    let v = trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+    let v = trust_root_valid(d, &node, &r.lineage, crate::host::clock::now())
         .await
         .unwrap();
     assert!(
@@ -2379,23 +2457,9 @@ async fn postgres_with_node() -> Option<crate::store::postgres::PostgresBackend>
     Some(b)
 }
 
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn i3242_sqlite() {
-    Box::pin(i3242_a_rooted_edition2_trust_root(
-        &sqlite_with_node().await,
-    ))
-    .await;
-}
+// LEAD-root1 — runner of a deleted root-community witness.
 
-#[cfg(feature = "postgres")]
-#[tokio::test]
-async fn i3242_postgres() {
-    let Some(b) = postgres_with_node().await else {
-        return;
-    };
-    Box::pin(i3242_a_rooted_edition2_trust_root(&b)).await;
-}
+// LEAD-root1 — runner of a deleted root-community witness.
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
@@ -2535,7 +2599,7 @@ async fn i3252_postgres() {
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn i3253_sqlite() {
-    Box::pin(i3253_no_key_arm_for_a_community_root(
+    Box::pin(i3253_a_self_chartered_key_is_no_root(
         &sqlite_with_node().await,
     ))
     .await;
@@ -2547,7 +2611,7 @@ async fn i3253_postgres() {
     let Some(b) = postgres_with_node().await else {
         return;
     };
-    Box::pin(i3253_no_key_arm_for_a_community_root(&b)).await;
+    Box::pin(i3253_a_self_chartered_key_is_no_root(&b)).await;
 }
 
 #[cfg(feature = "sqlite")]
@@ -2728,56 +2792,7 @@ pub(crate) async fn i2225_i2227_the_t7_margin(d: &dyn FederationDirectory) {
     );
 }
 
-/// **I2227b** (TR-fix1; CC rc21 3.2 T7 l.1240) — a STALLED root still
-/// authorises a purge: W1b's root (three holder founders at `quorum:2/3`,
-/// chartered, accepted here) loses one founder, so 2 = M is Stalled, and
-/// `trust_root_head` (the purge authorisation's root read) answers its head,
-/// not `stalled`.
-pub(crate) async fn i2227b_a_stalled_root_authorises_a_purge(d: &dyn FederationDirectory) {
-    use crate::federation::canonical_community::{
-        stored_standing_at, trust_root_head, StoredStanding,
-    };
-    use crate::federation::edition2::fixture_trust_root::rooted_trust_root;
-    use crate::federation::edition2::group::MembershipRecord;
-    use crate::federation::edition2::group_fixtures::membership_voices;
-    use crate::federation::types::CommunityMembershipRevocation;
-    let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
-    let tip = crate::federation::edition2::genesis::genesis_in_force(d)
-        .await
-        .unwrap()
-        .tips()
-        .iter()
-        .map(|t| t.asserted_at)
-        .max()
-        .expect("a tip");
-    let when = at(i64::try_from(tip + 120_000).unwrap());
-    let resignation = MembershipRecord::CommunityRemoval(CommunityMembershipRevocation {
-        community_key_id: r.root.clone(),
-        removed_identity_key_id: r.founders[2].clone(),
-        removed_at: when,
-        effective_at: when,
-        reason: None,
-        witness_set: Vec::new(),
-        persist_row_hash: String::new(),
-    });
-    let key = r.founder_key(2);
-    put_voices(d, &membership_voices(&resignation, Some(&r.birth), &[&key]))
-        .await
-        .expect("I2227b: a founder resigns alone");
-    let now = crate::host::clock::now();
-    assert!(
-        matches!(
-            stored_standing_at(d, &r.root, now).await.unwrap(),
-            StoredStanding::Stalled { .. }
-        ),
-        "I2227b: two of three founders at quorum:2/3 is Stalled"
-    );
-    assert!(
-        trust_root_head(d, &r.root, now).await.unwrap().is_ok(),
-        "I2227b: the stalled root's head authorises a purge (CC 3.2 T7: non-admitting is \
-         only the founders' roster count and a ceremony conferral)"
-    );
-}
+// LEAD-root1 (CC 3.2 T5) — I2227b (a root COMMUNITY stalled by a founder's resignation still authorises a purge) DELETED with the root community.
 
 /// **I2228** (TR-fix1; CC rc21 3.2 T4, T8 (ii) "a lapsed timer never moves
 /// Rooted or Stalled to NotRooted"; T8 l.1251 "t is a signer-stamped instant,
@@ -2797,8 +2812,8 @@ pub(crate) async fn i2228_v_at_a_signer_stamped_instant(d: &dyn FederationDirect
         .expect("I2228: the root confers");
     let t = crate::host::clock::now();
     let later = t + chrono::Duration::days(200);
-    let v = trust_root_valid(d, &node, &r.root, t).await.unwrap();
-    let w = trust_root_valid(d, &node, &r.root, later).await.unwrap();
+    let v = trust_root_valid(d, &node, &r.lineage, t).await.unwrap();
+    let w = trust_root_valid(d, &node, &r.lineage, later).await.unwrap();
     assert!(
         v.valid && w.valid,
         "I2228: valid at t and t + 200d: {v:?} / {w:?}"
@@ -2819,7 +2834,7 @@ pub(crate) async fn i2228_v_at_a_signer_stamped_instant(d: &dyn FederationDirect
             )
             .await
             .unwrap()
-            .is_some_and(|g| g.root_key_id == r.root),
+            .is_some_and(|g| g.root_key_id == r.lineage),
             "I2228: the conferral reaches the root at {at}"
         );
     }
@@ -2845,7 +2860,7 @@ pub(crate) async fn i2229_custody_is_not_a_leg(
         ..crate::federation::HardwareAttestationPolicy::default()
     };
     set_policy(std::sync::Arc::new(hostile));
-    let v = trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+    let v = trust_root_valid(d, &node, &r.lineage, crate::host::clock::now())
         .await
         .unwrap();
     set_policy(std::sync::Arc::new(
@@ -2924,23 +2939,9 @@ async fn i2225_i2227_postgres() {
     Box::pin(i2225_i2227_the_t7_margin(&b)).await;
 }
 
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn i2227b_sqlite() {
-    Box::pin(i2227b_a_stalled_root_authorises_a_purge(
-        &sqlite_with_node().await,
-    ))
-    .await;
-}
+// LEAD-root1 — runner of a deleted root-community witness.
 
-#[cfg(feature = "postgres")]
-#[tokio::test]
-async fn i2227b_postgres() {
-    let Some(b) = postgres_with_node().await else {
-        return;
-    };
-    Box::pin(i2227b_a_stalled_root_authorises_a_purge(&b)).await;
-}
+// LEAD-root1 — runner of a deleted root-community witness.
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
@@ -3115,7 +3116,7 @@ pub(crate) async fn i2233_a_revoked_holder_is_not_an_active_founder(d: &dyn Fede
     use crate::federation::edition2::fixture_trust_root::rooted_trust_root;
     let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
     assert!(
-        matches!(w1b_standing(d, &r.root).await, StoredStanding::Rooted(_)),
+        matches!(w1b_standing(d, &r.lineage).await, StoredStanding::Rooted(_)),
         "I2233: three holder founders, Rooted"
     );
     let now = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap();
@@ -3132,7 +3133,7 @@ pub(crate) async fn i2233_a_revoked_holder_is_not_an_active_founder(d: &dyn Fede
         .expect("I2233: holder 3 revokes its key");
     assert!(
         matches!(
-            w1b_standing(d, &r.root).await,
+            w1b_standing(d, &r.lineage).await,
             StoredStanding::Stalled { .. }
         ),
         "I2233: a founder past its key's revoked_after is not active: 2 = M, Stalled"
@@ -3150,7 +3151,7 @@ pub(crate) async fn i2234_a_node_bearing_holder_is_not_a_founder(d: &dyn Federat
     use crate::federation::edition2::fixture_trust_root::rooted_trust_root;
     let r = rooted_trust_root(d, &fixture_genesis::HOLDER_SEEDS, "quorum:2/3").await;
     assert!(
-        matches!(w1b_standing(d, &r.root).await, StoredStanding::Rooted(_)),
+        matches!(w1b_standing(d, &r.lineage).await, StoredStanding::Rooted(_)),
         "I2234: Rooted"
     );
     let now = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap();
@@ -3180,7 +3181,7 @@ pub(crate) async fn i2234_a_node_bearing_holder_is_not_a_founder(d: &dyn Federat
         .expect("I2234: holder 2's node-bearing record lands");
     assert!(
         matches!(
-            w1b_standing(d, &r.root).await,
+            w1b_standing(d, &r.lineage).await,
             StoredStanding::Stalled { .. }
         ),
         "I2234: a node-bearing founder does not count: 2 = M, Stalled"

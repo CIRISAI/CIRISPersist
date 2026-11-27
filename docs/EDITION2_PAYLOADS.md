@@ -89,6 +89,7 @@ Rules beyond the list (refused `edition2_payload_invalid`):
 - `membership` is one of `private`, `public`
 - `refs.head` is absent on version 1 and present on every later version
 - a `geographic` community names each new member's `location_proof:v1` row under `refs.also.cites` (CC 3.2, rc21): a founding version (every member new) cites at least as many rows as it lists members; the fold waits for the proofs and concludes nothing unless each is contained in the constraint and live at `asserted_at`
+- a `family`'s version carries no `membership` (CC 3.1.3.2: a `self` room and a `family` are seated by identity keys)
 
 | earlier-form co-signature (not a payload member) | now |
 |---|---|
@@ -300,7 +301,7 @@ Co-signatures now counted voices: none (the author's statement alone).
 - **Replaces:** DeliveryReceipt
 - **Authorship:** authored
 - **`sub`:** the subscriber's identity-ref (subscriber_key_id; equals iss)
-- **Lands in:** federation_stream_delivery_receipts
+- **Lands in:** federation_stream_delivery_acks
 
 | member | CBOR type | presence | maps from |
 |---|---|---|---|
@@ -316,7 +317,7 @@ Co-signatures now counted voices: none (the author's statement alone).
 ### `admission:unit`
 
 - **Replaces:** nothing: new in rc21 (CC 2.7.11, the code scope of kernel admission; wire admission:unit:v1, row type scores)
-- **Authorship:** counted where refs.head is present (act = group), authored otherwise; one person's (authored) row naming an effect is at cohort_scope self and admits only on a host that person owns; every signer a person (identity_type holds user or accord_holder); no delegate role
+- **Authorship:** counted where the payload carries no author (act = group; it names its roster head in refs.head), authored otherwise (naming no head); one person's (authored) row naming an effect is at cohort_scope self and admits only on a host that person owns; every signer a person (identity_type holds user or accord_holder); no delegate role
 - **`sub`:** the unit digest as tagged text, canonical:sha256:{hex} (not an identity-ref)
 - **Lands in:** ceg_statements + federation_attestations (the mapped scores row), held count_short until a counted row's count is met; no typed plane: the host's answer (admission_unit_runnable) reads the conclusion, the lease, the withdrawal, the standing and the receipt
 
@@ -468,7 +469,7 @@ Rules beyond the list (refused `edition2_payload_invalid`):
 ### Every mapped family
 
 - **Common members** (any family): `asserted_at`, `author`, `body`, `cohort_scope`, `community_id`, `confidence`, `delivery_mode`, `dimension`, `evidence_refs`, `expires_at`, `family_id`, `passed`, `reason`, `refs`, `salt`, `score`, `seat_commitment`, `subject_key_ids`, `total`, `valid_from`, `valid_until`, `weight`
-- **Hash-digest members** (any family; the earlier gates read each as 64 hex): `evidence_refs`, `carried`, `seat_commitment`, `amendment_digest`, `call_fingerprint`
+- **Hash-digest members** (any family; the earlier gates read each as 64 hex): `evidence_refs`, `carried`, `seat_commitment`, `amendment_digest`, `call_fingerprint`, `attached_head_digest`
 - every `refs.also` role is `ack` or `cites` (a closed registry, CC 2.6.1.3)
 - `body.note`, when present, is text of at most 2048 bytes
 - a composer (`withdraws`, `recants`, `supersedes`) carries its target's family but its own payload: the common members and `refs.target`, never the target family's list
