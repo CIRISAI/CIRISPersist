@@ -215,7 +215,7 @@ pub(crate) mod bodies {
         class: &str,
         valid_until: Option<chrono::DateTime<chrono::Utc>>,
     ) {
-        d.put_identity_occurrence_local(IdentityOccurrence {
+        d.test_seam_put_identity_occurrence(IdentityOccurrence {
             identity_key_id: identity.to_owned(),
             occurrence_key_id: occurrence_key.to_owned(),
             device_class: class.to_owned(),

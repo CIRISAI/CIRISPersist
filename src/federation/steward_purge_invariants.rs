@@ -1434,6 +1434,28 @@ pub(crate) mod bodies {
         assert_eq!(status.state, sp::PurgeState::Executed);
     }
 
+    /// v62.0.0 (WD-fix1 rev 3) — how many held edition-2 statements carry
+    /// row `id` (its row statement and voices).
+    async fn statements_of_row(d: &dyn FederationDirectory, id: &str) -> usize {
+        use crate::federation::edition2::names::RowId;
+        let (mut n, mut cursor) = (0, None);
+        loop {
+            let page = d
+                .edition2_statements_since(cursor.as_ref(), 500)
+                .await
+                .expect("the statement listing");
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map(|st| st.cursor);
+            n += page
+                .iter()
+                .filter(|st| RowId::of_statement(&st.bytes).map(|r| r.hex()).as_deref() == Some(id))
+                .count();
+        }
+        n
+    }
+
     // ── I655 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i655_finalize_after_settle_and_the_tombstone_outlives<D: Seams>(d: &D) {
         let r = root(d).await;
@@ -1471,10 +1493,29 @@ pub(crate) mod bodies {
                 .state,
             sp::PurgeState::Settled
         );
+        // v62.0.0 (WD-fix1 rev 3) — I4407 premise: the purged row's signed
+        // statement is held before the finalize.
+        let statements_before = statements_of_row(dir, &derived).await;
+        assert!(
+            statements_before > 0,
+            "I4407 premise: the row's statement is held"
+        );
         let fin = finalize_at(dir, &report.notice_id, later, None)
             .await
             .expect("finalizes");
         assert_eq!(fin.attestations_deleted, 3, "{fin:?}");
+        // **I4407** — a finalized purge (here a steward purge; every basis
+        // shares the line) deletes the row's statement bytes too: before
+        // WD-fix1 rev 3 they stayed held, only withheld from serve.
+        assert_eq!(
+            statements_of_row(dir, &derived).await,
+            0,
+            "I4407: no statement of the purged row is held"
+        );
+        assert!(
+            fin.statements_deleted >= statements_before as u64,
+            "I4407: the report counts them: {fin:?}"
+        );
         assert_eq!(fin.trace_events_deleted, 4, "{fin:?}");
         assert_eq!(fin.trace_llm_calls_deleted, 2, "{fin:?}");
         for m in &mocks {

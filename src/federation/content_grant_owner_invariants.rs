@@ -313,7 +313,7 @@ pub(crate) mod bodies {
         // owner's self content (#963), so it holds no wrap of its own.
         let kem_a =
             crate::federation::nested_manifest_invariants::bodies::kem_of(p.sa.as_ref()).await;
-        p.sa.put_identity_occurrence_local(IdentityOccurrence {
+        p.sa.test_seam_put_identity_occurrence(IdentityOccurrence {
             identity_key_id: p.owner.clone(),
             occurrence_key_id: p.key_a.clone(),
             device_class: device_class::SERVER.to_owned(),
@@ -344,15 +344,18 @@ pub(crate) mod bodies {
         );
         let sha = sealed.at_rest_sha256;
         let at = chrono::Utc::now();
-        p.sa.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-            identity_key_id: p.owner.clone(),
-            occurrence_key_id: p.key_b.clone(),
-            revoked_at: at,
-            effective_at: at,
-            reason: Some("lost device (I766)".into()),
-            witness_set: vec![],
-            persist_row_hash: String::new(),
-        })
+        p.sa.put_identity_occurrence_revocation_edition2(
+            IdentityOccurrenceRevocation {
+                identity_key_id: p.owner.clone(),
+                occurrence_key_id: p.key_b.clone(),
+                revoked_at: at,
+                effective_at: at,
+                reason: Some("lost device (I766)".into()),
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+            crate::federation::DoorToken::new(),
+        )
         .await
         .expect("I766: revoke the second device");
         let axis = KeyGrantAxis::Content {

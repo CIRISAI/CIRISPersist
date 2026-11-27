@@ -85,6 +85,8 @@ fn i3550_reason_tokens_and_read_keys_are_pinned() {
             "withdraws_not_admitted",
             "asserted_at_stale",
             "composer_family_mismatch",
+            // v62.0.0 (FS-class) — appended.
+            "withdraws_class_unread",
         ],
         "I3550: the core reason tokens are appended, never reordered"
     );

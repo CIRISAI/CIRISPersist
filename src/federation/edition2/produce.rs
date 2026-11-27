@@ -99,6 +99,9 @@ pub async fn signer_identity(signer: &LocalSigner) -> Result<(Digest32, String),
 /// `unexpected:refs`, `unexpected:also`, `malformed:<member>`,
 /// `set_order:<member>`.
 ///
+/// Replaced by a call to Verify's own refs reader once CIRISVerify exports
+/// it (asked for 23.5.1; private at 23.5.0, FS-step3).
+///
 /// # Errors
 /// The label of the first rule broken, in Verify's order.
 pub fn check_refs(v: &Value) -> Result<(), &'static str> {
