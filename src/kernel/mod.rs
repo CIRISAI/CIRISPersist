@@ -14,6 +14,7 @@
 //! | [`owner`] | a node's owner bindings as offers of the `owner` seat over its key | `seat::Seats::holders` |
 //! | [`trust`] | a user's acceptance edges | `derived::fold_default`, `trust::reaches` |
 //! | [`head`] | a group's held head and an offered version | `head::Entry`, `graph::Graph::frontier` |
+//! | [`content`] | one member's held rows in one room as Head / Content / End / Tips, the member's keys and the room's count, the held causal past | `content::answers`, `content::changed` |
 //! | [`key_end`] | an edition-2 key's records and its own revocations | `key_end::KeyEndRow`, `well_formed`, `conclude_rule`, `live`, `ended` |
 //!
 //! Every answer carries the rows it rests on, the dependency keys it read
@@ -22,6 +23,9 @@
 //! is carried; `valid_until` and the digest are not yet.
 
 pub mod consensus;
+pub mod content;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod content_invariants;
 pub mod head;
 pub mod key_end;
 pub mod law;

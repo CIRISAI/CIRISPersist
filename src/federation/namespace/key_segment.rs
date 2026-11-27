@@ -51,6 +51,16 @@ pub fn is_key_segment(s: &str) -> bool {
 /// identity-ref.
 #[must_use]
 pub fn segment_of(identity_ref: &str) -> Option<String> {
+    // v62.0.0 (GID-prod; CIRISConstitution "THE DERIVED GROUP ID") — a
+    // group-ref in a key-bearing position (`moderation_track_record:
+    // {community_key_id}`) carries "the 43 characters after the prefix", as a
+    // key carries its 43: the same segment shape the registry pins.
+    if let Some(seg) = identity_ref
+        .strip_prefix(crate::federation::edition2::group_id::GROUP_REF_PREFIX)
+        .filter(|s| is_key_segment(s))
+    {
+        return Some(seg.to_owned());
+    }
     if !ciris_verify_core::edition2::is_identity_ref(identity_ref) {
         return None;
     }
