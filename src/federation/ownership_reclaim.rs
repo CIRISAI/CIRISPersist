@@ -901,7 +901,12 @@ pub fn draft_reclaim_withdraws(
             "edition2_payload_invalid: {target_owner_binding_id:?} is not an edition-2 row id"
         ))
     })?;
-    super::edition2::emit::draft_from_envelope(
+    // v62.0.0 (HEAD-3; CC 2.4.1.1, "Where one row between two keys is the
+    // whole record, as an owner-binding is, that row is the head") — the end
+    // names the binding it ends as the head it acts from. It is one
+    // signer's (authored) end: its count is the cited WA finding, so it
+    // carries no `lifts` (`lifts_on_own_end`).
+    super::edition2::emit::draft_from_envelope_naming_head(
         kid,
         iss,
         node,
@@ -909,6 +914,7 @@ pub fn draft_reclaim_withdraws(
         &build_reclaim_withdraws_envelope(target_owner_binding_id, wa_adjudication_ref),
         asserted_at_ms,
         Some((&target, target_family)),
+        &super::edition2::names::RowId(target),
     )
 }
 

@@ -33,7 +33,7 @@ pub(crate) mod bodies {
     use crate::federation::types::attestation_type;
     use crate::federation::{Attestation, FederationDirectory};
 
-    const DIM: &str = "evidence:safety_battery:capture:a:c:v1";
+    const DIM: &str = "coherence_standing:cac:v1";
 
     fn scores(by: &str, dimension: &str) -> Attestation {
         let id = uuid::Uuid::new_v4().to_string();
@@ -96,7 +96,7 @@ pub(crate) mod bodies {
         .await;
 
         // A target not held: the composer waits, the gate is never skipped.
-        let ghost = scores(&by, "evidence:safety_battery:capture:a2:c:v1");
+        let ghost = scores(&by, "coherence_standing:ca2c:v1");
         let w2 = e2::composer_of(attestation_type::WITHDRAWS, &ghost, &seed);
         let e = composer_gate_dimension(d, &w2)
             .await
@@ -122,7 +122,7 @@ pub(crate) mod bodies {
         )
         .await;
         let by = e2::kid(&seed);
-        let target = scores(&by, "evidence:safety_battery:capture:a3:c:v1");
+        let target = scores(&by, "coherence_standing:ca3c:v1");
         let w = e2::composer_of(attestation_type::WITHDRAWS, &target, &seed);
         let w_id = RowId::of_statement(&e2::carried_statement(&w).expect("a statement"))
             .expect("a row id");

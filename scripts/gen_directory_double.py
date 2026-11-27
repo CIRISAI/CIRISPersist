@@ -63,6 +63,11 @@ from pathlib import Path
 # operation: backends override it, it composes no other trait method through
 # `self`, and a consumer wrapping a backend in this double must reach the
 # override rather than the default.
+# v62.0.0 (WD-fix11) — trait methods gated `#[cfg(test)]` on the trait (the
+# retired trusted-local occurrence write's storage, a test seam): their
+# delegation is gated too, so a `test-anchor` build has neither.
+TEST_ONLY = ("test_seam_put_identity_occurrence",)
+
 DELEGATED_DEFAULTS = (
     # The wire-hash family's one non-`Unsupported` member (its default is a
     # generic `Backend` "not implemented"); the rest of the family is found.
@@ -511,6 +516,10 @@ def render(methods) -> str:
     A("#[async_trait::async_trait]")
     A("impl FederationDirectory for FaultInjectingDirectory {")
     for name, args_src, ret in methods:
+        # v62.0.0 (WD-fix11) — a trait method compiled for persist's own
+        # tests only carries the same gate on its delegation.
+        if name in TEST_ONLY:
+            A("    #[cfg(test)]")
         args = split_args(args_src)
         # drop the receiver
         params = [a for a in args if a.strip() not in ("&self", "self", "&mut self")]

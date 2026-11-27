@@ -1617,6 +1617,9 @@ CREATE TABLE "federation_community_membership_revocations" (
     scrub_signature_pqc      TEXT,
     admitted_at              TEXT NOT NULL, cosignatures TEXT NOT NULL DEFAULT '[]', attestation_id TEXT
         REFERENCES federation_attestations(attestation_id) ON DELETE SET NULL,
+    record_row_id BLOB
+        CHECK (record_row_id IS NULL OR (typeof(record_row_id) = 'blob' AND length(record_row_id) = 32)),
+    leaf                     TEXT NOT NULL DEFAULT 'removal' CHECK (leaf IN ('removal', 'resignation')),
     PRIMARY KEY (community_key_id, removed_identity_key_id, effective_at)
 );
 CREATE TABLE federation_community_membership_widenings (
@@ -1631,6 +1634,8 @@ CREATE TABLE federation_community_membership_widenings (
     scrub_signature_pqc       TEXT,
     admitted_at               TEXT NOT NULL, cosignatures TEXT NOT NULL DEFAULT '[]', attestation_id TEXT
         REFERENCES federation_attestations(attestation_id) ON DELETE SET NULL,
+    record_row_id BLOB
+        CHECK (record_row_id IS NULL OR (typeof(record_row_id) = 'blob' AND length(record_row_id) = 32)),
     PRIMARY KEY (community_key_id, member_key_id, effective_at)
 );
 CREATE TABLE "consent_peer_set" (
@@ -1656,6 +1661,9 @@ CREATE TABLE "federation_family_membership_revocations" (
     admitted_at              TEXT NOT NULL,
     cosignatures             TEXT NOT NULL DEFAULT '[]', attestation_id TEXT
         REFERENCES federation_attestations(attestation_id) ON DELETE SET NULL,
+    record_row_id BLOB
+        CHECK (record_row_id IS NULL OR (typeof(record_row_id) = 'blob' AND length(record_row_id) = 32)),
+    leaf                     TEXT NOT NULL DEFAULT 'removal' CHECK (leaf IN ('removal', 'resignation')),
     PRIMARY KEY (family_key_id, removed_identity_key_id, effective_at)
 );
 CREATE TABLE federation_family_membership_widenings (
@@ -1671,6 +1679,8 @@ CREATE TABLE federation_family_membership_widenings (
     admitted_at               TEXT NOT NULL,
     cosignatures              TEXT NOT NULL DEFAULT '[]', attestation_id TEXT
         REFERENCES federation_attestations(attestation_id) ON DELETE SET NULL,
+    record_row_id BLOB
+        CHECK (record_row_id IS NULL OR (typeof(record_row_id) = 'blob' AND length(record_row_id) = 32)),
     PRIMARY KEY (family_key_id, member_key_id, effective_at)
 );
 CREATE TABLE federation_withdraws_admission_depths (
@@ -2881,6 +2891,13 @@ CREATE INDEX ceg_roster_proposals_open
 ALTER TABLE federation_attestations ADD COLUMN restatement_key TEXT;
 CREATE INDEX federation_attestations_restatement ON federation_attestations (attesting_key_id, restatement_key) WHERE restatement_key IS NOT NULL;
 
+-- v62.0.0 (WD-fix1; CC 2.4.1.1, CC 6.1.5 N5): the held withdrawals in this
+-- node's admission order, the withdrawn-content sweep's read
+-- (list_withdrawals_since): bounded by the withdrawals held, not the store.
+-- An edition-2 object on an edition-1 table
+-- (store::edition_baseline::ATTESTATIONS_WITHDRAWALS_INDEX).
+CREATE INDEX federation_attestations_withdrawals ON federation_attestations (admitted_at, attestation_id) WHERE attestation_type IN ('withdraws', 'recants');
+
 -- v62.0.0 (RL-fix1, lead ruling (B); CC 5.4 "carries none it cannot verify"):
 -- the accord rows a node holding no accord root skipped, as feed WATERMARKS
 -- only (no row bytes): per (plane, peer) the first position skipped, so the
@@ -2904,3 +2921,67 @@ CREATE TABLE ceg_dial_hints (
     body            TEXT    NOT NULL,
     recorded_at_ms  INTEGER NOT NULL CHECK (typeof(recorded_at_ms) = 'integer')
 );
+
+-- v62.0.0 (PRE4-V300-a; CONTENT-V300.rev3; CC rc22 3.1.3.2 "A room's content
+-- after a member's seat ends"): the room-content series index, the RETAINED
+-- ends / keeps rows and their tip lists (insert-only; they survive a purge, the
+-- bytes-plane tombstone and a checkpoint), and the cache of
+-- ciris_kernel::content answers (store::edition_baseline::EDITION_TWO_ADDITIONS).
+CREATE TABLE ceg_room_content (
+    row_id        BLOB    NOT NULL PRIMARY KEY
+        CHECK (typeof(row_id) = 'blob' AND length(row_id) = 32),
+    room_scope    TEXT    NOT NULL,
+    room_target   TEXT    NOT NULL,
+    author        TEXT    NOT NULL,      -- the member (identity-ref) the row is authored as
+    kid           BLOB    NOT NULL CHECK (typeof(kid) = 'blob' AND length(kid) = 32),
+    head_row_id   BLOB    CHECK (head_row_id IS NULL
+        OR (typeof(head_row_id) = 'blob' AND length(head_row_id) = 32)),
+    admitted_us   INTEGER NOT NULL CHECK (typeof(admitted_us) = 'integer')
+);
+CREATE INDEX ceg_room_content_series
+    ON ceg_room_content (room_scope, room_target, author, admitted_us, row_id);
+
+CREATE TABLE ceg_content_ends (
+    source_row_id  BLOB    NOT NULL PRIMARY KEY
+        CHECK (typeof(source_row_id) = 'blob' AND length(source_row_id) = 32),
+    room_scope     TEXT    NOT NULL,
+    room_target    TEXT    NOT NULL,
+    member         TEXT    NOT NULL,     -- whose seat it ends / keeps
+    source_kind    TEXT    NOT NULL CHECK (source_kind IN ('removal', 'resignation', 'keeps')),
+    counted        INTEGER NOT NULL CHECK (counted IN (0, 1)),
+    head_row_id    BLOB    NOT NULL
+        CHECK (typeof(head_row_id) = 'blob' AND length(head_row_id) = 32),
+    extends_row_id BLOB    CHECK (extends_row_id IS NULL
+        OR (typeof(extends_row_id) = 'blob' AND length(extends_row_id) = 32)),
+    CHECK ((source_kind = 'keeps') = (extends_row_id IS NOT NULL))
+);
+CREATE INDEX ceg_content_ends_member
+    ON ceg_content_ends (room_scope, room_target, member, source_row_id);
+
+CREATE TABLE ceg_content_end_tips (
+    source_row_id BLOB    NOT NULL
+        CHECK (typeof(source_row_id) = 'blob' AND length(source_row_id) = 32),
+    tip_row_id    BLOB    NOT NULL
+        CHECK (typeof(tip_row_id) = 'blob' AND length(tip_row_id) = 32),
+    PRIMARY KEY (source_row_id, tip_row_id)
+);
+-- a tip landing later finds the sources that name it (re-fold)
+CREATE INDEX ceg_content_end_tips_tip ON ceg_content_end_tips (tip_row_id, source_row_id);
+
+CREATE TABLE ceg_content_answers (
+    row_id        BLOB    NOT NULL PRIMARY KEY
+        CHECK (typeof(row_id) = 'blob' AND length(row_id) = 32),
+    room_scope    TEXT    NOT NULL,
+    room_target   TEXT    NOT NULL,
+    member        TEXT    NOT NULL,
+    counted       INTEGER NOT NULL CHECK (counted IN (0, 1)),
+    in_force      INTEGER NOT NULL CHECK (in_force IN (0, 1)),
+    rule          TEXT    NOT NULL,      -- content::Rule::as_str, or 'undecided'
+    undecided_on  BLOB    CHECK (undecided_on IS NULL
+        OR (typeof(undecided_on) = 'blob' AND length(undecided_on) = 32)),
+    CHECK ((undecided_on IS NULL) = (rule <> 'undecided'))
+);
+CREATE INDEX ceg_content_answers_member
+    ON ceg_content_answers (room_scope, room_target, member, row_id);
+CREATE INDEX ceg_content_answers_undecided
+    ON ceg_content_answers (undecided_on) WHERE undecided_on IS NOT NULL;

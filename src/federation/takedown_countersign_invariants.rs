@@ -168,7 +168,8 @@ pub(crate) mod bodies {
             id_of(&plain),
         );
         let at = Utc::now() - Duration::hours(3);
-        found_room_with_blob(
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let solo = found_room_with_blob(
             d,
             &solo,
             "founder_only",
@@ -179,7 +180,8 @@ pub(crate) mod bodies {
         .await
         .expect("I4140: a sole practitioner's affiliation");
         seat(d, &solo, &f, &m, at).await;
-        found_room_with_blob(
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let pair = found_room_with_blob(
             d,
             &pair,
             "founder_only",
@@ -190,7 +192,8 @@ pub(crate) mod bodies {
         .await
         .expect("I4143: a two-seat affiliation");
         seat(d, &pair, &f, &m, at + Duration::minutes(1)).await;
-        found_room_with_blob(d, &plain, "majority", &[&f], &[], None)
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let plain = found_room_with_blob(d, &plain, "majority", &[&f], &[], None)
             .await
             .expect("I4144: a plain community");
         let acts = at + Duration::minutes(30);

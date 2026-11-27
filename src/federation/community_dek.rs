@@ -552,7 +552,90 @@ pub mod orchestrate {
     {
         let (members, latest_removed_at) =
             resolve_community_members(backend, community_key_id).await?;
+        ensure_epoch_dek_over(
+            backend,
+            community_key_id,
+            minter_key_id,
+            epoch,
+            members,
+            latest_removed_at,
+        )
+        .await
+    }
 
+    /// v62.0.0 (KR-fix31) — **does the write's author hold a wrap target in
+    /// this fan-out?** (CC 5.2, "a write its own author cannot open is
+    /// refused".) True iff a GRANTED target of `members` (usable content-KEM
+    /// keys, [`partition_roster`]) is the author itself, one of the author's
+    /// own occurrences, or a node the author owns by a live two-voice owner
+    /// binding — [`devices_of`](crate::federation::replication_audience::devices_of),
+    /// the one enumeration of "the author's devices" (CC 3.2). Read over the
+    /// roster the sealer holds when it seals; nothing is written.
+    pub(crate) async fn author_has_wrap_target<B>(
+        backend: &B,
+        author_key_id: &str,
+        members: &[MemberOccurrences],
+    ) -> Result<bool, BlobError>
+    where
+        B: FederationDirectory + Sync + ?Sized,
+    {
+        let (_, report) = partition_roster(members.to_vec());
+        author_granted_in(backend, author_key_id, &report).await
+    }
+
+    /// v62.0.0 (KR-fix31c; CC 5.2) — [`author_has_wrap_target`] over a fan-out
+    /// already partitioned ([`partition_roster`]): the one test every seal
+    /// path asks (the community whole blob, the self / family cascade, a
+    /// chunk, a stream's segments and its manifest). A GRANTED target of
+    /// `report` is the author itself, the author's own member entry, or one
+    /// of [`devices_of`](crate::federation::replication_audience::devices_of)
+    /// the author (its occurrences and the nodes and agents it owns).
+    pub(crate) async fn author_granted_in<B>(
+        backend: &B,
+        author_key_id: &str,
+        report: &GrantReport,
+    ) -> Result<bool, BlobError>
+    where
+        B: FederationDirectory + Sync + ?Sized,
+    {
+        let granted: std::collections::HashSet<&str> =
+            report.granted.iter().map(String::as_str).collect();
+        if granted.is_empty() {
+            return Ok(false);
+        }
+        if granted.contains(author_key_id)
+            || report
+                .roster
+                .granted
+                .iter()
+                .any(|m| m.member_key_id == author_key_id)
+        {
+            return Ok(true);
+        }
+        Ok(
+            crate::federation::replication_audience::devices_of(backend, author_key_id)
+                .await
+                .map_err(map_dir_err)?
+                .iter()
+                .any(|d| granted.contains(d.occurrence_key_id.as_str())),
+        )
+    }
+
+    /// [`ensure_epoch_dek`] over a roster the caller already resolved
+    /// ([`resolve_community_members`]): the seal path resolves it once, asks
+    /// [`author_has_wrap_target`] over it, and only then lets anything be
+    /// written (KR-fix31 — a refused write leaves no epoch state behind).
+    async fn ensure_epoch_dek_over<B>(
+        backend: &B,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+        members: Vec<MemberOccurrences>,
+        latest_removed_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<EnsuredEpoch, BlobError>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
         // §15 — a removal admitted after this epoch was minted rotates it.
         let mut epoch = epoch;
         if let (Some(removed_at), Some(minted_at)) = (
@@ -1075,7 +1158,32 @@ pub mod orchestrate {
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
-        let ensured = ensure_epoch_dek(backend, community_key_id, minter_key_id, epoch).await?;
+        // v62.0.0 (KR-fix31; CC 5.2) — a write its own author cannot open is
+        // refused, BEFORE anything is written: the roster is resolved once,
+        // the author's wrap target is asked over it, and only then may the
+        // epoch be rotated, minted, granted, sealed or stored. The author is
+        // the minter (§11, `resolve_minter`). The sealer's own check; no
+        // receiving door repeats it. Another member with no target is still
+        // excluded with its recorded reason, as before.
+        let (members, latest_removed_at) =
+            resolve_community_members(backend, community_key_id).await?;
+        if !author_has_wrap_target(backend, minter_key_id, &members).await? {
+            return Err(
+                crate::federation::blobs::write_author_has_no_wrap_target_refusal(
+                    community_key_id,
+                    minter_key_id,
+                ),
+            );
+        }
+        let ensured = ensure_epoch_dek_over(
+            backend,
+            community_key_id,
+            minter_key_id,
+            epoch,
+            members,
+            latest_removed_at,
+        )
+        .await?;
         let epoch = ensured.epoch;
 
         // Seal the body under the shared epoch DEK into the self-describing
@@ -1998,8 +2106,9 @@ pub mod lifecycle_support {
         }
         let (_xp, x_pub, _mp, ml_pub) =
             crate::federation::identity_aggregate::mint_content_kem_keypair().expect("mint kem");
-        backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+        crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+            backend,
+            crate::federation::types::IdentityOccurrence {
                 identity_key_id: id_of(identity_key_id),
                 occurrence_key_id: id_of(occurrence_key_id),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -2012,9 +2121,10 @@ pub mod lifecycle_support {
                 }),
                 transport_binding: None,
                 persist_row_hash: String::new(),
-            })
-            .await
-            .unwrap_or_else(|e| panic!("seed occurrence {occurrence_key_id}: {e}"));
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed occurrence {occurrence_key_id}: {e}"));
     }
 
     /// Create a community whose own key is the signing authority, with the
@@ -2033,13 +2143,50 @@ pub mod lifecycle_support {
         .await
     }
 
+    /// v62.0.0 (KR-fix31b; CC 5.2 "a write its own author cannot open is
+    /// refused", CC 3.2) — **a sealing node seated as `owner_seed`'s owned,
+    /// keyed device**, the shape a production author has: a NODE key
+    /// (`two_node::node_as`) that `owner_seed` (a USER member's seed, as it
+    /// was registered) owns by a two-voice owner binding, with its own self
+    /// pair stating this store's content-KEM keys (`two_node::place_device`,
+    /// the one helper). Returns the node's signer and key (the minter: its
+    /// `federation_id`). Call after the member is seeded.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn seat_minter<B>(
+        backend: &B,
+        owner_seed: &str,
+        node_alias: &str,
+    ) -> (std::sync::Arc<crate::signing::LocalSigner>, String)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::key_grant_invariants::two_node::{node_as, place_device};
+        let n = node_as(
+            backend,
+            node_alias,
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
+        place_device(
+            backend,
+            owner_seed,
+            &n.key,
+            &n.key,
+            crate::federation::types::device_class::LAPTOP,
+            Some(n.kem.clone()),
+        )
+        .await;
+        (n.signer.clone(), n.key.clone())
+    }
+
     /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3) — [`seed_community`] with THIS
     /// NODE seated as a member's device, and the node's signer. A holding
     /// claim about room content is placed at the room's scope and only a
     /// device in the room may make one, as in production, where the sealing
-    /// node is a member's. `node_alias` (normalized, ≥ 32 bytes) shares its
-    /// first 32 bytes with its derived id, so the key the roster names and
-    /// the key the signer signs with are one keypair.
+    /// node is a member's (KR-fix31b: an owned, keyed device of the member
+    /// `{node_alias}-owner`; the signer states, mints and announces under its
+    /// `federation_id`, the key that holds the grant).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn seed_community_with_node<B>(
         backend: &B,
         community_key_id: &str,
@@ -2049,27 +2196,26 @@ pub mod lifecycle_support {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
-        use crate::federation::tier_ingest::test_support as ts;
+        // v62.0.0 (KR-fix31b; CC 5.2, CC 3.2) — the node is its OWNER's owned,
+        // keyed device ([`seat_minter`]: a NODE key, a two-voice owner
+        // binding, its own self pair with this store's content-KEM keys), and
+        // the owner is a roster member with no device of its own. Before, the
+        // node's DERIVED id was seeded as a person occurrence of the owner
+        // (the unsigned occurrence seam), while the node mints and announces
+        // under its `federation_id`: the author held no wrap target, which
+        // CC 5.2 now refuses.
         let alias = node_alias.replace('_', "-").to_lowercase();
-        let signer = ts::local_signer(&alias);
-        let derived = signer.derived_key_id();
-        assert_eq!(
-            &derived.as_bytes()[..32],
-            &alias.as_bytes()[..32],
-            "a seed-sharing node alias (normalized, at least 32 bytes)"
-        );
-        ts::register_hybrid_key_as(
+        let owner = format!("{alias}-owner");
+        seed_community_full(
             backend,
-            &alias,
-            &alias,
+            community_key_id,
+            members,
+            &[owner.as_str()],
             crate::federation::types::identity_type::USER,
+            None,
         )
         .await;
-        let owner = format!("{alias}-owner");
-        let mut all: Vec<(&str, &str)> = members.to_vec();
-        all.push((&owner, &derived));
-        seed_community(backend, community_key_id, &all).await;
-        signer
+        seat_minter(backend, &owner, &alias).await.0
     }
 
     /// As [`seed_community`], with control over the community key's
@@ -2079,6 +2225,30 @@ pub mod lifecycle_support {
         backend: &B,
         community_key_id: &str,
         members: &[(&str, &str)],
+        community_identity_type: &str,
+        policy_blob: Option<serde_json::Value>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        seed_community_full(
+            backend,
+            community_key_id,
+            members,
+            &[],
+            community_identity_type,
+            policy_blob,
+        )
+        .await;
+    }
+
+    /// v62.0.0 (KR-fix31b) — [`seed_community_with`] plus `bare_members`:
+    /// roster members registered as USER keys with NO occurrence (an owner
+    /// whose only device is a node it owns, [`seat_minter`]).
+    async fn seed_community_full<B>(
+        backend: &B,
+        community_key_id: &str,
+        members: &[(&str, &str)],
+        bare_members: &[&str],
         community_identity_type: &str,
         policy_blob: Option<serde_json::Value>,
     ) where
@@ -2102,10 +2272,21 @@ pub mod lifecycle_support {
         for (ident, occ) in members {
             seed_member(backend, ident, occ).await;
         }
+        for ident in bare_members {
+            ts::register_hybrid_key_as(
+                backend,
+                ident,
+                ident,
+                crate::federation::types::identity_type::USER,
+            )
+            .await;
+        }
         let roster = members
             .iter()
-            .map(|(ident, _)| crate::federation::types::CommunityMember {
-                key_id: (*ident).to_owned(),
+            .map(|(ident, _)| *ident)
+            .chain(bare_members.iter().copied())
+            .map(|ident| crate::federation::types::CommunityMember {
+                key_id: ident.to_owned(),
                 joined_at: crate::host::clock::now(),
                 role: None,
             })
@@ -2182,8 +2363,9 @@ pub mod lifecycle_support {
             } else {
                 None
             };
-            backend
-                .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            crate::federation::edition2::fixture_occurrence::put_occurrence_signed(
+                backend,
+                crate::federation::types::IdentityOccurrence {
                     identity_key_id: id_of(identity_key_id),
                     occurrence_key_id: id_of(occurrence_key_id),
                     device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -2193,9 +2375,10 @@ pub mod lifecycle_support {
                     encryption_pubkeys,
                     transport_binding: None,
                     persist_row_hash: String::new(),
-                })
-                .await
-                .unwrap_or_else(|e| panic!("seed occurrence {occurrence_key_id}: {e}"));
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("seed occurrence {occurrence_key_id}: {e}"));
         }
     }
 
@@ -2528,6 +2711,7 @@ pub mod lifecycle_harness {
 
     /// Drive the full cycle against one backend. `tag` namespaces the keys so
     /// two backends can share a database without colliding.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_cohort_lifecycle_43<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
@@ -2542,17 +2726,6 @@ pub mod lifecycle_harness {
         let alice_occ = format!("{tag}-alice-occ-{run}");
         let bob = format!("{tag}-bob-{run}");
         let bob_occ = format!("{tag}-bob-occ-{run}");
-        // #848 (§11) — THIS node is the minter: the sweeper's derived key.
-        // The sweep runs over the signer's own counter, so the cascades
-        // below mint under the same key the sweep will find.
-        let sweeper = crate::federation::at_rest_cascade::blob_invariants::node_signer(
-            backend,
-            &format!("{tag}-sweeper-{run}"),
-        )
-        .await;
-        let sweeper_id = sweeper.derived_key_id();
-        let minter = sweeper_id.clone();
-
         // ── 1. CREATE ────────────────────────────────────────────────────
         super::lifecycle_support::seed_community(
             backend,
@@ -2560,6 +2733,17 @@ pub mod lifecycle_harness {
             &[(&alice, &alice_occ), (&bob, &bob_occ)],
         )
         .await;
+        // #848 (§11) — THIS node is the minter. The sweep runs over the
+        // signer's own counter (`federation_id`), so the cascades below mint
+        // under the same key the sweep will find. v62.0.0 (KR-fix31b; CC 5.2)
+        // — the sweeper is alice's owned, keyed device: the writes' author
+        // holds a wrap target, and it is a device in the room for the holding
+        // claim below (before: a USER key named by its derived id, with the
+        // derived id joined to alice as a person occurrence, the seam).
+        let (sweeper, sweeper_id) =
+            super::lifecycle_support::seat_minter(backend, &alice, &format!("{tag}-sweeper-{run}"))
+                .await;
+        let minter = sweeper_id.clone();
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by
         // (identity-refs under the switch, the seeds when held).
         use super::lifecycle_support::id_of;
@@ -2767,14 +2951,8 @@ pub mod lifecycle_harness {
         // Announce epoch 0's sealed bytes as this sweeper node, so there is
         // an announcement to retract. v55.0.0 (CIRISPersist#989, CC 3.1.3.3)
         // — a room's holding claim is placed at the room's scope and made by
-        // a device in the room: seat the sweeper as Alice's device first
-        // (after the fan-outs above, so no grant count moves).
-        crate::federation::at_rest_cascade::blob_invariants::join_as_occurrence(
-            backend,
-            &alice,
-            &sweeper_id,
-        )
-        .await;
+        // a device in the room: the sweeper is alice's owned device (seated
+        // at step 1, KR-fix31b).
         let crate::federation::BlobBody::Inline(sealed0) = backend
             .get_blob(&before.at_rest_sha256)
             .await
@@ -2792,7 +2970,7 @@ pub mod lifecycle_harness {
                 &before.at_rest_sha256,
                 crate::federation::BlobBody::Inline(sealed0),
                 None,
-                &sweeper.derived_key_id(),
+                &sweeper_id,
                 &sweeper,
                 crate::host::clock::now(),
                 uuid::Uuid::new_v4(),

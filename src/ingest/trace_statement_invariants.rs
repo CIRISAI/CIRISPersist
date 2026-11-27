@@ -468,7 +468,7 @@ where
         &kid_a,
         &kid_a,
         "scores",
-        "evidence:.suite:.kind:.cell:.prefix",
+        "coherence_standing:.cohort",
         &Value::Map(vec![(
             Value::Text("asserted_at".into()),
             Value::Uint(u64::try_from(recently().timestamp_millis()).unwrap()),
@@ -1112,7 +1112,7 @@ fn i3482_the_crossing_gate() {
         refuse_unsigned_trace_crossing(&with_statement).is_ok(),
         "I3482: a row carrying its statement is not this gate's"
     );
-    let other = row(serde_json::json!({ "dimension": "evidence:safety_battery:capture:a:b:v1" }));
+    let other = row(serde_json::json!({ "dimension": "coherence_standing:cab:v1" }));
     assert!(
         refuse_unsigned_trace_crossing(&other).is_ok(),
         "I3482: other rows pass"
