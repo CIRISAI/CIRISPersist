@@ -921,6 +921,326 @@ pub(crate) async fn countersign_body(d: &dyn FederationDirectory) {
     );
 }
 
+/// I6121 (HEAD-6; CC 2.4.1.1, `end_names_old_head`) — **an end that acts
+/// from an old head concludes nothing**, at the statement door: a family's
+/// version 2 extends version 1; a member's act at the family names version
+/// 2; the member's own withdrawal of it naming version 1 is refused
+/// `end_names_old_head` (the act it ends, in its own past, names the newer
+/// head), and the same withdrawal naming version 2 is not.
+pub(crate) async fn end_old_head_body(d: &dyn FederationDirectory) {
+    use super::door_invariants::fixture::map;
+    let (a, b, c, g) = (key(171), key(172), key(173), key(174));
+    register(d, &[&a, &b, &c]).await;
+    let gid = iref(&g);
+    let members = [(&a, None), (&b, None), (&c, None)];
+    let v1 = family(&g, "end one", "majority", &members);
+    let mut v1_id = None;
+    for k in [&a, &b, &c] {
+        let o = put(d, &roster(&v1, 1, None, 2_000, k)).await.unwrap();
+        v1_id = v1_id.or(landed(&o));
+    }
+    let v1_id = v1_id.expect("I6121 version 1 lands");
+    let v2 = family(&g, "end two", "majority", &members);
+    let mut v2_id = None;
+    for k in [&a, &b] {
+        let o = put(d, &roster(&v2, 2, Some(&v1_id), 3_000, k))
+            .await
+            .unwrap();
+        v2_id = v2_id.or(landed(&o));
+    }
+    let v2_id = v2_id.expect("I6121 version 2 lands");
+    let head_ref = |h: &RowId| ciris_verify_core::edition2::row_ref(&h.0);
+    let act = sign(
+        &a,
+        &iref(&a),
+        "chat:*",
+        &map(vec![
+            ("asserted_at", Value::Uint(5_000)),
+            ("author", Value::Text(iref(&a))),
+            ("dimension", Value::Text("chat:message:v1".into())),
+            ("cohort_scope", Value::Text("family".into())),
+            ("family_id", Value::Text(gid.clone())),
+            ("refs", map(vec![("head", head_ref(&v2_id))])),
+        ]),
+    );
+    let act_id = RowId::of_statement(&act).expect("I6121 a row");
+    put(d, &act)
+        .await
+        .unwrap_or_else(|e| panic!("I6121 the act at version 2 lands: {e:?}"));
+    let end = |head: &RowId| {
+        ciris_verify_core::edition2::sign_row_statement(
+            &a,
+            &iref(&a),
+            &iref(&a),
+            "withdraws",
+            &ciris_verify_core::namespace_match::family_id("chat:*"),
+            &map(vec![
+                ("asserted_at", Value::Uint(6_000)),
+                ("author", Value::Text(iref(&a))),
+                (
+                    "refs",
+                    map(vec![
+                        ("head", head_ref(head)),
+                        ("target", head_ref(&act_id)),
+                    ]),
+                ),
+            ]),
+            vec![],
+        )
+        .unwrap()
+    };
+    let e = put(d, &end(&v1_id))
+        .await
+        .expect_err("I6121 an end naming the old head");
+    assert_eq!(
+        reason(&e),
+        malformed_row::END_NAMES_OLD_HEAD,
+        "I6121 refused end_names_old_head: {e:?}"
+    );
+    if let Err(e) = put(d, &end(&v2_id)).await {
+        assert_ne!(
+            reason(&e),
+            malformed_row::END_NAMES_OLD_HEAD,
+            "I6121 an end naming the newest head is not refused by the rule: {e:?}"
+        );
+    }
+}
+
+/// v62.0.0 (HEAD-R2.rev2; GID-prod, CIRISConstitution "THE DERIVED GROUP
+/// ID") — **a family's FIRST version through the founding helper**
+/// ([`super::group::founding_payload`]): `rec`'s id becomes the id its own
+/// members, `founded_at` and the fixed `nonce` byte derive, and the payload
+/// carries that nonce. The record keeps its own `founded_at`, so a witness's
+/// instants (founding, versions, removal, act) keep their order. The
+/// derived id and one voice per signer.
+fn founding_roster(
+    rec: &mut GroupRecord,
+    nonce: u8,
+    at_ms: u64,
+    signers: &[&K],
+) -> (String, Vec<Vec<u8>>) {
+    let (gid, p) = super::group::founding_payload(rec, &[nonce; 32], at_ms).unwrap();
+    let voices = signers
+        .iter()
+        .map(|k| sign(k, &gid, GROUP_ROSTER_PREFIX, &p))
+        .collect();
+    (gid, voices)
+}
+
+/// v62.0.0 (HEAD-R2.rev2) — a later version's record: `rec` (founded, its
+/// id the derived one) under a new family name.
+fn renamed(rec: &GroupRecord, name: &str) -> GroupRecord {
+    let mut r = rec.clone();
+    if let GroupRecord::Family(f) = &mut r {
+        f.family_name = name.into();
+    }
+    r
+}
+
+/// I6127 (R2; CC 2.4.1.1) — **the reader places two held heads**, through
+/// the store: a family's version 2 extends version 1, so an act at v2
+/// against an end at v1 names a LATER head (E3), the reverse an older one,
+/// the same head `Same`; a head this node does not hold is a HOLD
+/// (`link_unheld` marked, the `standing_end_head_unheld` error), never a
+/// refusal.
+pub(crate) async fn placing_body(d: &dyn FederationDirectory) {
+    use super::standing_end::{place, Lineage, Placing, Walked};
+    let (a, b, c, g) = (key(181), key(182), key(183), key(184));
+    register(d, &[&a, &b, &c]).await;
+    let members = [(&a, None), (&b, None), (&c, None)];
+    let mut v1 = family(&g, "place one", "majority", &members);
+    let (_, voices) = founding_roster(&mut v1, 0x27, 2_000, &[&a, &b, &c]);
+    let mut v1_id = None;
+    for st in &voices {
+        let o = put(d, st).await.unwrap();
+        v1_id = v1_id.or(landed(&o));
+    }
+    let v1_id = v1_id.expect("I6127 version 1 lands");
+    let v2 = renamed(&v1, "place two");
+    let mut v2_id = None;
+    for k in [&a, &b] {
+        let o = put(d, &roster(&v2, 2, Some(&v1_id), 3_000, k))
+            .await
+            .unwrap();
+        v2_id = v2_id.or(landed(&o));
+    }
+    let v2_id = v2_id.expect("I6127 version 2 lands");
+    let mut w = Walked::default();
+    assert_eq!(
+        place(d, Lineage::Roster, &v2_id, &v1_id, &mut w)
+            .await
+            .unwrap(),
+        Placing::ActLater,
+        "I6127: an act at v2 names a later head than an end at v1"
+    );
+    assert_eq!(
+        place(d, Lineage::Roster, &v1_id, &v2_id, &mut Walked::default())
+            .await
+            .unwrap(),
+        Placing::ActOlder,
+        "I6127: an act at v1 names an older head than an end at v2"
+    );
+    assert_eq!(
+        place(d, Lineage::Roster, &v2_id, &v2_id, &mut Walked::default())
+            .await
+            .unwrap(),
+        Placing::Same
+    );
+    let unheld = RowId([0x6a; 32]);
+    let e = place(d, Lineage::Roster, &unheld, &v1_id, &mut Walked::default())
+        .await
+        .expect_err("I6127: an unheld head");
+    assert!(
+        e.to_string().contains("standing_end_head_unheld"),
+        "I6127: an unheld head is a hold, named: {e}"
+    );
+}
+
+/// I6128 (HEAD-R2b; the lead's pin, CC 2.4.1.1's limit) — **today's door
+/// does not admit a removed member's act that names the last head at which
+/// they sat**: a family (a, b, c) at version 1; c's removal, counted over
+/// version 1, is held; then c signs a family-placed act naming version 1:
+///
+/// - dated AFTER the removal: the write-scope gate finds c no member at the
+///   act's instant and HOLDS it (`write_scope_refused`, the targeted
+///   scope's hold; `scope_no_family_membership` as the error): kept,
+///   concluding nothing;
+/// - dated BEFORE the removal (backdated, outside W): c was a member then
+///   and is not now, so it is HELD `asserted_at_stale` (KR-fix30's W rule).
+///
+/// Neither concludes (`verdict::row_state`), whatever head it names. This
+/// pins the instant window as the bound until a ruling moves a gate onto
+/// the head reader (`standing_end`).
+pub(crate) async fn removed_member_body(d: &dyn FederationDirectory) {
+    use super::door_invariants::fixture::map;
+    use super::verdict::{row_state, RowState};
+    let (a, b, c, g) = (key(191), key(192), key(193), key(194));
+    register(d, &[&a, &b, &c]).await;
+    let mut f = family(
+        &g,
+        "removed",
+        "majority",
+        &[(&a, None), (&b, None), (&c, None)],
+    );
+    let (gid, voices) = founding_roster(&mut f, 0x28, 2_000, &[&a, &b, &c]);
+    let mut head = None;
+    for st in &voices {
+        head = head.or(landed(&put(d, st).await.unwrap()));
+    }
+    let head = head.expect("I6128 the family is founded");
+    let removal = MembershipRecord::FamilyRemoval(FamilyMembershipRevocation {
+        family_key_id: gid.clone(),
+        removed_identity_key_id: iref(&c),
+        removed_at: at(5_000),
+        effective_at: at(5_000),
+        reason: None,
+        witness_set: Vec::new(),
+        persist_row_hash: String::new(),
+    });
+    for k in [&a, &b] {
+        let _ = put(d, &membership(&removal, &head, k)).await.unwrap();
+    }
+    assert_eq!(
+        d.list_family_membership_revocations_for(&gid)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "I6128 the removal is held"
+    );
+    let act = |at_ms: u64| {
+        sign(
+            &c,
+            &iref(&c),
+            "chat:*",
+            &map(vec![
+                ("asserted_at", Value::Uint(at_ms)),
+                ("author", Value::Text(iref(&c))),
+                ("dimension", Value::Text("chat:message:v1".into())),
+                ("cohort_scope", Value::Text("family".into())),
+                ("family_id", Value::Text(gid.clone())),
+                (
+                    "refs",
+                    map(vec![(
+                        "head",
+                        ciris_verify_core::edition2::row_ref(&head.0),
+                    )]),
+                ),
+            ]),
+        )
+    };
+    for (what, at_ms, reason) in [
+        (
+            "after the removal",
+            6_000,
+            super::fold::reason::WRITE_SCOPE_REFUSED,
+        ),
+        (
+            "backdated before it",
+            4_000,
+            super::fold::reason::ASSERTED_AT_STALE,
+        ),
+    ] {
+        let st = act(at_ms);
+        let id = RowId::of_statement(&st).expect("I6128 a row");
+        let out = put(d, &st).await;
+        assert!(
+            !matches!(out, Ok(StatementOutcome::Row { .. })),
+            "I6128 {what}: the removed member's act naming its last head is not admitted: {out:?}"
+        );
+        match row_state(d, &id).await.unwrap() {
+            RowState::Held(h) => assert_eq!(h.reason, reason, "I6128 {what}: held for {reason}"),
+            RowState::Concluded => panic!("I6128 {what}: CONCLUDED: a live defect"),
+            other => panic!("I6128 {what}: expected a hold ({reason}), got {other:?}"),
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i6128_a_removed_members_act_is_not_admitted_sqlite() {
+    Box::pin(removed_member_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i6128_a_removed_members_act_is_not_admitted_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(removed_member_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i6127_the_reader_places_held_heads_sqlite() {
+    Box::pin(placing_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i6127_the_reader_places_held_heads_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(placing_body(&b)).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i6121_an_end_naming_an_old_head_sqlite() {
+    Box::pin(end_old_head_body(&sqlite().await)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i6121_an_end_naming_an_old_head_postgres() {
+    let Some(b) = postgres().await else {
+        return;
+    };
+    Box::pin(end_old_head_body(&b)).await;
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite() -> crate::store::sqlite::SqliteBackend {
     use crate::store::Backend as _;

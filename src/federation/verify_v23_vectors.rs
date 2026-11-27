@@ -63,6 +63,16 @@ const PINNED: &[(&str, &[u8], &str)] = &[
         include_bytes!("../../tests/vectors/verify_v23/edition2/key_of_iss_v3.json"),
         "371eebcb647e802d522bf44fd979d7faa338d87c42a6af0377e5ab4aaab3a8f9",
     ),
+    // v62.0.0 (R1) — CIRISVerify feat/23.5.1 @ 9518060 (NOT a tag yet):
+    // the standing-end row vectors (`lifts`, `receipter`), 11 cases. Re-pin
+    // from the 23.5.1 tag. Replayed by `edition2::verify_vectors_replay`
+    // (I6124: the seven `lifts` cases; the four `receipter` cases wait for the
+    // 23.5.1 pin, whose Verify checks `receipter`).
+    (
+        "edition2/conferral_end_v1.json",
+        include_bytes!("../../tests/vectors/verify_v23/edition2/conferral_end_v1.json"),
+        "702be508ff60ebbb80979e0720a5e4359cc4a4a94dc8ed948b1cccb7fa5aedd7",
+    ),
     (
         "accord_halt/accord_halt_v2.json",
         include_bytes!("../../tests/vectors/verify_v23/accord_halt/accord_halt_v2.json"),

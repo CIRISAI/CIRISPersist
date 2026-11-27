@@ -360,12 +360,13 @@ pub(crate) mod bodies {
     }
 
     /// v62.0.0 (JSON cut, E12) — a registered dimension for the content's
-    /// binding rows: `evidence:{suite}:{kind}:{cell}:{prefix}` (Verify
+    /// binding rows: `coherence_standing:{cohort}` (v62.0.0 FS-sig-b; it
+    /// was `evidence:*`, which now needs `infra:attest`; Verify
     /// v23.3.0 `family_authorship.json`; the earlier fixtures'
     /// `content:established:v1` is not registered, so no statement of it can
     /// be signed). It is an open family: `evidence_refs` and the cohort
     /// target ride as they did.
-    pub(crate) const BINDING_DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
+    pub(crate) const BINDING_DIMENSION: &str = "coherence_standing:cab:v1";
 
     // ── I1170 (binding) ───────────────────────────────────────────────────
     /// v60.0.0 (#803) — a takedown notice ROW is about the content, never a

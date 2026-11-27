@@ -80,7 +80,7 @@ async fn a_consumer_can_reach_the_row_signing_helpers_664() {
             signer,
             signer,
             &serde_json::json!({
-                "dimension": "evidence:safety_battery:capture:a:b:v1",
+                "dimension": "coherence_standing:cab:v1",
                 "score": 0.75,
                 "confidence": 0.9,
             }),

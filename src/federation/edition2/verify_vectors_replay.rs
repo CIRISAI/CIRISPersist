@@ -1042,3 +1042,49 @@ async fn i4022_postgres() {
     b.run_migrations().await.unwrap();
     Box::pin(i4022_body(&b)).await;
 }
+
+/// v62.0.0 (R1) — CIRISVerify feat/23.5.1's standing-end row vectors
+/// (SHA-256 pinned in `verify_v23_vectors`).
+const CONFERRAL_END_V1: &str =
+    include_str!("../../../tests/vectors/verify_v23/edition2/conferral_end_v1.json");
+
+/// I6124 (R1; CC 2.4.1.1, CC 2.6.1) — **persist's door answers Verify's
+/// `lifts` vectors**: each of the seven `lifts` cases of
+/// `conferral_end_v1.json` through the door's pure gates
+/// ([`super::door::pure_statement_gates`], which run the payload rule):
+/// `valid` passes; `invalid:malformed:lifts` is refused
+/// `edition2_payload_invalid` (persist's door names Verify's malformed
+/// member under its own payload token); `family_invalid:lifts_on_own_end` is
+/// refused `lifts_on_own_end`. The four `receipter` cases are the pin step's
+/// (Verify 23.5.1 checks `receipter`; 23.5.0, the pinned one, does not) and
+/// are skipped here BY NAME of their member, counted so none is lost.
+#[test]
+fn i6124_the_door_answers_verifys_lifts_vectors() {
+    let f: J = serde_json::from_str(CONFERRAL_END_V1).unwrap();
+    let cases = f["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 11, "I6124: the vendored file's 11 cases");
+    let (mut run, mut pin_step) = (0, 0);
+    for c in cases {
+        let id = c["id"].as_str().unwrap();
+        if id.starts_with("receipter") {
+            pin_step += 1;
+            continue;
+        }
+        let st = hx(&c["statement_hex"]);
+        let got = super::door::pure_statement_gates(&st, &dir(seeds(c)));
+        match (c["expect"].as_str().unwrap(), got) {
+            ("valid", Ok(())) => {}
+            ("invalid:malformed:lifts", Err(Error::MalformedRow { reason, .. }))
+                if reason == malformed_row::EDITION2_PAYLOAD_INVALID => {}
+            ("family_invalid:lifts_on_own_end", Err(Error::MalformedRow { reason, .. }))
+                if reason == malformed_row::LIFTS_ON_OWN_END => {}
+            (want, got) => panic!("I6124 {id}: Verify expects {want}, persist's door gave {got:?}"),
+        }
+        run += 1;
+    }
+    assert_eq!(
+        (run, pin_step),
+        (7, 4),
+        "I6124: seven lifts cases run, four receipter cases wait"
+    );
+}
