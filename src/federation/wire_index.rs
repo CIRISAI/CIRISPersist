@@ -511,7 +511,9 @@ pub async fn wire_refs_for_subject(
     // key-plane refs are retired.
     // Every attestation about the subject is a ref ("what is about me"):
     // the whole slice, walked in pages.
-    let mut pages = AttestationQuery::to(subject_key_id, FOLD_PAGE).pages();
+    let mut pages = AttestationQuery::to(subject_key_id, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
+        .pages();
     while let Some(page) = pages.next(dir).await? {
         for a in page {
             let rk = record_key(&[("attestation_id", &a.attestation_id)]);

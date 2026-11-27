@@ -440,12 +440,27 @@ pub enum HoldingClaimOutcome {
         attestation_id: String,
         /// Where it was placed.
         scope: ClaimScope,
+        /// v62.0.0 (VD-step2) — what became of the claim: `Seated` = it
+        /// LANDED; `Waiting` = kept and held (its reason), concluding
+        /// nothing, so its bytes are kept-but-not-served
+        /// (`fold::bytes_servable`).
+        outcome: super::edition2::second_signer_voice::VoiceOutcome,
     },
     /// This node is not in the content's cohort, so it cannot claim (CC
     /// 3.1.3.3 rule 2: the holder of a bounded-cohort claim is in the
     /// cohort). Decided structurally, before signing; nothing was written.
     /// Never at `federation`, where everyone is audience.
     NotInCohort {
+        /// The scope the claim would have been placed at.
+        scope: ClaimScope,
+    },
+    /// v62.0.0 (HEAD-4.rev2; Constitution, head cases (3): "an unowned node
+    /// signs only possession rows ... does NOT sign ... holding claims until
+    /// owned") — this node's key is a `node` key with no counted owner
+    /// binding, so it signs no claim: a claim is a node's act for its owner,
+    /// and it would name no head (`act_names_no_head`). Decided before
+    /// signing; nothing was written. A person's own key is never skipped.
+    Unowned {
         /// The scope the claim would have been placed at.
         scope: ClaimScope,
     },
@@ -528,6 +543,12 @@ where
     {
         return Ok(HoldingClaimOutcome::NotInCohort { scope });
     }
+    if node_is_unowned(backend, &holder)
+        .await
+        .map_err(|e| BlobError::Backend(format!("holding claim owner: {e}")))?
+    {
+        return Ok(HoldingClaimOutcome::Unowned { scope });
+    }
     // v62.0.0 (JSON-cut slice B) — the claim is an edition-2 `custody`
     // statement signed by this node's composite key and admitted through the
     // statement door, the door a peer's copy meets (the custody gate and the
@@ -571,7 +592,76 @@ where
     Ok(HoldingClaimOutcome::Emitted {
         attestation_id: emitted.attestation_id,
         scope,
+        outcome: emitted.outcome,
     })
+}
+
+/// v62.0.0 (HEAD-4.rev2; Constitution, head cases (3)) — **is `key` a node
+/// key that no counted owner binds?** A producer-side read of "am I owned":
+/// it decides what THIS node signs (the door still judges each row from the
+/// row alone). `false` for a key whose record is not a node's.
+///
+/// # Errors
+/// Directory reads.
+pub async fn node_is_unowned<D>(dir: &D, key: &str) -> Result<bool, super::Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use super::edition2::head_rule::{held_identity_types, owner_binding_row};
+    let node = held_identity_types(dir, key)
+        .await?
+        .iter()
+        .any(|t| t == super::types::identity_type::NODE);
+    Ok(node && owner_binding_row(dir, key, false, 0).await?.is_none())
+}
+
+/// v62.0.0 (HEAD-7) — the claim pass's window: blobs read per statement.
+const CLAIM_WINDOW: u32 = 256;
+
+/// v62.0.0 (HEAD-7) — one node's walk of its claim backlog, kept in this
+/// process across sweep passes.
+#[derive(Clone, Copy, Debug, Default)]
+struct ClaimWalk {
+    /// The last blob sha read; the next window starts after it.
+    cursor: Option<[u8; 32]>,
+    /// A claim in this walk failed: the walk restarts instead of finishing.
+    failed: bool,
+    /// The walk reached the end with nothing failed: no further query.
+    done: bool,
+}
+
+/// The walks, by the node's identity-ref. Per process: a restart walks once
+/// more (a durable watermark would need a table V300 does not have).
+fn claim_backlog() -> &'static std::sync::Mutex<std::collections::HashMap<String, ClaimWalk>> {
+    static WALKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ClaimWalk>>,
+    > = std::sync::OnceLock::new();
+    WALKS.get_or_init(Default::default)
+}
+
+/// The walk to run for `me` this pass, or `None` when its backlog is done.
+fn claim_backlog_open(me: &str) -> Option<ClaimWalk> {
+    let walk = claim_backlog()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(me)
+        .copied()
+        .unwrap_or_default();
+    (!walk.done).then_some(walk)
+}
+
+fn claim_backlog_keep(me: &str, walk: ClaimWalk) {
+    claim_backlog()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(me.to_owned(), walk);
+}
+
+fn claim_backlog_forget(me: &str) {
+    claim_backlog()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(me);
 }
 
 // ── the re-ack (CC 3.1.3.3 rule 5) ───────────────────────────────────
@@ -641,6 +731,12 @@ pub struct ReackReport {
     /// reconsideration has since reversed: still held, so claimed `here`
     /// again (the holder's re-ack).
     pub restored: u64,
+    /// v62.0.0 (HEAD-4.rev2) — claims skipped because this node is unowned
+    /// ([`HoldingClaimOutcome::Unowned`]).
+    pub unowned: u64,
+    /// v62.0.0 (HEAD-6) — first claims of held blobs this node had made no
+    /// report about (the claim pass: blobs stored while it was unowned).
+    pub claimed: u64,
 }
 
 /// **Re-acknowledge this node's own holdings** (CC 3.1.3.3 rule 5: "freshness
@@ -733,6 +829,7 @@ where
             }
             Ok(HoldingClaimOutcome::Emitted { .. }) => report.renewed += 1,
             Ok(HoldingClaimOutcome::NotInCohort { .. }) => report.not_in_cohort += 1,
+            Ok(HoldingClaimOutcome::Unowned { .. }) => report.unowned += 1,
             Err(BlobError::Purged { .. }) => report.withheld += 1,
             Err(e) => {
                 report.failed += 1;
@@ -757,6 +854,7 @@ where
     // conversion is a new claim; a renewal is one about to lapse).
     let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     let mut pages = AttestationQuery::by(&me, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .type_prefix(super::namespace::registry::RETIRED_HOLDING_CLAIM_STEM)
         .pages();
     while let Some(page) = pages
@@ -795,6 +893,7 @@ where
             match emit_holding_claim(backend, local, &sha, now).await {
                 Ok(HoldingClaimOutcome::Emitted { .. }) => report.converted += 1,
                 Ok(HoldingClaimOutcome::NotInCohort { .. }) => report.not_in_cohort += 1,
+                Ok(HoldingClaimOutcome::Unowned { .. }) => report.unowned += 1,
                 // Codex r3 on #1065 — a counter-notice takedown keeps the bytes
                 // through its window; the conversion never re-advertises them.
                 Err(BlobError::Purged { .. }) => report.withheld += 1,
@@ -808,6 +907,70 @@ where
                 }
             }
         }
+    }
+    // v62.0.0 (HEAD-6, bounded by HEAD-7; Constitution, head cases (3)) —
+    // THE CLAIM PASS: blobs this node stores and has never reported about
+    // (the ones it stored while unowned, when it signed no claim) are
+    // claimed at the content's scope, naming its owner binding. Bounded:
+    //
+    // - while unowned it is a no-op (one owner read) and forgets any backlog
+    //   walk, so the walk starts again when the binding lands;
+    // - owned, it pages `held_blob_claim_window` (ONE statement per backend:
+    //   a primary-key window of 256 blobs, one citation-index seek each),
+    //   claims the unreported ones under the pass's budget, and keeps the
+    //   cursor across passes;
+    // - once a walk reaches the end with no failure, the backlog is DONE for
+    //   this process ([`claim_backlog`]): later passes run no query at all.
+    //   Blobs stored while owned are claimed at store time, so nothing new
+    //   enters the backlog until the node is unowned again (or the process
+    //   restarts, which walks once more).
+    if node_is_unowned(backend, &me)
+        .await
+        .map_err(|e| BlobError::Backend(format!("reack: {e}")))?
+    {
+        claim_backlog_forget(&me);
+    } else if let Some(mut walk) = claim_backlog_open(&me) {
+        'walk: loop {
+            let window = backend
+                .held_blob_claim_window(walk.cursor, CLAIM_WINDOW, &me)
+                .await?;
+            let Some(last) = window.iter().map(|(sha, _)| *sha).max() else {
+                if walk.failed {
+                    walk = ClaimWalk::default();
+                } else {
+                    walk.done = true;
+                }
+                break 'walk;
+            };
+            for (sha, reported) in window {
+                if reported || !seen.insert(sha) {
+                    continue;
+                }
+                if budget == 0 {
+                    report.deferred += 1;
+                    break 'walk;
+                }
+                budget -= 1;
+                tokio::task::yield_now().await;
+                match emit_holding_claim(backend, local, &sha, now).await {
+                    Ok(HoldingClaimOutcome::Emitted { .. }) => report.claimed += 1,
+                    Ok(HoldingClaimOutcome::NotInCohort { .. }) => report.not_in_cohort += 1,
+                    Ok(HoldingClaimOutcome::Unowned { .. }) => report.unowned += 1,
+                    Err(BlobError::Purged { .. }) => report.withheld += 1,
+                    Err(e) => {
+                        report.failed += 1;
+                        walk.failed = true;
+                        tracing::warn!(
+                            error = %e,
+                            sha256_prefix = &hex::encode(sha)[..16],
+                            "first holding claim failed; the walk retries it"
+                        );
+                    }
+                }
+            }
+            walk.cursor = Some(last);
+        }
+        claim_backlog_keep(&me, walk);
     }
     Ok(report)
 }
@@ -921,6 +1084,7 @@ where
     // the claim history; the set holds one entry per blob.
     let mut shas: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut pages = AttestationQuery::by(holder_key_id, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .dimension_prefix(CUSTODY_ACK_DIMENSION)
         .pages();
     while let Some(page) = pages.next(dir).await? {
@@ -1106,6 +1270,7 @@ where
     let mut out = std::collections::BTreeSet::new();
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut pages = AttestationQuery::by(me, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .dimension_prefix(CUSTODY_ACK_DIMENSION)
         .pages();
     while let Some(page) = pages

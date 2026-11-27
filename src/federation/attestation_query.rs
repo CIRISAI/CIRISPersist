@@ -55,6 +55,13 @@ use crate::ceg::list::federation::AttestationCursor;
 /// can spell "every row" as one huge page.
 pub const MAX_PAGE: u32 = 10_000;
 
+/// v62.0.0 (QUERY-1, CIRISPersist#1278) — the placements a query may be
+/// pinned on by its target alone: the ones that name a target (`self` and
+/// the broad tiers name none). Served by PRE4-V300-b's
+/// `federation_attestations_room_dimension (cohort_target, cohort_scope,
+/// dimension, asserted_at, attestation_id)`.
+pub const TARGET_PINNED_SCOPES: &[&str] = &["community", "affiliations", "family"];
+
 /// A `const` [`NonZeroU32`] page size. Panics at compile time on `0` (the
 /// only use is in `const` items).
 #[must_use]
@@ -195,6 +202,46 @@ impl QueryOrder {
 /// back as [`QueryRows`]. A changed field here, or in a type it carries, is a
 /// payload break outside the op digests' sight, so it bumps
 /// `DIRECTORY_ABI_VERSION`. An unknown field is refused, never dropped.
+/// v62.0.0 (CONTENT-A7; CC rc22 3.1.3.2: a host-rendered room read returns
+/// the room's CONTENT; replication, as-of and audit return every row) —
+/// **how a reader asks for a room's rows.** Stated, never defaulted: a query
+/// naming a room scope without it is refused ([`AttestationQuery::check_view`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentView {
+    /// Every held row the query matches (replication, as-of, audit, a
+    /// handshake reader, anything offered to a peer).
+    Record,
+    /// The room's content now: a removed member's rows the content rule
+    /// keeps out are dropped, by this node's cached answers
+    /// (`edition2::content_cache::present`). Decided inside persist from the
+    /// room the scope names, never from a participant list.
+    Present,
+}
+
+impl ContentView {
+    /// v62.0.0 (CONTENT-A7b) — a caller's stated view (`"record"` |
+    /// `"present"`), required: the Python reads that cannot tell a room read
+    /// from another take it on every call.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] for an absent or unknown view.
+    pub fn parse_required(view: Option<&str>) -> Result<Self, Error> {
+        match view {
+            Some("record") => Ok(Self::Record),
+            Some("present") => Ok(Self::Present),
+            Some(other) => Err(Error::InvalidArgument(format!(
+                "content_view {other:?}: \"record\" or \"present\""
+            ))),
+            None => Err(Error::InvalidArgument(
+                "content_view is required on this read (\"record\" or \"present\"; CC rc22 \
+                 3.1.3.2, no default)"
+                    .to_owned(),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttestationQuery {
@@ -226,6 +273,13 @@ pub struct AttestationQuery {
     pub as_of: Option<DateTime<Utc>>,
     /// Only rows in this visibility scope (and target).
     pub scope: Option<ScopeFilter>,
+    /// v62.0.0 (CONTENT-A7 / A7b) — the view of a room's rows: REQUIRED
+    /// on every query that can return room-placed rows
+    /// ([`Self::can_return_room_rows`]); absent only on a query narrowed to
+    /// a non-room scope. `Present` is judged PER ROW, by the room each row
+    /// is placed in. Crosses the capsule (`DIRECTORY_ABI_VERSION` 15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<ContentView>,
 }
 
 impl AttestationQuery {
@@ -243,6 +297,7 @@ impl AttestationQuery {
             after: None,
             as_of: None,
             scope: None,
+            view: None,
         }
     }
 
@@ -256,6 +311,30 @@ impl AttestationQuery {
     #[must_use]
     pub fn to(attested_key_id: &str, limit: NonZeroU32) -> Self {
         Self::pinned(None, Some(attested_key_id.to_owned()), limit)
+    }
+
+    /// v62.0.0 (QUERY-1, CIRISPersist#1278) — **the rows placed in one
+    /// room**: `cohort_scope` (one of [`TARGET_PINNED_SCOPES`]) and its
+    /// `cohort_target`, `limit` per page, pinned on the target alone (no `by`,
+    /// no `to`). Served by the `(cohort_scope, cohort_target)` index the
+    /// targeted read (`list_targeted_by_dimension_prefix`) uses; narrow it
+    /// with [`Self::dimension_prefix`] / [`Self::dimension`], page it with
+    /// [`Self::after`], read only what is new with [`Self::oldest_first`] and
+    /// a high-water cursor. The host reads its own store: what a PEER is
+    /// served of these rows is `edition2::serve`'s, unchanged.
+    #[must_use]
+    pub fn in_room(cohort_scope: &str, cohort_target: &str, limit: NonZeroU32) -> Self {
+        Self::pinned(None, None, limit).scope(cohort_scope, Some(cohort_target))
+    }
+
+    /// v62.0.0 (QUERY-1) — the target a query is pinned on when it pins no
+    /// key: a scope that names its target.
+    #[must_use]
+    pub fn pinned_target(&self) -> Option<&str> {
+        if self.by.is_some() || self.to.is_some() {
+            return None;
+        }
+        self.scope.as_ref().and_then(|s| s.cohort_target.as_deref())
     }
 
     /// Also pin the attester.
@@ -295,9 +374,46 @@ impl AttestationQuery {
         self
     }
 
+    /// v62.0.0 (CONTENT-A7) — the view of a room's rows ([`ContentView`]).
+    #[must_use]
+    pub fn view(mut self, view: ContentView) -> Self {
+        self.view = Some(view);
+        self
+    }
+
+    /// v62.0.0 (CONTENT-A7b; the lead's ruling after Server's READ 11-24:
+    /// Server's room transcript is a bare `by(member)` query) — **can the
+    /// query return room-placed rows?** Every query NOT narrowed to a
+    /// non-room scope: no scope at all (a bare `by` / `to`), or a room
+    /// placement (`community`, `affiliations`, `family`:
+    /// `room_content::ROOM_PLACEMENTS`), with or without its target.
+    #[must_use]
+    pub fn can_return_room_rows(&self) -> bool {
+        self.scope.as_ref().is_none_or(|s| {
+            super::edition2::room_content::ROOM_PLACEMENTS.contains(&s.cohort_scope.as_str())
+        })
+    }
+
+    /// v62.0.0 (CONTENT-A7; the lead's ruling with Edge 11-24: "ABSENCE MUST
+    /// NEVER MEAN PRESENT", and no default either way) — a query naming a
+    /// room states its view.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] for a room query with no view.
+    pub fn check_view(&self) -> Result<(), Error> {
+        if self.can_return_room_rows() && self.view.is_none() {
+            return Err(Error::InvalidArgument(format!(
+                "AttestationQuery that can return room rows (scope {:?}) states no view: \
+                 Record or Present (CC rc22 3.1.3.2; no default either way)",
+                self.scope.as_ref().map(|s| s.cohort_scope.as_str())
+            )));
+        }
+        Ok(())
+    }
+
     /// Only rows whose stored `cohort_scope` is `cohort_scope` and, when
     /// `cohort_target` is `Some`, whose `cohort_target` is it
-    /// ([`ScopeFilter`]).
+    /// ([`ScopeFilter`]). A query that can return room rows also needs [`Self::view`].
     #[must_use]
     pub fn scope(mut self, cohort_scope: &str, cohort_target: Option<&str>) -> Self {
         self.scope = Some(ScopeFilter {
@@ -383,7 +499,10 @@ impl AttestationQuery {
     /// query it is a filter on the attester's walk, like an exclusion.
     #[must_use]
     pub fn seeks_narrow_index(&self) -> bool {
-        !self.types.is_empty()
+        // v62.0.0 (QUERY-1) — a target-pinned query seeks the
+        // `(cohort_scope, cohort_target)` index.
+        self.pinned_target().is_some()
+            || !self.types.is_empty()
             || self.type_prefix.is_some()
             || self.dimension != DimensionFilter::Any
             || (self.scope.is_some() && self.to.is_some())
@@ -412,6 +531,10 @@ impl AttestationQuery {
         if self.tier == QueryTier::Local {
             return "list_local_tier_attestations";
         }
+        // v62.0.0 (QUERY-1) — the targeted read's shape.
+        if self.pinned_target().is_some() {
+            return "list_targeted_by_dimension_prefix";
+        }
         let to = self.to.is_some();
         let dim = self.dimension != DimensionFilter::Any;
         if self.type_prefix.is_some() && !dim {
@@ -437,7 +560,11 @@ impl AttestationQuery {
     /// attested key.
     #[must_use]
     pub fn key(&self) -> &str {
-        self.by.as_deref().or(self.to.as_deref()).unwrap_or("*")
+        self.by
+            .as_deref()
+            .or(self.to.as_deref())
+            .or(self.pinned_target())
+            .unwrap_or("*")
     }
 
     /// Refuse a query no backend may run: no pinned key, a page above
@@ -447,10 +574,31 @@ impl AttestationQuery {
     ///
     /// [`Error::InvalidArgument`] naming the defect.
     pub fn validate(&self) -> Result<(), Error> {
+        // v62.0.0 (CONTENT-A7) — a room read states its view.
+        self.check_view()?;
         if self.by.is_none() && self.to.is_none() {
-            return Err(Error::InvalidArgument(
-                "AttestationQuery pins no key (by or to)".to_owned(),
-            ));
+            // v62.0.0 (QUERY-1) — or a room: a scope that names its target,
+            // at a placement that has targets (the index's closed set).
+            match &self.scope {
+                Some(ScopeFilter {
+                    cohort_scope,
+                    cohort_target: Some(t),
+                }) if !t.is_empty() => {
+                    if !TARGET_PINNED_SCOPES.contains(&cohort_scope.as_str()) {
+                        return Err(Error::InvalidArgument(format!(
+                            "AttestationQuery pinned on a target at cohort_scope \
+                             {cohort_scope:?}: one of {TARGET_PINNED_SCOPES:?}"
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(Error::InvalidArgument(
+                        "AttestationQuery pins no key (by or to) and no room (a scope with its \
+                         target)"
+                            .to_owned(),
+                    ));
+                }
+            }
         }
         if self.limit.get() > MAX_PAGE {
             return Err(Error::InvalidArgument(format!(
@@ -626,7 +774,10 @@ where
     D: super::FederationDirectory + ?Sized,
 {
     async fn run_attestation_query(&self, q: &AttestationQuery) -> Result<QueryRows, Error> {
-        super::FederationDirectory::execute_attestation_query(self, q).await
+        let mut out = super::FederationDirectory::execute_attestation_query(self, q).await?;
+        // v62.0.0 (CONTENT-A7) — the view, applied once the statement ran.
+        out.rows = super::edition2::content_cache::view_rows(self, q, out.rows).await?;
+        Ok(out)
     }
 }
 

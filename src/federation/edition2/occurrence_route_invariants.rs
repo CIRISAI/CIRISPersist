@@ -310,10 +310,20 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
         XWingPublicKey::from_bytes(&transit),
         "I3038: the transit key resolves from the bind"
     );
+    // v62.0.0 (BIND-3; CC 5.4.6 "relayable exactly when its owner-binding
+    // is announced") — the earlier leg read a hop key off any node's bind.
+    // An unannounced node is no relay hop; its owner's announcement (an
+    // explicit fixture step) makes it one.
+    assert_eq!(
+        onion_hop_xwing_pubkey_for(d, &n).await.unwrap(),
+        None,
+        "I3038: an unannounced node is no onion hop"
+    );
+    super::fixture_occurrence::announce_node_owner(d, &owner, &node, t - 3_600_000).await;
     assert_eq!(
         onion_hop_xwing_pubkey_for(d, &n).await.unwrap(),
         XWingPublicKey::from_bytes(&hop),
-        "I3038: the onion hop key resolves from the bind"
+        "I3038: announced, the onion hop key resolves from the bind"
     );
 }
 
@@ -391,7 +401,9 @@ async fn displacement_body(d: &dyn FederationDirectory) {
         }),
         persist_row_hash: String::new(),
     };
-    d.put_identity_occurrence_local(occ.clone()).await.unwrap();
+    d.test_seam_put_identity_occurrence(occ.clone())
+        .await
+        .unwrap();
     let stale = occ
         .transport_binding
         .as_ref()

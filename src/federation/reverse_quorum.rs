@@ -1909,6 +1909,7 @@ where
     // carries them, the exact match below picks them.
     let mut rows = Vec::new();
     let mut pages = AttestationQuery::to(action.actor_key_id, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .dimension_prefix("objection:")
         .pages();
     let read: Result<(), Error> = async {

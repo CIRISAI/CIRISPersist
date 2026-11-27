@@ -440,6 +440,21 @@ where
     }
     let primary = primary_voice(dir, admitted).await?;
     let row = super::ingest::attestation_of(&primary, tier)?;
+    // v62.0.0 (CONTENT-A7) — room content of an ended member: read before
+    // the row moves into the gates (its place in the ended buffer below).
+    let ended = match super::content_cache::ended_member_content(dir, &row).await? {
+        Some(e) => Some((
+            e,
+            (
+                row.attesting_key_id.clone(),
+                row.cohort_scope.clone(),
+                crate::federation::admission::envelope_cohort_target(&row.attestation_envelope)?
+                    .map(str::to_owned),
+                row.asserted_at,
+            ),
+        )),
+        None => None,
+    };
     let offered = Voice {
         iss: admitted.iss.clone(),
         kid: admitted.kid,
@@ -459,12 +474,64 @@ where
         ),
     )
     .await;
-    match (out, att.held) {
+    // v62.0.0 (KR-fix33; FINDING: I5711 on built pass 9, "the door answered
+    // Row { new: true }; held: None", and no attestation row) — the gates'
+    // `Ok` is a landing only when the row IS stored: the door never answers
+    // `Row` for a row no reader can find. An `Ok` with a hold marked on the
+    // attempt and nothing stored is that hold (a gate that marked it and
+    // whose caller swallowed the error); an `Ok` with no mark and nothing
+    // stored is refused by name, naming what the attestation door answered,
+    // so the two readers cannot disagree silently.
+    let (out, held) = match (out, att.held) {
+        (Ok(o), held) if dir.get_attestation(&admitted.row_id.hex()).await?.is_none() => match held
+        {
+            Some((reason, detail)) => (
+                Err(Error::InvalidArgument(format!(
+                    "{reason}: the attestation door answered {o:?} and stored nothing, \
+                         with this hold marked: {detail}"
+                ))),
+                Some((reason, detail)),
+            ),
+            None => {
+                return Err(Error::Backend(format!(
+                    "row_reported_landed_not_stored: {} ({}): the attestation door \
+                         answered {o:?} and no attestation row is held under the row id",
+                    admitted.row_id.hex(),
+                    admitted.family
+                )));
+            }
+        },
+        other => other,
+    };
+    match (out, held) {
         (Ok(_), _) => {
             if primary.statement_id != admitted.statement_id {
                 dir.put_edition2_statement(&primary).await?;
             }
             let new = dir.put_edition2_statement(admitted).await?;
+            // v62.0.0 (CONTENT-A7) — an admitted post-end row of an ended
+            // member (admit-and-mark: the write scope refused it and the
+            // content rule decides it) takes its place in the ended buffer.
+            // The door's gate declined it already if the buffer was full.
+            if let (true, Some((ended, (writer, scope, target, act_at)))) = (new, &ended) {
+                let seated = super::fold::unmarked(Box::pin(dir.check_write_cohort_scope_for_at(
+                    writer,
+                    "edition2_statement",
+                    scope,
+                    target.as_deref(),
+                    Some(*act_at),
+                    None,
+                )))
+                .await;
+                if seated.is_err() {
+                    if let Some(entry) = super::hold_bound::admit_ended(dir, ended, false).await? {
+                        match dir.edition2_held_bound_put(&entry).await {
+                            Ok(()) | Err(Error::Unsupported { .. }) => {}
+                            Err(x) => return Err(x),
+                        }
+                    }
+                }
+            }
             super::fold::record(
                 dir,
                 admitted.row_id,
@@ -480,7 +547,25 @@ where
             })
         }
         (Err(e), Some((reason, detail))) => {
+            // v62.0.0 (HOLD-1a; CC 2.7.3 as ruled 11-23) — a FIRST hold of a
+            // row (nothing of it kept yet) that only adds, on its writer's
+            // write scope, is kept only inside this node's own bound
+            // (`hold_bound::admit`); over it the row is declined.
+            let bound = if matches!(
+                super::verdict::row_state(dir, &admitted.row_id).await?,
+                super::verdict::RowState::Absent
+            ) {
+                Box::pin(super::hold_bound::admit(dir, admitted, &reason, &e)).await?
+            } else {
+                None
+            };
             let new = dir.put_edition2_statement(admitted).await?;
+            if let (Some(entry), true) = (&bound, new) {
+                match dir.edition2_held_bound_put(entry).await {
+                    Ok(()) | Err(Error::Unsupported { .. }) => {}
+                    Err(x) => return Err(x),
+                }
+            }
             let detail = if detail.is_empty() {
                 e.to_string()
             } else {
@@ -502,6 +587,9 @@ where
                 att.reads,
             )
             .await?;
+            // v62.0.0 (WD-fix4 rev 2) — the gate's own error, for a door that
+            // answers a held row with it (the routed JSON door).
+            super::fold::keep_hold_error(admitted.row_id, e);
             Ok(StatementOutcome::Pending {
                 row_id: admitted.row_id,
                 new,

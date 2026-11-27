@@ -517,6 +517,7 @@ where
             signers: Default::default(),
             moderator_roots: Default::default(),
             reversed: false,
+            is_resignation: false,
         };
         if uncovered_keys.contains(key) && due(&row) {
             earliest(*admitted);

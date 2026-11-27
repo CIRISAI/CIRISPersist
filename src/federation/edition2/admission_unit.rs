@@ -265,7 +265,7 @@ fn is_admission_unit_row_statement(statement: &[u8]) -> bool {
         p.get_int(-70002).and_then(Value::as_text) == Some(super::payloads::ADMISSION_UNIT_FAMILY)
             && p.get_int(-70001)
                 .and_then(Value::as_text)
-                .is_some_and(|t| !super::payloads::COMPOSER_ROW_TYPES.contains(&t))
+                .is_some_and(|t| !super::emit::names_a_target(t))
     })
 }
 
@@ -437,7 +437,9 @@ where
         }
         let (live, _) = super::typed::acceptance_edges(
             dir,
-            AttestationQuery::by(&key, FOLD_PAGE).dimension(TRUST_ACCEPTS_DIMENSION),
+            AttestationQuery::by(&key, FOLD_PAGE)
+                .view(crate::federation::attestation_query::ContentView::Record)
+                .dimension(TRUST_ACCEPTS_DIMENSION),
         )
         .await?;
         for e in &live {

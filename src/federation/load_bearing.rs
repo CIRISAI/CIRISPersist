@@ -729,7 +729,9 @@ async fn retained_replication(
     let mut because: Vec<Dependency> = Vec::new();
     for peer in &row.subject_key_ids {
         // The peer's rows, a page at a time: the report stops at its cap.
-        let mut pages = AttestationQuery::by(peer, FOLD_PAGE).pages();
+        let mut pages = AttestationQuery::by(peer, FOLD_PAGE)
+            .view(crate::federation::attestation_query::ContentView::Record)
+            .pages();
         while let Some(page) = pages.next(directory).await? {
             for held in page {
                 // The grant itself is not evidence of its own necessity.
@@ -772,8 +774,16 @@ async fn key_record_load_bearing(
 ) -> Result<LoadBearing, Error> {
     let mut because: Vec<Dependency> = Vec::new();
     for (q, role) in [
-        (AttestationQuery::by(key_id, FOLD_PAGE), "attester"),
-        (AttestationQuery::to(key_id, FOLD_PAGE), "subject"),
+        (
+            AttestationQuery::by(key_id, FOLD_PAGE)
+                .view(crate::federation::attestation_query::ContentView::Record),
+            "attester",
+        ),
+        (
+            AttestationQuery::to(key_id, FOLD_PAGE)
+                .view(crate::federation::attestation_query::ContentView::Record),
+            "subject",
+        ),
     ] {
         // A page at a time: the report stops at its cap.
         let mut pages = q.pages();
@@ -1080,8 +1090,10 @@ pub async fn load_bearing_closure(
                 // Every row naming the key, as attester then as subject, a
                 // page at a time.
                 for q in [
-                    AttestationQuery::by(key_id, FOLD_PAGE),
-                    AttestationQuery::to(key_id, FOLD_PAGE),
+                    AttestationQuery::by(key_id, FOLD_PAGE)
+                        .view(crate::federation::attestation_query::ContentView::Record),
+                    AttestationQuery::to(key_id, FOLD_PAGE)
+                        .view(crate::federation::attestation_query::ContentView::Record),
                 ] {
                     let mut pages = q.pages();
                     while let Some(page) = pages.next(directory).await? {

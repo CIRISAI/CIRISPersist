@@ -38,6 +38,15 @@ pub struct EmittedAttestation {
     /// Was the emitted envelope's dimension the `consent:replication:v1`
     /// grant dimension? Drives the #509 promote-on-consent sweep.
     pub is_grant_dimension: bool,
+    /// v62.0.0 (VD-step2) — **what became of the row**, read back from the
+    /// one row-state verdict after the door answered
+    /// ([`second_signer_voice::row_status`](super::edition2::second_signer_voice::row_status)):
+    /// `Seated` = LANDED; `Waiting` with a reason = HELD (kept, concluding
+    /// nothing); `Waiting` with an empty reason = a voice kept, awaiting
+    /// others. An `Ok` is never "landed" by itself (VD-step1, finding: every
+    /// caller read `Ok(row id)` as landed). A row assembled and NOT put
+    /// ([`assemble`]'s path) is `Waiting`, empty reason.
+    pub outcome: super::edition2::second_signer_voice::VoiceOutcome,
 }
 
 /// Canonicalize an attestation envelope through the CEG produce gate (§0.9
@@ -329,6 +338,12 @@ fn assemble_any_row_type(
         attesting_key_id: key_id,
         is_grant_dimension: super::admission::envelope_dimension(&row.attestation_envelope)
             == Some(super::consent_grammar::GRANT_DIMENSION),
+        // Assembled, not put: nothing has landed.
+        outcome: super::edition2::second_signer_voice::VoiceOutcome::Waiting {
+            row_id: row.attestation_id.clone(),
+            reason: String::new(),
+            detail: String::new(),
+        },
     };
     Ok((row, emitted))
 }
@@ -459,10 +474,7 @@ where
         input.attestation_type = t::SCORES.to_owned();
     }
     // A composer's target: its row id (refs.target) and its family.
-    let composer = matches!(
-        input.attestation_type.as_str(),
-        t::WITHDRAWS | t::RECANTS | t::SUPERSEDES
-    );
+    let composer = super::edition2::emit::names_a_target(&input.attestation_type);
     let mut target: Option<(ciris_verify_core::edition2::Digest32, Option<Vec<u8>>)> = None;
     if composer {
         if let Some(id) = envelope
@@ -537,6 +549,44 @@ where
         author,
         target.as_ref().map(|(d, _)| d),
     )?;
+    // v62.0.0 (HEAD-1; CC 2.4.1.1, "an act names its head") — the head the
+    // act is at, resolved before the first voice signs
+    // (`edition2::head_rule::state_head`): the roster version of a room or
+    // family it is placed at, the bundle in force, the owner binding a node
+    // or agent acts under, the delegation a delegate acts under. A head the
+    // envelope names is kept; a retraction is HEAD-3's.
+    let payload = super::edition2::head_rule::state_head(
+        dir,
+        &input.attestation_type,
+        &family,
+        &iss,
+        payload,
+    )
+    .await?;
+    // v62.0.0 (CONTENT-A4; CC rc22 3.1.3.2) — a room content row names its
+    // author's newest tip in the room as `refs.prev`
+    // (`edition2::content_prev::state_prev`).
+    let payload =
+        super::edition2::content_prev::state_prev(dir, &input.attestation_type, &family, payload)
+            .await?;
+    // v62.0.0 (HEAD-3; CC 2.4.1.1, "A row that ends a standing carries
+    // `refs.head` beside its target") — a `withdraws` names the head it acts
+    // from, read from the target it ends (`head_rule::state_end_head`): the
+    // ending sites that state through here (`revoke_delegation`, the generic
+    // `emit_withdraws_attestation`, the blob helper, `retire_goal`, the
+    // subject-erasure and holding-claim retractions) all do.
+    let payload = match (&target, input.attestation_type.as_str()) {
+        (Some((d, st)), t::WITHDRAWS) => {
+            super::edition2::head_rule::state_end_head(
+                dir,
+                &super::edition2::names::RowId(*d),
+                st.as_deref(),
+                payload,
+            )
+            .await?
+        }
+        _ => payload,
+    };
     let sub = input.attested_key_id.clone().unwrap_or_else(|| iss.clone());
     let statement = super::edition2::produce::sign_row(
         signer,
@@ -603,18 +653,14 @@ where
         super::replication::admission::WriteOrigin::Authored,
     )
     .await?;
-    let row_id = match outcome {
-        super::edition2::ingest::StatementOutcome::Row { row_id, .. }
-        | super::edition2::ingest::StatementOutcome::Voice { row_id, .. }
-        | super::edition2::ingest::StatementOutcome::KeyPlane { row_id, .. }
-        // X2 build fix: T1's counted row short of its voices is held; the
-        // produced statement still names its row.
-        | super::edition2::ingest::StatementOutcome::Pending { row_id, .. } => row_id,
-    };
+    // v62.0.0 (VD-step2) — the door's answer is read back as the row's STATE
+    // (landed / held / a voice awaiting others), never folded into one Ok.
+    let outcome = super::edition2::second_signer_voice::outcome_of(dir, &outcome).await?;
     Ok(EmittedAttestation {
-        attestation_id: row_id.hex(),
+        attestation_id: outcome.row_id().to_owned(),
         attesting_key_id: produced.iss.clone(),
         is_grant_dimension: produced.is_grant_dimension,
+        outcome,
     })
 }
 

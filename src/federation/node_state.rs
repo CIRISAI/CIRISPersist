@@ -704,7 +704,9 @@ pub(crate) async fn resolve_trust_root_signal(
             // Every row the node authored: the candidate predicate reads its
             // edges and whatever retires them.
             let mut rows = Vec::new();
-            let mut pages = AttestationQuery::by(user, FOLD_PAGE).pages();
+            let mut pages = AttestationQuery::by(user, FOLD_PAGE)
+                .view(crate::federation::attestation_query::ContentView::Record)
+                .pages();
             let read: Result<(), Error> = async {
                 while let Some(page) = pages.next(directory).await? {
                     rows.extend(page);

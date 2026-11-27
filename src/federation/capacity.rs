@@ -347,7 +347,9 @@ pub async fn capacity_state(
     // rides either the `scores` dimension or the legacy type slot
     // (`row_type::claim_token`), so no one narrowing holds both shapes.
     let mut rows = Vec::new();
-    let mut pages = AttestationQuery::to(k, FOLD_PAGE).pages();
+    let mut pages = AttestationQuery::to(k, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
+        .pages();
     while let Some(page) = pages.next(directory).await? {
         rows.extend(page);
     }
@@ -406,7 +408,9 @@ pub async fn incapacity_facts(
     // rides either the `scores` dimension or the legacy type slot
     // (`row_type::claim_token`), so no one narrowing holds both shapes.
     let mut rows = Vec::new();
-    let mut pages = AttestationQuery::to(k, FOLD_PAGE).pages();
+    let mut pages = AttestationQuery::to(k, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
+        .pages();
     while let Some(page) = pages.next(directory).await? {
         rows.extend(page);
     }

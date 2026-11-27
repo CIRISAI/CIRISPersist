@@ -26,6 +26,17 @@
 //!   the `cohort_target`), on `by` and `to` queries and combined with a
 //!   dimension prefix — as I900 shapes, so they page, order and seek like
 //!   every other shape (I901/I903). An empty `AnyOf` is refused (I902).
+//! - **I6712** (QUERY-1, CIRISPersist#1278) — a query pinned on a ROOM alone
+//!   (`AttestationQuery::in_room`), on sqlite and postgres:
+//!   - newest first, with `limit` honoured on every page;
+//!   - a high-water cursor read oldest-first returns ZERO rows when nothing
+//!     is new;
+//!   - a query with neither a key nor a room (or a room scope without its
+//!     target, or a target at `self`) is still refused by `validate()`;
+//!   - the audience floor is unchanged: the form is the host's read of its
+//!     own store, and what a peer outside the room is served stays
+//!     `edition2::serve::servable_to`'s. A non-member is served none of the
+//!     room's rows; a member is served them.
 //! - **I906** `as_of(t)` keeps exactly the rows whose SIGNED `asserted_at <=
 //!   t`, in `ByAssertedAt` order with the id tie-break, both directions,
 //!   paged; a row landed AFTER the read, dated after `t`, never enters the
@@ -41,8 +52,8 @@ pub(crate) mod bodies {
     use std::num::NonZeroU32;
 
     use crate::federation::attestation_query::{
-        AttestationQuery, AttestationQueryExec, AttestationReads, NotServedReason, QueryRows,
-        QueryTier, ReadOutcome,
+        AttestationQuery, AttestationQueryExec, AttestationReads, ContentView, NotServedReason,
+        QueryRows, QueryTier, ReadOutcome, ScopeFilter,
     };
     use crate::federation::read_probe;
     use crate::federation::tier_ingest::test_support as ts;
@@ -169,21 +180,21 @@ pub(crate) mod bodies {
         // One live row per (subject, leaf): a second needs a `supersedes`.
         // A about A: three config:a* leaves (two tied), two config:b*
         // leaves (one tied with an A→B row), other:x.
-        rows.push(put_scores(d, &a, &a, "evidence:safety_battery:capture:a:c:v1", -60).await);
-        rows.push(put_scores(d, &a, &a, "evidence:safety_battery:capture:a2:c:v1", -50).await);
-        rows.push(put_scores(d, &a, &a, "evidence:safety_battery:capture:a3:c:v1", -50).await);
-        rows.push(put_scores(d, &a, &a, "evidence:safety_battery:capture:b:c:v1", -40).await);
-        rows.push(put_scores(d, &a, &a, "evidence:safety_battery:capture:b2:c:v1", -30).await);
+        rows.push(put_scores(d, &a, &a, "coherence_standing:cac:v1", -60).await);
+        rows.push(put_scores(d, &a, &a, "coherence_standing:ca2c:v1", -50).await);
+        rows.push(put_scores(d, &a, &a, "coherence_standing:ca3c:v1", -50).await);
+        rows.push(put_scores(d, &a, &a, "coherence_standing:cbc:v1", -40).await);
+        rows.push(put_scores(d, &a, &a, "coherence_standing:cb2c:v1", -30).await);
         // v62.0.0 (E0 fix 3) — `other` is not in the closed `{suite}` vocab: the
         // out-of-prefix row is the `interpret` kind, outside `…:capture:`.
-        rows.push(put_scores(d, &a, &a, "evidence:safety_battery:interpret:x:c:v1", -20).await);
+        rows.push(put_scores(d, &a, &a, "coherence_standing:ixc:v1", -20).await);
         // A about B and C, one tied with A's config:b2.
-        rows.push(put_scores(d, &a, &b, "evidence:safety_battery:capture:a:c:v1", -30).await);
-        rows.push(put_scores(d, &a, &b, "evidence:safety_battery:capture:ab:c:v1", -10).await);
-        rows.push(put_scores(d, &a, &c, "evidence:safety_battery:capture:a:c:v1", -25).await);
+        rows.push(put_scores(d, &a, &b, "coherence_standing:cac:v1", -30).await);
+        rows.push(put_scores(d, &a, &b, "coherence_standing:cabc:v1", -10).await);
+        rows.push(put_scores(d, &a, &c, "coherence_standing:cac:v1", -25).await);
         // B about A.
-        rows.push(put_scores(d, &b, &a, "evidence:safety_battery:capture:c:c:v1", -45).await);
-        rows.push(put_scores(d, &b, &a, "evidence:safety_battery:capture:c2:c:v1", -5).await);
+        rows.push(put_scores(d, &b, &a, "coherence_standing:ccc:v1", -45).await);
+        rows.push(put_scores(d, &b, &a, "coherence_standing:cc2c:v1", -5).await);
         // I913 — scoped rows: two communities, one species-wide row. A
         // community row lands only when the community's roster is held here
         // and names its writer (AV-45, `check_write_cohort_scope_for`; an
@@ -227,7 +238,7 @@ pub(crate) mod bodies {
                 d,
                 &a,
                 &a,
-                "evidence:safety_battery:interpret:sa:c:v1",
+                "coherence_standing:isac:v1",
                 -48,
                 Some((community, Some(&comm1))),
             )
@@ -238,7 +249,7 @@ pub(crate) mod bodies {
                 d,
                 &a,
                 &a,
-                "evidence:safety_battery:interpret:sb:c:v1",
+                "coherence_standing:isbc:v1",
                 -12,
                 Some((community, Some(&comm2))),
             )
@@ -253,7 +264,7 @@ pub(crate) mod bodies {
                 d,
                 &b,
                 &b,
-                "evidence:safety_battery:interpret:sc:c:v1",
+                "coherence_standing:iscc:v1",
                 -8,
                 Some((community, Some(&comm1))),
             )
@@ -264,7 +275,7 @@ pub(crate) mod bodies {
                 d,
                 &a,
                 &b,
-                "evidence:safety_battery:interpret:sd:c:v1",
+                "coherence_standing:isdc:v1",
                 -22,
                 Some((species, None)),
             )
@@ -272,9 +283,9 @@ pub(crate) mod bodies {
         );
         // C noise.
         for (leaf, m) in [
-            ("evidence:safety_battery:capture:a:c:v1", -55),
-            ("evidence:safety_battery:capture:a2:c:v1", -35),
-            ("evidence:safety_battery:capture:a3:c:v1", -15),
+            ("coherence_standing:cac:v1", -55),
+            ("coherence_standing:ca2c:v1", -35),
+            ("coherence_standing:ca3c:v1", -15),
         ] {
             rows.push(put_scores(d, &c, &c, leaf, m).await);
         }
@@ -298,7 +309,7 @@ pub(crate) mod bodies {
                 weight: None,
                 expires_at: None,
                 attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                    serde_json::json!({ "dimension": "evidence:safety_battery:capture:a:c:v1" }),
+                    serde_json::json!({ "dimension": "coherence_standing:cac:v1" }),
                 )
                 .unwrap(),
                 subject_key_ids: vec![],
@@ -311,7 +322,11 @@ pub(crate) mod bodies {
         // The local row's instant is the door's; read it back through the
         // query itself (the only by-A local row) so the oracle orders it.
         let local = d
-            .query_attestations(&AttestationQuery::by(&a, NonZeroU32::MIN).tier(QueryTier::Local))
+            .query_attestations(
+                &AttestationQuery::by(&a, NonZeroU32::MIN)
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .tier(QueryTier::Local),
+            )
             .await
             .served()
             .expect("local read")
@@ -323,7 +338,7 @@ pub(crate) mod bodies {
             by: a.clone(),
             to: a.clone(),
             kind: attestation_type::SCORES.into(),
-            dimension: Some("evidence:safety_battery:capture:a:c:v1".into()),
+            dimension: Some("coherence_standing:cac:v1".into()),
             at: local[0].asserted_at,
             local: true,
             scope: crate::federation::types::cohort_scope::SELF.to_owned(),
@@ -361,49 +376,54 @@ pub(crate) mod bodies {
             let o = |q: AttestationQuery| if oldest { q.oldest_first() } else { q };
             out.push((
                 "by A",
-                o(AttestationQuery::by(a, lim)),
+                o(AttestationQuery::by(a, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)),
                 expect(corpus, |r| fed(r) && r.by == a, oldest),
             ));
             out.push((
                 "to A",
-                o(AttestationQuery::to(a, lim)),
+                o(AttestationQuery::to(a, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)),
                 expect(corpus, |r| fed(r) && r.to == a, oldest),
             ));
             out.push((
                 "by A, prefix config:",
                 o(AttestationQuery::by(a, lim)
-                    .dimension_prefix("evidence:safety_battery:capture:")),
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .dimension_prefix("coherence_standing:c")),
                 expect(
                     corpus,
-                    |r| fed(r) && r.by == a && dim(r, "evidence:safety_battery:capture:"),
+                    |r| fed(r) && r.by == a && dim(r, "coherence_standing:c"),
                     oldest,
                 ),
             ));
             out.push((
                 "by A, exact config:a:v1",
-                o(
-                    AttestationQuery::by(a, lim)
-                        .dimension("evidence:safety_battery:capture:a:c:v1"),
-                ),
+                o(AttestationQuery::by(a, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .dimension("coherence_standing:cac:v1")),
                 expect(
                     corpus,
                     |r| {
                         fed(r)
                             && r.by == a
-                            && r.dimension.as_deref()
-                                == Some("evidence:safety_battery:capture:a:c:v1")
+                            && r.dimension.as_deref() == Some("coherence_standing:cac:v1")
                     },
                     oldest,
                 ),
             ));
             out.push((
                 "to A authored by B",
-                o(AttestationQuery::to(a, lim).authored_by(b)),
+                o(AttestationQuery::to(a, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .authored_by(b)),
                 expect(corpus, |r| fed(r) && r.to == a && r.by == b, oldest),
             ));
             out.push((
                 "by A, withdraws",
-                o(AttestationQuery::by(a, lim).types(&[attestation_type::WITHDRAWS])),
+                o(AttestationQuery::by(a, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .types(&[attestation_type::WITHDRAWS])),
                 expect(
                     corpus,
                     |r| fed(r) && r.by == a && r.kind == attestation_type::WITHDRAWS,
@@ -413,15 +433,15 @@ pub(crate) mod bodies {
             out.push((
                 "by A, withdraws+scores excluding config:a:v1",
                 o(AttestationQuery::by(a, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)
                     .types(&[attestation_type::SCORES, attestation_type::WITHDRAWS])
-                    .excluding_dimensions(&["evidence:safety_battery:capture:a:c:v1"])),
+                    .excluding_dimensions(&["coherence_standing:cac:v1"])),
                 expect(
                     corpus,
                     |r| {
                         fed(r)
                             && r.by == a
-                            && r.dimension.as_deref()
-                                != Some("evidence:safety_battery:capture:a:c:v1")
+                            && r.dimension.as_deref() != Some("coherence_standing:cac:v1")
                     },
                     oldest,
                 ),
@@ -429,14 +449,14 @@ pub(crate) mod bodies {
             out.push((
                 "by A excluding config:a:v1 (no type)",
                 o(AttestationQuery::by(a, lim)
-                    .excluding_dimensions(&["evidence:safety_battery:capture:a:c:v1"])),
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .excluding_dimensions(&["coherence_standing:cac:v1"])),
                 expect(
                     corpus,
                     |r| {
                         fed(r)
                             && r.by == a
-                            && r.dimension.as_deref()
-                                != Some("evidence:safety_battery:capture:a:c:v1")
+                            && r.dimension.as_deref() != Some("coherence_standing:cac:v1")
                     },
                     oldest,
                 ),
@@ -444,22 +464,20 @@ pub(crate) mod bodies {
             out.push((
                 "to B by A prefix config:a",
                 o(AttestationQuery::to(b, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)
                     .authored_by(a)
-                    .dimension_prefix("evidence:safety_battery:capture:a")),
+                    .dimension_prefix("coherence_standing:ca")),
                 expect(
                     corpus,
-                    |r| {
-                        fed(r)
-                            && r.to == b
-                            && r.by == a
-                            && dim(r, "evidence:safety_battery:capture:a")
-                    },
+                    |r| fed(r) && r.to == b && r.by == a && dim(r, "coherence_standing:ca"),
                     oldest,
                 ),
             ));
             out.push((
                 "by A, type prefix wi",
-                o(AttestationQuery::by(a, lim).type_prefix("wi")),
+                o(AttestationQuery::by(a, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .type_prefix("wi")),
                 expect(
                     corpus,
                     |r| fed(r) && r.by == a && r.kind.starts_with("wi"),
@@ -468,7 +486,9 @@ pub(crate) mod bodies {
             ));
             out.push((
                 "to A, type prefix sc",
-                o(AttestationQuery::to(a, lim).type_prefix("sc")),
+                o(AttestationQuery::to(a, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .type_prefix("sc")),
                 expect(
                     corpus,
                     |r| fed(r) && r.to == a && r.kind.starts_with("sc"),
@@ -478,10 +498,12 @@ pub(crate) mod bodies {
             // I913 — DimensionFilter::AnyOf: exact dimensions OR'd.
             out.push((
                 "by A, any of config:a:v1 / config:b2:v1",
-                o(AttestationQuery::by(a, lim).dimension_any_of(&[
-                    "evidence:safety_battery:capture:a:c:v1",
-                    "evidence:safety_battery:capture:b2:c:v1",
-                ])),
+                o(AttestationQuery::by(a, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .dimension_any_of(&[
+                        "coherence_standing:cac:v1",
+                        "coherence_standing:cb2c:v1",
+                    ])),
                 expect(
                     corpus,
                     |r| {
@@ -489,10 +511,7 @@ pub(crate) mod bodies {
                             && r.by == a
                             && matches!(
                                 r.dimension.as_deref(),
-                                Some(
-                                    "evidence:safety_battery:capture:a:c:v1"
-                                        | "evidence:safety_battery:capture:b2:c:v1"
-                                )
+                                Some("coherence_standing:cac:v1" | "coherence_standing:cb2c:v1")
                             )
                     },
                     oldest,
@@ -500,11 +519,13 @@ pub(crate) mod bodies {
             ));
             out.push((
                 "to B, any of config:a:v1 / config:ab:v1 / absent",
-                o(AttestationQuery::to(b, lim).dimension_any_of(&[
-                    "evidence:safety_battery:capture:a:c:v1",
-                    "evidence:safety_battery:capture:ab:c:v1",
-                    "evidence:safety_battery:capture:none:c:v1",
-                ])),
+                o(AttestationQuery::to(b, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .dimension_any_of(&[
+                        "coherence_standing:cac:v1",
+                        "coherence_standing:cabc:v1",
+                        "coherence_standing:cnonec:v1",
+                    ])),
                 expect(
                     corpus,
                     |r| {
@@ -512,10 +533,7 @@ pub(crate) mod bodies {
                             && r.to == b
                             && matches!(
                                 r.dimension.as_deref(),
-                                Some(
-                                    "evidence:safety_battery:capture:a:c:v1"
-                                        | "evidence:safety_battery:capture:ab:c:v1"
-                                )
+                                Some("coherence_standing:cac:v1" | "coherence_standing:cabc:v1")
                             )
                     },
                     oldest,
@@ -527,7 +545,10 @@ pub(crate) mod bodies {
             let species = crate::federation::types::cohort_scope::SPECIES;
             out.push((
                 "to A, scope community",
-                o(AttestationQuery::to(a, lim).scope(community, None)),
+                o(AttestationQuery::to(a, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .scope(community, None)
+                    .view(ContentView::Record)),
                 expect(
                     corpus,
                     |r| fed(r) && r.to == a && r.scope == community,
@@ -536,7 +557,10 @@ pub(crate) mod bodies {
             ));
             out.push((
                 "to A, scope community comm1",
-                o(AttestationQuery::to(a, lim).scope(community, Some(c1))),
+                o(AttestationQuery::to(a, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .scope(community, Some(c1))
+                    .view(ContentView::Record)),
                 expect(
                     corpus,
                     |r| {
@@ -550,7 +574,10 @@ pub(crate) mod bodies {
             ));
             out.push((
                 "by A, scope community",
-                o(AttestationQuery::by(a, lim).scope(community, None)),
+                o(AttestationQuery::by(a, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .scope(community, None)
+                    .view(ContentView::Record)),
                 expect(
                     corpus,
                     |r| fed(r) && r.by == a && r.scope == community,
@@ -559,7 +586,9 @@ pub(crate) mod bodies {
             ));
             out.push((
                 "by A, scope species",
-                o(AttestationQuery::by(a, lim).scope(species, None)),
+                o(AttestationQuery::by(a, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .scope(species, None)),
                 expect(
                     corpus,
                     |r| fed(r) && r.by == a && r.scope == species,
@@ -569,14 +598,16 @@ pub(crate) mod bodies {
             out.push((
                 "by A, prefix i900s: + scope community comm2",
                 o(AttestationQuery::by(a, lim)
-                    .dimension_prefix("evidence:safety_battery:interpret:s")
-                    .scope(community, Some(c2))),
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .dimension_prefix("coherence_standing:is")
+                    .scope(community, Some(c2))
+                    .view(ContentView::Record)),
                 expect(
                     corpus,
                     |r| {
                         fed(r)
                             && r.by == a
-                            && dim(r, "evidence:safety_battery:interpret:s")
+                            && dim(r, "coherence_standing:is")
                             && r.scope == community
                             && r.target.as_deref() == Some(c2)
                     },
@@ -585,7 +616,9 @@ pub(crate) mod bodies {
             ));
             out.push((
                 "local by A",
-                o(AttestationQuery::by(a, lim).tier(QueryTier::Local)),
+                o(AttestationQuery::by(a, lim)
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .tier(QueryTier::Local)),
                 expect(corpus, |r| r.local && r.by == a, oldest),
             ));
         }
@@ -659,7 +692,8 @@ pub(crate) mod bodies {
         // never in A's pages.
         let all_a = page_through(
             d,
-            AttestationQuery::by(&corpus.a, NonZeroU32::MIN),
+            AttestationQuery::by(&corpus.a, NonZeroU32::MIN)
+                .view(crate::federation::attestation_query::ContentView::Record),
             50,
             99,
             "x",
@@ -690,7 +724,8 @@ pub(crate) mod bodies {
         s: &str,
     ) {
         let corpus = seed(d, s).await;
-        let q = AttestationQuery::by(&corpus.a, NonZeroU32::MIN);
+        let q = AttestationQuery::by(&corpus.a, NonZeroU32::MIN)
+            .view(crate::federation::attestation_query::ContentView::Record);
         match Overreturning(d).query_attestations(&q).await {
             ReadOutcome::NotServed(NotServedReason::Fault(Error::Backend(m))) => {
                 assert!(m.contains("past its page"), "{m}");
@@ -722,6 +757,116 @@ pub(crate) mod bodies {
         ));
     }
 
+    /// **I6712** — a room-pinned query (QUERY-1).
+    pub async fn i6712_a_room_pins_a_query(d: &dyn FederationDirectory, s: &str) {
+        use crate::federation::types::cohort_scope as cs;
+        let corpus = seed(d, s).await;
+        let prefix = "coherence_standing:is";
+        let mut want: Vec<&Row> = corpus
+            .rows
+            .iter()
+            .filter(|r| {
+                !r.local
+                    && r.scope == cs::COMMUNITY
+                    && r.target.as_deref() == Some(corpus.comm1.as_str())
+                    && r.dimension
+                        .as_deref()
+                        .is_some_and(|x| x.starts_with(prefix))
+            })
+            .collect();
+        want.sort_by(|x, y| (y.at, &y.id).cmp(&(x.at, &x.id)));
+        assert!(want.len() >= 2, "I6712 the corpus has two comm1 rows");
+        // v62.0.0 (CONTENT-A7) — a room read states its view.
+        let q = AttestationQuery::in_room(cs::COMMUNITY, &corpus.comm1, NonZeroU32::MIN)
+            .view(crate::federation::attestation_query::ContentView::Record)
+            .dimension_prefix(prefix)
+            .view(ContentView::Record);
+        q.validate().expect("I6712 a room pins the query");
+        // Newest first, one row per page, to the end.
+        let mut got: Vec<String> = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = d
+                .query_attestations(&q.clone().after(cursor.clone()))
+                .await
+                .served()
+                .expect("I6712 served");
+            assert!(page.rows.len() <= 1, "I6712 the limit is honoured");
+            got.extend(page.rows.iter().map(|r| r.attestation_id.clone()));
+            match page.next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        let ids: Vec<String> = want.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(got, ids, "I6712 newest first, the room's rows only");
+        // A high-water cursor at the newest row, read oldest-first: nothing new.
+        let newest = want[0];
+        let high = crate::ceg::list::federation::AttestationCursor::from_trailing(
+            newest.at,
+            newest.id.clone(),
+        );
+        let fresh = d
+            .query_attestations(&q.clone().oldest_first().after(Some(high)))
+            .await
+            .served()
+            .expect("I6712 served");
+        assert!(
+            fresh.rows.is_empty() && fresh.next.is_none(),
+            "I6712 nothing new: {fresh:?}"
+        );
+        // Still refused: no key and no room; a scope without its target; a
+        // target at `self`.
+        let refused = |o: ReadOutcome| {
+            matches!(
+                o,
+                ReadOutcome::NotServed(NotServedReason::Refused(Error::InvalidArgument(_)))
+            )
+        };
+        let mut none = q.clone();
+        none.scope = None;
+        assert!(
+            refused(d.query_attestations(&none).await),
+            "I6712 no key, no room"
+        );
+        let mut untargeted = q.clone();
+        untargeted.scope = Some(ScopeFilter {
+            cohort_scope: cs::COMMUNITY.to_owned(),
+            cohort_target: None,
+        });
+        assert!(
+            refused(d.query_attestations(&untargeted).await),
+            "I6712 no target"
+        );
+        let at_self = AttestationQuery::in_room(cs::SELF, &corpus.a, NonZeroU32::MIN)
+            .view(crate::federation::attestation_query::ContentView::Record);
+        assert!(
+            refused(d.query_attestations(&at_self).await),
+            "I6712 self has no room"
+        );
+        // The audience floor: a peer is served the room's rows by
+        // `edition2::serve::servable_to`, which this form does not touch.
+        let held = d
+            .get_attestation(&newest.id)
+            .await
+            .unwrap()
+            .expect("I6712 the row is held");
+        let st = crate::federation::edition2::fixture_switch::carried_statement(&held)
+            .expect("I6712 the row carries its statement");
+        assert!(
+            !crate::federation::edition2::serve::servable_to(d, &st, Some(&corpus.c))
+                .await
+                .unwrap(),
+            "I6712 a non-member of the room is served nothing of it"
+        );
+        assert!(
+            crate::federation::edition2::serve::servable_to(d, &st, Some(&corpus.a))
+                .await
+                .unwrap(),
+            "I6712 a member is served it"
+        );
+    }
+
     /// **I905** — error is not empty. `d` is the real backend; it is wrapped
     /// in the fault double for the fault and the proxy refusal.
     pub async fn i905_not_served_is_never_an_empty_page(
@@ -731,7 +876,9 @@ pub(crate) mod bodies {
         use crate::federation::directory_double::FaultInjectingDirectory;
         let corpus = seed(&*d, s).await;
         // Served, zero rows: the filter matches nothing.
-        let unmatched = AttestationQuery::by(&corpus.a, NonZeroU32::MIN).dimension("i905:never:v1");
+        let unmatched = AttestationQuery::by(&corpus.a, NonZeroU32::MIN)
+            .view(crate::federation::attestation_query::ContentView::Record)
+            .dimension("i905:never:v1");
         match d.query_attestations(&unmatched).await {
             ReadOutcome::Served(p) => {
                 assert!(p.rows.is_empty() && p.next.is_none(), "I905 {p:?}");
@@ -739,13 +886,15 @@ pub(crate) mod bodies {
             other => panic!("I905 an unmatched filter is Served(empty), got {other:?}"),
         }
         // And an unknown key: still Served(empty).
-        let nobody = AttestationQuery::to(&format!("i905-nobody-{s}"), NonZeroU32::MIN);
+        let nobody = AttestationQuery::to(&format!("i905-nobody-{s}"), NonZeroU32::MIN)
+            .view(crate::federation::attestation_query::ContentView::Record);
         assert!(matches!(
             d.query_attestations(&nobody).await,
             ReadOutcome::Served(ref p) if p.rows.is_empty()
         ));
         // A matching query, for the faults below: Served with rows.
-        let q = AttestationQuery::by(&corpus.a, NonZeroU32::MIN);
+        let q = AttestationQuery::by(&corpus.a, NonZeroU32::MIN)
+            .view(crate::federation::attestation_query::ContentView::Record);
         assert!(matches!(
             d.query_attestations(&q).await,
             ReadOutcome::Served(ref p) if p.rows.len() == 1
@@ -794,7 +943,9 @@ pub(crate) mod bodies {
         for minute in cuts {
             let t = base() + chrono::Duration::minutes(minute);
             for oldest in [false, true] {
-                let mut q = AttestationQuery::by(&a, NonZeroU32::MIN).as_of(t);
+                let mut q = AttestationQuery::by(&a, NonZeroU32::MIN)
+                    .view(crate::federation::attestation_query::ContentView::Record)
+                    .as_of(t);
                 if oldest {
                     q = q.oldest_first();
                 }
@@ -810,27 +961,15 @@ pub(crate) mod bodies {
         }
         // Replay: the as-of(-26) view, read now.
         let t = base() + chrono::Duration::minutes(-26);
-        let q = AttestationQuery::by(&a, NonZeroU32::new(50).unwrap()).as_of(t);
+        let q = AttestationQuery::by(&a, NonZeroU32::new(50).unwrap())
+            .view(crate::federation::attestation_query::ContentView::Record)
+            .as_of(t);
         let before = d.query_attestations(&q).await.served().unwrap().rows;
         // A row RECEIVED now but SIGNED at -40 (inside the view) enters it; a
         // row received now and signed at -25 (after t) does not — even though
         // both landed after the first read.
-        let inside = put_scores(
-            d,
-            &a,
-            &corpus.b,
-            "evidence:safety_battery:capture:i906in:c:v1",
-            -40,
-        )
-        .await;
-        let outside = put_scores(
-            d,
-            &a,
-            &corpus.b,
-            "evidence:safety_battery:capture:i906out:c:v1",
-            -25,
-        )
-        .await;
+        let inside = put_scores(d, &a, &corpus.b, "coherence_standing:ci906inc:v1", -40).await;
+        let outside = put_scores(d, &a, &corpus.b, "coherence_standing:ci906outc:v1", -25).await;
         let after = d.query_attestations(&q).await.served().unwrap().rows;
         let ids: Vec<&str> = after.iter().map(|r| r.attestation_id.as_str()).collect();
         assert!(
@@ -889,6 +1028,15 @@ mod runners {
                 async fn i906_as_of_replays_by_the_signed_instant() {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::i906_as_of_replays_by_the_signed_instant(
+                        &d as &dyn FederationDirectory,
+                        &suffix(),
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i6712_a_room_pins_a_query() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i6712_a_room_pins_a_query(
                         &d as &dyn FederationDirectory,
                         &suffix(),
                     )

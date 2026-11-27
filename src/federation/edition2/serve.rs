@@ -159,6 +159,9 @@ pub fn is_bootstrap_kind(statement: &[u8]) -> bool {
 /// T7 l.1240). No wall clock: `at_ms` is the caller's instant. It now reads
 /// `node`'s chain, not this directory's node key's.
 ///
+/// v62.0.0 (R2-rooms; CC 3.2 T5) — the root is the bundle's lineage only:
+/// [`rooted_under`] reads `trust_root::bundle_root_accepted`, nothing else.
+///
 /// # Errors
 /// Directory reads.
 pub async fn node_is_rooted<F>(dir: &F, node: &str, at_ms: u64) -> Result<bool, Error>
@@ -170,7 +173,7 @@ where
 
 /// v62.0.0 (KB-fix4) — [`node_is_rooted`], naming the root: the first root
 /// `node`'s governing acceptor names that roots it (the bundle lineage's
-/// `family_key_id`, or a keyed root's id while that arm stands). `None`:
+/// `family_key_id`; v62.0.0 R2-rooms: there is no other kind). `None`:
 /// not rooted. The ONE body `node_is_rooted` and the host's read
 /// (`Engine::root_standing`) share.
 ///
@@ -180,7 +183,6 @@ pub async fn rooted_under<F>(dir: &F, node: &str, at_ms: u64) -> Result<Option<S
 where
     F: FederationDirectory + ?Sized,
 {
-    use crate::federation::canonical_community::{reader_standing, StoredStanding};
     let Some(now) = chrono::TimeZone::timestamp_millis_opt(
         &chrono::Utc,
         i64::try_from(at_ms).unwrap_or(i64::MAX),
@@ -200,13 +202,10 @@ where
         {
             return Ok(Some(root));
         }
-        let (standing, _) = Box::pin(reader_standing(dir, Some(node), &root, now)).await?;
-        if matches!(
-            standing,
-            StoredStanding::Rooted(_) | StoredStanding::Stalled { .. }
-        ) {
-            return Ok(Some(root));
-        }
+        // v62.0.0 (R2-rooms; CC 3.2 T5, "There is no other kind of root") —
+        // the KEYED fallback (a room chain read as a root's,
+        // `canonical_community::reader_standing`) is deleted: an accepted id
+        // that is not the bundle's lineage roots nothing.
     }
     Ok(None)
 }
@@ -572,6 +571,9 @@ where
 /// voice is counted. Every other family: `false` (a second-signer row with no
 /// typed row is never inferred concluded from the absence of a hold).
 ///
+/// VD-step1 — the conclusion is the one verdict's
+/// ([`super::verdict::row_state`]); this keeps RL-fix23's family scope.
+///
 /// # Errors
 /// Directory reads.
 pub(crate) async fn bootstrap_bind_concluded<F>(dir: &F, statement: &[u8]) -> Result<bool, Error>
@@ -579,7 +581,7 @@ where
     F: FederationDirectory + ?Sized,
 {
     use ciris_verify_core::namespace_match::family_id;
-    let Some((protected, payload)) = statement_parts(statement) else {
+    let Some((protected, _)) = statement_parts(statement) else {
         return Ok(false);
     };
     let family = protected.get_int(-70002).and_then(Value::as_text);
@@ -587,22 +589,149 @@ where
     if family != Some(occ_family) && family != Some(family_id(occ_family).as_str()) {
         return Ok(false);
     }
-    let text = |k: &str| payload.get_text(k).and_then(Value::as_text);
-    let (Some(identity), Some(occurrence), Some(at)) = (
-        text("identity_key_id"),
-        text("occurrence_key_id"),
-        payload.get_text("asserted_at").and_then(Value::as_u64),
-    ) else {
+    let Some(rid) = super::names::RowId::of_statement(statement) else {
         return Ok(false);
     };
-    Ok(dir
-        .list_identity_occurrences_by_occurrence_key(occurrence)
+    Ok(super::verdict::row_state(dir, &rid).await?.is_concluded())
+}
+
+/// v62.0.0 (WD-fix14; CC 5.4.6 "An occurrence follows its bindings", Eric's
+/// ruling via Constitution, 11-22) — **the audience of a concluded
+/// `identity:occurrence` bind**, by the identity's kind:
+///
+/// - a NODE's own self pair (author = identity = occurrence; its transport
+///   destination binding): `None`, the statement's scope rule as before
+///   (public, a bootstrap kind before Rooted; the Constitution's standing
+///   answer for a node, unchanged);
+/// - any other MACHINE occurrence (an AGENT identity's; a key bound under a
+///   NODE identity): `Some`: served to a requester in the audience of
+///   `self` (the identity's own) or of a placement of one of the identity's
+///   owner bindings in force now (`cohort_scope` + `community_id` /
+///   `family_id`, [`envelope_cohort_target`]: the same members the binding
+///   gate reads), and to no one else; a commons placement (the owner
+///   announced it at `federation`) is the public one, the only one an
+///   anonymous read is served;
+/// - a PERSON's occurrence (Constitution, 11-23): `Some`, by the same rule
+///   over the UNION of the placements of the owner bindings of EVERY node
+///   the person owns (`admission::nodes_owned_by`), plus `self`. Placement
+///   is per person at a group, never per device; a seat in a room places
+///   nothing. A person who placed no node's binding at a room has no
+///   occurrence held by that room's co-members (they wrap nothing to the
+///   person there) until one is placed.
+///
+/// Not an occurrence bind: `None`.
+///
+/// [`envelope_cohort_target`]: crate::federation::admission::envelope_cohort_target
+///
+/// # Errors
+/// Directory reads; a binding with two cohort targets.
+pub(crate) async fn occurrence_follows_its_bindings<F>(
+    dir: &F,
+    statement: &[u8],
+    requester: Option<&str>,
+) -> Result<Option<bool>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use crate::federation::types::identity_type::{set_contains, AGENT, NODE};
+    use ciris_verify_core::namespace_match::family_id;
+    let Some((protected, payload)) = statement_parts(statement) else {
+        return Ok(None);
+    };
+    let occ_family = super::occurrence::OCCURRENCE_FAMILY;
+    let family = protected.get_int(-70002).and_then(Value::as_text);
+    if family != Some(occ_family) && family != Some(family_id(occ_family).as_str()) {
+        return Ok(None);
+    }
+    let text = |m: &str| payload.get_text(m).and_then(Value::as_text);
+    let (Some(identity), Some(occurrence)) = (text("identity_key_id"), text("occurrence_key_id"))
+    else {
+        return Ok(None);
+    };
+    let types = dir
+        .lookup_public_key(identity)
         .await?
-        .iter()
-        .any(|o| {
-            o.identity_key_id == identity
-                && u64::try_from(o.asserted_at.timestamp_millis()).ok() == Some(at)
-        }))
+        .map(|r| r.identity_type)
+        .unwrap_or_default();
+    let (node, agent) = (set_contains(&types, NODE), set_contains(&types, AGENT));
+    // A node's own self pair: public (unchanged).
+    if node && identity == occurrence {
+        return Ok(None);
+    }
+    // The bindings whose placements are the occurrence's audience: a
+    // machine's own owner bindings; for a PERSON, the owner bindings of
+    // EVERY node the person owns (Constitution, 11-23: "each of a person's
+    // devices is held wherever one of them is placed"; a seat in a room
+    // places nothing: membership alone is no placement). A key of neither
+    // kind (no person, no machine record held): the scope rule as before.
+    let now = crate::host::clock::now();
+    let bindings = if agent {
+        // An AGENT's binding is read by its own fold (BIND-1:
+        // `is_owner_binding_envelope` marks a NODE binding only), the one
+        // `agent_owner_of` reads: each live binding's row.
+        let at_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
+        let mut rows = Vec::new();
+        for (_, rid) in
+            crate::federation::admission::agent_owner_bindings_at(dir, identity, at_ms).await?
+        {
+            if let Some(row) = dir.get_attestation(&rid).await? {
+                rows.push(row);
+            }
+        }
+        rows
+    } else if node {
+        crate::federation::admission::owner_bindings_in_force_at(dir, identity, now).await?
+    } else if super::occurrence::is_person_key(dir, identity).await? {
+        let mut all = Vec::new();
+        for owned in crate::federation::admission::nodes_owned_by(dir, identity).await? {
+            all.extend(
+                crate::federation::admission::owner_bindings_in_force_at(dir, &owned, now).await?,
+            );
+        }
+        all
+    } else {
+        return Ok(None);
+    };
+    let Some(peer) = requester.filter(|p| !p.is_empty()) else {
+        // An anonymous read: the commons placement only.
+        return Ok(Some(bindings.iter().any(|b| {
+            cs::Scope::parse(&b.cohort_scope).map(cs::Scope::placement)
+                == Some(cs::Placement::Commons)
+        })));
+    };
+    if crate::federation::replication::hold::is_audience(
+        dir,
+        cs::SELF,
+        None,
+        identity,
+        |author| author == peer,
+        peer,
+    )
+    .await?
+    {
+        return Ok(Some(true));
+    }
+    for b in &bindings {
+        if cs::Scope::parse(&b.cohort_scope).map(cs::Scope::placement)
+            == Some(cs::Placement::Commons)
+        {
+            return Ok(Some(true));
+        }
+        let target = crate::federation::admission::envelope_cohort_target(&b.attestation_envelope)?;
+        if crate::federation::replication::hold::is_audience(
+            dir,
+            &b.cohort_scope,
+            target,
+            &b.attesting_key_id,
+            |author| author == peer,
+            peer,
+        )
+        .await?
+        {
+            return Ok(Some(true));
+        }
+    }
+    Ok(Some(false))
 }
 
 /// **The statement's own serve rule**, before any row naming it carries
@@ -684,6 +813,15 @@ where
                 && Box::pin(bootstrap_bind_concluded(dir, statement)).await?)
         {
             return Ok(false);
+        }
+        // v62.0.0 (WD-fix14; CC 5.4.6 "An occurrence follows its bindings")
+        // — an occurrence (other than a node's own self pair) is served only to
+        // the audiences its identity's owner bindings are placed at (a
+        // person's: every owned node's), and `self`.
+        if let Some(decision) =
+            Box::pin(occurrence_follows_its_bindings(dir, statement, requester)).await?
+        {
+            return Ok(decision);
         }
         return Box::pin(super::group_serve::servable_without_row(
             dir, statement, requester,

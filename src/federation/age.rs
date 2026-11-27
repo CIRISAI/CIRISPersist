@@ -352,7 +352,9 @@ pub async fn age_band_held<F: FederationDirectory + ?Sized>(
 ) -> Result<AgeBand, Error> {
     super::edition2::fold::reads(super::edition2::fold::Dep::key(k));
     let mut rows = Vec::new();
-    let mut pages = AttestationQuery::to(k, FOLD_PAGE).pages();
+    let mut pages = AttestationQuery::to(k, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
+        .pages();
     while let Some(page) = pages.next(directory).await? {
         rows.extend(page);
     }
@@ -400,7 +402,9 @@ async fn age_rows_about(
     k: &str,
 ) -> Result<Vec<super::types::Attestation>, Error> {
     let mut rows = Vec::new();
-    let mut pages = AttestationQuery::to(k, FOLD_PAGE).pages();
+    let mut pages = AttestationQuery::to(k, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
+        .pages();
     while let Some(page) = pages.next(directory).await? {
         rows.extend(page);
     }
@@ -797,7 +801,10 @@ pub async fn age_band_fine(
     // taken at this node's own clock, explicitly, and means nothing beyond
     // this node. A fold or a gate asks `age_band_as_of` with the act's
     // instant instead.
-    let now = crate::host::clock::now();
+    // v62.0.0 (HOLD-1e) — but a gate DOES reach it (`is_steward_bound` →
+    // `age_band`): inside a door's gates it reads the row's original
+    // receipt, never the clock again; elsewhere the clock, as above.
+    let now = crate::federation::attestation_admit::receipt_now();
     let rows = age_rows_about(directory, k).await?;
     Ok(band_as_of_rows(&rows, now))
 }

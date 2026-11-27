@@ -901,7 +901,12 @@ pub fn draft_reclaim_withdraws(
             "edition2_payload_invalid: {target_owner_binding_id:?} is not an edition-2 row id"
         ))
     })?;
-    super::edition2::emit::draft_from_envelope(
+    // v62.0.0 (HEAD-3; CC 2.4.1.1, "Where one row between two keys is the
+    // whole record, as an owner-binding is, that row is the head") — the end
+    // names the binding it ends as the head it acts from. It is one
+    // signer's (authored) end: its count is the cited WA finding, so it
+    // carries no `lifts` (`lifts_on_own_end`).
+    super::edition2::emit::draft_from_envelope_naming_head(
         kid,
         iss,
         node,
@@ -909,6 +914,7 @@ pub fn draft_reclaim_withdraws(
         &build_reclaim_withdraws_envelope(target_owner_binding_id, wa_adjudication_ref),
         asserted_at_ms,
         Some((&target, target_family)),
+        &super::edition2::names::RowId(target),
     )
 }
 
@@ -1064,6 +1070,7 @@ async fn holds_recovery_delegation(
     now: DateTime<Utc>,
 ) -> Result<bool, Error> {
     let mut pages = AttestationQuery::by(node, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .attested_to(issuer)
         .types(&[attestation_type::DELEGATES_TO])
         .pages();
@@ -1411,6 +1418,7 @@ pub async fn check_post_reclaim_rebinding_admission(
     fold::reads(Dep::row_hex(&row.attestation_id).unwrap_or_else(|| Dep::key(&row.attestation_id)));
     let mut reclaimed = false;
     let mut pages = AttestationQuery::to(node, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .types(&[attestation_type::WITHDRAWS])
         .pages();
     while let Some(page) = pages.next(directory).await? {

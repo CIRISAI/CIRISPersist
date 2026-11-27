@@ -25,8 +25,9 @@
 //! 3. **the row's own scrub set reaches the HUMANITY_ACCORD family's quorum**
 //!    — the authority signature plus [`SignedCommunity::cosignatures`], all
 //!    over [`Community::signing_envelope`], counted by the SAME m-of-n body
-//!    that charters a family root
-//!    ([`family_quorum_holders_over_envelope`](super::trust_root::family_quorum_holders_over_envelope)),
+//!    that charters a family root (`trust_root::family_quorum_holders_over_envelope`,
+//!    deleted in v62.0.0 R2-rest: an edition-2 birth is counted over the
+//!    holders of the bundle in force, `trust_root_group::bundle_quorum_over`),
 //!    against THIS node's own stored accord family and its own directory pins.
 //!
 //! The id `ciris-canonical` is reserved to this door: any row at that id runs
@@ -447,7 +448,9 @@ where
 async fn accord_quorum_at<F>(
     directory: &F,
     signed: &SignedCommunity,
-    memo: &mut Memo,
+    // v62.0.0 (R2-rest) — the family roster fold this bounded is deleted; the
+    // bundle's count holds no `effective_at` instants of its own.
+    _memo: &mut Memo,
 ) -> Result<super::trust_root::SignerCount, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -461,23 +464,10 @@ where
     {
         return super::edition2::trust_root_group::bundle_quorum_over(directory, &signers).await;
     }
-    let Some(family) =
-        super::trust_root::resolve_family_root(directory, accord_family_key_id()).await?
-    else {
-        return Err(insufficient(signed));
-    };
-    for t in family_event_instants(directory, &family.family_key_id).await? {
-        memo.bound(t);
-    }
-    let (quorum, _) = super::trust_root::family_quorum_holders_over_envelope_at(
-        directory,
-        &signed.community.signing_envelope(),
-        &community_scrubs(signed),
-        &family,
-        memo.now,
-    )
-    .await?;
-    Ok(quorum)
+    // v62.0.0 (R2-rest; CC 3.2 T5) — the earlier-form fallback (the accord
+    // FAMILY record's m-of-n over the row's scrubs, `resolve_family_root`) is
+    // DELETED: a version with no edition-2 voices is short.
+    Err(insufficient(signed))
 }
 
 /// Every holder widening and revocation instant of the family's roster plane
@@ -1607,7 +1597,13 @@ pub async fn stored_standing<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    stored_standing_at(directory, community_key_id, crate::host::clock::now()).await
+    // v62.0.0 (HOLD-1e) — a re-judgement reads the row's original receipt.
+    stored_standing_at(
+        directory,
+        community_key_id,
+        crate::federation::attestation_admit::receipt_now(),
+    )
+    .await
 }
 
 /// v62.0.0 (wave W1b; CC 3.2 T3, CC 4.4.3.34, CC 2.6.1.12) — **the READ
@@ -2240,6 +2236,7 @@ where
     let mut charters = Vec::new();
     let mut pages =
         super::attestation_query::AttestationQuery::to(family, super::attestation_query::FOLD_PAGE)
+            .view(crate::federation::attestation_query::ContentView::Record)
             .types(&[super::types::attestation_type::DELEGATES_TO])
             .excluding_dimensions(&super::trust_root::jobs_other_than(
                 super::trust_root::TRUST_CHARTER_DIMENSION,
@@ -2629,19 +2626,27 @@ where
         }
         // The rule, per row (RL-fix15's table; witnessed at both doors):
         // (a) names no bundle, none of the lineage held: not on this branch
-        //     (no bundle in force): the edge waits on the subject rule and
-        //     lands at the import;
-        // (b) names no bundle, the lineage held: lands (the id is audit-only,
-        //     Verify 23.4.0; `Engine::accept_root` always names the held tip,
-        //     so only a peer's or an earlier edge reaches this row, and it
-        //     binds the LINEAGE, which is what an acceptance accepts);
+        //     (no bundle in force): the edge waits on the subject rule; at
+        //     the import its re-fold reaches (b);
+        // (b) v62.0.0 (R2-accept; the Constitution's `trust-accepts` rule,
+        //     "a new edge without it is refused, trust_root_head_unnamed")
+        //     names no bundle, the lineage held: REFUSED
+        //     `trust_root_head_unnamed`, at both doors (the row's own bytes;
+        //     an edge held before this rule passes above, unjudged);
         // (c) names a held Valid bundle of the lineage: lands;
         // (d) names a bundle not held: HELD `trust_root_head_stale`;
         // (e) names a held bundle of another lineage: unreachable in v62 (a
         //     node reads every held bundle as one lineage; a second
         //     `family_key_id` is a fork), so it reads as (d).
         return match presented {
-            None => Ok(()),
+            None => Err(Error::TrustRootHeadUnnamed {
+                root_key_id: root.to_owned(),
+                detail: format!(
+                    "a new acceptance of the lineage {root} names the bundle it attaches on \
+                     (`{}`, a hash digest): it names none (CC 3.2 T4a)",
+                    paths::ATTACHED_HEAD_DIGEST
+                ),
+            }),
             Some(p) if in_force.valid.iter().any(|b| hex::encode(b.object_id) == p) => Ok(()),
             Some(p) => refuse(format!(
                 "the presented bundle {p} is no bundle of the lineage {root} this node holds: \
@@ -2905,47 +2910,6 @@ where
     Ok(head.map(|(digest, _)| digest))
 }
 
-/// #973 (CC 3.2 T3 / T4a) — **the signed envelope of a NEW acceptance edge**
-/// toward `root`, as a host emits it: the job label, the scope the node
-/// accepts the root for, and the head it attaches on.
-///
-/// ```json
-/// { "dimension": "trust:accepts:v1",
-///   "scope": ["infra:attest", "infra:serve"],
-///   "attached_head_digest": "<64 hex>" }
-/// ```
-///
-/// `attached_head_digest` is [`attach_head_for`]'s answer and is omitted for a
-/// key root (no lineage held: the attach gate does not apply). The host adds
-/// its own `references_attestation_id` if it uses one and emits the row as a
-/// `delegates_to` with `attested_key_id = root`. Since #973 a `delegates_to`
-/// toward a root WITHOUT the label gives no acceptance, and a labelled one
-/// without the head is refused `trust_root_head_unnamed`.
-///
-/// # Errors
-///
-/// A directory read failure. `Ok` with no head while a witnessed lineage has
-/// no witnessed head yet: the edge is then refused at the write door, which is
-/// the honest answer (nothing is attachable).
-pub async fn acceptance_edge_envelope<F>(
-    directory: &F,
-    root: &str,
-    scope: &[&str],
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<serde_json::Value, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let mut envelope = serde_json::json!({
-        "dimension": super::trust_root::TRUST_ACCEPTS_DIMENSION,
-        "scope": scope,
-    });
-    if let Some(head) = attach_head_for(directory, root, now).await? {
-        envelope[super::envelope::paths::ATTACHED_HEAD_DIGEST] = serde_json::Value::String(head);
-    }
-    Ok(envelope)
-}
-
 /// v51.0.0 (CIRISPersist#938) — the witness plane's view of a held trust-root
 /// lineage, for the trust surfaces (`resolve_community`, the bundle response):
 /// the judged index, the unwitnessed tail, any equivocation, and `silent_since`
@@ -2984,7 +2948,13 @@ pub async fn rooted_community_family<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    rooted_community_family_at(directory, community_key_id, crate::host::clock::now()).await
+    // v62.0.0 (HOLD-1e) — a re-judgement reads the row's original receipt.
+    rooted_community_family_at(
+        directory,
+        community_key_id,
+        crate::federation::attestation_admit::receipt_now(),
+    )
+    .await
 }
 
 /// v62.0.0 (TR-fix1; CC 3.2 T8) — [`rooted_community_family`] judged at the
@@ -3673,7 +3643,9 @@ where
 /// already un-counts the key). The planes admit and remove MEMBERS only.
 ///
 /// One exception, the consent floor (#926 re-check): a founder's OWN
-/// revocation, signed by that founder alone, is admitted as a RESIGNATION. It
+/// end is admitted as a RESIGNATION. v62.0.0 (RESIGN-3; CC 3.1.3.2) — that
+/// end is the `resignation` leaf (`change`), never a removal the founder
+/// alone voiced, which is a founder-seat change on the plane like any other. It
 /// does not move the record: from its `effective_at` the founder stops
 /// counting (and stops being a seat) in every link and in the row's standing,
 /// so the row stalls until the other founders amend the seat out — or, if the
@@ -3687,14 +3659,14 @@ where
 pub async fn check_trust_root_roster_change<F>(
     directory: &F,
     community: &Community,
-    signers: &std::collections::BTreeSet<String>,
     incoming: &super::types::CommunityMember,
-    is_revocation: bool,
+    change: super::RosterChange,
     effective_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error>
 where
     F: FederationDirectory + ?Sized,
 {
+    let is_revocation = change.is_revocation();
     let founder = super::admission::MEMBER_ROLE_FOUNDER;
     // v62.0.0 (wave GC8; CC 2.7.3) — the held head, its roster fold and its
     // liveness are other rows: each leg that reads them is a fold
@@ -3720,10 +3692,10 @@ where
         .iter()
         .any(|m| m.key_id == incoming.key_id && m.role.as_deref() == Some(founder));
     let seats_founder = !is_revocation && incoming.role.as_deref() == Some(founder);
-    let resignation = is_revocation
-        && (recorded || folded)
-        && signers.len() == 1
-        && signers.contains(&incoming.key_id);
+    // v62.0.0 (RESIGN-3; CC 3.1.3.2) — a founder's resignation is the
+    // `resignation` leaf, never a removal its subject voiced alone (that is
+    // a removal of a founder seat on the plane, below).
+    let resignation = change.is_resignation() && (recorded || folded);
     if resignation {
         // Review MEDIUM-R (a): a resignation dated at or before the stored
         // head's instant would un-count a link the founder co-signed and
@@ -3993,242 +3965,9 @@ pub(crate) fn parse_quorum(s: &str) -> Option<(usize, usize)> {
 // (`server::edition2::trust_root_statements`); a node imports a genesis at
 // `edition2::genesis::put_genesis_bundle`.
 
-/// v62.0.0 (wave T2) — the trust root's ROOTED head, or why there is none
-/// (a refusal pair, `(reason, detail)`), for the edition-2 voice count
-/// ([`trust_root_counts_voices`]). v62.0.0 (BH-fix1): the earlier
-/// cosigned-envelope count (`trust_root_cosigners_over`, separate Ed25519 +
-/// ML-DSA-65 pairs) is deleted.
-///
-/// # Errors
-/// Directory reads.
-pub(crate) async fn trust_root_head<F>(
-    directory: &F,
-    community_key_id: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<Result<Box<SignedCommunity>, (&'static str, String)>, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    use super::steward_purge::unauthorised_reason as why;
-    // v62.0.0 (wave GC8; CC 2.7.3) — the root's standing is other rows: an
-    // answer that is not `Rooted` is a fold condition, noted on the running
-    // attempt with its token (the caller still answers its refusal pair; at
-    // an edition-2 door the row is held and re-folds when the root's rows
-    // change). Outside an attempt nothing is marked.
-    fold::reads(Dep::key(community_key_id));
-    let out = match stored_standing_at(directory, community_key_id, now).await? {
-        // v62.0.0 (TR-fix1; CC rc21 3.2 T7 l.1240) — a STALLED root is valid,
-        // and "non-admitting means exactly" no roster widening or removal by
-        // the founders' count and no ceremony-plane conferral by this roster.
-        // A purge is neither, so a stalled root's founders still authorise it
-        // ("Everything else is unchanged").
-        StoredStanding::Rooted(head) | StoredStanding::Stalled { held: head, .. } => Ok(head),
-        StoredStanding::NotRooted { reason } => Err((
-            why::ROOT_NOT_ROOTED,
-            format!("the row at {community_key_id:?} is not rooted ({reason})"),
-        )),
-        StoredStanding::Absent => Err((
-            why::ROOT_NOT_HELD,
-            format!(
-                "no community row at {community_key_id:?}: the claimant is not a trust root this \
-                 node holds"
-            ),
-        )),
-    };
-    if let Err((why_token, _)) = &out {
-        note_fold_reason(why_token);
-    }
-    Ok(out)
-}
-
-/// v62.0.0 (wave GC8) — mark the running fold attempt with the fold reason a
-/// trust-root count's refusal token names (`steward_purge::unauthorised_reason`).
-/// Only the tokens that read OTHER rows are fold conditions; a token about
-/// the notice's own bytes (no cosignature, a duplicate, a signature that does
-/// not verify, a malformed notice) marks nothing and stays a refusal.
-fn note_fold_reason(why_token: &str) {
-    use super::steward_purge::unauthorised_reason as why;
-    let r = match why_token {
-        t if t == why::ROOT_NOT_HELD => fold::reason::gc8::ROOT_NOT_HELD,
-        t if t == why::ROOT_NOT_ROOTED => fold::reason::gc8::ROOT_NOT_ROOTED,
-        t if t == why::STALLED => fold::reason::gc8::STALLED,
-        t if t == why::NOT_A_SEAT => fold::reason::gc8::NOT_A_SEAT,
-        t if t == why::COSIGNER_KEY_NOT_HELD => fold::reason::gc8::COSIGNER_KEY_NOT_HELD,
-        t if t == why::QUORUM_NOT_MET => fold::reason::COUNT_SHORT,
-        t if t == why::PROTOCOL_UNEVALUABLE => fold::reason::gc8::PROTOCOL_UNEVALUABLE,
-        _ => return,
-    };
-    fold::note(r);
-}
-
-/// v62.0.0 (wave T2) — the trust root's own `consensus_protocol` over
-/// `signers` (seats already checked): the ONE count both purge
-/// authorisations run.
-///
-/// # Errors
-/// Directory reads.
-async fn count_over_trust_root<F>(
-    directory: &F,
-    head: &SignedCommunity,
-    signers: std::collections::BTreeSet<String>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<Result<std::collections::BTreeSet<String>, (&'static str, String)>, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    use super::steward_purge::unauthorised_reason as why;
-    let mut seats: Vec<super::consensus::Seat> = Vec::with_capacity(head.community.members.len());
-    fold::reads(Dep::key(&head.community.community_key_id));
-    for m in &head.community.members {
-        fold::reads(Dep::key(&m.key_id));
-        seats.push(super::consensus::Seat {
-            key_id: m.key_id.clone(),
-            role: m.role.clone(),
-            node_bearing: super::is_node_bearing_key_at(directory, &m.key_id, now).await?,
-        });
-    }
-    let verdict = super::consensus::evaluate(&super::consensus::Ballot {
-        protocol: &head.community.consensus_protocol,
-        subkind: super::community_subkind(&head.community),
-        policy_blob: head.community.policy_blob.as_ref(),
-        roster: &seats,
-        signers: &signers,
-        direction: super::consensus::Direction::Add,
-        subject: None,
-        // The trust root's chain keeps the per-key count (CIRISPersist#1198).
-        persons: super::key_person::PersonsAt::each_key(),
-        high_water: None,
-    });
-    // v62.0.0 (wave GC8) — a count short of the held head's protocol, or one
-    // the held roster cannot evaluate, is a fold condition.
-    match &verdict {
-        super::consensus::Verdict::Admit => {}
-        super::consensus::Verdict::Insufficient { .. } => note_fold_reason(why::QUORUM_NOT_MET),
-        super::consensus::Verdict::Unevaluable { .. } => {
-            note_fold_reason(why::PROTOCOL_UNEVALUABLE);
-        }
-    }
-    match verdict {
-        super::consensus::Verdict::Admit => Ok(Ok(signers)),
-        super::consensus::Verdict::Insufficient { detail, .. } => Ok(Err((
-            why::QUORUM_NOT_MET,
-            format!(
-                "the trust root's consensus_protocol {:?} is not met: {detail}",
-                head.community.consensus_protocol
-            ),
-        ))),
-        super::consensus::Verdict::Unevaluable { reason } => Ok(Err((
-            why::PROTOCOL_UNEVALUABLE,
-            format!(
-                "the trust root's consensus_protocol {:?} cannot be evaluated: {reason}",
-                head.community.consensus_protocol
-            ),
-        ))),
-    }
-}
-
-/// v62.0.0 (wave T2) — **the trust root's count over an edition-2 notice's
-/// voices**: `voices` are the issuers of the notice's held statements, each
-/// verified by the edition-2 door (`cosign::edition2_voices` re-admits
-/// them), so no signature is checked here. The root must be rooted, every
-/// voice a seat of its head (a non-seat is a refusal, not a discount, as
-/// for a cosignature), and the head's protocol met
-/// ([`count_over_trust_root`], the same count).
-///
-/// # Errors
-/// `Ok(Err((reason, detail)))` names why the voices do not authorise:
-/// `reason` is a [`unauthorised_reason`](super::steward_purge::unauthorised_reason)
-/// token; `Err` is a directory read failure.
-pub async fn trust_root_counts_voices<F>(
-    directory: &F,
-    community_key_id: &str,
-    voices: &std::collections::BTreeSet<String>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<Result<std::collections::BTreeSet<String>, (&'static str, String)>, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let head = match trust_root_head(directory, community_key_id, now).await? {
-        Ok(head) => head,
-        Err(refusal) => return Ok(Err(refusal)),
-    };
-    counts_voices_over_head(directory, &head, voices, now).await
-}
-
-/// v62.0.0 (wave T2) — [`trust_root_counts_voices`] past the standing read:
-/// every voice a seat of `head`, then the head's own protocol
-/// ([`count_over_trust_root`]). Separate so a witness can hand it a head
-/// directly.
-///
-/// # Errors
-/// As [`trust_root_counts_voices`].
-pub(crate) async fn counts_voices_over_head<F>(
-    directory: &F,
-    head: &SignedCommunity,
-    voices: &std::collections::BTreeSet<String>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<Result<std::collections::BTreeSet<String>, (&'static str, String)>, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    use super::steward_purge::unauthorised_reason as why;
-    let community_key_id = head.community.community_key_id.as_str();
-    if voices.is_empty() {
-        return Ok(Err((
-            why::NO_COSIGNATURE,
-            "no statement of the notice is held".to_owned(),
-        )));
-    }
-    for v in voices {
-        if !head.community.members.iter().any(|m| m.key_id == *v) {
-            note_fold_reason(why::NOT_A_SEAT);
-            return Ok(Err((
-                why::NOT_A_SEAT,
-                format!("voice {v:?} holds no seat on the trust root {community_key_id:?}"),
-            )));
-        }
-    }
-    count_over_trust_root(directory, head, voices.clone(), now).await
-}
-
-/// v53.1.7 — I547's oracle: [`live_charter_rows`] as v53.1.6 shipped it,
-/// VERBATIM (the family's whole about-slice), `super::` spelled from the crate
-/// root.
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
-pub(crate) mod v53_1_6_reference {
-    use super::*;
-
-    pub(crate) async fn live_charter_rows_reference<F>(
-        directory: &F,
-        family: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, Error>
-    where
-        F: FederationDirectory + ?Sized,
-    {
-        use crate::federation::attestation_query::test_support::AllAttestations as _;
-        let is_charter = |a: &crate::federation::Attestation| {
-            a.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO
-                && a.attested_key_id == family
-                && crate::federation::trust_root::job_dimension_admits(
-                    &a.attestation_envelope,
-                    crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
-                )
-        };
-        let rows = directory.all_attestations_for(family).await?;
-        let refs: Vec<&crate::federation::Attestation> = rows.iter().collect();
-        let retired = crate::federation::precedence::retired_ids(&refs);
-        let denied = crate::federation::trust_root::direction_denied_ids(
-            directory,
-            rows.iter().filter(|a| is_charter(a)),
-        )
-        .await?;
-        Ok(rows
-            .into_iter()
-            .filter(|a| {
-                is_charter(a)
-                    && !denied.contains(&a.attestation_id)
-                    && !retired.contains(&a.attestation_id)
-            })
-            .collect())
-    }
-}
+// v62.0.0 (R2-rooms; CC 3.2 T5) — the voice count over a trust-root ROOM's
+// rooted head (`trust_root_head`, `count_over_trust_root`,
+// `trust_root_counts_voices`, `counts_voices_over_head`, `note_fold_reason`)
+// is DELETED: a room is no root, and the steward purge counts over the
+// holders of the bundle in force (`steward_purge::authorise_edition2_at`,
+// pass 15; witnessed by `steward_purge_invariants` I650).

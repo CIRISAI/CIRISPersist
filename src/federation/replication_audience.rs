@@ -467,6 +467,7 @@ impl OwnerAllowLists {
     {
         let mut grants = Vec::new();
         let mut pages = AttestationQuery::by(owner, FOLD_PAGE)
+            .view(crate::federation::attestation_query::ContentView::Record)
             .dimension_prefix(GRANT_DIMENSION)
             .pages();
         while let Some(page) = pages.next(dir).await? {
@@ -851,6 +852,7 @@ where
     // and the §6.1 winner is chosen among the composers naming that target.
     let mut charters = Vec::new();
     let mut pages = AttestationQuery::to(group, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .dimension_prefix(super::trust_root::TRUST_CHARTER_DIMENSION)
         .pages();
     while let Some(page) = pages.next(dir).await? {

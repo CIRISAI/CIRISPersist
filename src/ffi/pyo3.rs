@@ -6480,18 +6480,24 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             let offered = parse_digest32_hex("offered_row_id", offered_row_id)?;
-            let dir = self.federation_directory_arc();
+            // v62.0.0 (WD-fix3) — through the Engine's door: the door's own
+            // descent step then evicts under the Engine's bytes plane (which
+            // retracts this node's holding claims).
+            let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let engine = shared_view(backend, self.signer.clone(), self.local_signer.clone())?;
             let runtime = self.runtime.clone();
             let statement = statement.to_vec();
             let outcome = py.detach(move || {
                 runtime.block_on(async move {
-                    crate::federation::edition2::ingest::apply_replicated_statement(
-                        dir.as_ref(),
-                        &statement,
-                        &offered,
-                    )
-                    .await
-                    .map_err(federation_err_to_py)
+                    engine
+                        .apply_replicated_statement(&statement, &offered)
+                        .await
+                        .map_err(federation_err_to_py)
                 })
             })?;
             Ok(replicated_statement_outcome_json(&outcome).to_string())
@@ -6516,7 +6522,16 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             let offered = parse_digest32_hex("offered_row_id", offered_row_id)?;
-            let dir = self.federation_directory_arc();
+            // v62.0.0 (WD-fix3) — through the Engine's door: the door's own
+            // descent step then evicts under the Engine's bytes plane (which
+            // retracts this node's holding claims).
+            let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let engine = shared_view(backend, self.signer.clone(), self.local_signer.clone())?;
             let runtime = self.runtime.clone();
             let statement = statement.to_vec();
             let feed = crate::federation::edition2::accord_rescan::FeedPosition {
@@ -6526,14 +6541,10 @@ impl PyEngine {
             };
             let outcome = py.detach(move || {
                 runtime.block_on(async move {
-                    crate::federation::edition2::ingest::apply_replicated_statement_at_feed(
-                        dir.as_ref(),
-                        &statement,
-                        &offered,
-                        &feed,
-                    )
-                    .await
-                    .map_err(federation_err_to_py)
+                    engine
+                        .apply_replicated_statement_at_feed(&statement, &offered, &feed)
+                        .await
+                        .map_err(federation_err_to_py)
                 })
             })?;
             Ok(replicated_statement_outcome_json(&outcome).to_string())
@@ -7013,7 +7024,8 @@ impl PyEngine {
     /// short of its holders' count is not listed (`held_rows_for` with role
     /// `root_holder` lists it for a holder). A holder drafts a grant with
     /// `statement_draft` (row type `delegates_to`, envelope `{"dimension":
-    /// "trust:confers:v1", "scope": [...], "head": <bundle object id hex>}`,
+    /// "trust:confers:v1", "scope": [...], "head": <bundle object id hex>,
+    /// "author": null}` (v62.0.0 HEAD-4: the `author: null` makes it counted),
     /// `sub` = the grantee); the grantee's consenter (for a node or agent,
     /// its owner) accepts with `reply_to_membership_proposal(row_id, True)`.
     fn root_grants_for(&self, py: Python<'_>, grantee_key_id: &str) -> PyResult<String> {
@@ -8502,7 +8514,9 @@ impl PyEngine {
     /// what it authored and co-scrubs what another key signed at write; a row
     /// by another key that is unsigned WAITS — the outcome says so. Returns the
     /// `MeshCrossingOutcome` as a dict: `{"outcome": "crossed", ...}` |
-    /// `{"outcome": "already_in_mesh", ...}` | `{"outcome": "awaiting_actor", ...}`.
+    /// `{"outcome": "already_in_mesh", ...}` | `{"outcome": "awaiting_actor", ...}`
+    /// | `{"outcome": "unowned", ...}` (v62.0.0: this node's own report while
+    /// it is unowned; it waits).
     fn enter_mesh<'py>(
         &self,
         py: Python<'py>,
@@ -8644,6 +8658,12 @@ impl PyEngine {
     /// graduate itself: attester==attested on `age_assurance:*` raises
     /// `ValueError("federation_age_assurance_self_emission_rejected")`, and
     /// a non-witness emitter raises the reserved-prefix mismatch.
+    ///
+    /// v62.0.0 (VD-step2) — returns the row's STATE as JSON, the shape
+    /// `submit_voice` returns (`{"status": "seated"|"waiting", "row_id",
+    /// "reason", "detail", "http_status"}`), no longer the bare
+    /// `attestation_id`: a held row (`waiting`, its reason) was returned
+    /// exactly like a landed one.
     fn emit_attestation(&self, py: Python<'_>, input_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -8674,9 +8694,13 @@ impl PyEngine {
             py.detach(move || {
                 let engine = shared_view(backend, signer, Some(local_signer.clone()))?;
                 runtime.block_on(async move {
+                    // VD-step2 — the row's STATE as JSON (`submit_voice`'s
+                    // shape: `status` seated | waiting, `row_id`, `reason`,
+                    // `detail`, `http_status`), never a bare id read as landed.
                     engine
                         .emit_attestation(&local_signer, input)
                         .await
+                        .map(|o| o.to_json().to_string())
                         .map_err(federation_err_to_py)
                 })
             })
@@ -8690,7 +8714,7 @@ impl PyEngine {
     /// `emit_attestation` — whose FFI reconstructs a `LocalSigner` and
     /// raises if absent — this signs via the engine's composed signer
     /// (`Engine::sign_hybrid` over the propagated local signer), so a
-    /// **hardware-hybrid** PyEngine can emit. Returns the `attestation_id`.
+    /// **hardware-hybrid** PyEngine can emit. Returns the row's state (VD-step2).
     ///
     /// `attesting_key_id` / `scrub_key_id` are the composed signer's
     /// **DERIVED** federation key_id (`local_derived_key_id`, the #247
@@ -8704,6 +8728,10 @@ impl PyEngine {
     /// engine can graduate a DIFFERENT subject's age band through this path
     /// too. Omitted ⇒ self-attestation (and `age_assurance:*` then rejects:
     /// a subject must not emit its own age assurance, CC 3.4.11).
+    ///
+    /// v62.0.0 (VD-step2) — returns the row's STATE as JSON, as
+    /// [`PyEngine::emit_attestation`] does (no longer the bare
+    /// `attestation_id`).
     fn emit_attestation_self(&self, py: Python<'_>, input_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -8729,9 +8757,13 @@ impl PyEngine {
             let engine = shared_view(backend, signer, local_signer)?;
             py.detach(move || {
                 runtime.block_on(async move {
+                    // VD-step2 — the row's STATE as JSON (`submit_voice`'s
+                    // shape: `status` seated | waiting, `row_id`, `reason`,
+                    // `detail`, `http_status`), never a bare id read as landed.
                     engine
                         .emit_attestation_self(input)
                         .await
+                        .map(|o| o.to_json().to_string())
                         .map_err(federation_err_to_py)
                 })
             })
@@ -8755,7 +8787,8 @@ impl PyEngine {
     ///
     /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2) — `delegation_purpose` (optional,
     /// default `None`) marks the ownership sub-relation: pass
-    /// `"responsible_for"` (`owner_binding::PURPOSE`) to build the node's
+    /// `"owner_binding"` (`owner_binding::PURPOSE`; v62.0.0: `"responsible_for"`
+    /// is refused `owner_binding_purpose_retired`) to build the node's
     /// single-valued **owner-binding**, resolvable via `owner_of_json`
     /// (v62.0.0: a second distinct owner's binding is held, and two counted
     /// owners read as unowned, `federation_ambiguous_node_owner`). `None` is
@@ -8806,6 +8839,7 @@ impl PyEngine {
                             term,
                         )
                         .await
+                        .map(|o| o.to_json().to_string())
                         .map_err(federation_err_to_py)
                 })
             })
@@ -8818,12 +8852,18 @@ impl PyEngine {
     /// `sub_delegation=false`.
     ///
     /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2) — pass
-    /// `delegation_purpose="responsible_for"` (`owner_binding::PURPOSE`) to make
+    /// `delegation_purpose="owner_binding"` (`owner_binding::PURPOSE`) to make
     /// this the node's single-valued **owner-binding** (`infra:*`-only scope IS
     /// the owner-binding shape). v62.0.0: a second distinct owner's binding is
     /// held, not refused; two counted owners read as unowned
     /// (`federation_ambiguous_node_owner`). `None` (default) is a plain
     /// steward-binding.
+    ///
+    /// v62.0.0 (BIND-3) — an owner binding written here is placed at `self`
+    /// (the login producer; the owner chose nothing). To announce the node,
+    /// the owner emits a further owner binding at `cohort_scope: federation`
+    /// (`emit_attestation`, or `statement_draft` for a pen elsewhere) and the
+    /// node voices it (`voice_held_row`).
     #[pyo3(signature = (node_or_agent_key_id, infra_scopes, delegation_purpose = None))]
     fn steward_bind(
         &self,
@@ -8844,6 +8884,7 @@ impl PyEngine {
                     engine
                         .steward_bind(&local_signer, &key, infra_scopes, purpose.as_deref())
                         .await
+                        .map(|o| o.to_json().to_string())
                         .map_err(federation_err_to_py)
                 })
             })
@@ -8974,7 +9015,10 @@ impl PyEngine {
     /// drafted for a pen elsewhere**: FFI mirror of
     /// [`Engine::statement_draft`](crate::engine::Engine::statement_draft).
     /// `envelope_json` is the row's JSON members (instants RFC 3339, digests
-    /// 64-hex; an `admission:unit` row's roster head as `head`, 64-hex);
+    /// 64-hex; an `admission:unit` row's roster head as `head`, 64-hex;
+    /// v62.0.0 (HEAD-4) a COUNTED unit or trust row states `"author": null`,
+    /// since counted vs authored is the payload's `author`, never its head,
+    /// and a unit or trust draft naming `head` with no `author` is refused);
     /// `signer_kid_hex` the signing key's thumbprint (64 hex);
     /// `target_row_id` a composer's target (64 hex). Returns JSON
     /// `{"protected", "payload", "sig_structure"}` (hex): sign
@@ -9139,6 +9183,7 @@ impl PyEngine {
                             petitioner.as_deref(),
                         )
                         .await
+                        .map(|o| o.to_json().to_string())
                         .map_err(federation_err_to_py)
                 })
             })
@@ -9185,6 +9230,7 @@ impl PyEngine {
                     engine
                         .add_moderator(&local_signer, &community, &moderator, &duty, term)
                         .await
+                        .map(|o| o.to_json().to_string())
                         .map_err(federation_err_to_py)
                 })
             })
@@ -9213,6 +9259,7 @@ impl PyEngine {
                     engine
                         .revoke_delegation(&local_signer, &target, &delegate)
                         .await
+                        .map(|o| o.to_json().to_string())
                         .map_err(federation_err_to_py)
                 })
             })
@@ -9244,6 +9291,7 @@ impl PyEngine {
                     engine
                         .remove_moderator(&local_signer, &community, &target, &moderator, &duty)
                         .await
+                        .map(|o| o.to_json().to_string())
                         .map_err(federation_err_to_py)
                 })
             })
@@ -9277,6 +9325,7 @@ impl PyEngine {
                     engine
                         .file_moderation(&local_signer, &content, &community, &duty, &allegation)
                         .await
+                        .map(|o| o.to_json().to_string())
                         .map_err(federation_err_to_py)
                 })
             })
@@ -9299,7 +9348,15 @@ impl PyEngine {
     /// previous page's `next_cursor` as `cursor_json` to continue, and
     /// `dimension_prefix` to narrow to one envelope dimension family (a byte
     /// prefix). Replaces the uncapped `list_attestations_by(attesting_key_id)`.
-    #[pyo3(signature = (attesting_key_id, limit, cursor_json = None, dimension_prefix = None))]
+    ///
+    /// v62.0.0 (CONTENT-A7b; Constitution for Eric + the lead, 11-24) —
+    /// `content_view` (keyword-only: `"record"` | `"present"`) is REQUIRED on
+    /// every call: an author's rows can be placed in any room, so the read
+    /// cannot tell whether it is a room read. Absent or unknown, the call
+    /// raises `ValueError` (`federation_invalid_argument`), never an empty
+    /// page. `"present"` is judged per row, by the room each row is placed
+    /// in; a row placed in no room is returned under both.
+    #[pyo3(signature = (attesting_key_id, limit, cursor_json = None, dimension_prefix = None, *, content_view = None))]
     fn list_attestations_by(
         &self,
         py: Python<'_>,
@@ -9307,6 +9364,7 @@ impl PyEngine {
         limit: u32,
         cursor_json: Option<&str>,
         dimension_prefix: Option<&str>,
+        content_view: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -9320,8 +9378,12 @@ impl PyEngine {
                     PyValueError::new_err(format!("AttestationCursor JSON decode: {e}"))
                 })?),
             };
+            let view =
+                crate::federation::attestation_query::ContentView::parse_required(content_view)
+                    .map_err(federation_err_to_py)?;
             let mut q =
                 crate::federation::attestation_query::AttestationQuery::by(attesting_key_id, limit)
+                    .view(view)
                     .after(cursor);
             if let Some(p) = dimension_prefix {
                 q = q.dimension_prefix(p);
@@ -14639,6 +14701,7 @@ impl PyEngine {
                             aad.as_deref(),
                         )
                         .await
+                        .map(|o| o.to_json().to_string())
                         .map_err(federation_err_to_py)
                 })
             })
@@ -16802,9 +16865,11 @@ impl PyEngine {
         self.ensure_usable()?;
         let input =
             crate::federation::goal::decode_goal_input(body_json).map_err(federation_err_to_py)?;
-        goal_row_id(self.purge_engine_call(py, move |engine| async move {
-            engine.put_goal(&input).await
-        })?)
+        // VD-step2b — the row's STATE as JSON (`submit_voice`'s shape), no
+        // longer the bare row id.
+        self.purge_engine_call(py, move |engine| async move {
+            engine.put_goal(&input).await.map(|o| o.to_json())
+        })
     }
 
     /// v60.0.0 — Amend a goal: the engine's `supersedes` of the goal's
@@ -16821,9 +16886,14 @@ impl PyEngine {
         let input =
             crate::federation::goal::decode_goal_input(body_json).map_err(federation_err_to_py)?;
         let goal_id = goal_id.to_owned();
-        goal_row_id(self.purge_engine_call(py, move |engine| async move {
-            engine.amend_goal(&goal_id, &input).await
-        })?)
+        // VD-step2b — the row's STATE as JSON (`submit_voice`'s shape), no
+        // longer the bare row id.
+        self.purge_engine_call(py, move |engine| async move {
+            engine
+                .amend_goal(&goal_id, &input)
+                .await
+                .map(|o| o.to_json())
+        })
     }
 
     /// v60.0.0 — Retire a goal: the engine's `withdraws` of the declaration;
@@ -16832,9 +16902,11 @@ impl PyEngine {
     fn cirisnode_retire_goal_json(&self, py: Python<'_>, goal_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         let goal_id = goal_id.to_owned();
-        goal_row_id(self.purge_engine_call(py, move |engine| async move {
-            engine.retire_goal(&goal_id).await
-        })?)
+        // VD-step2b — the row's STATE as JSON (`submit_voice`'s shape), no
+        // longer the bare row id.
+        self.purge_engine_call(py, move |engine| async move {
+            engine.retire_goal(&goal_id).await.map(|o| o.to_json())
+        })
     }
 
     /// v60.0.0 — Disown a goal ("never mine"): the engine's `recants` of the
@@ -16843,9 +16915,11 @@ impl PyEngine {
     fn cirisnode_recant_goal_json(&self, py: Python<'_>, goal_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         let goal_id = goal_id.to_owned();
-        goal_row_id(self.purge_engine_call(py, move |engine| async move {
-            engine.recant_goal(&goal_id).await
-        })?)
+        // VD-step2b — the row's STATE as JSON (`submit_voice`'s shape), no
+        // longer the bare row id.
+        self.purge_engine_call(py, move |engine| async move {
+            engine.recant_goal(&goal_id).await.map(|o| o.to_json())
+        })
     }
 
     /// Federation directory: the projected `Goal` whose declaration row is
@@ -19799,6 +19873,13 @@ impl PyEngine {
 
     /// Bulk-list federation_attestations. Returns JSON-encoded
     /// `AttestationListPage`.
+    ///
+    /// v62.0.0 (CONTENT-A7; Constitution for Eric, 11-24) — `content_view`
+    /// (keyword-only: `"record"` | `"present"`) is REQUIRED when the filter's `cohort_scope`
+    /// is a room placement (`community`, `affiliations`, `family`): absent,
+    /// the call raises `ValueError`; `"present"` drops the rows the content
+    /// rule keeps out of the room. For any other filter it does not apply.
+    #[pyo3(signature = (filter_json, cursor_json, limit, caller_occurrence_key_id, *, content_view=None))]
     fn list_attestations(
         &self,
         py: Python<'_>,
@@ -19806,6 +19887,7 @@ impl PyEngine {
         cursor_json: Option<&str>,
         limit: i64,
         caller_occurrence_key_id: Option<String>,
+        content_view: Option<String>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -19814,6 +19896,7 @@ impl PyEngine {
                 .map_err(|e| {
                     PyValueError::new_err(format!("AttestationFilter JSON decode: {e}"))
                 })?;
+            let room_scope = filter.cohort_scope.clone();
             let cursor: Option<crate::read::AttestationCursor> = match cursor_json {
                 None => None,
                 Some(s) => Some(serde_json::from_str(s).map_err(|e| {
@@ -19834,10 +19917,19 @@ impl PyEngine {
                             caller_occurrence_key_id.clone(),
                         )
                         .await?;
-                        let page = backend
+                        let mut page = backend
                             .list_attestations(filter, cursor, limit, scope)
                             .await
                             .map_err(read_err_to_py)?;
+                        // v62.0.0 (CONTENT-A7) — the room view the caller states.
+                        page.items = crate::federation::edition2::content_cache::view_listed(
+                            &*backend,
+                            room_scope.as_deref(),
+                            content_view.as_deref(),
+                            page.items,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
                         serde_json::to_string(&page).map_err(|e| {
                             PyRuntimeError::new_err(format!("AttestationListPage encode: {e}"))
                         })
@@ -19854,10 +19946,19 @@ impl PyEngine {
                             caller_occurrence_key_id.clone(),
                         )
                         .await?;
-                        let page = backend
+                        let mut page = backend
                             .list_attestations(filter, cursor, limit, scope)
                             .await
                             .map_err(read_err_to_py)?;
+                        // v62.0.0 (CONTENT-A7) — the room view the caller states.
+                        page.items = crate::federation::edition2::content_cache::view_listed(
+                            &*backend,
+                            room_scope.as_deref(),
+                            content_view.as_deref(),
+                            page.items,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
                         serde_json::to_string(&page).map_err(|e| {
                             PyRuntimeError::new_err(format!("AttestationListPage encode: {e}"))
                         })
@@ -24498,6 +24599,12 @@ impl PyEngine {
     /// hold (a merged widening or removal that meets its protocol lands; a
     /// lapsed hold expires; a withdrawn one ends); returns how many landed.
     /// Run it on a schedule beside `execute_self_roster_due`.
+    ///
+    /// v62.0.0 (KR-fix24; CC 3.3.4) — it also lapses this node's edition-2
+    /// counted rows short of their count once their hold window has run
+    /// (the group's stated window, else 72 h, from this node's first hold of
+    /// the row's first voice): their kept voices are dropped, nothing is
+    /// refused. The count returned is unchanged (holds that landed).
     fn execute_cosign_due(&self, py: Python<'_>) -> PyResult<usize> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -32038,11 +32145,6 @@ struct GoalsFilterWire {
 
 /// v60.0.0 — a goal door's row id, from the JSON string the engine call
 /// returns.
-fn goal_row_id(json: String) -> PyResult<String> {
-    serde_json::from_str(&json)
-        .map_err(|e| PyRuntimeError::new_err(format!("goal row id decode: {e}")))
-}
-
 /// v0.3.5 — TraceLevel → wire-format string. Same shape as the
 /// trace_level_str helper in `src/store/postgres.rs` but free-standing
 /// for use from this FFI module without re-exposing storage internals.
@@ -32985,6 +33087,13 @@ fn federation_err_typed_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::WriteScopeRefused(reason) => {
             PyValueError::new_err(write_scope_refused_message(kind, &reason))
         }
+        // v62.0.0 (HOLD-1a) — the node's own bound declined the row: the
+        // class the write-scope hold it replaces raises.
+        crate::federation::Error::NotKept {
+            row_id,
+            bucket,
+            detail,
+        } => PyValueError::new_err(format!("{kind}: row {row_id} not kept ({bucket}): {detail}")),
         // v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3) — a refused
         // `withdraws` (issuer satisfies none of the 4 admission rules)
         // is caller-side authorization failure; ValueError (4xx).
@@ -35631,6 +35740,230 @@ mod tests {
     // they build a cell and construct `PyEngine` via `from_cell`
     // directly — so they don't need `#[serial(engine_singleton)]`.
 
+    // ── v62.0.0 (WD-fix3 rev 2) — I4409 through the PyO3 feed methods ──────
+    //
+    // Node A is a Rust Engine; node B is a `PyEngine` over its own store, fed
+    // A's serve feed through `apply_replicated_statement` /
+    // `apply_replicated_statement_at_feed` exactly as a Python host's feed
+    // puller calls them. B descends in the door's own admission, in both
+    // arrival orders, with no sweep.
+
+    /// One I4409 run through B's PyO3 feed method.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn i4409_through_the_pyo3_feed<B>(
+        runtime: SharedRuntime,
+        nodes: (crate::Engine, Arc<B>, crate::Engine, Arc<B>),
+        b_dispatch: BackendDispatch,
+        b_seed: &str,
+        withdrawal_first: bool,
+        at_feed: bool,
+    ) where
+        B: crate::federation::BlobStorage + crate::federation::FederationDirectory + Sync + Send,
+    {
+        use crate::federation::edition2::names::RowId;
+        use crate::federation::withdrawn_content_invariants::bodies as wd;
+        let (ea, ba, _eb, bb) = nodes;
+        let what = format!(
+            "I4409 (PyO3 {} door, {})",
+            if at_feed {
+                "apply_replicated_statement_at_feed"
+            } else {
+                "apply_replicated_statement"
+            },
+            if withdrawal_first {
+                "withdrawal first"
+            } else {
+                "row first"
+            }
+        );
+        let local = crate::federation::tier_ingest::test_support::local_signer(b_seed);
+        let signer: Arc<dyn HardwareSigner> = Arc::new(
+            crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
+        );
+        let cell = Arc::new(EngineCell {
+            backend: b_dispatch,
+            runtime,
+            scrubber: Arc::new(crate::scrub::NullScrubber),
+            signer,
+            signer_key_id: b_seed.to_string(),
+            local_signer: Some(local),
+            #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
+            sqlite_audit: None,
+            consumers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            subscriptions: Arc::new(std::sync::Mutex::new(SubscriptionState::default())),
+            config_fingerprint: "test-i4409-pyo3".to_string(),
+            construction_pid: std::process::id(),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rust_engine: std::sync::OnceLock::new(),
+            replication_config: std::sync::RwLock::new(Arc::new(
+                crate::federation::ReplicationConfig::default(),
+            )),
+            sweeper: std::sync::Mutex::new(None),
+            reack_sweeper: std::sync::Mutex::new(None),
+            disk_pressure: std::sync::Mutex::new(None),
+            disk_pressure_handle: std::sync::Mutex::new(None),
+        });
+        let pyb = PyEngine::from_cell(&cell);
+        let rt = &cell.runtime;
+        Python::initialize();
+        let feed_to_b = |statements: Vec<Vec<u8>>| {
+            for st in statements {
+                let Some(rid) = RowId::of_statement(&st) else {
+                    let _ =
+                        rt.block_on(crate::federation::edition2::fixture_switch::put_statement(
+                            bb.as_dyn_directory(),
+                            &st,
+                        ));
+                    continue;
+                };
+                let hex = rid.hex();
+                let _ = Python::attach(|py| {
+                    if at_feed {
+                        pyb.apply_replicated_statement_at_feed(
+                            py,
+                            &st,
+                            &hex,
+                            "statements",
+                            "i4409-peer",
+                            &hex,
+                        )
+                    } else {
+                        pyb.apply_replicated_statement(py, &st, &hex)
+                    }
+                });
+            }
+        };
+        let s = wd::suffix();
+        let case = rt.block_on(wd::wd_case(&*ba, &*bb, &s));
+        if !withdrawal_first {
+            feed_to_b(rt.block_on(wd::served_feed(ba.as_dyn_directory())));
+            assert!(
+                rt.block_on(bb.get_attestation(&case.id))
+                    .expect("reads")
+                    .is_some(),
+                "{what} premise: B holds the row before the withdrawal"
+            );
+        }
+        let wid = rt.block_on(wd::wd_withdraw(&*ba, &ea, &case, &what));
+        feed_to_b(rt.block_on(wd::served_feed(ba.as_dyn_directory())));
+        if withdrawal_first {
+            rt.block_on(wd::wd_assert_waiting(
+                bb.as_dyn_directory(),
+                &case,
+                &wid,
+                &what,
+            ));
+            feed_to_b(vec![case.late_copy.clone()]);
+        }
+        rt.block_on(wd::wd_assert_descended(&ea, &*bb, &case, &wid, &what));
+    }
+
+    /// Nodes A and B on sqlite (each its own in-memory store).
+    #[cfg(feature = "sqlite")]
+    fn i4409_pyo3_sqlite(withdrawal_first: bool, at_feed: bool) {
+        let runtime = SharedRuntime::new(Runtime::new().expect("tokio runtime"));
+        let s = crate::federation::withdrawn_content_invariants::bodies::suffix();
+        let b_seed = format!("i4409-py-b-{s}");
+        let (ea, ba, eb, bb) = runtime.block_on(async {
+            let ts = crate::federation::tier_ingest::test_support::local_signer;
+            let ea = crate::Engine::with_signer(ts(&format!("i4409-py-a-{s}")), "sqlite::memory:")
+                .await
+                .expect("A");
+            let eb = crate::Engine::with_signer(ts(&b_seed), "sqlite::memory:")
+                .await
+                .expect("B");
+            let ba = ea.sqlite_backend().expect("sqlite").clone();
+            let bb = eb.sqlite_backend().expect("sqlite").clone();
+            (ea, ba, eb, bb)
+        });
+        let dispatch = BackendDispatch::Sqlite(bb.clone());
+        i4409_through_the_pyo3_feed(
+            runtime,
+            (ea, ba, eb, bb),
+            dispatch,
+            &b_seed,
+            withdrawal_first,
+            at_feed,
+        );
+    }
+
+    /// Nodes A and B on postgres (each its own isolated database); skipped
+    /// with no DSN.
+    #[cfg(feature = "postgres")]
+    fn i4409_pyo3_postgres(withdrawal_first: bool, at_feed: bool) {
+        let (Some(dsn_a), Some(dsn_b)) = (
+            crate::test_pg::isolated_dsn(),
+            crate::test_pg::isolated_dsn(),
+        ) else {
+            return;
+        };
+        let runtime = SharedRuntime::new(Runtime::new().expect("tokio runtime"));
+        let s = crate::federation::withdrawn_content_invariants::bodies::suffix();
+        let b_seed = format!("i4409-py-b-{s}");
+        let (ea, ba, eb, bb) = runtime.block_on(async {
+            let ts = crate::federation::tier_ingest::test_support::local_signer;
+            let ea = crate::Engine::with_signer(ts(&format!("i4409-py-a-{s}")), &dsn_a)
+                .await
+                .expect("A");
+            let eb = crate::Engine::with_signer(ts(&b_seed), &dsn_b)
+                .await
+                .expect("B");
+            let ba = ea.postgres_backend().expect("postgres").clone();
+            let bb = eb.postgres_backend().expect("postgres").clone();
+            (ea, ba, eb, bb)
+        });
+        let dispatch = BackendDispatch::Postgres(bb.clone());
+        i4409_through_the_pyo3_feed(
+            runtime,
+            (ea, ba, eb, bb),
+            dispatch,
+            &b_seed,
+            withdrawal_first,
+            at_feed,
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn i4409_pyo3_at_feed_row_first_sqlite() {
+        i4409_pyo3_sqlite(false, true);
+    }
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn i4409_pyo3_plain_row_first_sqlite() {
+        i4409_pyo3_sqlite(false, false);
+    }
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn i4409_pyo3_at_feed_withdrawal_first_sqlite() {
+        i4409_pyo3_sqlite(true, true);
+    }
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn i4409_pyo3_plain_withdrawal_first_sqlite() {
+        i4409_pyo3_sqlite(true, false);
+    }
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn i4409_pyo3_at_feed_row_first_postgres() {
+        i4409_pyo3_postgres(false, true);
+    }
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn i4409_pyo3_plain_row_first_postgres() {
+        i4409_pyo3_postgres(false, false);
+    }
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn i4409_pyo3_at_feed_withdrawal_first_postgres() {
+        i4409_pyo3_postgres(true, true);
+    }
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn i4409_pyo3_plain_withdrawal_first_postgres() {
+        i4409_pyo3_postgres(true, false);
+    }
+
     #[cfg(feature = "sqlite")]
     fn build_cell_for_cohab_test() -> (Arc<EngineCell>, Arc<SqliteBackend>) {
         use crate::store::Backend;
@@ -35742,7 +36075,7 @@ mod tests {
                     attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
                         serde_json::json!({
                             "id": "att-1",
-                            "dimension": "evidence:safety_battery:capture:a:b:v1",
+                            "dimension": "coherence_standing:cab:v1",
                             "score": 1.0, "confidence": 0.9,
                         }),
                     )

@@ -31,16 +31,19 @@
 //!   strict majority of the other members objecting, and for an eviction only
 //!   if the target signed nothing since the proposal arrived.
 //!
-//! Every door that can change a roster — `put_identity_occurrence` on all
-//! three backends, and the attestation door for a `withdraws` of an occurrence
-//! row — asks [`gate`] after its
-//! signature gate and before any write. A change that lands proceeds exactly
-//! as before. One that does not is HELD as a proposal row and the door
-//! returns [`Error::SelfRosterNotLanded`]; when it later lands (an answer
-//! arrives, or the window closes and [`execute_due`] runs), the executor
-//! re-offers the same signed object through the same door, which now lets it
-//! through. So the write path is never spelled twice: the plan is the shared
-//! decision, the executors are the doors that already existed.
+//! v62.0.0: a roster changes only by the edition-2 statements, an
+//! `identity:occurrence` bind or an `identity:occurrence_revocation`, whose
+//! door asks [`gate_edition2`]. A change that lands proceeds; one that does
+//! not is HELD (its statements kept) and lands later by an answer, a further
+//! statement, or the lone path ([`execute_due`]).
+//!
+//! v62.0.0 (WD-fix7; the lead's ruling) — the EARLIER-FORM gate (on
+//! `put_identity_occurrence` and on the attestation door's `withdraws` of an
+//! `identity:occurrence:v1` row) and the proposal row it minted are retired:
+//! that row carried no statement, so every door refused it
+//! `earlier_form_object` and no proposal was ever opened. The proposal-row
+//! readers below ([`carried_of_row`], [`is_proposal_row`], and the plan's
+//! earlier-form receipts) read rows no v62 door stores.
 //!
 //! # The rows
 //!
@@ -77,7 +80,6 @@ use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
 
-use super::key_plane::{MintedFamily, PlaneSignature};
 use super::two_path::{
     self, Answers, LandingPath, Proposal, ProposalKind, TwoPathDecision, TwoPathPolicy,
     TwoPathRefusal,
@@ -208,14 +210,6 @@ pub const DIMENSION_OBJECTION: &str = super::reverse_quorum::DIMENSION_OBJECTION
 pub const COHORT_SELF: &str = "self";
 /// The envelope member a proposal row carries its object under.
 pub const PROPOSAL_MEMBER: &str = "roster_proposal";
-
-/// The proposal row's family.
-const PROPOSAL_FAMILY: MintedFamily = MintedFamily {
-    dimension: DIMENSION_PROPOSAL,
-    member: PROPOSAL_MEMBER,
-    score: 1,
-    id_domain: b"ciris:objection:proposal:v1:",
-};
 
 /// The members of a proposal object and of an answer envelope.
 pub mod field {
@@ -463,6 +457,7 @@ where
         identity,
         super::attestation_query::FOLD_PAGE,
     )
+    .view(crate::federation::attestation_query::ContentView::Record)
     .types(&[attestation_type::WITHDRAWS])
     .pages();
     while let Some(page) = pages.next(dir).await? {
@@ -633,7 +628,8 @@ where
     if stewards.iter().any(|s| s == author) {
         return Ok(());
     }
-    let now = roster_clock();
+    // v62.0.0 (HOLD-1d) — a re-judgement reads the row's original receipt.
+    let now = crate::federation::attestation_admit::receipt_or(roster_clock);
     if !outside_past_freshness_window(asserted_at, now) {
         return Ok(());
     }
@@ -810,103 +806,6 @@ impl Carried {
             | Self::Edition2Eviction { asserted_at, .. } => *asserted_at,
         }
     }
-
-    fn carrier(&self) -> &'static str {
-        match self {
-            Self::Occurrence(_) => carrier::IDENTITY_OCCURRENCE,
-            Self::Withdraws { .. } => carrier::WITHDRAWS,
-            Self::Edition2Occurrence { .. } => carrier::EDITION2_OCCURRENCE,
-            Self::Edition2Eviction { .. } => carrier::EDITION2_EVICTION,
-        }
-    }
-
-    /// The object the proposal row carries.
-    fn object(&self) -> Result<serde_json::Value, Error> {
-        let encode = |e: serde_json::Error| Error::Backend(format!("roster proposal encode: {e}"));
-        let carried = match self {
-            Self::Occurrence(s) => super::key_plane::occurrence_object(s)?,
-            Self::Withdraws { row, .. } => {
-                let mut v = serde_json::to_value(row).map_err(encode)?;
-                if let Some(o) = v.as_object_mut() {
-                    o.remove("persist_row_hash");
-                    o.remove("withdraws_admission_rule");
-                }
-                v
-            }
-            Self::Edition2Occurrence { row_id, .. } | Self::Edition2Eviction { row_id, .. } => {
-                serde_json::json!({ "edition2_row_id": row_id.hex() })
-            }
-        };
-        Ok(serde_json::json!({
-            field::IDENTITY_KEY_ID: self.identity_key_id(),
-            field::KIND: self.kind().as_str(),
-            field::TARGET_KEY_ID: self.target_key_id(),
-            field::CARRIER: self.carrier(),
-            self.carrier(): carried,
-        }))
-    }
-
-    /// The signature the proposal row carries: the object's own.
-    fn signature(&self) -> Result<PlaneSignature, Error> {
-        let hybrid = |classical: &str, pqc: &Option<String>, by: &str, at: DateTime<Utc>| {
-            let Some(pqc) = pqc.clone() else {
-                return Err(Error::SignatureInvalid(format!(
-                    "{DIMENSION_PROPOSAL}: the carried object's signature is Ed25519-only — a \
-                     minted row's signature is hybrid (CC 2.4)"
-                )));
-            };
-            Ok(PlaneSignature {
-                scrub_key_id: by.to_owned(),
-                classical: classical.to_owned(),
-                pqc: Some(pqc),
-                scrub_timestamp: at,
-                pqc_completed_at: Some(at),
-            })
-        };
-        match self {
-            Self::Occurrence(s) => hybrid(
-                &s.signature.ed25519_signature_base64,
-                &s.signature.mldsa65_signature_base64,
-                &s.attesting_key_id,
-                s.identity_occurrence.asserted_at,
-            ),
-            Self::Withdraws { row, .. } => {
-                if row.scrub_signature_pqc.is_none() {
-                    return hybrid("", &None, &row.scrub_key_id, row.scrub_timestamp);
-                }
-                Ok(PlaneSignature {
-                    scrub_key_id: row.scrub_key_id.clone(),
-                    classical: row.scrub_signature_classical.clone(),
-                    pqc: row.scrub_signature_pqc.clone(),
-                    scrub_timestamp: row.scrub_timestamp,
-                    pqc_completed_at: row.pqc_completed_at,
-                })
-            }
-            // v62.0.0 (wave O1, S1) — an edition-2 bind mints no proposal
-            // row: its statements are the proposal.
-            Self::Edition2Occurrence { row_id, .. } | Self::Edition2Eviction { row_id, .. } => {
-                Err(Error::InvalidArgument(format!(
-                    "{DIMENSION_PROPOSAL}: the edition-2 bind {} is its own proposal; no row is \
-                 minted for it",
-                    row_id.hex()
-                )))
-            }
-        }
-    }
-}
-
-/// **The proposal row** of a carried object (pure): attested by its proposer
-/// about the self, signed with the object's own signature, asserted at the
-/// object's own instant.
-pub fn proposal_row(carried: &Carried) -> Result<Attestation, Error> {
-    super::key_plane::minted_row(
-        PROPOSAL_FAMILY,
-        carried.proposer(),
-        carried.identity_key_id(),
-        carried.object()?,
-        carried.asserted_at(),
-        carried.signature()?,
-    )
 }
 
 /// Is `row` a self-roster proposal row (by its signed dimension)?
@@ -1000,48 +899,6 @@ where
     Ok(carried)
 }
 
-/// **The proposal row's signature rule** at the attestation plane's generic
-/// verify ([`super::tier_ingest::verify_row_hybrid_signature`]): the row is
-/// exactly the row its carried object mints, and the object verifies as its
-/// own door verifies it (signature, and a signer that acts for the self).
-/// `Ok(false)` when the row is not a proposal row (the generic rule applies).
-pub(crate) async fn verify_proposal_row<D>(dir: &D, row: &Attestation) -> Result<bool, Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    // v62.0.0 (slice J0; CC 2.6.1.12) — the cross-form refusal.
-    super::edition2::projection::refuse_edition2_row_signer(dir, "self_roster", row).await?;
-    if !is_proposal_row(row) {
-        return Ok(false);
-    }
-    let carried = carried_of_row(dir, row).await?;
-    super::key_plane::check_canonical_plane_row(row, &proposal_row(&carried)?)?;
-    verify_carried(dir, &carried).await?;
-    Ok(true)
-}
-
-/// The carried object verifies as its own door verifies it.
-async fn verify_carried<D>(dir: &D, carried: &Carried) -> Result<(), Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    match carried {
-        // Its statements were judged at the edition-2 door.
-        Carried::Edition2Occurrence { .. } | Carried::Edition2Eviction { .. } => Ok(()),
-        Carried::Occurrence(s) => super::admission::verify_signed_identity_occurrence(dir, s).await,
-        Carried::Withdraws {
-            row,
-            identity_key_id,
-            ..
-        } => {
-            // v62.0.0 (F0-cp9) — the generic rule (a `withdraws` is never a
-            // minted row) is the earlier form: deleted, refused by name.
-            let _ = (row, identity_key_id);
-            Err(super::edition2::door::earlier_form_signature("self_roster"))
-        }
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 //  Answers
 // ─────────────────────────────────────────────────────────────────────────
@@ -1115,7 +972,9 @@ where
     }
     // Any signed act by the target answers (CC 3.3.6.3): its latest row.
     let one = std::num::NonZeroU32::new(1).expect("one");
-    let mut pages = super::attestation_query::AttestationQuery::by(&proposal.target, one).pages();
+    let mut pages = super::attestation_query::AttestationQuery::by(&proposal.target, one)
+        .view(crate::federation::attestation_query::ContentView::Record)
+        .pages();
     if let Some(page) = pages.next(dir).await? {
         answers
             .target_acts
@@ -1134,6 +993,7 @@ where
         identity,
         super::attestation_query::FOLD_PAGE,
     )
+    .view(crate::federation::attestation_query::ContentView::Record)
     .dimension_any_of(&[DIMENSION_ASSENT, DIMENSION_OBJECTION])
     .pages();
     while let Some(page) = pages.next(dir).await? {
@@ -1480,121 +1340,9 @@ where
     })
 }
 
-/// **THE gate** (CC 3.3.6.3): may this roster change take effect now?
-///
-/// `Ok(())` when it is not a roster change, or when it lands (the door then
-/// writes it exactly as before). Otherwise the change is held as a proposal
-/// row (unless its proposer is not on the roster, which no answer can mend)
-/// and [`Error::SelfRosterNotLanded`] is returned: nothing on the roster
-/// changed.
-pub async fn gate<D>(dir: &D, carried: Carried) -> Result<(), Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    let identity = carried.identity_key_id().to_owned();
-    let roster = roster_now(dir, &identity).await?;
-    if !is_roster_change(dir, &carried, &roster).await? {
-        return Ok(());
-    }
-    // v60.0.0 (S6v) — the corridor at admission: the policy is the CC table's
-    // row, refused before anything is held when it is outside its corridor.
-    let policy = policy()?;
-    let row = proposal_row(&carried)?;
-    let id = row.attestation_id.clone();
-    let now = roster_clock();
-    let plan = plan(dir, &identity, Some((&carried, &id)), now, &policy).await?;
-    let decision = plan
-        .entries
-        .iter()
-        .find(|(p, ..)| p.id == id)
-        .map(|(.., d)| *d)
-        .ok_or_else(|| Error::Backend(format!("self-roster plan lost proposal {id}")))?;
-    if let TwoPathDecision::Lands { path } = decision {
-        // (The genesis key's eviction never lands on first offer: its roster
-        // holds the proposer and the target, so no quorum stands before an
-        // answer names the held proposal row and no lone window has run on
-        // this node — its landed receipt, which [`genesis_evicted_at`] reads,
-        // is always written.)
-        if dir.get_attestation(&id).await?.is_some() {
-            dir.note_self_roster_proposal(&id, &identity, now).await?;
-            dir.settle_self_roster_proposal(&id, landed_outcome(path), now)
-                .await?;
-        }
-        return Ok(());
-    }
-    // Terminal: no answer mends it. (`Cancelled` cannot arise under the self
-    // roster's `AtWindow::StayOpen`; a policy that cancels settles it here.)
-    let refused_for_good = matches!(
-        decision,
-        TwoPathDecision::Refused {
-            reason: TwoPathRefusal::ProposerNotOnRoster
-        } | TwoPathDecision::Cancelled { .. }
-    );
-    if !refused_for_good && dir.get_attestation(&id).await?.is_none() {
-        // v62.0.0 (wave GC2; G0 v4.1) — a NESTED write for another row: run
-        // outside the caller's fold attempt, so the proposal row's own gates
-        // never mark the withdrawal that carried it.
-        super::edition2::fold::isolated(
-            dir.put_attestation(super::SignedAttestation { attestation: row }),
-        )
-        .await?;
-    }
-    if !refused_for_good {
-        dir.note_self_roster_proposal(&id, &identity, now).await?;
-    }
-    let (earliest_lone_at, needs) = match decision {
-        TwoPathDecision::Pending {
-            earliest_lone_at,
-            needs,
-        } => (earliest_lone_at, needs),
-        _ => (None, 0),
-    };
-    Err(Error::SelfRosterNotLanded {
-        identity_key_id: identity,
-        target_key_id: carried.target_key_id().to_owned(),
-        kind: carried.kind().as_str(),
-        proposal_id: id,
-        decision: decision.token(),
-        earliest_lone_at,
-        needs,
-    })
-}
-
-/// [`gate`] for a signed occurrence (`put_identity_occurrence`).
-pub async fn gate_occurrence<D>(dir: &D, signed: &SignedIdentityOccurrence) -> Result<(), Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    gate(dir, Carried::Occurrence(signed.clone())).await
-}
-
-/// [`gate`] for a `withdraws` against an occurrence row (the attestation door).
-pub async fn gate_withdrawal<D>(
-    dir: &D,
-    row: &Attestation,
-    revocation: &super::types::IdentityOccurrenceRevocation,
-) -> Result<(), Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    // v62.0.0 (wave O1, S1b) — the earlier-form eviction carrier only
-    // behind the switch: an edition-2 eviction is an
-    // `identity:occurrence_revocation` through [`gate_edition2`].
-    super::edition2::door::refuse_earlier_form_row("self_roster", row)?;
-    gate(
-        dir,
-        Carried::Withdraws {
-            row: row.clone(),
-            identity_key_id: revocation.identity_key_id.clone(),
-            target_key_id: revocation.occurrence_key_id.clone(),
-        },
-    )
-    .await
-}
-
 /// v62.0.0 (wave O1, S1; CC 3.3.6.4) — **THE gate for an edition-2 bind**
 /// (`edition2::occurrence::put_occurrence_voice`, on every author
-/// statement): the same two paths as [`gate`], over a proposal whose id is
+/// statement): the two paths (quorum, lone), over a proposal whose id is
 /// the bind's row id and whose statements are held in `ceg_statements`.
 ///
 /// - `Ok(true)`: not a roster change, or it lands now (the quorum path: the
@@ -2288,17 +2036,10 @@ pub(crate) async fn after_admission<D>(dir: &D, row: &Attestation)
 where
     D: FederationDirectory + ?Sized,
 {
-    let identity = if is_proposal_row(row) {
-        if let Err(e) = dir
-            .note_self_roster_proposal(&row.attestation_id, &row.attested_key_id, roster_clock())
-            .await
-        {
-            tracing::warn!(proposal_id = %row.attestation_id, error = %e, "roster proposal receipt (heal)");
-        }
-        row.attested_key_id.clone()
-    } else if let Some(identity) = answer_identity(row) {
-        identity.to_owned()
-    } else {
+    // v62.0.0 (WD-fix7) — an answer executes what it may land. (The
+    // earlier-form proposal row this once noted is retired: no door stores
+    // one.)
+    let Some(identity) = answer_identity(row).map(str::to_owned) else {
         return;
     };
     if let Err(e) = execute_for(dir, &identity).await {
@@ -2359,10 +2100,25 @@ where
                 super::edition2::occurrence::land_held_eviction(dir, &row_id).await
             }
             Carried::Occurrence(s) => dir.put_identity_occurrence(s).await,
-            Carried::Withdraws { row, .. } => dir
-                .put_attestation(super::SignedAttestation { attestation: row })
-                .await
-                .map(|_| ()),
+            // v62.0.0 (WD-fix6) — a HOLD (the withdrawal's statement kept,
+            // waiting; WD-fix4) is told from a refusal structurally
+            // (`attestation_admit::kept_waiting`); the next pass's re-offer is
+            // a no-op on the statement id.
+            Carried::Withdraws { row, .. } => {
+                let put = dir
+                    .put_attestation(super::SignedAttestation {
+                        attestation: row.clone(),
+                    })
+                    .await
+                    .map(|_| ());
+                if put.is_err() && super::attestation_admit::kept_waiting(dir, &row).await? {
+                    tracing::info!(
+                        proposal_id = %p.id,
+                        "a landing roster proposal's withdrawal is kept and waiting (a hold)"
+                    );
+                }
+                put
+            }
         };
         match applied {
             Ok(()) => {

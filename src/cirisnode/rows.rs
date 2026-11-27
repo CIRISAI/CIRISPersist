@@ -824,7 +824,9 @@ pub async fn list_contributions(
     limit: u32,
 ) -> Result<RowPage, Error> {
     use crate::federation::attestation_query::AttestationQuery;
-    let q = AttestationQuery::by(author_id, page_limit(limit)?).after(after);
+    let q = AttestationQuery::by(author_id, page_limit(limit)?)
+        .view(crate::federation::attestation_query::ContentView::Record)
+        .after(after);
     let q = match &filter.subject_kind {
         Some(k) => q.dimension(&format!("{CONTRIBUTION_PREFIX}{k}:v1")),
         None => q.dimension_prefix(CONTRIBUTION_PREFIX),
@@ -866,6 +868,7 @@ pub async fn list_votes(
     let target =
         held_on_family(dir, "contribution_id", contribution_id, CONTRIBUTION_PREFIX).await?;
     let mut q = AttestationQuery::to(&target.attesting_key_id, page_limit(limit)?)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .dimension(&format!("{VOTE_PREFIX}{contribution_id}:v1"))
         .after(after);
     if let Some(v) = voter_id {
@@ -891,6 +894,7 @@ pub async fn list_takedowns(
 ) -> Result<RowPage, Error> {
     use crate::federation::attestation_query::AttestationQuery;
     let q = AttestationQuery::by(claimant_key_id, page_limit(limit)?)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .dimension_prefix(crate::federation::takedown_tombstone::NOTICE_DIMENSION_PREFIX)
         .after(after);
     run(dir, q, |r| {
@@ -912,7 +916,11 @@ impl crate::Engine {
     /// Sign `row` with this engine's own composed hybrid signer and put it
     /// through the plane's door. Returns the row's `attestation_id`.
     async fn cirisnode_emit(&self, row: EmitAttestationInput) -> Result<String, Error> {
-        self.emit_attestation_self(row).await.map_err(Error::from)
+        // VD-step2b: this verb still answers the row id alone.
+        self.emit_attestation_self(row)
+            .await
+            .map(crate::federation::edition2::second_signer_voice::VoiceOutcome::into_row_id)
+            .map_err(Error::from)
     }
 
     async fn cirisnode_signer_key_id(&self) -> Result<String, Error> {

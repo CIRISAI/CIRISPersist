@@ -670,6 +670,7 @@ where
     let dimension = delivery_receipt_dimension(stream_id);
     let mut rows: Vec<Attestation> = Vec::new();
     let mut pages = AttestationQuery::by(device_key_id, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .dimension(&dimension)
         .pages();
     while let Some(page) = pages.next(directory).await? {

@@ -126,7 +126,7 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
     let v = verdict(d, &reader, &holder, composite(&c.holder_key(0)), at).await;
     assert_eq!(
         rooted(&v, "I2217 holder"),
-        (r.root.clone(), Plane::Ceremony, RootedVia::AccordHolder),
+        (r.lineage.clone(), Plane::Ceremony, RootedVia::AccordHolder),
         "I2217: a holder of the bundle in force"
     );
     assert!(v.federation_tier_may_cross(), "I2217");
@@ -140,7 +140,7 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
         let v = verdict(d, &reader, &seat, claim.clone(), at).await;
         assert_eq!(
             rooted(&v, "I2217 seat"),
-            (r.root.clone(), Plane::Ceremony, RootedVia::ServeSeat),
+            (r.lineage.clone(), Plane::Ceremony, RootedVia::ServeSeat),
             "I2217: a serve seat, claimed as {claim:?}"
         );
     }
@@ -154,7 +154,11 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
     .await;
     assert_eq!(
         rooted(&v, "I2217 conferred"),
-        (r.root.clone(), Plane::Delegation, RootedVia::ConferredSeat),
+        (
+            r.lineage.clone(),
+            Plane::Delegation,
+            RootedVia::ConferredSeat
+        ),
         "I2217: a seat the root conferred"
     );
 
@@ -190,7 +194,7 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
             .await
         ),
         &NotRootedReason::NoAcceptanceEdge {
-            root: Some(r.root.clone())
+            root: Some(r.lineage.clone())
         },
         "I2219: a conferred seat names the root the reader does not accept"
     );
@@ -337,7 +341,7 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
         }
     }
     assert_eq!(
-        attach_reading(d, &reader, &r.root, at).await.unwrap(),
+        attach_reading(d, &reader, &r.lineage, at).await.unwrap(),
         None,
         "I2224: the held head is attachable (witnessed mode off)"
     );
@@ -347,8 +351,8 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
     let late = e2::put_key(d, "pr-fix1-late-reader", &["node"]).await;
     let stale = crate::federation::operational::test_support::e2_acceptance_statement(
         "pr-fix1-late-reader",
-        &r.root,
-        Some(&"00".repeat(32)),
+        &r.lineage,
+        &"00".repeat(32),
         at,
         None,
     );
@@ -359,54 +363,15 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
         "I2225b: an edge on a head this node does not hold attaches nothing: {v:?}"
     );
 
-    // ── I2222: a founder resigns; M founders remain ──
-    let tip = super::genesis::genesis_in_force(d)
-        .await
-        .unwrap()
-        .tips()
-        .iter()
-        .map(|t| t.asserted_at)
-        .max()
-        .expect("a tip");
-    let resigned_at = i64::try_from(tip + 120_000)
-        .ok()
-        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-        .expect("an instant");
-    let resignation = super::group::MembershipRecord::CommunityRemoval(
-        crate::federation::types::CommunityMembershipRevocation {
-            community_key_id: r.root.clone(),
-            removed_identity_key_id: r.founders[2].clone(),
-            removed_at: resigned_at,
-            effective_at: resigned_at,
-            reason: None,
-            witness_set: Vec::new(),
-            persist_row_hash: String::new(),
-        },
-    );
-    let key2 = r.founder_key(2);
-    e2::put_voices(
-        d,
-        &e2::membership_voices(&resignation, Some(&r.birth), &[&key2]),
-    )
-    .await
-    .expect("I2222: a founder resigns alone");
-    let at2 = now_ms();
-    let v = verdict(d, &reader, &holder, composite(&c.holder_key(0)), at2).await;
-    match &v {
-        PeerRooting::Stalled { root, via, .. } => {
-            assert_eq!(root, &r.root, "I2222");
-            assert_eq!(*via, RootedVia::AccordHolder, "I2222");
-        }
-        other => panic!("I2222: two of three founders at quorum:2/3 is Stalled: {other:?}"),
-    }
-    assert!(
-        v.federation_tier_may_cross(),
-        "I2222: Stalled is valid and serves (CC 3.2 T7)"
-    );
-    assert_eq!(v.as_str(), "community_liveness_stalled", "I2222");
-
+    // LEAD-root1 (CC 3.2 T5) — I2222 ("a founder resigns from the root
+    // community; M founders remain: the root STALLS") is DELETED with the
+    // root community: the root is the bundle's lineage, and a holder leaves
+    // it by a later bundle counted over its predecessor's holders (T6), which
+    // the genesis witnesses cover (`genesis_invariants`, the
+    // `later_removed_holder_counts` vector).
     // ── I2223: the reader withdraws its acceptance ──
-    let w = e2::trust_withdraws_statement(&reader, &r.root, &r.acceptance, at2);
+    let at2 = now_ms();
+    let w = e2::trust_withdraws_statement(&reader, &r.lineage, &r.acceptance, at2);
     e2::put_statement(d, &w)
         .await
         .expect("I2223: the reader withdraws its acceptance");
@@ -422,7 +387,7 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
             .await
         ),
         &NotRootedReason::EdgeOrCharterWithdrawn {
-            root: r.root.clone()
+            root: r.lineage.clone()
         },
         "I2223: un-trust is one row (CC 3.2 T3)"
     );

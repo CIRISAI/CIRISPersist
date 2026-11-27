@@ -62,7 +62,8 @@ where
             // naming `(owner, k)` stops the owner binding from lifting `k`; an
             // occurrence re-established after it (agreed, asserted later) is
             // already in `out` through the active fold.
-            let now = crate::host::clock::now();
+            // v62.0.0 (HOLD-1e) — a re-judgement reads the row's original receipt.
+            let now = crate::federation::attestation_admit::receipt_now();
             let revoked = dir
                 .list_identity_occurrence_revocations_for(&owner)
                 .await?

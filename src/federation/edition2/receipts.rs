@@ -914,7 +914,9 @@ where
     };
     let (live, _) = super::typed::acceptance_edges(
         dir,
-        AttestationQuery::by(&owner, FOLD_PAGE).dimension(TRUST_ACCEPTS_DIMENSION),
+        AttestationQuery::by(&owner, FOLD_PAGE)
+            .view(crate::federation::attestation_query::ContentView::Record)
+            .dimension(TRUST_ACCEPTS_DIMENSION),
     )
     .await?;
     let mut out: Vec<TrustedService> = Vec::new();

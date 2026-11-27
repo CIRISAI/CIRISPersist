@@ -529,7 +529,7 @@ pub mod key_grant_arms {
         ts::register_hybrid_key_as(n.backend, recipient, recipient, USER).await;
         let recipient = e2::kid(recipient);
         n.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: e2::kid_or_keep(identity),
                 occurrence_key_id: recipient.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -558,7 +558,7 @@ pub mod key_grant_arms {
         // identity-ref.
         let owner_k = e2::kid(&owner);
         a.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner_k.clone(),
                 occurrence_key_id: a.key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -686,7 +686,7 @@ pub mod key_grant_arms {
         // identity-ref.
         let owner_k = e2::kid(&owner);
         a.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner_k.clone(),
                 occurrence_key_id: a.key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -803,6 +803,151 @@ pub mod key_grant_arms {
         }
     }
 
+    /// **I6736 + I6737** (v62.0.0, HOLD-1d2) — **the door wiring**: a door
+    /// that re-judges a row this node already held runs its gates inside
+    /// `attestation_admit::at_original_receipt`, so the key-grant W bound
+    /// (`check_key_grant_row_admission`, which reads `receipt_now()`) judges
+    /// at the row's ORIGINAL receipt. Under a `FixedClock`: a `grant`
+    /// delegate appointed five days ago signs two rows an hour ago; the
+    /// owner withdraws the delegation FOUR days later, and both rows re-fold.
+    ///
+    /// - **I6737, the dry re-fold** (`recheck_planned`): r1's row, admitted
+    ///   at its receipt (inside W), stays concluded. MUTATION: drop
+    ///   `at_original_receipt` from `recheck_planned` and the bound reads the
+    ///   clock (four days on, outside W, the delegate not standing): the row
+    ///   un-concludes `asserted_at_stale`.
+    /// - **I6736, the door** (`put_attestation_planned`, reached through
+    ///   `put_admitted_row` for a HELD row): r2's row was held at receipt
+    ///   (`recipient_not_in_audience`: r2 has no occurrence), a gate that
+    ///   runs AFTER the W bound. Re-run through the door, it stays held for
+    ///   that reason. MUTATION: drop `at_original_receipt` from
+    ///   `put_attestation_planned` and the W bound fails first: held
+    ///   `asserted_at_stale`.
+    pub async fn exercise_i6736_i6737_the_door_rejudges_at_the_receipt<B>(
+        a: &Node<'_, B>,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+        use crate::federation::edition2::fold;
+        use crate::federation::key_grant_invariants::two_node::sign_row_unstored_at;
+        let fixed = std::sync::Arc::new(crate::host::clock::FixedClock::new(chrono::Utc::now()));
+        let prev = crate::host::clock::install(fixed.clone());
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let owner = format!("{tag}-i6736-owner-{run}");
+        ts::register_hybrid_key_as(a.backend, &owner, &owner, USER).await;
+        let owner_k = e2::kid(&owner);
+        let now = crate::host::clock::now();
+        a.backend
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
+                identity_key_id: owner_k.clone(),
+                occurrence_key_id: a.key.clone(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
+                hardware_attestation: None,
+                asserted_at: now - chrono::Duration::days(6),
+                valid_until: None,
+                encryption_pubkeys: Some(a.kem.clone()),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap();
+        let sealed = encrypt_and_cascade(
+            a.backend,
+            SELF,
+            &owner_k,
+            b"the ledger",
+            None,
+            None,
+            Some(&a.key),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I6736: A seals self: {e}"));
+        let sha = sealed.at_rest_sha256;
+        let set_for = |recipient: &str| KeyGrantRow {
+            axis: KeyGrantAxis::Content {
+                at_rest_sha256: hex::encode(sha),
+                cohort_scope: SELF.into(),
+                owner_key_id: owner_k.clone(),
+            },
+            wrap: wrap(recipient),
+        };
+        let dir = a.backend.as_dyn_directory();
+        let delegate = node_signer(a.backend, &format!("{tag}-i6736-d-{run}")).await;
+        let d_key = delegate.derived_key_id();
+        let appointed = now - chrono::Duration::days(5);
+        let edge = super::bodies::put_grant_with_term(
+            dir,
+            &owner,
+            &d_key,
+            appointed,
+            appointed,
+            now + chrono::Duration::days(30),
+        )
+        .await;
+        let signed = now - chrono::Duration::hours(1);
+        // r1: in the audience, admitted at its receipt.
+        let r1 = recipient_of(a, &owner_k, &format!("{tag}-i6737-r1-{run}")).await;
+        let row1 = sign_row_unstored_at(&delegate, &set_for(&r1), signed).await;
+        let id1 = crate::federation::edition2::voices::carried_row_id(&row1.attestation)
+            .expect("I6737: a statement-carrying row");
+        admit_replicated(a.backend, row1)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I6737: admitted at its receipt: {e}"));
+        // r2: no occurrence yet, held after the W bound.
+        let r2_seed = format!("{tag}-i6736-r2-{run}");
+        ts::register_hybrid_key_as(a.backend, &r2_seed, &r2_seed, USER).await;
+        let row2 = sign_row_unstored_at(&delegate, &set_for(&e2::kid(&r2_seed)), signed).await;
+        let id2 = crate::federation::edition2::voices::carried_row_id(&row2.attestation)
+            .expect("I6736: a statement-carrying row");
+        let _ = admit_replicated(a.backend, row2)
+            .await
+            .expect_err("I6736 premise: held at its receipt");
+        let why = |id| async move {
+            fold::why_held(dir, &id)
+                .await
+                .expect("read the held reason")
+                .map(|h| h.reason)
+        };
+        assert_eq!(
+            why(id2).await.as_deref(),
+            Some(fold::reason::gc8::RECIPIENT_NOT_IN_AUDIENCE),
+            "{tag} I6736 premise: held for its audience at receipt"
+        );
+        // Four days on, the owner withdraws the delegation; both rows re-fold.
+        fixed.advance(std::time::Duration::from_secs(4 * 86_400));
+        withdraw(dir, &owner, &owner, &d_key, &edge).await;
+        fold::refold_rows(dir, [id1, id2].into_iter().collect())
+            .await
+            .expect("I6736: the re-fold runs");
+        let concluded = a
+            .backend
+            .get_attestation(&id1.hex())
+            .await
+            .unwrap()
+            .is_some();
+        let held = why(id2).await;
+        match prev {
+            Some(p) => {
+                crate::host::clock::install(p);
+            }
+            None => {
+                crate::host::clock::uninstall();
+            }
+        }
+        assert!(
+            concluded,
+            "{tag} I6737: the dry re-fold judges at the original receipt: still concluded"
+        );
+        assert_eq!(
+            held.as_deref(),
+            Some(fold::reason::gc8::RECIPIENT_NOT_IN_AUDIENCE),
+            "{tag} I6736: the door re-run judges the W bound at the original receipt (not \
+             asserted_at_stale)"
+        );
+    }
+
     /// **I1221** (v60.0.0, CIRISPersist#1049) — a `key_grant` row's sealer
     /// chain is judged at its signed `asserted_at`, with W in front. A `grant`
     /// delegate appointed five days ago:
@@ -829,7 +974,7 @@ pub mod key_grant_arms {
         // identity-ref.
         let owner_k = e2::kid(&owner);
         a.backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: owner_k.clone(),
                 occurrence_key_id: a.key.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -919,6 +1064,30 @@ pub mod key_grant_arms {
                 .unwrap()
                 .is_none(),
             "{tag} I1221: a refused row projects nothing"
+        );
+        // v62.0.0 (HOLD-1d) — I6727: a four-day-old row asked again as a
+        // RE-JUDGEMENT of a row this node first held one second after it was
+        // signed (the chain standing then, inside W): admitted, whatever the
+        // clock reads now; asked at the clock it is stale (the premise).
+        // Kills: the key-grant W bound reading `clock::now()` on a re-fold.
+        let r3 = recipient_of(a, &owner_k, &format!("{tag}-i1221-r3-{run}")).await;
+        let old = sign_row_unstored_at(&delegate, &set_for(&r3), now - chrono::Duration::days(4))
+            .await
+            .attestation;
+        let at_clock = crate::federation::key_grant::check_key_grant_row_admission(dir, &old).await;
+        assert!(
+            matches!(&at_clock, Err(Error::AssertedAtStale { .. })),
+            "{tag} I6727 premise: asked at the clock the row is stale: {at_clock:?}"
+        );
+        let at_receipt = crate::federation::attestation_admit::at_original_receipt(
+            Some(old.asserted_at + chrono::Duration::seconds(1)),
+            crate::federation::key_grant::check_key_grant_row_admission(dir, &old),
+        )
+        .await;
+        assert!(
+            at_receipt.is_ok(),
+            "{tag} I6727 (HOLD-1d): a key-grant row first held inside W is judged at that \
+             receipt: {at_receipt:?}"
         );
         // A row whose attester is not its signer speaks for no one. Kills:
         // the self-signed test weakened from OR to AND.
@@ -1116,6 +1285,13 @@ mod run {
         }
 
         #[tokio::test(flavor = "multi_thread")]
+        async fn i6736_i6737() {
+            let ba = fresh().await;
+            let a = node(&ba, "i6736-a").await;
+            exercise_i6736_i6737_the_door_rejudges_at_the_receipt(&a, "sqlite").await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
         async fn i591c() {
             let (ba, bb) = (fresh().await, fresh().await);
             let a = node_as(
@@ -1173,6 +1349,13 @@ mod run {
             let Some(ba) = fresh().await else { return };
             let a = node(&ba, "i1221-a").await;
             exercise_i1221_key_grant_judged_at_issuance(&a, "postgres").await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn i6736_i6737() {
+            let Some(ba) = fresh().await else { return };
+            let a = node(&ba, "i6736-a").await;
+            exercise_i6736_i6737_the_door_rejudges_at_the_receipt(&a, "postgres").await;
         }
 
         #[tokio::test(flavor = "multi_thread")]

@@ -176,10 +176,6 @@ struct Offer<'a> {
     /// v62.0.0 (kernel pass 2) — the version's own signed `prev_head_digest`:
     /// the version it succeeds, which its proof must name.
     prev_head_digest: &'a str,
-    /// v52.0.0 (#956) — when the amendment's only change removes one member
-    /// from the held family record: that member and the held record. Its
-    /// signature alone authorizes it.
-    self_leave: Option<(&'a str, &'a super::types::Family)>,
 }
 
 /// What this node holds under the offered id.
@@ -211,7 +207,7 @@ where
     // a dissolution changes nothing but `dissolved_at` and is the one the
     // quorum signed. (An identical re-offer stays a no-op below.)
     if held.persist_row_hash != offered_hash {
-        super::family_dissolution::refuse_if_dissolved(&held)?;
+        super::family_dissolution::refuse_if_family_ended(dir, &held).await?;
         super::family_dissolution::check_dissolve_is_terminal_only(&held, f)?;
         if let Some(proof) = family.supersede_proof.as_ref() {
             super::family_dissolution::check_dissolution_matches_envelope(
@@ -230,10 +226,6 @@ where
         entrenched: Some(f.consensus_protocol_entrenched),
         proof: family.supersede_proof.as_ref(),
         prev_head_digest: &f.prev_head_digest,
-        // v62.0.0 (RL-fix7) — the accord's recovery and roster change are
-        // genesis bundles: `verify_family_admission` refuses every version of
-        // the accord before this route, so no amendment here is either.
-        self_leave: super::family_dissolution::self_leave_member(&held, f).map(|l| (l, &held)),
     };
     let stored = Stored {
         persist_row_hash: held.persist_row_hash.clone(),
@@ -249,7 +241,7 @@ where
     super::roster_head::check_version_covers_fold(
         dir,
         super::roster_head::LineageRecord::Family(f),
-        crate::host::clock::now(),
+        super::edition2::group::receipt_at_vouch(),
     )
     .await?;
     let snapshot = serde_json::to_value(family)
@@ -349,7 +341,6 @@ where
         entrenched: None,
         proof: community.supersede_proof.as_ref(),
         prev_head_digest: &c.prev_head_digest,
-        self_leave: None,
     };
     let stored = Stored {
         persist_row_hash: stored.persist_row_hash,
@@ -568,20 +559,12 @@ where
         )
         .await?,
     )?;
-    match offer.self_leave {
-        // v52.0.0 (#956) — leaving needs no quorum: the leaver's signature.
-        Some((leaver, held)) => {
-            super::family_dissolution::verify_self_leave_signature(
-                held,
-                &proof.change_envelope,
-                leaver,
-            )?;
-        }
-        None => {
-            dir.verify_membership_quorum(offer.cohort, offer.group_key_id, &proof.change_envelope)
-                .await?;
-        }
-    }
+    // v62.0.0 (RESIGN-3; CC 3.1.3.2) — every amendment is the group's
+    // counted version: one dropping only its own signer meets the quorum like
+    // any other (the self-leave arm of #956 is retired; a member's own
+    // leaving is the `membership:resignation` leaf).
+    dir.verify_membership_quorum(offer.cohort, offer.group_key_id, &proof.change_envelope)
+        .await?;
     Ok(true)
 }
 
@@ -859,7 +842,7 @@ where
     super::roster_head::check_version_covers_fold(
         dir,
         super::roster_head::LineageRecord::Family(&new.family),
-        crate::host::clock::now(),
+        super::edition2::group::receipt_at_vouch(),
     )
     .await?;
     // The snapshot is the SIGNED WRAPPER, not the bare record: the record and
@@ -903,7 +886,12 @@ where
     super::verify_community_admission(dir, &new).await?;
     // v61 S2 (CIRISPersist#1123) — a room stored under founder_only admits
     // one new version, its escape.
-    super::admission::check_founder_only_escape(dir, &new, crate::host::clock::now()).await?;
+    super::admission::check_founder_only_escape(
+        dir,
+        &new,
+        super::edition2::group::receipt_at_vouch(),
+    )
+    .await?;
     // v52.0.0 (#955, Q2) — an amendment never adds a member. The one
     // exception is a trust-root founders' amendment (#926 HIGH-3: its founder
     // seats move ONLY through the record): a founder it seats signed that very
@@ -942,7 +930,7 @@ where
     super::admission::check_infrastructure_community_conformance(
         dir.as_dyn_directory(),
         &new.community,
-        crate::host::clock::now(),
+        super::edition2::group::receipt_at_vouch(),
     )
     .await?;
     // v50.0.0 (CIRISPersist#926) — a trust-root row amends only as a verified

@@ -164,11 +164,18 @@ where
         .await?;
     // v57.0.0 (CIRISPersist#934 step 2) — the ONE clock read of this door,
     // and the record's head instant.
+    // v62.0.0 (HOLD-1e) — a held row re-run under the edition-2 vouch is
+    // judged at its ORIGINAL receipt; the plan (the gates) runs in that
+    // scope, the writes below do not.
     let instants = PlanInstants {
         fold_at: super::canonical_community::head_instant(&community),
-        received_at: crate::host::clock::now(),
+        received_at: super::edition2::group::receipt_at_vouch(),
     };
-    let planned = Box::pin(plan_put_community(dir, community, door, instants)).await?;
+    let planned = super::attestation_admit::at_original_receipt(
+        super::edition2::group::vouched_receipt(),
+        Box::pin(plan_put_community(dir, community, door, instants)),
+    )
+    .await?;
     // v49.0.0 (CIRISPersist#910.5) — the occupied-id route the plan decided:
     // an identical re-put is a no-op, an authorized amendment is applied as a
     // supersede, an empty id (or a chain apply that found it empty) inserts.
@@ -353,11 +360,16 @@ where
     super::edition2::door::refuse_earlier_form("community")?;
     // v57.0.0 (CIRISPersist#934 step 2) — the ONE clock read of this door, and
     // the row's signed instant.
+    // v62.0.0 (HOLD-1e) — at the vouched row's original receipt (plan only).
     let instants = PlanInstants {
         fold_at: revocation.community_membership_revocation.effective_at,
-        received_at: crate::host::clock::now(),
+        received_at: super::edition2::group::receipt_at_vouch(),
     };
-    let planned = plan_put_community_membership_revocation(dir, revocation, instants).await?;
+    let planned = super::attestation_admit::at_original_receipt(
+        super::edition2::group::vouched_receipt(),
+        plan_put_community_membership_revocation(dir, revocation, instants),
+    )
+    .await?;
     // v61.3.0 (CIRISPersist#1252) — the sole refusal is the shortfall: held
     // for its cosignatures (or refused as before).
     let planned = match super::cosign::hold_if_short(
@@ -407,13 +419,11 @@ where
     super::community_dek::reject_future_dated_community_revocation(row.effective_at, received_at)?;
     // v61 S2 (CIRISPersist#1123) — a room stored under founder_only admits
     // no removal but a member's own resignation.
+    // v62.0.0 (RESIGN-3; CC 3.1.3.2) — the resignation is the LEAF the row
+    // persists, never a removal whose voices include its subject.
+    let change = super::RosterChange::of_leaf(row.leaf);
     {
-        let self_leave = revocation.authority_key_id == row.removed_identity_key_id
-            || revocation
-                .cosignatures
-                .iter()
-                .any(|c| c.authority_key_id == row.removed_identity_key_id);
-        if !self_leave {
+        if !change.is_resignation() {
             super::admission::refuse_membership_event_under_founder_only(
                 dir,
                 &row.community_key_id,
@@ -442,7 +452,7 @@ where
             joined_at: row.effective_at,
             role: None,
         },
-        true,
+        change,
         fold_at,
     )
     .await?
@@ -453,11 +463,8 @@ where
     // v50.0.0 (review, M1 loophole) — removing a founder of a conformant
     // infrastructure room would leave its declared N stale.
     if let Some(stored) = dir.lookup_community(&row.community_key_id).await? {
-        let self_leave = revocation.authority_key_id == row.removed_identity_key_id
-            || revocation
-                .cosignatures
-                .iter()
-                .any(|c| c.authority_key_id == row.removed_identity_key_id);
+        // v62.0.0 (RESIGN-3) — by the leaf.
+        let self_leave = change.is_resignation();
         super::admission::check_infrastructure_founder_count_unchanged(
             dir,
             &stored,
@@ -502,8 +509,9 @@ where
 /// when the voices signed, and refusing a removal another node admitted in
 /// time would fork the roster.
 ///
-/// A resignation (the removed member among the signers) is a member's own
-/// act, not a counted removal, and is not bounded. Any other protocol, and a
+/// A resignation (v62.0.0 RESIGN-3: the `resignation` leaf, never a removal
+/// whose voices include its subject) is a member's own act, not a counted
+/// removal, and is not bounded. Any other protocol, and a
 /// room this node does not hold, pass.
 pub(crate) async fn check_open_self_admit_removal_window<D>(
     dir: &D,
@@ -520,9 +528,7 @@ where
     if community.consensus_protocol != super::types::consensus_protocol::OPEN_SELF_ADMIT {
         return Ok(());
     }
-    let signers =
-        super::roster_row_signer_set(&revocation.authority_key_id, &revocation.cosignatures);
-    if signers.contains(&row.removed_identity_key_id) {
+    if row.leaf.is_resignation() {
         return Ok(());
     }
     let window = chrono::Duration::seconds(super::consensus::OPEN_SELF_ADMIT_REMOVAL_WINDOW_SECS);
@@ -560,11 +566,16 @@ where
     super::edition2::door::refuse_earlier_form("community")?;
     // v57.0.0 (CIRISPersist#934 step 2) — the ONE clock read of this door, and
     // the row's signed instant.
+    // v62.0.0 (HOLD-1e) — at the vouched row's original receipt (plan only).
     let instants = PlanInstants {
         fold_at: widening.community_membership_widening.effective_at,
-        received_at: crate::host::clock::now(),
+        received_at: super::edition2::group::receipt_at_vouch(),
     };
-    let planned = plan_put_community_membership_widening(dir, widening, instants).await?;
+    let planned = super::attestation_admit::at_original_receipt(
+        super::edition2::group::vouched_receipt(),
+        plan_put_community_membership_widening(dir, widening, instants),
+    )
+    .await?;
     // v61.3.0 (CIRISPersist#1252) — the sole refusal is the shortfall: held
     // for its cosignatures (or refused as before).
     let planned = match super::cosign::hold_if_short(
@@ -622,7 +633,7 @@ where
         &widening.authority_key_id,
         &super::roster_row_signer_set(&widening.authority_key_id, &widening.cosignatures),
         row.member(),
-        false,
+        super::RosterChange::Widening,
         fold_at,
     )
     .await?

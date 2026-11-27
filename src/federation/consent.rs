@@ -676,6 +676,7 @@ where
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for p in principals {
         let mut pages = AttestationQuery::to(target_key_id, FOLD_PAGE)
+            .view(crate::federation::attestation_query::ContentView::Record)
             .authored_by(p)
             .dimension_prefix(consent_dimension::STATE_PREFIX)
             .pages();
@@ -688,6 +689,7 @@ where
         }
     }
     let mut pages = AttestationQuery::to(target_key_id, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .dimension_prefix(consent_dimension::STATE_EXPIRED_PREFIX)
         .pages();
     while let Some(page) = pages.next(dir).await? {

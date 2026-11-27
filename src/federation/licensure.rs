@@ -186,7 +186,9 @@ pub async fn status_set_for(
     // Every row about the subject, in pages: each is asked whether it was
     // issued under the authority, and the fold's retirement reads them all.
     let mut rows = Vec::new();
-    let mut pages = AttestationQuery::to(subject_key_id, FOLD_PAGE).pages();
+    let mut pages = AttestationQuery::to(subject_key_id, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
+        .pages();
     while let Some(page) = pages.next(directory).await? {
         rows.extend(page);
     }

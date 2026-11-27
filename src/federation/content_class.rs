@@ -190,6 +190,7 @@ where
     // the latest-wins fold below keeps.
     let mut rows = Vec::new();
     let mut pages = AttestationQuery::to(subject_key_id, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .types(&[attestation_type::SCORES])
         .dimension(dimension)
         .pages();

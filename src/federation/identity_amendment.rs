@@ -529,6 +529,7 @@ pub async fn amendment_standings_for(
     use super::attestation_query::{AttestationQuery, FOLD_PAGE};
     let mut rows = Vec::new();
     let mut pages = AttestationQuery::to(agent, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .dimension_prefix(IDENTITY_AMENDMENT_FAMILY_STEM)
         .pages();
     while let Some(page) = pages.next(directory).await? {

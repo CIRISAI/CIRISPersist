@@ -645,135 +645,52 @@ class Engine:
     def add_peer_record_json(self, payload_json: str) -> None:
         """(derived) deontic — Federation directory: add a peer record. Atomically inserts a federation_keys identity row + a federation_peer_metadata row with default trust = "u..."""
 
-    def adopt_sealed_blob_json(self, payload_json: str) -> str:
-        """(derived) deontic — #846 (BLOB_REPLICATION.md §6.1) — adopt a sealed blob received from a peer: store the AtRestEnvelope verbatim at the tier and under the (community,..."""
-
-    def adopt_sealed_chunk_json(self, payload_json: str) -> str:
-        """(derived) deontic — v46.4.0 (CIRISPersist#821, FSD/DRIVE_QUERY_AND_CHUNK_ADOPT.md §3) — the chunk twin of adopt_sealed_blob_json: take one sealed chunk of a stream thi..."""
-
-    def adopt_sealed_chunks_json(self, payload_json: str) -> str:
-        """(derived) deontic — v52.0.0 (CIRISPersist#957) — the batched twin of adopt_sealed_chunk_json: a run of up to 64 sealed chunks of ONE stream, at one epoch, under one pr..."""
-
-    def adopt_sealed_manifest_child_json(self, payload_json: str) -> str:
-        """(derived) deontic — v52.0.0 (CIRISPersist#954) — adopt one child of a v3 manifest (fetched by the sha256_hex its root names): stored as the sealed envelope it is, neve..."""
-
-    def apply_replicated_accord_evidence(self, evidence_json: str) -> str:
-        """(derived) deontic — v31.1.0 (CIRISPersist#662) — admit one replicated accord evidence bundle (JSON, as list_signed_accord_quorum_evidence_since returns its elements) b..."""
-
-    def apply_replicated_attestation(self, signed_attestation_json: str) -> str:
-        """(derived) deontic — v36.0.0 (CIRISPersist#624) — typed, pre-write replicated Attestation-plane apply. FFI mirror of [Engine::apply_replicated_attestation](crate::engin..."""
-
-    def apply_replicated_key_grant(self, signed_key_grant_json: str) -> str:
-        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §12–§13), v55.0.0 (#989, CC 3.3.2 rc7) — admit one replicated key-grant row and project its wrap. FFI mirror..."""
-
-    def apply_replicated_statement(self, statement: bytes, offered_row_id: str) -> str:
-        """v62.0.0 — the replicated edition-2 statement door: one ``COSE_Sign1``
-        statement as a peer delivered it, under the 64-hex id the peer offered
-        it as, at tier ``federation``, through every gate
-        ``put_edition2_statement`` runs. The edition-2 twin of
-        ``apply_replicated_attestation``.
-
-        Returns JSON; every outcome advances the sender's cursor:
-        ``{"outcome": "admitted"|"unchanged", "plane", "row_id", "new",
-        "advances_cursor": true}`` or ``{"outcome": "refused", "reason":
-        "store_conflict", "advances_cursor": true}``.
-
-        Raises:
-            ValueError: ``federation_attester_key_unknown`` (retryable: the
-                signer's key record is not held; do NOT advance the cursor);
-                ``federation_malformed_row: edition2: <token>`` and every
-                attestation-gate refusal, as ``put_edition2_statement``; a
-                malformed ``offered_row_id``.
-        """
-
-    def apply_replicated_statement_at_feed(
-        self,
-        statement: bytes,
-        offered_row_id: str,
-        plane: str,
-        peer: str,
-        position: str,
+    def admission_unit_rows(
+        self, sub: str, at_ms: int | None = None, owner_key_id: str | None = None
     ) -> str:
-        """v62.0.0 (RL-fix1) — ``apply_replicated_statement`` with the host's
-        feed position (``plane``, ``peer``, ``position``; each 1..=512 bytes,
-        stored opaquely). An accord row this node cannot judge (no genesis
-        bundle held) answers ``{"outcome": "refused", "reason":
-        "accord_root_not_held", "advances_cursor": true}``: advance the cursor;
-        the feed's first such position is kept for ``accord_rescan_needed_json``.
-        """
-
-    def accord_rescan_needed_json(self) -> str:
-        """v62.0.0 (RL-fix1) — the feeds to re-pull for accord rows skipped
-        while this node held no accord root: a JSON list of ``{"plane",
-        "peer", "from_position", "skipped_at_ms"}``, empty until a genesis
-        bundle is in force. Re-pull each feed from ``from_position``, then
-        call ``ack_accord_rescan``.
-        """
-
-    def ack_accord_rescan(self, plane: str, peer: str, from_position: str) -> bool:
-        """v62.0.0 (RL-fix1) — the host re-pulled ``plane`` from ``peer`` past
-        ``from_position``: clear that watermark. ``False`` when none matches.
-        """
-
-    def serve_standing_json(self) -> str:
-        """v62.0.0 (RL-fix2c) — what this node will serve a third party:
-        ``{"node_key_id": str | null, "rooted": bool,
-        "withholds_federation_tier": bool}``. ``node_key_id`` is ``null`` when
-        the signer could not derive one (a classical-only signer, a P-256
-        keystore fallback, a failed hardware public-key read); such a node
-        withholds every federation-tier row from third parties, so warn loudly
-        at startup.
-        """
-
-    def record_dial_hints(
-        self,
-        node: str,
-        transport_identity_hex: str,
-        hints_json: str,
-        identity: str | None = None,
-        kind: str | None = None,
-    ) -> None:
-        """v62.0.0 (RL-fix2) — record a contact's dial hint from a decoded node
-        code: ``node`` (identity-ref), ``transport_identity_hex`` (64 bytes,
-        X25519 ‖ Ed25519), ``hints_json`` (``[{"tag": 0..=255, "body_hex": hex},
-        ...]``, Verify's edition-2 FedCode hints in order, unknown tags
-        included; at most 8 hints of at most 255 bytes within the 1024-byte
-        payload), and the code's ``identity`` / ``kind`` (``"user"``
-        | ``"node"``). Local, unsigned, never a transit pair, never served;
-        replaces the node's list.
+        """v62.0.0 (CC 2.7.11; AU-fix2) — the LIVE ``admission:unit`` rows about
+        ``sub`` (a unit's ``canonical:sha256:{hex}``) at ``at_ms`` (POSIX ms;
+        None = now) on a host owned by ``owner_key_id`` (None: this node's
+        owner binding): the issuer standing there, concluded (a held row is
+        never listed), the lease
+        covering the instant, not withdrawn, every signer a live person's key.
+        Returns a JSON array of ``{"row_id", "sub", "unit", "capabilities",
+        "asserted_at_ms", "valid_until_ms", "signers", "authored", "author",
+        "group", "cohort_scope"}``. Whether one runs on this host is
+        ``admission_unit_runnable``'s.
 
         Raises:
-            ValueError: ``federation_malformed_row: contact:
-                dial_hint_out_of_bounds`` (also a ``tag`` above 255) or
-                ``fedcode_transport_is_federation_key``.
+            ValueError: an instant out of range.
         """
 
-    def dial_hints_for_json(self, node: str) -> str:
-        """v62.0.0 (RL-fix2) — the dial hint held for ``node`` as JSON (the
-        ``list_dial_hints_json`` entry shape), or ``null``.
-        """
-
-    def list_dial_hints_json(self) -> str:
-        """v62.0.0 (RL-fix2) — every dial hint held, by node: ``[{"node",
-        "transport_identity_hex", "hints": [{"tag", "body_hex"}],
-        "identity", "kind", "recorded_at_ms"}]``.
-        """
-
-    def remove_dial_hints(self, node: str) -> bool:
-        """v62.0.0 (RL-fix2) — remove a contact's dial hint (call it when the
-        contact is removed). ``False`` when none was held.
-        """
-
-    def admit_pre_seal_answer(self, dialled: str, key_record: bytes, route: bytes) -> str:
-        """v62.0.0 (RL-fix2; CC 5.3.3.10 E1) — the checked admission of a
-        pre-seal answer: the dialled node's own key record and its own bind
-        (route + transit key). Returns ``{"key_record": outcome, "route":
-        outcome, "transit_ready": bool}``.
+    def admission_unit_runnable(
+        self, row_id: str, at_ms: int | None = None, owner_key_id: str | None = None
+    ) -> str:
+        """v62.0.0 (CC 2.7.11; AU-fix1) — may the unit an ``admission:unit``
+        row admits run on this host at ``at_ms`` (POSIX ms; None = now)?
+        ``row_id`` is the row's id, 64 hex; ``owner_key_id`` the host owner the
+        standing legs read (None: this node's owner binding). ``runnable`` is
+        true only when
+        the row is held and CONCLUDED (a counted row's count met at the
+        roster head it names, never on fewer than two persons), its lease
+        covers the instant (``asserted_at <= at < valid_until``), no entitled
+        withdrawal asserted by then retires it, every signer is still a live
+        person's key, the author or group stands at this host (the host
+        owner's own key, or the owner's ``admission`` acceptance walk; one
+        person's effect row only on that person's own host), and a SCITT
+        receipt (RFC 9942, label 394) from a Transparency Service this host
+        trusts is held. Returns JSON ``{"row_id", "runnable", "token",
+        "detail", "service", "statement_id", "row"}``; tokens:
+        ``admission_none`` (``no_row``, ``lease_not_open``, ``lease_ended``,
+        ``withdrawn``), ``admission_count_unmet``, ``admission_unit_held``,
+        ``admission_issuer_not_person`` (``signer_not_live``),
+        ``admission_issuer_not_reached`` (``no_host_owner``,
+        ``not_owner_host``, ``not_reached``), ``admission_receipt_missing``
+        (``none``, ``unverifiable``, ``untrusted_service``). The halt is the
+        host's, read before each effect.
 
         Raises:
-            ValueError: ``federation_malformed_row: contact:
-                code_node_key_mismatch`` / ``code_route_signer_mismatch`` /
-                ``code_route_carries_no_transit_key`` (nothing stored).
+            ValueError: a malformed id, or an instant out of range.
         """
 
     def admit_contact_owner_rows(
@@ -788,6 +705,30 @@ class Engine:
                 (nothing of the owner rows stored).
         """
 
+    def admit_pre_seal_answer(self, dialled: str, key_record: bytes, route: bytes) -> str:
+        """v62.0.0 (RL-fix2; CC 5.3.3.10 E1) — the checked admission of a
+        pre-seal answer: the dialled node's own key record and its own bind
+        (route + transit key). Returns ``{"key_record": outcome, "route":
+        outcome, "transit_ready": bool}``.
+
+        Raises:
+            ValueError: ``federation_malformed_row: contact:
+                code_node_key_mismatch`` / ``code_route_signer_mismatch`` /
+                ``code_route_carries_no_transit_key`` (nothing stored).
+        """
+
+    def adopt_sealed_blob_json(self, payload_json: str) -> str:
+        """(derived) deontic — #846 (BLOB_REPLICATION.md §6.1) — adopt a sealed blob received from a peer: store the AtRestEnvelope verbatim at the tier and under the (community,..."""
+
+    def adopt_sealed_chunk_json(self, payload_json: str) -> str:
+        """(derived) deontic — v46.4.0 (CIRISPersist#821, FSD/DRIVE_QUERY_AND_CHUNK_ADOPT.md §3) — the chunk twin of adopt_sealed_blob_json: take one sealed chunk of a stream thi..."""
+
+    def adopt_sealed_chunks_json(self, payload_json: str) -> str:
+        """(derived) deontic — v52.0.0 (CIRISPersist#957) — the batched twin of adopt_sealed_chunk_json: a run of up to 64 sealed chunks of ONE stream, at one epoch, under one pr..."""
+
+    def adopt_sealed_manifest_child_json(self, payload_json: str) -> str:
+        """(derived) deontic — v52.0.0 (CIRISPersist#954) — adopt one child of a v3 manifest (fetched by the sha256_hex its root names): stored as the sealed envelope it is, neve..."""
+
     def amendment_standings_json(self, agent: str) -> str:
         """v62.0.0 (CC 2.7, CC 3.1.5) — the standing of every identity
         amendment about ``agent``, read now. An amendment is admitted and HELD
@@ -801,177 +742,14 @@ class Engine:
         ``amendment_digest_mismatch``.
         """
 
-    def bundles_in_force_json(self) -> str:
-        """v62.0.0 (CC 2.6.1.11, CC 2.7.8) — the genesis bundles in force on
-        this node: the tips of the held genesis lineage as CIRISVerify places
-        them. The bundle/2 accessor that replaces reading bundle/1
-        ``serve_nodes[].record.key_id``.
+    def apply_replicated_accord_evidence(self, evidence_json: str) -> str:
+        """(derived) deontic — v31.1.0 (CIRISPersist#662) — admit one replicated accord evidence bundle (JSON, as list_signed_accord_quorum_evidence_since returns its elements) b..."""
 
-        Returns a JSON list, empty when no bundle is held, one entry per tip:
-        ``{"object_id": hex, "version": int, "prev": hex | null,
-        "asserted_at": ms, "family_key_id": str, "holders": [identity-ref, ...],
-        "serve_nodes": [identity-ref, ...], "counted": [identity-ref, ...]}``.
-        Two entries are a fork: a reader takes only what both name.
-        """
+    def apply_replicated_attestation(self, signed_attestation_json: str) -> str:
+        """(derived) deontic — v36.0.0 (CIRISPersist#624) — typed, pre-write replicated Attestation-plane apply. FFI mirror of [Engine::apply_replicated_attestation](crate::engin..."""
 
-    def put_genesis_bundle(
-        self,
-        statements_hex: list[str],
-        anchor: dict[str, Any] | str | None = None,
-    ) -> str:
-        """v62.0.0 (CC 2.6.1.11, CC 5.3.4) — the genesis bundle/2 import door:
-        one list of hex statements (the ``ceg-genesis-bundle/2`` voices, one
-        or more objects, and the rows they name), read by CIRISVerify's bundle
-        reader. ``anchor`` roots a first bundle not already held:
-        ``{"thumbprints": [hex, ...]}`` or ``{"object_id": hex}`` (a dict or
-        its JSON text); ``None`` roots nothing new. All or nothing.
-
-        Returns JSON ``{"placed": [bundle, ...], "not_placed": [{"object_id":
-        hex, "token": str, "detail": str | null, "waiting": bool}, ...],
-        "unreadable": [int, ...], "tips": [bundle, ...]}``, each bundle in
-        :meth:`bundles_in_force_json`'s shape; ``tips`` is empty on a fork of
-        the genesis.
-
-        Raises:
-            ValueError: ``federation_malformed_row: edition2: <token>``
-                (``earlier_form_object``, ``genesis_bundle_malformed``,
-                ``genesis_bundle_count_unmet``, ``genesis_bundle_not_anchored``,
-                a named row's own token, ...); the retryable
-                ``federation_attester_key_unknown`` for a bundle waiting on a
-                named row or its predecessor; a malformed ``anchor`` or a
-                statement that is not hex.
-        """
-
-    def rebind_held_for_json(self, seat_identity_ref: str) -> str:
-        """v62.0.0 (CC 3.3.6.2, CC 3.4.7) — the counted re-bind live for a
-        seat, the edition-2 answer to a pre-roll gate.
-
-        Returns JSON: ``null`` when no genesis bundle is held, when
-        ``seat_identity_ref`` is not a seat of the bundle in force, when no
-        re-bind about it reaches its count (a strict majority of the holders
-        of the bundle it names), or when every counted re-bind is over a
-        bundle a later re-seat left behind. Otherwise ``{"row_id": hex,
-        "transit_xwing_pubkey_base64": str, "head": hex}``: the re-bind row,
-        the X-Wing key it makes live (1216 bytes, standard base64), and the
-        bundle it is counted over.
-        """
-
-    def root_grants_for(self, grantee_key_id: str) -> str:
-        """v62.0.0 (KR-fix2; CC 3.2, CC 4.4.3.19) — the counted grants from
-        the root that a key holds.
-
-        Returns a JSON array, one object per held counted
-        ``trust:confers:v1`` grant to ``grantee_key_id``: ``{"row_id": hex,
-        "grantee": str, "scope": [str], "family_key_id": str, "bundle": hex,
-        "bundle_in_force": bool, "accepted": bool, "withdrawn": bool,
-        "confers": bool, "acceptance_row_id": hex | null}``. A grant is
-        counted over the holders of the
-        genesis bundle it names (a strict majority, by voices dated before
-        that bundle's successor). ``confers`` is ``accepted and not
-        withdrawn``: for a node or agent grantee only its owner's acceptance
-        counts. ``withdrawn`` is the root's counted withdrawal only
-        (KR-fix18): a grantee (for a node or agent, its owner) ends the
-        conferral by withdrawing the ACCEPTANCE row (``acceptance_row_id``);
-        the grant still lists, with ``accepted`` and ``confers`` false, and a
-        later acceptance confers again. A grant still short of its holders'
-        count is not listed; a holder finds it with
-        ``held_rows_for(role="root_holder")``.
-        """
-
-    def peer_rooting_json(
-        self,
-        peer_identity_ref: str,
-        claimed_key_form: str,
-        claimed_key: bytes,
-        at_ms: int,
-        reader_node: str | None = None,
-    ) -> str:
-        """v62.0.0 (CC 3.2 T8, CC 5.3.4) — is the peer Rooted for this reader
-        node at ``at_ms``? Replaces the removed ``root_binding``.
-
-        ``claimed_key_form``: ``"composite"`` (the composite public key
-        bytes), ``"kid"`` (the 32-byte thumbprint) or ``"ed25519"`` (the
-        32-byte Ed25519 half; transitional, an identity match retired once
-        the caller carries the composite). ``at_ms``: the signer-stamped instant of the
-        thing judged, never this node's clock for a stored outcome.
-        ``reader_node``: the reader's identity-ref; default this node's key.
-
-        Returns JSON: ``{"state": "rooted" | "stalled", "root", "plane",
-        "via", "record"}``, ``{"state": "not_rooted", "reason": {"token",
-        ...}}`` or ``{"state": "cannot_tell_yet", "missing": {"token",
-        ...}}``. A NotRooted peer is not dropped: only the federation tier
-        waits (CC 5.3.4): rootless is a supported state, and a
-        ``not_rooted`` / ``cannot_tell_yet`` peer still gets the mesh planes
-        (pairing, dial, cohort delivery). Raises ``ValueError`` for an unknown form, a wrong
-        length, no reader, or a reader that is not an identity-ref.
-        """
-
-    def sign_composite(self, domain: str, message: bytes) -> bytes:
-        """v62.0.0 — this engine's ONE composite (ML-DSA-65-Ed25519, 3373
-        bytes) over `message` in the registered signing domain `domain`.
-        Replaces `sign`, `local_sign` and `local_pqc_sign` (removed). Raises
-        `ValueError` for an unregistered domain or with no local signer."""
-
-    def accord_manifest_v2_message(self, manifest_sha256_hex: str, manifest_size: int, signer_identity: str) -> bytes:
-        """v62.0.0 — the 32-byte accord manifest message (v2):
-        sha256(JCS({"domain": "ciris.accord_manifest.v2", "manifest_sha256",
-        "manifest_size", "signer_identity"})). A holder signs it in the
-        "ciris.accord_manifest.v2" domain."""
-
-    def signer_standing(self, identity_ref: str, agent_ref: str, wa_body: str | None = None) -> str:
-        """v62.0.0 — the signer's standing over the agent, now: "root" (an
-        accord holder of the genesis in force), "wise_authority" (an active
-        member of the WA body family `wa_body` names, carrying the
-        wise_authority card; the card alone is self-declared and never
-        standing; no wa_body → never), "owner" (the
-        agent's one counted owner) or "none"; first match wins. Verify the
-        shutdown's composite first (domain "ciris.emergency_shutdown.v1")."""
-
-    def identity_template_v1_message(self, manifest_sha256_hex: str, manifest_size: int, signer_identity: str) -> bytes:
-        """v62.0.0 — the 32-byte identity template message (v1):
-        sha256(JCS({"domain": "ciris.identity_template.v1", "manifest_sha256",
-        "manifest_size", "signer_identity"})). A holder signs it in the
-        "ciris.identity_template.v1" domain."""
-
-    def verify_identity_template_v1(self, statement_digest: bytes, signer_identity: str, composite_sig: bytes) -> None:
-        """v62.0.0 — verify an identity template signature (v1): the digest is
-        32 bytes (ValueError otherwise), the signer must be an accord holder of
-        the genesis bundle in force (`accord_manifest_signer_not_holder`), and
-        the ONE composite over the "ciris.identity_template.v1" domain
-        preimage must verify under that holder's live edition-2 key. Raises on
-        refusal."""
-
-    def verify_accord_manifest_v2(self, manifest_sha256_hex: str, manifest_size: int, signer_identity: str, composite_sig: bytes) -> None:
-        """v62.0.0 — verify an accord manifest signature (v2): the signer must
-        be an accord holder of the genesis bundle in force
-        (`accord_manifest_signer_not_holder`), and the composite must verify
-        under that holder's live edition-2 key. Raises on refusal."""
-
-    def verify_composite_via_directory(self, domain: str, message: bytes, composite_sig: bytes, identity_ref: str) -> str:
-        """v62.0.0 — verify ONE composite over the signing domain's preimage
-        (`domain` a registered tag, e.g. "ciris.agent.system_task.v1";
-        `signing_domain_unknown` otherwise) under the LIVE edition-2 key of
-        `identity_ref`, now. Returns the signer's identity-ref; a refusal raises
-        `ValueError` leading with its token (`verify_component_signature` for a
-        lone half). The producer is `sign_composite(domain, message)`."""
-
-    def put_edition2_statement(self, statement: bytes, offered_row_id: str | None = None) -> str:
-        """v62.0.0 (CC 2.6.1, 2.6.1.12) — the edition-2 statement door, local
-        or replicated: one ``COSE_Sign1`` (tag 18) statement as received.
-        ``offered_row_id`` is the 64-hex id the carrier names it by, if any;
-        it must be the id the bytes compute.
-
-        Returns JSON ``{"plane": "key_plane"|"voice"|"row"|"pending", "row_id": hex,
-        "new": bool}``.
-
-        Raises:
-            ValueError: ``federation_malformed_row: edition2: <token>``
-                (``earlier_form_object`` for a JSON object or bytes in no form,
-                ``row_id_mismatch``, ``row_ref_edition_1``, ...); the retryable
-                ``federation_attester_key_unknown``; every attestation-gate
-                refusal exactly as ``put_attestation`` raises it; a malformed
-                ``offered_row_id``.
-        """
+    def apply_replicated_key_grant(self, signed_key_grant_json: str) -> str:
+        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §12–§13), v55.0.0 (#989, CC 3.3.2 rc7) — admit one replicated key-grant row and project its wrap. FFI mirror..."""
 
     def apply_replicated_key_record(
         self,
@@ -1018,6 +796,42 @@ class Engine:
     def apply_replicated_purge_json(self, bundle_json: str) -> str:
         """(derived) deontic — v54.1.0 (CIRISPersist#1046) — apply a peer's purge bundle: the notice is re-verified against THIS node's trust root and the digest re-derived from..."""
 
+    def apply_replicated_statement(self, statement: bytes, offered_row_id: str) -> str:
+        """v62.0.0 — the replicated edition-2 statement door: one ``COSE_Sign1``
+        statement as a peer delivered it, under the 64-hex id the peer offered
+        it as, at tier ``federation``, through every gate
+        ``put_edition2_statement`` runs. The edition-2 twin of
+        ``apply_replicated_attestation``.
+
+        Returns JSON; every outcome advances the sender's cursor:
+        ``{"outcome": "admitted"|"unchanged", "plane", "row_id", "new",
+        "advances_cursor": true}`` or ``{"outcome": "refused", "reason":
+        "store_conflict", "advances_cursor": true}``.
+
+        Raises:
+            ValueError: ``federation_attester_key_unknown`` (retryable: the
+                signer's key record is not held; do NOT advance the cursor);
+                ``federation_malformed_row: edition2: <token>`` and every
+                attestation-gate refusal, as ``put_edition2_statement``; a
+                malformed ``offered_row_id``.
+        """
+
+    def apply_replicated_statement_at_feed(
+        self,
+        statement: bytes,
+        offered_row_id: str,
+        plane: str,
+        peer: str,
+        position: str,
+    ) -> str:
+        """v62.0.0 (RL-fix1) — ``apply_replicated_statement`` with the host's
+        feed position (``plane``, ``peer``, ``position``; each 1..=512 bytes,
+        stored opaquely). An accord row this node cannot judge (no genesis
+        bundle held) answers ``{"outcome": "refused", "reason":
+        "accord_root_not_held", "advances_cursor": true}``: advance the cursor;
+        the feed's first such position is kept for ``accord_rescan_needed_json``.
+        """
+
     def blackhole_prune_expired_iso(self, now_iso: str) -> int:
         """(derived) deontic — Federation blackhole rules: drop every rule whose until is in the past relative to now_iso. Permanent rules (until IS NULL) are NEVER pruned. Retur..."""
 
@@ -1035,6 +849,19 @@ class Engine:
 
     def build_storage_budget_v1(self, payload_json: str) -> str:
         """(derived) deontic — #356 (CC 6.1.5.2 §Q / CIRISVerify#170) — build a signed StorageBudgetV1 wire JSON from a payload JSON, bound-hybrid signing its CC 6.1.3 preimage w..."""
+
+    def bundles_in_force_json(self) -> str:
+        """v62.0.0 (CC 2.6.1.11, CC 2.7.8) — the genesis bundles in force on
+        this node: the tips of the held genesis lineage as CIRISVerify places
+        them. The bundle/2 accessor that replaces reading bundle/1
+        ``serve_nodes[].record.key_id``.
+
+        Returns a JSON list, empty when no bundle is held, one entry per tip:
+        ``{"object_id": hex, "version": int, "prev": hex | null,
+        "asserted_at": ms, "family_key_id": str, "holders": [identity-ref, ...],
+        "serve_nodes": [identity-ref, ...], "counted": [identity-ref, ...]}``.
+        Two entries are a fork: a reader takes only what both name.
+        """
 
     def capacity_consent_stance(self, attester_key_id: str, subject_key_id: str, family: str, now_iso: str | None = None) -> str:
         """(derived) deontic — v53.1.8 (CIRISPersist#1013) — the consent-before-scoring stance the emit gate asks: by principals, scope analyze:<family>. A scorer's precheck call..."""
@@ -1268,7 +1095,7 @@ class Engine:
         """
 
     def ledger_advance_head(self, ledger_id: str, seq: int, head_hash: str, witness_anchor_ref: str | None = None, source_envelope_ref: str | None = None) -> str:
-        """(derived) deontic — CC 3.3.10.1 L4 — move the stored head forward. Returns the outcome ("advanced" / "unchanged" / "stale" / "contested"); a DIFFERENT hash at the stored seq is "contested"... [build-conditional: #[cfg(feature = "ledgers")]]"""
+        """(derived) deontic — CC 3.3.10.1 L4 — move the stored head forward. Returns the outcome ("advanced" / "unchanged" / "stale" / "contested"); a DIFFERENT hash at the stor... [build-conditional: #[cfg(feature = "ledgers")]]"""
 
     def ledger_register(self, owner_key_id: str, unit: str, standard_version: str) -> str:
         """(derived) deontic — CC 3.3.10.1 L1 — register (or idempotently re-register) the ledger for (owner_key_id, unit, standard_version). Returns JSON {"ledger_id": .., "outc... [build-conditional: #[cfg(feature = "ledgers")]]"""
@@ -1278,6 +1105,9 @@ class Engine:
 
     def licensure_status_set(self, subject_key_id: str, authority_id: str) -> list[str]:
         """(derived) deontic — v54.0.0 (CIRISPersist#1035 item 3) — the live licensure status SET for (subject_key_id, authority_id) now, as wire tokens ("issued", "probation", …..."""
+
+    def may_publish_federation_rendezvous(self, key_id: str) -> None:
+        """(derived) deontic — v62.0.0 (K2-fix20; CC 5.4.6 as ruled for rc22, CC 3.4.13 Q5) — the producing node's authoring check before it publishes a federation-scope rendezvo..."""
 
     def may_release_copy_json(
         self, object_kind: str, object_id: str, object_id2: str | None = None
@@ -1315,6 +1145,34 @@ class Engine:
 
     def open_sealed_manifest_page_json(self, at_rest_sha256_hex: str, child_index: int, viewer_key_id: str, caller_aad_b64: str | None = None) -> str:
         """(derived) deontic — v52.0.0 (CIRISPersist#954) — one page of a v3 manifest: the chunks child child_index lists, opened as viewer_key_id (authorized on the root as read..."""
+
+    def peer_rooting_json(
+        self,
+        peer_identity_ref: str,
+        claimed_key_form: str,
+        claimed_key: bytes,
+        at_ms: int,
+        reader_node: str | None = None,
+    ) -> str:
+        """v62.0.0 (CC 3.2 T8, CC 5.3.4) — is the peer Rooted for this reader
+        node at ``at_ms``? Replaces the removed ``root_binding``.
+
+        ``claimed_key_form``: ``"composite"`` (the composite public key
+        bytes), ``"kid"`` (the 32-byte thumbprint) or ``"ed25519"`` (the
+        32-byte Ed25519 half; transitional, an identity match retired once
+        the caller carries the composite). ``at_ms``: the signer-stamped instant of the
+        thing judged, never this node's clock for a stored outcome.
+        ``reader_node``: the reader's identity-ref; default this node's key.
+
+        Returns JSON: ``{"state": "rooted" | "stalled", "root", "plane",
+        "via", "record"}``, ``{"state": "not_rooted", "reason": {"token",
+        ...}}`` or ``{"state": "cannot_tell_yet", "missing": {"token",
+        ...}}``. A NotRooted peer is not dropped: only the federation tier
+        waits (CC 5.3.4): rootless is a supported state, and a
+        ``not_rooted`` / ``cannot_tell_yet`` peer still gets the mesh planes
+        (pairing, dial, cohort delivery). Raises ``ValueError`` for an unknown form, a wrong
+        length, no reader, or a reader that is not an identity-ref.
+        """
 
     def promote_adopted_manifest_to_dag_json(self, at_rest_sha256_hex: str, viewer_key_id: str, disposition: str, caller_aad_b64: str | None = None) -> str:
         """(derived) deontic — v51.3.0 (CIRISPersist#947) — finish a sealed DAG adopt. adopt_sealed_blob_json stores a received sealed manifest as an inline envelope; until this..."""
@@ -1370,6 +1228,29 @@ class Engine:
                 ``federation_invalid_argument``.
             RuntimeError: backend / IO error.
         """
+
+    def put_blob(
+        self,
+        sha256_hex: str,
+        body_inline_b64: str | None,
+        external_ref_json: str | None,
+        media_type: str | None,
+        claim_hex: str,
+    ) -> None:
+        """v62.0.0 (T2-fix11; CC 6.1.3) — Blob ingest with the holder's
+        edition-2 holding claim: ``claim_hex`` is the holder's
+        ``custody:{kind}`` statement (``here``, at ``federation``, naming
+        this blob and its size; ONE composite signature), signed outside
+        persist. The bytes are checked and stored, then the claim goes
+        through the statement door; a refused claim leaves no bytes this
+        call stored. CLEAN BREAK: replaces ``put_blob_json`` (whose
+        ``PutBlobAttestation`` bound-hybrid claim is deleted) and the interim
+        name ``put_blob_edition2``.
+
+        ``body_inline_b64`` XOR ``external_ref_json`` — exactly one.
+        Raises ``ValueError`` for a malformed claim or body, and the blob
+        error's type for a refusal (the proxy decision runs on the claim's
+        holder)."""
 
     def put_blob_chunk_scoped(self, cohort_scope: str, stream_id: str, seq: int, plaintext_b64: str, epoch: int, community_key_id: str | None = None, aad_b64: str | None = None) -> str:
         """(derived) deontic — #832 (§12.3) — append one plaintext segment to a live stream at cohort_scope, sealed where the tier requires it. The chunk twin of put_blob_scoped:..."""
@@ -1428,11 +1309,57 @@ class Engine:
     def put_edge_detection_event(self, event_json: str) -> None:
         """(derived) deontic — v3.1.1 (CIRISPersist#118) — admission for cirislens.edge_detection_events (V020). Unblocks edge#39 ProbePatternObserver emit_verdict."""
 
+    def put_edition2_statement(self, statement: bytes, offered_row_id: str | None = None) -> str:
+        """v62.0.0 (CC 2.6.1, 2.6.1.12) — the edition-2 statement door, local
+        or replicated: one ``COSE_Sign1`` (tag 18) statement as received.
+        ``offered_row_id`` is the 64-hex id the carrier names it by, if any;
+        it must be the id the bytes compute.
+
+        Returns JSON ``{"plane": "key_plane"|"voice"|"row"|"pending", "row_id": hex,
+        "new": bool}``.
+
+        Raises:
+            ValueError: ``federation_malformed_row: edition2: <token>``
+                (``earlier_form_object`` for a JSON object or bytes in no form,
+                ``row_id_mismatch``, ``row_ref_edition_1``, ...); the retryable
+                ``federation_attester_key_unknown``; every attestation-gate
+                refusal exactly as ``put_attestation`` raises it; a malformed
+                ``offered_row_id``.
+        """
+
     def put_family_json(self, payload_json: str) -> None:
         """(derived) deontic — v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9) — admit a family row."""
 
     def put_fountain_content(self, manifest_json: str, symbols_json: str) -> None:
         """(derived) deontic — v8.0.0 (CIRISPersist#227) — admit a fountain-coded content unit (manifest + N+K symbols), JSON-over-FFI. manifest_json decodes to a FountainManifes..."""
+
+    def put_genesis_bundle(
+        self,
+        statements_hex: list[str],
+        anchor: dict[str, Any] | str | None = None,
+    ) -> str:
+        """v62.0.0 (CC 2.6.1.11, CC 5.3.4) — the genesis bundle/2 import door:
+        one list of hex statements (the ``ceg-genesis-bundle/2`` voices, one
+        or more objects, and the rows they name), read by CIRISVerify's bundle
+        reader. ``anchor`` roots a first bundle not already held:
+        ``{"thumbprints": [hex, ...]}`` or ``{"object_id": hex}`` (a dict or
+        its JSON text); ``None`` roots nothing new. All or nothing.
+
+        Returns JSON ``{"placed": [bundle, ...], "not_placed": [{"object_id":
+        hex, "token": str, "detail": str | null, "waiting": bool}, ...],
+        "unreadable": [int, ...], "tips": [bundle, ...]}``, each bundle in
+        :meth:`bundles_in_force_json`'s shape; ``tips`` is empty on a fork of
+        the genesis.
+
+        Raises:
+            ValueError: ``federation_malformed_row: edition2: <token>``
+                (``earlier_form_object``, ``genesis_bundle_malformed``,
+                ``genesis_bundle_count_unmet``, ``genesis_bundle_not_anchored``,
+                a named row's own token, ...); the retryable
+                ``federation_attester_key_unknown`` for a bundle waiting on a
+                named row or its predecessor; a malformed ``anchor`` or a
+                statement that is not hex.
+        """
 
     def put_identity_occurrence_json(self, payload_json: str) -> None:
         """(derived) deontic — v3.12.0 (CIRISPersist#153 Ask 1, CEG 0.7 §5.6.8.8) — admit an identity_occurrence binding (this occurrence_key_id IS also identity_key_id)."""
@@ -1478,6 +1405,20 @@ class Engine:
 
     def read_stream_chunk_as(self, stream_id: str, seq: int, viewer_key_id: str, aad_b64: str | None = None) -> str:
         """(derived) deontic — #838 (§12.10) — read one chunk of a stream by POSITION as viewer_key_id, base64-encoded. The DVR / catch-up read: the row at (stream_id, seq) autho..."""
+
+    def rebind_held_for_json(self, seat_identity_ref: str) -> str:
+        """v62.0.0 (CC 3.3.6.2, CC 3.4.7) — the counted re-bind live for a
+        seat, the edition-2 answer to a pre-roll gate.
+
+        Returns JSON: ``null`` when no genesis bundle is held, when
+        ``seat_identity_ref`` is not a seat of the bundle in force, when no
+        re-bind about it reaches its count (a strict majority of the holders
+        of the bundle it names), or when every counted re-bind is over a
+        bundle a later re-seat left behind. Otherwise ``{"row_id": hex,
+        "transit_xwing_pubkey_base64": str, "head": hex}``: the re-bind row,
+        the X-Wing key it makes live (1216 bytes, standard base64), and the
+        bundle it is counted over.
+        """
 
     def rebind_key_record(self, signed_key_record_json: str) -> str:
         """(derived) deontic — v44.7.0 (CIRISPersist#864) — the local REBIND door, see Engine::rebind_key_record. signed_key_record_json is the holder's self-signed re-signing of..."""
@@ -1744,6 +1685,28 @@ class Engine:
     def rewrap_own_epochs_to_member_devices_json(self, member_key_id: str | None = None, device_key_id: str | None = None) -> str:
         """(derived) deontic — v50.0.0 (CIRISPersist#916, FSD/SECOND_DEVICE.md §3) — the minter side of the second device, on demand: re-wrap every retained epoch THIS node minte..."""
 
+    def root_grants_for(self, grantee_key_id: str) -> str:
+        """v62.0.0 (KR-fix2; CC 3.2, CC 4.4.3.19) — the counted grants from
+        the root that a key holds.
+
+        Returns a JSON array, one object per held counted
+        ``trust:confers:v1`` grant to ``grantee_key_id``: ``{"row_id": hex,
+        "grantee": str, "scope": [str], "family_key_id": str, "bundle": hex,
+        "bundle_in_force": bool, "accepted": bool, "withdrawn": bool,
+        "confers": bool, "acceptance_row_id": hex | null}``. A grant is
+        counted over the holders of the
+        genesis bundle it names (a strict majority, by voices dated before
+        that bundle's successor). ``confers`` is ``accepted and not
+        withdrawn``: for a node or agent grantee only its owner's acceptance
+        counts. ``withdrawn`` is the root's counted withdrawal only
+        (KR-fix18): a grantee (for a node or agent, its owner) ends the
+        conferral by withdrawing the ACCEPTANCE row (``acceptance_row_id``);
+        the grant still lists, with ``accepted`` and ``confers`` false, and a
+        later acceptance confers again. A grant still short of its holders'
+        count is not listed; a holder finds it with
+        ``held_rows_for(role="root_holder")``.
+        """
+
     def seal_descriptor_for_blob(self, at_rest_sha256_hex: str, key_id: str, plaintext_b64: str) -> str:
         """(derived) deontic — v51.0.0 (CIRISPersist#923, CIRISConstitution#114) — seal a descriptor under an existing blob's DEK as key_id: plaintext_b64 (the JCS {name, format,..."""
 
@@ -1890,20 +1853,14 @@ class Engine:
     def sign_stream_sth_json(self, stream_id: str, chunk_shas_hex: list[str], tree_size: int) -> str:
         """(derived) deontic — v52.0.0 (CIRISPersist#950) — mint this node's Signed Tree Head over a chunk-DAG file's stream under the engine's local signer. chunk_shas_hex are t..."""
 
-    def held_rows_for(self, key_id: str | None = None, role: str | None = None, after: str | None = None, limit: int = 1000) -> str:
-        """(derived) empirical — v62.0.0 (v62 P8-fix5; CC 2.6.1.9, CC 2.7.3, CC 4.4.3.19) — the held rows waiting for a key's voice, in every second-signer role the gate's resolver..."""
-
-    def submit_voice(self, statement_hex: str) -> str:
-        """(derived) deontic — v62.0.0 (v62 P8-fix5) — submit a second signer's voice signed elsewhere (statement_hex: the assembled COSE_Sign1, lowercase hex) through the statem..."""
-
-    def voice_draft(self, row_id: str, signer_iss: str) -> str:
-        """(derived) procedural — v62.0.0 (v62 P8-fix5) — a held row's voice, drafted for a hardware or remote second signer (signer_iss, its identity-ref): JSON {protected, payload..."""
-
-    def voice_held_row(self, row_id: str) -> str:
-        """(derived) deontic — v62.0.0 (v62 P8-fix5; CC 2.6.1.9) — voice a held row with this engine's composite key: its own statement over the author's payload, through the sta..."""
-
-    def voice_status(self, row_id: str) -> str:
-        """(derived) epistemic — v62.0.0 (v62 P8-fix5; CC 2.6.1.9, CC 2.7.3) — the state of a row a second signer's voice concerns as JSON: {"status": "seated"|"waiting", "row_id",..."""
+    def signer_standing(self, identity_ref: str, agent_ref: str, wa_body: str | None = None) -> str:
+        """v62.0.0 — the signer's standing over the agent, now: "root" (an
+        accord holder of the genesis in force), "wise_authority" (an active
+        member of the WA body family `wa_body` names, carrying the
+        wise_authority card; the card alone is self-declared and never
+        standing; no wa_body → never), "owner" (the
+        agent's one counted owner) or "none"; first match wins. Verify the
+        shutdown's composite first (domain "ciris.emergency_shutdown.v1")."""
 
     def steward_bind(self, node_or_agent_key_id: str, infra_scopes: list[str], delegation_purpose: str | None = None) -> str:
         """(derived) deontic — v9.3.0 (#249, CC 4.4.3.4.3) — steward-bind a node/agent occurrence by granting it infra:-only scopes (passes the node-agency gate on a node-role ke..."""
@@ -1916,6 +1873,9 @@ class Engine:
 
     def store_plaintext_local(self, sha256_hex: str, bytes: bytes, media_type: str | None = None) -> None:
         """(derived) deontic — v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §4; #863 ask 1) — the LocalOnly plaintext door. Store commons bytes this node verified itself (size..."""
+
+    def submit_voice(self, statement_hex: str) -> str:
+        """(derived) deontic — v62.0.0 (v62 P8-fix5) — submit a second signer's voice signed elsewhere (statement_hex: the assembled COSE_Sign1, lowercase hex) through the statem..."""
 
     def trust_root_verdict_json(self, user_key_id: str, root_key_id: str) -> str:
         """CIRISServer#356 — **does this node still have a live trust root at
@@ -1967,12 +1927,26 @@ class Engine:
     def update_peer_trust(self, key_id: str, trust_wire: str) -> None:
         """(derived) deontic — Federation directory: set peer trust class. trust_wire is the snake_case TEXT form (untrusted / trusted / restricted / blocked); unrecognized value..."""
 
+    def verify_accord_manifest_v2(self, manifest_sha256_hex: str, manifest_size: int, signer_identity: str, composite_sig: bytes) -> None:
+        """v62.0.0 — verify an accord manifest signature (v2): the signer must
+        be an accord holder of the genesis bundle in force
+        (`accord_manifest_signer_not_holder`), and the composite must verify
+        under that holder's live edition-2 key. Raises on refusal."""
+
     @staticmethod
     def verify_coord_check_observed_region(observed_region: str) -> None:
         """(derived) deontic — v3.11.0 (CIRISPersist#143) — validate a producer-side observed_region value against the closed set {us, eu, apac} without writing a row. Raises Val..."""
 
     def verify_corpus_want_v1(self, wire_json: str, ed25519_pubkey_base64: str, ml_dsa_65_pubkey_base64: str) -> bool:
         """(derived) deontic — #356 — verify a signed CorpusWantV1 wire JSON at ingest. Same contract as [Self::verify_storage_budget_v1_py]."""
+
+    def verify_identity_template_v1(self, statement_digest: bytes, signer_identity: str, composite_sig: bytes) -> None:
+        """v62.0.0 — verify an identity template signature (v1): the digest is
+        32 bytes (ValueError otherwise), the signer must be an accord holder of
+        the genesis bundle in force (`accord_manifest_signer_not_holder`), and
+        the ONE composite over the "ciris.identity_template.v1" domain
+        preimage must verify under that holder's live edition-2 key. Raises on
+        refusal."""
 
     def verify_skill_import_manifest_b64(
         self,
@@ -1993,6 +1967,9 @@ class Engine:
 
     def verify_storage_budget_v1(self, wire_json: str, ed25519_pubkey_base64: str, ml_dsa_65_pubkey_base64: str) -> bool:
         """(derived) deontic — #356 — verify a signed StorageBudgetV1 wire JSON at ingest (structure + PQC-mandatory bound-hybrid signature) against the owner's raw pubkeys (base..."""
+
+    def voice_held_row(self, row_id: str) -> str:
+        """(derived) deontic — v62.0.0 (v62 P8-fix5; CC 2.6.1.9) — voice a held row with this engine's composite key: its own statement over the author's payload, through the sta..."""
 
     def wa_cert_set_active(self, wa_id: str, active: bool) -> bool:
         """v1.5.19 — Activity toggle. Sets ``active`` to the
@@ -2203,7 +2180,7 @@ class Engine:
     def put_stream_sth(self, sth_json: str, producer_key_id: str) -> None:
         """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C1b) — store a producer-signed Signed Tree Head for a stream's transparency log (CEG §10.5.1)."""
 
-    def put_wholeness_witness_json(self, witness_json: str, signature: str, *legacy_positional: object, ed25519_pubkey_b64: str | None = None, mldsa65_pubkey_b64: str | None = None, leaves_b64_json: str | None = None) -> str:
+    def put_wholeness_witness_json(self, witness_json: str, signature: str, legacy_positional: Any, ed25519_pubkey_b64: str | None = None, mldsa65_pubkey_b64: str | None = None, leaves_b64_json: str | None = None) -> str:
         """(derived) testimonial — v16 (CIRISPersist#431, N3 + N4) — admit a WholenessWitness to the corpus, PQC-verified-BEFORE-persist: the full hybrid gate over the §19.1 canonica..."""
 
     def rebuild_signed_wire_index(self) -> int:
@@ -2394,8 +2371,8 @@ class Engine:
     def respond_hybrid_kex_b64(self, recipient_x25519_priv_b64: str, recipient_mlkem768_priv_b64: str, recipient_mlkem768_pub_b64: str, handshake_msg_json: str) -> str:
         """(derived) ontological — v3.8.0 — respond side of hybrid KEX. Returns the matching session key as JSON."""
 
-    def seal_trace_statement(self, trace_json: str, trace_level: str) -> tuple[bytes, bytes]:
-        """(derived) ontological — v62.0.0 (wave P7; CC 3.1.5) — scrub a trace with persist's own scrubber and seal the scrubbed bytes as its `trace:complete:v1` row."""
+    def seal_trace_statement(self, trace_json: str, trace_level: str) -> bytes:
+        """(derived) ontological — v62.0.0 (wave P7; CC 3.1.5) — scrub a trace with persist's own scrubber and seal the scrubbed bytes as its trace:complete:v1 row. FFI mirror of [cr... [build-conditional: #[cfg(feature = "scrub")]]"""
 
     def self_enc_pubkeys(self) -> dict[str, Any]:
         """(derived) ontological — v19.2.0 (CIRISPersist#493) — the node's own content-tier self-encryption pubkeys, derived from the engine's local signing seed (public halves only)..."""
@@ -2406,10 +2383,23 @@ class Engine:
     def set_self_key_id(self, key_id: str | None) -> None:
         """(derived) ontological — v22.0.0 (CIRISPersist#543 / AV-77) — declare THIS NODE'S OWN federation key id, which is what activates the peer de-admission gate. Call it once at..."""
 
+    def sign_composite(self, domain: str, message: bytes) -> bytes:
+        """v62.0.0 — this engine's ONE composite (ML-DSA-65-Ed25519, 3373
+        bytes) over `message` in the registered signing domain `domain`.
+        Replaces `sign`, `local_sign` and `local_pqc_sign` (removed). Raises
+        `ValueError` for an unregistered domain or with no local signer."""
+
+
     # ==============================================================
     # NOMOLOGICAL  (descriptive)
     # Varying one of these changes the model every other symbol reasons under.
     # ==============================================================
+
+    def accord_manifest_v2_message(self, manifest_sha256_hex: str, manifest_size: int, signer_identity: str) -> bytes:
+        """v62.0.0 — the 32-byte accord manifest message (v2):
+        sha256(JCS({"domain": "ciris.accord_manifest.v2", "manifest_sha256",
+        "manifest_size", "signer_identity"})). A holder signs it in the
+        "ciris.accord_manifest.v2" domain."""
 
     def audit_canonicalize_for_hash(self, entry_json: str) -> bytes:
         """v1.5.4 — Return the exact canonical bytes whose SHA-256 equals
@@ -2453,6 +2443,12 @@ class Engine:
     def envelope_vocabulary(self) -> dict[str, Any]:
         """(derived) nomological — v20.0.0 (CIRISPersist#495) — the pinned envelope-vocabulary manifest and its sha256, as {"manifest_json", "sha256"}. A cross-repo harness asserts e..."""
 
+    def identity_template_v1_message(self, manifest_sha256_hex: str, manifest_size: int, signer_identity: str) -> bytes:
+        """v62.0.0 — the 32-byte identity template message (v1):
+        sha256(JCS({"domain": "ciris.identity_template.v1", "manifest_sha256",
+        "manifest_size", "signer_identity"})). A holder signs it in the
+        "ciris.identity_template.v1" domain."""
+
     def is_canonical(self, key_id: str) -> bool:
         """(derived) nomological — v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — is key_id a canonical / founding bootstrap server? Returns True iff its federation_keys row's identity_typ..."""
 
@@ -2466,7 +2462,7 @@ class Engine:
 
     @staticmethod
     def ledger_detect_double_head(head_a_json: str, head_b_json: str) -> str | None:
-        """(derived) nomological — CC 3.3.10.1 L8, first shape — two owner-signed heads (JSON SignedHead each) at one sequence number with different hashes. Returns the JSON ForkEvid... [build-conditional: #[cfg(feature = "ledgers")]]"""
+        """(derived) nomological — CC 3.3.10.1 L8, first shape — two owner-signed heads (JSON SignedHead each: {ledger_id, seq, head_hash, signature_key_id, signature_composite_base6... [build-conditional: #[cfg(feature = "ledgers")]]"""
 
     @staticmethod
     def ledger_verify_chain(entries_json: str, expected_first_seq: int, expected_first_prev: str) -> str:
@@ -2704,8 +2700,19 @@ class Engine:
     def temporal_drift(self, agent_id_hash: str, baseline_json: str, comparison_json: str, caller_occurrence_key_id: str | None) -> str:
         """(derived) epistemic — Temporal drift between two windows for one agent. Returns JSON array of TemporalDriftRow."""
 
+    def verify_composite_via_directory(self, domain: str, message: bytes, composite_sig: bytes, identity_ref: str) -> str:
+        """v62.0.0 — verify ONE composite over the signing domain's preimage
+        (`domain` a registered tag, e.g. "ciris.agent.system_task.v1";
+        `signing_domain_unknown` otherwise) under the LIVE edition-2 key of
+        `identity_ref`, now. Returns the signer's identity-ref; a refusal raises
+        `ValueError` leading with its token (`verify_component_signature` for a
+        lone half). The producer is `sign_composite(domain, message)`."""
+
     def verify_trace(self, complete_trace_json: str) -> dict[str, Any]:
         """(derived) epistemic — v0.4.0 — Verify a CompleteTrace envelope end-to-end, WITHOUT storing it (dry-run validation, pre-storage check, audit replay)."""
+
+    def voice_status(self, row_id: str) -> str:
+        """(derived) epistemic — v62.0.0 (v62 P8-fix5; CC 2.6.1.9, CC 2.7.3) — the state of a row a second signer's voice concerns as JSON: {"status": "seated"|"waiting", "row_id",..."""
 
 
     # ==============================================================
@@ -2739,115 +2746,6 @@ class Engine:
 
     def blob_provenance_from_attestation_json(self, attestation_json: str, sha256_hex: str, epoch: int | None = None, minter_key_id: str | None = None) -> str:
         """(derived) empirical — v46.0.0 (CIRISPersist#876, FSD/EPOCH_MINTER.md) — the provenance of a blob, read off the attestation it flowed from."""
-
-    def edition2_statements_since(self, cursor: str | None = None, limit: int = 1000) -> list[tuple[str, bytes]]:
-        """v62.0.0 — serve the held edition-2 statements after ``cursor``, in
-        this node's admission order, at most ``limit`` (clamped to 1000). Each
-        item is ``(cursor, statement)``: the statement's bytes as received and
-        the opaque cursor (``"<admitted_us>:<statement_id hex>"``) to pass
-        back to resume after it. None starts from the first.
-
-        Raises:
-            ValueError: a malformed cursor.
-        """
-
-    def edition2_held_reason(self, row_id: str) -> str | None:
-        """v62.0.0 (CC 2.7.3) — why a held edition-2 row concludes nothing.
-        ``row_id`` is 64 hex. Returns JSON ``{"row_id", "family", "tier",
-        "replicated", "plane", "reason", "detail", "since_us"}``, or None
-        when the row is concluded
-        (its typed row is in its table) or not held. ``reason`` is a token:
-        ``count_short``, ``owner_unseated``, ``steward_unproven``,
-        ``amendment_digest_mismatch``, ``refold_refused``, ``refolding``. A
-        ``put_edition2_statement`` that answered ``"pending"`` is held.
-
-        Raises:
-            ValueError: a malformed id.
-        """
-
-    def admission_unit_runnable(
-        self, row_id: str, at_ms: int | None = None, owner_key_id: str | None = None
-    ) -> str:
-        """v62.0.0 (CC 2.7.11; AU-fix1) — may the unit an ``admission:unit``
-        row admits run on this host at ``at_ms`` (POSIX ms; None = now)?
-        ``row_id`` is the row's id, 64 hex; ``owner_key_id`` the host owner the
-        standing legs read (None: this node's owner binding). ``runnable`` is
-        true only when
-        the row is held and CONCLUDED (a counted row's count met at the
-        roster head it names, never on fewer than two persons), its lease
-        covers the instant (``asserted_at <= at < valid_until``), no entitled
-        withdrawal asserted by then retires it, every signer is still a live
-        person's key, the author or group stands at this host (the host
-        owner's own key, or the owner's ``admission`` acceptance walk; one
-        person's effect row only on that person's own host), and a SCITT
-        receipt (RFC 9942, label 394) from a Transparency Service this host
-        trusts is held. Returns JSON ``{"row_id", "runnable", "token",
-        "detail", "service", "statement_id", "row"}``; tokens:
-        ``admission_none`` (``no_row``, ``lease_not_open``, ``lease_ended``,
-        ``withdrawn``), ``admission_count_unmet``, ``admission_unit_held``,
-        ``admission_issuer_not_person`` (``signer_not_live``),
-        ``admission_issuer_not_reached`` (``no_host_owner``,
-        ``not_owner_host``, ``not_reached``), ``admission_receipt_missing``
-        (``none``, ``unverifiable``, ``untrusted_service``). The halt is the
-        host's, read before each effect.
-
-        Raises:
-            ValueError: a malformed id, or an instant out of range.
-        """
-
-    def admission_unit_rows(
-        self, sub: str, at_ms: int | None = None, owner_key_id: str | None = None
-    ) -> str:
-        """v62.0.0 (CC 2.7.11; AU-fix2) — the LIVE ``admission:unit`` rows about
-        ``sub`` (a unit's ``canonical:sha256:{hex}``) at ``at_ms`` (POSIX ms;
-        None = now) on a host owned by ``owner_key_id`` (None: this node's
-        owner binding): the issuer standing there, concluded (a held row is
-        never listed), the lease
-        covering the instant, not withdrawn, every signer a live person's key.
-        Returns a JSON array of ``{"row_id", "sub", "unit", "capabilities",
-        "asserted_at_ms", "valid_until_ms", "signers", "authored", "author",
-        "group", "cohort_scope"}``. Whether one runs on this host is
-        ``admission_unit_runnable``'s.
-
-        Raises:
-            ValueError: an instant out of range.
-        """
-
-    def statement_draft(
-        self,
-        row_type: str,
-        envelope_json: str,
-        signer_iss: str,
-        signer_kid_hex: str,
-        sub: str,
-        asserted_at_ms: int,
-        target_row_id: str | None = None,
-    ) -> str:
-        """v62.0.0 (CC 2.6.1.1; AU-fix2) — draft a NEW edition-2 statement for a
-        pen elsewhere (a hardware-custodied owner), for any family: the
-        payload from the row's JSON members (the family from ``dimension``;
-        ``author`` = ``signer_iss`` for an authored family; instants RFC
-        3339; digests 64-hex; an ``admission:unit`` row's roster head as
-        ``head``, which makes it counted), under a header naming
-        ``signer_iss`` / ``signer_kid_hex``. ``target_row_id`` names a
-        composer's held target. Returns JSON ``{"protected", "payload",
-        "sig_structure"}`` (hex): sign ``sig_structure`` with the composite
-        key, assemble the ``COSE_Sign1``, then ``put_edition2_statement``.
-
-        Raises:
-            ValueError: malformed input, an unregistered dimension, a target
-                not held.
-        """
-
-    def edition2_held_rows(self, after: str | None = None, limit: int = 1000) -> str:
-        """v62.0.0 (CC 2.7.3) — the held edition-2 rows that conclude nothing,
-        in row-id order after ``after`` (64 hex; None from the first), at
-        most ``limit`` (clamped to 1000). Returns a JSON array of the objects
-        ``edition2_held_reason`` returns.
-
-        Raises:
-            ValueError: a malformed ``after``.
-        """
 
     def cache_stats(self) -> dict[str, Any]:
         """(derived) empirical — v53.1.8 (CIRISPersist#1014) — [crate::Engine::cache_stats] as a dict keyed by cache (repository_statistics, scoring_factors), each {hits, misses, e..."""
@@ -3198,6 +3096,41 @@ class Engine:
     def duty_holders_for_content_json(self, content_sha256: str, community_id: str, duty: str) -> str:
         """(derived) empirical — #249 Cut A — the duty-holders of a content target (content_sha256) for duty (moderate / takedown / review): the content's resolved subjects ∪ the n..."""
 
+    def edition2_held_reason(self, row_id: str) -> str | None:
+        """v62.0.0 (CC 2.7.3) — why a held edition-2 row concludes nothing.
+        ``row_id`` is 64 hex. Returns JSON ``{"row_id", "family", "tier",
+        "replicated", "plane", "reason", "detail", "since_us"}``, or None
+        when the row is concluded
+        (its typed row is in its table) or not held. ``reason`` is a token:
+        ``count_short``, ``owner_unseated``, ``steward_unproven``,
+        ``amendment_digest_mismatch``, ``refold_refused``, ``refolding``. A
+        ``put_edition2_statement`` that answered ``"pending"`` is held.
+
+        Raises:
+            ValueError: a malformed id.
+        """
+
+    def edition2_held_rows(self, after: str | None = None, limit: int = 1000) -> str:
+        """v62.0.0 (CC 2.7.3) — the held edition-2 rows that conclude nothing,
+        in row-id order after ``after`` (64 hex; None from the first), at
+        most ``limit`` (clamped to 1000). Returns a JSON array of the objects
+        ``edition2_held_reason`` returns.
+
+        Raises:
+            ValueError: a malformed ``after``.
+        """
+
+    def edition2_statements_since(self, cursor: str | None = None, limit: int = 1000) -> list[tuple[str, bytes]]:
+        """v62.0.0 — serve the held edition-2 statements after ``cursor``, in
+        this node's admission order, at most ``limit`` (clamped to 1000). Each
+        item is ``(cursor, statement)``: the statement's bytes as received and
+        the opaque cursor (``"<admitted_us>:<statement_id hex>"``) to pass
+        back to resume after it. None starts from the first.
+
+        Raises:
+            ValueError: a malformed cursor.
+        """
+
     def escrow_get(self, escrow_id: str) -> str | None:
         """(derived) empirical — Point lookup by escrow_id — JSON KeyEscrowRow or None. [build-conditional: #[cfg(feature = "registry_key_escrows")]]"""
 
@@ -3321,6 +3254,9 @@ class Engine:
     def has_blob_json(self, sha256_hex: str) -> bool:
         """(derived) empirical — Federation blob storage: existence check by SHA-256 (hex)."""
 
+    def held_rows_for(self, key_id: str | None = None, role: str | None = None, after: str | None = None, limit: int = 1000) -> str:
+        """(derived) empirical — v62.0.0 (v62 P8-fix5; CC 2.6.1.9, CC 2.7.3, CC 4.4.3.19) — the held rows waiting for a key's voice, in every second-signer role the gate's resolver..."""
+
     def incident_correlate(self, tenant_id: str, key: str) -> str:
         """(derived) empirical — v0.8.3 — Reverse-lookup incidents naming a given correlation key. Returns JSON array of IncidentRef. [build-conditional: #[cfg(feature = "cirisincident")]]"""
 
@@ -3354,10 +3290,10 @@ class Engine:
     def list_accord_proposals_by_anchor_json(self, action: str, prior_family_digest: str) -> str:
         """(derived) empirical — #302 — proposals over (action, prior_family_digest) (H4) as a JSON array."""
 
-    def list_attestations(self, filter_json: str, cursor_json: str | None, limit: int, caller_occurrence_key_id: str | None) -> str:
+    def list_attestations(self, filter_json: str, cursor_json: str | None, limit: int, caller_occurrence_key_id: str | None, content_view: str | None = None) -> str:
         """(derived) empirical — Bulk-list federation_attestations. Returns JSON-encoded AttestationListPage."""
 
-    def list_attestations_by(self, attesting_key_id: str, limit: int, cursor_json: str | None = None, dimension_prefix: str | None = None) -> str:
+    def list_attestations_by(self, attesting_key_id: str, limit: int, cursor_json: str | None = None, dimension_prefix: str | None = None, content_view: str | None = None) -> str:
         """(derived) empirical — v56.0.0 (CIRISPersist#1001) — federation directory: ONE PAGE of the federation-tier attestations attesting_key_id issued, newest first, as a JSON A..."""
 
     def list_attestations_for(self, target_key_id: str, cursor_json: str | None = None, limit: int = 100, caller_occurrence_key_id: str | None = None) -> str:
@@ -3532,29 +3468,6 @@ class Engine:
     def put_blob_chunks_json(self, payload_json: str) -> None:
         """(derived) empirical — v4.1 (CIRISPersist#142, Cut B) — atomic chunked-blob upload."""
 
-    def put_blob(
-        self,
-        sha256_hex: str,
-        body_inline_b64: str | None,
-        external_ref_json: str | None,
-        media_type: str | None,
-        claim_hex: str,
-    ) -> None:
-        """v62.0.0 (T2-fix11; CC 6.1.3) — Blob ingest with the holder's
-        edition-2 holding claim: ``claim_hex`` is the holder's
-        ``custody:{kind}`` statement (``here``, at ``federation``, naming
-        this blob and its size; ONE composite signature), signed outside
-        persist. The bytes are checked and stored, then the claim goes
-        through the statement door; a refused claim leaves no bytes this
-        call stored. CLEAN BREAK: replaces ``put_blob_json`` (whose
-        ``PutBlobAttestation`` bound-hybrid claim is deleted) and the interim
-        name ``put_blob_edition2``.
-
-        ``body_inline_b64`` XOR ``external_ref_json`` — exactly one.
-        Raises ``ValueError`` for a malformed claim or body, and the blob
-        error's type for a refusal (the proxy decision runs on the claim's
-        holder)."""
-
     def put_calibration_bundle(self, bundle_json: str) -> None:
         """(derived) empirical — Lens-derived: write a calibration bundle."""
 
@@ -3581,6 +3494,16 @@ class Engine:
 
     def send_set_for_json(self, key_id: str, cohort_scope: str) -> str:
         """(derived) empirical — v46.3.0 (CIRISPersist#884, FSD/SELF_COLLECTIVE_TRANSFER.md §4) — the send set of key_id for a record at cohort_scope: the consent peers (consent_pe..."""
+
+    def serve_standing_json(self) -> str:
+        """v62.0.0 (RL-fix2c) — what this node will serve a third party:
+        ``{"node_key_id": str | null, "rooted": bool,
+        "withholds_federation_tier": bool}``. ``node_key_id`` is ``null`` when
+        the signer could not derive one (a classical-only signer, a P-256
+        keystore fallback, a failed hardware public-key read); such a node
+        withholds every federation-tier row from third parties, so warn loudly
+        at startup.
+        """
 
     def service_token_revocation_list(self) -> str:
         """v1.5.23 (CIRISPersist#64) — List ALL revoked tokens.
@@ -3847,7 +3770,7 @@ class Engine:
         """
 
     def trust_root_bundle_response_json(self) -> str:
-        """(derived) empirical — v50.0.0 (CIRISPersist#926) — the CC 5.3.4 body (GET /v1/trust-root/bundle), as JSON {"statements": [hex, …]}: the held named rows and voices of each ceg-genesis-bundle/2 in force, in lineage order — the same body t..."""
+        """(derived) empirical — v50.0.0 (CIRISPersist#926) — the CC 5.3.4 body (GET /v1/trust-root/bundle), as JSON {"statements": [hex, …]}: the held named rows and voices of eac..."""
 
     def tsdb_count_edges_by_relationship_in_window(
         self,
@@ -4044,6 +3967,19 @@ class Engine:
     # Varying one of these changes orchestration — when and by whom, not what is true.
     # ==============================================================
 
+    def accord_rescan_needed_json(self) -> str:
+        """v62.0.0 (RL-fix1) — the feeds to re-pull for accord rows skipped
+        while this node held no accord root: a JSON list of ``{"plane",
+        "peer", "from_position", "skipped_at_ms"}``, empty until a genesis
+        bundle is in force. Re-pull each feed from ``from_position``, then
+        call ``ack_accord_rescan``.
+        """
+
+    def ack_accord_rescan(self, plane: str, peer: str, from_position: str) -> bool:
+        """v62.0.0 (RL-fix1) — the host re-pulled ``plane`` from ``peer`` past
+        ``from_position``: clear that watermark. ``False`` when none matches.
+        """
+
     def audit_seal_entry(self, entry_json: str) -> str:
         """v62.0.0 — Seal an audit entry with this engine's composite key:
         sets `actor_id` to the engine's identity-ref, truncates
@@ -4139,9 +4075,6 @@ class Engine:
 
     def mark_replay_resolved(self, queue_id: str) -> None:
         """(derived) procedural — v0.4.0 — Treat a previously-sent row as delivered (the receiver replied replay_detected; the original send already landed before the ACK could arri..."""
-
-    def may_publish_federation_rendezvous(self, key_id: str) -> None:
-        """(derived) deontic — v62.0.0 (K2-fix20; CC 5.4.6 as ruled for rc22, CC 3.4.13 Q5) — the producing node's authoring check before it publishes a federation-scope..."""
 
     def mark_transport_delivered(self, queue_id: str, transport: str) -> None:
         """(derived) procedural — v0.4.0 — Transport reports successful delivery. Transitions the row to delivered (no ACK) or awaiting_ack (ACK required)."""
@@ -4307,6 +4240,32 @@ class Engine:
     def sign_draft(self, draft_json: str) -> bytes:
         """(derived) procedural — v62.0.0 (v62 P8-fix10) — sign a drafted statement with this engine's composite key (ML-DSA-65 + Ed25519): draft_json is a draft as detection_draft..."""
 
+    def statement_draft(
+        self,
+        row_type: str,
+        envelope_json: str,
+        signer_iss: str,
+        signer_kid_hex: str,
+        sub: str,
+        asserted_at_ms: int,
+        target_row_id: str | None = None,
+    ) -> str:
+        """v62.0.0 (CC 2.6.1.1; AU-fix2) — draft a NEW edition-2 statement for a
+        pen elsewhere (a hardware-custodied owner), for any family: the
+        payload from the row's JSON members (the family from ``dimension``;
+        ``author`` = ``signer_iss`` for an authored family; instants RFC
+        3339; digests 64-hex; an ``admission:unit`` row's roster head as
+        ``head``, which makes it counted), under a header naming
+        ``signer_iss`` / ``signer_kid_hex``. ``target_row_id`` names a
+        composer's held target. Returns JSON ``{"protected", "payload",
+        "sig_structure"}`` (hex): sign ``sig_structure`` with the composite
+        key, assemble the ``COSE_Sign1``, then ``put_edition2_statement``.
+
+        Raises:
+            ValueError: malformed input, an unregistered dimension, a target
+                not held.
+        """
+
     def sweep_ack_timeouts(self) -> int:
         """(derived) procedural — v0.4.0 — Sweep ACK timeouts. Returns the count of rows touched (retried or abandoned)."""
 
@@ -4464,6 +4423,9 @@ class Engine:
         Returns the JSON-encoded ``TypedConsolidationOutcome``.
         """
 
+    def voice_draft(self, row_id: str, signer_iss: str) -> str:
+        """(derived) procedural — v62.0.0 (v62 P8-fix5) — a held row's voice, drafted for a hardware or remote second signer (signer_iss, its identity-ref): JSON {protected, payload..."""
+
 
     # ==============================================================
     # PRAGMATIC  (descriptive)
@@ -4473,14 +4435,53 @@ class Engine:
     def body_sha256(self, body_bytes: bytes) -> bytes:
         """(derived) pragmatic — v0.4.1 (CIRISEdge ask) — SHA-256 of body verbatim wire bytes. Used by body_sha256_prefix forensic join key and in_reply_to content-derived ACK matc..."""
 
+    def dial_hints_for_json(self, node: str) -> str:
+        """v62.0.0 (RL-fix2) — the dial hint held for ``node`` as JSON (the
+        ``list_dial_hints_json`` entry shape), or ``null``.
+        """
+
     def get_blob_range(self, sha256_hex: str, start: int, end_inclusive: int) -> Any:
         """(derived) pragmatic — v4.1 (CIRISPersist#142, Cut A) — byte-range read over a blob by SHA-256 (hex). RFC 9110 §14.4 semantics: end_inclusive is clamped to size-1; a star..."""
+
+    def list_dial_hints_json(self) -> str:
+        """v62.0.0 (RL-fix2) — every dial hint held, by node: ``[{"node",
+        "transport_identity_hex", "hints": [{"tag", "body_hex"}],
+        "identity", "kind", "recorded_at_ms"}]``.
+        """
 
     def locale_leaf_hash_hex(self, leaf_json: str) -> str:
         """(derived) pragmatic — v3.8.0 — compute the per-locale leaf hash for a LocaleLeaf JSON envelope. Returns the 32-byte SHA-256 as hex."""
 
     def locale_merkle_root_hex(self, leaves_json: str) -> str:
         """(derived) pragmatic — v3.8.0 — compute the RFC 6962-style Merkle root over a list of LocaleLeaf JSON envelopes. Returns root as hex."""
+
+    def record_dial_hints(
+        self,
+        node: str,
+        transport_identity_hex: str,
+        hints_json: str,
+        identity: str | None = None,
+        kind: str | None = None,
+    ) -> None:
+        """v62.0.0 (RL-fix2) — record a contact's dial hint from a decoded node
+        code: ``node`` (identity-ref), ``transport_identity_hex`` (64 bytes,
+        X25519 ‖ Ed25519), ``hints_json`` (``[{"tag": 0..=255, "body_hex": hex},
+        ...]``, Verify's edition-2 FedCode hints in order, unknown tags
+        included; at most 8 hints of at most 255 bytes within the 1024-byte
+        payload), and the code's ``identity`` / ``kind`` (``"user"``
+        | ``"node"``). Local, unsigned, never a transit pair, never served;
+        replaces the node's list.
+
+        Raises:
+            ValueError: ``federation_malformed_row: contact:
+                dial_hint_out_of_bounds`` (also a ``tag`` above 255) or
+                ``fedcode_transport_is_federation_key``.
+        """
+
+    def remove_dial_hints(self, node: str) -> bool:
+        """v62.0.0 (RL-fix2) — remove a contact's dial hint (call it when the
+        contact is removed). ``False`` when none was held.
+        """
 
     def secrets_encrypt(self, plaintext: str) -> str:
         """(derived) pragmatic — v0.6.1 — Direct AES-GCM encrypt. Returns base64(salt || nonce || ciphertext). [build-conditional: #[cfg(feature = "secrets")]]"""
@@ -4738,6 +4739,6 @@ def earlier_form_doors_shut() -> bool:
     before it decodes its object."""
 
 def key_grant_refusal_is_retryable(reason: str) -> bool:
-    """(derived) procedural — v60.1.0 (CIRISPersist#1064, CIRISEdge) — may a later re-offer of the row a federation_key_grant_refused refusal named succeed? reason is the refusa..."""
+    """(derived) procedural"""
 
 # --- pyi_surface: END GENERATED REGION ---

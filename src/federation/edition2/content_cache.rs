@@ -1,0 +1,569 @@
+//! v62.0.0 (CONTENT-A6; CC rc22 3.1.3.2) — **the cache of
+//! `ciris_kernel::content`'s answers**, kept by the door.
+//!
+//! [`refresh`] recomputes one (member, room) whole and replaces its cached
+//! answers. The crate's `changed` is itself two full reads of the member's
+//! rows, so the result is the same, and one entry point is simpler to
+//! witness. [`refresh_after`] runs it at the end of every statement's door,
+//! for the (member, room)s that statement bears on:
+//!
+//! - a room content row of an author;
+//! - a composer on one (an edit, a retraction);
+//! - an end of a seat, or a `keeps` row (every placement of the group).
+//!
+//! **What is not stored.** A (member, room) with no concluded end is not
+//! cached. Its rows are counted, and in force unless the author's own
+//! retraction is held: the crate's documented no-end property
+//! (`kernel::content::kernel_in_play`). A refresh that finds no concluded
+//! end clears the member's cached rows (an end retracted).
+//!
+//! **Retractions and held composers.** A retraction is read whether or not
+//! it is concluded (CC: "takes effect whenever it is signed, whether or not
+//! the retraction itself counts or is kept"). So the composers gathered here
+//! are the KEPT statements naming the member's rows, by design: the crate
+//! decides, not this module.
+
+use ciris_verify_core::cde::Value;
+
+use super::content_store::{CachedAnswer, RetainedEnd};
+use super::door::AdmittedRow;
+use super::names::RowId;
+use crate::federation::{Error, FederationDirectory};
+use crate::kernel::content::{self as adapter, Room, RoomRow, COUNT};
+
+fn group_kind_of(scope: &str) -> &'static str {
+    if scope == crate::federation::types::cohort_scope::FAMILY {
+        "family"
+    } else {
+        "community"
+    }
+}
+
+/// `Unsupported` (a backend without the content tables) is no work.
+fn supported<T>(r: Result<T, Error>) -> Result<Option<T>, Error> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(Error::Unsupported { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// A retained end as the crate reads it (the end's statement may be gone).
+fn end_row(e: &RetainedEnd, member: &str) -> RoomRow {
+    use ciris_kernel::content::{Kind, SeatAt};
+    RoomRow {
+        id: e.source,
+        kind: if e.kind == super::group::KEEPS_LEAF {
+            Kind::Tips
+        } else {
+            Kind::End
+        },
+        signer: if e.counted {
+            COUNT.to_owned()
+        } else {
+            member.to_owned()
+        },
+        head: Some(e.head),
+        prev: Vec::new(),
+        tips: e.tips.clone(),
+        retracts: None,
+        extends: e.extends,
+        seat: SeatAt::Sits,
+        several_heads: false,
+    }
+}
+
+/// v62.0.0 (CONTENT-A1.rev2) — **the crate's answers, as cached**, for
+/// `member` over `rows` (the member's rows and retained ends, WITHOUT heads):
+/// the room's heads from the lineage ([`adapter::head_rows`]) for the heads
+/// the rows name, the member's own removal presented as End + Head `Out`
+/// ([`adapter::present_own_removals`]), the crate asked, and every row
+/// naming several heads cached as not judged yet (rule [`UNDECIDED`], waiting
+/// on no row).
+async fn judged_rows<F>(
+    dir: &F,
+    room: &Room,
+    member: &str,
+    mut rows: Vec<RoomRow>,
+    keys: &std::collections::BTreeSet<String>,
+    offered: &[Vec<u8>],
+) -> Result<Vec<CachedAnswer>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let named = adapter::named_heads(&rows);
+    let (heads, own_removals) = adapter::head_rows(dir, room, member, &named).await?;
+    rows.extend(heads);
+    let roots: Vec<RowId> = rows.iter().map(|r| r.id).collect();
+    let mut past = adapter::HeldPast::preload(dir, &roots, offered).await?;
+    adapter::present_own_removals(&mut rows, &own_removals, &mut past);
+    let mut out: Vec<CachedAnswer> = adapter::answers(&rows, keys, &past)
+        .into_iter()
+        .map(|(row, a)| cached(row, a))
+        .collect();
+    out.extend(
+        adapter::not_judged(&rows)
+            .into_iter()
+            .map(|row| CachedAnswer {
+                row,
+                counted: false,
+                in_force: false,
+                rule: UNDECIDED.to_owned(),
+                undecided_on: None,
+            }),
+    );
+    Ok(out)
+}
+
+fn cached(row: RowId, a: ciris_kernel::content::Answer<RowId>) -> CachedAnswer {
+    match a {
+        ciris_kernel::content::Answer::Judged(j) => CachedAnswer {
+            row,
+            counted: j.counted,
+            in_force: j.in_force,
+            rule: j.rule.as_str().to_owned(),
+            undecided_on: None,
+        },
+        ciris_kernel::content::Answer::Undecided(on) => CachedAnswer {
+            row,
+            counted: false,
+            in_force: false,
+            rule: UNDECIDED.to_owned(),
+            undecided_on: Some(on),
+        },
+    }
+}
+
+/// **Recompute `member`'s answers in the room (`scope`, `target`)** and
+/// replace the cache.
+///
+/// # Errors
+/// Directory reads and writes (other than `Unsupported`).
+pub async fn refresh<F>(dir: &F, scope: &str, target: &str, member: &str) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(ends) = supported(
+        dir.edition2_content_ends(group_kind_of(scope), target, member)
+            .await,
+    )?
+    else {
+        return Ok(());
+    };
+    if ends.is_empty() {
+        return Ok(());
+    }
+    let mut retained = Vec::new();
+    for e in ends {
+        if super::verdict::row_state(dir, &e.source)
+            .await?
+            .is_concluded()
+        {
+            retained.push(e);
+        }
+    }
+    if !retained.iter().any(|e| e.kind != super::group::KEEPS_LEAF) {
+        dir.edition2_put_content_answers(scope, target, member, &[])
+            .await?;
+        return Ok(());
+    }
+    let series =
+        supported(dir.edition2_room_series(scope, target, member).await)?.unwrap_or_default();
+    // v62.0.0 (CONTENT-A1.rev2) — the heads are the lineage's
+    // ([`judged_rows`]); no roster statement is read here.
+    let mut statements: Vec<Vec<u8>> = Vec::new();
+    for (id, _) in &series {
+        statements.extend(dir.edition2_voices(id).await?);
+        for c in dir.edition2_rows_naming(id, "target").await? {
+            statements.extend(dir.edition2_voices(&c).await?);
+        }
+    }
+    let room = Room {
+        scope: scope.to_owned(),
+        group: target.to_owned(),
+    };
+    let mut rows = adapter::rows_of(&statements, &room, member);
+    rows.extend(retained.iter().map(|e| end_row(e, member)));
+    let keys = adapter::member_keys(&statements, member);
+    let answers = judged_rows(dir, &room, member, rows, &keys, &[]).await?;
+    dir.edition2_put_content_answers(scope, target, member, &answers)
+        .await
+}
+
+/// v62.0.0 (CONTENT-A7; CC rc22 3.1.3.2; P/CONTENT-design.rev3.md
+/// "admit-and-mark") — a room content row of a member with a CONCLUDED end
+/// of a seat in its room: where the row sits, its id and its size.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EndedContent {
+    /// The row's room and author.
+    pub entry: super::room_content::SeriesEntry,
+    /// The row id.
+    pub row_id: RowId,
+    /// The statement's size.
+    pub bytes: u64,
+}
+
+/// v62.0.0 (CONTENT-A7) — **is `row` room content of a member whose seat in
+/// that room has a concluded end?** Such a row is not held on its writer's
+/// write scope: it is ADMITTED, and the crate's cached answer marks it
+/// (counted at its head; in the room's content only where a tip holds it
+/// good). The ends read are declared to the running fold attempt, so a
+/// withdrawn end re-folds the row. `None` for any other row, and on a
+/// backend with no content tables.
+///
+/// # Errors
+/// Directory reads.
+pub async fn ended_member_content<F>(
+    dir: &F,
+    row: &crate::federation::types::Attestation,
+) -> Result<Option<EndedContent>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(st) = super::emit::carried_statement(row) else {
+        return Ok(None);
+    };
+    let (Some(row_id), Some((protected, payload))) = (
+        RowId::of_statement(&st),
+        super::liveness::statement_parts(&st),
+    ) else {
+        return Ok(None);
+    };
+    let (Some(family), Some(row_type)) = (
+        protected.get_int(-70002).and_then(Value::as_text),
+        protected.get_int(-70001).and_then(Value::as_text),
+    ) else {
+        return Ok(None);
+    };
+    let Some(entry) = super::room_content::series_entry(row_type, family, &payload) else {
+        return Ok(None);
+    };
+    let Some(ends) = concluded_ends(dir, &entry.scope, &entry.target, &entry.author).await? else {
+        return Ok(None);
+    };
+    for e in &ends {
+        super::fold::reads(super::fold::Dep::Row(e.source));
+    }
+    if !ends.iter().any(|e| e.kind != super::group::KEEPS_LEAF) {
+        return Ok(None);
+    }
+    Ok(Some(EndedContent {
+        entry,
+        row_id,
+        bytes: u64::try_from(st.len()).unwrap_or(u64::MAX),
+    }))
+}
+
+/// v62.0.0 (CONTENT-A7; CC rc22 3.1.3.2: a host-rendered room read returns
+/// the room's CONTENT) — **the present filter**: `rows` less every row whose
+/// cached answer says it is not in the room's content now (`in_force`
+/// false, an undecided row included: it waits). A row with no cached answer
+/// is kept (no end of its author's seat is held: the crate's no-end
+/// property). Rows are dropped only, never added or changed. A backend with
+/// no content tables keeps every row.
+///
+/// # Errors
+/// Directory reads.
+pub async fn present<F>(
+    dir: &F,
+    rows: Vec<crate::federation::types::Attestation>,
+) -> Result<Vec<crate::federation::types::Attestation>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let out_of_content = match super::voices::carried_row_id(&r) {
+            Some(id) => supported(dir.edition2_content_answer(&id).await)?
+                .flatten()
+                .is_some_and(|a| !a.in_force),
+            None => false,
+        };
+        if !out_of_content {
+            out.push(r);
+        }
+    }
+    Ok(out)
+}
+
+/// v62.0.0 (CONTENT-A7) — **a query's rows in the view it states**: a room
+/// query with no view is refused (`AttestationQuery::check_view`, no
+/// default); `Present` is [`present`]; `Record` (and a query naming no
+/// room) is every row. The ONE function both the in-process read
+/// (`AttestationQueryExec::run_attestation_query`) and the capsule host's
+/// `ExecuteAttestationQuery` apply.
+///
+/// # Errors
+/// The missing view; directory reads.
+pub async fn view_rows<F>(
+    dir: &F,
+    q: &crate::federation::attestation_query::AttestationQuery,
+    rows: Vec<crate::federation::types::Attestation>,
+) -> Result<Vec<crate::federation::types::Attestation>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use crate::federation::attestation_query::ContentView;
+    q.check_view()?;
+    match q.view {
+        Some(ContentView::Present) => present(dir, rows).await,
+        Some(ContentView::Record) | None => Ok(rows),
+    }
+}
+
+/// v62.0.0 (CONTENT-A7; Constitution for Eric, 11-24: `content_view` on the
+/// Python reads, the capsule member's rule) — **a listing's rows in the view
+/// its caller states**: where the listing is of a ROOM (its `cohort_scope`
+/// is a room placement, `room_content::ROOM_PLACEMENTS`) the view is
+/// REQUIRED: `"record"` keeps every row, `"present"` is [`present`], and an
+/// absent or unknown view is refused. Where it is not of a room the view
+/// does not apply and the rows are returned as they are.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] for a room listing with no view or an unknown
+/// one; directory reads.
+pub async fn view_listed<F>(
+    dir: &F,
+    cohort_scope: Option<&str>,
+    view: Option<&str>,
+    rows: Vec<crate::federation::types::Attestation>,
+) -> Result<Vec<crate::federation::types::Attestation>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let room = cohort_scope.is_some_and(|s| super::room_content::ROOM_PLACEMENTS.contains(&s));
+    if !room {
+        return Ok(rows);
+    }
+    match view {
+        Some("present") => present(dir, rows).await,
+        Some("record") => Ok(rows),
+        Some(other) => Err(Error::InvalidArgument(format!(
+            "content_view {other:?}: a room read states \"record\" or \"present\""
+        ))),
+        None => Err(Error::InvalidArgument(format!(
+            "a read of the room scope {cohort_scope:?} states its content_view (\"record\" or \
+             \"present\"; CC rc22 3.1.3.2, no default)"
+        ))),
+    }
+}
+
+/// The cache's rule for an `Answer::Undecided` (the crate's past could not
+/// tell until a row is held).
+pub const UNDECIDED: &str = "undecided";
+
+/// The (scope, room, member)s a row of `row_type` / `family` with `payload`
+/// bears on: a room content row's own; an end's or keeps row's at every
+/// placement of its group. Empty for anything else.
+fn bears_on(row_type: &str, family: &str, payload: &Value) -> Vec<(String, String, String)> {
+    use super::group::{
+        KEEPS_LEAF, MEMBERSHIP_PREFIX, REMOVAL_LEAF, RESIGNATION_LEAF, WIDENING_LEAF,
+    };
+    if let Some(e) = super::room_content::series_entry(row_type, family, payload) {
+        return vec![(e.scope, e.target, e.author)];
+    }
+    if super::emit::names_a_target(row_type)
+        || family != ciris_verify_core::namespace_match::family_id(MEMBERSHIP_PREFIX)
+    {
+        return Vec::new();
+    }
+    let leaf = super::payloads::leaf_of(MEMBERSHIP_PREFIX, payload);
+    // v62.0.0 (CONTENT-A7) — a WIDENING too: a member seated again is
+    // re-answered (a new seat begins at it; the lead's gap, closed).
+    if !matches!(leaf, Some(l) if l == REMOVAL_LEAF
+        || l == RESIGNATION_LEAF
+        || l == KEEPS_LEAF
+        || l == WIDENING_LEAF)
+    {
+        return Vec::new();
+    }
+    let text = |k: &str| {
+        payload
+            .get_text(k)
+            .and_then(Value::as_text)
+            .map(str::to_owned)
+    };
+    let (Some(kind), Some(group), Some(member)) =
+        (text("group_kind"), text("group"), text("member"))
+    else {
+        return Vec::new();
+    };
+    super::content_prev::room_scopes(&kind)
+        .iter()
+        .map(|s| ((*s).to_owned(), group.clone(), member.clone()))
+        .collect()
+}
+
+/// **The (member, room)s an admitted statement bears on**, each refreshed:
+/// its own ([`bears_on`]), or, for a composer, its target's (an edit or a
+/// retraction of a content row; the withdrawal of an end).
+///
+/// # Errors
+/// As [`refresh`].
+pub async fn refresh_after<F>(dir: &F, admitted: &AdmittedRow) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    // v62.0.0 (CONTENT-A6b) — a NEW own content row of an ENDED member whose
+    // cache is current is answered alone ([`answer_one`]); every other
+    // arrival recomputes the (member, room).
+    if let Some(e) =
+        super::room_content::series_entry(&admitted.row_type, &admitted.family, &admitted.payload)
+    {
+        if answer_one(dir, &e.scope, &e.target, &e.author, admitted).await? {
+            return Ok(());
+        }
+    }
+    let mut on = bears_on(&admitted.row_type, &admitted.family, &admitted.payload);
+    if super::emit::names_a_target(&admitted.row_type) {
+        if let Some(target) = super::names::single(&admitted.names, "target") {
+            for st in dir.edition2_voices(&target).await? {
+                let Some((protected, payload)) = super::liveness::statement_parts(&st) else {
+                    continue;
+                };
+                let (Some(family), Some(row_type)) = (
+                    protected.get_int(-70002).and_then(Value::as_text),
+                    protected.get_int(-70001).and_then(Value::as_text),
+                ) else {
+                    continue;
+                };
+                on = bears_on(row_type, family, &payload);
+                break;
+            }
+        }
+    }
+    for (scope, target, member) in on {
+        refresh(dir, &scope, &target, &member).await?;
+    }
+    Ok(())
+}
+
+/// The concluded retained ends / keeps rows of `member` in the room, or
+/// `None` when the backend has no content tables.
+pub(crate) async fn concluded_ends<F>(
+    dir: &F,
+    scope: &str,
+    target: &str,
+    member: &str,
+) -> Result<Option<Vec<RetainedEnd>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(ends) = supported(
+        dir.edition2_content_ends(group_kind_of(scope), target, member)
+            .await,
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut out = Vec::new();
+    for e in ends {
+        if super::verdict::row_state(dir, &e.source)
+            .await?
+            .is_concluded()
+        {
+            out.push(e);
+        }
+    }
+    Ok(Some(out))
+}
+
+/// v62.0.0 (CONTENT-A6b; the lead's ruling 11-23: no O(n²) for an ended
+/// member) — **the one-row step.** For an admitted room content row X of
+/// `member` (its own row, not a composer), answer X ALONE and write its one
+/// cache row, when every condition below holds; `Ok(false)` (the caller
+/// recomputes the member) when any fails.
+///
+/// 1. `member` has a CONCLUDED end in the room. With none, X is `no_end`
+///    (the crate's documented property) and nothing is cached: `Ok(true)`
+///    with no write.
+/// 2. No retained end or keeps row names X as a tip.
+/// 3. No held row names X as `prev`, `further_prev`, `trusted_through` or
+///    `target` (a retraction or edit of X that arrived first).
+/// 4. The cache is current through X's predecessor: X names `refs.prev` P
+///    and P has a cache row. (A first row after the end has none: the
+///    member is recomputed, once, cheaply.)
+///
+/// **Why the other rows' answers cannot move.** The crate decides a row by
+/// the ends that count (X is no End), the seats (X is no head), the
+/// retractions held (X is no retraction), and the kept set: the union of
+/// the walks from the tips read along same-member predecessors. A walk
+/// reaches a row only through a tip naming it or a held row naming it as a
+/// predecessor. By (2) and (3) nothing reaches X, so X's own predecessor
+/// edges are never followed and the kept set is unchanged.
+///
+/// **Why X's answer is the crate's own.** X's answer reads: the ends and
+/// their counting (each end's own past and the heads), X's head against the
+/// ends' heads and the seats (E3, `no_seat`), the ends in X's causal past
+/// (E4), a held retraction of X (none, by 3), and whether X is held good
+/// (not, by 2 and 3). So `content::answers` over {the room's heads, the
+/// retained ends and keeps rows, X} gives exactly the answer it gives over
+/// the whole series. The crate is asked; persist approximates nothing.
+/// X's `prev` is not an input to X's answer; it is read only for (4).
+///
+/// Reads, whatever the member's number of posts:
+/// - the retained ends (one indexed probe, plus one tips probe per end on
+///   sqlite);
+/// - one verdict per retained end;
+/// - four `ceg_row_names` probes for X;
+/// - one cache probe for P;
+/// - v62.0.0 (CONTENT-A1.rev2) — the room's lineage nodes (one read) and
+///   the seat marks of the heads presented ([`adapter::head_rows`]: those
+///   the rows name and those that can admit the member, two `members_at`
+///   each, each bounded by the restating version it stands on);
+/// - X's causal past, bounded by the roster lineage (`MAX_PAST`).
+///
+/// # Errors
+/// Directory reads and the one write.
+pub async fn answer_one<F>(
+    dir: &F,
+    scope: &str,
+    target: &str,
+    member: &str,
+    admitted: &AdmittedRow,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(ends) = concluded_ends(dir, scope, target, member).await? else {
+        return Ok(true);
+    };
+    if !ends.iter().any(|e| e.kind != super::group::KEEPS_LEAF) {
+        // (1) No concluded end. A retained end that does not conclude yet is
+        // the full refresh's (it clears the member's cache).
+        return Ok(ends.is_empty());
+    }
+    let x = admitted.row_id;
+    if ends.iter().any(|e| e.tips.contains(&x)) {
+        return Ok(false);
+    }
+    for role in ["prev", "further_prev", "trusted_through", "target"] {
+        if !dir.edition2_rows_naming(&x, role).await?.is_empty() {
+            return Ok(false);
+        }
+    }
+    let Some(prev) = super::names::single(&admitted.names, "prev") else {
+        return Ok(false);
+    };
+    if dir.edition2_content_answer(&prev).await?.is_none() {
+        return Ok(false);
+    }
+    let room = Room {
+        scope: scope.to_owned(),
+        group: target.to_owned(),
+    };
+    let offered = std::slice::from_ref(&admitted.bytes);
+    let mut rows = adapter::rows_of(offered, &room, member);
+    rows.extend(ends.iter().map(|e| end_row(e, member)));
+    let keys = adapter::member_keys(offered, member);
+    let Some(cached) = judged_rows(dir, &room, member, rows, &keys, offered)
+        .await?
+        .into_iter()
+        .find(|a| a.row == x)
+    else {
+        return Ok(false);
+    };
+    dir.edition2_put_content_answer(scope, target, member, &cached)
+        .await?;
+    Ok(true)
+}

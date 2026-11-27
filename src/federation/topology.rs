@@ -195,13 +195,15 @@ pub async fn build_trust_topology(
     // `dimension`) pinned in the query, every page of it.
     let mut q = match (&filter.granter_key, &filter.grantee_key) {
         (Some(g), grantee) => {
-            let q = AttestationQuery::by(g, FOLD_PAGE);
+            let q = AttestationQuery::by(g, FOLD_PAGE)
+                .view(crate::federation::attestation_query::ContentView::Record);
             match grantee {
                 Some(t) => q.attested_to(t),
                 None => q,
             }
         }
-        (None, Some(g)) => AttestationQuery::to(g, FOLD_PAGE),
+        (None, Some(g)) => AttestationQuery::to(g, FOLD_PAGE)
+            .view(crate::federation::attestation_query::ContentView::Record),
         // Guarded by the InvalidArgument check above.
         (None, None) => unreachable!("granter_key or grantee_key is set"),
     };
@@ -258,6 +260,7 @@ pub async fn build_trust_topology(
     }
     for g in &granters_seen {
         let mut pages = AttestationQuery::to(g, FOLD_PAGE)
+            .view(crate::federation::attestation_query::ContentView::Record)
             .types(&[attestation_type::DELEGATES_TO])
             .pages();
         while let Some(page) = pages.next(directory).await? {
@@ -498,6 +501,7 @@ pub async fn build_delegation_graph(
         // The node's edges and its retractions of them.
         let mut rows = Vec::new();
         let mut pages = AttestationQuery::by(&current, FOLD_PAGE)
+            .view(crate::federation::attestation_query::ContentView::Record)
             .types(&[
                 attestation_type::DELEGATES_TO,
                 attestation_type::WITHDRAWS,
@@ -569,7 +573,9 @@ pub async fn build_delegation_graph(
 /// depth cap, emit a `delegates_to` the walk may not follow? One read. Used
 /// for a recipient at the cap and, under a zero cap, for the root itself.
 async fn delegates_onward(directory: &dyn FederationDirectory, key: &str) -> Result<bool, Error> {
-    let q = AttestationQuery::by(key, NonZeroU32::MIN).types(&[attestation_type::DELEGATES_TO]);
+    let q = AttestationQuery::by(key, NonZeroU32::MIN)
+        .view(crate::federation::attestation_query::ContentView::Record)
+        .types(&[attestation_type::DELEGATES_TO]);
     Ok(!directory
         .query_attestations(&q)
         .await
@@ -686,7 +692,9 @@ where
     // Every row `subject` authored: the precedence fold below reads the whole
     // record.
     let mut rows = Vec::new();
-    let mut pages = AttestationQuery::by(subject, FOLD_PAGE).pages();
+    let mut pages = AttestationQuery::by(subject, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
+        .pages();
     while let Some(page) = pages.next(directory).await? {
         rows.extend(page);
     }

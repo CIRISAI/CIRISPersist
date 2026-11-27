@@ -12,12 +12,23 @@
 //!   `federation_group_dissolved` (a further amendment on A and on B's apply,
 //!   a membership revocation, a row placed at it); the identical dissolved
 //!   record re-offered is the idempotent no-op.
-//! - **I283** — a self-leave: carol's amendment removing only herself,
-//!   signed by carol alone, is admitted on A and applied on B.
-//! - **I284** — the self-leave arm admits nothing else: removing someone
-//!   else, leaving while renaming, leaving while re-roling a seat, a record
-//!   the leaver did not sign — each falls to the quorum, which one signature
-//!   does not meet.
+//! - **I283** — v62.0.0 (RESIGN-3; CC 3.1.3.2, rewritten): leaving is the
+//!   `membership:resignation` leaf, never a roster version. Carol's version
+//!   removing only herself, on her voice alone, is short of the family's
+//!   `majority` and moves no head; carol's own resignation lands on A and on
+//!   B (the same statement), she is active on neither, and the stored end
+//!   names its leaf.
+//! - **I284** — a version voiced by one member alone moves nothing:
+//!   removing someone else, leaving while renaming, leaving while re-roling a
+//!   seat, a record the leaver did not sign — each falls to the quorum, which
+//!   one signature does not meet.
+//! - **I6809** — v62.0.0 (RESIGN-3c; the Constitution's answer of
+//!   2026-11-23, CC 4.4.3.12): the LAST member's resignation lands and the
+//!   family reads DISSOLVED from it, with no further row. Each member resigns
+//!   on A in order and on B in the reverse order; both nodes answer the same
+//!   dissolution instant (the last end's), hold no active member, and HOLD a
+//!   later proposal and a later roster version `group_dissolved`, exactly as
+//!   for a `dissolved_at` family.
 //! - **I285** — a live family's record never carries `dissolved_at`, so every
 //!   record written before v52.0.0 keeps its bytes and signing envelope.
 
@@ -366,6 +377,7 @@ pub mod bodies {
                 reason: Some("I282".into()),
                 witness_set: vec![],
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Removal,
             },
         );
         // v62 (E4-fix6; CC 2.7.3): read against the held (dissolved) head,
@@ -378,15 +390,19 @@ pub mod bodies {
         assert_eq!(held(a, &w.id).await.dissolved_at, Some(at(DISSOLVED)));
     }
 
-    /// **I283** — a self-leave is admitted on the leaver's voice alone.
+    /// **I283** (RESIGN-3) — leaving is the resignation leaf.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    pub async fn i283_a_self_leave_needs_only_the_leaver(
+    pub async fn i283_leaving_is_the_resignation_leaf(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
         tag: &str,
     ) {
+        use crate::federation::types::{FamilyMembershipRevocation, RevocationLeaf};
         let w = world(a, b, tag).await;
         let (alice, bob, carol) = (&w.keys[0], &w.keys[1], &w.keys[2]);
+        let before = held(a, &w.id).await.persist_row_hash;
+        // A version dropping only its signer is the GROUP's counted row:
+        // carol's voice alone is one of three under `majority`.
         let leave = version(
             a,
             &w,
@@ -395,28 +411,40 @@ pub mod bodies {
             chrono::Utc::now(),
         )
         .await;
-        let out = e2::put_voices(a, &leave)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I283: carol leaves on her own voice: {e}"));
-        assert!(
-            matches!(out, StatementOutcome::Row { .. }),
-            "{tag} I283: the leave lands: {out:?}"
+        not_landed(
+            e2::put_voices(a, &leave).await,
+            &format!("{tag} I283 (a version voiced by its leaver alone)"),
         );
-        e2::put_voices(b, &leave)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I283: B applies carol's leave: {e}"));
+        assert_eq!(
+            held(a, &w.id).await.persist_row_hash,
+            before,
+            "{tag} I283: the head does not move"
+        );
+        // Carol's own `membership:resignation`, her one voice.
+        let t = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let t = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis())
+            .expect("a ms instant");
+        let r = ts::sign_family_membership_revocation(
+            carol,
+            FamilyMembershipRevocation {
+                family_key_id: w.id.clone(),
+                removed_identity_key_id: carol.clone(),
+                removed_at: t,
+                effective_at: t,
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+                leaf: RevocationLeaf::Resignation,
+            },
+        );
+        let head = e2::held_head(a, &w.id).await.map(|(h, _)| h);
+        let resignation = e2::family_revocation_voices(&r, head.as_ref());
+        assert_eq!(resignation.len(), 1, "{tag} I283: one voice, carol's");
         for (d, who) in [(a, "A"), (b, "B")] {
-            let members: Vec<String> = held(d, &w.id)
-                .await
-                .members
-                .into_iter()
-                .map(|m| m.key_id)
-                .collect();
-            assert_eq!(
-                members,
-                vec![alice.clone(), bob.clone()],
-                "{tag} I283: {who} holds the roster without carol"
-            );
+            match e2::put_voices(d, &resignation).await {
+                Ok(StatementOutcome::Row { .. }) => {}
+                other => panic!("{tag} I283: carol's resignation lands on {who}: {other:?}"),
+            }
             assert!(
                 !d.active_family_members(&w.id)
                     .await
@@ -425,12 +453,140 @@ pub mod bodies {
                     .any(|m| &m.key_id == carol),
                 "{tag} I283: carol is not active on {who}"
             );
+            assert!(
+                d.list_family_membership_revocations_for(&w.id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|e| &e.removed_identity_key_id == carol
+                        && e.leaf == RevocationLeaf::Resignation),
+                "{tag} I283: {who} stores carol's end under its leaf"
+            );
         }
     }
 
-    /// **I284** — the self-leave arm admits nothing but a self-leave: each
-    /// version below is kept short of the protocol or refused, and the head
-    /// does not move.
+    /// **I6809** (RESIGN-3c) — the last member's end dissolves the family.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub async fn i6809_the_last_members_end_dissolves(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::types::{FamilyMembershipRevocation, RevocationLeaf};
+        let w = world(a, b, tag).await;
+        let head = e2::held_head(a, &w.id).await.map(|(h, _)| h);
+        let base = chrono::Utc::now() - chrono::Duration::minutes(30);
+        let base = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(base.timestamp_millis())
+            .expect("a ms instant");
+        // Each member's own resignation, a minute apart: alice, bob, carol.
+        let ends: Vec<Vec<Vec<u8>>> = w
+            .keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let t = base + chrono::Duration::minutes(i64::try_from(i).expect("small"));
+                e2::family_revocation_voices(
+                    &ts::sign_family_membership_revocation(
+                        k,
+                        FamilyMembershipRevocation {
+                            family_key_id: w.id.clone(),
+                            removed_identity_key_id: k.clone(),
+                            removed_at: t,
+                            effective_at: t,
+                            reason: None,
+                            witness_set: vec![],
+                            persist_row_hash: String::new(),
+                            leaf: RevocationLeaf::Resignation,
+                        },
+                    ),
+                    head.as_ref(),
+                )
+            })
+            .collect();
+        // A in order, B in the reverse order: one verdict.
+        for e in &ends {
+            match e2::put_voices(a, e).await {
+                Ok(StatementOutcome::Row { .. }) => {}
+                other => panic!("{tag} I6809: a resignation lands on A: {other:?}"),
+            }
+        }
+        for e in ends.iter().rev() {
+            match e2::put_voices(b, e).await {
+                Ok(StatementOutcome::Row { .. }) => {}
+                other => panic!("{tag} I6809: a resignation lands on B: {other:?}"),
+            }
+        }
+        let last = base + chrono::Duration::minutes(2);
+        for (d, who) in [(a, "A"), (b, "B")] {
+            let f = held(d, &w.id).await;
+            assert_eq!(
+                f.dissolved_at, None,
+                "{tag} I6809: no further row: the record is unchanged on {who}"
+            );
+            assert_eq!(
+                crate::federation::family_ended_at(d, &f).await.unwrap(),
+                Some(last),
+                "{tag} I6809: {who} reads the family dissolved from the last end"
+            );
+            assert!(
+                d.active_family_members(&w.id).await.unwrap().is_empty(),
+                "{tag} I6809: no active member on {who}"
+            );
+        }
+        // A later proposal for it is held `group_dissolved`, as for a
+        // `dissolved_at` family (I282).
+        let x = e2::kid(&format!("x-{tag}"));
+        e2::put_key(a, &x, &[identity_type::USER]).await;
+        let p = crate::federation::membership_acceptance_invariants::bodies::proposal(
+            &w.keys[0],
+            crate::federation::types::cohort_scope::FAMILY,
+            &w.id,
+            &x,
+            None,
+            chrono::Utc::now(),
+            Some(chrono::Duration::days(7)),
+        );
+        match e2::put_signed(a, &p).await {
+            Ok(StatementOutcome::Pending { row_id, .. }) => assert_eq!(
+                crate::federation::edition2::fold::why_held(a, &row_id)
+                    .await
+                    .unwrap()
+                    .expect("I6809: a held row carries its reason")
+                    .reason,
+                crate::federation::edition2::fold::reason::GROUP_DISSOLVED,
+                "{tag} I6809: the proposal"
+            ),
+            Err(e) => assert!(is_dissolved_refusal(&e), "{tag} I6809 proposal: {e:?}"),
+            Ok(other) => panic!("{tag} I6809: no proposal to a dissolved family: {other:?}"),
+        }
+        // A later roster version voiced by a former member concludes nothing.
+        let before = held(a, &w.id).await.persist_row_hash;
+        let alice = &w.keys[0];
+        not_landed(
+            e2::put_voices(
+                a,
+                &version(
+                    a,
+                    &w,
+                    &family(&w, &[alice], "household"),
+                    &[alice],
+                    chrono::Utc::now(),
+                )
+                .await,
+            )
+            .await,
+            &format!("{tag} I6809 (a version after the last end)"),
+        );
+        assert_eq!(
+            held(a, &w.id).await.persist_row_hash,
+            before,
+            "{tag} I6809: the head does not move"
+        );
+    }
+
+    /// **I284** — a version voiced by one member alone (the self-leave arm
+    /// of v52 is retired, RESIGN-3) admits nothing: each version below is
+    /// kept short of the protocol or refused, and the head does not move.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i284_the_leave_arm_admits_only_a_leave(
         a: &dyn FederationDirectory,
@@ -558,13 +714,18 @@ mod run {
                     "i281"
                 );
                 case!(
+                    i6809,
+                    super::super::bodies::i6809_the_last_members_end_dissolves,
+                    "i6809"
+                );
+                case!(
                     i282,
                     super::super::bodies::i282_a_dissolved_family_admits_nothing,
                     "i282"
                 );
                 case!(
                     i283,
-                    super::super::bodies::i283_a_self_leave_needs_only_the_leaver,
+                    super::super::bodies::i283_leaving_is_the_resignation_leaf,
                     "i283"
                 );
                 case!(

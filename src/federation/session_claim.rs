@@ -195,6 +195,7 @@ pub async fn handler_for(
         // that shape.
         let mut rows = Vec::new();
         let mut pages = AttestationQuery::to(&occurrence, FOLD_PAGE)
+            .view(crate::federation::attestation_query::ContentView::Record)
             .authored_by(&occurrence)
             .dimension(SESSION_CLAIM_DIMENSION)
             .pages();

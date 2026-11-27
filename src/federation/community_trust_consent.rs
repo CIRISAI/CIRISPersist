@@ -297,6 +297,7 @@ pub async fn community_trust_consent_for(
     // v59.0.0 (CIRISPersist#1096) — the owner-authored form too: every
     // capture grant about the node, whoever (admittedly) authored it.
     let mut pages = AttestationQuery::to(node, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .types(&[attestation_type::SCORES])
         .dimension_prefix(COMMUNITY_TRUST_PREFIX)
         .pages();

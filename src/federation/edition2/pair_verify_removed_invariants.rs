@@ -8,93 +8,18 @@
 //!   count it witnessed (`tier_ingest::standing_majority_signed_by`, read by
 //!   the accord head version and roster change) is deleted with those doors;
 //!   the accord is the genesis bundle in force.
-//! - **I2121** (a pure rule) — the self-leave (`family_dissolution::
-//!   verify_self_leave_signature`, CIRISPersist#956): the leaver's vouched
-//!   voice is the authority; another member's voice, no vouch, or a vouch
-//!   over another envelope is "the leaver did not sign". It takes no
-//!   signature list, so a separate pair cannot be offered at all.
+//! - **I2121** deleted in v62.0.0 (RESIGN-3; CC 3.1.3.2): the self-leave
+//!   (`family_dissolution::verify_self_leave_signature`, CIRISPersist#956) it
+//!   witnessed is retired with its arm. A roster version is the group's
+//!   counted row; a member's own leaving is the `membership:resignation` leaf
+//!   (I283 rewritten, I6802).
 //! - **I2122** (sqlite AND postgres) — a skill import is an edition-2 ROW:
 //!   one composite `provenance:skill_import:{source}` statement lands through
 //!   the statement door, and the earlier manifest's refusal names
 //!   `earlier_form_object` (`door::skill_import_manifest_refusal`, the
 //!   refusal `verify_skill_import_manifest_b64` raises; I2123 holds the verb).
 
-use crate::federation::edition2::group::with_quorum_vouch;
-use crate::federation::family_dissolution::verify_self_leave_signature;
-use crate::federation::types::{Family, FamilyMember};
 use crate::federation::{malformed_row, Error, FederationDirectory};
-
-/// Standing holders; their names differ within their first 32 bytes (a test
-/// signer seeds from them).
-const A: &str = "bh1-a-standing-holder";
-const B: &str = "bh1-b-standing-holder";
-const C: &str = "bh1-c-standing-holder";
-fn household() -> Family {
-    let founded_at: chrono::DateTime<chrono::Utc> =
-        "2020-01-01T00:00:00Z".parse().expect("a pinned instant");
-    Family {
-        prev_head_digest: String::new(),
-        charter_digest: String::new(),
-        family_key_id: "bh1-household".to_owned(),
-        family_name: "household".to_owned(),
-        members: [A, B, C]
-            .iter()
-            .map(|k| FamilyMember {
-                key_id: (*k).to_owned(),
-                joined_at: founded_at,
-                role: None,
-            })
-            .collect(),
-        founded_at,
-        consensus_protocol: "quorum:2/3".to_owned(),
-        consensus_protocol_entrenched: false,
-        dissolved_at: None,
-        persist_row_hash: String::new(),
-    }
-}
-
-fn leave_envelope(tag: &str) -> serde_json::Value {
-    serde_json::json!({
-        "tag": tag,
-        "supersedes": { "prior_member_key_ids": [A, B, C] },
-    })
-}
-
-fn did_not_sign(r: Result<(), Error>, what: &str) {
-    match r {
-        Err(Error::InvalidArgument(m)) => {
-            assert!(m.contains("the leaver did not sign"), "I2121 {what}: {m}");
-        }
-        other => panic!("I2121 {what}: refused as unsigned, not {other:?}"),
-    }
-}
-
-/// I2121 — the self-leave's authority is the leaver's vouched voice.
-#[tokio::test]
-async fn i2121_a_self_leave_is_the_leavers_vouched_voice() {
-    let held = household();
-    let env = leave_envelope("I2121");
-    with_quorum_vouch(env.clone(), &[C], async {
-        verify_self_leave_signature(&held, &env, C)
-    })
-    .await
-    .unwrap_or_else(|e| panic!("I2121: carol's own voice is the authority: {e:?}"));
-    did_not_sign(
-        with_quorum_vouch(env.clone(), &[A, B], async {
-            verify_self_leave_signature(&held, &env, C)
-        })
-        .await,
-        "(another member's voices)",
-    );
-    did_not_sign(verify_self_leave_signature(&held, &env, C), "(no vouch)");
-    did_not_sign(
-        with_quorum_vouch(leave_envelope("another"), &[C], async {
-            verify_self_leave_signature(&held, &env, C)
-        })
-        .await,
-        "(a vouch over another envelope)",
-    );
-}
 
 /// A composite `provenance:skill_import:{source}` row by `k` at `at` ms: the
 /// source `registry:ciris-registry-us` (a multi-segment value), version `v1`.

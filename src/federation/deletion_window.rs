@@ -558,6 +558,7 @@ pub(crate) async fn producer_retracted_ids(
     // The producer's structural composers: the only rows grouped below.
     let mut rows = Vec::new();
     let mut pages = AttestationQuery::by(producer, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .types(&[
             super::types::attestation_type::SUPERSEDES,
             super::types::attestation_type::WITHDRAWS,
@@ -892,10 +893,16 @@ pub(crate) mod watch_witness {
         keys(dir, tag).await;
         let mut ids = Ids::new();
 
-        // The breach: published with a deletion window, the SUBJECT revoked,
-        // the window passed, and the producer never deleted.
+        // The breach: published with a deletion window, the window passed,
+        // and the row is still present (the producer never deleted it).
+        // v62.0.0 (WD-fix5 rev 2; CC 6.1.5 N5, the lead's ruling) — a row
+        // whose SUBJECT withdrew it no longer breaches here: the admitted
+        // withdrawal descends it at once on this node ("revoked" below), so
+        // nothing is left to breach. The breach leg is a row nobody withdrew.
         for (label, window) in [
             ("breached", Some(PAST_WINDOW)),
+            // The subject revoked it: descended at the door, no breach.
+            ("revoked", Some(PAST_WINDOW)),
             // Negative 1 — the window has not passed yet.
             ("future", Some(FUTURE_WINDOW)),
             // Negative 2 — window passed, but the PRODUCER retracted the row.
@@ -909,13 +916,41 @@ pub(crate) mod watch_witness {
         }
         let row_id = |label: &str| ids[label].clone();
 
-        // The subject's revocation is the DEMAND, not the proof — it must NOT
-        // clear the breach (admission rule 2: subject named in subject_key_ids).
+        // The subject's revocation (admission rule 2: subject named in
+        // subject_key_ids): the content descends on this node at once.
         publish(
             dir,
-            withdraws(tag, "w-subject", &subject_key(tag), &row_id("breached")),
+            withdraws(tag, "w-subject", &subject_key(tag), &row_id("revoked")),
         )
         .await;
+        assert!(
+            dir.get_attestation(&row_id("revoked"))
+                .await
+                .expect("reads")
+                .is_none(),
+            "the subject's admitted withdrawal deleted the content at once"
+        );
+        assert!(
+            matches!(
+                crate::federation::withdrawn_content::held_row_state(dir, &row_id("revoked"))
+                    .await
+                    .expect("reads"),
+                crate::federation::withdrawn_content::HeldRowState::Withdrawn { .. }
+            ),
+            "its id reads Withdrawn"
+        );
+        let late = e2::try_put_row(
+            dir,
+            &published(tag, "revoked", Some(PAST_WINDOW)),
+            &producer_key(tag),
+        )
+        .await
+        .expect_err("a later copy of the revoked row is refused");
+        assert_eq!(
+            late.kind(),
+            crate::federation::steward_purge::token::TOMBSTONED,
+            "by the tombstone: {late}"
+        );
         // The producer's own retraction IS the proof (admission rule 1).
         publish(
             dir,
@@ -963,9 +998,9 @@ pub(crate) mod watch_witness {
             Some(row_id("malformed").as_str())
         );
 
-        // The negatives: no signal for a live window, a deleted row, or a row
-        // that never committed one.
-        for label in ["future", "deleted", "plain"] {
+        // The negatives: no signal for a live window, a deleted row, a row
+        // its subject withdrew (descended), or a row that never committed one.
+        for label in ["future", "deleted", "revoked", "plain"] {
             let id = row_id(label);
             assert!(
                 !breaches
@@ -984,11 +1019,14 @@ pub(crate) mod watch_witness {
         if fresh {
             assert_eq!(
                 report,
+                // WD-fix5 rev 2 — the two withdrawn rows descended ("deleted"
+                // by its producer, "revoked" by its subject): six published
+                // less two, plus the two withdrawals; three windows seen.
                 DeletionWindowWatchReport {
-                    rows_scanned: 7,
-                    windows_seen: 4,
+                    rows_scanned: 6,
+                    windows_seen: 3,
                     within_window: 1,
-                    deleted_in_time: 1,
+                    deleted_in_time: 0,
                     breaches: 1,
                     malformed: 1,
                     retain_window_breaches: 0,

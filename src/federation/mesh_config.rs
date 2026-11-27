@@ -894,17 +894,11 @@ pub enum MeshConfigForm {
     ///    ([`field::RATIFIES`]); that emergency must be one this node holds, on
     ///    the same key and root, agreeing about the value.
     /// 2. **Cold durable, under the root's own quorum.** No prior emergency —
-    ///    admitted iff the act is not UNILATERAL. For a
-    ///    [`RootKind::Family`](super::trust_root::RootKind::Family) root that
-    ///    means ≥m distinct seated holders scrubbed this row, counted by the
-    ///    same [`family_quorum_over`](super::trust_root::family_quorum_over)
-    ///    that charters roots. For a
-    ///    [`RootKind::Key`](super::trust_root::RootKind::Key) root it means the
-    ///    root ITSELF signed — *"1-of-1 is a legitimate quorum for a root you
-    ///    alone own"*, which is
-    ///    [`trust_root`](super::trust_root)'s own doctrine, not a hole opened
-    ///    here. A CONFERRED delegate is refused on both arms: a delegation is
-    ///    not a quorum, and that is where this door actually bites.
+    ///    admitted iff the act is not UNILATERAL: v62.0.0 (R2-rest) the row's
+    ///    voices reach the accord's threshold over the holders of the bundle
+    ///    in force (`root_quorum_reached`; the earlier family and key arms are
+    ///    deleted). A CONFERRED delegate is refused: a delegation is not a
+    ///    quorum, and that is where this door actually bites.
     ///
     /// # The reading, and the one it replaced
     ///
@@ -1716,6 +1710,7 @@ where
     // trust-root walks' shape, v53.1.7).
     let mut rows = Vec::new();
     let mut pages = AttestationQuery::by(root_ref, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .attested_to(author)
         .types(&[super::types::attestation_type::DELEGATES_TO])
         .dimension(super::trust_root::TRUST_CONFERS_DIMENSION)
@@ -1788,24 +1783,18 @@ pub(crate) enum AuthorAuthority {
 
 /// **"The root's own quorum" (CC 4.2.1 rule 3), as a predicate over one row.**
 ///
-/// What counts depends on what kind of thing the root is, resolved once through
-/// [`resolve_family_root`](super::trust_root::resolve_family_root) — the same
-/// function [`trust_root_valid`](super::trust_root::trust_root_valid) uses to
-/// pick its arm, so the two can never disagree about which arm a root is on:
+/// v62.0.0 (R2-rest; CC 3.2 T5, CC 4.2.1 rule 3; lead's ruling 1) — **what it
+/// counts:** the row's distinct voices (`edition2::voices::counted_roster_signers`)
+/// among the HOLDERS OF THE BUNDLE IN FORCE, against the accord's threshold
+/// (`admission::accord_threshold`, the one strict-majority seam), when
+/// `root_ref` is that bundle's lineage (`trust_root::bundle_root_holders`).
+/// Any other `root_ref` has no quorum and the answer is `false`: the root is
+/// the bundle's lineage, and there is no other kind of root. The earlier
+/// FAMILY-record arm (`resolve_family_root`, a family's m-of-n over the row's
+/// scrubs) and the KEY arm ("the root itself is the author": 1-of-1) are
+/// deleted.
 ///
-/// - **Family root** — ≥m distinct SEATED holders must have scrubbed this row,
-///   counted by [`family_quorum_over`](super::trust_root::family_quorum_over):
-///   the row's full scrub set intersected with the family's own
-///   revocation-folded roster, each survivor hybrid-verified against pubkeys
-///   from THIS node's directory, against a threshold floored at a strict
-///   majority of that roster. Not a second m-of-n implementation — the one
-///   that charters roots.
-/// - **Key root** — the root itself must be the author. *"1-of-1 is a
-///   legitimate quorum for a root you alone own"* is
-///   [`trust_root`](super::trust_root)'s stated doctrine, and this is where it
-///   is being relied on rather than quietly assumed.
-///
-/// **A conferred delegate fails on both arms.** That is the whole bite of this
+/// **A conferred delegate is not a quorum.** That is the whole bite of this
 /// gate: a `trust:confers:v1` grant lets a key act for the root at
 /// threshold-1 — which is exactly what CC 4.2.1 rule 4 says must expire — so
 /// it can raise a bounded emergency and it cannot make anything permanent
@@ -1818,37 +1807,15 @@ async fn root_quorum_reached<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    // v31.0.0 (CIRISPersist#648) — the constitutional family is judged on the
-    // FAMILY arm or not at all.
-    //
-    // The `None` arm below is correct for a key root, where authorship IS the
-    // 1-of-1 quorum. It is a silent downgrade for a FAMILY root that this node
-    // simply has not seeded yet: `humanity-accord` holds no key, so
-    // "did a key literally named humanity-accord sign this" is a question no
-    // legitimate signer can answer and a squatted key id can. On a pre-genesis
-    // node that turned a strict-majority count into a string comparison. Absence of the family
-    // row is not permission to use a weaker rule about it.
     // v62.0.0 (KB-fix1; CC 3.2 at `87abd2d`, CC 4.2.1 rule 3) — the bundle
     // root's own quorum: the row's distinct voices among the holders of the
     // bundle in force, at the accord's threshold (the one strict-majority
-    // seam). It replaces the family-row reading below, which no v62 door
-    // can satisfy for the accord.
-    if let Some(holders) = super::trust_root::bundle_root_holders(directory, root_ref).await? {
-        let counted =
-            super::edition2::voices::counted_roster_signers(directory, row, &holders).await?;
-        return Ok(counted.len() >= super::admission::accord_threshold(holders.len()));
-    }
-    match super::trust_root::resolve_family_root(directory, root_ref).await? {
-        Some(family) => Ok(
-            super::trust_root::family_quorum_over(directory, row, &family)
-                .await?
-                .met(),
-        ),
-        None if root_ref == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID => {
-            Ok(false)
-        }
-        None => Ok(row.attesting_key_id == root_ref),
-    }
+    // seam). v62.0.0 (R2-rest) — the only quorum there is.
+    let Some(holders) = super::trust_root::bundle_root_holders(directory, root_ref).await? else {
+        return Ok(false);
+    };
+    let counted = super::edition2::voices::counted_roster_signers(directory, row, &holders).await?;
+    Ok(counted.len() >= super::admission::accord_threshold(holders.len()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1859,6 +1826,15 @@ where
 ///
 /// Verify-before-mutation (AV-9): every gate below runs BEFORE any row is
 /// written, and a refusal writes nothing.
+///
+/// v62.0.0 (WD-fix6) — a HOLD is not a refusal: when the final put's
+/// statement door HOLDS the row (a fold condition not yet met; WD-fix4 routes
+/// a statement-carrying row through the statement funnel), the answer is the
+/// gate's error, as before, but the statement is KEPT and concludes when what
+/// it waits for arrives. Told apart structurally by
+/// [`kept_waiting`](super::attestation_admit::kept_waiting) (the fold's held
+/// state, `fold::why_held`), never by the error's text; a re-offer is a no-op
+/// on the statement id.
 ///
 /// `node_key_id` is the node whose subscription and consent are being judged —
 /// its live trust edges decide [`RootNotTrusted`](MeshConfigRefusalReason::RootNotTrusted),
@@ -2014,6 +1990,7 @@ where
     // The root's `mesh_config:*` rows: the only rows `parse_row` accepts.
     let mut held = Vec::new();
     let mut pages = AttestationQuery::to(&root_ref, FOLD_PAGE)
+        .view(crate::federation::attestation_query::ContentView::Record)
         .dimension_prefix(DIMENSION_PREFIX)
         .pages();
     let read: Result<(), Error> = async {
@@ -2130,6 +2107,7 @@ where
         // The root's `mesh_config:*` rows, every page.
         let mut found = Vec::new();
         let mut pages = AttestationQuery::to(root, FOLD_PAGE)
+            .view(crate::federation::attestation_query::ContentView::Record)
             .dimension_prefix(DIMENSION_PREFIX)
             .pages();
         let read: Result<(), Error> = async {
@@ -3803,12 +3781,17 @@ mod tests {
 
         // ── 2b. **CC 4.2.1 RULE 3, THE READ THAT MATTERS.** A COLD durable
         //        row — no prior emergency — turns on whether the act is
-        //        UNILATERAL, not on whether it was exercised. `root_a` is a
-        //        single-key root, so signing for itself IS its whole quorum
-        //        and this admits; the conferred delegate is refused, because a
-        //        delegation is threshold-1 and rule 4 says threshold-1
-        //        expires. See `MeshConfigForm::Durable` for the argument that
-        //        overturned the stricter reading.
+        //        UNILATERAL, not on whether it was exercised. The conferred
+        //        delegate is refused, because a delegation is threshold-1 and
+        //        rule 4 says threshold-1 expires. See `MeshConfigForm::Durable`
+        //        for the argument that overturned the stricter reading.
+        //
+        //        **I6407** (v62.0.0 R2-rest; CC 3.2 T5, lead's ruling 1) —
+        //        `root_a` is a KEY: its own signature is NO quorum (the key arm,
+        //        "1-of-1 is a legitimate quorum for a root you alone own", is
+        //        deleted with the keyed root). The quorum counted is the
+        //        holders of the bundle in force at the accord's threshold
+        //        (I2410/I2411); a key's cold durable restriction is refused.
         let cold_durable_by_root = signed_config_row(
             &root_a,
             &root_a,
@@ -3822,11 +3805,12 @@ mod tests {
         );
         assert_eq!(
             door!(cold_durable_by_root),
-            MeshConfigOutcome::Admitted,
-            "[{tag}] a single-key root IS its own quorum (1-of-1), so a cold durable RESTRICTION \
-             it signs for itself must admit. Refusing here makes a durable setting unreachable on \
-             a fresh mesh until someone fires a 72h emergency to bootstrap one — the \
-             circular-at-genesis class."
+            MeshConfigOutcome::Refused {
+                reason: MeshConfigRefusalReason::DurableWithoutRootQuorum
+            },
+            "[{tag}] I6407: a key is no root, so its own signature is no quorum: a cold \
+             durable restriction it signs for itself is refused (the bundle root's count is \
+             I2410/I2411)"
         );
         // Names the REAL conferral, so this row reaches the durability check
         // rather than stopping at #601's attribution gate — the refusal under
