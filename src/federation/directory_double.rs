@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 202 delegations, generated. Every one: fault first, then delegate.
+// 216 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_skips(&self) -> Result<Vec<edition2::accord_rescan::AccordRescan>, Error> {
@@ -314,6 +314,38 @@ impl FederationDirectory for FaultInjectingDirectory {
             .drop_group_tips(cohort, group_key_id, persist_row_hashes)
             .await
     }
+    async fn drop_held_row(&self, row_id: &edition2::names::RowId) -> Result<u64, Error> {
+        if let Some(e) = self.faulted("drop_held_row") {
+            return Err(e);
+        }
+        self.inner.drop_held_row(row_id).await
+    }
+    async fn edition2_drop_room_bindings(
+        &self,
+        room: &str,
+    ) -> Result<edition2::room_keys::RoomErasure, Error> {
+        if let Some(e) = self.faulted("edition2_drop_room_bindings") {
+            return Err(e);
+        }
+        self.inner.edition2_drop_room_bindings(room).await
+    }
+    async fn edition2_erase_person_room_keys(
+        &self,
+        person: &str,
+    ) -> Result<edition2::room_keys::RoomErasure, Error> {
+        if let Some(e) = self.faulted("edition2_erase_person_room_keys") {
+            return Err(e);
+        }
+        self.inner.edition2_erase_person_room_keys(person).await
+    }
+    async fn edition2_erase_room_device_state(
+        &self,
+    ) -> Result<edition2::room_keys::RoomErasure, Error> {
+        if let Some(e) = self.faulted("edition2_erase_room_device_state") {
+            return Err(e);
+        }
+        self.inner.edition2_erase_room_device_state().await
+    }
     async fn edition2_first_held_us(
         &self,
         row_id: &edition2::names::RowId,
@@ -328,6 +360,66 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.edition2_objects(typ).await
+    }
+    async fn edition2_put_room_binding(
+        &self,
+        binding: &edition2::room_keys::RoomBinding,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("edition2_put_room_binding") {
+            return Err(e);
+        }
+        self.inner.edition2_put_room_binding(binding).await
+    }
+    async fn edition2_put_room_key_local(
+        &self,
+        key: &edition2::room_keys::RoomKeyHeld,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("edition2_put_room_key_local") {
+            return Err(e);
+        }
+        self.inner.edition2_put_room_key_local(key).await
+    }
+    async fn edition2_retire_room_key_local(
+        &self,
+        room_key_kid: &[u8; 32],
+        at_us: i64,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("edition2_retire_room_key_local") {
+            return Err(e);
+        }
+        self.inner
+            .edition2_retire_room_key_local(room_key_kid, at_us)
+            .await
+    }
+    async fn edition2_room_bindings(
+        &self,
+        room: &str,
+    ) -> Result<Vec<edition2::room_keys::RoomBinding>, Error> {
+        if let Some(e) = self.faulted("edition2_room_bindings") {
+            return Err(e);
+        }
+        self.inner.edition2_room_bindings(room).await
+    }
+    async fn edition2_room_bindings_of_person(
+        &self,
+        room: &str,
+        person: &str,
+    ) -> Result<Vec<edition2::room_keys::RoomBinding>, Error> {
+        if let Some(e) = self.faulted("edition2_room_bindings_of_person") {
+            return Err(e);
+        }
+        self.inner
+            .edition2_room_bindings_of_person(room, person)
+            .await
+    }
+    async fn edition2_room_keys_held(
+        &self,
+        room: Option<&str>,
+    ) -> Result<Vec<edition2::room_keys::RoomKeyHeld>, Error> {
+        if let Some(e) = self.faulted("edition2_room_keys_held") {
+            return Err(e);
+        }
+        self.inner.edition2_room_keys_held(room).await
     }
     async fn edition2_roster_proposal(
         &self,
@@ -493,6 +585,12 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.fold_held_page(after, limit).await
+    }
+    async fn fold_slot_all_rows(&self, slot: &str) -> Result<Vec<edition2::names::RowId>, Error> {
+        if let Some(e) = self.faulted("fold_slot_all_rows") {
+            return Err(e);
+        }
+        self.inner.fold_slot_all_rows(slot).await
     }
     async fn fold_slot_held(&self, slot: &str) -> Result<bool, Error> {
         if let Some(e) = self.faulted("fold_slot_held") {
@@ -1305,6 +1403,16 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_wire_hashes_since(kind, after_content_hash, limit)
             .await
     }
+    async fn list_withdrawals_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedAttestation>, Error> {
+        if let Some(e) = self.faulted("list_withdrawals_since") {
+            return Err(e);
+        }
+        self.inner.list_withdrawals_since(since, limit).await
+    }
     async fn list_witness_peer_ids(&self) -> Result<Vec<String>, Error> {
         if let Some(e) = self.faulted("list_witness_peer_ids") {
             return Err(e);
@@ -1463,6 +1571,14 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .purge_delete_tombstoned_attestation(attestation_id)
+            .await
+    }
+    async fn purge_delete_tombstoned_statements(&self, attestation_id: &str) -> Result<u64, Error> {
+        if let Some(e) = self.faulted("purge_delete_tombstoned_statements") {
+            return Err(e);
+        }
+        self.inner
+            .purge_delete_tombstoned_statements(attestation_id)
             .await
     }
     async fn purge_delete_tombstoned_trace(&self, trace_id: &str) -> Result<(u64, u64), Error> {
@@ -1697,11 +1813,14 @@ impl FederationDirectory for FaultInjectingDirectory {
     async fn put_identity_occurrence_edition2(
         &self,
         bind: edition2::occurrence::OccurrenceBind,
+        door: DoorToken,
     ) -> Result<bool, Error> {
         if let Some(e) = self.faulted("put_identity_occurrence_edition2") {
             return Err(e);
         }
-        self.inner.put_identity_occurrence_edition2(bind).await
+        self.inner
+            .put_identity_occurrence_edition2(bind, door)
+            .await
     }
     async fn put_identity_occurrence_local(
         &self,
@@ -1712,15 +1831,16 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.put_identity_occurrence_local(occurrence).await
     }
-    async fn put_identity_occurrence_revocation_local(
+    async fn put_identity_occurrence_revocation_edition2(
         &self,
         revocation: types::IdentityOccurrenceRevocation,
+        door: DoorToken,
     ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_identity_occurrence_revocation_local") {
+        if let Some(e) = self.faulted("put_identity_occurrence_revocation_edition2") {
             return Err(e);
         }
         self.inner
-            .put_identity_occurrence_revocation_local(revocation)
+            .put_identity_occurrence_revocation_edition2(revocation, door)
             .await
     }
     async fn put_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error> {
@@ -2025,6 +2145,17 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .supersede_group_row(cohort, new_snapshot, authorization)
+            .await
+    }
+    async fn test_seam_put_identity_occurrence(
+        &self,
+        occurrence: types::IdentityOccurrence,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("test_seam_put_identity_occurrence") {
+            return Err(e);
+        }
+        self.inner
+            .test_seam_put_identity_occurrence(occurrence)
             .await
     }
     async fn trust_direction_held_among(

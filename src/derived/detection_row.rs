@@ -582,6 +582,12 @@ where
     let subject =
         crate::federation::attestation_admit::detection_subject(dir, Some(&event.trace_id)).await?;
     let (sub, family, payload) = detection_statement_parts(event, subject.as_deref())?;
+    // v62.0.0 (HEAD-1; CC 2.4.1.1) — a duty row names the standing it is
+    // exercised under: the detector node's owner binding, or a delegate's
+    // delegation (`edition2::head_rule::state_head`).
+    let payload =
+        crate::federation::edition2::head_rule::state_head(dir, "scores", &family, &iss, payload)
+            .await?;
     let statement =
         crate::federation::edition2::produce::sign_row(signer, &sub, "scores", &family, &payload)
             .await

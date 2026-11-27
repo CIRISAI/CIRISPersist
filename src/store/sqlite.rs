@@ -2787,6 +2787,112 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await
     }
 
+    async fn edition2_put_room_key_local(
+        &self,
+        key: &crate::federation::edition2::room_keys::RoomKeyHeld,
+    ) -> Result<bool, crate::federation::Error> {
+        let key = key.clone();
+        self.write(move |conn| {
+            crate::federation::edition2::room_keys::put_room_key_local_sqlite(conn, &key)
+        })
+        .await
+    }
+
+    async fn edition2_retire_room_key_local(
+        &self,
+        room_key_kid: &[u8; 32],
+        at_us: i64,
+    ) -> Result<bool, crate::federation::Error> {
+        let kid = *room_key_kid;
+        self.write(move |conn| {
+            crate::federation::edition2::room_keys::retire_room_key_local_sqlite(conn, &kid, at_us)
+        })
+        .await
+    }
+
+    async fn edition2_room_keys_held(
+        &self,
+        room: Option<&str>,
+    ) -> Result<Vec<crate::federation::edition2::room_keys::RoomKeyHeld>, crate::federation::Error>
+    {
+        let room = room.map(str::to_owned);
+        self.read(move |conn| {
+            crate::federation::edition2::room_keys::room_keys_held_sqlite(conn, room.as_deref())
+        })
+        .await
+    }
+
+    async fn edition2_put_room_binding(
+        &self,
+        binding: &crate::federation::edition2::room_keys::RoomBinding,
+    ) -> Result<bool, crate::federation::Error> {
+        let binding = binding.clone();
+        // v62.0.0 (ROOMKEY-3b) — the tie is sealed under the content master.
+        let seal = crate::federation::edition2::room_keys::tie_seal(self).await?;
+        self.write(move |conn| {
+            crate::federation::edition2::room_keys::put_room_binding_sqlite(conn, &binding, &seal)
+        })
+        .await
+    }
+
+    async fn edition2_room_bindings(
+        &self,
+        room: &str,
+    ) -> Result<Vec<crate::federation::edition2::room_keys::RoomBinding>, crate::federation::Error>
+    {
+        let room = room.to_owned();
+        let seal = crate::federation::edition2::room_keys::tie_seal(self).await?;
+        self.read(move |conn| {
+            crate::federation::edition2::room_keys::room_bindings_sqlite(conn, &room, &seal)
+        })
+        .await
+    }
+
+    async fn edition2_room_bindings_of_person(
+        &self,
+        room: &str,
+        person: &str,
+    ) -> Result<Vec<crate::federation::edition2::room_keys::RoomBinding>, crate::federation::Error>
+    {
+        let (room, person) = (room.to_owned(), person.to_owned());
+        let seal = crate::federation::edition2::room_keys::tie_seal(self).await?;
+        self.read(move |conn| {
+            crate::federation::edition2::room_keys::room_bindings_of_person_sqlite(
+                conn, &room, &person, &seal,
+            )
+        })
+        .await
+    }
+
+    async fn edition2_drop_room_bindings(
+        &self,
+        room: &str,
+    ) -> Result<crate::federation::edition2::room_keys::RoomErasure, crate::federation::Error> {
+        let room = room.to_owned();
+        self.write(move |conn| {
+            crate::federation::edition2::room_keys::drop_room_bindings_sqlite(conn, &room)
+        })
+        .await
+    }
+
+    async fn edition2_erase_person_room_keys(
+        &self,
+        person: &str,
+    ) -> Result<crate::federation::edition2::room_keys::RoomErasure, crate::federation::Error> {
+        let person = person.to_owned();
+        self.write(move |conn| {
+            crate::federation::edition2::room_keys::erase_person_room_keys_sqlite(conn, &person)
+        })
+        .await
+    }
+
+    async fn edition2_erase_room_device_state(
+        &self,
+    ) -> Result<crate::federation::edition2::room_keys::RoomErasure, crate::federation::Error> {
+        self.write(crate::federation::edition2::room_keys::erase_room_device_state_sqlite)
+            .await
+    }
+
     async fn edition2_objects(&self, typ: &str) -> Result<Vec<Vec<u8>>, crate::federation::Error> {
         let typ = typ.to_owned();
         self.read(move |conn| crate::federation::edition2::store::objects_of_sqlite(conn, &typ))
@@ -2921,6 +3027,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await
     }
 
+    async fn drop_held_row(
+        &self,
+        row_id: &crate::federation::edition2::names::RowId,
+    ) -> Result<u64, crate::federation::Error> {
+        // v62.0.0 (KR-fix20) — one write transaction, gated in the statement.
+        let row_id = *row_id;
+        self.write(move |conn| {
+            crate::federation::edition2::fold::drop_held_row_sqlite(conn, &row_id)
+        })
+        .await
+    }
+
     async fn fold_slot_rows(
         &self,
         slot: &str,
@@ -2933,6 +3051,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn fold_slot_held(&self, slot: &str) -> Result<bool, crate::federation::Error> {
         let slot = slot.to_owned();
         self.read(move |conn| crate::federation::edition2::fold::slot_held_sqlite(conn, &slot))
+            .await
+    }
+
+    async fn fold_slot_all_rows(
+        &self,
+        slot: &str,
+    ) -> Result<Vec<crate::federation::edition2::names::RowId>, crate::federation::Error> {
+        let slot = slot.to_owned();
+        self.read(move |conn| crate::federation::edition2::fold::slot_all_rows_sqlite(conn, &slot))
             .await
     }
 
@@ -3382,7 +3509,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                            WHERE plane = 'attestation' AND record_ref = ?1) \
                AND NOT {} AND NOT {}",
             crate::federation::migration::accountability_record_sql("dimension"),
-            crate::federation::steward_purge::person_subject_sql("federation_attestations", "")
+            // v62.0.0 (WD-fix1) — the person-subject void, lifted only by an
+            // admitted withdrawal's descent re-derived here from stored rows.
+            crate::federation::steward_purge::person_void_sql(
+                "federation_attestations",
+                "",
+                crate::federation::attestation_query::Dialect::Sqlite,
+            )
         );
         self.write(move |conn| -> Result<usize, rusqlite::Error> { conn.execute(&sql, [&id]) })
             .await
@@ -3392,6 +3525,81 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "purge_delete_tombstoned_attestation: {e}"
                 ))
             })
+    }
+
+    async fn list_withdrawals_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedAttestation>, crate::federation::Error> {
+        // v62.0.0 (WD-fix1) — the withdrawn-content sweep's read: every held
+        // withdrawal in admission order, no serve rule.
+        // A row-value seek on the partial index (`''` before every instant
+        // and id when there is no cursor): a tick reads its page, not the
+        // withdrawals before it (EXPLAIN QUERY PLAN in WD-fix1.md).
+        let since_at = since
+            .as_ref()
+            .map_or_else(String::new, |(t, _)| t.to_rfc3339());
+        let since_id = since
+            .as_ref()
+            .map_or_else(String::new, |(_, id)| id.clone());
+        let sql = format!(
+            "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                weight, asserted_at, expires_at, attestation_envelope, \
+                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
+                additional_scrubs, admitted_at AS _pos \
+             FROM federation_attestations \
+             WHERE attestation_type IN ('{w}', '{r}') \
+               AND (admitted_at, attestation_id) > (?1, ?2) \
+             ORDER BY admitted_at ASC, attestation_id ASC LIMIT ?3",
+            w = crate::federation::types::attestation_type::WITHDRAWS,
+            r = crate::federation::types::attestation_type::RECANTS,
+        );
+        let (read, _) = self
+            .read_measured(move |conn| -> Result<Vec<_>, rusqlite::Error> {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params![since_at, since_id, limit], |row| {
+                    let pos: String = row.get("_pos")?;
+                    Ok(crate::federation::ServedAttestation {
+                        attestation: sqlite_row_to_attestation(row)?,
+                        admitted_at: parse_rfc3339(&pos),
+                    })
+                })?;
+                rows.collect()
+            })
+            .await;
+        read.map_err(|e| crate::federation::Error::Backend(format!("list_withdrawals_since: {e}")))
+    }
+
+    async fn purge_delete_tombstoned_statements(
+        &self,
+        attestation_id: &str,
+    ) -> Result<u64, crate::federation::Error> {
+        // v62.0.0 (WD-fix1) — the door's own gate, in the statement: a row an
+        // `attestation` tombstone names whose attestation row is already gone
+        // (so a void the attestation door kept keeps its statements too).
+        let mut row_id = [0u8; 32];
+        if hex::decode_to_slice(attestation_id, &mut row_id).is_err() {
+            return Ok(0);
+        }
+        let id = attestation_id.to_owned();
+        self.write(move |conn| -> Result<usize, rusqlite::Error> {
+            conn.execute(
+                "DELETE FROM ceg_statements WHERE row_id = ?1 \
+                   AND EXISTS (SELECT 1 FROM purge_tombstones \
+                               WHERE plane = 'attestation' AND record_ref = ?2) \
+                   AND NOT EXISTS (SELECT 1 FROM federation_attestations \
+                                   WHERE attestation_id = ?2)",
+                rusqlite::params![row_id.to_vec(), id],
+            )
+        })
+        .await
+        .map(|n| n as u64)
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("purge_delete_tombstoned_statements: {e}"))
+        })
     }
 
     async fn purge_delete_tombstoned_trace(
@@ -3578,6 +3786,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
     fn node_key_id(&self) -> Option<String> {
         self.node_key_id.read().expect("node_key_id lock").clone()
+    }
+    // v62.0.0 (WD-fix3 rev 2) — this backend evicts its own bytes for the
+    // descent a statement door runs in its own admission.
+    fn withdrawn_bytes_evictor(
+        &self,
+    ) -> Option<&dyn crate::federation::steward_purge::BytesEvictor> {
+        Some(self)
     }
     // v23.1.0 (CIRISPersist#554) — surface THIS backend's configured policy on
     // the trait so `genesis::verify_bundle_quorum` gates holder evidence with
@@ -5013,7 +5228,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         crate::federation::occurrence_admit::put_identity_occurrence_planned(self, occurrence).await
     }
 
-    async fn put_identity_occurrence_local(
+    // v62.0.0 (WD-fix9) — the retired trusted-local write survives as a
+    // TEST seam only; `put_identity_occurrence_local` refuses (trait default).
+    #[cfg(any(test, feature = "test-anchor"))]
+    async fn test_seam_put_identity_occurrence(
         &self,
         occurrence: crate::federation::IdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
@@ -5024,6 +5242,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn put_identity_occurrence_edition2(
         &self,
         bind: crate::federation::edition2::occurrence::OccurrenceBind,
+        _door: crate::federation::DoorToken,
     ) -> Result<bool, crate::federation::Error> {
         // v62.0.0 (wave O1) — the gates are the edition-2 door's.
         crate::federation::occurrence_admit::put_identity_occurrence_edition2_planned(self, bind)
@@ -5870,9 +6089,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.
 
-    async fn put_identity_occurrence_revocation_local(
+    // v62.0.0 (WD-fix8) — the edition-2 eviction's STORE (the retired
+    // trusted-local verb `put_identity_occurrence_revocation_local` refuses
+    // by name, the trait default).
+    async fn put_identity_occurrence_revocation_edition2(
         &self,
         revocation: crate::federation::IdentityOccurrenceRevocation,
+        _door: crate::federation::DoorToken,
     ) -> Result<(), crate::federation::Error> {
         // #421 — trusted-local (grandfathered) write: NO signature gate, signed
         // columns NULL. Engine-internal self-writes only; never reached from the
@@ -11534,8 +11757,10 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let (x_priv, x_pub, ml_priv, ml_pub) = mint_content_kem_keypair()?;
         let x_pub_b64 = B64.encode(x_pub);
         let ml_pub_b64 = B64.encode(&ml_pub);
-        let x_priv_sealed = seal_content_kem_private(&content_master, &x_priv)?;
-        let ml_priv_sealed = seal_content_kem_private(&content_master, &ml_priv)?;
+        // v62.0.0 (ROOMKEY-Z1b) — both privates are `Zeroizing` (the mint's
+        // answer): sealed by reference, scrubbed when this scope ends.
+        let x_priv_sealed = seal_content_kem_private(&content_master, x_priv.as_slice())?;
+        let ml_priv_sealed = seal_content_kem_private(&content_master, ml_priv.as_slice())?;
 
         let (stored_x, stored_ml) = self
             .write(move |conn| -> Result<(String, String), rusqlite::Error> {
@@ -11596,13 +11821,17 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     "load_content_kem_private_halves: {e}"
                 ))
             })?;
+        // v62.0.0 (ROOMKEY-Z1) — the plaintext stays `Zeroizing` and is copied
+        // into a `Zeroizing` array, never through a bare `[u8; 32]`.
         let x_priv_v = unseal_content_kem_private(&content_master, &x_sealed)?;
-        let x25519_priv: [u8; 32] = x_priv_v.try_into().map_err(|v: Vec<u8>| {
-            crate::federation::BlobError::Backend(format!(
+        if x_priv_v.len() != 32 {
+            return Err(crate::federation::BlobError::Backend(format!(
                 "load_content_kem_private_halves: x25519 private is {} bytes, expected 32",
-                v.len()
-            ))
-        })?;
+                x_priv_v.len()
+            )));
+        }
+        let mut x25519_priv = zeroize::Zeroizing::new([0u8; 32]);
+        x25519_priv.copy_from_slice(&x_priv_v);
         let ml_kem_768_priv = unseal_content_kem_private(&content_master, &ml_sealed)?;
         let ml_kem_768_pub = B64.decode(&identity.ml_kem_768_pubkey_b64).map_err(|e| {
             crate::federation::BlobError::Backend(format!(
@@ -12149,6 +12378,44 @@ impl crate::federation::BlobStorage for SqliteBackend {
                         "list_unlinked_chunk_dags: a 32-byte sha".into(),
                     )
                 })
+            })
+            .collect()
+    }
+
+    async fn held_blob_claim_window(
+        &self,
+        after: Option<[u8; 32]>,
+        limit: u32,
+        holder: &str,
+    ) -> Result<Vec<([u8; 32], bool)>, crate::federation::BlobError> {
+        let after = after.map(|a| a.to_vec()).unwrap_or_default();
+        let lim = i64::from(limit);
+        let holder = holder.to_owned();
+        let dimension = crate::federation::custody_ack::CUSTODY_ACK_DIMENSION.to_owned();
+        let rows: Vec<(Vec<u8>, bool)> = self
+            .read(
+                move |conn| -> Result<Vec<(Vec<u8>, bool)>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(&sqlite_held_blob_claim_window_sql())?;
+                    let it = stmt
+                        .query_map(rusqlite::params![after, lim, holder, dimension], |r| {
+                            Ok((r.get(0)?, r.get(1)?))
+                        })?;
+                    it.collect()
+                },
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("held_blob_claim_window: {e}"))
+            })?;
+        rows.into_iter()
+            .map(|(v, claimed)| {
+                <[u8; 32]>::try_from(v.as_slice())
+                    .map(|sha| (sha, claimed))
+                    .map_err(|_| {
+                        crate::federation::BlobError::Backend(
+                            "held_blob_claim_window: a 32-byte sha".into(),
+                        )
+                    })
             })
             .collect()
     }
@@ -12776,7 +13043,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             .read(move |conn| -> Result<Vec<ReceiptRow>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
                     "SELECT subscriber_key_id, epoch, k, chunk_root, signature_blob, received_at \
-                   FROM federation_stream_delivery_receipts \
+                   FROM federation_stream_delivery_acks \
                   WHERE stream_id = ?1 \
                   ORDER BY k ASC, subscriber_key_id ASC \
                   LIMIT ?2",
@@ -16750,6 +17017,28 @@ fn sqlite_attestations_referencing_sql() -> String {
            AND json_extract(attestation_envelope, '$.references_attestation_id') = ?1 \
          ORDER BY asserted_at DESC"
     )
+}
+
+/// v62.0.0 (HEAD-7) — `held_blob_claim_window`'s statement (`?1` the
+/// cursor, `?2` the window, `?3` the holder, `?4` the custody dimension):
+/// the window seeks the blob primary key; each blob's report is one seek of
+/// V180's `(attesting_key_id, dimension, evidence_refs[0])` (pinned with
+/// INDEXED BY, as `sqlite_by_dimension_citing_sql` is). Plan (CHECKED,
+/// `EXPLAIN QUERY PLAN` on V300):
+/// `CO-ROUTINE b` / `SEARCH federation_blobs USING COVERING INDEX
+/// sqlite_autoindex_federation_blobs_1 (sha256>?)` / `SCAN b` /
+/// `CORRELATED SCALAR SUBQUERY 1` / `SEARCH a USING INDEX
+/// federation_attestations_attester_dimension_citation (attesting_key_id=?
+/// AND dimension=? AND <expr>=?)`. The caller takes the cursor from the
+/// largest sha it read, so the window needs no outer ORDER BY.
+pub(crate) fn sqlite_held_blob_claim_window_sql() -> String {
+    "SELECT b.sha256, EXISTS (SELECT 1 FROM federation_attestations a \
+       INDEXED BY federation_attestations_attester_dimension_citation \
+       WHERE a.attesting_key_id = ?3 AND a.dimension = ?4 \
+         AND json_extract(a.attestation_envelope, '$.evidence_refs[0]') = lower(hex(b.sha256)) \
+         AND a.tier = 'federation') \
+     FROM (SELECT sha256 FROM federation_blobs WHERE sha256 > ?1 ORDER BY sha256 LIMIT ?2) b"
+        .to_owned()
 }
 
 /// v61 — `list_attestations_by_dimension_citing`'s statement (`?1` the
@@ -24795,7 +25084,7 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
             }
             let inserted = tx
                 .execute(
-                    "INSERT INTO federation_stream_delivery_receipts (\
+                    "INSERT INTO federation_stream_delivery_acks (\
                         stream_id, subscriber_key_id, epoch, k, chunk_root, \
                         signature_blob, received_at\
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
@@ -24814,7 +25103,7 @@ impl crate::federation::blob_admit::BlobFloorStore for SqliteBackend {
             if inserted == 0 {
                 let held: Vec<u8> = tx
                     .query_row(
-                        "SELECT chunk_root FROM federation_stream_delivery_receipts \
+                        "SELECT chunk_root FROM federation_stream_delivery_acks \
                           WHERE stream_id = ?1 AND subscriber_key_id = ?2 AND k = ?3",
                         rusqlite::params![stream_id, subscriber, k],
                         |r| r.get(0),
@@ -27570,21 +27859,7 @@ mod accord_tests {
         crate::federation::operational::test_support::exercise_trust_root(&backend, "sq536").await;
     }
 
-    #[tokio::test]
-    async fn family_trust_root_works_on_sqlite_557() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        // v62.0.0 (E9: the body is edition 2) — this node's key, an edition-2
-        // `node` record, set before the body runs (the body needs it).
-        backend.set_node_key_id(e2::put_key(&backend, "sq557-node", &["node"]).await);
-        Box::pin(
-            crate::federation::operational::test_support::exercise_family_trust_root(
-                &backend, "sq557",
-            ),
-        )
-        .await
-        .expect("557 family trust root exercise");
-    }
+    // LEAD-root1 — runner of the deleted exercise_family_trust_root (the root is the bundle).
 
     /// **CIRISPersist#561 — transport-hop eligibility.** The A/B/C/D rule, its
     /// authoritative TTL, the anti-inflation bound and the withdrawal contract,
@@ -27782,6 +28057,26 @@ mod accord_tests {
             &backend, "sqR536",
         )
         .await;
+    }
+}
+
+/// v62.0.0 (WD-fix3 rev 2; CC 6.1.5 N5) — the backend's own bytes plane for a
+/// door's descent ([`FederationDirectory::withdrawn_bytes_evictor`](crate::federation::FederationDirectory::withdrawn_bytes_evictor)):
+/// the purge's one eviction (`engine::purge_evict_blob_on`: the bytes, then
+/// the DAG children no live manifest keeps), with no signer, so no holding
+/// claim is retracted (an Engine door supplies its own, which does).
+#[async_trait::async_trait]
+impl crate::federation::steward_purge::BytesEvictor for SqliteBackend {
+    async fn evict(
+        &self,
+        sha256: &[u8; 32],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, String> {
+        let node = crate::federation::FederationDirectory::node_key_id(self).unwrap_or_default();
+        crate::engine::purge_evict_blob_on(self, &node, None, sha256, now)
+            .await
+            .map(|r| r.blob_deleted)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -28472,8 +28767,7 @@ mod tests {
             row.attestation_envelope["references_attestation_id"] =
                 serde_json::Value::String(target);
         }
-        let mapped = if [at::WITHDRAWS, at::RECANTS, at::SUPERSEDES]
-            .contains(&row.attestation_type.as_str())
+        let mapped = if crate::federation::edition2::emit::names_a_target(&row.attestation_type)
             && row.attestation_envelope.get("dimension").is_none()
         {
             let target = row
@@ -28731,7 +29025,7 @@ mod tests {
             attestation_envelope: serde_json::json!({
                 "id": id,
                 "dimension": if e2::emit_edition2() {
-                    "evidence:safety_battery:capture:a:b:v1"
+                    "coherence_standing:cab:v1"
                 } else {
                     "identity_binding:v1"
                 },
@@ -31491,7 +31785,7 @@ mod tests {
         // Two occurrences of alice-root.
         for occ in ["alice-phone", "alice-laptop"] {
             backend
-                .put_identity_occurrence_local(fed_identity_occurrence(
+                .test_seam_put_identity_occurrence(fed_identity_occurrence(
                     "alice-root",
                     occ,
                     crate::federation::types::device_class::PHONE,
@@ -31512,15 +31806,18 @@ mod tests {
 
         // Revoke alice-phone, effective in the past (trusted-local, #421).
         backend
-            .put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-                identity_key_id: kid_any("alice-root"),
-                occurrence_key_id: kid_any("alice-phone"),
-                revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
-                effective_at: "2026-06-05T00:00:00Z".parse().unwrap(),
-                reason: Some("lost device".into()),
-                witness_set: vec![kid_any("alice-root")],
-                persist_row_hash: String::new(),
-            })
+            .put_identity_occurrence_revocation_edition2(
+                IdentityOccurrenceRevocation {
+                    identity_key_id: kid_any("alice-root"),
+                    occurrence_key_id: kid_any("alice-phone"),
+                    revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                    effective_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                    reason: Some("lost device".into()),
+                    witness_set: vec![kid_any("alice-root")],
+                    persist_row_hash: String::new(),
+                },
+                crate::federation::DoorToken::new(),
+            )
             .await
             .unwrap();
 
@@ -31557,15 +31854,18 @@ mod tests {
 
         // Future-effective revocation does NOT exclude (trusted-local, #421).
         backend
-            .put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-                identity_key_id: kid_any("alice-root"),
-                occurrence_key_id: kid_any("alice-laptop"),
-                revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
-                effective_at: "2099-01-01T00:00:00Z".parse().unwrap(),
-                reason: None,
-                witness_set: vec![],
-                persist_row_hash: String::new(),
-            })
+            .put_identity_occurrence_revocation_edition2(
+                IdentityOccurrenceRevocation {
+                    identity_key_id: kid_any("alice-root"),
+                    occurrence_key_id: kid_any("alice-laptop"),
+                    revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                    effective_at: "2099-01-01T00:00:00Z".parse().unwrap(),
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+                crate::federation::DoorToken::new(),
+            )
             .await
             .unwrap();
         let active = backend
@@ -31652,7 +31952,7 @@ mod tests {
 
         // Occurrence WITH encryption keys → round-trips + resolves.
         backend
-            .put_identity_occurrence_local(occ(
+            .test_seam_put_identity_occurrence(occ(
                 "occ-enc",
                 Some(EncryptionPubkeys {
                     x25519_base64: x25519.clone(),
@@ -31683,7 +31983,7 @@ mod tests {
 
         // Occurrence WITHOUT keys → resolve = None (fail-secure exclusion).
         backend
-            .put_identity_occurrence_local(occ("occ-bare", None))
+            .test_seam_put_identity_occurrence(occ("occ-bare", None))
             .await
             .unwrap();
         assert!(backend
@@ -31700,7 +32000,7 @@ mod tests {
 
         // Admission rejects a wrong-length key.
         let err = backend
-            .put_identity_occurrence_local(occ(
+            .test_seam_put_identity_occurrence(occ(
                 "occ-enc",
                 Some(EncryptionPubkeys {
                     x25519_base64: B64.encode([0u8; 16]), // too short
@@ -31759,7 +32059,7 @@ mod tests {
             persist_row_hash: String::new(),
         };
         backend
-            .put_identity_occurrence_local(occ(
+            .test_seam_put_identity_occurrence(occ(
                 &kid_any("occ-keyed"),
                 Some(EncryptionPubkeys {
                     x25519_base64: B64.encode(x_pub),
@@ -31769,7 +32069,7 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_identity_occurrence_local(occ(&kid_any("occ-bare"), None))
+            .test_seam_put_identity_occurrence(occ(&kid_any("occ-bare"), None))
             .await
             .unwrap();
 
@@ -31781,7 +32081,7 @@ mod tests {
             plaintext,
             Some("text/plain"),
             None,
-            None,
+            Some(&kid_any("occ-keyed")),
         )
         .await
         .unwrap();
@@ -31898,7 +32198,7 @@ mod tests {
             }
         };
         backend
-            .put_identity_occurrence_local(occ(
+            .test_seam_put_identity_occurrence(occ(
                 &kid_any("alice"),
                 &kid_any("alice-phone"),
                 Some(EncryptionPubkeys {
@@ -31909,7 +32209,7 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_identity_occurrence_local(occ(&kid_any("bob"), &kid_any("bob-phone"), None))
+            .test_seam_put_identity_occurrence(occ(&kid_any("bob"), &kid_any("bob-phone"), None))
             .await
             .unwrap();
 
@@ -31931,7 +32231,7 @@ mod tests {
             plaintext,
             None,
             None,
-            None,
+            Some(&kid_any("alice-phone")),
         )
         .await
         .unwrap();
@@ -31986,6 +32286,34 @@ mod tests {
         policy: Option<serde_json::Value>,
         comm_authorized: bool,
     ) -> SqliteBackend {
+        community_fixture_inner(members, policy, comm_authorized, false).await
+    }
+
+    /// v62.0.0 (KR-fix31b; CC 5.2 "a write its own author cannot open is
+    /// refused") — [`community_fixture`] for a test that SEALS: the fixture
+    /// node `comm-node` (the minter of every epoch a `None`-author write
+    /// mints) is the owned, keyed device of one more roster member,
+    /// `comm-node-owner` (a USER key with no device of its own), through
+    /// `lifecycle_support::seat_minter` (a two-voice owner binding and the
+    /// node's self pair with this store's content-KEM keys). The node is then
+    /// a granted recipient of everything it seals, after the listed members.
+    async fn community_fixture_sealed(
+        members: &[(&str, &str, bool)],
+        policy: Option<serde_json::Value>,
+        comm_authorized: bool,
+    ) -> SqliteBackend {
+        community_fixture_inner(members, policy, comm_authorized, true).await
+    }
+
+    /// The seed of the fixture node's owner ([`community_fixture_sealed`]).
+    const COMM_NODE_OWNER: &str = "comm-node-owner";
+
+    async fn community_fixture_inner(
+        members: &[(&str, &str, bool)],
+        policy: Option<serde_json::Value>,
+        comm_authorized: bool,
+        seat_comm_node: bool,
+    ) -> SqliteBackend {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         // #848 — the fixture node IS the minter of every epoch it mints.
@@ -32009,10 +32337,31 @@ mod tests {
                 None
             };
             backend
-                .put_identity_occurrence_local(occ_signed(ident, occ, enc))
+                .test_seam_put_identity_occurrence(occ_signed(ident, occ, enc))
                 .await
                 .unwrap();
             member_idents.push(*ident);
+        }
+        if seat_comm_node {
+            crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+                &backend,
+                COMM_NODE_OWNER,
+                COMM_NODE_OWNER,
+                crate::federation::types::identity_type::USER,
+            )
+            .await;
+            member_idents.push(COMM_NODE_OWNER);
+            let (_, node) = crate::federation::community_dek::lifecycle_support::seat_minter(
+                &backend,
+                COMM_NODE_OWNER,
+                "comm-node",
+            )
+            .await;
+            assert_eq!(
+                node,
+                kid_any("comm-node"),
+                "the seated node is the fixture's node key"
+            );
         }
         if comm_authorized {
             // v62.0.0 (E5's edition-2 room; W1-fix4: the earlier-form room went
@@ -32491,15 +32840,19 @@ mod tests {
         };
         use crate::federation::{BlobStorage, DekKeyState};
 
-        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        let backend = community_fixture_sealed(&[("alice", "alice-occ", true)], None, false).await;
         // #848 — the sweep runs over the SIGNER's own counter, so the node
-        // that mints here is the sweeper.
-        let sweeper = test_signer_for("sweeper");
-        // v62.0.0 (E1, round 3) — the sweeper is a live edition-2 key, and the
-        // minter is named by the id its statements carry (cut B:
-        // `LocalSigner::federation_id`).
-        put_fed_key(&backend, &fed_key("sweeper", "sweeper", "sweeper")).await;
+        // that mints here is the sweeper. v62.0.0 (KR-fix31b; CC 5.2) — the
+        // sweeper is the fixture node `comm-node`, seated as a member's owned,
+        // keyed device (the writes' author holds a wrap target); the minter is
+        // named by the id its statements carry (`LocalSigner::federation_id`).
+        let sweeper = test_signer_for("comm-node");
         let minter = sweeper.federation_id().await;
+        assert_eq!(
+            minter,
+            kid_any("comm-node"),
+            "the sweeper is the fixture node"
+        );
         backend.set_node_key_id(&minter);
         let old =
             encrypt_and_cascade_community(&backend, &kid_any("comm"), b"old minutes", None, None)
@@ -32562,15 +32915,19 @@ mod tests {
         };
         use crate::federation::{BlobStorage, DekKeyState};
 
-        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        let backend = community_fixture_sealed(&[("alice", "alice-occ", true)], None, false).await;
         // #848 — the sweep runs over the SIGNER's own counter, so the node
-        // that mints here is the sweeper.
-        let sweeper = test_signer_for("sweeper");
-        // v62.0.0 (E1, round 3) — the sweeper is a live edition-2 key, and the
-        // minter is named by the id its statements carry (cut B:
-        // `LocalSigner::federation_id`).
-        put_fed_key(&backend, &fed_key("sweeper", "sweeper", "sweeper")).await;
+        // that mints here is the sweeper. v62.0.0 (KR-fix31b; CC 5.2) — the
+        // sweeper is the fixture node `comm-node`, seated as a member's owned,
+        // keyed device (the writes' author holds a wrap target); the minter is
+        // named by the id its statements carry (`LocalSigner::federation_id`).
+        let sweeper = test_signer_for("comm-node");
         let minter = sweeper.federation_id().await;
+        assert_eq!(
+            minter,
+            kid_any("comm-node"),
+            "the sweeper is the fixture node"
+        );
         backend.set_node_key_id(&minter);
         let old =
             encrypt_and_cascade_community(&backend, &kid_any("comm"), b"old minutes", None, None)
@@ -32660,7 +33017,9 @@ mod tests {
         };
         use crate::federation::{BlobStorage, DekKeyState};
 
-        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — a sealing test: the minter is a
+        // member's owned, keyed device.
+        let backend = community_fixture_sealed(&[("alice", "alice-occ", true)], None, false).await;
         let sealed =
             encrypt_and_cascade_community(&backend, &kid_any("comm"), b"minutes", None, None)
                 .await
@@ -32734,7 +33093,9 @@ mod tests {
         };
         use crate::federation::DekKeyState;
 
-        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — a sealing test: the minter is a
+        // member's owned, keyed device.
+        let backend = community_fixture_sealed(&[("alice", "alice-occ", true)], None, false).await;
         let first = encrypt_and_cascade_community(&backend, &kid_any("comm"), b"one", None, None)
             .await
             .unwrap();
@@ -32787,7 +33148,9 @@ mod tests {
         use crate::federation::community_dek::orchestrate::set_key_state;
         use crate::federation::{BlobStorage, DekKeyState};
 
-        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — a sealing test: the minter is a
+        // member's owned, keyed device.
+        let backend = community_fixture_sealed(&[("alice", "alice-occ", true)], None, false).await;
         // Mint the epoch DEK without sealing anything under it.
         crate::federation::community_dek::orchestrate::encrypt_and_cascade_community(
             &backend,
@@ -32856,18 +33219,14 @@ mod tests {
         use crate::federation::hard_case::{kind, HardCaseFilter};
         use crate::federation::{BlobStorage, FederationDirectory};
 
-        let backend = community_fixture(
+        // v62.0.0 (KR-fix31b; CC 5.2) — a sealing test: the fixture's node key
+        // ("comm-node", the attester of the recipient_excluded row, v57.0.0
+        // #988 item 2) is held as a NODE key and seated as a member's owned,
+        // keyed device by the fixture itself.
+        let backend = community_fixture_sealed(
             &[("alice", "alice-occ", true), ("bob", "bob-occ", false)],
             None,
-        )
-        .await;
-        // v57.0.0 (#988 item 2) — the fixture's node key ("comm-node"), held:
-        // the attester of the recipient_excluded row.
-        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
-            &backend,
-            "comm-node",
-            "comm-node",
-            crate::federation::types::identity_type::NODE,
+            false,
         )
         .await;
 
@@ -32885,7 +33244,11 @@ mod tests {
             result.epoch, 0,
             "never-rotated community seals under epoch 0"
         );
-        assert_eq!(result.granted, vec![kid_any("alice-occ")]);
+        // KR-fix31b — the author (the seated fixture node) is granted too.
+        assert_eq!(
+            result.granted,
+            vec![kid_any("alice-occ"), kid_any("comm-node")]
+        );
         assert_eq!(result.excluded, vec![kid_any("bob-occ")]);
 
         // Granted member's grant exists and is v2; keyless member has NONE.
@@ -32893,7 +33256,11 @@ mod tests {
             .community_dek_member_grant_recipients(&kid_any("comm"), &kid_any("comm-node"), 0)
             .await
             .unwrap();
-        assert_eq!(recips, vec![kid_any("alice-occ")]);
+        let mut recips = recips;
+        recips.sort();
+        let mut want = vec![kid_any("alice-occ"), kid_any("comm-node")];
+        want.sort();
+        assert_eq!(recips, want);
         assert!(backend
             .community_dek_has_member_grant(
                 &kid_any("comm"),
@@ -32991,7 +33358,9 @@ mod tests {
 
         // Infra-LABELED community whose own key is NOT substrate_persist
         // (comm_authorized == false) — an UNauthorized self-labeled infra.
-        let backend = community_fixture_comm_authority(
+        // v62.0.0 (KR-fix31b; CC 5.2) — a sealing test: the minter is a
+        // member's owned, keyed device.
+        let backend = community_fixture_sealed(
             &[("alice", "alice-occ", true)],
             Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
             false,
@@ -33009,7 +33378,11 @@ mod tests {
         .await
         .expect("unauthorized infra label must NOT opt out of the DEK cascade");
         assert_eq!(result.epoch, 0);
-        assert_eq!(result.granted, vec![kid_any("alice-occ")]);
+        // KR-fix31b — the author (the seated fixture node) is granted too.
+        assert_eq!(
+            result.granted,
+            vec![kid_any("alice-occ"), kid_any("comm-node")]
+        );
         // An epoch-0 DEK self-retention row WAS minted (cascade ran).
         assert!(backend
             .community_dek_get_self_retention(&kid_any("comm"), &kid_any("comm-node"), 0)
@@ -33353,9 +33726,12 @@ mod tests {
         };
         use crate::federation::BlobStorage;
 
-        let backend = community_fixture(
+        // v62.0.0 (KR-fix31b; CC 5.2) — a sealing test: the minter is a
+        // member's owned, keyed device.
+        let backend = community_fixture_sealed(
             &[("alice", "alice-occ", true), ("bob", "bob-occ", true)],
             None,
+            false,
         )
         .await;
 
@@ -33403,7 +33779,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(after.epoch, 1);
-        assert_eq!(after.granted, vec![kid_any("alice-occ")]);
+        // KR-fix31b — the author (the seated fixture node) is granted too.
+        assert_eq!(
+            after.granted,
+            vec![kid_any("alice-occ"), kid_any("comm-node")]
+        );
         assert!(!after.granted.contains(&kid_any("bob-occ")));
         assert_ne!(
             before.at_rest_sha256, after.at_rest_sha256,
@@ -33451,7 +33831,9 @@ mod tests {
         use crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2;
         use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
 
-        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — a sealing test: the minter is a
+        // member's owned, keyed device.
+        let backend = community_fixture_sealed(&[("alice", "alice-occ", true)], None, false).await;
         encrypt_and_cascade_community(&backend, &kid_any("comm"), b"x", None, None)
             .await
             .unwrap();
@@ -33533,7 +33915,7 @@ mod tests {
         }
         // A content-only occurrence with KEX keys (trusted-local path).
         backend
-            .put_identity_occurrence_local(occ_signed("root", "phone", Some(keyed_enc(0x33))))
+            .test_seam_put_identity_occurrence(occ_signed("root", "phone", Some(keyed_enc(0x33))))
             .await
             .unwrap();
         assert!(
@@ -33549,7 +33931,7 @@ mod tests {
         // asserted_at (2026-06-10), so it kills the CURRENT binding (#421:
         // the comparator is `effective_at >= asserted_at`).
         backend
-            .put_identity_occurrence_revocation_local(
+            .put_identity_occurrence_revocation_edition2(
                 crate::federation::IdentityOccurrenceRevocation {
                     identity_key_id: kid_any("root"),
                     occurrence_key_id: kid_any("phone"),
@@ -33559,6 +33941,7 @@ mod tests {
                     witness_set: vec![],
                     persist_row_hash: String::new(),
                 },
+                crate::federation::DoorToken::new(),
             )
             .await
             .unwrap();
@@ -33578,7 +33961,10 @@ mod tests {
         // compromise → revoke → re-key → publish → recovered.
         let mut fresh = occ_signed("root", "phone", Some(keyed_enc(0x44)));
         fresh.asserted_at = "2026-06-14T00:00:00Z".parse().unwrap();
-        backend.put_identity_occurrence_local(fresh).await.unwrap();
+        backend
+            .test_seam_put_identity_occurrence(fresh)
+            .await
+            .unwrap();
         assert!(
             backend
                 .resolve_encryption_keys(&kid_any("phone"))
@@ -33619,7 +34005,7 @@ mod tests {
         }
         // Only the OLD occurrence exists at write time.
         backend
-            .put_identity_occurrence_local(occ_signed("root", "occ-old", Some(keyed_enc(0x11))))
+            .test_seam_put_identity_occurrence(occ_signed("root", "occ-old", Some(keyed_enc(0x11))))
             .await
             .unwrap();
 
@@ -33631,7 +34017,7 @@ mod tests {
             plaintext,
             None,
             None,
-            None,
+            Some(&kid_any("occ-old")),
         )
         .await
         .unwrap();
@@ -33639,7 +34025,7 @@ mod tests {
 
         // The new occurrence joins AFTER the write — initially NO grant.
         backend
-            .put_identity_occurrence_local(occ_signed("root", "occ-new", Some(keyed_enc(0x22))))
+            .test_seam_put_identity_occurrence(occ_signed("root", "occ-new", Some(keyed_enc(0x22))))
             .await
             .unwrap();
         assert!(
@@ -33715,7 +34101,7 @@ mod tests {
         // occurrence is registered only afterwards, so the original write
         // could not reach her.
         backend
-            .put_identity_occurrence_local(occ_signed(
+            .test_seam_put_identity_occurrence(occ_signed(
                 "alice",
                 "alice-phone",
                 Some(keyed_enc(0x33)),
@@ -33739,7 +34125,7 @@ mod tests {
             plaintext,
             None,
             None,
-            None,
+            Some(&kid_any("alice-phone")),
         )
         .await
         .unwrap();
@@ -33747,7 +34133,7 @@ mod tests {
 
         // carol registers a KEYLESS occurrence (her wrap target is invalid).
         backend
-            .put_identity_occurrence_local(occ_signed("carol", "carol-phone", None))
+            .test_seam_put_identity_occurrence(occ_signed("carol", "carol-phone", None))
             .await
             .unwrap();
 
@@ -33834,7 +34220,7 @@ mod tests {
             put_fed_key(&backend, &fed_key(k, k, k)).await;
         }
         backend
-            .put_identity_occurrence_local(occ_signed(
+            .test_seam_put_identity_occurrence(occ_signed(
                 "alice",
                 "alice-phone",
                 Some(keyed_enc(0x66)),
@@ -33860,7 +34246,7 @@ mod tests {
             b"before bob",
             None,
             None,
-            None,
+            Some(&kid_any("alice-phone")),
         )
         .await
         .unwrap();
@@ -33868,7 +34254,11 @@ mod tests {
 
         // bob registers a KEYED occurrence, then is admitted.
         backend
-            .put_identity_occurrence_local(occ_signed("bob", "bob-phone", Some(keyed_enc(0x77))))
+            .test_seam_put_identity_occurrence(occ_signed(
+                "bob",
+                "bob-phone",
+                Some(keyed_enc(0x77)),
+            ))
             .await
             .unwrap();
         // v31.0.0 (CIRISPersist#654) — the driver REFUSES a newcomer the roster
@@ -33992,7 +34382,7 @@ mod tests {
             b"after bob",
             None,
             None,
-            None,
+            Some(&kid_any("alice-phone")),
         )
         .await
         .unwrap();
@@ -34040,7 +34430,7 @@ mod tests {
             put_fed_key(&backend, &fed_key(k, k, k)).await;
         }
         backend
-            .put_identity_occurrence_local(occ_signed(
+            .test_seam_put_identity_occurrence(occ_signed(
                 "alice",
                 "alice-phone",
                 Some(keyed_enc(0x44)),
@@ -34048,7 +34438,11 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_identity_occurrence_local(occ_signed("dave", "dave-phone", Some(keyed_enc(0x55))))
+            .test_seam_put_identity_occurrence(occ_signed(
+                "dave",
+                "dave-phone",
+                Some(keyed_enc(0x55)),
+            ))
             .await
             .unwrap();
         put_family_any(
@@ -34062,10 +34456,17 @@ mod tests {
         .unwrap();
 
         // Before removal: both occurrences are granted on a write.
-        let before =
-            encrypt_and_cascade(&backend, FAMILY, &kid_any("fam"), b"v1", None, None, None)
-                .await
-                .unwrap();
+        let before = encrypt_and_cascade(
+            &backend,
+            FAMILY,
+            &kid_any("fam"),
+            b"v1",
+            None,
+            None,
+            Some(&kid_any("alice-phone")),
+        )
+        .await
+        .unwrap();
         let mut g = before.granted.clone();
         g.sort();
         let mut want = vec![kid_any("alice-phone"), kid_any("dave-phone")];
@@ -34100,7 +34501,7 @@ mod tests {
             b"v2-post-removal",
             None,
             None,
-            None,
+            Some(&kid_any("alice-phone")),
         )
         .await
         .unwrap();
@@ -34122,7 +34523,7 @@ mod tests {
         put_fed_key(&backend, &fed_key("alice-laptop", "alice", "alice-root")).await;
 
         backend
-            .put_identity_occurrence_local(fed_identity_occurrence(
+            .test_seam_put_identity_occurrence(fed_identity_occurrence(
                 "alice-root",
                 "alice-phone",
                 crate::federation::types::device_class::PHONE,
@@ -34130,7 +34531,7 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_identity_occurrence_local(fed_identity_occurrence(
+            .test_seam_put_identity_occurrence(fed_identity_occurrence(
                 "alice-root",
                 "alice-laptop",
                 crate::federation::types::device_class::LAPTOP,
@@ -34802,7 +35203,7 @@ mod tests {
         put_fed_key(&backend, &fed_key("alice-root", "alice", "alice-root")).await;
         put_fed_key(&backend, &fed_key("alice-phone", "alice", "alice-root")).await;
         backend
-            .put_identity_occurrence_local(fed_identity_occurrence(
+            .test_seam_put_identity_occurrence(fed_identity_occurrence(
                 "alice-root",
                 "alice-phone",
                 crate::federation::types::device_class::PHONE,
@@ -34838,7 +35239,7 @@ mod tests {
         put_fed_key(&backend, &fed_key("alice-watch", "alice", "alice-root")).await;
         let bad = fed_identity_occurrence("alice-root", "alice-watch", "wearable");
         let err = backend
-            .put_identity_occurrence_local(bad)
+            .test_seam_put_identity_occurrence(bad)
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "federation_device_class_rejected");
@@ -37433,12 +37834,7 @@ mod tests {
             .unwrap();
         let composers: Vec<_> = by_steward
             .iter()
-            .filter(|r| {
-                matches!(
-                    r.attestation_type.as_str(),
-                    "withdraws" | "recants" | "supersedes"
-                )
-            })
+            .filter(|r| crate::federation::edition2::emit::names_a_target(&r.attestation_type))
             .collect();
         assert_eq!(composers.len(), 3, "expected three distinct triples");
         let by_agent = backend
@@ -37646,10 +38042,12 @@ mod tests {
         )
         .await;
         put_fed_key(&backend, &fed_key("k-a", "primitive-a", "registry-steward")).await;
+        // v62.0.0 (FS-sig-a; CC 3.1.2.1) — `attestation:self_verify` is a
+        // key's row about itself: the canonical leg signs about its signer.
         let att = scores_attestation_with_dimension(
             "att-canonical",
             "registry-steward",
-            "k-a",
+            "registry-steward",
             "registry-steward",
             "attestation:self_verify",
         );
@@ -40383,6 +40781,42 @@ mod tests {
             "the citing read seeks (attester, dimension, citation): {plan:?}"
         );
         v61_storm_no_history_walk(&plan, "by_dimension_citing");
+    }
+
+    /// I6122 (HEAD-7) — the claim pass's window (`held_blob_claim_window`)
+    /// seeks the blob primary key for its window and V180's citation index
+    /// per blob; it never scans the blob table or walks the holder's
+    /// custody history.
+    #[tokio::test]
+    async fn i6122_the_claim_window_seeks_its_indexes() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let binds = vec![
+            SqlValue::Blob(vec![0u8; 32]),
+            SqlValue::Integer(256),
+            SqlValue::Text("device".into()),
+            SqlValue::Text("custody:ack:v1".into()),
+        ];
+        let plan = sqlite_plan(&backend, &sqlite_held_blob_claim_window_sql(), binds).await;
+        eprintln!("I6122 held_blob_claim_window plan: {plan:?}");
+        assert!(
+            plan.iter().any(|l| l.starts_with(
+                "SEARCH federation_blobs USING COVERING INDEX sqlite_autoindex_federation_blobs_1 \
+                 (sha256>?)"
+            )),
+            "I6122: the window seeks the blob primary key: {plan:?}"
+        );
+        assert!(
+            plan.iter().any(|l| l.starts_with(
+                "SEARCH a USING INDEX federation_attestations_attester_dimension_citation \
+                 (attesting_key_id=? AND dimension=? AND <expr>=?)"
+            )),
+            "I6122: each blob's report is one citation seek: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|l| l.starts_with("SCAN federation_")),
+            "I6122: never a table scan: {plan:?}"
+        );
     }
 
     /// v61 — `list_composers_referencing_any` on the attesting axis
@@ -43503,12 +43937,12 @@ mod tests {
             );
         }
         // `scores` admission gate requires a versioned dimension —
-        // the helper picks `evidence:safety_battery:capture:a:b:v1` (registered; v62 E0 fix 9) when no dimension is
+        // the helper picks `coherence_standing:cab:v1` (registered; v62 E0 fix 9) when no dimension is
         // provided for a scores row so tests don't have to spell it.
         if atype == crate::federation::types::attestation_type::SCORES && dimension.is_none() {
             env.insert(
                 "dimension".into(),
-                serde_json::Value::String("evidence:safety_battery:capture:a:b:v1".into()),
+                serde_json::Value::String("coherence_standing:cab:v1".into()),
             );
             env.insert(
                 "score".into(),
@@ -43572,7 +44006,7 @@ mod tests {
                     "topo-granter",
                     "topo-grantee",
                     attestation_type::SCORES,
-                    Some("evidence:safety_battery:capture:a:b:v1"),
+                    Some("coherence_standing:cab:v1"),
                     None,
                     &[],
                     Some(2.5),
@@ -43596,7 +44030,7 @@ mod tests {
         assert_eq!(e.edge_type, crate::federation::EdgeType::Direct);
         assert_eq!(e.from_key, e2::kid("topo-grantee"));
         assert_eq!(e.to_key, e2::kid("topo-granter"));
-        assert_eq!(e.purpose, "evidence:safety_battery:capture:a:b:v1");
+        assert_eq!(e.purpose, "coherence_standing:cab:v1");
         assert!((e.weight - 2.5).abs() < 1e-9);
         assert!(e.revoked_at.is_none());
         assert_eq!(topo.nodes.len(), 2);
@@ -43621,7 +44055,7 @@ mod tests {
             "adv-granter",
             "adv-grantee",
             attestation_type::SCORES,
-            Some("evidence:safety_battery:capture:a:b:v1"),
+            Some("coherence_standing:cab:v1"),
             None,
             &[],
             Some(1.0),
@@ -47198,7 +47632,7 @@ mod tests {
         let sha_hex = "d".repeat(64);
         let mut att = fed_attestation("att-steward", steward_key, steward_key, steward_key);
         att.attestation_envelope = serde_json::json!({
-            "dimension": "evidence:safety_battery:capture:a:b:v1",
+            "dimension": "coherence_standing:cab:v1",
             "score": 1.0,
             "confidence": 0.9,
             "evidence_refs": [sha_hex],
@@ -48774,20 +49208,7 @@ mod tests {
 
     // ── v31.0.0 (CIRISPersist#656) — the ungated-door witnesses, SQLITE legs ──
 
-    /// #686 — the SQLITE leg of the CHARTER-PLANE foreign-retraction question.
-    #[tokio::test]
-    async fn foreign_retraction_cannot_sever_charter_sqlite_686() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        // v62.0.0 (E9: the body is edition 2) — this node's key, an edition-2
-        // `node` record, set before the body runs (the body needs it).
-        backend.set_node_key_id(e2::put_key(&backend, "sq686c-node", &["node"]).await);
-        crate::federation::operational::test_support::exercise_foreign_retraction_cannot_sever_charter(
-            &backend, "sq686c",
-        )
-        .await
-        .expect("686 charter-plane foreign-retraction exercise");
-    }
+    // LEAD-root1 — runner of the deleted exercise_foreign_retraction_cannot_sever_charter (no row is a charter).
 
     /// The SQLITE leg of the FOREIGN-RETRACTION witness.
     #[tokio::test]

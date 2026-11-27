@@ -266,7 +266,8 @@ pub(crate) mod bodies {
         found_family(d, &fam, FOUNDER_ONLY, &[&founder], &[])
             .await
             .expect("I1500: a family's protocol");
-        found_affiliation(d, &aff, FOUNDER_ONLY, &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let _aff = found_affiliation(d, &aff, FOUNDER_ONLY, &[&founder], &[])
             .await
             .expect("I1500: an affiliation keeps founder_only (CC 4.4.3.2.8)");
         // A stored room never moves ONTO founder_only: its v+1 is refused.
@@ -323,7 +324,8 @@ pub(crate) mod bodies {
             matches!(e, Error::ConsensusProtocolMalformed { .. }),
             "I1501: {e:?}"
         );
-        found_public_room(d, &public, OPEN_SELF_ADMIT, &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let public = found_public_room(d, &public, OPEN_SELF_ADMIT, &[&founder], &[])
             .await
             .expect("I1501: a public room admits openly");
         assert_eq!(
@@ -420,7 +422,8 @@ pub(crate) mod bodies {
         let joiner = bound_joiner(d, &joiner, &format!("i1502-o-{s}")).await;
         let (founder, late, cid, closed) =
             (id_of(&founder), id_of(&late), id_of(&cid), id_of(&closed));
-        found_public_room(d, &cid, OPEN_SELF_ADMIT, &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_public_room(d, &cid, OPEN_SELF_ADMIT, &[&founder], &[])
             .await
             .unwrap();
         let at = Utc::now() - Duration::hours(1);
@@ -599,10 +602,12 @@ pub(crate) mod bodies {
             id_of(&pubr),
             id_of(&privr),
         );
-        found_public_room(d, &cid, "quorum:1/1", &[&f], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_public_room(d, &cid, "quorum:1/1", &[&f], &[])
             .await
             .expect("a public room under quorum:1/1");
-        found_community(d, &priv_cid, "quorum:1/1", &[&f], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let priv_cid = found_community(d, &priv_cid, "quorum:1/1", &[&f], &[])
             .await
             .expect("a private room");
         let at = Utc::now() - Duration::hours(1);
@@ -750,7 +755,8 @@ pub(crate) mod bodies {
         reg(d, &[&f1, &f2, &f3, &cid]).await;
         let joiner = bound_joiner(d, &joiner, &format!("i1503-o-{s}")).await;
         let (f1, f2, f3, cid) = (id_of(&f1), id_of(&f2), id_of(&f3), id_of(&cid));
-        found_public_room(d, &cid, OPEN_SELF_ADMIT, &[&f1, &f2, &f3], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_public_room(d, &cid, OPEN_SELF_ADMIT, &[&f1, &f2, &f3], &[])
             .await
             .unwrap();
         let at = Utc::now() - Duration::hours(2);
@@ -871,7 +877,8 @@ pub(crate) mod two_node {
         // its binding reaches B with A's statements (a commons row).
         let joiner = super::bodies::bound_joiner(a, &joiner, &format!("i1504-o-{s}")).await;
         let (founder, cid, private) = (id_of(&founder), id_of(&cid), id_of(&private));
-        found_public_room(a, &cid, OPEN_SELF_ADMIT, &[&founder], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_public_room(a, &cid, OPEN_SELF_ADMIT, &[&founder], &[])
             .await
             .unwrap();
         let at = Utc::now() - Duration::hours(1);
@@ -1019,7 +1026,8 @@ pub(crate) mod two_node {
         e2::put_signed(d, &early)
             .await
             .expect("I1624: a proposal for a group not held here is kept");
-        found_public_room(d, &quorum_room, "quorum:1/1", &[&f], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let quorum_room = found_public_room(d, &quorum_room, "quorum:1/1", &[&f], &[])
             .await
             .expect("I1624: a public room under quorum:1/1");
         let early_id = crate::federation::edition2::names::RowId(e2::rid_digest(&early));
@@ -1042,7 +1050,8 @@ pub(crate) mod two_node {
             "I1624: a public room that is not open serves no standing proposal"
         );
 
-        found_public_room(d, &cid, OPEN_SELF_ADMIT, &[&f, &f2], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let cid = found_public_room(d, &cid, OPEN_SELF_ADMIT, &[&f, &f2], &[])
             .await
             .unwrap();
         // An invitation is not a standing proposal.
