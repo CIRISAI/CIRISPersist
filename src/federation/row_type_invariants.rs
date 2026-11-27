@@ -672,11 +672,11 @@ pub(crate) mod bodies {
         for t in PROBES {
             let e = with_enforcement(
                 ENFORCE,
-                emit_with_local_signer(
+                Box::pin(emit_with_local_signer(
                     b,
                     &w.signer,
                     input(t, serde_json::json!({"id": "x", "size": 3})),
-                ),
+                )),
             )
             .await
             .expect_err("the emit mint refuses it too");

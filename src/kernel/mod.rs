@@ -22,6 +22,7 @@
 //! is carried; `valid_until` and the digest are not yet.
 
 pub mod consensus;
+pub mod delegation;
 pub mod head;
 pub mod key_end;
 pub mod law;

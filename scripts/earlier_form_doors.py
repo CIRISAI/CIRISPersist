@@ -163,6 +163,12 @@ OBJECT_TYPES = re.compile(
     # earlier-form signatures
     r"|\bAdmitSpec\b|\bRevokeSpec\b|\bGroupSupersedeProof\b"
     r"|\bserde_json\s*::\s*Value\b"
+    # v62.0.0 (WD-fix9 rev 2) — an occurrence or its revocation as an
+    # UNSIGNED struct: a door taking one writes a device's authority with no
+    # signature unless it is retired or sealed behind the edition-2 door.
+    r"|\bIdentityOccurrence\b|\bIdentityOccurrenceRevocation\b|\bOccurrenceBind\b"
+    # a write sealed behind the edition-2 door (`federation::DoorToken`)
+    r"|\bDoorToken\b"
 )
 JSON_PARAM = re.compile(r"\b\w*json\w*\s*:")
 WRITE_VERB_JSON = re.compile(
@@ -208,7 +214,17 @@ COMPOSITE_ENTRIES = (
 NODE_LOCAL_ENTRIES = ("require_node_local_producer",)
 # v62.0.0 (F0-cp8) — `substrate` is gone: its one plane (the audit entry) is
 # `composite`, so no plane keeps its own signature form.
-VERDICTS = ("refuses", "edition2", "retired", "exempt", "composite", "pending", "node_local")
+# v62.0.0 (WD-fix9 rev 2) — `sealed`: a STORAGE-ONLY write behind the
+# edition-2 door (what a door already judged: an occurrence bind, an
+# occurrence revocation). The trait method takes `DoorToken` (private field,
+# `pub(crate)` constructor: no host crate can call it), and its route names
+# the ONLY functions that may call it (`path.rs::fn`, `|`-separated): every
+# production call of the method, and every `DoorToken::new(`, must sit in one
+# of them. A future caller anywhere else is red.
+SEALED_TOKEN = "DoorToken"
+SEALED_EXEMPT_FILES = ("src/federation/directory_double.rs",)
+VERDICTS = ("refuses", "edition2", "retired", "exempt", "composite", "pending", "node_local",
+            "sealed")
 SURFACES = ("trait", "pyo3", "capsule", "http")
 
 
@@ -907,6 +923,9 @@ def read_rows(base: Path, errors: list[str]) -> dict[tuple[str, str], tuple[str,
             errors.append(f"{TSV}:{n}: an exemption has no route and must say why in `note`")
         if verdict == "retired" and hops:
             errors.append(f"{TSV}:{n}: a retired door has no route")
+        if verdict == "sealed" and (not hops or any(len(c) != 1 for c in hops)):
+            errors.append(f"{TSV}:{n}: a sealed door's route names its callers, one hop each, "
+                          f"`a.rs::f | b.rs::g`")
         if verdict == "pending" and (hops or not re.search(r"\bowner:\s*\S", note)):
             errors.append(f"{TSV}:{n}: a pending door has no route and its note names `owner: <who>`")
         if (surface, door) in rows:
@@ -1012,6 +1031,47 @@ def check_retired(where: str, body: str, trait_names: set[str], errors: list[str
         errors.append(f"{label}: {where} is `retired` but still reads its object ({', '.join(sorted(set(reads)))})")
         return False
     return True
+
+
+def check_sealed(tree: Tree, name: str, callers: list[list[str]], errors: list[str]) -> bool:
+    """A sealed door: its trait signature takes `DoorToken`; every production
+    `.name(` call and every `DoorToken::new(` lies in a named caller.
+    Production here excludes `feature = "test-anchor"` code too (the
+    anchored tree: never in a published wheel)."""
+    tree = Tree(tree.base, anchored=True)
+    code = tree.code(TRAIT_FILE) or ""
+    span = find_block(code, re.compile(rf"\btrait\s+{TRAIT_NAME}\b[^{{]*\{{"))
+    ok = True
+    sig = None
+    if span:
+        for fname, at, _ in fns_at_depth0(code, *span):
+            if fname == name:
+                sig = params_of(code, at)
+    if sig is None or not re.search(rf"\b{SEALED_TOKEN}\b", sig):
+        errors.append(f"trait `{name}`: a sealed door must take `{SEALED_TOKEN}`")
+        ok = False
+    allowed_calls = allowed_tokens = 0
+    for chain in callers:
+        rel, _, fn = chain[0].partition("::")
+        bodies = fn_bodies(tree, f"src/{rel}", fn)
+        if not bodies:
+            errors.append(f"trait `{name}`: sealed caller {chain[0]} not found")
+            ok = False
+        for b in bodies:
+            allowed_calls += len(re.findall(rf"\.\s*{re.escape(name)}\s*\(", b))
+            allowed_tokens += len(re.findall(rf"\b{SEALED_TOKEN}\s*::\s*new\s*\(", b))
+    total_calls = total_tokens = 0
+    for rel in tree.glob("src/**/*.rs"):
+        if rel in SEALED_EXEMPT_FILES:
+            continue
+        c = tree.code(rel) or ""
+        total_calls += len(re.findall(rf"\.\s*{re.escape(name)}\s*\(", c))
+        total_tokens += len(re.findall(rf"\b{SEALED_TOKEN}\s*::\s*new\s*\(", c))
+    if total_calls != allowed_calls:
+        errors.append(f"trait `{name}`: {total_calls - allowed_calls} production call(s) outside its "
+                      f"sealed callers ({', '.join(c[0] for c in callers)})")
+        ok = False
+    return ok, allowed_tokens, total_tokens
 
 
 def switch_is_shut(base: Path) -> bool | None:
@@ -1333,6 +1393,7 @@ def _check(base: Path) -> tuple[list[str], dict]:
     for key in sorted(set(rows) - set(inv)):
         errors.append(f"STALE row {key[0]} `{key[1]}`: the inventory finds no such door")
     verified: dict[str, bool] = {}
+    sealed_tokens = [0, 0]  # DoorToken::new( calls in sealed callers / in all production code
     # trait doors first: pyo3 / capsule rows may route through them, and a
     # trait door may route through another (`trait:put_attestation_with_origin`)
     order = sorted(inv, key=lambda k: (SURFACES.index(k[0]), k[1]))
@@ -1358,17 +1419,24 @@ def _check(base: Path) -> tuple[list[str], dict]:
             if verdict == "retired":
                 ok = bool(inv[key].bodies) and all(
                     check_retired(w, b, trait_names, errors, f"trait `{key[1]}`") for w, b in inv[key].bodies)
+            elif verdict == "sealed":
+                ok, a_tok, t_tok = check_sealed(tree, key[1], hops, errors)
+                sealed_tokens[0] += a_tok
+                sealed_tokens[1] = t_tok
             elif verdict not in ("exempt", "pending"):
                 door = inv[key]
                 ok = bool(door.bodies) and all(
                     check_chain(tree, w, b, verdict, chain, verified, trait_names, errors, f"trait `{key[1]}`")
                     for w, b in door.bodies for chain in (hops or [[]]))
             verified[key[1]] = ok and verdict in ("refuses", "edition2", "retired", "composite",
-                                                  "node_local")
+                                                  "node_local", "sealed")
         if not progressed:
             break
     for key in pending:
         errors.append(f"trait `{key[1]}`: its route cycles through trait doors")
+    if sealed_tokens[1] != sealed_tokens[0]:
+        errors.append(f"`{SEALED_TOKEN}::new(` is called {sealed_tokens[1] - sealed_tokens[0]} time(s) "
+                      f"outside a sealed door's named callers")
     for key in order:
         if key[0] == "trait" or key not in rows:
             continue

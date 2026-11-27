@@ -138,6 +138,9 @@ pub struct SeatFields {
     pub target: Option<RowId>,
     /// The whole-number weights of a `weighted` count.
     pub weights: Vec<(String, u64)>,
+    /// v62.0.0 (R2-delegation) — the grant carries sub-delegation: it may
+    /// confer the same scope or a narrower one (the kernel's `sub()`).
+    pub sub: bool,
 }
 
 impl SeatFields {
@@ -166,6 +169,7 @@ impl SeatFields {
             of: None,
             target: None,
             weights: Vec::new(),
+            sub: false,
         }
     }
 }
@@ -324,6 +328,9 @@ impl SeatRow for KRow {
     }
     fn weights(&self) -> &[(String, u64)] {
         &self.seat.weights
+    }
+    fn sub(&self) -> bool {
+        self.seat.sub
     }
 }
 

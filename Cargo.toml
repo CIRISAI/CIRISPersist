@@ -87,7 +87,7 @@ pyo3-sqlite = ["_pyffi", "sqlite"]
 # BOTH public pyo3 shapes via `feature = "_pyffi"`. Not meant to be enabled
 # directly (it would give a PyEngine with no backend). Enabling `dep:pyo3`
 # lives here so both `pyo3` and `pyo3-sqlite` inherit it.
-_pyffi   = ["dep:pyo3", "host", "queue", "dep:getrandom", "dep:libc"]
+_pyffi   = ["dep:pyo3", "host", "queue", "dep:libc"]
 # v1.13.0 (CIRISPersist#92) — `extension-module` is its OWN feature,
 # enabled by maturin (see `pyproject.toml [tool.maturin] features`),
 # NOT folded into `pyo3`.
@@ -580,7 +580,11 @@ tls = ["postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native
 # 0.2 to match the copy already in the graph. Nothing crosses a type boundary —
 # it fills a `[u8; 32]` — so this cannot split a dependency the way a shared
 # `rand_core` RNG type would.
-getrandom = { version = "0.2", optional = true }
+# v62.0.0 (GID-prod.fix1) — no longer optional: a group founding's 32-byte
+# nonce is drawn here (`edition2::group_id::fresh_nonce`) on every build that
+# states a founding. The lock already carries this copy (ring's); on wasm32
+# the node crate's `ciris-host-abi/getrandom-backend` serves it.
+getrandom = { version = "0.2" }
 # v0.1.9 — bumped from v1.6.4 to v1.8.0. v1.7 brought
 # `HardwareSigner::storage_descriptor()` (closes the prediction
 # shim in src/ffi/pyo3.rs); v1.8 brought the generic BuildManifest
@@ -693,7 +697,7 @@ ciris-host-abi    = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v23
 # `ciris-kernel`: no_std, zero dependencies, its rules the Constitution's
 # (CC 2.7). `src/kernel/` is the adapter (persist's verified rows as the
 # kernel's `Row` / `SeatRow` views).
-ciris-kernel = { git = "https://github.com/CIRISAI/CIRISKernel", tag = "kernel-v0.2.0", version = "0.2" }
+ciris-kernel = { git = "https://github.com/CIRISAI/CIRISKernel", tag = "kernel-v0.2.1", version = "0.2" }
 # v0.3.6 (CIRISPersist#14) — direct ciris-crypto dep for HybridVerifier
 # in `Engine.verify_hybrid`. Same git source / tag as ciris-keyring +
 # ciris-verify-core so versions are workspace-coherent. Features
