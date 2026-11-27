@@ -237,11 +237,40 @@ pub(crate) mod bodies {
                 .await;
         }
         reg(d, &[&room]).await;
-        found_community(d, &room, "quorum:1/1", &[&author], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let room = found_community(d, &room, "quorum:1/1", &[&author], &[])
             .await
             .unwrap();
         let prior = self_row(d, &author).await;
         let p = place(d, &prior, &room).await;
+        // I6135 (HEAD-fix1; CC 2.4.1.1) — the restatement at the room names
+        // the head of its NEW placement, the room's roster version (read here
+        // by `head_rule::roster_head_row` over the group the placement
+        // names), not its self prior's (a person's own row names none).
+        // Before HEAD-fix1 every self -> room placement named no head and was
+        // refused `act_names_no_head`.
+        {
+            use ciris_verify_core::cde::Value;
+            let st = e2::carried_statement(&p).expect("I6135: the placement's statement");
+            let (_, pl) = crate::federation::edition2::liveness::statement_parts(&st)
+                .expect("I6135: a row statement");
+            let group = pl
+                .get_text("community_id")
+                .and_then(Value::as_text)
+                .expect("I6135: the placement names its room")
+                .to_owned();
+            let roster = crate::federation::edition2::head_rule::roster_head_row(d, &group)
+                .await
+                .expect("I6135: the roster read")
+                .expect("I6135: the room's roster version is held");
+            assert_eq!(
+                pl.get_text("refs")
+                    .and_then(|r| r.get_text("head"))
+                    .cloned(),
+                Some(ciris_verify_core::edition2::row_ref(&roster.0)),
+                "I6135: the placement names the room's roster version as its head"
+            );
+        }
         let t = Utc::now() - Duration::minutes(10);
         let e1 = composer(
             &author,

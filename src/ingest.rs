@@ -2443,19 +2443,37 @@ pub fn prepare_trace_row(
 /// `iss` is the signer key's own identity-ref: an agent signing with a
 /// rotated key (whose `iss` is its genesis key) is not served here.
 ///
+/// v62.0.0 (HEAD-fix1; CC 2.4.1.1) — the row names the head the agent acts
+/// at (its owner binding, `edition2::head_rule::state_head` over `dir`)
+/// before it is signed, as `Engine::seal_trace` does: without it the door
+/// refuses the row `act_names_no_head`.
+///
 /// # Errors
 /// [`prepare_trace_row`]'s; [`IngestError::Sign`] when the signer has no
-/// composite (no PQC half) or a half fails.
+/// composite (no PQC half) or a half fails; the head read's.
 #[cfg(feature = "scrub")]
-pub async fn seal_trace_row(
+pub async fn seal_trace_row<D>(
+    dir: &D,
     signer: &crate::signing::LocalSigner,
     trace: &serde_json::Value,
     level: TraceLevel,
-) -> Result<SealedTrace, IngestError> {
+) -> Result<SealedTrace, IngestError>
+where
+    D: crate::federation::FederationDirectory + ?Sized,
+{
     let (_, iss) = crate::federation::edition2::produce::signer_identity(signer)
         .await
         .map_err(|e| IngestError::Sign(format!("trace row signer: {e}")))?;
     let (trace_blob, payload) = prepare_trace_row(trace, level, &iss)?;
+    let payload = crate::federation::edition2::head_rule::state_head(
+        dir,
+        TRACE_ROW_TYPE,
+        TRACE_FAMILY_ID,
+        &iss,
+        payload,
+    )
+    .await
+    .map_err(|e| IngestError::Sign(format!("trace row head: {e}")))?;
     let statement = crate::federation::edition2::produce::sign_row(
         signer,
         &iss,

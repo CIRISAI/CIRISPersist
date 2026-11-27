@@ -608,10 +608,10 @@ pub(crate) mod bodies {
     where
         B: crate::federation::BlobStorage + FederationDirectory + Sync,
     {
-        use crate::federation::key_grant_invariants::two_node::node_as;
+        use crate::federation::key_grant_invariants::two_node::node_owned_as;
         use crate::federation::types::identity_type::NODE;
         use crate::federation::BlobBody;
-        let n = node_as(b, &format!("i118b-n-{s}"), NODE).await;
+        let n = node_owned_as(b, &format!("i118b-n-{s}"), NODE).await;
         let bytes = format!("i118b original {s}").into_bytes();
         let sha: [u8; 32] = {
             use sha2::Digest as _;
@@ -686,14 +686,14 @@ pub(crate) mod bodies {
         use crate::federation::at_rest_cascade::blob_invariants::hold_ctx;
         use crate::federation::at_rest_cascade::{fresh_dek, seal};
         use crate::federation::key_grant_invariants::two_node::{
-            introduce_as, node_as, seed_community_everywhere,
+            introduce_as, node_owned_as, seed_community_everywhere,
         };
         use crate::federation::replication::hold::BlobProvenance;
         use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
         use crate::federation::types::identity_type::NODE;
         use crate::federation::BlobBody;
-        let na = node_as(a, &format!("i117b-a-{s}"), NODE).await;
-        let nb = node_as(b, &format!("i117b-b-{s}"), NODE).await;
+        let na = node_owned_as(a, &format!("i117b-a-{s}"), NODE).await;
+        let nb = node_owned_as(b, &format!("i117b-b-{s}"), NODE).await;
         introduce_as(
             &[&na, &nb],
             &[&format!("i117b-a-{s}"), &format!("i117b-b-{s}")],
@@ -760,6 +760,9 @@ pub(crate) mod bodies {
         // The adopt door, at the sealed community shape.
         let comm = crate::federation::edition2::fixture_switch::kid(&format!("i117b-comm-{s}")); // v62 (E4): the typed row is keyed by identity-ref
         seed_community_everywhere(&[&nb], &comm, &[(&format!("i117b-m-{s}"), Some(&nb))]).await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         let envelope = seal(
             &fresh_dek().unwrap(),
             format!("i117b sealed {s}").as_bytes(),
