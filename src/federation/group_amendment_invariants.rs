@@ -194,6 +194,9 @@ pub mod bodies {
             protocol: consensus_protocol::MAJORITY,
         };
         let founding = e2::roster_voices(&kind.record(&id, &keys, &v1), 1, None, ms_ago(30), &all);
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let id = crate::federation::edition2::fixture_switch::room_id(&id);
         let r = e2::put_voices(a, &founding).await;
         assert!(
             matches!(r, Ok(StatementOutcome::Row { .. })),

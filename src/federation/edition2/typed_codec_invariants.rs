@@ -200,7 +200,13 @@ fn i3142_a_key_grant_reads_back_as_its_row_on_each_axis() {
         wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.to_owned(),
         wrapped_dek: "{\"v\":2,\"ct\":\"AAAA\"}".to_owned(),
     };
-    let community = iref(&key(43));
+    // GID-fix5 — an epoch grant's `community` is a group-ref (the derived
+    // id's form: `group-` and 43 characters), never a key's identity-ref.
+    let community = format!(
+        "{}{}",
+        crate::federation::edition2::group_id::GROUP_REF_PREFIX,
+        crate::federation::namespace::key_segment::segment_of(&iref(&key(43))).expect("a segment")
+    );
     let axes = [
         KeyGrantAxis::Content {
             at_rest_sha256: hex::encode([0x61; 32]),

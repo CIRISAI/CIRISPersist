@@ -73,6 +73,8 @@ mod tests {
         let comm = format!("i79-comm-{run}");
         let (alice, bob) = (format!("i79-alice-{run}"), format!("i79-bob-{run}"));
         seed_community_everywhere(&[&a, &b], &comm, &[(&alice, Some(&a)), (&bob, Some(&b))]).await;
+        // GID-fix6 — the room's DERIVED id, once founded.
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
 
         // A writes through THE door; the door announces the sealed bytes.
         let r = engine_a

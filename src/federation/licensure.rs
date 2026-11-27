@@ -140,6 +140,21 @@ pub fn authority_of(dimension: &str) -> Option<std::borrow::Cow<'_, str>> {
     ))
 }
 
+/// v62.0.0 (GID-fix3; CIRISConstitution "THE DERIVED GROUP ID") — **does
+/// `dimension` name `authority_id` as its authority?** Compared as the
+/// FAMILY PARAMETER both spell (`key_segment::family_param_of`): a key's 43
+/// characters after the identity-ref prefix, a group's after `group-`. The
+/// pure [`authority_of`] answers the KEY spelling of a segment, so an equality
+/// against an affiliation's derived id (a group-ref) failed and its licences
+/// read as nobody's.
+#[must_use]
+pub fn names_authority(dimension: &str, authority_id: &str) -> bool {
+    authority_of(dimension).is_some_and(|a| {
+        super::namespace::key_segment::family_param_of(&a)
+            == super::namespace::key_segment::family_param_of(authority_id)
+    })
+}
+
 /// The registry family a licensure dimension resolves to.
 pub const LICENSURE_FAMILY: &str = "licensure:{authority_id}";
 
@@ -314,7 +329,7 @@ pub fn fold_status_set(
         else {
             continue;
         };
-        if authority_of(dimension).as_deref() != Some(authority_id) {
+        if !names_authority(dimension, authority_id) {
             continue;
         }
         // v42.0.0 — a RETRACTION carries no replacement body, so it must not

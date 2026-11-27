@@ -109,7 +109,7 @@ pub(crate) mod bodies {
     }
 
     /// A family founded by every holder's `group:roster` voice (version 1),
-    /// naming `charter` (empty: none). Returns its identity-ref.
+    /// naming `charter` (empty: none). Returns its DERIVED group id.
     async fn found(
         d: &dyn FederationDirectory,
         seed: &str,
@@ -154,7 +154,8 @@ pub(crate) mod bodies {
             .await,
             &format!("the founding of {seed}"),
         );
-        fam
+        // GID-fix6 — the family's DERIVED id (`fam` named it until now).
+        e2::room_id(&fam)
     }
 
     /// A conferring family: its founding head names a charter (`digest`).

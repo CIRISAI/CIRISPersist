@@ -156,7 +156,8 @@ pub(crate) mod bodies {
             id_of(&solo),
             id_of(&pair),
         );
-        found_room_with_blob(
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let solo = found_room_with_blob(
             d,
             &solo,
             "founder_only",
@@ -198,8 +199,9 @@ pub(crate) mod bodies {
             "I1513: a resignation needs no countersign",
         );
         assert!(!active(d, &solo, &n).await, "I1513: n resigned");
-        // Two seats decide under their own protocol.
-        found_room_with_blob(
+        // Two seats decide under their own protocol. GID-fix6: rebound to
+        // the RETURNED (derived) id.
+        let pair = found_room_with_blob(
             d,
             &pair,
             "founder_only",
@@ -301,7 +303,8 @@ pub(crate) mod bodies {
         let k = |n: &str| format!("i1514-{n}-{s}");
         let (a, b, j, room, fam) = (k("a"), k("b"), k("j"), k("room"), k("fam"));
         reg(d, &[&a, &b, &j, &room, &fam]).await;
-        found_community(d, &room, "unanimous", &[&a, &b], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let room = found_community(d, &room, "unanimous", &[&a, &b], &[])
             .await
             .unwrap();
         let rec = record_row(d, &room, cohort_scope::COMMUNITY).await;
@@ -348,7 +351,8 @@ pub(crate) mod bodies {
             .expect_err("I1514: no new seat");
         assert_eq!(e.kind(), "federation_group_dissolved", "I1514: {e}");
         // A family's record withdraws is still refused (its own amendment).
-        found_family(d, &fam, "founder_only", &[&a], &[])
+        // GID-fix6: rebound to the RETURNED (derived) id.
+        let fam = found_family(d, &fam, "founder_only", &[&a], &[])
             .await
             .unwrap();
         let frec = record_row(d, &fam, cohort_scope::FAMILY).await;
@@ -377,7 +381,8 @@ pub(crate) mod bodies {
         for n in [a, b] {
             reg(n, &[&f, &g, &stranger, &room]).await;
         }
-        found_community(a, &room, "unanimous", &[&f, &g], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let room = found_community(a, &room, "unanimous", &[&f, &g], &[])
             .await
             .unwrap();
         let rec = record_row(a, &room, cohort_scope::COMMUNITY).await;

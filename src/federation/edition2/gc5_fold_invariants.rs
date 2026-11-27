@@ -121,11 +121,19 @@ fn at(ms: i64) -> chrono::DateTime<Utc> {
 }
 
 fn roster(rec: &GroupRecord, version: u64, head: Option<&RowId>, at_ms: u64, k: &K) -> Vec<u8> {
-    let group = match rec {
-        GroupRecord::Family(f) => f.family_key_id.clone(),
-        GroupRecord::Community(c) => c.community_key_id.clone(),
+    use crate::federation::edition2::group_fixtures::{fixture_founding, fixture_record};
+    // GID-fixtures-sites — a first version is founded under its DERIVED id
+    // (the record's id is the room's NAME); a later one names that id.
+    let (group, p) = if version == 1 && head.is_none() {
+        fixture_founding(rec, at_ms)
+    } else {
+        let rec = &fixture_record(rec);
+        let group = match rec {
+            GroupRecord::Family(f) => f.family_key_id.clone(),
+            GroupRecord::Community(c) => c.community_key_id.clone(),
+        };
+        (group, roster_payload(rec, version, head, at_ms).unwrap())
     };
-    let p = roster_payload(rec, version, head, at_ms).unwrap();
     ciris_verify_core::edition2::sign_row_statement(
         k,
         &iref(k),
@@ -174,8 +182,10 @@ async fn group_order_body(d: &dyn FederationDirectory, v2_first: bool) -> (Strin
             .await
             .unwrap();
     }
-    let gid = iref(&g);
     let v1 = family(&g, "fam one", &[&a, &b, &c]);
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&v1);
     let v1_voices: Vec<Vec<u8>> = [&a, &b, &c]
         .iter()
         .map(|k| roster(&v1, 1, None, 2_000, k))
@@ -387,14 +397,17 @@ fn geographic_room(g: &K, constraint: &str, members: &[&K]) -> GroupRecord {
 }
 
 fn citing(rec: &GroupRecord, proofs: &[RowId], k: &K) -> Vec<u8> {
-    let GroupRecord::Community(c) = rec else {
+    let GroupRecord::Community(_) = rec else {
         unreachable!("a community")
     };
-    let p = roster_payload_citing(rec, 1, None, proofs, 2_000).unwrap();
+    // GID-fixtures-sites — a first version citing its proofs, founded under
+    // its DERIVED id.
+    let (gid, p) =
+        crate::federation::edition2::group_fixtures::fixture_founding_citing(rec, proofs, 2_000);
     ciris_verify_core::edition2::sign_row_statement(
         k,
         &iref(k),
-        &c.community_key_id,
+        &gid,
         "scores",
         &ciris_verify_core::namespace_match::family_id(GROUP_ROSTER_PREFIX),
         &p,
@@ -421,7 +434,7 @@ async fn geographic_order_body(d: &dyn FederationDirectory, proofs_first: bool) 
     let room = geographic_room(&g, &constraint, &[&a, &b]);
     let voices = [citing(&room, &ids, &a), citing(&room, &ids, &b)];
     let room_id = RowId::of_statement(&voices[0]).unwrap();
-    let gid = iref(&g);
+    let gid = crate::federation::edition2::fixture_switch::room_id(&iref(&g)); // GID-fixtures-sites: founded above
     if proofs_first {
         for p in &proofs {
             put_statement(d, p, None, INGEST_TIER).await.unwrap();
@@ -492,7 +505,14 @@ async fn geographic_outside_body(d: &dyn FederationDirectory) {
         "I3833: a member outside the constraint"
     );
     assert!(
-        d.lookup_community(&iref(&g)).await.unwrap().is_none(),
+        // GID-fixtures-sites — asked under the DERIVED id (the raw name
+        // would answer `None` whatever concluded).
+        d.lookup_community(&crate::federation::edition2::fixture_switch::room_id(
+            &iref(&g)
+        ))
+        .await
+        .unwrap()
+        .is_none(),
         "I3833: concludes nothing"
     );
 }
@@ -565,9 +585,11 @@ async fn cosign_non_member_body(d: &dyn FederationDirectory) {
             .await
             .unwrap();
     }
-    let gid = iref(&g);
     let v1 = family(&g, "fam", &[&a, &b, &c]);
     let mut event = None;
+    // GID-fixtures-sites — the room's DERIVED id, predicted from its first
+    // version (the founding below derives exactly it).
+    let gid = crate::federation::edition2::group_fixtures::fixture_group_id(&v1);
     for k in [&a, &b, &c] {
         let st = roster(&v1, 1, None, 2_000, k);
         put_statement(d, &st, None, INGEST_TIER).await.unwrap();

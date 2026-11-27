@@ -210,19 +210,24 @@ pub mod bodies {
         else {
             return Ok(None);
         };
-        // `authority_of` already answers the authority's identity-ref (P2's
-        // key-segment parser), so it is the group id as the store keys it.
+        // `authority_of` answers the KEY spelling of the dimension's segment
+        // (P2's key-segment parser).
         let Some(authority) = crate::federation::licensure::authority_of(dimension) else {
             return Ok(None);
         };
         let group = authority.to_string();
-        Ok(dir
-            .lookup_community(&group)
-            .await?
+        // GID-fix6 — the authority's room by the id the store keys it: the
+        // key spelling `authority_of` answers, else the held group the
+        // dimension's segment names (an affiliation's derived id; GID-fix3).
+        let held = match dir.lookup_community(&group).await? {
+            Some(c) => Some(c),
+            None => crate::federation::admission::held_group_of_segment_id(dir, &group).await?,
+        };
+        Ok(held
             .filter(|c| {
                 c.consensus_protocol != crate::federation::types::consensus_protocol::FOUNDER_ONLY
             })
-            .map(|_| group))
+            .map(|c| c.community_key_id))
     }
 
     /// Offer `row` at its door, returning the row as offered and the door's
