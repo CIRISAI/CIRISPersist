@@ -36,8 +36,8 @@
 //! - **I3153** a revocation of a key by itself lands in
 //!   `federation_revocations` (`revocations_for_subject`), through
 //!   `put_revocation`.
-//! - **I3154** a revocation of another's key with no slash conferral is
-//!   refused by the revocation door's authority rule, and not kept.
+//! - **I3154** (v62.0.0, KR-fix43b) a revocation of another's key is HELD
+//!   `key_revocation_no_standing`: kept, concluding nothing, ending nothing.
 //! - **I3155** a revocation whose `revoked_at` is text is `edition2_payload_invalid`.
 //! - **I3156** a revocation of a key not held waits (the retryable
 //!   `federation_attester_key_unknown`).
@@ -767,18 +767,32 @@ async fn revocation_body<D: FederationDirectory + ?Sized>(d: &D) {
         .unwrap()
     };
 
-    // I3154 — another's key, no slash conferral.
+    // I3154 (KR-fix43b; Constitution's correction of CC 2.4.1.1: three may
+    // revoke a key and no other) — another's key: HELD
+    // `key_revocation_no_standing`, kept and concluding nothing, never a
+    // refusal on the row alone (who the signer is is read from other rows),
+    // and it ends nothing: no revocation of the subject is projected. I1218
+    // offers the same shape WITH a root's `slash` conferral on the revoker:
+    // held the same.
     let st = sign(&other, &s, REVOCATION_PREFIX, &payload(&o));
-    let e = put(d, &st).await.unwrap_err();
+    let out = put(d, &st).await;
     assert!(
-        [
-            "federation_delegated_scope_unauthorized",
-            "federation_node_identity_unset"
-        ]
-        .contains(&e.kind()),
-        "I3154 the revocation door's authority rule: {e:?}"
+        matches!(out, Ok(StatementOutcome::Pending { .. })),
+        "I3154 a revocation of another's key is kept, not refused: {out:?}"
     );
-    assert!(!kept(d, &st).await, "I3154 not kept");
+    assert!(kept(d, &st).await, "I3154 kept");
+    assert_eq!(
+        super::fold::why_held(d, &rid(&st))
+            .await
+            .unwrap()
+            .map(|h| h.reason),
+        Some(super::fold::reason::KEY_REVOCATION_NO_STANDING.to_owned()),
+        "I3154 held key_revocation_no_standing"
+    );
+    assert!(
+        d.revocations_for(&s).await.unwrap().is_empty(),
+        "I3154 and it revokes nothing"
+    );
 
     // I3155 — a missing member.
     let bad = sign(

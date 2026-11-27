@@ -9066,15 +9066,16 @@ mod tests {
             for i in 0..3 {
                 // v62.0.0 (E0 fix 2) — a registered family (`i1578:` is
                 // open vocabulary, refused at the edition-2 door).
-                ids.push(
-                    f::put_dim(dir.as_ref(), &a, &k, &format!("watchlist:i1578_{i}:v1")).await,
-                );
+                // v62.0.0 (FS-sig-a) — `need:` (the serve feeds' own fixture
+                // family), not `watchlist:`, whose rows now count only from
+                // a group's `moderate` / `takedown` holder.
+                ids.push(f::put_dim(dir.as_ref(), &a, &k, &format!("need:i1578n{i}:x:v1")).await);
             }
             let (owner, node) = f::owner_and_node(dir.as_ref(), "cap1578").await;
             f::bind(dir.as_ref(), &owner, &node, cohort_scope::FEDERATION).await;
             (ids, owner, node)
         });
-        let dims = vec!["watchlist:".to_owned()];
+        let dims = vec!["need:".to_owned()];
         let direct = rt
             .block_on(dir.list_attestations_since_by_prefixes(None, &dims, 2))
             .expect("direct");
@@ -10613,7 +10614,7 @@ mod tests {
             &[crate::federation::types::identity_type::USER],
         ));
         rt.block_on(
-            dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
+            dir.test_seam_put_identity_occurrence(crate::federation::IdentityOccurrence {
                 identity_key_id: identity.clone(),
                 occurrence_key_id: phone.clone(),
                 // v62.0.0 (P1-fix4; CC rc21 3.3.6) — a person's phone, not an
@@ -10652,7 +10653,7 @@ mod tests {
         }
 
         // Revoke → the SAME proxy call fail-secure excludes the occurrence.
-        rt.block_on(dir.put_identity_occurrence_revocation_local(
+        rt.block_on(dir.put_identity_occurrence_revocation_edition2(
             crate::federation::IdentityOccurrenceRevocation {
                 identity_key_id: identity.clone(),
                 occurrence_key_id: phone.clone(),
@@ -10662,6 +10663,7 @@ mod tests {
                 witness_set: vec![identity.clone()],
                 persist_row_hash: String::new(),
             },
+            crate::federation::DoorToken::new(),
         ))
         .expect("seed revocation");
         let resolved = rt
@@ -11935,7 +11937,7 @@ mod tests {
                 asserted_at: now,
                 expires_at: None,
                 attestation_envelope: serde_json::json!({
-                    "dimension": "evidence:safety_battery:capture:a:b:v1",
+                    "dimension": "coherence_standing:cab:v1",
                     "score": 1.0,
                     "confidence": 0.9,
                     "label": label,
@@ -12210,6 +12212,7 @@ mod tests {
                 effective_at: t_join,
                 role: None,
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         );
         let revocation = ts::sign_community_membership_revocation(
@@ -12222,6 +12225,7 @@ mod tests {
                 reason: None,
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         );
         // v62.0.0 (round 3, E7; T1 §3) — the widening and the revocation are
@@ -12421,6 +12425,7 @@ mod tests {
                 reason: None,
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         )
     }
@@ -12435,6 +12440,7 @@ mod tests {
                 effective_at: at_1890(),
                 role: None,
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         )
     }
@@ -12450,6 +12456,7 @@ mod tests {
                 reason: None,
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         )
     }
@@ -12464,6 +12471,7 @@ mod tests {
                 effective_at: at_1890(),
                 role: None,
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         )
     }
@@ -13384,6 +13392,7 @@ mod tests {
                 reason: None,
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         );
         let widening = ts::sign_community_membership_widening(
@@ -13395,6 +13404,7 @@ mod tests {
                 effective_at: joined,
                 role: None,
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         );
         let proxy = proxy_1244(rt, dir.clone());
@@ -14091,7 +14101,7 @@ mod tests {
             .expect("the chartered root confers");
             Eq1774 {
                 node,
-                root: r.root.clone(),
+                root: r.lineage.clone(),
                 subject_a: e2::kid("eqa-subject"),
                 holder: f.founders.first().cloned().unwrap_or_default(),
                 root_f: f.root,
@@ -14344,14 +14354,26 @@ mod tests {
         ("record_role_withdrawal", RETIRED_FOR_EDGE_PX),
         ("put_touch_claim", RETIRED_FOR_EDGE_PX),
         ("put_identity_occurrence_local", RETIRED_FOR_EDGE_PX),
+        // v62.0.0 (WD-fix9) — a TEST seam (cfg(test) / test-anchor): the
+        // storage the retired trusted-local write had; no op carries it.
+        (
+            "test_seam_put_identity_occurrence",
+            "v62.0.0 (WD-fix9) — test-only seeding of an occurrence row (the retired \
+             trusted-local write's storage); never compiled into a production build",
+        ),
         // v62.0.0 (PX-fix1) — the `Err(Backend)` defaults, now refusing.
         ("put_edition2_object", REFUSED_DEFAULT_PX),
         ("put_edition2_statement", REFUSED_DEFAULT_PX),
         ("upsert_edition2_key_projection", REFUSED_DEFAULT_PX),
         ("put_family_local", REFUSED_DEFAULT_PX),
+        // v62.0.0 (WD-fix8) — the retired trusted-local revocation now refuses
+        // by name on every directory (not `Unsupported`); its store is the
+        // edition-2 eviction door's, which runs on the host's store.
         (
-            "put_identity_occurrence_revocation_local",
-            REFUSED_DEFAULT_PX,
+            "put_identity_occurrence_revocation_edition2",
+            "v62.0.0 (WD-fix8) — the edition-2 occurrence revocation is written by the \
+             node's own eviction door (`edition2::typed` / `occurrence::land_held_eviction`), \
+             reached through `put_edition2_statement`; no DirectoryOp carries the typed write",
         ),
         ("grant_trust", REFUSED_DEFAULT_PX),
         ("revoke_trust", REFUSED_DEFAULT_PX),
@@ -14447,6 +14469,10 @@ mod tests {
         ("list_purge_executions_since", INHERITED_DEFAULT),
         ("purge_delete_tombstoned_attestation", INHERITED_DEFAULT),
         ("purge_delete_tombstoned_trace", INHERITED_DEFAULT),
+        // v62.0.0 (WD-fix1) — the withdrawn-content sweep's read and the
+        // descent's statement delete: the host's own store's, never proxied.
+        ("list_withdrawals_since", INHERITED_DEFAULT),
+        ("purge_delete_tombstoned_statements", INHERITED_DEFAULT),
         ("purge_mark_finalized", INHERITED_DEFAULT),
         (
             "put_identity_occurrence_edition2",
@@ -14494,6 +14520,18 @@ mod tests {
             "put_fold_reason",
             "v62.0.0 (wave G0 fix4) — the re-fold's marker and its restore run in the \
              process that owns the store (`edition2::fold`); no DirectoryOp carries it",
+        ),
+        (
+            "fold_slot_all_rows",
+            "v62.0.0 (GID-tips) — the roster door's read of every row under one group id \
+             runs in the process that owns the store (`edition2::group`, inside the \
+             statement door the proxy carries whole); no DirectoryOp carries it",
+        ),
+        (
+            "drop_held_row",
+            "v62.0.0 (KR-fix20) — the door's drop of a held row it now refuses for good \
+             runs in the process that owns the store (`edition2::ingest`, \
+             `edition2::fold`); no DirectoryOp carries it",
         ),
         // v62.0.0 (RL-fix1, ruling (B)) — the accord-rescan watermark store
         // is written and read by the free doors persist runs over its own
@@ -15806,10 +15844,7 @@ mod wait_relay {
             ("author", Value::Text(me.clone())),
             ("score", Value::Uint(750_000)),
             ("confidence", Value::Uint(900_000)),
-            (
-                "dimension",
-                Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-            ),
+            ("dimension", Value::Text("coherence_standing:cab:v1".into())),
             (
                 "refs",
                 map(vec![(
@@ -15823,7 +15858,7 @@ mod wait_relay {
             &me,
             &me,
             "scores",
-            "evidence:.suite:.kind:.cell:.prefix",
+            "coherence_standing:.cohort",
             &payload,
             vec![],
         )

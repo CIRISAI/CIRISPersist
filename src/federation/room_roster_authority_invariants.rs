@@ -50,6 +50,7 @@ pub mod bodies {
             effective_at,
             role: role.map(str::to_owned),
             persist_row_hash: String::new(),
+            record_row_id: None,
         }
     }
 
@@ -66,6 +67,7 @@ pub mod bodies {
             reason: None,
             witness_set: vec![],
             persist_row_hash: String::new(),
+            record_row_id: None,
         }
     }
 

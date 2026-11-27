@@ -507,6 +507,7 @@ mod revocation_honesty_tests {
                     reason: None,
                     witness_set: vec![],
                     persist_row_hash: String::new(),
+                    record_row_id: None,
                 },
             );
         e2::put_voices(&*sq, &e2::family_revocation_voices(&removal, Some(&head)))

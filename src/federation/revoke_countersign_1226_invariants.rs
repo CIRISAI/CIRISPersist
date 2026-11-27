@@ -85,6 +85,7 @@ pub(crate) mod bodies {
                     reason: None,
                     witness_set: Vec::new(),
                     persist_row_hash: String::new(),
+                    record_row_id: None,
                 },
             );
             for c in &signers[1..] {
@@ -102,6 +103,7 @@ pub(crate) mod bodies {
                 reason: None,
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         );
         for c in &signers[1..] {
@@ -381,6 +383,7 @@ pub(crate) mod bodies {
                 effective_at: t + Duration::seconds(2),
                 role: None,
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         );
         ts::cosign_family_membership_widening(&mut w, &b);

@@ -162,6 +162,7 @@ fn i2991_membership_payload_reads_back_as_its_record() {
             reason: Some("3".into()),
             witness_set: vec![iref(&key(91))],
             persist_row_hash: String::new(),
+            record_row_id: None,
         }),
         MembershipRecord::CommunityRemoval(CommunityMembershipRevocation {
             community_key_id: g.clone(),
@@ -171,6 +172,7 @@ fn i2991_membership_payload_reads_back_as_its_record() {
             reason: None,
             witness_set: vec![],
             persist_row_hash: String::new(),
+            record_row_id: None,
         }),
         MembershipRecord::FamilyWidening(FamilyMembershipWidening {
             family_key_id: g.clone(),
@@ -179,6 +181,7 @@ fn i2991_membership_payload_reads_back_as_its_record() {
             effective_at: at(7_000),
             role: Some("member".into()),
             persist_row_hash: String::new(),
+            record_row_id: None,
         }),
         MembershipRecord::CommunityWidening(CommunityMembershipWidening {
             community_key_id: g.clone(),
@@ -187,6 +190,7 @@ fn i2991_membership_payload_reads_back_as_its_record() {
             effective_at: at(8_000),
             role: None,
             persist_row_hash: String::new(),
+            record_row_id: None,
         }),
     ];
     for record in records {

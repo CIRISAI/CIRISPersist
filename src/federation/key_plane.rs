@@ -979,9 +979,9 @@ pub(crate) trait KeyPlaneStore: super::attestation_admit::AttestationStore {
 /// refused: a plane row's signature is hybrid — the v58 clean break that ends
 /// the hybrid-pending revocation path); the revoker's hybrid signature,
 /// resolved from this node's directory (an unheld revoker is the retryable
-/// [`Error::AttesterKeyUnknown`] — the order rule); the moderation authority
-/// for revoking another's key; the closed region set; the scrub-time skew
-/// ceiling; and the signed history bound. v62.0.0 (CC rc21 item 18): no
+/// [`Error::AttesterKeyUnknown`] — the order rule); a key revokes only
+/// itself (KR-fix43: another's key is refused); the closed region set; the
+/// scrub-time skew ceiling; and the signed history bound. v62.0.0 (CC rc21 item 18): no
 /// longer the per-subject anti-rollback floor or the "bound only lowers"
 /// refusal; every revocation held stands, and the reader takes the minimum
 /// bound.
@@ -1023,30 +1023,14 @@ where
     // v21.0.0 (CIRISPersist#502 E1) — the revoker's hybrid signature, resolved
     // from this node's directory.
     super::verify_revocation_admission(dir, &row).await?;
-    // v30.8.0 (CIRISPersist#596 item 1) — revoking another's key is moderation.
-    // v62.0.0 (wave GC7; CC 2.7.3) — the moderation authority reads other
-    // rows (seats, delegations): declared, so the row re-folds when they
-    // change.
-    {
-        use super::edition2::fold::{reads, Dep};
-        reads(Dep::key(&row.revoking_key_id));
-        if let Some(k) = &row.revoked_key_id {
-            reads(Dep::key(k));
-        }
-    }
-    // G0 v4: a held key-plane statement is skipped by the key-plane reader
-    // (`held_keys_for_kid`), so the moderation authority (other rows) HOLDS
-    // the revocation under a fold attempt; any other error is returned as
-    // it was.
-    super::admission::check_revocation_authority(dir, &row)
-        .await
-        .map_err(|e| match e {
-            e @ Error::DelegatedScopeUnauthorized { .. } => super::edition2::fold::hold(
-                super::edition2::fold::reason::REVOCATION_UNAUTHORIZED,
-                e,
-            ),
-            e => e,
-        })?;
+    // v62.0.0 (KR-fix43; CC 2.4.1.1, CC 2.7.5) — a key revokes itself; a
+    // revocation of another's key is REFUSED (the v30.8.0 slash-conferral
+    // arm is deleted: "THE DOOR SHOULD NOT EXIST"). The rule reads only the
+    // revoker's own key record (its key plane), so it is no fold over other
+    // rows: nothing is declared and nothing is held. The fold reason
+    // `revocation_unauthorized` (appended vocabulary, kept in place) is no
+    // longer produced.
+    super::admission::check_revocation_authority(dir, &row).await?;
     super::check_observed_region(&row.observed_region)?;
     // v31.0.0 (CIRISPersist#659) — the anti-rollback dual, before the floor.
     super::admission::check_revocation_scrub_skew(

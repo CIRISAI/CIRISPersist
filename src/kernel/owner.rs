@@ -134,6 +134,7 @@ pub fn owner_rows_with_genesis(
         cosign,
         genesis_carried,
         &BTreeMap::new(),
+        &[],
     )
 }
 
@@ -156,6 +157,7 @@ pub fn owner_rows_with_voices(
     cosign: Cosign,
     genesis_carried: &BTreeSet<RowId>,
     held_voices: &BTreeMap<String, BTreeSet<String>>,
+    owner_revocations: &[crate::federation::admission::OwnerRevocation],
 ) -> Vec<KRow> {
     // CC 3.2, the ownerless-lock reclaim: a third-party `withdraws` the door
     // admitted only on a verified m-of-n reclaim quorum (rule 5) ends the
@@ -284,6 +286,41 @@ pub fn owner_rows_with_voices(
                 wd.seat.target = Some(target);
                 out.push(wd);
             }
+        }
+    }
+    out.extend(present_owner_revocations(
+        &bindings,
+        &id_of,
+        owner_revocations,
+    ));
+    out
+}
+
+/// v62.0.0 (KR-fix43b; Constitution's correction, CC 2.4.1.1 (ii)) — **an
+/// owner's revocation of the key, presented to the crate**: on the pinned
+/// kernel 0.2.2 the `owner -> owner` ends-arm cannot be expressed, so each
+/// concluded owner revocation is presented as that owner's
+/// [`SeatKind::Withdraw`] of every binding offer it holds over the key (the
+/// same object), exactly as a granter's own retraction about the node is.
+/// Kernel's reading of the walk, TESTED by persist's witness (the key stays
+/// live, its own rows still count, a new first binding lands).
+///
+/// PIN NOTE: replaced by the `owner -> owner` Unseat form at the kernel pin
+/// that carries CIRISKernel #40.
+fn present_owner_revocations(
+    bindings: &[&Attestation],
+    id_of: &BTreeMap<&str, RowId>,
+    owner_revocations: &[crate::federation::admission::OwnerRevocation],
+) -> Vec<KRow> {
+    let mut out = Vec::new();
+    for r in owner_revocations {
+        for b in bindings.iter().filter(|b| b.attesting_key_id == r.owner) {
+            let target = id_of[b.attestation_id.as_str()];
+            let id = RowId::of_label(&["owner-revocation", &r.row_id, &b.persist_row_hash]);
+            let mut wd = KRow::new(id, vec![target], r.owner.clone()).at(micros(r.effective_at));
+            wd.seat.kind = SeatKind::Withdraw;
+            wd.seat.target = Some(target);
+            out.push(wd);
         }
     }
     out

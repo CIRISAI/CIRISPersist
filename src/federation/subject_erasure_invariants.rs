@@ -1193,9 +1193,21 @@ mod run {
     #[tokio::test(flavor = "multi_thread")]
     async fn i974_sqlite() {
         let signer = crate::federation::tier_ingest::test_support::local_signer(I974_NODE);
-        let engine = crate::Engine::with_signer(signer, "sqlite::memory:")
+        let engine = crate::Engine::with_signer_pre_genesis(signer, "sqlite::memory:")
             .await
             .expect("engine");
+        // v62.0.0 (pass 13 follow-up; CC 4.4.3.19) — the fixture ceremony
+        // under the PRODUCTION charter scope (`bundle_v2_wide`), installed
+        // through the real door: the root grant this witness asks for
+        // (`infra:detect`) is outside the boot hook's fixture charter (`infra:attest`,
+        // `infra:serve`) and is refused `conferral_outside_charter_scope`
+        // there.
+        crate::federation::edition2::fixture_genesis::install_ceremony_v2(
+            engine.federation_directory().as_ref(),
+            crate::federation::edition2::fixture_genesis::bundle_v2_wide(),
+        )
+        .await
+        .expect("the production-charter ceremony");
         let b = engine.sqlite_backend().expect("sqlite").clone();
         // v62.0.0 (JSON cut, E7) — the node's key is an edition-2 record, named
         // by its identity-ref (the JSON self-registration door is shut).
@@ -1218,9 +1230,21 @@ mod run {
             return;
         };
         let signer = crate::federation::tier_ingest::test_support::local_signer(I974_NODE);
-        let engine = crate::Engine::with_signer(signer, &dsn)
+        let engine = crate::Engine::with_signer_pre_genesis(signer, &dsn)
             .await
             .expect("engine");
+        // v62.0.0 (pass 13 follow-up; CC 4.4.3.19) — the fixture ceremony
+        // under the PRODUCTION charter scope (`bundle_v2_wide`), installed
+        // through the real door: the root grant this witness asks for
+        // (`infra:detect`) is outside the boot hook's fixture charter (`infra:attest`,
+        // `infra:serve`) and is refused `conferral_outside_charter_scope`
+        // there.
+        crate::federation::edition2::fixture_genesis::install_ceremony_v2(
+            engine.federation_directory().as_ref(),
+            crate::federation::edition2::fixture_genesis::bundle_v2_wide(),
+        )
+        .await
+        .expect("the production-charter ceremony");
         let b = engine.postgres_backend().expect("postgres").clone();
         // v62.0.0 (JSON cut, E7) — the node's key is an edition-2 record, named
         // by its identity-ref (the JSON self-registration door is shut).

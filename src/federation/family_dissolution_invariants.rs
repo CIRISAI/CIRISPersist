@@ -366,6 +366,7 @@ pub mod bodies {
                 reason: Some("I282".into()),
                 witness_set: vec![],
                 persist_row_hash: String::new(),
+                record_row_id: None,
             },
         );
         // v62 (E4-fix6; CC 2.7.3): read against the held (dissolved) head,

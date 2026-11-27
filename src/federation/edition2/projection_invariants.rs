@@ -20,8 +20,7 @@
 //!   `tier_ingest::verify_row_hybrid_signature`,
 //!   `register::verify_key_registration`, `register::verify_proof_of_possession`
 //!   (→ `verify_record_signed_by`), `key_plane::verify_plane_row`,
-//!   `group_plane::verify_plane_row`, `self_roster::verify_proposal_row`,
-//!   `cosign::verify_row`, `occurrence_revocation_carrier::verify_carrier_row`,
+//!   `group_plane::verify_plane_row`, `cosign::verify_row`, `occurrence_revocation_carrier::verify_carrier_row`,
 //!   `admission::verify_consent_record_transit_ingest`,
 //!   `admission::verify_caller_signed_local_row`. The same rows under an
 //!   earlier-form key id are never refused by that name, and the mapped row
@@ -32,9 +31,9 @@
 //!   (`witness_standing_at`), and the subject read (`wire_refs_for_subject`)
 //!   still answers.
 //! - **I2005 (revocation authority).** A stranger's `key:revocation` is held
-//!   and projects nothing; an owner's projects nothing under [`SelfOnly`] and
-//!   projects (with the owner's key row, its FK target) only under a
-//!   [`RevokerStanding`] that admits it.
+//!   and projects nothing; so is an unbound "owner"'s (v62.0.0, KR-fix43b:
+//!   both are held `key_revocation_no_standing`; the owner-standing
+//!   projection leg is deleted: an owner's revocation never ends a key).
 //! - **I2006 (one fold).** The projected row corrupted (`valid_until` in the
 //!   past, `identity_type` and the Ed25519 half replaced): the key's next
 //!   edition-2 row is admitted exactly as before.
@@ -51,15 +50,13 @@
 //!   held statement once, as received, in admission order, paging by its
 //!   cursor; positions strictly increase.
 
-use std::sync::Arc;
-
 use ciris_verify_core::cde::Value;
 use ciris_verify_core::edition2::sign_row_statement;
 
 use super::door_invariants::fixture::*;
 use super::ingest::{held_keys_for_kid, put_statement, StatementOutcome, INGEST_TIER};
-use super::liveness::{Liveness, RevokerStanding};
-use super::projection::{edition_of_key_record, project_key, project_key_with, EDITION_TWO};
+use super::liveness::Liveness;
+use super::projection::{edition_of_key_record, project_key, EDITION_TWO};
 use crate::federation::types::Attestation;
 use crate::federation::{malformed_row, Error, FederationDirectory};
 
@@ -74,17 +71,14 @@ fn score_row(k: &ciris_crypto::composite::CompositeSigningKey, at_ms: u64) -> Ve
         ("author", Value::Text(iref(k))),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
     ]);
     sign_row_statement(
         k,
         &iref(k),
         &iref(k),
         "scores",
-        "evidence:.suite:.kind:.cell:.prefix",
+        "coherence_standing:.cohort",
         &payload,
         vec![],
     )
@@ -232,18 +226,6 @@ impl Raw<'_> {
 
 fn sq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
-}
-
-/// A standing that admits one owner over one subject.
-struct Owner {
-    owner: String,
-    subject: String,
-}
-
-impl RevokerStanding for Owner {
-    fn may_revoke(&self, revoker: &str, subject: &str) -> bool {
-        revoker == self.owner && subject == self.subject
-    }
 }
 
 pub(crate) async fn body(d: &dyn FederationDirectory, raw: &Raw<'_>) {
@@ -574,20 +556,17 @@ pub(crate) async fn body(d: &dyn FederationDirectory, raw: &Raw<'_>) {
         d.revocations_for(&iref(&subj)).await.unwrap().is_empty(),
         "I2005: an owner's revocation projects nothing without standing"
     );
-    let standing: Arc<dyn RevokerStanding> = Arc::new(Owner {
-        owner: iref(&owner),
-        subject: iref(&subj),
-    });
-    let set = project_key_with(d, &kid(&subj), standing).await.unwrap();
-    assert_eq!(set.revocations.len(), 1, "I2005: only the owner's");
-    let revs = d.revocations_for(&iref(&subj)).await.unwrap();
-    assert_eq!(revs.len(), 1, "I2005: projected with standing");
-    assert_eq!(
-        revs[0].revoking_key_id,
-        iref(&owner),
-        "I2005: the owner's, not the stranger's"
-    );
-
+    // DELETED (KR-fix43b; Constitution's correction of CC 2.4.1.1: only the
+    // key's own revocation ends its liveness; an owner's revocation ends the
+    // owner BINDING, never the key): "an owner's revocation, given standing
+    // (`project_key_with` + an `Owner` RevokerStanding), is projected as the
+    // key's revocation". Its premise is the earlier model (an owner ending a
+    // key's liveness); and the two rows above are now HELD
+    // `key_revocation_no_standing` at the key route (neither signer is the
+    // subject, its bound owner or its roster), so the projection would not
+    // see them. What covers the property now: I3154 / I1218 (held, ending
+    // nothing) and I4352 (the owner's revocation ends the binding, the key
+    // stays live).
     // v62.0.0 (slice F) — the earlier-form leg of I2001 (a JSON key through
     // `put_public_key`, read back as edition 1) is deleted: that door refuses
     // the earlier form by name now (I2872).
@@ -743,7 +722,7 @@ async fn cross_form(
 ) {
     use crate::federation::{
         admission, cosign, group_plane, key_plane, occurrence_revocation_carrier, register,
-        self_roster, tier_ingest,
+        tier_ingest,
     };
     let token = malformed_row::EARLIER_FORM_SIGNER_IS_EDITION2;
     // Each site refuses under its own plane, so a site whose guard is gone
@@ -793,11 +772,6 @@ async fn cross_form(
         "group_plane::verify_plane_row",
         "group_plane",
         b(group_plane::verify_plane_row(d, row).await),
-    );
-    check(
-        "self_roster::verify_proposal_row",
-        "self_roster",
-        b(self_roster::verify_proposal_row(d, row).await),
     );
     check(
         "cosign::verify_row",

@@ -86,6 +86,17 @@ pub enum Ty {
     /// closure and non-emptiness are the family's own rule, with the
     /// verifier's token).
     Tstrs,
+    /// v62.0.0 (GID-prod; CIRISConstitution "THE DERIVED GROUP ID") — a
+    /// group id (`group-ref`, `"group-"` + 43 base64url characters,
+    /// [`super::group_id::is_group_ref`]): never an identity-ref, so the form
+    /// alone tells a body from a key.
+    GroupRef,
+    /// v62.0.0 (GID-fix2) — an identity-ref OR a group-ref: a member that
+    /// names "the self identity, family or community" (a key grant's
+    /// `owner`, CC 3.3.2). GID-prod typed the group-only members
+    /// [`Ty::GroupRef`] and left this one identity-ref, which refused every
+    /// family- or community-owned content and stream grant.
+    IdentityOrGroupRef,
 }
 
 impl Ty {
@@ -106,6 +117,8 @@ impl Ty {
             Ty::RosterMembers => "[* roster-member]",
             Ty::Any => "ceg-value",
             Ty::Tstrs => "[* tstr]",
+            Ty::GroupRef => "group-ref",
+            Ty::IdentityOrGroupRef => "identity-ref / group-ref",
         }
     }
 
@@ -146,6 +159,10 @@ impl Ty {
             Ty::Tstrs => v
                 .as_array()
                 .is_some_and(|a| a.iter().all(|e| e.as_text().is_some()) && sorted_unique(a)),
+            Ty::GroupRef => v.as_text().is_some_and(super::group_id::is_group_ref),
+            Ty::IdentityOrGroupRef => {
+                identity(v) || v.as_text().is_some_and(super::group_id::is_group_ref)
+            }
         }
     }
 }
@@ -300,7 +317,7 @@ pub const FAMILIES: &[FamilyPayload] = &[
         sub: "the group's identity-ref (family_key_id / community_key_id)",
         members: &[
             m("group_kind", Ty::Tstr, R, "the record's kind: \"family\" | \"community\""),
-            m("group", Ty::IdentityRef, R, "Family.family_key_id / Community.community_key_id (equals sub)"),
+            m("group", Ty::GroupRef, R, "Family.family_key_id / Community.community_key_id (equals sub; GID-prod: derived from the founding, a group-ref)"),
             m("name", Ty::Tstr, R, "Family.family_name / Community.community_name"),
             m("version", Ty::Uint, R, "federation_group_versions.version (a consistency check only)"),
             m("members", Ty::RosterMembers, R, "Family.members / Community.members (a set)"),
@@ -312,6 +329,7 @@ pub const FAMILIES: &[FamilyPayload] = &[
             m("cohort_subkind", Ty::Tstr, O, "a community's discriminator (CC 3.2; earlier: policy_blob.cohort_subkind)"),
             m("cohort_subkind_payload", Ty::Map, O, "a community's Option<SubkindPayload> (CC 3.2)"),
             m("membership", Ty::Tstr, O, "a community's founding row: \"private\" | \"public\" (CC 3.1.3.2; absent reads public)"),
+            m("nonce", Ty::Bstr, O, "GID-prod: 32 fresh bytes, on the FIRST version only (the group id's derivation input; group_id::check_group_roster_founding)"),
         ],
         refs: &[
             RefRole { role: "head", presence: O, from: "prev_head_digest: the version this one extends (CC 3.2 T6); absent on version 1, present on every later one" },
@@ -332,7 +350,7 @@ pub const FAMILIES: &[FamilyPayload] = &[
         sub: "the member's identity-ref",
         members: &[
             m("group_kind", Ty::Tstr, R, "\"family\" | \"community\" (which struct)"),
-            m("group", Ty::IdentityRef, R, "family_key_id / community_key_id"),
+            m("group", Ty::GroupRef, R, "family_key_id / community_key_id (GID-prod: a group-ref)"),
             m("member", Ty::IdentityRef, R, "removal: removed_identity_key_id; widening: member_key_id (equals sub)"),
             m("removed_at", Ty::Ms, Presence::RequiredWhen("dimension", &["removal"]), "MembershipRevocation.removed_at"),
             m("joined_at", Ty::Ms, Presence::RequiredWhen("dimension", &["widening"]), "MembershipWidening.joined_at"),
@@ -446,7 +464,9 @@ pub const FAMILIES: &[FamilyPayload] = &[
         sub: "the claimant's identity-ref",
         members: &[
             m("legal_basis", Ty::Tstr, R, "legal_basis (CC 3.3.2's closed set; equals the {basis} leaf)"),
-            m("claimant", Ty::IdentityRef, R, "claimant_key_id"),
+            // LEAD-root2 (CC 3.1.1 at rc22 462260c) — "iff the notice is
+            // authored": absent on a steward purge (`check_prose`).
+            m("claimant", Ty::IdentityRef, O, "claimant_key_id (iff the notice is authored)"),
             m("content_sha256", Ty::Digest, R, "content_sha256 (the selection digest)"),
             m("content_holders", Ty::IdentityRefs, R, "content_holder_key_ids"),
             m("claim_text", Ty::Tstr, R, "claim_text"),
@@ -487,11 +507,11 @@ pub const FAMILIES: &[FamilyPayload] = &[
             m("axis", Ty::Tstr, R, "axis: \"epoch\" | \"content\" | \"stream\" (also the {axis} leaf)"),
             m("wrap_algorithm", Ty::Tstr, R, "GrantWrap.wrap_algorithm (the v2 wire string only)"),
             m("wrapped_dek", Ty::Bstr, R, "GrantWrap.wrapped_dek"),
-            m("community", Ty::IdentityRef, Presence::RequiredWhen("axis", &["epoch"]), "community_key_id"),
+            m("community", Ty::GroupRef, Presence::RequiredWhen("axis", &["epoch"]), "community_key_id (GID-prod: a group-ref)"),
             m("minter", Ty::IdentityRef, Presence::RequiredWhen("axis", &["epoch"]), "minter_key_id"),
             m("epoch", Ty::Uint, Presence::RequiredWhen("axis", &["epoch", "stream"]), "epoch"),
             m("at_rest_sha256", Ty::Digest, Presence::RequiredWhen("axis", &["content"]), "at_rest_sha256"),
-            m("owner", Ty::IdentityRef, Presence::RequiredWhen("axis", &["content", "stream"]), "owner_key_id (the axis identity, CC 3.3.2)"),
+            m("owner", Ty::IdentityOrGroupRef, Presence::RequiredWhen("axis", &["content", "stream"]), "owner_key_id (the axis identity, CC 3.3.2; GID-fix2: a family's or community's group-ref)"),
             m("stream_id", Ty::Tstr, Presence::RequiredWhen("axis", &["stream"]), "stream_id"),
         ],
         refs: &[],
@@ -518,7 +538,7 @@ pub const FAMILIES: &[FamilyPayload] = &[
     FamilyPayload {
         family: "admission:unit",
         replaces: "nothing: new in rc21 (CC 2.7.11, the code scope of kernel admission; wire admission:unit:v1, row type scores)",
-        authorship: "counted where refs.head is present (act = group), authored otherwise; one person's (authored) row naming an effect is at cohort_scope self and admits only on a host that person owns; every signer a person (identity_type holds user or accord_holder); no delegate role",
+        authorship: "counted where the payload carries no author (act = group; it names its roster head in refs.head), authored otherwise (naming no head); one person's (authored) row naming an effect is at cohort_scope self and admits only on a host that person owns; every signer a person (identity_type holds user or accord_holder); no delegate role",
         sub: "the unit digest as tagged text, canonical:sha256:{hex} (not an identity-ref)",
         members: &[
             m("unit", Ty::Digest, R, "SHA-256 over the unit's bytes as the host loads them (a multi-file unit: its manifest's digest)"),
@@ -1001,6 +1021,10 @@ pub fn check_body_numbers(v: &Value) -> Result<(), Error> {
 
 /// The `also` roles of `refs`, a closed registry (CC 2.6.1.3, the CDDL's
 /// `also-role`), as [`names_of`] spells them.
+///
+/// Gains `also:under`, on deputy edges only, when the pinned
+/// CIRISConstitution tag's grammar names it (pre4; pre3 says `ack` | `cites`;
+/// FS-step3).
 pub const ALSO_ROLES: &[&str] = &["also:ack", "also:cites"];
 
 /// How a family's first parameter (its leaf, `dimension`'s second segment)
@@ -1197,14 +1221,27 @@ pub fn check_admission_unit(sub: &str, payload: &Value) -> Result<(), Error> {
     let fail = |reason: &'static str, msg: String| {
         Error::malformed_row(PLANE, reason, format!("{ADMISSION_UNIT_FAMILY}: {msg}"))
     };
+    // v62.0.0 (HEAD-4; Constitution's ruling of 2026-11-22, CC 2.6.1.9) —
+    // COUNTED vs AUTHORED is whether the payload carries `author`, never
+    // whether it names a head. The head is then the ruled cell: a counted
+    // unit names the roster head it is counted over; an authored one (one
+    // person's, at self) names none.
     let authored = payload.get_text("author").is_some();
-    let counted = names_of(payload)
+    let names_head = names_of(payload)
         .map(|n| n.iter().any(|x| x.role == "head"))
         .unwrap_or(false);
-    if authored == counted {
+    if !authored && !names_head {
         return Err(fail(
             mr::ADMISSION_UNIT_MALFORMED,
-            "exactly one of `author` (authored) and `refs.head` (counted) is present".into(),
+            "a counted row (no `author`) names the roster head it is counted over in \
+             `refs.head`"
+                .into(),
+        ));
+    }
+    if authored && names_head {
+        return Err(fail(
+            mr::ADMISSION_UNIT_MALFORMED,
+            "an authored row (`author`) names no head: one person's unit exercises no seat".into(),
         ));
     }
     let unit_hex = payload
@@ -1347,7 +1384,81 @@ pub const REF_MEMBERS: &[(&str, &str, &str, RefShape)] = &[
     // it is counted over: the envelope member `head` (64-hex object id) is
     // stated as `refs.head`, as a grant from the root's is.
     ("transport:canonical_rebind", "head", "head", RefShape::One),
+    // v62.0.0 (KR-fix32; CC 2.6.1.3's role table, the Constitution's ruling
+    // (A) of 2026-11-22) — a membership REPLY (an acceptance or a decline, of
+    // a group's proposal, an officer's appointment or a root grant) names the
+    // row it answers under `answers`, never `target` (which keeps the
+    // composer roles). The earlier gates read it back as
+    // `references_attestation_id`, as a deferral response's is. A
+    // composer of the family (a `withdraws` of a reply) keeps its target in
+    // `refs.target`: `emit::row_payload` and the fixture mapping never read
+    // a composer's `references_attestation_id` through this entry.
+    (
+        "membership:{stage}",
+        "answers",
+        "references_attestation_id",
+        RefShape::One,
+    ),
+    // v62.0.0 (KR-fix34a; CC 2.6.1.3, the Constitution's ruling (a)) — an
+    // `objection:assent` / `objection:raised` vote names the ROW it answers
+    // under `answers` (the self-roster proposal; a reverse-quorum objection's
+    // attested action), read back as `references_attestation_id`
+    // (`reverse_quorum::field::ANSWERS`). Per leaf by construction: only those
+    // two builders write the member; the dismissal and ballot rows carry
+    // none. A `withdraws` of a vote keeps its target in `refs.target` (the
+    // composer guard, `emit::row_payload`).
+    (
+        "objection:{state}",
+        "answers",
+        "references_attestation_id",
+        RefShape::One,
+    ),
 ];
+
+/// v62.0.0 (KR-fix34a; CC 2.6.1.3, the Constitution's ruling (a)) — **the
+/// shape of an `objection:assent` / `objection:raised` vote's refs.**
+///
+/// **REPLACED BY VERIFY'S EXPORT AT THE 23.5.1 PIN** (Verify's pure checked
+/// reader of the `objection:{state}` refs rule) and deleted then; the half
+/// that needs held rows (finding the answered row, the fold, the composer
+/// guard) stays persist's.
+///
+/// A vote names exactly one `refs.answers` and no `refs.target`, and carries
+/// no `objects_to_attestation_id` (the earlier form's member), else it is
+/// REFUSED `malformed:refs` / `malformed:objects_to_attestation_id`, Verify's
+/// label form. v62.0.0 (KR-fix34b) — with no exception: a reverse-quorum
+/// objection to a ROSTER EVENT names the event's row id (its record's
+/// `record_row_id`, PRE4-V300-a) in `refs.answers` like any other. Every
+/// other state of the family is not judged here.
+///
+/// # Errors
+/// `edition2_payload_invalid`, naming the label.
+fn check_objection_vote_refs(family_id: &str, payload: &Value) -> Result<(), Error> {
+    if family_id != ciris_verify_core::namespace_match::family_id("objection:{state}") {
+        return Ok(());
+    }
+    let leaf = leaf_of(family_id, payload);
+    if !matches!(leaf, Some("assent" | "raised")) {
+        return Ok(());
+    }
+    let names: Vec<Name> =
+        names_of(payload).map_err(|e| refuse(format!("{family_id}: refs: {e:?}")))?;
+    let answers = names.iter().filter(|n| n.role == "answers").count();
+    let target = names.iter().any(|n| n.role == "target");
+    let earlier = payload.get_text("objects_to_attestation_id").is_some();
+    match (answers, earlier) {
+        (1, false) if !target => Ok(()),
+        (_, true) => Err(refuse(format!(
+            "{family_id}: malformed:objects_to_attestation_id: a vote names the row it answers \
+             in `refs.answers`; `objects_to_attestation_id` is a member of the earlier form \
+             (CC 2.6.1.3)"
+        ))),
+        _ => Err(refuse(format!(
+            "{family_id}: malformed:refs: a vote names the row it answers in `refs.answers` \
+             (exactly one), never `refs.target` (CC 2.6.1.3)"
+        ))),
+    }
+}
 
 /// v62.0.0 (wave P1e) — the [`REF_MEMBERS`] entries of the family a
 /// statement's header names (its family id).
@@ -1375,17 +1486,60 @@ pub const GEOGRAPHIC_SUBKIND: &str = "geographic";
 /// roles are closed to `ack` and `cites`). As [`names_of`] spells it.
 pub const LOCATION_PROOF_ROLE: &str = "also:cites";
 
-/// v62.0.0 (wave P1e, O1's finding) — the composer row types (CC 2.4.1.1).
-/// A composer carries its TARGET's family (header -70002,
-/// `composer_family_mismatch` otherwise) but states its OWN payload, so the
-/// target family's list never applies to it: [`check_composer`] does.
+/// v62.0.0 (HEAD-3; CC 2.4.1.1, the CDDL's `? "lifts": true`) — the
+/// top-level member a COUNTED end states when the count lifts single
+/// receipts.
+pub const LIFTS: &str = "lifts";
+
+/// v62.0.0 (HEAD-3; CC 2.4.1.1, "A count that ends a standing MAY state
+/// `lifts` ... One's own end lifts nothing, and `lifts` on it is refused,
+/// `lifts_on_own_end`") — **the `lifts` rule**, pure: absent, nothing; else
+/// it is `true`, on a `withdraws` (or an unseating, [`check`]), and the row
+/// is counted (no `author`). A `recants` ends no standing and states none.
 ///
-/// v62.0.0 (PIN-fix3) — NAMING: since the Constitution's 2026-11-21 ruling
-/// this list means "the rows that name a `refs.target`", NOT Verify's
-/// composers (`withdraws` / `recants`, the rows that carry no dimension:
-/// `emit::carries_no_dimension`); it decides no dimension. Its copy is
-/// `ingest::COMPOSER_ROW_TYPES`.
-pub const COMPOSER_ROW_TYPES: &[&str] = &["withdraws", "recants", "supersedes"];
+/// # Errors
+/// `edition2_payload_invalid` (not `true`, or not on an end);
+/// `lifts_on_own_end` (on an authored end).
+pub fn check_lifts(row_type: &str, payload: &Value) -> Result<(), Error> {
+    let Some(v) = payload.get_text(LIFTS) else {
+        return Ok(());
+    };
+    if *v != Value::Bool(true) {
+        return Err(refuse(format!(
+            "{row_type}: `lifts` is present only as true (CC 2.4.1.1)"
+        )));
+    }
+    if row_type == "recants" {
+        return Err(refuse(format!(
+            "{row_type}: `lifts` rides an end only: a withdrawal or an unseating (CC 2.4.1.1)"
+        )));
+    }
+    if payload.get_text("author").is_some() {
+        return Err(Error::malformed_row(
+            PLANE,
+            malformed_row::LIFTS_ON_OWN_END,
+            format!(
+                "{row_type}: `lifts` on an authored end: one's own end lifts nothing; only a \
+                 count states it (CC 2.4.1.1)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// `payload` without its `lifts` member (checked by [`check_lifts`]), for the
+/// closed-map check.
+fn without_lifts(payload: &Value) -> std::borrow::Cow<'_, Value> {
+    match payload {
+        Value::Map(m) if payload.get_text(LIFTS).is_some() => std::borrow::Cow::Owned(Value::Map(
+            m.iter()
+                .filter(|(k, _)| k.as_text() != Some(LIFTS))
+                .cloned()
+                .collect(),
+        )),
+        _ => std::borrow::Cow::Borrowed(payload),
+    }
+}
 
 /// v62.0.0 (wave P1e) — **a composer's payload rule**: the common members
 /// only ([`COMMON`], typed as everywhere), `refs.target` required (the row
@@ -1401,7 +1555,10 @@ pub const COMPOSER_ROW_TYPES: &[&str] = &["withdraws", "recants", "supersedes"];
 pub fn check_composer(row_type: &str, payload: &Value) -> Result<(), Error> {
     let fail = |e: String| refuse(format!("{row_type} (a composer): {e}"));
     check_common(payload).map_err(fail)?;
-    check_map(&[], COMMON, payload).map_err(fail)?;
+    // v62.0.0 (HEAD-3) — `lifts` rides a counted end (`check_lifts`); the
+    // rest of the map is the common members.
+    check_lifts(row_type, payload)?;
+    check_map(&[], COMMON, &without_lifts(payload)).map_err(fail)?;
     let names: Vec<Name> = names_of(payload).map_err(|e| fail(format!("refs: {e:?}")))?;
     if let Some(n) = names
         .iter()
@@ -1446,8 +1603,19 @@ pub fn check_by_id(family_id: &str, row_type: &str, payload: &Value) -> Result<(
     if super::emit::carries_no_dimension(row_type) {
         return check_composer(row_type, payload);
     }
-    if COMPOSER_ROW_TYPES.contains(&row_type) {
+    if super::emit::names_a_target(row_type) {
         require_target(row_type, payload)?;
+    }
+    // v62.0.0 (HEAD-4; Constitution's ruling of 2026-11-22) — `lifts` sits
+    // beside the row type: a `supersedes` (a rotation, the act again) MUST
+    // NOT carry it.
+    // v62.0.0 (KR-fix34a) — an objection vote's refs shape.
+    check_objection_vote_refs(family_id, payload)?;
+    if row_type == "supersedes" && payload.get_text(LIFTS).is_some() {
+        return Err(refuse(format!(
+            "{family_id}: a supersedes carries no `lifts`: only a counted withdrawal states \
+             compromise"
+        )));
     }
     match family_by_id(family_id) {
         Some(f) => check(f.family, payload),
@@ -1457,6 +1625,14 @@ pub fn check_by_id(family_id: &str, row_type: &str, payload: &Value) -> Result<(
         // as something else later. Its other members pass as before.
         None => {
             check_common(payload).map_err(|e| refuse(format!("{family_id}: {e}")))?;
+            // v62.0.0 (HEAD-3) — a family with no list ends no standing here:
+            // `lifts` rides a withdrawal or an unseating only.
+            if payload.get_text(LIFTS).is_some() {
+                return Err(refuse(format!(
+                    "{family_id}: `lifts` rides an end only: a withdrawal or an unseating (CC \
+                     2.4.1.1)"
+                )));
+            }
             // v62.0.0 (CC rc21 397100e, CC 3.3.11) — on a family with no list
             // the `refs` roles are open (a chat reply names its message under
             // `answers`), but the `also` roles stay closed (ack | cites): CC
@@ -1512,7 +1688,7 @@ fn dimension_has(payload: &Value, leaf: &str) -> bool {
 /// segment, when its first is the family's stem. `None` without a
 /// `dimension`, or with one of another family (a cosign state's payload
 /// is the event's).
-fn leaf_of<'a>(family_id: &str, payload: &'a Value) -> Option<&'a str> {
+pub(crate) fn leaf_of<'a>(family_id: &str, payload: &'a Value) -> Option<&'a str> {
     // v62.0.0 (triage 1) — the leaf is the dimension's segment at the
     // position of the family's FIRST parameter, after every literal segment
     // before it matches: `deferral:response:{outcome}` reads `approved` from
@@ -1621,6 +1797,11 @@ fn check_common(payload: &Value) -> Result<(), String> {
 fn check_prose(family_id: &str, payload: &Value, names: &[Name]) -> Result<(), String> {
     match family_id {
         "group:roster" => {
+            // v62.0.0 (HEAD-1; CC 2.6.1 "on a roster version") — a version's
+            // `refs.head` is the version it extends, which IS the head it is
+            // at; the founding version is the conferral and names none. No
+            // roster version is authored, so this reads no "counted" flag
+            // (`head_rule::CONFERRAL_RECORDS`).
             let version = payload.get_text("version").and_then(Value::as_u64);
             let head = names.iter().any(|n| n.role == "head");
             match (version, head) {
@@ -1662,6 +1843,33 @@ fn check_prose(family_id: &str, payload: &Value, names: &[Name]) -> Result<(), S
             }
         }
         "takedown_notice:{basis}" => {
+            // LEAD-root2 (CC 2.4.1.1 "A purge is a tombstone"; CC 3.1.1 at
+            // rc22 462260c; CC 3.2 T5) — a STEWARD PURGE is counted over the
+            // holders of the bundle it names: no `author`, no `claimant`,
+            // and `refs.head` (the bundle). Every other basis is authored by
+            // its claimant and carries both.
+            let purge = text_of(payload, "legal_basis") == Some("steward_purge");
+            let has = |m: &str| payload.get_text(m).is_some();
+            let head = names.iter().any(|n| n.role == "head");
+            if purge {
+                if has("claimant") || has("author") {
+                    return Err(
+                        "a steward purge is counted: it carries no `claimant` and no `author`"
+                            .into(),
+                    );
+                }
+                if !head {
+                    return Err(
+                        "a steward purge names the bundle it is counted over: `refs.head`".into(),
+                    );
+                }
+            } else if !has("claimant") {
+                // The claimant was always required here. (`author` is not
+                // asked: an affiliation's one-seat notice is counted and
+                // carries none, CC 4.4.3.12; open with the Constitution,
+                // whose rule text asks a legal-basis notice for both.)
+                return Err("a legal-basis notice carries `claimant`".into());
+            }
             let leaf = leaf_of(family_id, payload);
             if leaf.is_none() || leaf != text_of(payload, "legal_basis") {
                 return Err("`legal_basis` is not the `{basis}` leaf of `dimension`".into());
@@ -1758,6 +1966,38 @@ pub fn check(family_id: &str, payload: &Value) -> Result<(), Error> {
         return Ok(());
     };
     let fail = |e: String| refuse(format!("{family_id}: {e}"));
+    // v62.0.0 (KR-fix32; CC 2.6.1.3's role table, the Constitution's ruling
+    // (A) of 2026-11-22) — a membership REPLY (`acceptance` / `decline`)
+    // names the row it answers in `refs.answers`, exactly one, and never in
+    // `refs.target` (the composer roles' alone). Read from the statement's
+    // own bytes: a REFUSAL, `malformed:refs`, never a reading of `target` as
+    // the answered row. Before the mapped-leaf exit below: these leaves are
+    // not the table's (widening, removal), so nothing else here reads them.
+    if family_id == "membership:{stage}"
+        && matches!(leaf_of(family_id, payload), Some("acceptance" | "decline"))
+    {
+        let names: Vec<Name> = names_of(payload).map_err(|e| fail(format!("refs: {e:?}")))?;
+        let answers = names.iter().filter(|n| n.role == "answers").count();
+        if answers != 1 || names.iter().any(|n| n.role == "target") {
+            return Err(fail(
+                "malformed:refs: a reply names the row it answers in `refs.answers` (exactly \
+                 one), never `refs.target` (CC 2.6.1.3)"
+                    .into(),
+            ));
+        }
+        // v62.0.0 (KR-fix32b; the Constitution's ruling of 2026-11-22: "A
+        // reply that carries `proposal_hash`, a member of the earlier form,
+        // is malformed and refused") — the member is NAMED; the row id is
+        // the digest of the answered row's payload, so the earlier member
+        // has no meaning here.
+        if payload.get_text("proposal_hash").is_some() {
+            return Err(fail(
+                "malformed:proposal_hash: a reply carries no `proposal_hash` (a member of the \
+                 earlier form; the answered row's id is the digest of its payload, CC 2.1)"
+                    .into(),
+            ));
+        }
+    }
     if let Some((_, leaves)) = LEAVES.iter().find(|(fam, _)| *fam == family_id) {
         match (leaves, leaf_of(family_id, payload)) {
             (Leaves::Closed(set), Some(l)) if !set.contains(&l) => {
@@ -1784,7 +2024,17 @@ pub fn check(family_id: &str, payload: &Value) -> Result<(), Error> {
         return Ok(());
     }
     check_common(payload).map_err(fail)?;
-    check_map(f.members, COMMON, payload).map_err(fail)?;
+    if payload.get_text(LIFTS).is_some() {
+        // v62.0.0 (HEAD-3) — only an unseating (`membership:{stage}` at
+        // `removal`) is a non-composer end that may state `lifts`.
+        if family_id != "membership:{stage}" || leaf_of(family_id, payload) != Some("removal") {
+            return Err(fail(
+                "`lifts` rides an end only: a withdrawal or an unseating (CC 2.4.1.1)".into(),
+            ));
+        }
+        check_lifts("scores", payload)?;
+    }
+    check_map(f.members, COMMON, &without_lifts(payload)).map_err(fail)?;
     for (fam, member, values) in CLOSED_VALUES {
         if *fam != family_id {
             continue;

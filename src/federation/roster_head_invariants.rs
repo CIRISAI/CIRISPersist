@@ -246,6 +246,7 @@ pub(crate) mod bodies {
             reason: None,
             witness_set: vec![],
             persist_row_hash: String::new(),
+            record_row_id: None,
         });
         let k = keys_of(&[who]);
         let refs: Vec<&CompositeSigningKey> = k.iter().collect();
@@ -282,6 +283,7 @@ pub(crate) mod bodies {
             effective_at: at,
             role: role.map(str::to_owned),
             persist_row_hash: String::new(),
+            record_row_id: None,
         });
         let k = keys_of(signers);
         let refs: Vec<&CompositeSigningKey> = k.iter().collect();
@@ -477,6 +479,7 @@ pub(crate) mod bodies {
             reason: None,
             witness_set: vec![],
             persist_row_hash: String::new(),
+            record_row_id: None,
         });
         let k2 = keys_of(&[keys[2].as_str()]);
         let r2: Vec<&CompositeSigningKey> = k2.iter().collect();
@@ -824,6 +827,7 @@ pub(crate) mod backdated {
             reason: None,
             witness_set: vec![],
             persist_row_hash: String::new(),
+            record_row_id: None,
         });
         let keys = founder_keys();
         let refs: Vec<&CompositeSigningKey> = keys.iter().collect();

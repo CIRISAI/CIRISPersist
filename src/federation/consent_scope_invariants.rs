@@ -360,7 +360,7 @@ pub(crate) mod bodies {
             &format!("i106b-held-{s}"),
             &producer,
             &subject,
-            serde_json::json!({"id": format!("i106b-held-{s}"), "dimension": "evidence:safety_battery:capture:a:b:v1", "score": 1.0,
+            serde_json::json!({"id": format!("i106b-held-{s}"), "dimension": "coherence_standing:cab:v1", "score": 1.0,
                 crate::federation::envelope::paths::ASSERTED_AT: crate::federation::admission::render_signed_instant(at("2026-05-01T00:00:00Z"))}),
             vec![subject.clone()],
             at("2026-05-01T00:00:00Z"),

@@ -158,17 +158,14 @@ fn row_as(signer: &CompositeSigningKey, iss: &str, asserted_at: u64) -> Vec<u8> 
         ("author", Value::Text(iss.to_owned())),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
     ]);
     sign_row_statement(
         signer,
         iss,
         iss,
         "scores",
-        "evidence:.suite:.kind:.cell:.prefix",
+        "coherence_standing:.cohort",
         &payload,
         vec![],
     )
@@ -210,6 +207,7 @@ async fn put_agent_owner_binding(
             Value::Text("ownership:responsible_party:agent:v1".into()),
         ),
     ]);
+    let mut last = None;
     for (signer, iss) in [(owner, iref(owner)), (agent, iref(agent))] {
         let st = sign_row_statement(
             signer,
@@ -221,16 +219,18 @@ async fn put_agent_owner_binding(
             vec![],
         )
         .unwrap();
-        let keys = held_keys_for(d, &st).await.unwrap();
-        let admitted = super::door::admit_row(
-            &st,
-            &keys,
-            None,
-            ciris_verify_core::edition2::family::SelectContext::default(),
-        )
-        .unwrap_or_else(|e| panic!("owner binding voice of {iss}: {e}"));
-        d.put_edition2_statement(&admitted).await.unwrap();
+        // v62.0.0 (VD-step1c, F9) — through the statement door: the binding
+        // must CONCLUDE (`agent_owner_of` counts a concluded binding only).
+        last = Some(
+            put(d, &st)
+                .await
+                .unwrap_or_else(|e| panic!("owner binding voice of {iss}: {e}")),
+        );
     }
+    assert!(
+        matches!(last, Some(StatementOutcome::Row { .. })),
+        "the owner binding concludes: {last:?}"
+    );
 }
 
 pub(crate) async fn body(d: &dyn FederationDirectory) {
@@ -302,15 +302,18 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
 
     // I3021: revoked at 30 000 ms, its later statement as the user is not
     // of the user's.
-    d.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
-        identity_key_id: u.clone(),
-        occurrence_key_id: iref(&device),
-        revoked_at: at(30_000),
-        effective_at: at(30_000),
-        reason: None,
-        witness_set: Vec::new(),
-        persist_row_hash: String::new(),
-    })
+    d.put_identity_occurrence_revocation_edition2(
+        IdentityOccurrenceRevocation {
+            identity_key_id: u.clone(),
+            occurrence_key_id: iref(&device),
+            revoked_at: at(30_000),
+            effective_at: at(30_000),
+            reason: None,
+            witness_set: Vec::new(),
+            persist_row_hash: String::new(),
+        },
+        crate::federation::DoorToken::new(),
+    )
     .await
     .unwrap();
     let after = row_as(&device, &u, 40_000);
@@ -482,7 +485,7 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
         ("I3044 (c)", u.as_str(), lone_ref.as_str(), "agent"),
     ] {
         let e = d
-            .put_identity_occurrence_local(local(identity, occurrence, class))
+            .test_seam_put_identity_occurrence(local(identity, occurrence, class))
             .await
             .unwrap_err();
         assert_eq!(
@@ -496,7 +499,7 @@ pub(crate) async fn body(d: &dyn FederationDirectory) {
             "{what}: nothing stored"
         );
     }
-    d.put_identity_occurrence_local(local(&u, &lone_ref, "laptop"))
+    d.test_seam_put_identity_occurrence(local(&u, &lone_ref, "laptop"))
         .await
         .expect("I3044 (d): a user's device under the user is stored");
 
@@ -840,6 +843,7 @@ async fn put_agent_owner_binding_refolding(
             Value::Text("ownership:responsible_party:agent:v1".into()),
         ),
     ]);
+    let mut last = None;
     for (signer, iss) in [(owner, iref(owner)), (agent, iref(agent))] {
         let st = sign_row_statement(
             signer,
@@ -851,19 +855,19 @@ async fn put_agent_owner_binding_refolding(
             vec![],
         )
         .unwrap();
-        let keys = held_keys_for(d, &st).await.unwrap();
-        let admitted = super::door::admit_row(
-            &st,
-            &keys,
-            None,
-            ciris_verify_core::edition2::family::SelectContext::default(),
-        )
-        .unwrap_or_else(|e| panic!("I3910: owner binding voice of {iss}: {e}"));
-        d.put_edition2_statement(&admitted).await.unwrap();
-        super::fold::refold_touched(d, super::fold::touches(&admitted))
-            .await
-            .unwrap();
+        // v62.0.0 (VD-step1c, F9) — through the statement door, whose tail
+        // runs the re-fold (`fold::after_statement`): the binding must
+        // CONCLUDE, and the dependency index, not the test, wakes the bind.
+        last = Some(
+            put(d, &st)
+                .await
+                .unwrap_or_else(|e| panic!("I3910: owner binding voice of {iss}: {e}")),
+        );
     }
+    assert!(
+        matches!(last, Some(StatementOutcome::Row { .. })),
+        "I3910: the owner binding concludes: {last:?}"
+    );
 }
 
 /// One store, one arrival order: the agent's occurrence key's own statement
@@ -975,4 +979,186 @@ async fn i3910_agent_owner_fold_order_postgres() {
         stores.push(b);
     }
     Box::pin(i3910_body(&stores[0], &stores[1])).await;
+}
+
+/// v62.0.0 (KR-fix43b; Constitution's correction of CC 2.4.1.1) — **I4352
+/// (agent) and I4353**: an AGENT key's owner ends the owner binding two ways,
+/// and neither ends the agent key.
+///
+/// - **I4352** — the owner's `key:revocation` of the agent key, under its
+///   binding, is ADMITTED (kept, concluded): from its instant the agent is
+///   unowned (`agent_owner_of`), before it still owned; the agent key stays
+///   LIVE (no key's revocation but its own ends its liveness). A STRANGER's
+///   `key:revocation` of the same key is HELD `key_revocation_no_standing`
+///   and changes nothing.
+/// - **I4353** — the owner's `withdraws` of the agent's owner binding (the
+///   agent-unbind witness): from its instant the agent is unowned.
+async fn owner_ends_the_agent_binding_body(d: &dyn FederationDirectory) {
+    use super::door_invariants::fixture::revocation;
+    use crate::federation::admission::agent_owner_of;
+    let (owner, stranger) = (key(80), key(81));
+    for k in [&owner, &stranger] {
+        put(d, &key_record(k, &["user"], 0, None)).await.unwrap();
+    }
+    let (agent_r, agent_w) = (key(82), key(83));
+    for k in [&agent_r, &agent_w] {
+        put(
+            d,
+            &key_record(k, &["agent"], 1_000, Some(1_000 + 2_592_000_000)),
+        )
+        .await
+        .unwrap();
+    }
+
+    // ── I4352: the owner revokes the agent key under the binding.
+    put_agent_owner_binding(d, &owner, &agent_r, 5_000).await;
+    let ar = iref(&agent_r);
+    assert_eq!(
+        agent_owner_of(d, &ar, 15_000).await.unwrap(),
+        Some(iref(&owner)),
+        "I4352 precondition: owned"
+    );
+    let by_stranger = revocation(&stranger, &agent_r, 18_000, None);
+    let out = put(d, &by_stranger).await;
+    let Ok(StatementOutcome::Pending { row_id, .. }) = out else {
+        panic!("I4352: a stranger's key:revocation is kept and held: {out:?}");
+    };
+    assert_eq!(
+        super::fold::why_held(d, &row_id)
+            .await
+            .unwrap()
+            .map(|h| h.reason),
+        Some(super::fold::reason::KEY_REVOCATION_NO_STANDING.to_owned()),
+        "I4352: held key_revocation_no_standing"
+    );
+    assert_eq!(
+        agent_owner_of(d, &ar, 19_000).await.unwrap(),
+        Some(iref(&owner)),
+        "I4352: a stranger's revocation ends nothing"
+    );
+    let by_owner = revocation(&owner, &agent_r, 20_000, None);
+    let out = put(d, &by_owner).await;
+    assert!(
+        matches!(out, Ok(StatementOutcome::KeyPlane { .. })),
+        "I4352: the owner's key:revocation under its binding is admitted: {out:?}"
+    );
+    assert_eq!(
+        agent_owner_of(d, &ar, 19_999).await.unwrap(),
+        Some(iref(&owner)),
+        "I4352: before its instant the agent is still owned"
+    );
+    assert_eq!(
+        agent_owner_of(d, &ar, 25_000).await.unwrap(),
+        None,
+        "I4352: from its instant the agent is unowned"
+    );
+    let held = super::ingest::held_keys_for_kid(d, &kid(&agent_r))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            held.liveness(&kid(&agent_r), 25_000),
+            super::liveness::Liveness::Live(_)
+        ),
+        "I4352: the agent key stays LIVE: only its own revocation ends it"
+    );
+
+    // ── I4353: the owner withdraws the agent's owner binding.
+    let binding = put_agent_owner_binding_returning(d, &owner, &agent_w, 5_000).await;
+    let aw = iref(&agent_w);
+    assert_eq!(
+        agent_owner_of(d, &aw, 15_000).await.unwrap(),
+        Some(iref(&owner)),
+        "I4353 precondition: owned"
+    );
+    let family = ciris_verify_core::namespace_match::family_id(
+        "ownership:{relation}:{target_kind}:{version}",
+    );
+    let withdraws = sign_row_statement(
+        &owner,
+        &iref(&owner),
+        &aw,
+        crate::federation::types::attestation_type::WITHDRAWS,
+        &family,
+        &map(vec![
+            ("asserted_at", Value::Uint(30_000)),
+            ("author", Value::Text(iref(&owner))),
+            ("refs", super::emit::refs_target(&binding.0)),
+        ]),
+        vec![],
+    )
+    .unwrap();
+    let out = put(d, &withdraws).await;
+    assert!(
+        matches!(out, Ok(StatementOutcome::Row { .. })),
+        "I4353: the owner's withdraws of the agent binding lands: {out:?}"
+    );
+    assert_eq!(
+        agent_owner_of(d, &aw, 35_000).await.unwrap(),
+        None,
+        "I4353: from its instant the agent is unowned"
+    );
+}
+
+/// [`put_agent_owner_binding`], returning the binding's row id.
+async fn put_agent_owner_binding_returning(
+    d: &dyn FederationDirectory,
+    owner: &CompositeSigningKey,
+    agent: &CompositeSigningKey,
+    asserted_at: u64,
+) -> super::names::RowId {
+    let family = ciris_verify_core::namespace_match::family_id(
+        "ownership:{relation}:{target_kind}:{version}",
+    );
+    let payload = map(vec![
+        ("asserted_at", Value::Uint(asserted_at)),
+        ("author", Value::Text(iref(owner))),
+        (
+            "dimension",
+            Value::Text("ownership:responsible_party:agent:v1".into()),
+        ),
+    ]);
+    let mut id = None;
+    for (signer, iss) in [(owner, iref(owner)), (agent, iref(agent))] {
+        let st = sign_row_statement(
+            signer,
+            &iss,
+            &iref(agent),
+            "delegates_to",
+            &family,
+            &payload,
+            vec![],
+        )
+        .unwrap();
+        id = super::names::RowId::of_statement(&st);
+        put(d, &st)
+            .await
+            .unwrap_or_else(|e| panic!("owner binding voice of {iss}: {e}"));
+    }
+    id.expect("the binding's row id")
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn i4352_i4353_the_owner_ends_the_agent_binding_sqlite() {
+    use crate::store::Backend as _;
+    let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(owner_ends_the_agent_binding_body(&b)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn i4352_i4353_the_owner_ends_the_agent_binding_postgres() {
+    use crate::store::Backend as _;
+    let Some(dsn) = crate::test_pg::empty_dsn() else {
+        return;
+    };
+    let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+        .await
+        .unwrap();
+    b.run_migrations().await.unwrap();
+    Box::pin(owner_ends_the_agent_binding_body(&b)).await;
 }
