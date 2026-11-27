@@ -1311,6 +1311,33 @@ pub mod orchestrate {
             CryptoTier::InvisibleEncrypted
         );
 
+        // 0. v62.0.0 (KR-fix31c; CC 5.2 "a write its own author cannot open
+        //    is refused") — the recipients, resolved ONCE, before anything is
+        //    sealed or stored; a write whose author holds no granted wrap
+        //    among them is refused by name. The author is the row's named
+        //    writer, else this node's own key (a write that names no author
+        //    is the node's; with neither, no author holds a target: refused).
+        //    The sealer's own check; no receiving door repeats it.
+        let author = author_key_id
+            .filter(|a| !a.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| backend.node_key_id())
+            .unwrap_or_default();
+        let (targets, report) =
+            resolve_cohort_targets(backend, cohort_scope, owner_or_family_key_id).await?;
+        if !crate::federation::community_dek::orchestrate::author_granted_in(
+            backend, &author, &report,
+        )
+        .await?
+        {
+            return Err(
+                crate::federation::blobs::write_author_has_no_wrap_target_refusal(
+                    owner_or_family_key_id,
+                    &author,
+                ),
+            );
+        }
+
         // 1. Fresh per-write DEK + seal the body into a self-describing
         //    ciphertext envelope (the format/version marker).
         let dek = fresh_dek().map_err(map_at_rest_err)?;
@@ -1340,15 +1367,11 @@ pub mod orchestrate {
             .await?;
 
         // 3 + 4. Self-retention + recipient fan-out (shared with the chunk
-        //        cascade, §12.3: a chunk row gets exactly these grants).
-        let report = grant_dek_to_cohort(
-            backend,
-            &at_rest_sha256,
-            cohort_scope,
-            owner_or_family_key_id,
-            &dek,
-        )
-        .await?;
+        //        cascade, §12.3: a chunk row gets exactly these grants), to
+        //        the targets resolved at step 0 (KR-fix31c: one roster).
+        let items = [(at_rest_sha256, dek)];
+        self_retain_deks(backend, &items, cohort_scope).await?;
+        grant_deks_to_targets(backend, &items, cohort_scope, &targets).await?;
 
         Ok(CascadeResult {
             at_rest_sha256,
@@ -4422,6 +4445,7 @@ pub mod blob_invariants {
     /// constructed is now unrepresentable — I6 made bind and destroy
     /// mutually exclusive by statement — so this asserts the property on a
     /// live blob, where the refusal path is the ordinary one.)
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i4b_refusal_does_not_name_the_binding<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
@@ -4429,7 +4453,6 @@ pub mod blob_invariants {
         use crate::federation::at_rest_cascade::orchestrate::read_any_for_viewer;
         use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let minter = format!("{tag}-minter-{run}");
         let comm = format!("{tag}-comm-{run}");
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
@@ -4439,6 +4462,15 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — the minter (the write's author) is
+        // alice's owned, keyed device, so it holds a wrap target.
+        let (_minter_signer, minter) =
+            crate::federation::community_dek::lifecycle_support::seat_minter(
+                backend,
+                &alice,
+                &format!("{tag}-minter-{run}"),
+            )
+            .await;
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
         let (comm, _alice, _alice_occ) = (
             crate::federation::community_dek::lifecycle_support::id_of(&comm),
@@ -4474,6 +4506,7 @@ pub mod blob_invariants {
     /// The self-retention wrap and every member grant are gone. A text column
     /// that says "destroyed" while the wraps survive is a read-door refusal,
     /// not destruction — the first implementation shipped exactly that.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i5_destroy_deletes_key_material<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
@@ -4482,7 +4515,6 @@ pub mod blob_invariants {
             encrypt_and_cascade_community, set_key_state,
         };
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let minter = format!("{tag}-minter-{run}");
         let comm = format!("{tag}-comm-{run}");
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
@@ -4492,6 +4524,15 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — the minter (the write's author) is
+        // alice's owned, keyed device, so it holds a wrap target.
+        let (_minter_signer, minter) =
+            crate::federation::community_dek::lifecycle_support::seat_minter(
+                backend,
+                &alice,
+                &format!("{tag}-minter-{run}"),
+            )
+            .await;
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
         let (comm, _alice, _alice_occ) = (
             crate::federation::community_dek::lifecycle_support::id_of(&comm),
@@ -4565,6 +4606,7 @@ pub mod blob_invariants {
     /// first implementation's bind was an unconditional INSERT, so an emission
     /// that read `enabled` and then lost a race with the sweep bound its blob
     /// to a destroyed epoch — permanently unreadable.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i6_bind_and_destroy_exclude_each_other<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
@@ -4573,7 +4615,6 @@ pub mod blob_invariants {
             encrypt_and_cascade_community, set_key_state,
         };
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let minter = format!("{tag}-minter-{run}");
         let comm = format!("{tag}-comm-{run}");
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
@@ -4583,6 +4624,15 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — the minter (the write's author) is
+        // alice's owned, keyed device, so it holds a wrap target.
+        let (_minter_signer, minter) =
+            crate::federation::community_dek::lifecycle_support::seat_minter(
+                backend,
+                &alice,
+                &format!("{tag}-minter-{run}"),
+            )
+            .await;
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
         let (comm, _alice, _alice_occ) = (
             crate::federation::community_dek::lifecycle_support::id_of(&comm),
@@ -4648,6 +4698,7 @@ pub mod blob_invariants {
     /// node is no longer a listed holder. The first implementation deleted
     /// bytes and binding with no signer and no withdraws, so peers kept
     /// routing to a node that answered `NotHeld`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i9_eviction_retracts_announcement<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
@@ -4906,13 +4957,13 @@ pub mod blob_invariants {
     /// bump must NOT be able to bind under it: the member the rotation
     /// removed keeps that epoch's wrap (AV-70) and would read content
     /// written after their removal. (C2-2)
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i17_bind_requires_the_current_epoch<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let minter = format!("{tag}-minter-{run}");
         let comm = format!("{tag}-comm-{run}");
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
@@ -4922,6 +4973,15 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — the minter (the write's author) is
+        // alice's owned, keyed device, so it holds a wrap target.
+        let (_minter_signer, minter) =
+            crate::federation::community_dek::lifecycle_support::seat_minter(
+                backend,
+                &alice,
+                &format!("{tag}-minter-{run}"),
+            )
+            .await;
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
         let (comm, _alice, _alice_occ) = (
             crate::federation::community_dek::lifecycle_support::id_of(&comm),
@@ -5143,13 +5203,13 @@ pub mod blob_invariants {
     /// **A blob's satellite rows die with it.** `delete_blob` removes the
     /// epoch binding and the at-rest grants transactionally, so a deleted
     /// blob can never hold an epoch's object count above zero. (C2-9)
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i19_delete_blob_removes_satellites<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let minter = format!("{tag}-minter-{run}");
         let comm = format!("{tag}-comm-{run}");
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
@@ -5159,6 +5219,15 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — the minter (the write's author) is
+        // alice's owned, keyed device, so it holds a wrap target.
+        let (_minter_signer, minter) =
+            crate::federation::community_dek::lifecycle_support::seat_minter(
+                backend,
+                &alice,
+                &format!("{tag}-minter-{run}"),
+            )
+            .await;
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
         let (comm, alice, _alice_occ) = (
             crate::federation::community_dek::lifecycle_support::id_of(&comm),
@@ -5232,6 +5301,7 @@ pub mod blob_invariants {
     /// **The current epoch cannot be disabled or destroyed through the
     /// key-state door.** Rotation retires an epoch; the door only acts on
     /// epochs rotation has already left behind. (C2-8)
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i20_the_primary_cannot_be_retired<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
@@ -5240,7 +5310,6 @@ pub mod blob_invariants {
             encrypt_and_cascade_community, set_key_state,
         };
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let minter = format!("{tag}-minter-{run}");
         let comm = format!("{tag}-comm-{run}");
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
@@ -5250,6 +5319,15 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — the minter (the write's author) is
+        // alice's owned, keyed device, so it holds a wrap target.
+        let (_minter_signer, minter) =
+            crate::federation::community_dek::lifecycle_support::seat_minter(
+                backend,
+                &alice,
+                &format!("{tag}-minter-{run}"),
+            )
+            .await;
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
         let (comm, _alice, _alice_occ) = (
             crate::federation::community_dek::lifecycle_support::id_of(&comm),
@@ -5330,6 +5408,7 @@ pub mod blob_invariants {
 
     /// **The matcher screens the PLAINTEXT, once, before sealing, on every
     /// tier.** The caller installs `matcher` on the backend first. (C2-6)
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i21_matcher_screens_plaintext_before_sealing<B>(
         backend: &B,
         tag: &str,
@@ -5355,7 +5434,12 @@ pub mod blob_invariants {
             crate::federation::community_dek::lifecycle_support::id_of(&alice),
             crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
         );
-        let signer = node_signer(backend, &node).await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — the signer (the write's author) is
+        // alice's owned, keyed device, so it holds a wrap target.
+        let (signer, _) = crate::federation::community_dek::lifecycle_support::seat_minter(
+            backend, &alice, &node,
+        )
+        .await;
 
         let plaintext = format!("{tag} an image the matcher must see AS IS {run}").into_bytes();
         matcher.seen.lock().unwrap().clear();
@@ -5403,6 +5487,7 @@ pub mod blob_invariants {
     /// The refusing half of I21: a refused plaintext leaves NOTHING behind —
     /// no ciphertext row, no binding — because the screen ran before the
     /// cascade, not after it.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i21b_a_refused_plaintext_is_never_sealed<B>(
         backend: &B,
         tag: &str,
@@ -5428,7 +5513,12 @@ pub mod blob_invariants {
             crate::federation::community_dek::lifecycle_support::id_of(&alice),
             crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
         );
-        let signer = node_signer(backend, &node).await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — the signer (the write's author) is
+        // alice's owned, keyed device, so it holds a wrap target.
+        let (signer, _) = crate::federation::community_dek::lifecycle_support::seat_minter(
+            backend, &alice, &node,
+        )
+        .await;
         let minter = signer.federation_id().await;
         assert!(matcher.refuse, "{tag} I21b: fixture — a refusing matcher");
         let epoch = backend
@@ -5504,6 +5594,7 @@ pub mod blob_invariants {
     /// `community` share a cascade and a tier; an `affiliations` write must
     /// not land as `community` on the row §11.1 calls the authority.
     /// (Ultrareview of `30fde79`.)
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i24_the_row_records_the_named_cohort<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
@@ -5527,7 +5618,12 @@ pub mod blob_invariants {
             crate::federation::community_dek::lifecycle_support::id_of(&alice),
             crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
         );
-        let signer = node_signer(backend, &node).await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — the signer (the write's author) is
+        // alice's owned, keyed device, so it holds a wrap target.
+        let (signer, _) = crate::federation::community_dek::lifecycle_support::seat_minter(
+            backend, &alice, &node,
+        )
+        .await;
         let res = put_blob_scoped(
             backend,
             &signer,
@@ -5595,6 +5691,7 @@ pub mod blob_invariants {
     /// evict a community blob between the cascade's bind and the door's
     /// announcement, the announcement must refuse (`NotHeld`) — not re-insert
     /// a ciphertext row with no binding and return success. (C3-2)
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i28_announce_refuses_an_evicted_row<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
@@ -5619,7 +5716,12 @@ pub mod blob_invariants {
             crate::federation::community_dek::lifecycle_support::id_of(&alice),
             crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
         );
-        let signer = node_signer(backend, &node).await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — the signer (the write's author) is
+        // alice's owned, keyed device, so it holds a wrap target.
+        let (signer, _) = crate::federation::community_dek::lifecycle_support::seat_minter(
+            backend, &alice, &node,
+        )
+        .await;
         let minter = signer.federation_id().await;
         let node_derived = signer.federation_id().await;
 
@@ -5762,6 +5864,7 @@ pub mod blob_invariants {
     /// (a REMOVED member, who keeps the old epoch's grant by AV-70, before
     /// the epoch is destroyed) and the current roster (a member after the
     /// production sweep has destroyed the epoch and erased its grants).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i31_eviction_is_a_fact_a_reader_is_told<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
@@ -5787,7 +5890,14 @@ pub mod blob_invariants {
             crate::federation::community_dek::lifecycle_support::id_of(&bob),
             crate::federation::community_dek::lifecycle_support::id_of(&bob_occ),
         );
-        let sweeper = node_signer(backend, &format!("{tag}-sweeper-{run}")).await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — the sweeper (the minter, the writes'
+        // author) is alice's owned, keyed device, so it holds a wrap target.
+        let (sweeper, _) = crate::federation::community_dek::lifecycle_support::seat_minter(
+            backend,
+            &alice,
+            &format!("{tag}-sweeper-{run}"),
+        )
+        .await;
         // #848 — the sweep runs over the signer's own counter: the sweeper
         // is the minter of everything sealed below.
         let minter = sweeper.federation_id().await;
@@ -6022,6 +6132,7 @@ pub mod blob_invariants {
     /// into the GCM tag, the reader presents the same data, and the data is
     /// never on disk. Both encrypted tiers; the plaintext tier refuses the
     /// data rather than dropping it.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i40_associated_data_binds_the_seal<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
@@ -6064,6 +6175,15 @@ pub mod blob_invariants {
             crate::federation::community_dek::lifecycle_support::id_of(&alice),
             crate::federation::community_dek::lifecycle_support::id_of(&alice_occ),
         );
+        // v62.0.0 (KR-fix31b; CC 5.2) — the COMMUNITY write's author is
+        // alice's owned, keyed device (it holds a wrap target); the self
+        // write keeps its signer.
+        let (room_signer, _) = crate::federation::community_dek::lifecycle_support::seat_minter(
+            backend,
+            &alice,
+            &format!("{tag}-room-node-{run}"),
+        )
+        .await;
 
         for (scope, key, viewer, tier) in [
             (
@@ -6080,7 +6200,12 @@ pub mod blob_invariants {
             ),
         ] {
             let body = format!("message body sealed at {scope}").into_bytes();
-            let put = put_blob_scoped(backend, &signer, scope, Some(key), &body, None, Some(a))
+            let writer = if scope == COMMUNITY {
+                &room_signer
+            } else {
+                &signer
+            };
+            let put = put_blob_scoped(backend, writer, scope, Some(key), &body, None, Some(a))
                 .await
                 .unwrap_or_else(|e| panic!("{tag} I40: seal at {scope} with associated data: {e}"));
             assert_eq!(
@@ -6160,7 +6285,7 @@ pub mod blob_invariants {
             // without data, and presenting data against it is refused — the
             // two entry points do not open each other's ciphertext.
             let unbound =
-                put_blob_scoped(backend, &signer, scope, Some(key), b"unbound", None, None)
+                put_blob_scoped(backend, writer, scope, Some(key), b"unbound", None, None)
                     .await
                     .unwrap_or_else(|e| panic!("{tag} I40: an AAD-less seal at {scope}: {e}"));
             assert_eq!(
@@ -6286,6 +6411,7 @@ pub mod blob_invariants {
     ///    the self/family cascade, same partition;
     /// 5. a commons write, readable by everyone, which must not say
     ///    otherwise.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i54_the_cascade_result_partitions_the_roster<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
@@ -6300,7 +6426,6 @@ pub mod blob_invariants {
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
         let none: Vec<String> = Vec::new();
-        let no_grants: Vec<MemberGrant> = Vec::new();
 
         // 1. The #843 case: alice on the roster with NO occurrence; bob with
         //    one bare occurrence.
@@ -6315,13 +6440,17 @@ pub mod blob_invariants {
         )
         .await;
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
-        let (comm, alice, bob, bob_phone) = (
+        let (comm, _alice, _bob, _bob_phone) = (
             crate::federation::community_dek::lifecycle_support::id_of(&comm),
             crate::federation::community_dek::lifecycle_support::id_of(&alice),
             crate::federation::community_dek::lifecycle_support::id_of(&bob),
             crate::federation::community_dek::lifecycle_support::id_of(&bob_phone),
         );
-        let res = put_blob_scoped(
+        // v62.0.0 (KR-fix31; CC 5.2 "a write its own author cannot open is
+        // refused") — the #843 write (its author holds no wrap target: no
+        // member is granted) is no longer sealed for nobody: it is refused by
+        // name before anything is stored.
+        let err = put_blob_scoped(
             backend,
             &signer,
             COMMUNITY,
@@ -6331,30 +6460,19 @@ pub mod blob_invariants {
             None,
         )
         .await
-        .unwrap_or_else(|e| panic!("{tag} I54/1: community write: {e}"));
-        assert_eq!(res.granted, none, "{tag} I54/1: no occurrence granted");
-        assert_eq!(
-            res.excluded,
-            vec![bob_phone.clone()],
-            "{tag} I54/1: bob's phone is the excluded OCCURRENCE (unchanged meaning)"
-        );
-        assert_eq!(
-            res.roster.granted, no_grants,
-            "{tag} I54/1: no member granted"
-        );
-        assert_eq!(
-            res.roster.excluded,
-            vec![bob.clone()],
-            "{tag} I54/1: bob — has a device, none usable — is the excluded MEMBER"
-        );
-        assert_eq!(
-            res.roster.absent,
-            vec![alice.clone()],
-            "{tag} I54/1: alice — on the roster, no occurrence — is ABSENT, and named"
+        .expect_err("I54/1: a write its own author cannot open is refused");
+        assert!(
+            matches!(&err, BlobError::InvalidArgument(m)
+                if m.starts_with(crate::federation::blobs::WRITE_AUTHOR_HAS_NO_WRAP_TARGET)),
+            "{tag} I54/1: refused by name, got {err:?}"
         );
         assert!(
-            res.readable_by_nobody(),
-            "{tag} I54/1: nobody can read this, and the result says so"
+            backend
+                .community_dek_epochs(&comm, &signer.federation_id().await)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{tag} I54/1: nothing minted for the refused write"
         );
 
         // 2. Nothing enumerated at all.
@@ -6362,11 +6480,13 @@ pub mod blob_invariants {
         let lone = format!("{tag}-lone-{run}");
         seed_community_shaped(backend, &comm2, &[(&lone, &[])]).await;
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
-        let (comm2, lone) = (
+        let (comm2, _lone) = (
             crate::federation::community_dek::lifecycle_support::id_of(&comm2),
             crate::federation::community_dek::lifecycle_support::id_of(&lone),
         );
-        let res2 = put_blob_scoped(
+        // v62.0.0 (KR-fix31; CC 5.2) — nothing enumerated, so no wrap target
+        // for the author either: refused by name, not sealed for nobody.
+        let err2 = put_blob_scoped(
             backend,
             &signer,
             COMMUNITY,
@@ -6376,19 +6496,11 @@ pub mod blob_invariants {
             None,
         )
         .await
-        .unwrap_or_else(|e| panic!("{tag} I54/2: community write: {e}"));
-        assert_eq!(res2.granted, none, "{tag} I54/2");
-        assert_eq!(res2.excluded, none, "{tag} I54/2: nothing to exclude");
-        assert_eq!(res2.roster.excluded, none, "{tag} I54/2");
-        assert_eq!(
-            res2.roster.absent,
-            vec![lone.clone()],
-            "{tag} I54/2: the lone member is absent"
-        );
+        .expect_err("I54/2: a write its own author cannot open is refused");
         assert!(
-            res2.readable_by_nobody(),
-            "{tag} I54/2: nothing was enumerated and nothing was excluded — an answer \
-             derived from the occurrence list says everyone can read; the roster says nobody"
+            matches!(&err2, BlobError::InvalidArgument(m)
+                if m.starts_with(crate::federation::blobs::WRITE_AUTHOR_HAS_NO_WRAP_TARGET)),
+            "{tag} I54/2: refused by name, got {err2:?}"
         );
 
         // 3. Mixed devices, and a REMOVED member.
@@ -6410,6 +6522,16 @@ pub mod blob_invariants {
             ],
         )
         .await;
+        // v62.0.0 (KR-fix31b; CC 5.2) — the write's author is carol's owned,
+        // keyed device: it holds a wrap target, and it is one more granted
+        // occurrence of carol's.
+        let (signer3, carol_node) =
+            crate::federation::community_dek::lifecycle_support::seat_minter(
+                backend,
+                &carol,
+                &format!("{tag}-carol-node-{run}"),
+            )
+            .await;
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
         let (comm3, carol, carol_laptop, carol_old, dave, dave_phone, erin, erin_phone) = (
             crate::federation::community_dek::lifecycle_support::id_of(&comm3),
@@ -6424,7 +6546,7 @@ pub mod blob_invariants {
         revoke_member(backend, &comm3, &erin).await;
         let res3 = put_blob_scoped(
             backend,
-            &signer,
+            &signer3,
             COMMUNITY,
             Some(&comm3),
             b"mixed",
@@ -6440,7 +6562,7 @@ pub mod blob_invariants {
         };
         assert_eq!(
             sorted(&res3.granted),
-            sorted(&[carol_laptop.clone(), dave_phone.clone()]),
+            sorted(&[carol_laptop.clone(), carol_node.clone(), dave_phone.clone()]),
             "{tag} I54/3: the usable occurrences are granted"
         );
         assert_eq!(
@@ -6450,10 +6572,13 @@ pub mod blob_invariants {
         );
         let mut grants = res3.roster.granted.clone();
         grants.sort_by(|a, b| a.member_key_id.cmp(&b.member_key_id));
+        for g in &mut grants {
+            g.occurrence_key_ids.sort();
+        }
         let mut want = vec![
             MemberGrant {
                 member_key_id: carol.clone(),
-                occurrence_key_ids: vec![carol_laptop.clone()],
+                occurrence_key_ids: sorted(&[carol_laptop.clone(), carol_node.clone()]),
             },
             MemberGrant {
                 member_key_id: dave.clone(),
@@ -6599,7 +6724,7 @@ pub mod blob_invariants {
         let (_xp, x_pub, _mp, ml_pub) =
             crate::federation::identity_aggregate::mint_content_kem_keypair().expect("mint kem");
         backend
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 // v62.0.0 (wave 3, E5) — keyed as the directory keys them
                 // (identity-refs under the switch, `lifecycle_support::id_of`).
                 identity_key_id: crate::federation::community_dek::lifecycle_support::id_of(
@@ -6702,6 +6827,7 @@ pub mod blob_invariants {
     ///
     /// A full disk that still takes relay content, or a node that refuses
     /// its own family, would each fail this.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i47_pressure_refuses_proxy_never_local_or_family<B>(
         backend: &B,
         tag: &str,
@@ -6715,13 +6841,27 @@ pub mod blob_invariants {
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
         let our = signer.federation_id().await;
-        let family = vec![format!("{tag}-fam-{run}")];
-        let peer = format!("{tag}-peer-{run}");
         // A community this node is party to (our key is alice's occurrence).
         let comm = format!("{tag}-comm-{run}");
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        // v62.0.0 (KR-fix31b; CC 5.2 "a write its own author cannot open is
+        // refused") — every author that seals below is a member's owned,
+        // keyed device (a wrap target in the room it seals for).
+        let (_, peer) = crate::federation::community_dek::lifecycle_support::seat_minter(
+            backend,
+            &alice,
+            &format!("{tag}-peer-{run}"),
+        )
+        .await;
+        let (_, fam0) = crate::federation::community_dek::lifecycle_support::seat_minter(
+            backend,
+            &alice,
+            &format!("{tag}-fam-{run}"),
+        )
+        .await;
+        let family = vec![fam0];
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
         let (comm, alice, _alice_occ) = (
             crate::federation::community_dek::lifecycle_support::id_of(&comm),
@@ -6858,6 +6998,7 @@ pub mod blob_invariants {
     /// party to is adopted regardless of serve standing.** Serve standing
     /// changes nothing on either side: a `MeshServer` that is not a member
     /// is refused exactly as a nobody-node is.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i48_never_adopts_non_party_content_whatever_the_serve_standing<B>(
         backend: &B,
         tag: &str,
@@ -6872,7 +7013,6 @@ pub mod blob_invariants {
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
         let our = signer.federation_id().await;
-        let peer = format!("{tag}-peer-{run}");
         let family: Vec<String> = Vec::new();
 
         // Two communities: ours (we are alice's occurrence) and theirs.
@@ -6880,6 +7020,15 @@ pub mod blob_invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        // v62.0.0 (KR-fix31b; CC 5.2 "a write its own author cannot open is
+        // refused") — every author that seals below is a member's owned,
+        // keyed device (a wrap target in the room it seals for).
+        let (_, peer) = crate::federation::community_dek::lifecycle_support::seat_minter(
+            backend,
+            &alice,
+            &format!("{tag}-peer-{run}"),
+        )
+        .await;
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
         let (comm, alice, _alice_occ) = (
             crate::federation::community_dek::lifecycle_support::id_of(&comm),
@@ -6891,6 +7040,14 @@ pub mod blob_invariants {
         let bob = format!("{tag}-bob-{run}");
         let bob_occ = format!("{tag}-bob-occ-{run}");
         seed_community(backend, &theirs, &[(&bob, &bob_occ)]).await;
+        // KR-fix31b — the author of THEIR room's write is bob's device (a
+        // node has one owner, so it is another key than `peer`).
+        let (_, peer_theirs) = crate::federation::community_dek::lifecycle_support::seat_minter(
+            backend,
+            &bob,
+            &format!("{tag}-peer-theirs-{run}"),
+        )
+        .await;
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
         let (theirs, bob, _bob_occ) = (
             crate::federation::community_dek::lifecycle_support::id_of(&theirs),
@@ -6899,7 +7056,7 @@ pub mod blob_invariants {
         );
 
         let (env_theirs, ep_theirs, sha_theirs) =
-            sealed_community_envelope(backend, &theirs, b"their minutes", &peer).await;
+            sealed_community_envelope(backend, &theirs, b"their minutes", &peer_theirs).await;
         backend.delete_blob(&sha_theirs).await.unwrap();
         let (env_ours, ep_ours, sha_ours) =
             sealed_community_envelope(backend, &comm, b"our minutes", &peer).await;
@@ -6914,7 +7071,7 @@ pub mod blob_invariants {
         let ctx = hold_ctx(false, &our, &family);
         // (a) not party ⇒ refused, typed, naming only the declared cohort +
         //     community; nothing written.
-        let prov = community_provenance(&peer, &theirs, ep_theirs);
+        let prov = community_provenance(&peer_theirs, &theirs, ep_theirs);
         let err = adopt_sealed_blob(
             backend,
             Some(&signer),
@@ -7043,6 +7200,7 @@ pub mod blob_invariants {
     /// locally cascaded blob classifies protected, a row with no author
     /// classifies proxy, and the serve door refuses the adopted one under
     /// `Stop` while serving the local one.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i49_an_adopted_blob_classifies_proxy_and_a_null_author_is_proxy<B>(
         backend: &B,
         tag: &str,
@@ -7057,12 +7215,20 @@ pub mod blob_invariants {
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
         let our = signer.federation_id().await;
-        let peer = format!("{tag}-peer-{run}");
         let family: Vec<String> = Vec::new();
         let comm = format!("{tag}-comm-{run}");
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        // v62.0.0 (KR-fix31b; CC 5.2 "a write its own author cannot open is
+        // refused") — every author that seals below is a member's owned,
+        // keyed device (a wrap target in the room it seals for).
+        let (_, peer) = crate::federation::community_dek::lifecycle_support::seat_minter(
+            backend,
+            &alice,
+            &format!("{tag}-peer-{run}"),
+        )
+        .await;
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
         let (comm, alice, _alice_occ) = (
             crate::federation::community_dek::lifecycle_support::id_of(&comm),
@@ -7277,6 +7443,7 @@ pub mod blob_invariants {
     /// declared epoch and refused `NotGranted` for one who does not — also
     /// after the community has ROTATED past that epoch, which a *write*
     /// (I17) would refuse.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i51_adopt_needs_no_key_state_and_reads_dispatch_on_grants<B>(
         backend: &B,
         tag: &str,
@@ -7291,7 +7458,6 @@ pub mod blob_invariants {
         let signer = node_signer(backend, &node).await;
         let minter = signer.federation_id().await;
         let our = signer.federation_id().await;
-        let peer = format!("{tag}-peer-{run}");
         let family: Vec<String> = Vec::new();
         let ctx = hold_ctx(false, &our, &family);
 
@@ -7300,6 +7466,15 @@ pub mod blob_invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &ghost, &[(&alice, &alice_occ)]).await;
+        // v62.0.0 (KR-fix31b; CC 5.2 "a write its own author cannot open is
+        // refused") — every author that seals below is a member's owned,
+        // keyed device (a wrap target in the room it seals for).
+        let (_, peer) = crate::federation::community_dek::lifecycle_support::seat_minter(
+            backend,
+            &alice,
+            &format!("{tag}-peer-{run}"),
+        )
+        .await;
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
         let (ghost, alice, alice_occ) = (
             crate::federation::community_dek::lifecycle_support::id_of(&ghost),
@@ -7321,20 +7496,29 @@ pub mod blob_invariants {
         let carol = format!("{tag}-carol-{run}");
         let carol_occ = format!("{tag}-carol-occ-{run}");
         seed_community(backend, &comm, &[(&carol, &carol_occ)]).await;
+        // KR-fix31b — the far room's write is by carol's device (a node has
+        // one owner, so it is another key than `peer`).
+        let (_, peer_far) = crate::federation::community_dek::lifecycle_support::seat_minter(
+            backend,
+            &carol,
+            &format!("{tag}-peer-far-{run}"),
+        )
+        .await;
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
         let (comm, _carol, _carol_occ) = (
             crate::federation::community_dek::lifecycle_support::id_of(&comm),
             crate::federation::community_dek::lifecycle_support::id_of(&carol),
             crate::federation::community_dek::lifecycle_support::id_of(&carol_occ),
         );
-        let (env_a, _, sha_a) = sealed_community_envelope(backend, &comm, b"far away", &peer).await;
+        let (env_a, _, sha_a) =
+            sealed_community_envelope(backend, &comm, b"far away", &peer_far).await;
         backend.delete_blob(&sha_a).await.unwrap();
         let out = adopt_sealed_blob(
             backend,
             Some(&signer),
             &ctx,
             &env_a,
-            &community_provenance(&peer, &ghost, 7),
+            &community_provenance(&peer_far, &ghost, 7),
             None,
             AdoptDisposition::LocalOnly,
         )
@@ -7425,6 +7609,7 @@ pub mod blob_invariants {
     /// `author_key_id`, `community_key_id` — is readable in the clear from
     /// the row (`blob_provenance`) the claim announces; the signed claim's
     /// preimage is unchanged (v31, #652).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn exercise_i52_announce_emits_the_holder_claim_and_self_family_never_announce<B>(
         backend: &B,
         tag: &str,
@@ -7439,13 +7624,21 @@ pub mod blob_invariants {
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
         let our = signer.federation_id().await;
-        let peer = format!("{tag}-peer-{run}");
         let family: Vec<String> = Vec::new();
         let ctx = hold_ctx(false, &our, &family);
         let comm = format!("{tag}-comm-{run}");
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        // v62.0.0 (KR-fix31b; CC 5.2 "a write its own author cannot open is
+        // refused") — every author that seals below is a member's owned,
+        // keyed device (a wrap target in the room it seals for).
+        let (_, peer) = crate::federation::community_dek::lifecycle_support::seat_minter(
+            backend,
+            &alice,
+            &format!("{tag}-peer-{run}"),
+        )
+        .await;
         // v62.0.0 (wave 3, E5) — the ids the directory keys them by.
         let (comm, alice, _alice_occ) = (
             crate::federation::community_dek::lifecycle_support::id_of(&comm),

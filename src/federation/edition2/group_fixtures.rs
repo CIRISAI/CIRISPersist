@@ -89,16 +89,77 @@ pub fn roster_voices(
     asserted_at_ms: u64,
     signers: &[&CompositeSigningKey],
 ) -> Vec<Vec<u8>> {
-    let p = roster_payload(record, version, head, asserted_at_ms)
-        .expect("group_fixtures: roster payload");
-    let group = match record {
-        GroupRecord::Family(f) => &f.family_key_id,
-        GroupRecord::Community(c) => &c.community_key_id,
+    let (group, p) = if version == 1 && head.is_none() {
+        fixture_founding(record, asserted_at_ms)
+    } else {
+        // v62.0.0 (GID-fixtures-mech.rev2) — a later version of a room a
+        // fixture founded carries the `founded_at` it was founded at.
+        let record = &with_fixture_founded_at(record, false);
+        let group = match record {
+            GroupRecord::Family(f) => f.family_key_id.clone(),
+            GroupRecord::Community(c) => c.community_key_id.clone(),
+        };
+        let p = roster_payload(record, version, head, asserted_at_ms)
+            .expect("group_fixtures: roster payload");
+        (group, p)
     };
     signers
         .iter()
-        .map(|k| sign_group_payload(k, group, GROUP_ROSTER_PREFIX, &p))
+        .map(|k| sign_group_payload(k, &group, GROUP_ROSTER_PREFIX, &p))
         .collect()
+}
+
+/// v62.0.0 (GID-fixtures) — **a fixture's FIRST version**: `record`'s id is
+/// the NAME the fixture gave the room (a seed's identity-ref, or the derived
+/// id when it was founded before); the payload is founded under the DERIVED
+/// id with the name's fixture nonce ([`fixture_group_nonce`](super::fixture_switch::fixture_group_nonce)),
+/// and the name is recorded so `kid(name)` answers the derived id after.
+/// Returns the derived id and the payload.
+///
+/// v62.0.0 (GID-fixtures-mech.rev2) — the record's `founded_at` is REPLACED
+/// by the name's fixture instant
+/// ([`fixture_founded_at`](super::fixture_switch::fixture_founded_at)):
+/// it is an input of the derived id, so the wall-clock instant a fixture
+/// builds its record with would derive a different id on each node.
+/// `asserted_at_ms` (the row's instant, the test's clock seam) is kept.
+///
+/// # Panics
+/// A record that does not encode.
+#[must_use]
+pub fn fixture_founding(record: &GroupRecord, asserted_at_ms: u64) -> (String, Value) {
+    let mut rec = with_fixture_founded_at(record, true);
+    let alias = match &rec {
+        GroupRecord::Family(f) => f.family_key_id.clone(),
+        GroupRecord::Community(c) => c.community_key_id.clone(),
+    };
+    let nonce = super::fixture_switch::fixture_group_nonce(&alias);
+    let founded_at_ms = super::fixture_switch::fixture_founded_at_ms(&alias);
+    let (gid, p) = super::group::founding_payload(&mut rec, &nonce, asserted_at_ms)
+        .expect("group_fixtures: founding payload");
+    super::fixture_switch::note_founded_group(&[&alias], &gid, nonce, founded_at_ms);
+    (gid, p)
+}
+
+/// v62.0.0 (GID-fixtures-mech.rev2) — `record` with its `founded_at` set to
+/// the fixture instant of the room it names: always when `founding`; for a
+/// later version, only when a fixture founded that room in this process (a
+/// room no fixture founded keeps its own).
+#[must_use]
+pub fn with_fixture_founded_at(record: &GroupRecord, founding: bool) -> GroupRecord {
+    use super::fixture_switch::{fixture_founded_at, founded_group_id};
+    let mut rec = record.clone();
+    let alias = match &rec {
+        GroupRecord::Family(f) => f.family_key_id.clone(),
+        GroupRecord::Community(c) => c.community_key_id.clone(),
+    };
+    if founding || founded_group_id(&alias).is_some() {
+        let at = fixture_founded_at(&alias);
+        match &mut rec {
+            GroupRecord::Family(f) => f.founded_at = at,
+            GroupRecord::Community(c) => c.founded_at = at,
+        }
+    }
+    rec
 }
 
 /// One voice per signer of a MERGE version (CC 2.7.8): `record` at
@@ -180,6 +241,34 @@ fn signer_keys(authority: &str, cosignatures: &[RosterCosignature]) -> Vec<Compo
         .collect()
 }
 
+/// v62.0.0 (GID-fixtures) — the voices of a roster: [`signer_keys`], except
+/// that a record "signed by the group's own key" (its authority names the
+/// group itself: a fixture fiction, since a group has no key) is signed by
+/// its FIRST listed member (`first_members[0]`), deduplicated.
+fn roster_signer_keys(
+    authority: &str,
+    cosignatures: &[RosterCosignature],
+    group: &str,
+    members: &[&str],
+) -> Vec<CompositeSigningKey> {
+    let is_group = authority == group || kid_or_keep(authority) == kid_or_keep(group);
+    // The first member the record lists (`first_members[0]`).
+    let first = members.first().copied();
+    let lead = if is_group {
+        first.unwrap_or(authority)
+    } else {
+        authority
+    };
+    let mut ids: Vec<&str> = vec![lead];
+    for c in cosignatures {
+        let id = c.authority_key_id.as_str();
+        if !ids.contains(&id) && kid_or_keep(id) != kid_or_keep(group) {
+            ids.push(id);
+        }
+    }
+    ids.into_iter().map(signing_key).collect()
+}
+
 fn voices_with(
     keys: &[CompositeSigningKey],
     f: impl Fn(&[&CompositeSigningKey]) -> Vec<Vec<u8>>,
@@ -234,8 +323,15 @@ pub fn family_voices(
     asserted_at_ms: u64,
 ) -> Vec<Vec<u8>> {
     let record = GroupRecord::Family(family_with_kids(&signed.family));
+    let f = &signed.family;
+    let members: Vec<&str> = f.members.iter().map(|m| m.key_id.as_str()).collect();
     voices_with(
-        &signer_keys(&signed.authority_key_id, &signed.cosignatures),
+        &roster_signer_keys(
+            &signed.authority_key_id,
+            &signed.cosignatures,
+            &f.family_key_id,
+            &members,
+        ),
         |k| roster_voices(&record, version, head, asserted_at_ms, k),
     )
 }
@@ -249,8 +345,15 @@ pub fn community_voices(
     asserted_at_ms: u64,
 ) -> Vec<Vec<u8>> {
     let record = GroupRecord::Community(community_with_kids(&signed.community));
+    let c = &signed.community;
+    let members: Vec<&str> = c.members.iter().map(|m| m.key_id.as_str()).collect();
     voices_with(
-        &signer_keys(&signed.authority_key_id, &signed.cosignatures),
+        &roster_signer_keys(
+            &signed.authority_key_id,
+            &signed.cosignatures,
+            &c.community_key_id,
+            &members,
+        ),
         |k| roster_voices(&record, version, head, asserted_at_ms, k),
     )
 }

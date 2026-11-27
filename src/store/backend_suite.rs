@@ -415,7 +415,7 @@ mod tests {
                 "id": id,
                 // v62.0.0 (E5) — the earlier form (held tests) keeps its own.
                 "dimension": if e2::emit_edition2() {
-                    "evidence:safety_battery:capture:a:b:v1"
+                    "coherence_standing:cab:v1"
                 } else {
                     "identity_binding:v1"
                 },

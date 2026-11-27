@@ -288,9 +288,13 @@ where
     {
         return Ok(true);
     }
-    // The members at the named head.
+    // The members at the named head. VD-step1 — only a CONCLUDED version
+    // lists members ([`super::verdict::row_state`]): a version kept short of
+    // its count (or a lone voice of one) is no version yet, and its listed
+    // members are no party of the rows that name it.
     if let Some(h) = head {
-        if let Some(st) = dir.edition2_voices(&h).await?.first() {
+        let concluded = super::verdict::row_state(dir, &h).await?.is_concluded();
+        if let Some(st) = dir.edition2_voices(&h).await?.first().filter(|_| concluded) {
             if let Ok(v) = roster_view_of_statement(st) {
                 if v.group == group && v.kind == kind {
                     party.extend(listed_members(&v.payload));
@@ -465,6 +469,11 @@ pub const NAMING_ROLES: &[&str] = &[
     "prev",
     "answers",
     "trusted_through",
+    // v62.0.0 (CONTENT-K2) — a content row's further predecessors. Like
+    // `prev` and `trusted_through` it CARRIES (a tip named by an end is
+    // served with the end) and nothing waits on it: no gate reads these
+    // three roles, and carrying is this copy rule's alone.
+    "further_prev",
 ];
 
 /// A statement's CWT `iss`.
@@ -553,7 +562,8 @@ where
 /// row's audience." For each held row `C` that names this statement's row
 /// (under any [`NAMING_ROLES`] role, from `ceg_row_names`):
 ///
-/// - `C` is concluded: no fold hold is recorded for it (`fold_held`);
+/// - `C` is concluded ([`super::verdict::row_state`]; VD-step1: not merely
+///   "no fold hold is recorded");
 /// - `C` sits in the same room ([`room_of`]);
 /// - `C`'s signer is in this statement's audience by its own rule
 ///   (`serve::servable_by_own_rule` with the signer as the party);
@@ -588,7 +598,10 @@ where
             if !seen.insert(citer) {
                 continue;
             }
-            if dir.fold_held(&citer).await?.is_some() {
+            // VD-step1 — "concluded" is the one verdict's, never "no fold
+            // hold": a citer kept as a lone voice (or never folded here) has
+            // no hold and concludes nothing, so carries nothing.
+            if !super::verdict::row_state(dir, &citer).await?.is_concluded() {
                 continue;
             }
             let voices = dir.edition2_voices(&citer).await?;

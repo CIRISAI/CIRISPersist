@@ -2828,7 +2828,7 @@ pub(crate) mod test_support {
 
         // THE ATTACK — the trusted-local self-write on the same pair, later,
         // content-only.
-        dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
+        dir.test_seam_put_identity_occurrence(crate::federation::IdentityOccurrence {
             identity_key_id: a.clone(),
             occurrence_key_id: ph.clone(),
             device_class: PHONE.into(),
@@ -2885,7 +2885,7 @@ pub(crate) mod test_support {
             at(t(40)),
             "({suffix}) I3324: the first revocation's instant stands"
         );
-        dir.put_identity_occurrence_revocation_local(
+        dir.put_identity_occurrence_revocation_edition2(
             crate::federation::types::IdentityOccurrenceRevocation {
                 identity_key_id: a.clone(),
                 occurrence_key_id: ph.clone(),
@@ -2895,6 +2895,7 @@ pub(crate) mod test_support {
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
             },
+            crate::federation::DoorToken::new(),
         )
         .await
         .expect_err("I3324: a second local revocation of the pair is refused (#541)");

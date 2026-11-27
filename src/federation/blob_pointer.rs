@@ -160,6 +160,35 @@ pub fn names_pointer_owner(envelope: &Value) -> bool {
     })
 }
 
+/// v62.0.0 (WD-fix1) — **every sha a readable pointer in `envelope`
+/// names**, by [`pointer_for`]'s own scan (every top-level member, and the
+/// items of an array member). A member that does not read as a pointer
+/// names nothing here (the binding predicate still counts an unreadable one
+/// at a sha it is asked about).
+#[must_use]
+pub fn pointed_shas(envelope: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(members) = envelope.as_object() else {
+        return out;
+    };
+    let mut take = |v: &Value| {
+        if let Ok(Some(p)) = parse_member(v) {
+            if !out.contains(&p.content_sha256) {
+                out.push(p.content_sha256);
+            }
+        }
+    };
+    for v in members.values() {
+        take(v);
+        if let Some(arr) = v.as_array() {
+            for item in arr {
+                take(item);
+            }
+        }
+    }
+    out
+}
+
 /// **The pointer in `envelope` that names `sha256_hex`, if any.** Scans
 /// every top-level member (and the members of an array member, so a list of
 /// attachments resolves too).

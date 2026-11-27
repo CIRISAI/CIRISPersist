@@ -78,7 +78,8 @@ impl RowId {
 
 /// One name a row carries: the `refs` member it stands under and the row id
 /// it names. `role` is the member path: `head`, `further_heads`, `prev`,
-/// `answers`, `target`, `trusted_through`, `also:ack`, `also:cites`.
+/// `answers`, `target`, `trusted_through`, `further_prev` (CONTENT-K2),
+/// `also:ack`, `also:cites`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Name {
     /// The `refs` member path.

@@ -58,7 +58,7 @@ use sha2::Digest as _;
 
 use super::door::AdmittedRow;
 use super::group::{composite_signature_b64, run_vouched, Landing, Vouch};
-use super::ingest::{attestation_of, json_of, StatementOutcome, COMPOSER_ROW_TYPES};
+use super::ingest::{attestation_of, json_of, StatementOutcome};
 use super::names::{single, RowId};
 use crate::federation::blobs::GrantWrap;
 use crate::federation::custody_ack::CustodyState;
@@ -1269,7 +1269,7 @@ where
 /// which reads [`occurrence_revocation_of`]). A proposal no answer can mend
 /// is `SelfRosterNotLanded` (the voice stays held: the gate counts held
 /// voices, so it is stored first). Landing writes the revocation the carrier
-/// feeds (`put_identity_occurrence_revocation_local`) unless the pair is
+/// feeds (`put_identity_occurrence_revocation_edition2`) unless the pair is
 /// already revoked: the first route to land fixes the instants.
 async fn put_occurrence_revocation<F>(dir: &F, row: &AdmittedRow) -> Result<StatementOutcome, Error>
 where
@@ -1320,8 +1320,11 @@ where
         .iter()
         .any(|r| r.occurrence_key_id == revocation.occurrence_key_id);
     if !held {
-        dir.put_identity_occurrence_revocation_local(revocation)
-            .await?;
+        dir.put_identity_occurrence_revocation_edition2(
+            revocation,
+            crate::federation::DoorToken::new(),
+        )
+        .await?;
     }
     Ok(StatementOutcome::Row {
         row_id: row.row_id,
@@ -1556,7 +1559,7 @@ where
         crate::federation::replication::admission::WriteOrigin::Wire,
     ))
     .await?;
-    let edge = if COMPOSER_ROW_TYPES.contains(&row.row_type.as_str()) {
+    let edge = if super::emit::names_a_target(&row.row_type) {
         match single(&row.names, TARGET_ROLE) {
             Some(t) => dir.get_attestation(&t.hex()).await?,
             None => None,

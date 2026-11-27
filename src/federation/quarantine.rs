@@ -683,6 +683,15 @@ pub fn release_envelope(
 /// Verify-before-mutation (AV-9): every gate below runs BEFORE any row is
 /// written, and a refusal writes nothing.
 ///
+/// v62.0.0 (WD-fix6) — a HOLD is not a refusal: when the final put's
+/// statement door HOLDS the row (a fold condition not yet met; WD-fix4 routes
+/// a statement-carrying row through the statement funnel), the answer is the
+/// gate's error, as before, but the statement is KEPT and concludes when what
+/// it waits for arrives. Told apart structurally by
+/// [`kept_waiting`](super::attestation_admit::kept_waiting) (the fold's held
+/// state, `fold::why_held`), never by the error's text; a re-offer is a no-op
+/// on the statement id.
+///
 /// The `slash` authority check is
 /// [`check_delegated_duty_scores_admission`](super::admission::check_delegated_duty_scores_admission)
 /// — the same gate `put_attestation` runs on all three backends. It is called

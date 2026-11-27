@@ -1513,8 +1513,14 @@ pub(crate) async fn i3245_i3247_infrastructure_rooted_here(d: &dyn FederationDir
 /// with no role. It lands: no voice of the node, no acceptance row from the
 /// node or from an owner (the seat has none), and the node is on the roster,
 /// not a founder (it holds no vote). KR-fix10's consent rule is not asked.
-/// Control: the same room listing a `node` key that is NO seat of the bundle
-/// does not land on the holders' voices alone.
+///
+/// v62.0.0 (KR-fix23; CC 4.4.3.19 as written: "seated by the founders' count
+/// alone, for the canonical room with the bundle's conferral") — the same
+/// room listing a `node` key that is NO seat of the bundle ALSO lands on the
+/// holders' voices alone (any infrastructure room seats a node by the
+/// founders' count; before KR-fix23 it did not land). Only THE CANONICAL room
+/// (`ciris-canonical`) asks for the bundle's conferral: the one predicate
+/// answers no for that node there, yes for the seat.
 pub(crate) async fn i4290_a_bundle_seat_is_seated_without_acceptance(d: &dyn FederationDirectory) {
     use crate::federation::edition2::fixture_trust_root::rooted_trust_root;
     use crate::federation::membership_acceptance::node_seated_without_acceptance;
@@ -1623,18 +1629,50 @@ pub(crate) async fn i4290_a_bundle_seat_is_seated_without_acceptance(d: &dyn Fed
         "I4290: and it has no owner yet (the founding seats it before any owner binding)"
     );
 
-    // Control: a node that is no seat of the bundle is not seated that way.
+    // KR-fix23 — a node that is no seat of the bundle, in an infrastructure
+    // room that is not the canonical one: seated by the founders' count too.
     let (out, _) = found("i4290-stray-room", stray.clone()).await;
     assert!(
-        !matches!(out, Ok(StatementOutcome::Row { .. })),
-        "I4290: a node that is no bundle seat is not seated by others' voices alone: {out:?}"
+        matches!(out, Ok(StatementOutcome::Row { .. })),
+        "I4290 (KR-fix23): any node is seated by the founders' count in an infrastructure \
+         room: {out:?}"
     );
+    let stray_cid = e2::kid("i4290-stray-room");
+    let stray_room = d
+        .lookup_community(&stray_cid)
+        .await
+        .unwrap()
+        .expect("I4290 (KR-fix23): that room landed");
     assert!(
-        d.lookup_community(&e2::kid("i4290-stray-room"))
+        d.active_community_members(&stray_cid)
             .await
             .unwrap()
-            .is_none(),
-        "I4290: that room did not land"
+            .iter()
+            .any(|m| m.key_id == stray && m.role.is_none()),
+        "I4290 (KR-fix23): the node is an active member, with no vote"
+    );
+    assert!(
+        node_seated_without_acceptance(d, &stray_room, &stray, stray_room.founded_at)
+            .await
+            .unwrap(),
+        "I4290 (KR-fix23): the one predicate answers yes for it there"
+    );
+    // The canonical room asks for the bundle's conferral: the same record
+    // under the reserved id seats the bundle's seat and not that node.
+    let mut canonical = stray_room.clone();
+    canonical.community_key_id =
+        crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID.to_owned();
+    assert!(
+        !node_seated_without_acceptance(d, &canonical, &stray, canonical.founded_at)
+            .await
+            .unwrap(),
+        "I4290 (KR-fix23): in the canonical room a node that is no bundle seat is not seated so"
+    );
+    assert!(
+        node_seated_without_acceptance(d, &canonical, &seat, canonical.founded_at)
+            .await
+            .unwrap(),
+        "I4290 (KR-fix23): in the canonical room the bundle's seat is"
     );
 }
 
