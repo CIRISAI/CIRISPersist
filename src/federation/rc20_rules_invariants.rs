@@ -170,20 +170,18 @@ mod pure_1871 {
             "I1871: no ceremony confers it"
         );
         assert_eq!(it::SELF_REPORT_IDENTITY_TYPES, [it::SUBSTRATE_PERSIST]);
-        // The families reserved to it are self-reports only.
+        // v62.0.0 (D1; CC 3.4.7 "No admission decision reads it to open a
+        // reserved family") — no family is reserved to it at all: the
+        // self-report families are the owner's `infra:attest`.
         for rule in crate::federation::admission::default_reserved_prefix_rules() {
-            if rule
-                .required_identity_types
-                .iter()
-                .any(|t| t == it::SUBSTRATE_PERSIST)
-            {
-                assert!(
-                    crate::federation::admission::SUBSTRATE_SELF_REPORT_PREFIXES
-                        .contains(&rule.pattern_prefix.as_str()),
-                    "I1871: {} keyed on substrate_persist is not a self-report family",
-                    rule.pattern_prefix
-                );
-            }
+            assert!(
+                !rule
+                    .required_identity_types
+                    .iter()
+                    .any(|t| t == it::SUBSTRATE_PERSIST),
+                "I1871: {} opens on the substrate_persist label",
+                rule.pattern_prefix
+            );
         }
     }
 }

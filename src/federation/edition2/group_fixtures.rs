@@ -89,16 +89,168 @@ pub fn roster_voices(
     asserted_at_ms: u64,
     signers: &[&CompositeSigningKey],
 ) -> Vec<Vec<u8>> {
-    let p = roster_payload(record, version, head, asserted_at_ms)
-        .expect("group_fixtures: roster payload");
-    let group = match record {
-        GroupRecord::Family(f) => &f.family_key_id,
-        GroupRecord::Community(c) => &c.community_key_id,
+    let (group, p) = if version == 1 && head.is_none() {
+        fixture_founding(record, asserted_at_ms)
+    } else {
+        // v62.0.0 (GID-fixtures-mech.rev2, .fix2) — a later version of a
+        // room a fixture founded names its DERIVED id and carries the
+        // `founded_at` it was founded at, whichever spelling the record uses.
+        let record = &fixture_record(record);
+        let group = match record {
+            GroupRecord::Family(f) => f.family_key_id.clone(),
+            GroupRecord::Community(c) => c.community_key_id.clone(),
+        };
+        let p = roster_payload(record, version, head, asserted_at_ms)
+            .expect("group_fixtures: roster payload");
+        (group, p)
     };
     signers
         .iter()
-        .map(|k| sign_group_payload(k, group, GROUP_ROSTER_PREFIX, &p))
+        .map(|k| sign_group_payload(k, &group, GROUP_ROSTER_PREFIX, &p))
         .collect()
+}
+
+/// v62.0.0 (GID-fixtures) — **a fixture's FIRST version**: `record`'s id is
+/// the NAME the fixture gave the room (a seed's identity-ref, or the derived
+/// id when it was founded before); the payload is founded under the DERIVED
+/// id with the name's fixture nonce ([`fixture_group_nonce`](super::fixture_switch::fixture_group_nonce)),
+/// and the name is recorded so `kid(name)` answers the derived id after.
+/// Returns the derived id and the payload.
+///
+/// v62.0.0 (GID-fixtures-mech.rev2) — the record's `founded_at` is REPLACED
+/// by the name's fixture instant
+/// ([`fixture_founded_at`](super::fixture_switch::fixture_founded_at)):
+/// it is an input of the derived id, so the wall-clock instant a fixture
+/// builds its record with would derive a different id on each node.
+/// `asserted_at_ms` (the row's instant, the test's clock seam) is kept.
+///
+/// # Panics
+/// A record that does not encode.
+#[must_use]
+pub fn fixture_founding(record: &GroupRecord, asserted_at_ms: u64) -> (String, Value) {
+    let mut rec = with_fixture_founded_at(record, true);
+    let alias = match &rec {
+        GroupRecord::Family(f) => f.family_key_id.clone(),
+        GroupRecord::Community(c) => c.community_key_id.clone(),
+    };
+    let nonce = super::fixture_switch::fixture_group_nonce(&alias);
+    let founded_at_ms = super::fixture_switch::fixture_founded_at_ms(&alias);
+    let (gid, p) = super::group::founding_payload(&mut rec, &nonce, asserted_at_ms)
+        .expect("group_fixtures: founding payload");
+    super::fixture_switch::note_founded_group(&[&alias], &gid, nonce, founded_at_ms);
+    (gid, p)
+}
+
+/// v62.0.0 (GID-fixtures-mech.rev2.fix2) — **`record` as a LATER version
+/// of a room a fixture founded states it**: its id the room's DERIVED id
+/// and its `founded_at` the founding's, when the record names (by any
+/// alias: the seed, its identity-ref) a room founded in this process;
+/// otherwise unchanged. Local roster builders in witnesses call it for
+/// every version after the first.
+#[must_use]
+pub fn fixture_record(record: &GroupRecord) -> GroupRecord {
+    let mut rec = with_fixture_founded_at(record, false);
+    match &mut rec {
+        GroupRecord::Family(f) => {
+            if let Some(g) = super::fixture_switch::founded_group_id(&f.family_key_id) {
+                f.family_key_id = g;
+            }
+        }
+        GroupRecord::Community(c) => {
+            if let Some(g) = super::fixture_switch::founded_group_id(&c.community_key_id) {
+                c.community_key_id = g;
+            }
+        }
+    }
+    rec
+}
+
+/// v62.0.0 (GID-fixtures-mech.rev2.fix2) — [`fixture_founding`] of a first
+/// version that also CITES `proofs` (`refs.cites`, a geographic room's
+/// location proofs; `group::roster_payload_citing`): the same derived id,
+/// nonce and fixture instant.
+///
+/// # Panics
+/// A record that does not encode.
+#[must_use]
+pub fn fixture_founding_citing(
+    record: &GroupRecord,
+    proofs: &[RowId],
+    asserted_at_ms: u64,
+) -> (String, Value) {
+    use ciris_verify_core::cde;
+    let gid = fixture_group_id(record);
+    let mut rec = with_fixture_founded_at(record, true);
+    let alias = match &mut rec {
+        GroupRecord::Family(f) => std::mem::replace(&mut f.family_key_id, gid.clone()),
+        GroupRecord::Community(c) => std::mem::replace(&mut c.community_key_id, gid.clone()),
+    };
+    let nonce = super::fixture_switch::fixture_group_nonce(&alias);
+    let founded_at_ms = super::fixture_switch::fixture_founded_at_ms(&alias);
+    let mut p = super::group::roster_payload_citing(&rec, 1, None, proofs, asserted_at_ms)
+        .expect("group_fixtures: citing founding payload");
+    let Value::Map(m) = &mut p else {
+        panic!("group_fixtures: the payload is not a map")
+    };
+    m.push((Value::Text("nonce".into()), Value::Bytes(nonce.to_vec())));
+    m.sort_by_key(|(k, _)| cde::encode(k));
+    super::fixture_switch::note_founded_group(&[&alias], &gid, nonce, founded_at_ms);
+    (gid, p)
+}
+
+/// v62.0.0 (GID-fixtures-mech.rev2.fix2) — **the id a fixture founding of
+/// `record` WILL derive**, without founding it: the name's fixture instant
+/// and nonce, the record's members. The registry is NOT written (only a
+/// founding writes it), so [`room_id`](super::fixture_switch::room_id)
+/// still panics until the room is founded. For a row that must name a room
+/// before the room lands (a wait witness, I724).
+///
+/// # Panics
+/// A record whose `founded_at` does not encode.
+#[must_use]
+pub fn fixture_group_id(record: &GroupRecord) -> String {
+    let rec = with_fixture_founded_at(record, true);
+    let (kind, alias, founders): (&str, String, Vec<String>) = match &rec {
+        GroupRecord::Family(f) => (
+            "family",
+            f.family_key_id.clone(),
+            f.members.iter().map(|m| m.key_id.clone()).collect(),
+        ),
+        GroupRecord::Community(c) => (
+            "community",
+            c.community_key_id.clone(),
+            c.members.iter().map(|m| m.key_id.clone()).collect(),
+        ),
+    };
+    let refs: Vec<&str> = founders.iter().map(String::as_str).collect();
+    super::group_id::derive_group_id(
+        kind,
+        &refs,
+        super::fixture_switch::fixture_founded_at_ms(&alias),
+        &super::fixture_switch::fixture_group_nonce(&alias),
+    )
+}
+
+/// v62.0.0 (GID-fixtures-mech.rev2) — `record` with its `founded_at` set to
+/// the fixture instant of the room it names: always when `founding`; for a
+/// later version, only when a fixture founded that room in this process (a
+/// room no fixture founded keeps its own).
+#[must_use]
+pub fn with_fixture_founded_at(record: &GroupRecord, founding: bool) -> GroupRecord {
+    use super::fixture_switch::{fixture_founded_at, founded_group_id};
+    let mut rec = record.clone();
+    let alias = match &rec {
+        GroupRecord::Family(f) => f.family_key_id.clone(),
+        GroupRecord::Community(c) => c.community_key_id.clone(),
+    };
+    if founding || founded_group_id(&alias).is_some() {
+        let at = fixture_founded_at(&alias);
+        match &mut rec {
+            GroupRecord::Family(f) => f.founded_at = at,
+            GroupRecord::Community(c) => c.founded_at = at,
+        }
+    }
+    rec
 }
 
 /// One voice per signer of a MERGE version (CC 2.7.8): `record` at
@@ -180,6 +332,34 @@ fn signer_keys(authority: &str, cosignatures: &[RosterCosignature]) -> Vec<Compo
         .collect()
 }
 
+/// v62.0.0 (GID-fixtures) — the voices of a roster: [`signer_keys`], except
+/// that a record "signed by the group's own key" (its authority names the
+/// group itself: a fixture fiction, since a group has no key) is signed by
+/// its FIRST listed member (`first_members[0]`), deduplicated.
+fn roster_signer_keys(
+    authority: &str,
+    cosignatures: &[RosterCosignature],
+    group: &str,
+    members: &[&str],
+) -> Vec<CompositeSigningKey> {
+    let is_group = authority == group || kid_or_keep(authority) == kid_or_keep(group);
+    // The first member the record lists (`first_members[0]`).
+    let first = members.first().copied();
+    let lead = if is_group {
+        first.unwrap_or(authority)
+    } else {
+        authority
+    };
+    let mut ids: Vec<&str> = vec![lead];
+    for c in cosignatures {
+        let id = c.authority_key_id.as_str();
+        if !ids.contains(&id) && kid_or_keep(id) != kid_or_keep(group) {
+            ids.push(id);
+        }
+    }
+    ids.into_iter().map(signing_key).collect()
+}
+
 fn voices_with(
     keys: &[CompositeSigningKey],
     f: impl Fn(&[&CompositeSigningKey]) -> Vec<Vec<u8>>,
@@ -207,6 +387,11 @@ pub fn family_with_kids(f: &Family) -> Family {
 }
 
 /// A community record with every key id as its identity-ref.
+///
+/// v62.0.0 (SEAT-fx1; CC 4.5.4) — the keys a founding names in
+/// `policy_blob.duty_holders` too, so a fixture names its founding duty
+/// holders by the same seeds it lists its members by. A record whose blob
+/// names none is returned exactly as before.
 #[must_use]
 pub fn community_with_kids(c: &Community) -> Community {
     Community {
@@ -220,8 +405,31 @@ pub fn community_with_kids(c: &Community) -> Community {
                 role: m.role.clone(),
             })
             .collect(),
+        policy_blob: duty_holders_with_kids(c.policy_blob.as_ref()),
         ..c.clone()
     }
+}
+
+/// v62.0.0 (SEAT-fx1) — `blob` with each key of its `duty_holders` map
+/// (duty → keys) as its identity-ref ([`kid_or_keep`]); any other member,
+/// and a blob with no `duty_holders`, unchanged.
+fn duty_holders_with_kids(blob: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let mut b = blob?.clone();
+    if let Some(holders) = b
+        .get_mut("duty_holders")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for keys in holders.values_mut() {
+            if let Some(a) = keys.as_array_mut() {
+                for k in a.iter_mut() {
+                    if let Some(s) = k.as_str() {
+                        *k = serde_json::Value::String(kid_or_keep(s));
+                    }
+                }
+            }
+        }
+    }
+    Some(b)
 }
 
 /// **`sign_family`'s twin**: the roster voices of `signed` (its authority,
@@ -234,8 +442,15 @@ pub fn family_voices(
     asserted_at_ms: u64,
 ) -> Vec<Vec<u8>> {
     let record = GroupRecord::Family(family_with_kids(&signed.family));
+    let f = &signed.family;
+    let members: Vec<&str> = f.members.iter().map(|m| m.key_id.as_str()).collect();
     voices_with(
-        &signer_keys(&signed.authority_key_id, &signed.cosignatures),
+        &roster_signer_keys(
+            &signed.authority_key_id,
+            &signed.cosignatures,
+            &f.family_key_id,
+            &members,
+        ),
         |k| roster_voices(&record, version, head, asserted_at_ms, k),
     )
 }
@@ -249,8 +464,15 @@ pub fn community_voices(
     asserted_at_ms: u64,
 ) -> Vec<Vec<u8>> {
     let record = GroupRecord::Community(community_with_kids(&signed.community));
+    let c = &signed.community;
+    let members: Vec<&str> = c.members.iter().map(|m| m.key_id.as_str()).collect();
     voices_with(
-        &signer_keys(&signed.authority_key_id, &signed.cosignatures),
+        &roster_signer_keys(
+            &signed.authority_key_id,
+            &signed.cosignatures,
+            &c.community_key_id,
+            &members,
+        ),
         |k| roster_voices(&record, version, head, asserted_at_ms, k),
     )
 }
@@ -324,15 +546,64 @@ pub fn community_widening_voices(
 
 // ── The `*_naming_held` twins ─────────────────────────────────────────────
 
-/// **The held head of `group`** (an identity-ref): the row id of the
-/// `group:roster` version whose typed record is the one `federation_families`
-/// / `federation_communities` holds, and its version. `None` when the group
-/// is not held, or no held statement maps to its head (an earlier-form
-/// record).
+/// v62.0.0 (LINEAGE-L2; CC 2.7.8, CC 3.3.4) — **the fixtures' twin of
+/// `head_rule::roster_heads`**: every current head of `group`'s roster
+/// lineage (a `group:roster` version or a counted widening / removal no
+/// other node extends), by row id. Empty when no node of the group is held.
+///
+/// # Panics
+/// A directory read failure.
+pub async fn held_heads<D: FederationDirectory + ?Sized>(dir: &D, group: &str) -> Vec<RowId> {
+    super::lineage::heads(dir, group)
+        .await
+        .expect("group_fixtures: the lineage heads")
+}
+
+/// v62.0.0 (LINEAGE-L2) — **the head a row placed in `group` names**
+/// (`refs.head`: the lowest of [`held_heads`] by row id, as the producer
+/// states it), with the number of the restating version it stands on, so a
+/// test drafts the next `group:roster` version as `(head, version + 1)`.
+/// After a counted widening or removal the head is that change, not the
+/// version ([`held_version`] is the version). `None` when no node of the
+/// group is held.
 ///
 /// # Panics
 /// A directory read failure.
 pub async fn held_head<D: FederationDirectory + ?Sized>(
+    dir: &D,
+    group: &str,
+) -> Option<(RowId, u64)> {
+    let head = *held_heads(dir, group).await.first()?;
+    let mut version = None;
+    for v in super::lineage::nearest_versions(dir, &[head])
+        .await
+        .expect("group_fixtures: nearest_versions")
+    {
+        let voices = dir
+            .edition2_voices(&v)
+            .await
+            .expect("group_fixtures: edition2_voices");
+        if let Some(n) = voices
+            .first()
+            .and_then(|st| roster_view_of_statement(st).ok())
+            .map(|r| r.version)
+        {
+            version = Some(version.map_or(n, |x: u64| x.max(n)));
+        }
+    }
+    Some((head, version?))
+}
+
+/// **The held VERSION of `group`** (an identity-ref): the row id of the
+/// `group:roster` version whose typed record is the one `federation_families`
+/// / `federation_communities` holds, and its version. `None` when the group
+/// is not held, or no held statement maps to its head (an earlier-form
+/// record). v62.0.0 (LINEAGE-L2) — before the head moved on a membership
+/// change this was `held_head`; it is the restating version, not the head.
+///
+/// # Panics
+/// A directory read failure.
+pub async fn held_version<D: FederationDirectory + ?Sized>(
     dir: &D,
     group: &str,
 ) -> Option<(RowId, u64)> {

@@ -288,9 +288,13 @@ where
         door == CommunityDoor::ReplicatedApply,
     )
     .await?;
-    // v61 S2 (CIRISPersist#1123) — a room stored under founder_only admits
-    // one new version, its escape, on both doors.
-    super::admission::check_founder_only_escape(dir, &community, received_at).await?;
+    // v62.0.0 (LINEAGE-L6b (b)) — the v61 S2 "room stored under
+    // founder_only" gates are DELETED: no such room can exist on a v62 node
+    // (the edition upgrade deletes the earlier store, CC "nothing carries";
+    // every edition-2 roster version, replicated or not, takes the record
+    // door's Local branch, which refuses founder_only above the family;
+    // the earlier-form replicated door is shut). A guard nothing reaches is
+    // a comment (P/LINEAGE-L6b-b.md: the producer grep).
     let row = &community.community;
     // v4.0 — the consensus_protocol canonical form.
     super::check_consensus_protocol_form(&row.consensus_protocol)?;
@@ -405,23 +409,16 @@ where
     // SecReview F4 — community removal is immediate for forward-secrecy; a
     // future-dated effective_at is refused BEFORE any write.
     super::community_dek::reject_future_dated_community_revocation(row.effective_at, received_at)?;
-    // v61 S2 (CIRISPersist#1123) — a room stored under founder_only admits
-    // no removal but a member's own resignation.
-    {
-        let self_leave = revocation.authority_key_id == row.removed_identity_key_id
-            || revocation
-                .cosignatures
-                .iter()
-                .any(|c| c.authority_key_id == row.removed_identity_key_id);
-        if !self_leave {
-            super::admission::refuse_membership_event_under_founder_only(
-                dir,
-                &row.community_key_id,
-                "removal",
-            )
-            .await?;
-        }
-    }
+    // v62.0.0 (RESIGN-3; CC 3.1.3.2) — the resignation is the LEAF the row
+    // persists, never a removal whose voices include its subject.
+    let change = super::RosterChange::of_leaf(row.leaf);
+    // v62.0.0 (LINEAGE-L6b (b)) — the v61 S2 "room stored under
+    // founder_only" gates are DELETED: no such room can exist on a v62 node
+    // (the edition upgrade deletes the earlier store, CC "nothing carries";
+    // every edition-2 roster version, replicated or not, takes the record
+    // door's Local branch, which refuses founder_only above the family;
+    // the earlier-form replicated door is shut). A guard nothing reaches is
+    // a comment (P/LINEAGE-L6b-b.md: the producer grep).
     // v61 S2 (CC 4.5.13) — under `open:self_admit`, the removal window, at
     // the local door only.
     if !super::group_plane::applying_replicated_group_row() {
@@ -442,7 +439,7 @@ where
             joined_at: row.effective_at,
             role: None,
         },
-        true,
+        change,
         fold_at,
     )
     .await?
@@ -453,11 +450,8 @@ where
     // v50.0.0 (review, M1 loophole) — removing a founder of a conformant
     // infrastructure room would leave its declared N stale.
     if let Some(stored) = dir.lookup_community(&row.community_key_id).await? {
-        let self_leave = revocation.authority_key_id == row.removed_identity_key_id
-            || revocation
-                .cosignatures
-                .iter()
-                .any(|c| c.authority_key_id == row.removed_identity_key_id);
+        // v62.0.0 (RESIGN-3) — by the leaf.
+        let self_leave = change.is_resignation();
         super::admission::check_infrastructure_founder_count_unchanged(
             dir,
             &stored,
@@ -502,8 +496,9 @@ where
 /// when the voices signed, and refusing a removal another node admitted in
 /// time would fork the roster.
 ///
-/// A resignation (the removed member among the signers) is a member's own
-/// act, not a counted removal, and is not bounded. Any other protocol, and a
+/// A resignation (v62.0.0 RESIGN-3: the `resignation` leaf, never a removal
+/// whose voices include its subject) is a member's own act, not a counted
+/// removal, and is not bounded. Any other protocol, and a
 /// room this node does not hold, pass.
 pub(crate) async fn check_open_self_admit_removal_window<D>(
     dir: &D,
@@ -520,9 +515,7 @@ where
     if community.consensus_protocol != super::types::consensus_protocol::OPEN_SELF_ADMIT {
         return Ok(());
     }
-    let signers =
-        super::roster_row_signer_set(&revocation.authority_key_id, &revocation.cosignatures);
-    if signers.contains(&row.removed_identity_key_id) {
+    if row.leaf.is_resignation() {
         return Ok(());
     }
     let window = chrono::Duration::seconds(super::consensus::OPEN_SELF_ADMIT_REMOVAL_WINDOW_SECS);
@@ -605,14 +598,13 @@ where
     super::verify_community_membership_widening_admission(dir, &widening).await?;
     let row = &widening.community_membership_widening;
     super::community_dek::reject_future_dated_community_widening(row.effective_at, received_at)?;
-    // v61 S2 (CIRISPersist#1123) — a room stored under founder_only admits
-    // no widening.
-    super::admission::refuse_membership_event_under_founder_only(
-        dir,
-        &row.community_key_id,
-        "widening",
-    )
-    .await?;
+    // v62.0.0 (LINEAGE-L6b (b)) — the v61 S2 "room stored under
+    // founder_only" gates are DELETED: no such room can exist on a v62 node
+    // (the edition upgrade deletes the earlier store, CC "nothing carries";
+    // every edition-2 roster version, replicated or not, takes the record
+    // door's Local branch, which refuses founder_only above the family;
+    // the earlier-form replicated door is shut). A guard nothing reaches is
+    // a comment (P/LINEAGE-L6b-b.md: the producer grep).
     // v49.0.0 (CIRISPersist#908) — whose signature, not just whether: the
     // signer must have standing in the room at the row's instant.
     // v61.3.0 (CIRISPersist#1252) — the shortfall split out, as on removal.
@@ -622,7 +614,7 @@ where
         &widening.authority_key_id,
         &super::roster_row_signer_set(&widening.authority_key_id, &widening.cosignatures),
         row.member(),
-        false,
+        super::RosterChange::Widening,
         fold_at,
     )
     .await?

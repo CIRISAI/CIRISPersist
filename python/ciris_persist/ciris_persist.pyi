@@ -1896,7 +1896,7 @@ class Engine:
     def submit_voice(self, statement_hex: str) -> str:
         """(derived) deontic — v62.0.0 (v62 P8-fix5) — submit a second signer's voice signed elsewhere (statement_hex: the assembled COSE_Sign1, lowercase hex) through the statem..."""
 
-    def voice_draft(self, row_id: str, signer_iss: str) -> str:
+    def voice_draft(self, row_id: str, signer_iss: str, signer_kid: str | None = None) -> str:
         """(derived) procedural — v62.0.0 (v62 P8-fix5) — a held row's voice, drafted for a hardware or remote second signer (signer_iss, its identity-ref): JSON {protected, payload..."""
 
     def voice_held_row(self, row_id: str) -> str:

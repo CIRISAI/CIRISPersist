@@ -708,6 +708,197 @@ pub mod bodies {
         );
     }
 
+    /// **I6930 (LINEAGE-L6b (c); CC 2.4.1.1, Kernel 11-24) — a founder
+    /// issues at the head its licence names.** A `founder_only` affiliation
+    /// founded by a; two widenings naming v1 make two tips: x (a member) at
+    /// T1, y (a FOUNDER) at T2. y's licence naming T2 is the affiliation's
+    /// own act (`Authority`); the same licence naming T1, where y holds no
+    /// founder seat, is not. Red on the founders folded at the signed
+    /// instant (y, a founder by then, issued at T1 too).
+    pub async fn i6930_a_founder_issues_at_the_head_it_names(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::admission::{
+            licensure_issuance_at, resolve_licensure_authority, LicensureIssuance,
+        };
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::room_roster_authority_invariants::bodies::{consent, head_of};
+        use crate::federation::types::CommunityMembershipWidening;
+        let (aff, k) = affiliation(
+            d,
+            &format!("{tag}-fo"),
+            consensus_protocol::FOUNDER_ONLY,
+            &["a", "b"],
+            1,
+            None,
+        )
+        .await;
+        let [x, y, holder] = ["x", "y", "holder"].map(|n| format!("{tag}-{n}"));
+        for n in [&x, &y, &holder] {
+            crate::federation::licensure_chain_invariants::bodies::reg(
+                d,
+                n,
+                &[identity_type::USER],
+            )
+            .await;
+        }
+        let v1 = head_of(d, &aff).await.expect("I6930: the founding version");
+        let widening = |m: &str, role: Option<&str>| CommunityMembershipWidening {
+            community_key_id: aff.clone(),
+            member_key_id: m.to_owned(),
+            joined_at: base() - Duration::minutes(3),
+            effective_at: base() - Duration::minutes(3),
+            role: role.map(str::to_owned),
+            persist_row_hash: String::new(),
+        };
+        let mut tips = Vec::new();
+        for (m, role) in [(&x, None), (&y, Some("founder"))] {
+            let w = widening(m, role);
+            consent(d, &k[0], &w).await;
+            let voices = e2::community_widening_voices(
+                &ts::sign_community_membership_widening(&k[0], w),
+                Some(&v1),
+            );
+            let id = e2::row_id_of(&voices[0]);
+            let r = e2::put_voices(d, &voices).await;
+            assert!(
+                matches!(r, Ok(StatementOutcome::Row { .. })),
+                "[{tag}] I6930 premise: the widening of {m} lands: {r:?}"
+            );
+            tips.push(id);
+        }
+        let (t1, t2) = (tips[0], tips[1]);
+        let authority = resolve_licensure_authority(d, &key_id(&aff))
+            .await
+            .expect("I6930: the authority");
+        let issued_at = |head: &crate::federation::edition2::names::RowId| {
+            let mut shape = licence(
+                &y,
+                &holder,
+                &aff,
+                "issued",
+                None,
+                base() - Duration::minutes(1),
+            );
+            shape.attestation_envelope["refs"] =
+                serde_json::json!({ "head": [2, [-16, head.hex()]] });
+            e2::row_of(&shape, &e2::seed_of(&shape.attesting_key_id))
+        };
+        let at_t2 = issued_at(&t2);
+        assert!(
+            matches!(
+                licensure_issuance_at(d, &authority, &at_t2, base())
+                    .await
+                    .unwrap(),
+                LicensureIssuance::Authority
+            ),
+            "[{tag}] I6930: naming T2, y holds the founder seat: the affiliation's act"
+        );
+        let at_t1 = issued_at(&t1);
+        assert!(
+            !matches!(
+                licensure_issuance_at(d, &authority, &at_t1, base())
+                    .await
+                    .unwrap(),
+                LicensureIssuance::Authority
+            ),
+            "[{tag}] I6930: naming T1, y holds no founder seat there"
+        );
+    }
+
+    /// **I6931 (LINEAGE-L6b (d); CC 4.4.3.12, Kernel 11-24) — the deciding
+    /// seats are read at the head the change names.** A `founder_only`
+    /// affiliation founded by a, with member b; tips T1 (x, a member) and T2
+    /// (y, a FOUNDER), both naming v1. A removal of b voiced by a alone
+    /// naming T1 meets ONE deciding seat there (a): the one-seat floor asks a
+    /// countersign from outside the seat, and there is none: it does not
+    /// land. The same removal naming T2 meets two seats (a, y): no floor; it
+    /// lands. Red on the roster folded at the instant (a and y both
+    /// founders: no floor for the T1 removal either).
+    pub async fn i6931_deciding_seats_are_read_at_the_named_head(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::edition2::fixture_switch as e2;
+        use crate::federation::room_roster_authority_invariants::bodies::{consent, head_of};
+        use crate::federation::types::{
+            CommunityMembershipRevocation, CommunityMembershipWidening, RevocationLeaf,
+        };
+        let (aff, k) = affiliation(
+            d,
+            &format!("{tag}-ds"),
+            consensus_protocol::FOUNDER_ONLY,
+            &["a", "b"],
+            1,
+            None,
+        )
+        .await;
+        let [x, y] = ["x", "y"].map(|n| format!("{tag}-{n}"));
+        for n in [&x, &y] {
+            crate::federation::licensure_chain_invariants::bodies::reg(
+                d,
+                n,
+                &[identity_type::USER],
+            )
+            .await;
+        }
+        let v1 = head_of(d, &aff).await.expect("I6931: the founding version");
+        let mut tips = Vec::new();
+        for (m, role) in [(&x, None), (&y, Some("founder"))] {
+            let w = CommunityMembershipWidening {
+                community_key_id: aff.clone(),
+                member_key_id: m.clone(),
+                joined_at: base() - Duration::minutes(3),
+                effective_at: base() - Duration::minutes(3),
+                role: role.map(str::to_owned),
+                persist_row_hash: String::new(),
+            };
+            consent(d, &k[0], &w).await;
+            let voices = e2::community_widening_voices(
+                &ts::sign_community_membership_widening(&k[0], w),
+                Some(&v1),
+            );
+            let id = e2::row_id_of(&voices[0]);
+            let r = e2::put_voices(d, &voices).await;
+            assert!(
+                matches!(r, Ok(StatementOutcome::Row { .. })),
+                "[{tag}] I6931 premise: the widening of {m} lands: {r:?}"
+            );
+            tips.push(id);
+        }
+        let removal = |head: &crate::federation::edition2::names::RowId, mins: i64| {
+            let at = base() - Duration::minutes(mins);
+            e2::community_revocation_voices(
+                &ts::sign_community_membership_revocation(
+                    &k[0],
+                    CommunityMembershipRevocation {
+                        community_key_id: aff.clone(),
+                        removed_identity_key_id: k[1].clone(),
+                        removed_at: at,
+                        effective_at: at,
+                        reason: None,
+                        witness_set: vec![],
+                        persist_row_hash: String::new(),
+                        leaf: RevocationLeaf::Removal,
+                    },
+                ),
+                Some(head),
+            )
+        };
+        let r = e2::put_voices(d, &removal(&tips[0], 2)).await;
+        assert!(
+            !matches!(r, Ok(StatementOutcome::Row { .. })),
+            "[{tag}] I6931: at T1 a is the one deciding seat: no outside countersign, no \
+             removal: {r:?}"
+        );
+        let r = e2::put_voices(d, &removal(&tips[1], 1)).await;
+        assert!(
+            matches!(r, Ok(StatementOutcome::Row { .. })),
+            "[{tag}] I6931: at T2 a and y are two seats: no floor, the removal lands: {r:?}"
+        );
+    }
+
     /// **I1214** — a licence under a quorum is a cosigned row.
     pub async fn i1214_quorum_licence_is_cosigned(d: &dyn FederationDirectory, tag: &str) {
         let (aff, k) = affiliation(
@@ -1496,10 +1687,10 @@ pub mod bodies {
             .await
             .expect("capability_roots_to_trusted_root");
             assert!(
-                rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
+                rooted.as_ref().is_some_and(|g| g.root_key_id == r.lineage),
                 "[{tag}] I1218 precondition: the board's slash roots at {} through this node: \
                  {rooted:?}",
-                r.root
+                r.lineage
             );
         }
         let lic = must_put(
@@ -1619,51 +1810,38 @@ pub mod bodies {
         // revocation stands (CC 2.4.1.1: an entity revocation is withdrawn by
         // nobody). The typed plane holds no attestation row under the
         // statement's id; v62.0.0 (LF-fix2, P5) the withdraws gate reads the
-        // statement store under it and SETTLES `withdraws_not_admitted` (it
-        // waited `link_unheld` forever).
-        // Strict (LF-fix2): the door's own outcome is HELD, the fold's reason
-        // is exactly `withdraws_not_admitted`, nothing concludes, and the held
-        // set (the pending sweep's input) carries it settled, never waiting.
+        // statement store under it. v62.0.0 (KR-fix20; the count always wins)
+        // — the target is held and never withdrawn, so the door REFUSES the
+        // withdraws by name (`withdraws_never_retracts`) and keeps nothing: no
+        // fold record, no statement, nothing in the held set (it was held
+        // `withdraws_not_admitted` for ever before).
         {
-            use crate::federation::edition2::fold::{self, reason};
-            let (w, out) = crate::federation::licensure_chain_invariants::bodies::offer(
-                d,
-                &withdraw(&holder, &adverse.attestation_id, 20),
-            )
-            .await
-            .unwrap_or_else(|e| {
-                panic!("[{tag}] I1218: the subject's withdraws of the revocation is held: {e}")
-            });
-            let Some(StatementOutcome::Pending { row_id: wid, .. }) = out else {
-                panic!(
-                    "[{tag}] I1218: a subject's withdraws against revocation concludes nothing: \
-                     {out:?}"
-                );
-            };
-            assert_eq!(
-                fold::why_held(d, &wid).await.unwrap().map(|h| h.reason),
-                Some(reason::WITHDRAWS_NOT_ADMITTED.to_owned()),
-                "[{tag}] I1218: a subject's withdraws against revocation settles not admitted"
-            );
+            use crate::federation::edition2::fold;
+            // The held set as a full re-fold leaves it, before the offer.
+            fold::refold_all(d)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] I1218: refold_all: {e:?}"));
+            let held_before = fold::held_rows(d, None, fold::MAX_HELD_PAGE).await.unwrap();
+            let w = withdraw(&holder, &adverse.attestation_id, 20);
+            let refusal = crate::federation::licensure_chain_invariants::bodies::offer(d, &w)
+                .await
+                .expect_err("I1218: a subject's withdraws of the revocation is refused");
             assert!(
-                d.get_attestation(&w.attestation_id)
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "[{tag}] I1218: the withdraws concludes nothing"
+                matches!(
+                    &refusal,
+                    Error::MalformedRow { reason, .. }
+                        if *reason == crate::federation::malformed_row::WITHDRAWS_NEVER_RETRACTS
+                ),
+                "[{tag}] I1218: refused withdraws_never_retracts: {refusal:?}"
             );
             fold::refold_all(d)
                 .await
                 .unwrap_or_else(|e| panic!("[{tag}] I1218: refold_all: {e:?}"));
-            let page = fold::held_rows(d, None, fold::MAX_HELD_PAGE).await.unwrap();
-            let entry = page
-                .iter()
-                .find(|h| h.row_id == wid)
-                .unwrap_or_else(|| panic!("[{tag}] I1218: the settled withdraws is held"));
+            let held_after = fold::held_rows(d, None, fold::MAX_HELD_PAGE).await.unwrap();
             assert_eq!(
-                entry.reason,
-                reason::WITHDRAWS_NOT_ADMITTED,
-                "[{tag}] I1218: the held set carries the settle, never `link_unheld`"
+                held_after.iter().map(|h| h.row_id).collect::<Vec<_>>(),
+                held_before.iter().map(|h| h.row_id).collect::<Vec<_>>(),
+                "[{tag}] I1218: nothing of the refused withdraws is held"
             );
         }
         assert!(
@@ -1758,14 +1936,17 @@ pub mod bodies {
         )
         .await;
         let binding = |steward: &str, node: &str, community: Option<&str>| {
+            // v62.0.0 (BIND-1; CC rc22 rule `owner-binding`) — the
+            // organisation on the bond is the one `on_behalf_of` names; the
+            // placement (`community_id`) is only where the row is held, and
+            // the producer signs no `kind`.
             let mut env = serde_json::json!({
-                "kind": "delegates_to",
                 "dimension": owner_binding::DIMENSION,
                 "delegation_purpose": owner_binding::PURPOSE,
                 "scope": [ds::INFRA_SERVE],
             });
             if let Some(c) = community {
-                env["community_id"] = serde_json::json!(c);
+                env[crate::federation::admission::ON_BEHALF_OF_FIELD] = serde_json::json!(c);
             }
             let mut row = crate::federation::admission::steward_liveness_test_support::signed_row(
                 &crate::federation::edition2::fixture_switch::seed_of(steward),
@@ -1852,7 +2033,8 @@ pub mod bodies {
                 &cosigned(binding(&pk[0], &node("n4"), Some(&plain)), &[&pk[1]]),
             )
             .await,
-            obr::NOT_AN_AFFILIATION,
+            // v62.0.0 (BIND-1) — the edition-2 gate's appended token.
+            obr::OWNER_BINDING_NOT_AN_AFFILIATION,
             "I1219 a binding naming a plain community",
         );
         // An affiliation this node does not hold yet: the binding WAITS
@@ -1942,7 +2124,9 @@ pub mod bodies {
             &crate::federation::edition2::fixture_switch::seed_of(&pk[0]),
             &node("n3"),
             attestation_type::DELEGATES_TO,
-            serde_json::json!({ "scope": [ds::INFRA_SERVE], "community_id": plain }),
+            // v62.0.0 (BIND-1) — naming the community the way an owner
+            // binding names its organisation (`on_behalf_of`).
+            serde_json::json!({ "scope": [ds::INFRA_SERVE], "on_behalf_of": plain }),
         );
         general.asserted_at = base() - Duration::minutes(4);
         general.scrub_timestamp = general.asserted_at;
@@ -2200,6 +2384,18 @@ mod run {
         i2630_sqlite,
         i2630_postgres,
         "i2630"
+    );
+    on_both_backends!(
+        i6930_a_founder_issues_at_the_head_it_names,
+        i6930_sqlite,
+        i6930_postgres,
+        "i6930"
+    );
+    on_both_backends!(
+        i6931_deciding_seats_are_read_at_the_named_head,
+        i6931_sqlite,
+        i6931_postgres,
+        "i6931"
     );
     on_both_backends!(
         i1214_quorum_licence_is_cosigned,

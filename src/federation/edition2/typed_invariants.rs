@@ -108,10 +108,8 @@
 //! - **I3174** the granter's `withdraws` expires the row, and the other end
 //!   is re-derived `temporary`.
 //! - **I3175** a `self`-scope edge is `anonymous`.
-//! - **I3176** the purge count over a trust root's head: one voice of three
-//!   is `quorum_not_met`; a voice holding no seat is `not_a_seat`.
-//! - **I3177** two voices of three meet the head's `majority`: the counted
-//!   signers are exactly the voices.
+//! - **I3176 / I3177** — DELETED (v62.0.0 R2-rooms): the room-head purge
+//!   count they read is gone (the note at their site).
 //! - **I3179** an edition-2 purge bundle carries the notice's statements: a
 //!   second node admits them through its own door (it then holds both
 //!   voices) and counts them by the edition-2 count (`root_not_held` with no
@@ -1622,14 +1620,7 @@ fn sign_typed(k: &K, row_type: &str, sub: &str, prefix: &str, p: &Value) -> Vec<
 }
 
 fn accepts(granter: &K, key: &str, scope: &str, until: Option<u64>, t: u64) -> Vec<u8> {
-    let p = trust_accepts_payload(
-        &iref(granter),
-        &[crate::federation::trust_root::INFRA_SERVE_SCOPE],
-        &[],
-        until,
-        scope,
-        t,
-    );
+    let p = trust_accepts_payload(&iref(granter), &[], until, scope, t);
     sign_typed(granter, "delegates_to", key, TRUST_PREFIX, &p)
 }
 
@@ -1726,69 +1717,10 @@ async fn trust_body<D: FederationDirectory + ?Sized>(d: &D) {
     );
 }
 
-/// I3176–I3177: the purge door's count over voices against a trust root's
-/// head (handed in: no edition-2 path seats a ROOTED trust root yet).
-async fn purge_quorum_body<D: FederationDirectory + ?Sized>(d: &D) {
-    use crate::federation::canonical_community::counts_voices_over_head;
-    use crate::federation::steward_purge::unauthorised_reason as why;
-    use crate::federation::types::{Community, CommunityMember, SignedCommunity};
-    let (f1, f2, f3, x) = (key(190), key(191), key(192), key(193));
-    register(d, &[&f1, &f2, &f3, &x]).await;
-    let head = SignedCommunity {
-        community: Community {
-            community_key_id: iref(&key(194)),
-            community_name: "t2 root".into(),
-            members: [&f1, &f2, &f3]
-                .iter()
-                .map(|k| CommunityMember {
-                    key_id: iref(k),
-                    joined_at: at(1_000),
-                    role: Some("founder".into()),
-                })
-                .collect(),
-            founded_at: at(1_000),
-            consensus_protocol: "majority".into(),
-            policy_blob: None,
-            prev_head_digest: String::new(),
-            charter_digest: String::new(),
-            persist_row_hash: String::new(),
-        },
-        authority_key_id: String::new(),
-        scrub_signature_classical: String::new(),
-        scrub_signature_pqc: None,
-        supersede_proof: None,
-        cosignatures: vec![],
-        lineage: vec![],
-    };
-    fn set(ks: &[&K]) -> std::collections::BTreeSet<String> {
-        ks.iter().map(|k| iref(k)).collect()
-    }
-    let now = Utc::now();
-    let one = counts_voices_over_head(d, &head, &set(&[&f1]), now)
-        .await
-        .unwrap();
-    assert_eq!(
-        one.map_err(|(r, _)| r),
-        Err(why::QUORUM_NOT_MET),
-        "I3176 one voice of three is short of the root's majority"
-    );
-    let stranger = counts_voices_over_head(d, &head, &set(&[&f1, &x]), now)
-        .await
-        .unwrap();
-    assert_eq!(
-        stranger.map_err(|(r, _)| r),
-        Err(why::NOT_A_SEAT),
-        "I3176 a voice that holds no seat is a refusal, not a discount"
-    );
-    let two = counts_voices_over_head(d, &head, &set(&[&f1, &f2]), now)
-        .await
-        .unwrap();
-    assert_eq!(
-        two.map_err(|(r, _)| r),
-        Ok(set(&[&f1, &f2])),
-        "I3177 two voices of three meet the root's majority"
-    );
-}
+// v62.0.0 (R2-rooms; CC 3.2 T5) — I3176 / I3177 DELETED: they witnessed the
+// purge count over a trust-root ROOM's head (`counts_voices_over_head`),
+// deleted with it; the steward purge counts over the holders of the bundle in
+// force (`steward_purge_invariants` I650).
 
 /// I3179–I3180: an edition-2 purge bundle replicated to a second node.
 async fn purge_replication_body<D: FederationDirectory + ?Sized>(a: &D, b: &D) {
@@ -2263,21 +2195,6 @@ async fn i3172_i3175_trust_postgres() {
         return;
     };
     Box::pin(trust_body(&b)).await;
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn i3176_i3177_purge_quorum_sqlite() {
-    Box::pin(purge_quorum_body(&sqlite().await)).await;
-}
-
-#[cfg(feature = "postgres")]
-#[tokio::test]
-async fn i3176_i3177_purge_quorum_postgres() {
-    let Some(b) = postgres().await else {
-        return;
-    };
-    Box::pin(purge_quorum_body(&b)).await;
 }
 
 #[cfg(feature = "sqlite")]

@@ -161,31 +161,183 @@ pub fn delegates_to_envelope(
 
 /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2 single-owner) — the **owner-binding**
 /// `delegates_to(user → node)` envelope: "I (user) am the single responsible
-/// steward of `node`". The ownership specialization of
-/// [`delegates_to_envelope`]: it stamps the CC 1.13.3.3 / CC 3.2 ownership
-/// [`DIMENSION`](super::types::owner_binding::DIMENSION) (what the single-owner
-/// admission gate + [`owner_of`](super::admission::owner_of) key on) plus the
-/// producer-side [`PURPOSE`](super::types::owner_binding::PURPOSE) marker
-/// (`delegation_purpose`). This is the ONE `delegates_to` shape that is
-/// single-valued (a node has at most one owner) — distinct from the general
-/// (multi-parent) act-on-behalf / hierarchy grammar `delegates_to_envelope`
-/// builds. `scope` SHOULD be `infra:*`-only (the owner-binding carries only
-/// server-class authority); `sub_delegation` is `false` (a leaf ownership
-/// binding, not a deputization). The two constants stay byte-identical to
-/// CIRISServer's `auth::ownership` shape (the wire is the contract).
-pub fn owner_binding_delegates_to_envelope(
-    node_key_id: &str,
-    infra_scopes: &[String],
-) -> serde_json::Value {
+/// steward of `node`". This is the ONE `delegates_to` shape that is
+/// single-valued (a node has at most one owner), distinct from the general
+/// (multi-parent) grammar [`delegates_to_envelope`] builds.
+///
+/// v62.0.0 (BIND-1; CC rc22 462260c rule `owner-binding`) — the members it
+/// states, and no others: the ownership
+/// [`DIMENSION`](super::types::owner_binding::DIMENSION);
+/// `delegation_purpose` = [`PURPOSE`](super::types::owner_binding::PURPOSE)
+/// (`owner_binding`, the one spelling); `scope` = the caller's `infra:*`
+/// tokens as a SET (CC 2.6.1.2: sorted, no repeat). It no longer states
+/// `kind`, `delegate_key_id` or `sub_delegation` (not members of the rule;
+/// the bound key is the statement's `sub`). The emitter adds `cohort_scope`
+/// (always), `author`, `asserted_at`, and the term
+/// (`delegation_valid_from` / `delegation_valid_until`, ms-time) where one is
+/// stated; a caller adds the placement (`community_id` / `family_id`) or
+/// `on_behalf_of` where it means one.
+pub fn owner_binding_delegates_to_envelope(infra_scopes: &[String]) -> serde_json::Value {
     use super::types::owner_binding;
     serde_json::json!({
-        "kind": "delegates_to",
         "dimension": owner_binding::DIMENSION,
         "delegation_purpose": owner_binding::PURPOSE,
-        "delegate_key_id": node_key_id,
-        "scope": infra_scopes,
-        "sub_delegation": false,
+        "scope": scope_set(infra_scopes),
     })
+}
+
+/// v62.0.0 (BIND-3; CC 3.2, CC 5.4.6; Constitution's ruling on the login
+/// placement, P/FREEZE.md) — **which producer states a node's owner binding.**
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerBindingProducer {
+    /// A person's device at login, the owner's pen in the process
+    /// (`Engine::steward_bind` / `grant_delegation(.., Some(owner_binding))`):
+    /// the placement the owner CHOSE at first setup, `self` where the owner
+    /// chose nothing. It never writes `federation` on its own.
+    Login,
+    /// A serve seat (the ceremony; `Engine::owner_binding_draft`,
+    /// [`owner_binding_draft_envelope`]): `federation`, always. A seat must
+    /// have an announced owner, else `serve_seat_owner_unannounced`.
+    ServeSeat,
+}
+
+/// v62.0.0 (BIND-3) — the placement an owner chose for a node's binding: a
+/// scope, and the group it names where the scope is a group's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChosenPlacement {
+    /// The `cohort_scope` the owner chose.
+    pub scope: String,
+    /// The room (`community` / `affiliations`) or family (`family`) the
+    /// binding is placed at; `None` at `self` / `federation`.
+    pub group: Option<String>,
+}
+
+/// v62.0.0 (BIND-3) — **where a node's owner binding rows go**: the first
+/// row's scope (and group), and whether the owner announces (a SECOND row at
+/// `federation`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnerBindingPlacement {
+    /// The first row's `cohort_scope`.
+    pub scope: String,
+    /// The first row's group (`community_id` for `community` /
+    /// `affiliations`, `family_id` for `family`).
+    pub group: Option<String>,
+    /// The owner announces: a further row at `federation`.
+    pub announce: bool,
+}
+
+impl OwnerBindingPlacement {
+    /// The placement member the first row names its group under, if any.
+    #[must_use]
+    pub fn group_member(&self) -> Option<&'static str> {
+        use super::types::cohort_scope as cs;
+        match self.scope.as_str() {
+            cs::COMMUNITY | cs::AFFILIATIONS => Some("community_id"),
+            cs::FAMILY => Some("family_id"),
+            _ => None,
+        }
+    }
+
+    /// The announcing row: `federation`, no group.
+    #[must_use]
+    pub fn federation() -> Self {
+        Self {
+            scope: super::types::cohort_scope::FEDERATION.to_owned(),
+            group: None,
+            announce: false,
+        }
+    }
+}
+
+/// v62.0.0 (BIND-3; Constitution's ruling on the login placement: "the LOGIN
+/// producer writes the placement the owner chose at first setup, and `self`
+/// where the owner chose nothing. It NEVER writes `federation` on its own.
+/// Owner chose to announce ⇒ the self-or-first row PLUS the federation row,
+/// by that choice. The SERVE-SEAT producer ⇒ federation") — **the ONE place a
+/// node owner binding's placement is chosen**, by `producer` and the owner's
+/// `chosen` placement:
+///
+/// | producer | chosen | rows |
+/// |---|---|---|
+/// | `Login` | none | `self` |
+/// | `Login` | `federation` | `self`, then `federation` (announce) |
+/// | `Login` | `community` / `affiliations` / `family` + group | that group |
+/// | `Login` | `self` | `self` |
+/// | `ServeSeat` | none or `federation` | `federation` |
+///
+/// # Errors
+/// `InvalidArgument` (`owner_binding_placement_refused`): a seat given any
+/// other scope; a group scope with no group, or a group at a scope that names
+/// none; a commons scope other than `federation` (`species`, `biosphere`: no
+/// owner binding is placed there).
+pub fn node_owner_binding_placement(
+    producer: OwnerBindingProducer,
+    chosen: Option<&ChosenPlacement>,
+) -> Result<OwnerBindingPlacement, super::Error> {
+    use super::types::cohort_scope as cs;
+    let refused = |why: String| {
+        super::Error::InvalidArgument(format!("owner_binding_placement_refused: {why}"))
+    };
+    match producer {
+        OwnerBindingProducer::ServeSeat => match chosen {
+            None => Ok(OwnerBindingPlacement::federation()),
+            Some(c) if c.scope == cs::FEDERATION && c.group.is_none() => {
+                Ok(OwnerBindingPlacement::federation())
+            }
+            Some(c) => Err(refused(format!(
+                "a serve seat's owner binding is placed at federation, not {:?} (CC 5.4.6)",
+                c.scope
+            ))),
+        },
+        OwnerBindingProducer::Login => {
+            let Some(c) = chosen else {
+                return Ok(OwnerBindingPlacement {
+                    scope: cs::SELF.to_owned(),
+                    group: None,
+                    announce: false,
+                });
+            };
+            let plan = match c.scope.as_str() {
+                cs::SELF => OwnerBindingPlacement {
+                    scope: cs::SELF.to_owned(),
+                    group: None,
+                    announce: false,
+                },
+                cs::FEDERATION => OwnerBindingPlacement {
+                    scope: cs::SELF.to_owned(),
+                    group: None,
+                    announce: true,
+                },
+                cs::COMMUNITY | cs::AFFILIATIONS | cs::FAMILY => OwnerBindingPlacement {
+                    scope: c.scope.clone(),
+                    group: c.group.clone(),
+                    announce: false,
+                },
+                other => return Err(refused(format!("no owner binding is placed at {other:?}"))),
+            };
+            if plan.group_member().is_some() != c.group.is_some() {
+                return Err(refused(format!(
+                    "a placement at {:?} names a group exactly when the scope is a group's \
+                     (got {:?})",
+                    c.scope, c.group
+                )));
+            }
+            Ok(plan)
+        }
+    }
+}
+
+/// v62.0.0 (BIND-1; CC 2.6.1.2) — `scopes` as a set: sorted by the bytewise
+/// order of their deterministic encodings (so a shorter text first), without
+/// repeats.
+#[must_use]
+pub fn scope_set(scopes: &[String]) -> Vec<String> {
+    let set: std::collections::BTreeSet<&str> = scopes.iter().map(String::as_str).collect();
+    let mut v: Vec<String> = set.into_iter().map(str::to_owned).collect();
+    v.sort_by_cached_key(|s| {
+        ciris_verify_core::cde::encode(&ciris_verify_core::cde::Value::Text(s.clone()))
+    });
+    v
 }
 
 /// v62.0.0 (KR-fix11; CC 3.2 "the first binding", CC 3.1.3.2: a serve seat's
@@ -193,8 +345,10 @@ pub fn owner_binding_delegates_to_envelope(
 /// for a signer whose pen is elsewhere** (the operator's own person key, held
 /// on hardware): exactly the members the software producer states
 /// (`Engine::steward_bind(.., Some(owner_binding::PURPOSE))`:
-/// [`owner_binding_delegates_to_envelope`] through `EnvelopeCore`, placed at
-/// `cohort_scope: federation`). Hand it to
+/// [`owner_binding_delegates_to_envelope`] through `EnvelopeCore`), placed
+/// by the SERVE-SEAT producer at `cohort_scope: federation` (v62.0.0 BIND-3,
+/// [`node_owner_binding_placement`]; the login producer places at `self`
+/// unless its owner chose). Hand it to
 /// `Engine::statement_draft("delegates_to", &envelope, owner_iss,
 /// owner_kid_hex, node_key_id, asserted_at_ms, None)`, or call
 /// `Engine::owner_binding_draft`, which does. Both producers then state the
@@ -206,7 +360,7 @@ pub fn owner_binding_delegates_to_envelope(
 /// # Errors
 /// `InvalidArgument`: no scope, or a token outside `infra:*`.
 pub fn owner_binding_draft_envelope(
-    node_key_id: &str,
+    _node_key_id: &str,
     infra_scopes: &[String],
 ) -> Result<serde_json::Value, super::Error> {
     let set: std::collections::HashSet<String> = infra_scopes.iter().cloned().collect();
@@ -217,13 +371,15 @@ pub fn owner_binding_draft_envelope(
         )));
     }
     let mut envelope = super::envelope::EnvelopeCore::from_value(
-        owner_binding_delegates_to_envelope(node_key_id, infra_scopes),
+        owner_binding_delegates_to_envelope(infra_scopes),
     )?
     .to_value();
+    // v62.0.0 (BIND-3) — the serve-seat producer: federation, always.
+    let placement = node_owner_binding_placement(OwnerBindingProducer::ServeSeat, None)?;
     if let Some(o) = envelope.as_object_mut() {
         o.insert(
             "cohort_scope".into(),
-            serde_json::Value::String(super::types::cohort_scope::FEDERATION.to_owned()),
+            serde_json::Value::String(placement.scope),
         );
         o.retain(|_, v| !v.is_null());
     }
@@ -1629,6 +1785,74 @@ pub enum TransportDestinationApplyOutcome {
 mod tests {
     use super::*;
 
+    /// v62.0.0 (BIND-3; Constitution's ruling on the login placement) —
+    /// **I6630: the placement table.** Login with no choice is `self`; login
+    /// choosing `federation` is `self` plus the announcement; a group choice
+    /// is that group, named by its member; a serve seat is `federation`
+    /// whatever it is handed, and any other scope is refused; a group scope
+    /// without its group, a group at `self`, and a commons scope other than
+    /// `federation` are refused by name.
+    #[test]
+    fn i6630_the_owner_binding_placement_table() {
+        use crate::federation::types::cohort_scope as cs;
+        use OwnerBindingProducer::{Login, ServeSeat};
+        let chose = |scope: &str, group: Option<&str>| ChosenPlacement {
+            scope: scope.to_owned(),
+            group: group.map(str::to_owned),
+        };
+        let plan = |p, c: Option<&ChosenPlacement>| node_owner_binding_placement(p, c);
+        let at = |scope: &str, group: Option<&str>, announce: bool| OwnerBindingPlacement {
+            scope: scope.to_owned(),
+            group: group.map(str::to_owned),
+            announce,
+        };
+        assert_eq!(plan(Login, None).unwrap(), at(cs::SELF, None, false));
+        assert_eq!(
+            plan(Login, Some(&chose(cs::SELF, None))).unwrap(),
+            at(cs::SELF, None, false)
+        );
+        assert_eq!(
+            plan(Login, Some(&chose(cs::FEDERATION, None))).unwrap(),
+            at(cs::SELF, None, true),
+            "announcing is the self row plus a federation row"
+        );
+        let room = plan(Login, Some(&chose(cs::COMMUNITY, Some("g-room")))).unwrap();
+        assert_eq!(room, at(cs::COMMUNITY, Some("g-room"), false));
+        assert_eq!(room.group_member(), Some("community_id"));
+        let fam = plan(Login, Some(&chose(cs::FAMILY, Some("g-fam")))).unwrap();
+        assert_eq!(fam.group_member(), Some("family_id"));
+        assert_eq!(
+            plan(ServeSeat, None).unwrap(),
+            at(cs::FEDERATION, None, false)
+        );
+        assert_eq!(
+            plan(ServeSeat, Some(&chose(cs::FEDERATION, None))).unwrap(),
+            at(cs::FEDERATION, None, false)
+        );
+        for (p, c) in [
+            (ServeSeat, chose(cs::SELF, None)),
+            (ServeSeat, chose(cs::COMMUNITY, Some("g"))),
+            (Login, chose(cs::COMMUNITY, None)),
+            (Login, chose(cs::SELF, Some("g"))),
+            (Login, chose(cs::FEDERATION, Some("g"))),
+            (Login, chose(cs::SPECIES, None)),
+            (Login, chose(cs::BIOSPHERE, None)),
+        ] {
+            let e = plan(p, Some(&c)).expect_err("refused");
+            assert!(
+                e.to_string().contains("owner_binding_placement_refused"),
+                "{p:?} {c:?}: {e}"
+            );
+        }
+        // The serve-seat producer's draft envelope is placed at federation.
+        let env = owner_binding_draft_envelope(
+            "n",
+            &[crate::federation::types::delegation_scope::INFRA_SERVE.to_owned()],
+        )
+        .unwrap();
+        assert_eq!(env["cohort_scope"], cs::FEDERATION);
+    }
+
     /// v59.0.0 (CIRISPersist#1106) — the pure separation rule: a pair that
     /// reuses none of the other keys passes; one whose X25519 or ML-KEM-768
     /// equals a supplied key is refused with that half's token; keys of other
@@ -1744,22 +1968,24 @@ mod tests {
         // ownership dimension + producer-side purpose marker (what owner_of
         // keys on), sub_delegation always false.
         use super::super::types::owner_binding;
-        let env = owner_binding_delegates_to_envelope(
-            "node-key",
-            &[
-                "infra:serve".to_string(),
-                "infra:network_presence".to_string(),
-            ],
-        );
-        assert_eq!(env["kind"], "delegates_to");
+        // v62.0.0 (BIND-1) — the rule's members only, the scope a sorted set.
+        let env = owner_binding_delegates_to_envelope(&[
+            "infra:serve".to_string(),
+            "infra:network_presence".to_string(),
+            "infra:serve".to_string(),
+        ]);
         assert_eq!(env["dimension"], owner_binding::DIMENSION);
-        assert_eq!(env["delegation_purpose"], owner_binding::PURPOSE);
-        assert_eq!(env["delegate_key_id"], "node-key");
-        assert_eq!(env["sub_delegation"], false);
-        let scope = env["scope"].as_array().unwrap();
-        assert!(scope
-            .iter()
-            .all(|v| v.as_str().unwrap().starts_with("infra:")));
+        assert_eq!(env["delegation_purpose"], "owner_binding");
+        for gone in ["kind", "delegate_key_id", "sub_delegation"] {
+            assert!(env.get(gone).is_none(), "BIND-1: {gone} is not a member");
+        }
+        // CDE order is by the ENCODED bytes, so the shorter text sorts
+        // first (its length is in the head byte).
+        assert_eq!(
+            env["scope"],
+            serde_json::json!(["infra:serve", "infra:network_presence"]),
+            "BIND-1: a set in CDE order, no repeat"
+        );
     }
 
     #[test]
@@ -2828,7 +3054,7 @@ pub(crate) mod test_support {
 
         // THE ATTACK — the trusted-local self-write on the same pair, later,
         // content-only.
-        dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
+        dir.test_seam_put_identity_occurrence(crate::federation::IdentityOccurrence {
             identity_key_id: a.clone(),
             occurrence_key_id: ph.clone(),
             device_class: PHONE.into(),
@@ -2885,7 +3111,7 @@ pub(crate) mod test_support {
             at(t(40)),
             "({suffix}) I3324: the first revocation's instant stands"
         );
-        dir.put_identity_occurrence_revocation_local(
+        dir.put_identity_occurrence_revocation_edition2(
             crate::federation::types::IdentityOccurrenceRevocation {
                 identity_key_id: a.clone(),
                 occurrence_key_id: ph.clone(),
@@ -2895,6 +3121,7 @@ pub(crate) mod test_support {
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
             },
+            crate::federation::DoorToken::new(),
         )
         .await
         .expect_err("I3324: a second local revocation of the pair is refused (#541)");
@@ -3467,13 +3694,32 @@ pub(crate) mod test_support {
             Some(winner_transit),
             "I3331: a non-seat's held bind's transit key resolves"
         );
+        // v62.0.0 (BIND-3; CC 5.4.6 "relayable exactly when its
+        // owner-binding is announced") — no relay hop until its owner
+        // announces it (an explicit fixture step).
+        assert_eq!(
+            crate::federation::edition2::occurrence::onion_hop_xwing_pubkey_for(dir, &relay_kid)
+                .await
+                .unwrap(),
+            None,
+            "I3331: an unannounced non-seat is no onion hop"
+        );
+        let relay_owner = format!("xwing-relay-owner-{suffix}");
+        e2::put_key(dir, &relay_owner, &["user"]).await;
+        crate::federation::edition2::fixture_occurrence::announce_node_owner_seeds(
+            dir,
+            &relay_owner,
+            &relay,
+            now - 60_000,
+        )
+        .await;
         assert_eq!(
             crate::federation::edition2::occurrence::onion_hop_xwing_pubkey_for(dir, &relay_kid)
                 .await
                 .unwrap()
                 .map(|k| k.as_bytes().to_vec()),
             Some([h_m.as_slice(), &h_x[..]].concat()),
-            "I3331: a non-seat's bind onion hop key resolves"
+            "I3331: announced, a non-seat's bind onion hop key resolves"
         );
     }
 }

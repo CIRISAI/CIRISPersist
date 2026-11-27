@@ -14,7 +14,10 @@
 //! | [`owner`] | a node's owner bindings as offers of the `owner` seat over its key | `seat::Seats::holders` |
 //! | [`trust`] | a user's acceptance edges | `derived::fold_default`, `trust::reaches` |
 //! | [`head`] | a group's held head and an offered version | `head::Entry`, `graph::Graph::frontier` |
+//! | [`content`] | one member's held rows in one room as Head / Content / End / Tips, the member's keys and the room's count, the held causal past | `content::answers`, `content::changed` |
+//! | [`lineage`] | a group's roster lineage back to its restating version: seats offered and ended by the group's own key | `seat::members_at` |
 //! | [`key_end`] | an edition-2 key's records and its own revocations | `key_end::KeyEndRow`, `well_formed`, `conclude_rule`, `live`, `ended` |
+//! | [`receipts`] | an `act:ack` receipt, one row per act it acknowledges at its own scope | `conferral::ConferralRow` (`Kind::Receipt`, `of`) |
 //!
 //! Every answer carries the rows it rests on, the dependency keys it read
 //! and the rule that gave it ([`Answer`], KERNEL_SEAMS §5.3's `Answer`: its
@@ -22,15 +25,26 @@
 //! is carried; `valid_until` and the digest are not yet.
 
 pub mod consensus;
+pub mod content;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod content_invariants;
 pub mod head;
 pub mod key_end;
 pub mod law;
+// v62.0.0 (LINEAGE-L3; CC 2.7.8) — a group's roster lineage as seats.
+pub mod lineage;
 pub mod owner;
+// v62.0.0 (ACK-3) — an `act:ack` receipt presented to `ciris_kernel::conferral`.
+pub mod receipts;
 pub mod trust;
 pub mod view;
 
 #[cfg(test)]
 pub(crate) mod differential;
+// v62.0.0 (SEAT-K0) — I7165–I7172: Kernel's own duty fixtures through
+// persist's `KRow` (asserting) and the three Kernel questions (reports).
+#[cfg(test)]
+mod duty_probe_invariants;
 
 /// The differential's hooks where a from-disk gate scans the caller's body
 /// (`store::parity`): a call that compiles to nothing outside a test build,

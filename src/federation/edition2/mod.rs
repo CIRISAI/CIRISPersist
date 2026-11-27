@@ -60,6 +60,20 @@ pub mod accord_rescan;
 // v62.0.0 (RL-fix2) — first contact by node code: the local dial hint, the
 // checked pre-seal admission and the post-seal owner check.
 pub mod contact;
+// v62.0.0 (CONTENT-A6) — the room-content answer cache and its store.
+pub mod content_cache;
+// v62.0.0 (CONTENT-A6) — I6711.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod content_cache_invariants;
+pub mod content_store;
+// v62.0.0 (CONTENT-A4) — the producer names a content row's predecessors.
+pub mod content_prev;
+// v62.0.0 (CONTENT-A4) — I6709.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod content_prev_invariants;
+// v62.0.0 (CONTENT-A2) — I6703–I6705: the room-content door.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod content_door_invariants;
 pub mod fold;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod fold_invariants;
@@ -111,13 +125,40 @@ mod relay_eligibility_invariants;
 // v62.0.0 (wave W1b) — a ROOTED edition-2 trust root, for any test.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod fixture_trust_root;
+// v62.0.0 (SEAT-1; CC 4.5.4) — the founding duty holders: the codec's
+// helpers and the founding cases as one pure predicate (no door wired).
+pub mod founding_duty;
+// v62.0.0 (SEAT-1) — I7160–I7164: the codec, the predicate (pure) and the
+// founding through the door (sqlite + pg).
+#[cfg(test)]
+mod founding_duty_invariants;
 pub mod genesis;
 pub mod group;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod group_fixtures;
+// v62.0.0 (GID-prod) — the derived group id: one module, swapped for Verify
+// 23.5.1's export at the pin step.
+pub mod group_id;
 pub mod group_serve;
+// v62.0.0 (GID-tips) — I5717, I5718: a contested founding concludes nothing.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod group_tips_invariants;
+// v62.0.0 (ACK-1, ACK-2; CC pre4 3.1.3, 2.4.1.1) — the `act:ack` receipt:
+// its door rules and its draft.
+pub mod act_ack;
 pub mod halt;
+// v62.0.0 (HEAD-1; CC 2.4.1.1) — the head rule: which head a row names.
+pub mod head_rule;
+// v62.0.0 (HEAD-2) — the head rule at the statement door (sqlite + pg).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod head_rule_invariants;
 pub mod ingest;
+// v62.0.0 (LINEAGE-L1; CC 2.7.8, CC 3.3.4) — a group's roster lineage.
+pub mod lineage;
+// v62.0.0 (LINEAGE-L1) — I6902–I6904: the lineage store and the door's
+// write (sqlite + pg).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod lineage_invariants;
 pub mod liveness;
 pub mod names;
 pub mod occurrence;
@@ -127,6 +168,9 @@ pub mod peer_rooting;
 pub mod produce;
 pub mod projection;
 pub mod recovery_signer;
+// v62.0.0 (CONTENT-A3) — which rows are a room's content (R1): one
+// predicate, a constant list until the family table carries the column.
+pub mod room_content;
 // v62.0.0 (P10; CC rc21 2.7.11) — SCITT receipts (RFC 9942, label 394) held
 // with their statements; the receipt leg of running admitted code.
 pub mod receipts;
@@ -159,6 +203,19 @@ pub mod trust_root_group;
 pub mod typed;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod typed_fixtures;
+// v62.0.0 (VD-step1) — the one row-state verdict: "is this row concluded".
+pub mod verdict;
+// v62.0.0 (VD-step1b) — I6300–I6305: the one row-state verdict's findings.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod verdict_invariants;
+// v62.0.0 (BIND-1) — I6620–I6626: placement is not accountability;
+// `on_behalf_of` counts the affiliation (node and agent).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod owner_binding_rule_invariants;
+// v62.0.0 (BIND-1b) — I6627–I6628: a delegation's term is ms-time in the
+// payload and RFC 3339 text on the row, on every family that carries one.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod term_ms_invariants;
 pub mod voices;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod voices_invariants;

@@ -24,7 +24,7 @@
 //! `minted_by_persist` entries — scoped to the three families persist is the
 //! PRODUCER of, because CC 3.1.7 R2(a) is a producer obligation. R2(a) is not
 //! the whole exposure. Measured on the vendored rc5 @ 4b624513 cut, the minted
-//! set is **4 of 22** (three from #590, plus `mesh_config:` — CIRISPersist#570
+//! set is **4 of 26** (three from #590, plus `mesh_config:` — CIRISPersist#570
 //! ask 1; v60.0.0 added `goal:`, CIRISPersist#988 item 4; v60.1.0 added
 //! `identity_amendment:`, CIRISPersist#1120). v50.0.0 (CIRISPersist#924): CC's `_meta.case_rule.reserved_stems`
 //! now states the `capacity:` and `detection:` rules at the FAMILY (the
@@ -38,6 +38,11 @@
 //! v62.0.0 (CC rc20): `hard_case:{kind}` carries its rule on the row
 //! (`reserved_rule`, CC 3.4.4: "substrate-emitted"), so `authority_for`
 //! resolves it and the `hard_case:` pin retired (the inventory is 21).
+//! v62.0.0 (FS-sig-a.fix1): the family model's signer cells persist now
+//! enforces join it — `watchlist:`, `attestation:self_verify`,
+//! `hardware_custody:` (their registry rows carry no `reserved_rule`; the
+//! rule is the rc22-pre3 `family_model.json` signer cell): 25. FS-sig-b adds
+//! `evidence:` (`infra:attest`): 26.
 //!
 //! # What is derived and what is pinned
 //!
@@ -389,10 +394,12 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     PersistFamilyRule {
         prefix: "age_self_declared:",
         rule: "the self rung is a `{band}` — an `age_self_declared:level*` spelling is refused \
-               outright, on both the dimension and the attestation_type surface",
+               outright, on both the dimension and the attestation_type surface; v62.0.0 \
+               (FS-sig-a) its signer is the subject or an admitted occurrence of it (CC 3.4.11)",
         enforced_at: &[
             "federation::admission::check_reserved_prefix_admission",
             "federation::admission::DimensionAdmissionPolicy::check",
+            "federation::admission::check_self_signed_family",
         ],
         gap: RowRuleGap::NoRuleOnTheRow,
         minted_by_persist: false,
@@ -497,6 +504,58 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
                  duty; the registry row carries no reserved_rule)",
     },
     PersistFamilyRule {
+        prefix: "watchlist:",
+        rule: "a `moderate`- or `takedown`-holder of the group the row names, at its signed \
+               instant (CC 3.1.9.4, CC 4.5.5; v62.0.0 FS-sig-a); a row naming no group is held",
+        enforced_at: &[
+            "federation::admission::check_delegated_duty_scores_admission",
+            "federation::admission::check_watchlist_admission",
+        ],
+        gap: RowRuleGap::NoRuleOnTheRow,
+        minted_by_persist: false,
+        cc_ask: "the rc22-pre3 family model states the signer cell; the registry row carries no \
+                 reserved_rule (re-vendor once CC lands it on the row)",
+    },
+    PersistFamilyRule {
+        prefix: "attestation:self_verify",
+        rule: "the signer is the key the row is about (CC 3.1.2.1, \"the running node about \
+               itself\"; v62.0.0 FS-sig-a)",
+        enforced_at: &[
+            "federation::admission::check_reserved_prefix_admission",
+            "federation::admission::check_self_signed_family",
+        ],
+        gap: RowRuleGap::NoRuleOnTheRow,
+        minted_by_persist: false,
+        cc_ask: "the rc22-pre3 family model states the signer cell (`self`); the registry row \
+                 carries no reserved_rule",
+    },
+    PersistFamilyRule {
+        prefix: "hardware_custody:",
+        rule: "the signer is the key the row is about (CC 3.4.5, \"a statement about the \
+               emitter itself\"; v62.0.0 FS-sig-a)",
+        enforced_at: &[
+            "federation::admission::check_reserved_prefix_admission",
+            "federation::admission::check_self_signed_family",
+        ],
+        gap: RowRuleGap::NoRuleOnTheRow,
+        minted_by_persist: false,
+        cc_ask: "the rc22-pre3 family model states the signer cell (`self`); the registry row \
+                 carries no reserved_rule",
+    },
+    PersistFamilyRule {
+        prefix: "evidence:",
+        rule: "an `infra:attest` holder under a root this node trusts, at the row's own instant \
+               (CC 3.1.5.5; v62.0.0 FS-sig-b); an unconferred signer's row is held",
+        enforced_at: &[
+            "federation::admission::check_reserved_prefix_admission",
+            "federation::admission::check_evidence_admission",
+        ],
+        gap: RowRuleGap::NoRuleOnTheRow,
+        minted_by_persist: false,
+        cc_ask: "the rc22-pre3 family model states the signer cell; the registry row carries no \
+                 reserved_rule",
+    },
+    PersistFamilyRule {
         prefix: "reconsideration:",
         rule: "a filing: the subject of the held target attestation (its signed subjects) or a \
                review duty-holder of the target's community; a ruling (an `outcome`): the \
@@ -532,8 +591,9 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     //    covers the family. Safe direction, still two predicates. ───────────
     PersistFamilyRule {
         prefix: "audit_chain:",
-        rule: "substrate_persist-only emitter, for the WHOLE family, about itself \
-               (attesting_key_id == attested_key_id) (CC 3.4.3 substrate-self-report)",
+        rule: "a node holding infra:attest from its OWNER (its owner binding), for the WHOLE \
+               family, about itself (attesting_key_id == attested_key_id); no identity_type is \
+               read (CC 3.4.3 substrate-self-report, CC 3.4.7)",
         enforced_at: &[
             "federation::admission::check_reserved_prefix_admission",
             "federation::admission::check_substrate_self_report_attester",
@@ -545,8 +605,9 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     },
     PersistFamilyRule {
         prefix: "corpus_health:",
-        rule: "substrate_persist-only emitter, for the WHOLE family, about itself \
-               (attesting_key_id == attested_key_id) (CC 3.4.3 substrate-self-report)",
+        rule: "a node holding infra:attest from its OWNER (its owner binding), for the WHOLE \
+               family, about itself (attesting_key_id == attested_key_id); no identity_type is \
+               read (CC 3.4.3 substrate-self-report, CC 3.4.7)",
         enforced_at: &[
             "federation::admission::check_reserved_prefix_admission",
             "federation::admission::check_substrate_self_report_attester",
@@ -557,8 +618,9 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     },
     PersistFamilyRule {
         prefix: "federation_directory:",
-        rule: "substrate_persist-only emitter, for the WHOLE family, about itself \
-               (attesting_key_id == attested_key_id) (CC 3.4.3 substrate-self-report)",
+        rule: "a node holding infra:attest from its OWNER (its owner binding), for the WHOLE \
+               family, about itself (attesting_key_id == attested_key_id); no identity_type is \
+               read (CC 3.4.3 substrate-self-report, CC 3.4.7)",
         enforced_at: &[
             "federation::admission::check_reserved_prefix_admission",
             "federation::admission::check_substrate_self_report_attester",
@@ -569,8 +631,9 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     },
     PersistFamilyRule {
         prefix: "identity_continuity:",
-        rule: "substrate_persist-only emitter, for the WHOLE family, about itself \
-               (attesting_key_id == attested_key_id) (CC 3.4.3 substrate-self-report)",
+        rule: "a node holding infra:attest from its OWNER (its owner binding), for the WHOLE \
+               family, about itself (attesting_key_id == attested_key_id); no identity_type is \
+               read (CC 3.4.3 substrate-self-report, CC 3.4.7)",
         enforced_at: &[
             "federation::admission::check_reserved_prefix_admission",
             "federation::admission::check_substrate_self_report_attester",
@@ -672,15 +735,6 @@ pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
          identifier anywhere in the envelope — billing stays off-wire), never an \
          emitter or composition rule; rc7 classified the family by the row's \
          `substrate-self-report` reservation, which rc8 removed.",
-    ),
-    (
-        "hardware_custody:",
-        "v50.0.0 (CIRISPersist#924) — `hardware_attestation::HARDWARE_CUSTODY_FAMILY` \
-         NAMES the registry row so a test can read its closed `{platform}` values \
-         and hold `HardwareTypePlatform::as_platform` equal to them. Persist states \
-         no emitter or composition rule of its own on the family: the closed \
-         vocabulary is CC's (the row's `segments[].values`), enforced by the one \
-         matcher at the case gate like every other enumeration.",
     ),
     (
         "canonical:",
@@ -884,6 +938,12 @@ pub fn persist_ruled_prefixes() -> Vec<String> {
                 .iter()
                 .map(|s| (*s).to_owned()),
         )
+        // v62.0.0 (FS-sig-a) — the `self` signer cells.
+        .chain(
+            admission::SELF_SIGNED_FAMILY_STEMS
+                .iter()
+                .map(|s| (*s).to_owned()),
+        )
         .chain(
             admission::MINTED_NAMESPACE_FAMILIES
                 .iter()
@@ -903,6 +963,10 @@ pub fn persist_ruled_prefixes() -> Vec<String> {
                 admission::QUARANTINE_DIMENSION_PREFIX,
                 // v62.0.0 (SL-fix1) — the duty gate's fourth arm.
                 admission::SLASHING_DIMENSION_PREFIX,
+                // v62.0.0 (FS-sig-a) — the watchlist's two-duty arm.
+                admission::WATCHLIST_DIMENSION_PREFIX,
+                // v62.0.0 (FS-sig-b) — the evidence arm (`infra:attest`).
+                admission::EVIDENCE_DIMENSION_PREFIX,
                 registry::ACCORD_CO_SCRUB_MATCH_PREFIX,
                 admission::LEDGER_DIMENSION_PREFIX,
                 // v38.7.0 (CIRISPersist#782) — persist rules on `session:`:
@@ -1225,9 +1289,9 @@ mod tests {
         // stop, so it is checked here rather than trusted.
         assert_eq!(
             RULES_NOT_ON_THE_ROW.len(),
-            22,
+            26,
             "the inventory now has {} entries; this module's doc says the minted set is \"4 of \
-             22\". Update BOTH numbers so the claim a reader acts on is the claim the build \
+             26\". Update BOTH numbers so the claim a reader acts on is the claim the build \
              checked.",
             RULES_NOT_ON_THE_ROW.len()
         );

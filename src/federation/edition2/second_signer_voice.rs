@@ -120,6 +120,15 @@ impl VoiceOutcome {
         }
     }
 
+    /// v62.0.0 (VD-step2) — the row id (hex), owned: for a caller that
+    /// keeps only the id. Whether the row LANDED is [`Self::is_seated`].
+    #[must_use]
+    pub fn into_row_id(self) -> String {
+        match self {
+            Self::Seated { row_id } | Self::Waiting { row_id, .. } => row_id,
+        }
+    }
+
     /// Did the row land?
     #[must_use]
     pub fn is_seated(&self) -> bool {
@@ -147,13 +156,17 @@ impl VoiceOutcome {
     }
 }
 
-/// **The state of row `row_id`**: `Seated` when the attestation plane holds
-/// it, else `Waiting` with its held reason (`fold::why_held_listed`), else
-/// `Waiting` with an empty reason (nothing under the id has arrived). A seat
-/// re-bind (never an attestation row) is `Seated` when it reaches its count
-/// now and `Waiting` otherwise, recomputed from the held lineage and its
-/// voices' signed instants: two nodes that hold the same rows answer alike,
-/// whichever arrived first (KR-fix2 rev 5).
+/// **The state of row `row_id`** as a host reads it: `Seated` when it is
+/// CONCLUDED here, `Waiting` with its held reason when the fold holds it,
+/// else `Waiting` with an empty reason (a voice kept awaiting others, or
+/// nothing under the id has arrived).
+///
+/// v62.0.0 (VD-step2) — read from the one row-state verdict
+/// ([`super::verdict::row_state`]), so every plane answers alike: before, a
+/// row concluded on a plane with no attestation row (an occurrence bind, a
+/// group version, a key-plane statement, a typed-final row) answered
+/// `Waiting`. A seat re-bind is `Seated` when it reaches its count NOW,
+/// recomputed (KR-fix2 rev 5; the verdict's first rule).
 ///
 /// # Errors
 /// Directory reads.
@@ -161,23 +174,16 @@ pub async fn row_status<F>(dir: &F, row_id: &RowId) -> Result<VoiceOutcome, Erro
 where
     F: FederationDirectory + ?Sized,
 {
+    use super::verdict::RowState;
     let hex = row_id.hex();
-    if dir.get_attestation(&hex).await?.is_some() {
-        return Ok(VoiceOutcome::Seated { row_id: hex });
-    }
-    // KR-fix2 rev 5 — a seat re-bind never has an attestation row: it is
-    // `Seated` when it reaches its count NOW, recomputed
-    // (`transport_rebind::rebind_counted`), never by the fold's stored state.
-    if super::transport_rebind::rebind_counted(dir, row_id).await? == Some(true) {
-        return Ok(VoiceOutcome::Seated { row_id: hex });
-    }
-    Ok(match super::fold::why_held_listed(dir, row_id).await? {
-        Some(h) => VoiceOutcome::Waiting {
+    Ok(match super::verdict::row_state(dir, row_id).await? {
+        RowState::Concluded => VoiceOutcome::Seated { row_id: hex },
+        RowState::Held(h) => VoiceOutcome::Waiting {
             row_id: hex,
             reason: h.reason,
             detail: h.detail,
         },
-        None => VoiceOutcome::Waiting {
+        RowState::KeptUnconcluded | RowState::Absent => VoiceOutcome::Waiting {
             row_id: hex,
             reason: String::new(),
             detail: String::new(),
@@ -536,16 +542,29 @@ where
 /// `signer_iss`. A hardware or remote signer signs `sig_structure` and
 /// submits `Draft::assemble(signature)` ([`submit_voice`]).
 ///
+/// v62.0.0 (RESIGN-7; the Constitution's approval for Eric) — `signer_kid`
+/// is the key the voice will sign with, stated by the caller (the Engine's
+/// one rule for a pen elsewhere, as `statement_draft`'s `signer_kid_hex`):
+/// a rotated key, a second device's occurrence key, a voice's later room
+/// key. `None` keeps the earlier behaviour: the identity's FIRST (genesis)
+/// key. Whether the key is one of `signer_iss`'s is the door's one check
+/// (`door::require_key_of_iss`, `kid_not_of_iss`) when the voice arrives.
+///
 /// # Errors
 /// `InvalidArgument` for bytes that are no row statement, or a `signer_iss`
 /// that is not an identity-ref.
-pub fn voice_draft(statement: &[u8], signer_iss: &str) -> Result<Draft, Error> {
+pub fn voice_draft(
+    statement: &[u8],
+    signer_iss: &str,
+    signer_kid: Option<&super::Digest32>,
+) -> Result<Draft, Error> {
     let (family, row_type, sub, payload) = row_parts(statement)?;
-    let kid = kid_of_identity_ref(signer_iss).ok_or_else(|| {
+    let genesis = kid_of_identity_ref(signer_iss).ok_or_else(|| {
         Error::InvalidArgument(format!(
             "second-signer voice: {signer_iss} is not an identity-ref"
         ))
     })?;
+    let kid = signer_kid.copied().unwrap_or(genesis);
     draft_row(&kid, signer_iss, &sub, &row_type, &family, &payload)
         .map_err(|e| produce_error("second_signer_voice", e))
 }

@@ -459,7 +459,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // withdraws gate's; this fails only on storage.
     ("after_withdraws", Class::Plumbing),
     ("occurrence_withdrawal_of", Class::Plumbing),
-    ("put_identity_occurrence_revocation_local", Class::Plumbing),
+    (
+        "put_identity_occurrence_revocation_edition2",
+        Class::Plumbing,
+    ),
     ("sqlite_sync_key_record_row", Class::Plumbing),
     ("sqlite_sync_occurrence_row", Class::Plumbing),
     ("sqlite_drop_key_record_rows", Class::Plumbing),
@@ -903,10 +906,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_reseal_admission", Class::Gate),
     ("check_reseal_seal_admission", Class::Gate),
     ("check_reserved_prefix_admission", Class::Gate),
-    // v61.1.0 (CIRISPersist#1174 item 3, as ruled) — the CC 3.4.3 substrate
-    // self-report attester, asked beside the reserved-prefix gate with its
-    // door: a refusal at the local door, reported at a peer's.
-    ("check_substrate_self_report_attester_at", Class::Gate),
+    // v61.1.0 (CIRISPersist#1174 item 3) — the CC 3.4.3 substrate
+    // self-report attester at the local-tier door (v62.0.0, D1: enforced at
+    // every door; the others ask it inside `check_reserved_prefix_admission`).
+    ("check_substrate_self_report_attester", Class::Gate),
     ("check_revocation_authority", Class::Gate),
     ("check_revocation_bound", Class::Gate),
     ("check_revocation_envelope_binding", Class::Gate),
@@ -1031,10 +1034,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("from_str", Class::Plumbing),
     ("from_value", Class::Plumbing),
     ("from_wire_str", Class::Plumbing),
-    // v59.0.0 (CIRISPersist#1099) — the self-roster door: refuses (holds) a
-    // roster change one key of two or more signed.
-    ("gate_occurrence", Class::Gate),
-    ("gate_withdrawal", Class::Gate),
     ("get", Class::Plumbing),
     ("get_attestation", Class::Delegates),
     ("get_client", Class::Delegates),
@@ -1329,11 +1328,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v61 S2 (CC 4.5.13) — the open:self_admit removal window at the local
     // door: refuses a removal received outside 259 200 s of its signed instant.
     ("check_open_self_admit_removal_window", Class::Gate),
-    // v61 S2 (CIRISPersist#1123) — a room stored under founder_only: the
-    // record door admits only its escape, the roster doors no membership
-    // event (both refuse the caller's input).
-    ("check_founder_only_escape", Class::Gate),
-    ("refuse_membership_event_under_founder_only", Class::Gate),
     // #840 (I44) — the V070 checksum repair. PLUMBING, and the reason is
     // that it cannot refuse anything: one conditional UPDATE whose entire
     // predicate is this crate's own constants (version 70, that name, one
@@ -1976,9 +1970,10 @@ mod tests {
             "put_identity_occurrence",
             "put_identity_occurrence_planned",
         ),
+        // v62.0.0 (WD-fix9) — the retired trusted-local write, a TEST seam.
         (
             "FederationDirectory",
-            "put_identity_occurrence_local",
+            "test_seam_put_identity_occurrence",
             "put_identity_occurrence_local_planned",
         ),
         // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
@@ -3640,13 +3635,6 @@ mod tests {
         (
             "plan_put_community_membership_revocation",
             "reject_future_dated_community_revocation",
-            Reads::ReceivedAt,
-        ),
-        // v61 S2 (CIRISPersist#1123) — the founder_only escape: the founders
-        // under the old protocol, folded at receipt.
-        (
-            "plan_put_community",
-            "check_founder_only_escape",
             Reads::ReceivedAt,
         ),
         // v61 S2 — the open:self_admit removal window, bounded on receipt at

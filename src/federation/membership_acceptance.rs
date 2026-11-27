@@ -10,7 +10,8 @@
 //!   most 30 days out;
 //! - `membership:acceptance:v1` / `membership:decline:v1` — K's reply, signed
 //!   by K (or a device acting for K), attested to K, placed at the group, and
-//!   binding the proposal's id, content hash and (acceptance) role.
+//!   naming the proposal by its row id in `refs.answers` (KR-fix32; the row
+//!   id is the digest of its payload) and restating the (acceptance) role.
 //!
 //! Every roster GROWTH — a widening that adds a key not active before its
 //! instant — needs a live acceptance ([`check_growth_accepted`]). A founding
@@ -94,6 +95,19 @@ pub const RULE_JOINER_OWNER_UNBOUND: &str = "joiner_owner_unbound";
 /// refused) while the row stands ([`check_public_roster_not_minor`]). The
 /// spelling of `fold::reason::gc6::MINOR_PUBLIC_ROSTER_ENTRY`.
 pub const RULE_MINOR_PUBLIC_ROSTER_ENTRY: &str = "minor_public_roster_entry";
+/// ACCEPT-tokens (CC 3.1.2.1, "concludes nothing") — a root grant's
+/// acceptance signed by the grantee's own key (a machine's consent is its
+/// owner's).
+pub const RULE_ACCEPTANCE_BY_GRANTEE: &str = "acceptance_by_grantee";
+/// ACCEPT-tokens (CC 3.1.2.1) — the acceptance's signer is not the owner of
+/// the grantee's key (nor, for a person grantee, the person).
+pub const RULE_ACCEPTANCE_NOT_BY_OWNER: &str = "acceptance_not_by_owner";
+/// ACCEPT-tokens (CC 3.1.2.1) — the acceptance names another grant in
+/// `refs.answers` (a held row that is no counted root grant).
+pub const RULE_ACCEPTANCE_OTHER_GRANT: &str = "acceptance_other_grant";
+/// ACCEPT-tokens (CC 3.1.2.1) — the acceptance's `sub` is not the grant's
+/// grantee.
+pub const RULE_ACCEPTANCE_OTHER_GRANTEE: &str = "acceptance_other_grantee";
 
 /// The retryable rules: rows arrive out of order and persist holds no
 /// deferral queue, so the caller re-submits. v61 (CIRISPersist#1101): an
@@ -267,12 +281,14 @@ pub fn check_membership_row_shape(row: &Attestation) -> Result<(), Error> {
     // at the federation scope and names no group: the root is the accord of
     // the bundle the grant names (`check_root_grant_reply`).
     if is_root_grant_reply(row) {
-        for key in ["references_attestation_id", "proposal_hash"] {
-            if env_str(row, key).is_none_or(str::is_empty) {
-                return Err(Error::InvalidArgument(format!(
-                    "root grant reply: envelope `{key}` is required"
-                )));
-            }
+        // v62.0.0 (KR-fix32; the Constitution's ruling (A)) — the answered
+        // row is named by `refs.answers` (read back as
+        // `references_attestation_id`); `proposal_hash` is gone (a row's id
+        // IS the digest of its payload).
+        if env_str(row, "references_attestation_id").is_none_or(str::is_empty) {
+            return Err(Error::InvalidArgument(
+                "root grant reply: the row it answers (refs.answers) is required".into(),
+            ));
         }
         return Ok(());
     }
@@ -305,12 +321,11 @@ pub fn check_membership_row_shape(row: &Attestation) -> Result<(), Error> {
             }
         }
         MembershipRow::Acceptance | MembershipRow::Decline => {
-            for key in ["references_attestation_id", "proposal_hash"] {
-                if env_str(row, key).is_none_or(str::is_empty) {
-                    return Err(Error::InvalidArgument(format!(
-                        "membership reply: envelope `{key}` is required"
-                    )));
-                }
+            // v62.0.0 (KR-fix32) — `proposal_hash` is gone, as above.
+            if env_str(row, "references_attestation_id").is_none_or(str::is_empty) {
+                return Err(Error::InvalidArgument(
+                    "membership reply: the row it answers (refs.answers) is required".into(),
+                ));
             }
         }
     }
@@ -352,7 +367,6 @@ pub(crate) fn as_proposal(row: Attestation) -> Option<Proposal> {
 fn reply_matches(reply: &Attestation, p: &Proposal) -> bool {
     group_of(reply).is_ok_and(|g| g == p.group)
         && same_membership_plane(&reply.cohort_scope, &p.row.cohort_scope)
-        && env_str(reply, "proposal_hash") == Some(p.row.original_content_hash.as_str())
         && p.invitee
             .as_ref()
             .is_none_or(|i| reply.attested_key_id == *i)
@@ -613,6 +627,319 @@ where
     Ok(Some(placed))
 }
 
+/// v62.0.0 (WD-fix16a; the join carriage, Constitution 11-23) — **is `row`
+/// an owner binding placed at a group by a live invitee of that group?** The
+/// binding names the group (`envelope_cohort_target`) at a targeted scope;
+/// its owner (the payload's `author`, else the signer) is a live invitee of
+/// the group (the subject of a held, unexpired, unwithdrawn, undeclined
+/// proposal at it by a member, [`live_invitees_of`]) AND has answered it (a
+/// held `membership:acceptance` by the owner at the group). Declared as reads of
+/// the group and the owner, so a held binding re-folds when the invitation
+/// arrives.
+///
+/// # Errors
+/// Directory reads; a binding naming two groups.
+pub(crate) async fn owner_binding_placed_by_an_invitee<F>(
+    dir: &F,
+    row: &Attestation,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if row.attestation_type != attestation_type::DELEGATES_TO
+        || !super::admission::is_owner_binding_envelope(&row.attestation_envelope)
+    {
+        return Ok(false);
+    }
+    let Some(plane) = membership_plane(&row.cohort_scope) else {
+        return Ok(false);
+    };
+    let Some(group) = super::admission::envelope_cohort_target(&row.attestation_envelope)? else {
+        return Ok(false);
+    };
+    let owner = row
+        .attestation_envelope
+        .get("author")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(row.attesting_key_id.as_str());
+    fold::reads(Dep::key(group));
+    fold::reads(Dep::key(owner));
+    // WD-fix16e — a private room takes no identity-key owner binding on the
+    // invitation (its join is the room-key form, CC 3.1.3.2).
+    if room_is_private(dir, group).await? {
+        return Ok(false);
+    }
+    let kind = match plane {
+        cohort_scope::TargetPlane::Family => super::group_plane::GroupKind::Family,
+        cohort_scope::TargetPlane::Room => super::group_plane::GroupKind::Community,
+    };
+    let members =
+        super::cosign::active_members_at(dir, kind, group, crate::host::clock::now()).await?;
+    if members.is_empty() {
+        return Ok(false);
+    }
+    if !live_invitees_of(dir, &row.cohort_scope, group, &members)
+        .await?
+        .iter()
+        .any(|i| i == owner)
+    {
+        return Ok(false);
+    }
+    // ... and has ANSWERED it: a held acceptance by the owner at the group
+    // (the answer envelope carries the acceptance before the binding), so
+    // an invitee who has not accepted discloses nothing of its node to the
+    // room.
+    let mut pages = AttestationQuery::to(owner, FOLD_PAGE)
+        .dimension_prefix(ACCEPTANCE_DIMENSION)
+        .pages();
+    while let Some(page) = pages.next(dir).await? {
+        for a in page {
+            if membership_row(&a) == Some(MembershipRow::Acceptance)
+                && super::admission::envelope_cohort_target(&a.attestation_envelope)? == Some(group)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// v62.0.0 (WD-fix16e; CC 3.1.3.2, the room-key form Eric ruled in for
+/// v62.0) — **is `room` a PRIVATE room?** Its founding roster states
+/// `membership: "private"` (`payloads::CLOSED_VALUES`: `private` | `public`;
+/// absent reads public), carried into the community record's `policy_blob`
+/// (`edition2::group::policy_blob_of`). A private room seats per-device ROOM
+/// KEYS, not identities: the identity-key carriage below is not its form.
+/// `false` when this node holds no record of `room` (it cannot tell).
+///
+/// # Errors
+/// Directory reads.
+pub(crate) async fn room_is_private<F>(dir: &F, room: &str) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(dir
+        .lookup_community(room)
+        .await?
+        .and_then(|c| c.policy_blob)
+        .and_then(|b| {
+            b.get("membership")
+                .and_then(serde_json::Value::as_str)
+                .map(|m| m == "private")
+        })
+        .unwrap_or(false))
+}
+
+/// The refusal of the identity-key carriage for a private room.
+fn private_room_carriage_refused(what: &str, room: &str) -> Error {
+    Error::InvalidArgument(format!(
+        "{what}: {room} is a PRIVATE room (`membership: private`, CC 3.1.3.2): its roster seats \
+         per-device room keys, and its join carries room-key rows, not an identity-key owner \
+         binding; this carriage is for identity-seated rooms (a family, a public or \
+         roster-visible room)"
+    ))
+}
+
+/// The statements of a held edition-2 row (every voice), for an envelope.
+async fn row_statements<F>(dir: &F, row: &Attestation, what: &str) -> Result<Vec<Vec<u8>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(rid) = super::edition2::voices::carried_row_id(row) else {
+        return Err(Error::InvalidArgument(format!(
+            "join carriage: the {what} {} is not an edition-2 row",
+            row.attestation_id
+        )));
+    };
+    dir.edition2_voices(&rid).await
+}
+
+/// The occurrence bind statements (every voice) `dir` holds for `identity`,
+/// as its signed occurrence listing serves them (`ceg_statements`).
+async fn occurrence_statements<F>(dir: &F, identity: &str) -> Result<Vec<Vec<u8>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut out = Vec::new();
+    for occ in dir.list_signed_identity_occurrences_for(identity).await? {
+        if let Some(all) = occ
+            .signed_envelope
+            .get("ceg_statements")
+            .and_then(serde_json::Value::as_array)
+        {
+            for h in all.iter().filter_map(serde_json::Value::as_str) {
+                if let Ok(b) = hex::decode(h) {
+                    if !out.contains(&b) {
+                        out.push(b);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Is `statement` a voice of an owner binding authored by `owner` and
+/// placed at `group` (its payload's `cohort_scope` targeted, its group member
+/// `community_id` / `community_key_id` / `family_id` / `family_key_id` =
+/// `group`)?
+fn binding_placed_at(statement: &[u8], owner: &str, group: &str) -> bool {
+    use ciris_verify_core::cde::Value;
+    let Some((_, payload)) = super::edition2::liveness::statement_parts(statement) else {
+        return false;
+    };
+    let text = |m: &str| payload.get_text(m).and_then(Value::as_text);
+    let targeted = text("cohort_scope").is_some_and(|s| membership_plane(s).is_some());
+    let names_group = [
+        "community_id",
+        "community_key_id",
+        "family_id",
+        "family_key_id",
+    ]
+    .iter()
+    .any(|m| text(m) == Some(group));
+    targeted && names_group && text("author") == Some(owner)
+}
+
+/// The identity a membership row speaks for: its payload's `author`, else
+/// its signer.
+fn row_author(row: &Attestation) -> String {
+    row.attestation_envelope
+        .get("author")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(row.attesting_key_id.as_str())
+        .to_owned()
+}
+
+/// v62.0.0 (WD-fix16a; the join carriage as Constitution ruled 11-23, the
+/// form of the contact request) — **the rows of THE INVITATION envelope**,
+/// which the host seals to the invitee's occurrence key: the inviter's
+/// occurrence bind statements (every voice), then the proposal's own
+/// statement(s). Nothing else (no roster: the invitee holds nothing of the
+/// room before it is seated, CC 2.7.8). In receive order: offer each to the
+/// invitee's replicated statement door, re-offering a wait.
+///
+/// # Errors
+/// `InvalidArgument` when `proposal_attestation_id` is not a held
+/// `membership:proposal` row; directory reads.
+pub async fn join_invitation_rows<F>(
+    dir: &F,
+    proposal_attestation_id: &str,
+) -> Result<Vec<Vec<u8>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let proposal = dir
+        .get_attestation(proposal_attestation_id)
+        .await?
+        .filter(|r| membership_row(r) == Some(MembershipRow::Proposal))
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "join_invitation_rows: {proposal_attestation_id} is not a held membership proposal"
+            ))
+        })?;
+    if let Some(group) = super::admission::envelope_cohort_target(&proposal.attestation_envelope)? {
+        if membership_plane(&proposal.cohort_scope) == Some(cohort_scope::TargetPlane::Room)
+            && room_is_private(dir, group).await?
+        {
+            return Err(private_room_carriage_refused("join_invitation_rows", group));
+        }
+    }
+    let mut out = occurrence_statements(dir, &row_author(&proposal)).await?;
+    for st in row_statements(dir, &proposal, "proposal").await? {
+        if !out.contains(&st) {
+            out.push(st);
+        }
+    }
+    Ok(out)
+}
+
+/// v62.0.0 (WD-fix16a; the join carriage as Constitution ruled 11-23) —
+/// **the rows of THE ANSWER envelope**, which the host seals to the
+/// proposer's occurrence key: the joiner's occurrence bind statements, the
+/// acceptance's own statement(s), then the joiner's owner binding(s)
+/// RE-SIGNED AT `room` (every voice of each, of every node the joiner owns:
+/// read from the statements the joiner's node KEEPS, since the binding is
+/// held there while the room's roster is not). The proposer holds the room's
+/// roster, so the binding is admitted
+/// ([`owner_binding_placed_by_an_invitee`]); it is a row of the room, so
+/// cohort delivery takes it to the other members.
+///
+/// # Errors
+/// `InvalidArgument` when `acceptance_attestation_id` is not a held
+/// `membership:acceptance` for `room`, or when the joiner holds no owner
+/// binding placed at `room` (re-sign one at the room first); directory reads.
+pub async fn join_answer_rows<F>(
+    dir: &F,
+    acceptance_attestation_id: &str,
+    room: &str,
+) -> Result<Vec<Vec<u8>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let acceptance = dir
+        .get_attestation(acceptance_attestation_id)
+        .await?
+        .filter(|r| membership_row(r) == Some(MembershipRow::Acceptance))
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "join_answer_rows: {acceptance_attestation_id} is not a held membership acceptance"
+            ))
+        })?;
+    if super::admission::envelope_cohort_target(&acceptance.attestation_envelope)? != Some(room) {
+        return Err(Error::InvalidArgument(format!(
+            "join_answer_rows: the acceptance {acceptance_attestation_id} is not about {room}"
+        )));
+    }
+    // WD-fix16e — refused for a room this node knows is private. The joiner's
+    // node holds no record of the room before it is seated (CC 2.7.8), so it
+    // cannot always tell: the proposer's door is the second guard
+    // ([`owner_binding_placed_by_an_invitee`] admits no identity-key binding
+    // at a private room).
+    if room_is_private(dir, room).await? {
+        return Err(private_room_carriage_refused("join_answer_rows", room));
+    }
+    let joiner = acceptance.attested_key_id.clone();
+    let mut out = occurrence_statements(dir, &joiner).await?;
+    // The acceptance before the binding: the proposer admits a binding
+    // placed at the room only from an invitee who has answered
+    // ([`owner_binding_placed_by_an_invitee`]).
+    for st in row_statements(dir, &acceptance, "acceptance").await? {
+        if !out.contains(&st) {
+            out.push(st);
+        }
+    }
+    // The binding re-signed at the room is HELD on the joiner's own node
+    // (the room's roster is not held there: CC 2.7.8), so it is read as the
+    // statements the node keeps, not as a concluded row: every voice of an
+    // owner binding of a node the joiner owns, authored by the joiner and
+    // placed at `room`.
+    let families = [
+        ciris_verify_core::namespace_match::family_id(
+            "ownership:{relation}:{target_kind}:{version}",
+        ),
+        super::edition2::emit::DELEGATES_TO_FAMILY.to_owned(),
+    ];
+    let mut placed = 0usize;
+    for node in super::admission::nodes_owned_by(dir, &joiner).await? {
+        for family in &families {
+            for st in dir.edition2_statements_about(family, &node).await? {
+                if binding_placed_at(&st, &joiner, room) && !out.contains(&st) {
+                    placed += 1;
+                    out.push(st);
+                }
+            }
+        }
+    }
+    if placed == 0 {
+        return Err(Error::InvalidArgument(format!(
+            "join_answer_rows: {joiner} holds no owner binding placed at {room}: the answer \
+             carries the joiner's binding re-signed at the room (CC 5.4.6); re-sign one first"
+        )));
+    }
+    Ok(out)
+}
+
 /// **The write-scope door for attestations** (AV-45 plus the two membership
 /// arms). Every backend's `put_attestation` calls this where it called
 /// `check_write_cohort_scope_for`.
@@ -662,21 +989,42 @@ where
                     return Ok(());
                 }
             }
+            // v62.0.0 (KR-fix30) — standing at the row's own instant.
             return dir
-                .check_write_cohort_scope_for(
+                .check_write_cohort_scope_for_at(
                     &row.attesting_key_id,
                     write_path,
                     &placed.cohort_scope,
                     placed.target.as_deref(),
+                    Some(row.asserted_at),
                 )
                 .await;
         }
+        // v62.0.0 (WD-fix16a; the join carriage as Constitution ruled 11-23:
+        // "THE ANSWER, sealed to the proposer: the membership:acceptance +
+        // the joiner's occurrence row(s) + the joiner's owner binding
+        // RE-SIGNED AT R. The proposer holds R's roster so the binding is
+        // admitted") — an owner binding PLACED at a group by a LIVE INVITEE
+        // of that group is the joining step, not a write by a member: the
+        // owner is not on R's roster yet, so the member test below would
+        // hold it forever (its instant precedes the seat). Admitted on the
+        // invitation: a held, unexpired, unwithdrawn, undeclined proposal at
+        // the group naming the owner (`live_invitees_of`). Every other gate
+        // (the owner's and the node's voices, the counted gate) is the
+        // door's, unchanged.
+        if owner_binding_placed_by_an_invitee(dir, row).await? {
+            return Ok(());
+        }
+        // v62.0.0 (KR-fix30; the lead's ruling on I4310) — a row a member
+        // wrote while a member counted when it was made: standing at the
+        // row's own instant, within W, never "now".
         return dir
-            .check_write_cohort_scope_for(
+            .check_write_cohort_scope_for_at(
                 &row.attesting_key_id,
                 write_path,
                 &row.cohort_scope,
                 super::admission::envelope_cohort_target(&row.attestation_envelope)?,
+                Some(row.asserted_at),
             )
             .await;
     };
@@ -687,21 +1035,13 @@ where
         return check_root_grant_reply(dir, row, kind).await;
     }
     let group = group_of(row)?;
-    // v61 S2 (CIRISPersist#1123) — a room stored under founder_only admits
-    // no proposal and no acceptance (its one event is the escape).
-    if membership_plane(&row.cohort_scope) == Some(cohort_scope::TargetPlane::Room)
-        && matches!(kind, MembershipRow::Proposal | MembershipRow::Acceptance)
-    {
-        super::admission::refuse_membership_event_under_founder_only(
-            dir,
-            &group,
-            match kind {
-                MembershipRow::Proposal => "membership proposal",
-                _ => "membership acceptance",
-            },
-        )
-        .await?;
-    }
+    // v62.0.0 (LINEAGE-L6b (b)) — the v61 S2 "room stored under
+    // founder_only" gates are DELETED: no such room can exist on a v62 node
+    // (the edition upgrade deletes the earlier store, CC "nothing carries";
+    // every edition-2 roster version, replicated or not, takes the record
+    // door's Local branch, which refuses founder_only above the family;
+    // the earlier-form replicated door is shut). A guard nothing reaches is
+    // a comment (P/LINEAGE-L6b-b.md: the producer grep).
     // v52.0.0 (#956) — no invitation to, or reply about, a dissolved family.
     if row.cohort_scope == cohort_scope::FAMILY {
         super::family_dissolution::refuse_if_held_family_dissolved(dir, &group).await?;
@@ -719,11 +1059,14 @@ where
             if !group_is_held(dir, &row.cohort_scope, &group).await? {
                 return Ok(());
             }
-            dir.check_write_cohort_scope_for(
+            // v62.0.0 (KR-fix30) — the proposer's standing at the
+            // proposal's own instant.
+            dir.check_write_cohort_scope_for_at(
                 &row.attesting_key_id,
                 write_path,
                 &row.cohort_scope,
                 Some(&group),
+                Some(row.asserted_at),
             )
             .await
             .map_err(|e| hold_unless_storage(reason::MEMBERSHIP_PROPOSER_OUT_OF_SCOPE, e))?;
@@ -867,7 +1210,7 @@ const ROOT_GRANT_GROUP: &str = "trust-root";
 /// a counted grant from the root** (the grant's second consent, the same
 /// acceptance family as an officer's): it names a HELD counted root grant
 /// (`references_attestation_id`; not held yet, it waits), is attested to the
-/// grant's grantee, binds the grant's content hash, and is signed FOR the
+/// grant's grantee (named in `refs.answers`, KR-fix32), and is signed FOR the
 /// grantee: by the grantee's person, or for a MACHINE grantee (a `node` or an
 /// `agent`) by its OWNER at the reply's own instant
 /// ([`admission::root_grant_consenter`](super::admission::root_grant_consenter)).
@@ -900,11 +1243,29 @@ where
             refuse(ROOT_GRANT_GROUP, member, RULE_PROPOSAL_UNRESOLVED),
         ));
     };
+    // ACCEPT-tokens (CC 3.1.2.1, each "concludes nothing": kept, held, never
+    // refused) — the text's own token for each way an acceptance fails to
+    // give the grantee's consent, one per case, in this order.
     if !super::admission::is_counted_root_grant_row(&grant) {
-        return Err(refuse(ROOT_GRANT_GROUP, member, RULE_ACCEPTANCE_MISMATCH));
+        return Err(fold::hold(
+            reason::ACCEPTANCE_OTHER_GRANT,
+            refuse(ROOT_GRANT_GROUP, member, RULE_ACCEPTANCE_OTHER_GRANT),
+        ));
+    }
+    if member != grant.attested_key_id {
+        return Err(fold::hold(
+            reason::ACCEPTANCE_OTHER_GRANTEE,
+            refuse(ROOT_GRANT_GROUP, member, RULE_ACCEPTANCE_OTHER_GRANTEE),
+        ));
     }
     // KR-fix5 — the signing key's OWN identity, never lifted to its owner: a
     // bound worker node's signature is not its owner's consent.
+    if row.attesting_key_id == grant.attested_key_id {
+        return Err(fold::hold(
+            reason::ACCEPTANCE_BY_GRANTEE,
+            refuse(ROOT_GRANT_GROUP, member, RULE_ACCEPTANCE_BY_GRANTEE),
+        ));
+    }
     if !super::admission::signs_for_root_grantee(
         dir,
         &row.attesting_key_id,
@@ -912,12 +1273,10 @@ where
         row.asserted_at,
     )
     .await?
-        || member != grant.attested_key_id
-        || env_str(row, "proposal_hash") != Some(grant.original_content_hash.as_str())
     {
         return Err(fold::hold(
-            reason::MEMBERSHIP_ACCEPTANCE_MISMATCH,
-            refuse(ROOT_GRANT_GROUP, member, RULE_ACCEPTANCE_MISMATCH),
+            reason::ACCEPTANCE_NOT_BY_OWNER,
+            refuse(ROOT_GRANT_GROUP, member, RULE_ACCEPTANCE_NOT_BY_OWNER),
         ));
     }
     let held = replies_of(dir, member).await?;
@@ -954,7 +1313,11 @@ where
 /// signed FOR the grantee (its person, or a machine grantee's owner at the
 /// acceptance's own instant: `admission::signs_for_root_grantee`), asserted
 /// by `t`, and NOT WITHDRAWN BY ITS OWN SIGNER by `t`
-/// ([`acceptance_withdrawn_by`]). No decline of the grant by `t`.
+/// ([`acceptance_withdrawn_by`]). No decline of the grant by `t`. KR-fix28:
+/// for a machine grantee, the owner binding in force at the acceptance's
+/// instant is the one in force at `t` (`admission::machine_owner_binding_at`):
+/// after a re-binding the grant confers again only once the new owner
+/// accepts it.
 ///
 /// - **From then on.** A withdrawal counts from its own signed
 ///   `asserted_at`: read at an instant before it, the acceptance still
@@ -976,12 +1339,57 @@ pub async fn root_grant_acceptance_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    root_grant_acceptance_for(dir, grant, t, None).await
+}
+
+/// v62.0.0 (HEAD-4.rev3; KR-fix28's marked move, CC 2.4.1.1 "an act names
+/// its head") — [`root_grant_acceptance_at`] for an ACT IN HAND: `act_head`
+/// is the act's `refs.head`. For a machine grantee, a node's or agent's act
+/// names its owner-binding row (`edition2::head_rule`), so the acceptance
+/// stands for the act exactly when that binding row is among the bindings in
+/// force at the acceptance's own instant: "the binding an act names" is read
+/// from the act, not from the binding in force at its instant. `None` (no
+/// act in hand: the grant listing, `admission::root_grants_for`; or an act
+/// naming no head) keeps the instant form below.
+///
+/// # Errors
+/// Directory reads.
+pub async fn root_grant_acceptance_for<F>(
+    dir: &F,
+    grant: &Attestation,
+    t: chrono::DateTime<chrono::Utc>,
+    act_head: Option<&crate::federation::edition2::names::RowId>,
+) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let grantee = grant.attested_key_id.as_str();
     let held = replies_of(dir, grantee).await?;
     let replies: Vec<&Attestation> = replies_to(&held, &grant.attestation_id)
         .into_iter()
         .filter(|r| r.asserted_at <= t && is_root_grant_reply(r))
         .collect();
+    // v62.0.0 (KR-fix28; CC 3.2, as the Constitution ruled 2026-11-22) — a
+    // machine grantee's acceptance is its owner's consent AS BOUND AT THE
+    // ACCEPTANCE'S OWN INSTANT, and it stands only for acts under THAT
+    // binding: a re-binding is a new owner-binding row, rows under it stand
+    // on the new owner, who has consented to nothing until they accept the
+    // grant themselves (the old owner's acceptance does not carry over, and
+    // the old owner cannot withdraw or renew on the new owner's behalf).
+    // v62.0.0 (HEAD-4.rev3) — "the binding an act names" is the act's
+    // `refs.head` when the act is in hand (`act_head`); with no act in hand,
+    // the binding in force at `t`.
+    let binding_at_t = super::admission::machine_owner_binding_at(dir, grantee, t).await?;
+    let names_the_binding = |at_acceptance: &super::admission::MachineOwner| match act_head {
+        Some(h) => match at_acceptance {
+            super::admission::MachineOwner::Bound { bindings, .. } => {
+                bindings.iter().any(|b| *b == h.hex())
+            }
+            super::admission::MachineOwner::NotAMachine => true,
+            super::admission::MachineOwner::Unbound => false,
+        },
+        None => *at_acceptance == binding_at_t,
+    };
     if replies
         .iter()
         .any(|r| membership_row(r) == Some(MembershipRow::Decline))
@@ -999,6 +1407,9 @@ where
             r.asserted_at,
         )
         .await?
+            && names_the_binding(
+                &super::admission::machine_owner_binding_at(dir, grantee, r.asserted_at).await?,
+            )
             && !acceptance_withdrawn_by(dir, r, t).await?
         {
             return Ok(Some(r.attestation_id.clone()));
@@ -1082,7 +1493,7 @@ where
 /// v62.0.0 (wave V1b; CC 4.4.3.12) — **a reply to a counted officer
 /// appointment**: signed for the officer (the appointment's attested key, by
 /// person), attested to it, about the affiliation the appointment names,
-/// binding the appointment's content hash; never both an acceptance and a
+/// naming the appointment in `refs.answers` (KR-fix32); never both an acceptance and a
 /// decline of one appointment.
 async fn check_officer_reply<F>(
     dir: &F,
@@ -1103,11 +1514,7 @@ where
         .active_identity_for_occurrence(&appointment.attested_key_id)
         .await?;
     let names = super::admission::envelope_cohort_target(&appointment.attestation_envelope)?;
-    if signer != officer
-        || member != appointment.attested_key_id
-        || names != Some(group)
-        || env_str(row, "proposal_hash") != Some(appointment.original_content_hash.as_str())
-    {
+    if signer != officer || member != appointment.attested_key_id || names != Some(group) {
         return Err(fold::hold(
             reason::MEMBERSHIP_ACCEPTANCE_MISMATCH,
             refuse(group, member, RULE_ACCEPTANCE_MISMATCH),
@@ -1355,17 +1762,27 @@ where
 }
 
 /// **A node gives no acceptance** (CIRISPersist#972; CC 3.1.3.2: "a node
-/// member of an `infrastructure` community is seated by the founders' quorum
-/// … the seat is valid when the founders' quorum signed the record and the
-/// node's own key record carries the conferring family's m-of-n scrub").
+/// member of an `infrastructure` community is seated by the founders' quorum";
+/// CC 4.4.3.19: in an infrastructure room a node "gives NO acceptance: seated
+/// by the founders' count alone, for the canonical room with the bundle's
+/// conferral").
 ///
 /// The ONE predicate both the growth gate and the founding rule read: `member`
 /// needs no acceptance in `community` at `at` iff the community is
 /// `infrastructure`, the key is node-bearing at `at` (#925's predicate), and
-/// its own key record carries the accord's m-of-n scrub. The founders' quorum
-/// is the caller's roster-authority check and is not weakened here. A person
-/// in the same community, and a node anywhere else, still needs what they
-/// needed.
+///
+/// - v62.0.0 (KR-fix23) — the community is any infrastructure room but the
+///   canonical one: nothing more (the founders' count seats it);
+/// - the community is THE CANONICAL room
+///   ([`CIRIS_CANONICAL_COMMUNITY_KEY_ID`](super::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID)):
+///   the bundle's conferral, which on v62 is a serve SEAT of the genesis
+///   bundle in force (KR-fix13). (The earlier co-scrub on the node's own key
+///   record is gone, KR-fix27.)
+///
+/// The founders' quorum is the caller's roster-authority check and is not
+/// weakened here. A person in the same community, and a node in any room
+/// that is not `infrastructure`, still needs what they needed (CC 4.4.3.19:
+/// there a node is never a member; its owner is).
 ///
 /// v61 (CIRISPersist#1101) — the announced-owner leg is the growth
 /// gate's ([`check_growth_accepted`]), not this predicate's: the founding
@@ -1387,21 +1804,27 @@ where
     if !super::is_node_bearing_key_at(dir, member, at).await? {
         return Ok(false);
     }
+    // v62.0.0 (KR-fix23; CC 4.4.3.19, the text as written: "seated by the
+    // founders' count alone") — in an infrastructure room that is not the
+    // canonical one, a node is seated by the founders' count and nothing
+    // else. (KR-fix13 asked every infrastructure room for the bundle's seat:
+    // narrower than the text, so no other node could be seated without its
+    // own voice, which KR-fix10 refuses.)
+    if community.community_key_id != super::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID {
+        return Ok(true);
+    }
     // v62.0.0 (KR-fix13; CC 3.1.3.2, CC 4.4.3.19: in an infrastructure room
     // a node "gives NO acceptance: seated by the founders' count alone, for
     // the canonical room with the bundle's conferral") — THE CONFERRAL ON
     // v62 IS THE BUNDLE'S SEAT. A canonical install is a serve seat of the
     // genesis bundle in force (`is_canonical_by_bundle`). The earlier
-    // conferral (the accord's co-scrub on the node's own key record) can
-    // never pass on v62 (`verify_accord_family_coscrub` answers
-    // `accord_conferral_awaits_trust_blessing_card`, TR-fix1), so before this
-    // line NO node was ever seated without its own voice, and after KR-fix10
-    // a node's acceptance of a named invitation is refused: a canonical
-    // install could not be added to the room at all.
-    if super::edition2::genesis::is_canonical_by_bundle(dir, member).await? {
-        return Ok(true);
-    }
-    super::admission::key_record_carries_accord_scrub(dir, member).await
+    // conferral (the accord's co-scrub on the node's own key record) is gone
+    // (KR-fix27: an edition-2 key record carries no capability role; it
+    // could never pass on v62), so before KR-fix13 NO node was ever seated
+    // without its own voice, and after KR-fix10 a node's acceptance of a
+    // named invitation is refused: a canonical install could not be added to
+    // the room at all.
+    super::edition2::genesis::is_canonical_by_bundle(dir, member).await
 }
 
 /// **The growth gate** (FSD §5): `member` joins `group` at `growth_instant`
@@ -1904,7 +2327,7 @@ pub fn standing_proposal_input(
 /// v62.0.0 (KR-fix6) — **a reply's envelope, for a signer whose pen is
 /// elsewhere** (a hardware-held owner): exactly the members
 /// [`reply_input`] gives the software producer (`dimension`,
-/// `references_attestation_id`, `proposal_hash`, the group's members for a
+/// `references_attestation_id` (stated as `refs.answers`), the group's members for a
 /// group reply) plus the `cohort_scope` the producer states. Hand it to
 /// `Engine::statement_draft("scores", &envelope, signer_iss, signer_kid_hex,
 /// sub, asserted_at_ms, None)`, with `sub` = the proposal's
@@ -1936,15 +2359,12 @@ pub fn reply_input(proposal: &Attestation, accept: bool) -> super::types::EmitAt
     // v62.0.0 (KR-fix2; CC 3.2 as ruled 2026-11-21) — a reply to a counted
     // grant from the root: placed at the federation scope, naming no group
     // (the root is the accord of the bundle the grant names), attested to the
-    // grantee, binding the grant's id and content hash
+    // grantee, naming the grant by its row id (`refs.answers`, KR-fix32:
+    // no `proposal_hash`, the row id IS the digest of the grant's payload)
     // ([`check_root_grant_reply`]). The signer must be the grantee's
     // consenter: for a `node` or `agent` grantee, its owner.
     if super::admission::is_counted_root_grant_row(proposal) {
-        let mut extra = serde_json::Map::new();
-        extra.insert(
-            "proposal_hash".into(),
-            proposal.original_content_hash.clone().into(),
-        );
+        let extra = serde_json::Map::new();
         let envelope = super::envelope::EnvelopeCore {
             dimension: Some(
                 if accept {
@@ -1978,10 +2398,8 @@ pub fn reply_input(proposal: &Attestation, accept: bool) -> super::types::EmitAt
             extra.insert(key.into(), v.clone());
         }
     }
-    extra.insert(
-        "proposal_hash".into(),
-        proposal.original_content_hash.clone().into(),
-    );
+    // v62.0.0 (KR-fix32) — no `proposal_hash`: the reply names the
+    // proposal by its row id (`refs.answers`), the digest of its payload.
     // The acceptance restates the offered role, and carries none when none
     // was offered (absent, never `null`).
     if accept {
@@ -2112,7 +2530,6 @@ pub mod test_support {
             "group_kind": super::group_kind_for_scope(&scope).unwrap_or("community"),
             target_key(&scope): p.attestation_envelope.get(target_key(&scope)).cloned(),
             "references_attestation_id": p.attestation_id,
-            "proposal_hash": p.original_content_hash,
         });
         // The acceptance restates the offered role, and carries none when none
         // was offered.

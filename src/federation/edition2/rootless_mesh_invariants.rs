@@ -787,7 +787,7 @@ mod sqlite {
     use super::*;
     use crate::federation::key_grant_invariants::two_node::{
         exercise_i199_family_member_publishes_and_another_opens, exercise_i61_end_to_end,
-        introduce, introduce_as, node, node_as,
+        introduce, introduce_as, node, node_as, own,
     };
     use crate::store::sqlite::SqliteBackend;
     use crate::store::Backend as _;
@@ -813,7 +813,7 @@ mod sqlite {
     }
 
     /// I2242 — community roster, key grant to the peer and sealed blob cross
-    /// between two rootless nodes.
+    /// between two rootless nodes (v62.0.0 HEAD-6: two OWNED rootless nodes).
     #[tokio::test]
     async fn i2242_a_community_blob_opens_across_rootless_nodes_sqlite() {
         use crate::federation::types::identity_type::NODE;
@@ -821,6 +821,12 @@ mod sqlite {
         let a = node_as(&ba, "i2242-a", NODE).await;
         let b = node_as(&bb, "i2242-b", NODE).await;
         introduce_as(&[&a, &b], &["i2242-a", "i2242-b"], NODE).await;
+        // v62.0.0 (HEAD-6; Constitution, head cases (3)) — re-staged on OWNED
+        // nodes: an unowned node is only reachable (it signs no holding claim
+        // and no report); owned-but-rootless runs the mesh. Each node's owner
+        // binding lands through the real door; neither node holds a root.
+        own(&a, "i2242-a", "i2242-owner-a").await;
+        own(&b, "i2242-b", "i2242-owner-b").await;
         assert_rootless(&ba, "sqlite A").await;
         assert_rootless(&bb, "sqlite B").await;
         Box::pin(exercise_i61_end_to_end(&a, &b, "i2242-sqlite")).await;
@@ -884,7 +890,7 @@ mod postgres {
     use super::*;
     use crate::federation::key_grant_invariants::two_node::{
         exercise_i199_family_member_publishes_and_another_opens, exercise_i61_end_to_end,
-        introduce, introduce_as, node, node_as,
+        introduce, introduce_as, node, node_as, own,
     };
     use crate::store::postgres::PostgresBackend;
     use crate::store::Backend as _;
@@ -927,6 +933,12 @@ mod postgres {
         let a = node_as(&ba, "i2242-a", NODE).await;
         let b = node_as(&bb, "i2242-b", NODE).await;
         introduce_as(&[&a, &b], &["i2242-a", "i2242-b"], NODE).await;
+        // v62.0.0 (HEAD-6; Constitution, head cases (3)) — re-staged on OWNED
+        // nodes: an unowned node is only reachable (it signs no holding claim
+        // and no report); owned-but-rootless runs the mesh. Each node's owner
+        // binding lands through the real door; neither node holds a root.
+        own(&a, "i2242-a", "i2242-owner-a").await;
+        own(&b, "i2242-b", "i2242-owner-b").await;
         assert_rootless(&ba, "postgres A").await;
         assert_rootless(&bb, "postgres B").await;
         Box::pin(exercise_i61_end_to_end(&a, &b, "i2242-postgres")).await;

@@ -47,8 +47,7 @@ residual (CC 5.4.6).
 | witness | where | backends | what it proves |
 |---|---|---|---|
 | `exercise_family_trust_root` via `family_trust_root_works_on_{sqlite,postgres}_557` | `src/federation/operational.rs`; runners in `src/store/{sqlite,postgres}.rs` | sqlite+pg | A 1-of-3 charter is refused, one seat cannot re-root, and a family becomes a root only with a 2-of-3 charter, a grant, and this node's own edge |
-| `exercise_trust_root` via `trust_root_helper_works_on_{sqlite,postgres}_536` | same | sqlite+pg | The trust-root verdict's walk |
-| I437, I438 `i437_trust_root_valid_reads_a_superseded_edge`, `i438_trusted_roots_of_reads_a_superseded_edge` | `src/federation/rc7_accord_invariants.rs` | sqlite+pg | The edge leg of the trust-root verdict reads a superseded acceptance |
+| `exercise_ceremony_plane_capability_walk` via its `{sqlite,postgres}` `_548` runners | `src/federation/operational.rs`; runners in `src/store/{sqlite,postgres}.rs` | sqlite+pg | The trust-root verdict's walk over the bundle's lineage: a counted grant confers, one holder's grant does not, and withdrawing this node's one acceptance collapses trust (v62.0.0 R2-fixture: `exercise_trust_root` and I437/I438, which read a KEYED root, are deleted) |
 | I439 `i439_a_keyed_root_confers_by_its_own_key_not_by_one_founder` | same | sqlite+pg | A KEYED threshold root confers by its own key; one founder alone confers nothing (the bundle root's counted grant: I4200–I4204, `edition2/root_grant_invariants.rs`) |
 | `exercise_conferral_is_not_stewardship` via `conferral_is_not_stewardship_{sqlite,postgres}_87` | `src/federation/admission.rs`; `src/store/{sqlite,postgres}.rs` | sqlite+pg | A conferral is never counted as stewardship |
 | I1361 `i1361_infra_relay_is_accord_conferred` | `src/federation/v601_asks_invariants.rs` | sqlite+pg | `infra:relay` is conferred only by a 2-of-3 holder co-scrub (CC 5.4.6 item 4). A scrub by a key outside the roster reads false |

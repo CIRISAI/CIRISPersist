@@ -431,6 +431,7 @@ pub mod bodies {
                 reason: reason.map(str::to_owned),
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
+                leaf: crate::federation::types::RevocationLeaf::Removal,
             },
         );
         let h = head(dir, here).await;
@@ -656,6 +657,115 @@ pub mod bodies {
             "[{tag}] I175b: {roster:?}"
         );
     }
+
+    /// **I6928 — an appointment belongs to the head it NAMES** (LINEAGE-L6d-2b;
+    /// CC 2.4.1.1 "an act names its head", rc22 "no instant decides it").
+    /// Founders alice, bob, carol. (B) bob appoints mo2 while a founder,
+    /// carol then demotes bob: mo2's appointment still stands (it names a
+    /// head where bob is a founder) and mo2 widens ivy. (A) carol demotes
+    /// alice; alice THEN signs an appointment of mo STAMPED before her
+    /// demotion: it names the head after the demotion, where alice is no
+    /// founder, so it confers nothing and mo's widening of hank does not
+    /// land. Red on the v49 instant intervals (the stamp falls inside
+    /// alice's founder interval).
+    pub async fn exercise_an_appointment_belongs_to_the_head_it_names(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let [alice, bob, carol] = ["alice", "bob", "carol"].map(|k| format!("{tag}-{k}"));
+        let [mo, mo2] = ["mo", "mo2"].map(|k| format!("{tag}-{k}"));
+        let [hank, ivy] = ["hank", "ivy"].map(|k| format!("{tag}-{k}"));
+        for k in [&alice, &bob, &carol, &hank, &ivy] {
+            register(dir, k, &[identity_type::USER]).await;
+        }
+        for k in [&mo, &mo2] {
+            register(dir, k, &[identity_type::PRIMITIVE]).await;
+        }
+        let here = format!("{tag}-room");
+        let now = Utc::now();
+        let seat = |k: &str| CommunityMember {
+            key_id: k.to_owned(),
+            joined_at: now,
+            role: Some(MEMBER_ROLE_FOUNDER.to_owned()),
+        };
+        let founding = sign_community(
+            &alice,
+            Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
+                community_key_id: here.clone(),
+                community_name: format!("named-head room {here}"),
+                members: vec![seat(&alice), seat(&bob), seat(&carol)],
+                founded_at: now,
+                consensus_protocol: "quorum:1/1".into(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        fx::put_voices(dir, &fx::community_voices(&founding, 1, None, fx::ms(now)))
+            .await
+            .unwrap_or_else(|e| panic!("room: {e}"));
+        // (B) bob appoints mo2 as a founder, then carol demotes bob.
+        put(
+            dir,
+            &appointment(&bob, &mo2, Some(&fx::kid(&here)), None),
+            "bob appoints mo2",
+        )
+        .await;
+        tick().await;
+        let r = widen_e2(dir, &here, &carol, &carol, &bob, None, Utc::now()).await;
+        assert!(
+            landed(&r),
+            "[{tag}] I6928 premise: carol demotes bob: {r:?}"
+        );
+        tick().await;
+        let r = widen_e2(dir, &here, &carol, &mo2, &ivy, None, Utc::now()).await;
+        assert!(
+            landed(&r),
+            "[{tag}] I6928 (B): an appointment naming a head where bob was a founder \
+             stands after bob's demotion: {r:?}"
+        );
+        // (A) carol demotes alice; alice then appoints mo, stamped earlier.
+        tick().await;
+        let stamp = Utc::now() - Duration::seconds(5);
+        tick().await;
+        let r = widen_e2(dir, &here, &carol, &carol, &alice, None, Utc::now()).await;
+        assert!(
+            landed(&r),
+            "[{tag}] I6928 premise: carol demotes alice: {r:?}"
+        );
+        tick().await;
+        let backdated = {
+            let envelope = serde_json::json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "scope": [DELEGATION_SCOPE_MODERATE],
+                "sub_delegation": false,
+                "community_id": fx::kid(&here),
+            });
+            // CP2 skeleton: the builder's unsigned shape, re-signed as edition
+            // 2 (`row_of`) before any door, as `appointment` does.
+            let mut row = fx::with_earlier_form(|| {
+                signed_row(&alice, &mo, attestation_type::DELEGATES_TO, envelope)
+            });
+            row.subject_key_ids = vec![mo.clone()];
+            row.asserted_at = stamp;
+            fx::row_of(&row, &alice)
+        };
+        // The door may keep or hold it; either way it must confer nothing.
+        let _ = fx::land_delegation(dir, &backdated).await;
+        tick().await;
+        let r = widen_e2(dir, &here, &carol, &mo, &hank, None, Utc::now()).await;
+        assert!(
+            !landed(&r),
+            "[{tag}] I6928 (A): an appointment signed after alice's demotion confers \
+             nothing, whatever it is stamped with: {r:?}"
+        );
+        let roster = roster(dir, &here).await;
+        assert!(
+            roster.contains(&fx::kid(&ivy)) && !roster.contains(&fx::kid(&hank)),
+            "[{tag}] I6928: {roster:?}"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -778,6 +888,39 @@ mod run {
         super::bodies::exercise_an_appointment_belongs_to_its_epoch(
             &b,
             &format!("i175b-{}", suffix()),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn an_appointment_belongs_to_the_head_it_names_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::bodies::exercise_an_appointment_belongs_to_the_head_it_names(
+            &b,
+            &format!("i6928-{}", suffix()),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn an_appointment_belongs_to_the_head_it_names_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::bodies::exercise_an_appointment_belongs_to_the_head_it_names(
+            &b,
+            &format!("i6928-{}", suffix()),
         )
         .await;
     }

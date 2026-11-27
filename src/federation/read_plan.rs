@@ -444,7 +444,9 @@ pub(crate) fn serve_rule_parts(
         &format!("{alias}.attestation_type"),
         dialect.row_type(),
     ));
-    parts.push(super::steward_purge::served_under_purge_sql(alias, prefix));
+    parts.push(super::steward_purge::served_under_purge_sql(
+        alias, prefix, dialect,
+    ));
     if !rooted {
         parts.push(served_while_unrooted_sql(dialect, alias));
     }
@@ -566,7 +568,7 @@ pub(crate) fn owner_binding_marker_sql(dialect: Dialect, t: &str) -> String {
     format!(
         "({t}.dimension = '{}' OR {purpose} = '{}')",
         owner_binding::DIMENSION,
-        owner_binding::CC_DELEGATION_PURPOSE
+        owner_binding::PURPOSE
     )
 }
 
