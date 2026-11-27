@@ -46,8 +46,8 @@
 // generator exists to remove.
 #[allow(unused_imports)]
 use super::*;
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 /// A `FederationDirectory` that delegates to `inner`, except where a method
 /// has been declared faulted — there it returns [`Error::Unsupported`].
@@ -61,6 +61,9 @@ pub struct FaultInjectingDirectory {
     inner: Arc<dyn FederationDirectory>,
     unsupported: BTreeSet<&'static str>,
     erroring: BTreeSet<&'static str>,
+    // v62.0.0 (CONTENT-A6b) — every Result-returning call, by method name,
+    // shared by clones: a witness counts the store reads a door makes.
+    calls: Arc<Mutex<BTreeMap<&'static str, u64>>>,
 }
 
 impl std::fmt::Debug for FaultInjectingDirectory {
@@ -81,6 +84,21 @@ impl FaultInjectingDirectory {
             inner,
             unsupported: BTreeSet::new(),
             erroring: BTreeSet::new(),
+            calls: Arc::default(),
+        }
+    }
+
+    /// v62.0.0 (CONTENT-A6b) — the calls made through this double so far
+    /// (every Result-returning trait method), by method name.
+    #[must_use]
+    pub fn calls(&self) -> BTreeMap<&'static str, u64> {
+        self.calls.lock().map(|m| m.clone()).unwrap_or_default()
+    }
+
+    /// v62.0.0 (CONTENT-A6b) — forget the calls counted so far.
+    pub fn reset_calls(&self) {
+        if let Ok(mut m) = self.calls.lock() {
+            m.clear();
         }
     }
 
@@ -125,6 +143,9 @@ impl FaultInjectingDirectory {
     }
 
     fn faulted(&self, method: &'static str) -> Option<Error> {
+        if let Ok(mut m) = self.calls.lock() {
+            *m.entry(method).or_insert(0) += 1;
+        }
         if self.unsupported.contains(method) {
             return Some(Error::Unsupported { method });
         }
@@ -134,7 +155,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 202 delegations, generated. Every one: fault first, then delegate.
+// 217 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_skips(&self) -> Result<Vec<edition2::accord_rescan::AccordRescan>, Error> {
@@ -314,6 +335,34 @@ impl FederationDirectory for FaultInjectingDirectory {
             .drop_group_tips(cohort, group_key_id, persist_row_hashes)
             .await
     }
+    async fn drop_held_row(&self, row_id: &edition2::names::RowId) -> Result<u64, Error> {
+        if let Some(e) = self.faulted("drop_held_row") {
+            return Err(e);
+        }
+        self.inner.drop_held_row(row_id).await
+    }
+    async fn edition2_content_answer(
+        &self,
+        row: &edition2::names::RowId,
+    ) -> Result<Option<edition2::content_store::CachedAnswer>, Error> {
+        if let Some(e) = self.faulted("edition2_content_answer") {
+            return Err(e);
+        }
+        self.inner.edition2_content_answer(row).await
+    }
+    async fn edition2_content_ends(
+        &self,
+        group_kind: &str,
+        group: &str,
+        member: &str,
+    ) -> Result<Vec<edition2::content_store::RetainedEnd>, Error> {
+        if let Some(e) = self.faulted("edition2_content_ends") {
+            return Err(e);
+        }
+        self.inner
+            .edition2_content_ends(group_kind, group, member)
+            .await
+    }
     async fn edition2_first_held_us(
         &self,
         row_id: &edition2::names::RowId,
@@ -323,11 +372,109 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.edition2_first_held_us(row_id).await
     }
+    async fn edition2_held_bound_expired(
+        &self,
+        scope: &str,
+        target: &str,
+        bucket: &str,
+        before_us: i64,
+        limit: u32,
+    ) -> Result<Vec<edition2::names::RowId>, Error> {
+        if let Some(e) = self.faulted("edition2_held_bound_expired") {
+            return Err(e);
+        }
+        self.inner
+            .edition2_held_bound_expired(scope, target, bucket, before_us, limit)
+            .await
+    }
+    async fn edition2_held_bound_put(
+        &self,
+        entry: &edition2::hold_bound::HeldEntry,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("edition2_held_bound_put") {
+            return Err(e);
+        }
+        self.inner.edition2_held_bound_put(entry).await
+    }
+    async fn edition2_held_bound_remove(&self, row: &edition2::names::RowId) -> Result<(), Error> {
+        if let Some(e) = self.faulted("edition2_held_bound_remove") {
+            return Err(e);
+        }
+        self.inner.edition2_held_bound_remove(row).await
+    }
+    async fn edition2_held_bound_usage(
+        &self,
+        scope: &str,
+        target: &str,
+        bucket: &str,
+        writer: Option<&str>,
+        cap: u64,
+    ) -> Result<(u64, u64), Error> {
+        if let Some(e) = self.faulted("edition2_held_bound_usage") {
+            return Err(e);
+        }
+        self.inner
+            .edition2_held_bound_usage(scope, target, bucket, writer, cap)
+            .await
+    }
     async fn edition2_objects(&self, typ: &str) -> Result<Vec<Vec<u8>>, Error> {
         if let Some(e) = self.faulted("edition2_objects") {
             return Err(e);
         }
         self.inner.edition2_objects(typ).await
+    }
+    async fn edition2_put_content_answer(
+        &self,
+        scope: &str,
+        target: &str,
+        member: &str,
+        answer: &edition2::content_store::CachedAnswer,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("edition2_put_content_answer") {
+            return Err(e);
+        }
+        self.inner
+            .edition2_put_content_answer(scope, target, member, answer)
+            .await
+    }
+    async fn edition2_put_content_answers(
+        &self,
+        scope: &str,
+        target: &str,
+        member: &str,
+        answers: &[edition2::content_store::CachedAnswer],
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("edition2_put_content_answers") {
+            return Err(e);
+        }
+        self.inner
+            .edition2_put_content_answers(scope, target, member, answers)
+            .await
+    }
+    async fn edition2_room_series(
+        &self,
+        scope: &str,
+        target: &str,
+        author: &str,
+    ) -> Result<Vec<(edition2::names::RowId, i64)>, Error> {
+        if let Some(e) = self.faulted("edition2_room_series") {
+            return Err(e);
+        }
+        self.inner.edition2_room_series(scope, target, author).await
+    }
+    async fn edition2_room_tips(
+        &self,
+        scope: &str,
+        target: &str,
+        author: &str,
+        limit: u32,
+    ) -> Result<Vec<(edition2::names::RowId, i64)>, Error> {
+        if let Some(e) = self.faulted("edition2_room_tips") {
+            return Err(e);
+        }
+        self.inner
+            .edition2_room_tips(scope, target, author, limit)
+            .await
     }
     async fn edition2_roster_proposal(
         &self,
@@ -493,6 +640,12 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.fold_held_page(after, limit).await
+    }
+    async fn fold_slot_all_rows(&self, slot: &str) -> Result<Vec<edition2::names::RowId>, Error> {
+        if let Some(e) = self.faulted("fold_slot_all_rows") {
+            return Err(e);
+        }
+        self.inner.fold_slot_all_rows(slot).await
     }
     async fn fold_slot_held(&self, slot: &str) -> Result<bool, Error> {
         if let Some(e) = self.faulted("fold_slot_held") {
@@ -1305,6 +1458,16 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_wire_hashes_since(kind, after_content_hash, limit)
             .await
     }
+    async fn list_withdrawals_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedAttestation>, Error> {
+        if let Some(e) = self.faulted("list_withdrawals_since") {
+            return Err(e);
+        }
+        self.inner.list_withdrawals_since(since, limit).await
+    }
     async fn list_witness_peer_ids(&self) -> Result<Vec<String>, Error> {
         if let Some(e) = self.faulted("list_witness_peer_ids") {
             return Err(e);
@@ -1463,6 +1626,14 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .purge_delete_tombstoned_attestation(attestation_id)
+            .await
+    }
+    async fn purge_delete_tombstoned_statements(&self, attestation_id: &str) -> Result<u64, Error> {
+        if let Some(e) = self.faulted("purge_delete_tombstoned_statements") {
+            return Err(e);
+        }
+        self.inner
+            .purge_delete_tombstoned_statements(attestation_id)
             .await
     }
     async fn purge_delete_tombstoned_trace(&self, trace_id: &str) -> Result<(u64, u64), Error> {
@@ -1697,11 +1868,14 @@ impl FederationDirectory for FaultInjectingDirectory {
     async fn put_identity_occurrence_edition2(
         &self,
         bind: edition2::occurrence::OccurrenceBind,
+        door: DoorToken,
     ) -> Result<bool, Error> {
         if let Some(e) = self.faulted("put_identity_occurrence_edition2") {
             return Err(e);
         }
-        self.inner.put_identity_occurrence_edition2(bind).await
+        self.inner
+            .put_identity_occurrence_edition2(bind, door)
+            .await
     }
     async fn put_identity_occurrence_local(
         &self,
@@ -1712,15 +1886,16 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.put_identity_occurrence_local(occurrence).await
     }
-    async fn put_identity_occurrence_revocation_local(
+    async fn put_identity_occurrence_revocation_edition2(
         &self,
         revocation: types::IdentityOccurrenceRevocation,
+        door: DoorToken,
     ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_identity_occurrence_revocation_local") {
+        if let Some(e) = self.faulted("put_identity_occurrence_revocation_edition2") {
             return Err(e);
         }
         self.inner
-            .put_identity_occurrence_revocation_local(revocation)
+            .put_identity_occurrence_revocation_edition2(revocation, door)
             .await
     }
     async fn put_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error> {
@@ -2025,6 +2200,17 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .supersede_group_row(cohort, new_snapshot, authorization)
+            .await
+    }
+    async fn test_seam_put_identity_occurrence(
+        &self,
+        occurrence: types::IdentityOccurrence,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("test_seam_put_identity_occurrence") {
+            return Err(e);
+        }
+        self.inner
+            .test_seam_put_identity_occurrence(occurrence)
             .await
     }
     async fn trust_direction_held_among(

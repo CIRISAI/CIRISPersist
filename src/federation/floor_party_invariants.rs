@@ -53,7 +53,8 @@ pub(crate) mod bodies {
                 { "role": "records_officer", "key_id": o2 },
             ],
         });
-        found_room_with_blob(d, &solo, "founder_only", &[&f], &[], Some(blob))
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let solo = found_room_with_blob(d, &solo, "founder_only", &[&f], &[], Some(blob))
             .await
             .expect("I4155: a sole practitioner's affiliation with two officials");
         assert!(

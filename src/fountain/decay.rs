@@ -234,6 +234,10 @@ pub struct ConsentDecaySweepReport {
     pub content_decayed: u64,
     /// Total symbol rows the decay clock evicted this pass.
     pub symbols_evicted: u64,
+    /// v62.0.0 (WD-fix3 rev 2) — withdrawn rows whose unfinished descent this
+    /// pass finished (`Engine::descend_withdrawn_content_pending`).
+    #[serde(default)]
+    pub withdrawals_descended: u64,
 }
 
 #[cfg(test)]

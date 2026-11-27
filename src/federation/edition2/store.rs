@@ -297,7 +297,181 @@ pub fn put_row_sqlite(
         )
         .map_err(be)?;
     }
+    // v62.0.0 (CONTENT-A4; V300 per P/CONTENT-V300.rev3.sql) — a room
+    // content row joins its author's series (`ceg_room_content`), held or
+    // concluded, at its first statement's admission.
+    if let Some(e) = series_of(row) {
+        let head = super::names::single(&row.names, "head");
+        tx.execute(
+            "INSERT OR IGNORE INTO ceg_room_content (row_id, room_scope, room_target, author, \
+             kid, head_row_id, admitted_us) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                &row.row_id.0[..],
+                e.scope,
+                e.target,
+                e.author,
+                &row.kid[..],
+                head.map(|h| h.0.to_vec()),
+                admitted,
+            ],
+        )
+        .map_err(be)?;
+        // v62.0.0 (CONTENT-A4b; V300-b `followed`) — the series' tips kept
+        // in the index: the predecessors this row names are followed, and
+        // this row is followed when a held row of its series already names
+        // it (it arrived after its successor).
+        for p in predecessors(row) {
+            tx.execute(
+                "UPDATE ceg_room_content SET followed = 1 WHERE row_id = ?1 AND room_scope = ?2 \
+                 AND room_target = ?3 AND author = ?4",
+                rusqlite::params![&p.0[..], e.scope, e.target, e.author],
+            )
+            .map_err(be)?;
+        }
+        tx.execute(
+            "UPDATE ceg_room_content SET followed = 1 WHERE row_id = ?1 AND EXISTS (SELECT 1 FROM \
+             ceg_row_names n JOIN ceg_room_content c ON c.row_id = n.row_id WHERE \
+             n.named_row_id = ?1 AND n.role IN ('prev', 'further_prev') AND c.room_scope = ?2 \
+             AND c.room_target = ?3 AND c.author = ?4)",
+            rusqlite::params![&row.row_id.0[..], e.scope, e.target, e.author],
+        )
+        .map_err(be)?;
+    }
+    // v62.0.0 (CONTENT-A6) — an end of a seat or a `keeps` row is retained
+    // with its head, class and tips (survives a purge).
+    super::content_store::retain_sqlite(tx, row).map_err(be)?;
     Ok(n == 1)
+}
+
+/// v62.0.0 (CONTENT-A4b) — the predecessors a row names (`refs.prev` and
+/// `refs.further_prev`).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn predecessors(row: &AdmittedRow) -> Vec<super::names::RowId> {
+    row.names
+        .iter()
+        .filter(|n| n.role == "prev" || n.role == "further_prev")
+        .map(|n| n.row)
+        .collect()
+}
+
+/// v62.0.0 (CONTENT-A4b) — sqlite: `author`'s TIPS in the room, newest first
+/// by admission (ties by row id), at most `limit`: the series rows no held
+/// row of the series names as a predecessor (`followed = 0`).
+///
+/// # Errors
+/// sqlite errors.
+#[cfg(feature = "sqlite")]
+pub fn room_tips_sqlite(
+    conn: &rusqlite::Connection,
+    scope: &str,
+    target: &str,
+    author: &str,
+    limit: u32,
+) -> Result<Vec<(super::names::RowId, i64)>, crate::federation::Error> {
+    let be =
+        |e: rusqlite::Error| crate::federation::Error::Backend(format!("ceg_room_content: {e}"));
+    let mut st = conn
+        .prepare(
+            "SELECT row_id, admitted_us FROM ceg_room_content WHERE room_scope = ?1 AND \
+             room_target = ?2 AND author = ?3 AND followed = 0 ORDER BY admitted_us DESC, row_id \
+             DESC LIMIT ?4",
+        )
+        .map_err(be)?;
+    let rows = st
+        .query_map(
+            rusqlite::params![scope, target, author, i64::from(limit)],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .map_err(be)?;
+    rows.map(|r| {
+        let (b, at) = r.map_err(be)?;
+        <[u8; 32]>::try_from(b.as_slice())
+            .map(|d| (super::names::RowId(d), at))
+            .map_err(|_| {
+                crate::federation::Error::Backend("ceg_room_content: row_id length".into())
+            })
+    })
+    .collect()
+}
+
+/// v62.0.0 (CONTENT-A4b) — postgres: [`room_tips_sqlite`].
+///
+/// # Errors
+/// postgres errors.
+#[cfg(feature = "postgres")]
+pub async fn room_tips_postgres<C>(
+    client: &C,
+    scope: &str,
+    target: &str,
+    author: &str,
+    limit: u32,
+) -> Result<Vec<(super::names::RowId, i64)>, crate::federation::Error>
+where
+    C: deadpool_postgres::GenericClient + Sync,
+{
+    let rows = client
+        .query(
+            "SELECT row_id, admitted_us FROM cirislens.ceg_room_content WHERE room_scope = $1 \
+             AND room_target = $2 AND author = $3 AND NOT followed ORDER BY admitted_us DESC, \
+             row_id DESC LIMIT $4",
+            &[&scope, &target, &author, &i64::from(limit)],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("ceg_room_content: {e}")))?;
+    rows.iter()
+        .map(|r| {
+            let b: Vec<u8> = r.get(0);
+            let at: i64 = r.get(1);
+            <[u8; 32]>::try_from(b.as_slice())
+                .map(|d| (super::names::RowId(d), at))
+                .map_err(|_| {
+                    crate::federation::Error::Backend("ceg_room_content: row_id length".into())
+                })
+        })
+        .collect()
+}
+
+/// v62.0.0 (CONTENT-A4) — the series place of an admitted row
+/// ([`super::room_content::series_entry`]).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn series_of(row: &AdmittedRow) -> Option<super::room_content::SeriesEntry> {
+    super::room_content::series_entry(&row.row_type, &row.family, &row.payload)
+}
+
+/// v62.0.0 (CONTENT-A4) — sqlite: `author`'s room content rows in the room
+/// (`scope`, `target`), as `(row id, admitted_us)` in admission order.
+///
+/// # Errors
+/// sqlite errors.
+#[cfg(feature = "sqlite")]
+pub fn room_series_sqlite(
+    conn: &rusqlite::Connection,
+    scope: &str,
+    target: &str,
+    author: &str,
+) -> Result<Vec<(super::names::RowId, i64)>, crate::federation::Error> {
+    let be =
+        |e: rusqlite::Error| crate::federation::Error::Backend(format!("ceg_room_content: {e}"));
+    let mut st = conn
+        .prepare(
+            "SELECT row_id, admitted_us FROM ceg_room_content WHERE room_scope = ?1 AND \
+             room_target = ?2 AND author = ?3 ORDER BY admitted_us, row_id",
+        )
+        .map_err(be)?;
+    let rows = st
+        .query_map(rusqlite::params![scope, target, author], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
+        })
+        .map_err(be)?;
+    rows.map(|r| {
+        let (b, at) = r.map_err(be)?;
+        <[u8; 32]>::try_from(b.as_slice())
+            .map(|d| (super::names::RowId(d), at))
+            .map_err(|_| {
+                crate::federation::Error::Backend("ceg_room_content: row_id length".into())
+            })
+    })
+    .collect()
 }
 
 /// sqlite: the held statements of `family` about `sub`, as received.
@@ -415,7 +589,88 @@ where
             .await
             .map_err(be)?;
     }
+    // v62.0.0 (CONTENT-A4) — the series index, as on sqlite.
+    if let Some(e) = series_of(row) {
+        let head: Option<Vec<u8>> = super::names::single(&row.names, "head").map(|h| h.0.to_vec());
+        client
+            .execute(
+                "INSERT INTO cirislens.ceg_room_content (row_id, room_scope, room_target, author, \
+                 kid, head_row_id, admitted_us) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT \
+                 DO NOTHING",
+                &[
+                    &&row.row_id.0[..],
+                    &e.scope,
+                    &e.target,
+                    &e.author,
+                    &&row.kid[..],
+                    &head,
+                    &admitted,
+                ],
+            )
+            .await
+            .map_err(be)?;
+        // v62.0.0 (CONTENT-A4b) — the tips, as on sqlite.
+        for p in predecessors(row) {
+            client
+                .execute(
+                    "UPDATE cirislens.ceg_room_content SET followed = true WHERE row_id = $1 AND \
+                     room_scope = $2 AND room_target = $3 AND author = $4",
+                    &[&&p.0[..], &e.scope, &e.target, &e.author],
+                )
+                .await
+                .map_err(be)?;
+        }
+        client
+            .execute(
+                "UPDATE cirislens.ceg_room_content SET followed = true WHERE row_id = $1 AND \
+                 EXISTS (SELECT 1 FROM cirislens.ceg_row_names n JOIN cirislens.ceg_room_content \
+                 c ON c.row_id = n.row_id WHERE n.named_row_id = $1 AND n.role IN ('prev', \
+                 'further_prev') AND c.room_scope = $2 AND c.room_target = $3 AND c.author = $4)",
+                &[&&row.row_id.0[..], &e.scope, &e.target, &e.author],
+            )
+            .await
+            .map_err(be)?;
+    }
+    // v62.0.0 (CONTENT-A6) — the retained end, as on sqlite.
+    super::content_store::retain_postgres(client, row)
+        .await
+        .map_err(be)?;
     Ok(n == 1)
+}
+
+/// v62.0.0 (CONTENT-A4) — postgres: [`room_series_sqlite`].
+///
+/// # Errors
+/// postgres errors.
+#[cfg(feature = "postgres")]
+pub async fn room_series_postgres<C>(
+    client: &C,
+    scope: &str,
+    target: &str,
+    author: &str,
+) -> Result<Vec<(super::names::RowId, i64)>, crate::federation::Error>
+where
+    C: deadpool_postgres::GenericClient + Sync,
+{
+    let rows = client
+        .query(
+            "SELECT row_id, admitted_us FROM cirislens.ceg_room_content WHERE room_scope = $1 \
+             AND room_target = $2 AND author = $3 ORDER BY admitted_us, row_id",
+            &[&scope, &target, &author],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("ceg_room_content: {e}")))?;
+    rows.iter()
+        .map(|r| {
+            let b: Vec<u8> = r.get(0);
+            let at: i64 = r.get(1);
+            <[u8; 32]>::try_from(b.as_slice())
+                .map(|d| (super::names::RowId(d), at))
+                .map_err(|_| {
+                    crate::federation::Error::Backend("ceg_room_content: row_id length".into())
+                })
+        })
+        .collect()
 }
 
 /// postgres: the held statements of `family` about `sub`, as received.

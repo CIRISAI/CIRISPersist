@@ -100,6 +100,9 @@ pub(crate) mod bodies {
             crate::federation::edition2::fixture_switch::kid(&format!("em-bob-{run}")),
         );
         seed_community_everywhere(&[&a, &b], &comm, &[(&alice, Some(&a)), (&bob, Some(&b))]).await;
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         let (node_a, node_b) = (a.key.clone(), b.key.clone());
         Ladder {
             engine_a,
@@ -451,7 +454,7 @@ pub(crate) mod bodies {
         );
         // Two candidates act for the author: still no guess.
         b.as_ref()
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: l.alice.clone(),
                 occurrence_key_id: other.clone(),
                 device_class: crate::federation::types::device_class::LAPTOP.into(),
@@ -1382,6 +1385,9 @@ pub(crate) mod room_1271 {
             )
             .await;
         }
+        // GID-fixtures-sites — the room's DERIVED id, once founded (`room_id`
+        // panics if it was not).
+        let comm = crate::federation::edition2::fixture_switch::room_id(&comm);
         let (node_a, node_b, node_c) = (
             nodes[0].key.clone(),
             nodes[1].key.clone(),
@@ -2097,7 +2103,7 @@ pub(crate) mod room_1271 {
         assert_eq!(bound(&r.bc, &sha_a).await, r.alice, "I1782: stranded");
         // The occurrence lands (the same record the other nodes hold).
         let kem_a = r.ba.load_or_init_content_kem_identity().await.unwrap();
-        r.bc.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+        r.bc.test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
             identity_key_id: r.alice.clone(),
             occurrence_key_id: r.node_a.clone(),
             device_class: crate::federation::types::device_class::LAPTOP.into(),

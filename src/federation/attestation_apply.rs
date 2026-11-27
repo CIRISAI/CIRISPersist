@@ -146,6 +146,15 @@ pub enum AttestationRefusalReason {
     /// (`edition2::accord_rescan`), and the host re-pulls from it once a
     /// bundle is in force. APPENDED.
     AccordRootNotHeld,
+    /// v62.0.0 (HOLD-1a; CC 2.7.3 as ruled 11-23: "A node may decline to keep
+    /// or serve a row by its own configuration … never a verdict on the row,
+    /// and the row is not Invalid") — a row held for its writer's standing
+    /// (the write scope) that only ADDS, offered past this node's own bound
+    /// on such rows (per room, per writer, per removed member:
+    /// `edition2::hold_bound`). Not kept; the store untouched; the sender's
+    /// cursor ADVANCES; a re-offer once the writer's seating record is held
+    /// lands. A LOCAL decline, RETRYABLE. APPENDED.
+    NotKept,
 }
 
 impl AttestationRefusalReason {
@@ -165,6 +174,7 @@ impl AttestationRefusalReason {
             Self::GroupPlaneRefused => "group_plane_refused",
             Self::NotInAudience => "not_in_audience",
             Self::AccordRootNotHeld => "accord_root_not_held",
+            Self::NotKept => "not_kept",
         }
     }
 
@@ -180,6 +190,7 @@ impl AttestationRefusalReason {
                 | Self::StoreConflict
                 | Self::NotInAudience
                 | Self::AccordRootNotHeld
+                | Self::NotKept
         )
     }
 
@@ -189,7 +200,10 @@ impl AttestationRefusalReason {
     /// against it, and it is taken once the local answer changes.
     #[must_use]
     pub const fn is_local_decline(&self) -> bool {
-        matches!(self, Self::NotInAudience | Self::AccordRootNotHeld)
+        matches!(
+            self,
+            Self::NotInAudience | Self::AccordRootNotHeld | Self::NotKept
+        )
     }
 
     /// The reason a self-roster door's [`Error::SelfRosterNotLanded`] maps to:
@@ -215,6 +229,7 @@ impl AttestationRefusalReason {
         Self::GroupPlaneRefused,
         Self::NotInAudience,
         Self::AccordRootNotHeld,
+        Self::NotKept,
     ];
 }
 
@@ -748,9 +763,10 @@ mod tests {
     use crate::federation::{FederationDirectory, SignedAttestation};
 
     /// v62.0.0 (JSON cut, E7) — a dimension Verify's family matcher registers
-    /// (`evidence:{suite}:{kind}:{cell}:{prefix}`): an edition-2 row of an
+    /// (`coherence_standing:{cohort}`; v62.0.0 FS-sig-b: an ungated claim
+    /// family, since `evidence:*` now needs `infra:attest`): an edition-2 row of an
     /// unregistered dimension (`identity_binding:v1`) is refused at the door.
-    const DIMENSION: &str = "evidence:safety_battery:capture:a:b:v1";
+    const DIMENSION: &str = "coherence_standing:cab:v1";
 
     // ── Pure plan + token tests (no backend, no directory) ────────────
 

@@ -1312,8 +1312,13 @@ pub async fn check_key_grant_row_admission(
     // instant, is judged against the emission's one fold (the sealer leg at
     // that instant, the audience folded once); every other row, a peer's
     // included, takes the per-row path below.
-    if let Some(verdict) = judged_by_emission_fold(signer, &parsed, row, crate::host::clock::now())
-    {
+    // v62.0.0 (HOLD-1d) — a re-judgement reads the row's original receipt.
+    if let Some(verdict) = judged_by_emission_fold(
+        signer,
+        &parsed,
+        row,
+        crate::federation::attestation_admit::receipt_now(),
+    ) {
         return verdict;
     }
     check_sealer(
@@ -1330,7 +1335,8 @@ pub async fn check_key_grant_row_admission(
     // signer must ALSO be a sealer at receipt, or the row is
     // `asserted_at_stale`: a withdrawn delegate cannot backdate a grant into
     // its old window.
-    let now = crate::host::clock::now();
+    // v62.0.0 (HOLD-1d) — a re-judgement reads the row's original receipt.
+    let now = crate::federation::attestation_admit::receipt_now();
     if crate::federation::self_roster::outside_past_freshness_window(row.asserted_at, now)
         && e2fold::unmarked(check_sealer(dir, signer, &parsed.axis, now, now))
             .await
@@ -2103,6 +2109,19 @@ where
     let producer = "key_grant";
     let iss = signer.federation_id().await;
     let payload = crate::federation::edition2::typed::key_grant_payload(&iss, row, asserted_at_ms)?;
+    // v62.0.0 (HEAD-1; Constitution: "key grant → the room's roster version
+    // if the asset is in a room, else none") — a hand builder states its
+    // head as the one builder does (`edition2::head_rule::state_head`).
+    let payload = crate::federation::edition2::head_rule::state_head(
+        backend,
+        crate::federation::types::attestation_type::SCORES,
+        &ciris_verify_core::namespace_match::family_id(
+            crate::federation::edition2::typed::KEY_GRANT_PREFIX,
+        ),
+        &iss,
+        payload,
+    )
+    .await?;
     let statement = crate::federation::edition2::produce::sign_row(
         signer,
         &row.wrap.recipient_key_id,

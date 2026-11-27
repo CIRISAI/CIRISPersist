@@ -118,6 +118,16 @@ pub mod reason {
     /// v5.1 (GC1's door gap) — a composer whose held target is of another
     /// family (read from the target's statement).
     pub const COMPOSER_FAMILY_MISMATCH: &str = "composer_family_mismatch";
+    /// v62.0.0 (FS-class; CC 2.4.1.1 the kept list, "an act of a body under
+    /// a declared legal-weight class", as CIRISConstitution ruled 2026-11-22)
+    /// — a subject's rules 2–4 `withdraws` of a row (outside `licensure:` /
+    /// `revocation:`, which the kept list keeps whatever their class) that
+    /// carries a `class` member: HELD until persist can read the issuing
+    /// body's declared classes (`licence_classes` with `legal_weight`, the
+    /// body's record at the head the row names), which it does not in
+    /// v62.0. It errs toward keeping: such a row is never withdrawn by its
+    /// subject here, whatever its class.
+    pub const WITHDRAWS_CLASS_UNREAD: &str = "withdraws_class_unread";
     /// The core tokens, in append order (pinned by I3550).
     pub const ALL: &[&str] = &[
         COUNT_SHORT,
@@ -135,6 +145,7 @@ pub mod reason {
         WITHDRAWS_NOT_ADMITTED,
         ASSERTED_AT_STALE,
         COMPOSER_FAMILY_MISMATCH,
+        WITHDRAWS_CLASS_UNREAD,
     ];
 
     /// Wave GC1's reasons (GC1 owns this module): the `admission.rs` gates'
@@ -519,6 +530,16 @@ pub mod reason {
         /// A roster version whose number is not one past the greatest version
         /// it names (the named versions' content).
         pub const VERSION_DOES_NOT_FOLLOW: &str = "group_version_does_not_follow";
+        /// v62.0.0 (GID-tips; CC 2.7.8 "two versions of one head wait as
+        /// tips", as the lead ruled the convergent minimum for v62.0) — more
+        /// than one DISTINCT first version is held under one group id (the
+        /// same derived id, so the same kind, first members, instant and
+        /// nonce: its founders signed two foundings): the group concludes
+        /// NOTHING on this node (no roster, seats, key wrap, nothing counted
+        /// over it), whichever arrived first. The acknowledgement that would
+        /// let a member hold the rival void for itself is not built in
+        /// v62.0; the remedy is a new founding (a new nonce).
+        pub const GROUP_FOUNDING_CONTESTED: &str = "group_founding_contested";
         /// GC5's tokens.
         pub const ALL: &[&str] = &[
             NAMES_ANOTHER_GROUP,
@@ -541,6 +562,7 @@ pub mod reason {
             GENESIS_BUNDLE_ROW_INVALID,
             REBIND_HEAD_NOT_IN_FORCE,
             VERSION_DOES_NOT_FOLLOW,
+            GROUP_FOUNDING_CONTESTED,
         ];
     }
     /// Wave GC6's reasons (GC6 owns this module).
@@ -590,7 +612,7 @@ pub mod reason {
         pub const COMMUNITY_LISTING_ROOM_NOT_PUBLIC: &str = "community_listing_room_not_public";
         /// A listing whose subkind / admission members disagree with the held room.
         pub const COMMUNITY_LISTING_MALFORMED: &str = "community_listing_malformed";
-        /// A listing signed by neither a founder nor a named moderate-holder.
+        /// A listing signed by a key that is not a named `moderate`-holder.
         pub const COMMUNITY_LISTING_SIGNER_NOT_AUTHORIZED: &str =
             "community_listing_signer_not_authorized";
         /// A community version crossing the `public` boundary of the held head.
@@ -1156,6 +1178,50 @@ where
     ARRIVAL.scope(arrival, fut).await
 }
 
+tokio::task_local! {
+    /// v62.0.0 (WD-fix4 rev 2) — the gate errors a door's holds were made of,
+    /// by row, for a caller that must answer with that error
+    /// ([`capturing_holds`]).
+    static HOLD_ERRORS: std::sync::Mutex<Vec<(RowId, Error)>>;
+}
+
+/// v62.0.0 (WD-fix4 rev 2) — run `fut` (a statement door) keeping the gate
+/// error each HELD row's attestation tail raised (`voices::put_counted_row`,
+/// [`keep_hold_error`]). The JSON attestation door, routed into the statement
+/// funnel, answers a held row with the error it answered before the routing.
+pub(crate) async fn capturing_holds<T, Fut>(fut: Fut) -> (T, Vec<(RowId, Error)>)
+where
+    Fut: std::future::Future<Output = T>,
+{
+    HOLD_ERRORS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            let out = fut.await;
+            let kept = HOLD_ERRORS
+                .try_with(|v| std::mem::take(&mut *v.lock().unwrap_or_else(|p| p.into_inner())))
+                .unwrap_or_default();
+            (out, kept)
+        })
+        .await
+}
+
+/// v62.0.0 (WD-fix4 rev 2) — keep the gate error `err` that held `row_id`,
+/// when a caller asked for it ([`capturing_holds`]); dropped otherwise.
+pub(crate) fn keep_hold_error(row_id: RowId, err: Error) {
+    let _ = HOLD_ERRORS.try_with(|v| {
+        v.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((row_id, err));
+    });
+}
+
+/// v62.0.0 (WD-fix4) — is the running task inside `row_id`'s OWN door (the
+/// statement funnel's `put_admitted_row` for that row, its re-conclusion
+/// included)? The JSON attestation door asks it so the funnel's own
+/// attestation tail is not routed back into the funnel.
+pub(crate) fn arriving_for(row_id: &RowId) -> bool {
+    current_arrival(row_id).is_some()
+}
+
 fn current_arrival(row_id: &RowId) -> Option<Arrival> {
     ARRIVAL
         .try_with(|a| (a.row_id == *row_id).then(|| a.clone()))
@@ -1174,6 +1240,27 @@ pub struct RefoldReport {
     pub still_held: Vec<RowId>,
     /// Rows evaluated.
     pub steps: usize,
+    /// v62.0.0 (KR-fix20) — held, now REFUSED by a refusal no later row
+    /// changes ([`never_retracts`]), and dropped: its statements, names and
+    /// fold record are gone ([`FederationDirectory::drop_held_row`]).
+    pub dropped: Vec<RowId>,
+}
+
+/// v62.0.0 (KR-fix20; CC 2.4.1.1 rule 0) — **is `e` the refusal of a
+/// withdrawal that can never retract its target**
+/// ([`malformed_row::WITHDRAWS_NEVER_RETRACTS`](crate::federation::malformed_row::WITHDRAWS_NEVER_RETRACTS))?
+/// Read from the error's variant and token, never from its text. A HELD row
+/// that meets it when re-run (it waited `link_unheld`, and its target has
+/// now arrived) is dropped, not kept under `refold_refused`: it is what the
+/// door refuses outright when the target is held first, so both arrival
+/// orders end with nothing kept.
+#[must_use]
+pub fn never_retracts(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::MalformedRow { reason, .. }
+            if *reason == crate::federation::malformed_row::WITHDRAWS_NEVER_RETRACTS
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1692,6 +1779,168 @@ where
     dir.fold_held_page(after, limit.min(MAX_HELD_PAGE)).await
 }
 
+/// v62.0.0 (KR-fix24; CC 3.3.4, as ruled 2026-11-22) — the hold window of
+/// a counted row with no group of its own stated window: the governance
+/// table's standing class, 72 hours (`standing_72h`, 259 200 s).
+pub const DEFAULT_HOLD_WINDOW_SECS: i64 = crate::federation::cosign::WINDOW_FLOOR_SECS;
+
+/// v62.0.0 (KR-fix24) — what one [`lapse_short_counted_rows`] pass dropped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LapseReport {
+    /// The rows whose kept voices were dropped, in row-id order.
+    pub lapsed: Vec<RowId>,
+    /// The statements (voices) deleted with them.
+    pub statements: u64,
+    /// Held `count_short` rows looked at.
+    pub examined: usize,
+}
+
+/// v62.0.0 (KR-fix24; CC 3.3.4, as ruled 2026-11-22: "the group's own stated
+/// hold window, else 72 hours, counted per node from when it first held the
+/// first voice of that row; expiry drops that node's kept voices and refuses
+/// nothing") — **the hold window lapses.** Every row this node holds
+/// [`reason::COUNT_SHORT`] (a counted row short of its count) whose window
+/// has run at `now` is dropped: its kept voices, names and fold record
+/// ([`FederationDirectory::drop_held_row`], gated on held + no attestation
+/// row).
+///
+/// - **"First held"** is the EARLIEST `ceg_statements.first_held_us` among the
+///   row's kept voices on this node
+///   ([`FederationDirectory::edition2_first_held_us`]: `MIN`, written once
+///   at insert, never updated). Node-local: two nodes that first held the row
+///   at different instants lapse it at different instants, which decides
+///   only what each keeps.
+/// - **The window** ([`hold_window_secs`]): the group's own stated window
+///   (a community's `policy_blob.cosign_window_secs`,
+///   [`cosign::window_secs`](crate::federation::cosign::window_secs)), else
+///   [`DEFAULT_HOLD_WINDOW_SECS`].
+/// - **Lapsed** when `first_held + window <= now`; not before.
+/// - **Refuses nothing:** the same voices offered again are held anew, with a
+///   fresh `first_held_us` (the rows were deleted, so the insert writes it
+///   again), and a fresh window.
+/// - **Not aged here:** the self-roster bind (the `occurrence` plane: CC
+///   3.3.6.4 gives it its own course, `self_roster_add` / `self_roster_evict`
+///   and the lone path, `self_roster::execute_due`), and a seat re-bind (the
+///   `rebind` plane is FINAL and its stored hold is not its verdict, see
+///   [`why_held_listed`]). A row that reached its count is concluded and is
+///   never `count_short`.
+///
+/// `now` is the caller's: the host verb passes this node's clock
+/// ([`crate::host::clock::now`], `Engine::execute_cosign_due`).
+///
+/// # Errors
+/// Directory reads and the drop's storage errors.
+pub async fn lapse_short_counted_rows<F>(
+    dir: &F,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<LapseReport, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut report = LapseReport::default();
+    let now_us = now.timestamp_micros();
+    let mut after: Option<RowId> = None;
+    loop {
+        let page = dir.fold_held_page(after.as_ref(), MAX_HELD_PAGE).await?;
+        let Some(last) = page.last() else {
+            break;
+        };
+        after = Some(last.row_id);
+        let full = u32::try_from(page.len()).unwrap_or(u32::MAX) >= MAX_HELD_PAGE;
+        for h in &page {
+            if h.reason != reason::COUNT_SHORT
+                || h.plane == plane::OCCURRENCE
+                || h.plane == plane::REBIND
+                || h.family == super::occurrence::OCCURRENCE_FAMILY
+            {
+                continue;
+            }
+            report.examined += 1;
+            let Some(first_us) = dir.edition2_first_held_us(&h.row_id).await? else {
+                continue;
+            };
+            let window = hold_window_secs(dir, &h.row_id, &h.plane).await?;
+            if first_us.saturating_add(window.saturating_mul(1_000_000)) > now_us {
+                continue;
+            }
+            let n = dir.drop_held_row(&h.row_id).await?;
+            if n > 0 {
+                tracing::debug!(
+                    row_id = %h.row_id.hex(),
+                    family = %h.family,
+                    window_secs = window,
+                    statements = n,
+                    "edition-2 counted row short of its count: hold window lapsed, voices dropped"
+                );
+                report.lapsed.push(h.row_id);
+                report.statements += n;
+            }
+        }
+        if !full {
+            break;
+        }
+    }
+    Ok(report)
+}
+
+/// v62.0.0 (KR-fix24; CC 3.3.4) — **the hold window of a held counted row**,
+/// in seconds: the window its group states, else [`DEFAULT_HOLD_WINDOW_SECS`].
+/// The group is the row's own (`sub`) on the group plane (a roster version,
+/// a founding record awaiting a voice); otherwise the group whose roster
+/// version the row names as `refs.head` (an appointment, a duty conferral, a
+/// licence, a counted `admission:unit`). A head that is no roster version (a
+/// root grant and its counted withdrawal name the bundle), a group not held,
+/// or a family takes the default. A community's window is
+/// [`cosign::window_secs`](crate::federation::cosign::window_secs) over its
+/// record (a value the record door would refuse reads as the default).
+///
+/// # Errors
+/// Directory reads.
+pub async fn hold_window_secs<F>(dir: &F, row_id: &RowId, plane_name: &str) -> Result<i64, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use ciris_verify_core::cde::Value;
+    let voices = dir.edition2_voices(row_id).await?;
+    let Some((protected, payload)) = voices
+        .iter()
+        .find(|st| RowId::of_statement(st) == Some(*row_id))
+        .and_then(|st| super::liveness::statement_parts(st))
+    else {
+        return Ok(DEFAULT_HOLD_WINDOW_SECS);
+    };
+    let group = if plane_name == plane::GROUP {
+        protected
+            .get_int(15)
+            .and_then(|c| c.get_int(2))
+            .and_then(Value::as_text)
+            .map(str::to_owned)
+    } else {
+        match super::names::names_of(&payload)
+            .ok()
+            .and_then(|n| super::names::single(&n, "head"))
+        {
+            Some(head) => {
+                crate::federation::admission::admission_head_group(dir.as_dyn_directory(), &head)
+                    .await?
+            }
+            None => None,
+        }
+    };
+    let Some(group) = group else {
+        return Ok(DEFAULT_HOLD_WINDOW_SECS);
+    };
+    let Some(community) = dir.lookup_community(&group).await? else {
+        return Ok(DEFAULT_HOLD_WINDOW_SECS);
+    };
+    Ok(crate::federation::cosign::window_secs(
+        crate::federation::group_plane::GroupKind::Community,
+        crate::federation::group_plane::GroupPlaneFamily::Widening,
+        community.policy_blob.as_ref(),
+    )
+    .unwrap_or(DEFAULT_HOLD_WINDOW_SECS))
+}
+
 /// v62.0.0 (KR-fix2 rev 5; CC rc22 7b4a55e) — **[`why_held`] as a host
 /// reads it.** The same answer for every row but a seat re-bind
 /// (`transport:canonical_rebind`), whose answer is RECOMPUTED from the held
@@ -1865,12 +2114,80 @@ where
     if let Some(a) = dir.get_attestation(&admitted.row_id.hex()).await? {
         t.extend(touches_of_attestation(&a));
     }
+    t.extend(roster_member_touches(dir, admitted).await?);
     Ok(t)
+}
+
+/// v62.0.0 (HOLD-1b; CC 2.7.3 as ruled 11-23) — **what a roster version
+/// changes for its members:** `key:<m>` for each member it lists that the
+/// version it extends does not, and each member that version lists that
+/// this one does not. A founding version (no `refs.head`) lists only added
+/// members. The rows waiting on a writer's standing read `key:<writer>`, so
+/// a roster version re-folds exactly the rows of members whose seat it
+/// changed, never every row of the room. A predecessor that is not CONCLUDED
+/// here lists nothing (every listed member counts as added). Empty for any
+/// other row.
+///
+/// # Errors
+/// Directory reads.
+pub(crate) async fn roster_member_touches<F>(
+    dir: &F,
+    admitted: &AdmittedRow,
+) -> Result<BTreeSet<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use super::group::{roster_view_of_statement, GROUP_ROSTER_PREFIX};
+    use super::group_serve::listed_members;
+    let mut out = BTreeSet::new();
+    if super::emit::names_a_target(&admitted.row_type)
+        || admitted.family != ciris_verify_core::namespace_match::family_id(GROUP_ROSTER_PREFIX)
+    {
+        return Ok(out);
+    }
+    let Ok(view) = roster_view_of_statement(&admitted.bytes) else {
+        return Ok(out);
+    };
+    let now = listed_members(&view.payload);
+    let mut before: BTreeSet<String> = BTreeSet::new();
+    if let Some(prev) = view.head {
+        if super::verdict::row_state(dir, &prev).await?.is_concluded() {
+            for st in dir.edition2_voices(&prev).await? {
+                if let Ok(p) = roster_view_of_statement(&st) {
+                    before = listed_members(&p.payload);
+                    break;
+                }
+            }
+        }
+    }
+    for m in now.symmetric_difference(&before) {
+        out.insert(Dep::key(m).read_key());
+    }
+    Ok(out)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 //  The door's tail
 // ─────────────────────────────────────────────────────────────────────────
+
+/// v62.0.0 (KR-fix33b) — **the read keys whose readers re-fold after a
+/// `Pending` outcome**: the row's own (`Dep::Row`), and only when the kept
+/// statement is NEW. A re-offer of a statement already kept changes nothing a
+/// reader read, so it re-runs nothing; a row that stays `Pending` re-runs its
+/// readers once per NEW voice (a finite set: each is a distinct statement),
+/// never on every later touch. Every other outcome is not this path's
+/// (`None`). The cascade that follows is bounded as every re-fold pass is:
+/// only a CHANGE (concluded / unconcluded) enqueues dependents, and one pass
+/// stops at [`MAX_REFOLD_STEPS`].
+#[must_use]
+pub(crate) fn pending_refold_keys(outcome: &StatementOutcome) -> Option<BTreeSet<String>> {
+    match outcome {
+        StatementOutcome::Pending { row_id, new: true } => {
+            Some([Dep::Row(*row_id).read_key()].into_iter().collect())
+        }
+        _ => None,
+    }
+}
 
 /// **After `put_statement` stored a statement**: every held or concluded
 /// row whose fold read what it touches is re-folded ([`refold_touched`]).
@@ -1891,7 +2208,22 @@ where
 {
     let _ = tier;
     match outcome {
-        StatementOutcome::Pending { .. } => Ok(()),
+        // v62.0.0 (KR-fix33; CC 2.7.3 "either order converges") — a row KEPT
+        // short of its count is still a held row that others name: a row
+        // already held waiting for it (`link_unheld`: the proposer's
+        // withdrawal of an open self-roster proposal that arrived FIRST)
+        // re-folds now that it is held. Only the readers of the row ITSELF
+        // (`Dep::Row`): what else it touches has not changed while it
+        // concludes nothing.
+        StatementOutcome::Pending { .. } => match pending_refold_keys(outcome) {
+            Some(touched) => {
+                let me: BTreeSet<RowId> = [admitted.row_id].into_iter().collect();
+                refold_touched_excluding(dir, touched, &me)
+                    .await
+                    .map(|_| ())
+            }
+            None => Ok(()),
+        },
         StatementOutcome::Row { .. }
         | StatementOutcome::Voice { .. }
         | StatementOutcome::KeyPlane { .. } => {
@@ -2134,6 +2466,10 @@ enum Change {
     StillHeld,
     /// Nothing to do (concluded and still concluding, or not held here).
     Unchanged,
+    /// v62.0.0 (KR-fix20) — held, now refused by [`never_retracts`]: the door
+    /// dropped it (`ingest::put_admitted_row`). It touched nothing (a held
+    /// row projects nothing).
+    Dropped,
 }
 
 /// The voice that projects a held row: the author's own voice for an
@@ -2260,6 +2596,10 @@ where
         return match reconclude(dir, &primary, &state).await {
             Ok(StatementOutcome::Pending { .. }) => Ok(Change::StillHeld),
             Ok(_) => Ok(Change::Concluded(touched_by(dir, &primary).await?)),
+            // v62.0.0 (KR-fix20) — the door re-run refused it by a refusal no
+            // later row changes and dropped it; recording `refold_refused`
+            // here would re-create the record of a row no longer held.
+            Err(e) if never_retracts(&e) => Ok(Change::Dropped),
             Err(e) => {
                 let mut reads = BTreeSet::new();
                 reads.insert(Dep::Row(*row_id).read_key());
@@ -2279,6 +2619,51 @@ where
     // Concluded.
     let pl = plane_for(&state.plane);
     if pl.is_final() {
+        // v62.0.0 (VD-step1c, F8) — "no hold" is not "concluded": a kept
+        // voice whose hold fix3 CLEARED (a lone occurrence-key statement once
+        // its owner binding landed) concluded nothing, so it is re-run like a
+        // held row when what it read changes (the binding withdrawn), and
+        // its door records the hold again. Concluded is the one verdict's
+        // (`verdict::row_state`). The re-bind plane keeps its stored state
+        // (the fold acts on it; KR-fix2 rev 5).
+        if state.plane != plane::REBIND
+            && !super::verdict::row_state(dir, row_id).await?.is_concluded()
+        {
+            return match reconclude(dir, &primary, &state).await {
+                Ok(StatementOutcome::Row { .. } | StatementOutcome::KeyPlane { .. }) => {
+                    Ok(Change::Concluded(touched_by(dir, &primary).await?))
+                }
+                Ok(StatementOutcome::Pending { .. }) => Ok(Change::StillHeld),
+                Ok(StatementOutcome::Voice { .. }) => Ok(Change::Unchanged),
+                // KR-fix20 — a refusal no later row changes, after which the
+                // door DROPPED the row (`put_admitted_row`'s `(Err, None)` arm),
+                // is reported as the held branch reports it. That arm drops
+                // only a row that WAS held, and this one has no hold, so the
+                // drop is read back, never assumed: the row is `Dropped` only
+                // when its fold state is gone. BELIEVED unreachable: this arm
+                // re-runs only a FINAL-plane kept voice, and a
+                // never-retracting refusal answers a withdrawal (the
+                // attestation plane, or an occurrence-family withdraws, which
+                // the door never keeps as a voice).
+                Err(e) => {
+                    if never_retracts(&e) && dir.fold_state(row_id).await?.is_none() {
+                        return Ok(Change::Dropped);
+                    }
+                    let mut reads = BTreeSet::new();
+                    reads.insert(Dep::Row(*row_id).read_key());
+                    record(
+                        dir,
+                        *row_id,
+                        &state.family,
+                        &state.tier,
+                        Some((reason::REFOLD_REFUSED.to_owned(), e.to_string())),
+                        reads,
+                    )
+                    .await?;
+                    Ok(Change::StillHeld)
+                }
+            };
+        }
         return Ok(Change::Unchanged);
     }
     let ddir = dir.as_dyn_directory();
@@ -2444,6 +2829,7 @@ where
                 queue.extend(next);
             }
             Change::StillHeld => report.still_held.push(id),
+            Change::Dropped => report.dropped.push(id),
             Change::Unchanged => {}
         }
     }
@@ -2750,6 +3136,46 @@ pub fn put_reason_sqlite(
     .map_err(|e| Error::Backend(format!("ceg_fold_state: {e}")))
 }
 
+/// v62.0.0 (KR-fix20) — sqlite: [`FederationDirectory::drop_held_row`] in
+/// one transaction. The gate is in the statement: the row is HELD (a fold
+/// state with a reason) and no attestation row stands under its id.
+///
+/// # Errors
+/// sqlite errors.
+#[cfg(feature = "sqlite")]
+pub fn drop_held_row_sqlite(conn: &mut rusqlite::Connection, row_id: &RowId) -> Result<u64, Error> {
+    let be = |e: rusqlite::Error| Error::Backend(format!("drop_held_row: {e}"));
+    let tx = crate::store::sqlite_conn_model::write_tx(conn).map_err(be)?;
+    let id = &row_id.0[..];
+    let held: bool = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM ceg_fold_state WHERE row_id = ?1 \
+             AND reason IS NOT NULL) AND NOT EXISTS (SELECT 1 FROM federation_attestations \
+             WHERE attestation_id = ?2)",
+            rusqlite::params![id, row_id.hex()],
+            |r| r.get(0),
+        )
+        .map_err(be)?;
+    if !held {
+        return Ok(0);
+    }
+    let n = tx
+        .execute(
+            "DELETE FROM ceg_statements WHERE row_id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(be)?;
+    for sql in [
+        "DELETE FROM ceg_row_names WHERE row_id = ?1",
+        "DELETE FROM ceg_fold_reads WHERE row_id = ?1",
+        "DELETE FROM ceg_fold_state WHERE row_id = ?1",
+    ] {
+        tx.execute(sql, rusqlite::params![id]).map_err(be)?;
+    }
+    tx.commit().map_err(be)?;
+    Ok(u64::try_from(n).unwrap_or(u64::MAX))
+}
+
 /// sqlite: the CONCLUDED rows of one projection slot, in row-id order.
 ///
 /// # Errors
@@ -2761,6 +3187,27 @@ pub fn slot_rows_sqlite(conn: &rusqlite::Connection, slot: &str) -> Result<Vec<R
         .prepare(
             "SELECT row_id FROM ceg_fold_state WHERE slot = ?1 AND reason IS NULL ORDER BY row_id",
         )
+        .map_err(be)?;
+    let rows = st
+        .query_map(rusqlite::params![slot], |r| r.get::<_, Vec<u8>>(0))
+        .map_err(be)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(row_id_of(&r.map_err(be)?, "ceg_fold_state")?);
+    }
+    Ok(out)
+}
+
+/// v62.0.0 (GID-tips) — sqlite: EVERY row of one projection slot (held or
+/// concluded), in row-id order.
+///
+/// # Errors
+/// sqlite errors.
+#[cfg(feature = "sqlite")]
+pub fn slot_all_rows_sqlite(conn: &rusqlite::Connection, slot: &str) -> Result<Vec<RowId>, Error> {
+    let be = |e: rusqlite::Error| Error::Backend(format!("ceg_fold_state: {e}"));
+    let mut st = conn
+        .prepare("SELECT row_id FROM ceg_fold_state WHERE slot = ?1 ORDER BY row_id")
         .map_err(be)?;
     let rows = st
         .query_map(rusqlite::params![slot], |r| r.get::<_, Vec<u8>>(0))
@@ -3012,6 +3459,51 @@ where
         .map_err(|e| Error::Backend(format!("ceg_fold_state: {e}")))
 }
 
+/// v62.0.0 (KR-fix20) — postgres: [`FederationDirectory::drop_held_row`] in
+/// one transaction, gated as [`drop_held_row_sqlite`] is.
+///
+/// # Errors
+/// postgres errors.
+#[cfg(feature = "postgres")]
+pub async fn drop_held_row_postgres(
+    client: &mut deadpool_postgres::Object,
+    row_id: &RowId,
+) -> Result<u64, Error> {
+    let be = |e: tokio_postgres::Error| Error::Backend(format!("drop_held_row: {e}"));
+    let tx = client.transaction().await.map_err(be)?;
+    let id: &[u8] = &row_id.0[..];
+    let hex = row_id.hex();
+    let held: bool = tx
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM cirislens.ceg_fold_state WHERE row_id = $1 \
+             AND reason IS NOT NULL) AND NOT EXISTS (SELECT 1 FROM \
+             cirislens.federation_attestations WHERE attestation_id = $2::text)",
+            &[&id, &hex],
+        )
+        .await
+        .map_err(be)?
+        .get(0);
+    if !held {
+        return Ok(0);
+    }
+    let n = tx
+        .execute(
+            "DELETE FROM cirislens.ceg_statements WHERE row_id = $1",
+            &[&id],
+        )
+        .await
+        .map_err(be)?;
+    for sql in [
+        "DELETE FROM cirislens.ceg_row_names WHERE row_id = $1",
+        "DELETE FROM cirislens.ceg_fold_reads WHERE row_id = $1",
+        "DELETE FROM cirislens.ceg_fold_state WHERE row_id = $1",
+    ] {
+        tx.execute(sql, &[&id]).await.map_err(be)?;
+    }
+    tx.commit().await.map_err(be)?;
+    Ok(n)
+}
+
 /// postgres: the CONCLUDED rows of one projection slot, in row-id order.
 ///
 /// # Errors
@@ -3025,6 +3517,31 @@ where
         .query(
             "SELECT row_id FROM cirislens.ceg_fold_state WHERE slot = $1 AND reason IS NULL \
              ORDER BY row_id",
+            &[&slot],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("ceg_fold_state: {e}")))?;
+    rows.iter()
+        .map(|r| {
+            let b: Vec<u8> = r.get(0);
+            row_id_of(&b, "ceg_fold_state")
+        })
+        .collect()
+}
+
+/// v62.0.0 (GID-tips) — postgres: EVERY row of one projection slot (held
+/// or concluded), in row-id order.
+///
+/// # Errors
+/// postgres errors.
+#[cfg(feature = "postgres")]
+pub async fn slot_all_rows_postgres<C>(client: &C, slot: &str) -> Result<Vec<RowId>, Error>
+where
+    C: deadpool_postgres::GenericClient + Sync,
+{
+    let rows = client
+        .query(
+            "SELECT row_id FROM cirislens.ceg_fold_state WHERE slot = $1 ORDER BY row_id",
             &[&slot],
         )
         .await

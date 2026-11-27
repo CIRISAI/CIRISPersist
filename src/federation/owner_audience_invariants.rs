@@ -99,7 +99,7 @@ pub(crate) mod bodies {
         class: &str,
         valid_until: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), crate::federation::Error> {
-        d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+        d.test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
             identity_key_id: machine.to_owned(),
             occurrence_key_id: machine.to_owned(),
             device_class: class.to_owned(),
@@ -261,7 +261,7 @@ pub(crate) mod bodies {
         // derive the node's human from it.
         let at = now_ms();
         let planted = d
-            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            .test_seam_put_identity_occurrence(crate::federation::types::IdentityOccurrence {
                 identity_key_id: alice.clone(),
                 occurrence_key_id: node.clone(),
                 device_class: device_class::LAPTOP.to_owned(),

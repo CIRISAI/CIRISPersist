@@ -1496,10 +1496,10 @@ pub mod bodies {
             .await
             .expect("capability_roots_to_trusted_root");
             assert!(
-                rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
+                rooted.as_ref().is_some_and(|g| g.root_key_id == r.lineage),
                 "[{tag}] I1218 precondition: the board's slash roots at {} through this node: \
                  {rooted:?}",
-                r.root
+                r.lineage
             );
         }
         let lic = must_put(
@@ -1619,51 +1619,38 @@ pub mod bodies {
         // revocation stands (CC 2.4.1.1: an entity revocation is withdrawn by
         // nobody). The typed plane holds no attestation row under the
         // statement's id; v62.0.0 (LF-fix2, P5) the withdraws gate reads the
-        // statement store under it and SETTLES `withdraws_not_admitted` (it
-        // waited `link_unheld` forever).
-        // Strict (LF-fix2): the door's own outcome is HELD, the fold's reason
-        // is exactly `withdraws_not_admitted`, nothing concludes, and the held
-        // set (the pending sweep's input) carries it settled, never waiting.
+        // statement store under it. v62.0.0 (KR-fix20; the count always wins)
+        // — the target is held and never withdrawn, so the door REFUSES the
+        // withdraws by name (`withdraws_never_retracts`) and keeps nothing: no
+        // fold record, no statement, nothing in the held set (it was held
+        // `withdraws_not_admitted` for ever before).
         {
-            use crate::federation::edition2::fold::{self, reason};
-            let (w, out) = crate::federation::licensure_chain_invariants::bodies::offer(
-                d,
-                &withdraw(&holder, &adverse.attestation_id, 20),
-            )
-            .await
-            .unwrap_or_else(|e| {
-                panic!("[{tag}] I1218: the subject's withdraws of the revocation is held: {e}")
-            });
-            let Some(StatementOutcome::Pending { row_id: wid, .. }) = out else {
-                panic!(
-                    "[{tag}] I1218: a subject's withdraws against revocation concludes nothing: \
-                     {out:?}"
-                );
-            };
-            assert_eq!(
-                fold::why_held(d, &wid).await.unwrap().map(|h| h.reason),
-                Some(reason::WITHDRAWS_NOT_ADMITTED.to_owned()),
-                "[{tag}] I1218: a subject's withdraws against revocation settles not admitted"
-            );
+            use crate::federation::edition2::fold;
+            // The held set as a full re-fold leaves it, before the offer.
+            fold::refold_all(d)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] I1218: refold_all: {e:?}"));
+            let held_before = fold::held_rows(d, None, fold::MAX_HELD_PAGE).await.unwrap();
+            let w = withdraw(&holder, &adverse.attestation_id, 20);
+            let refusal = crate::federation::licensure_chain_invariants::bodies::offer(d, &w)
+                .await
+                .expect_err("I1218: a subject's withdraws of the revocation is refused");
             assert!(
-                d.get_attestation(&w.attestation_id)
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "[{tag}] I1218: the withdraws concludes nothing"
+                matches!(
+                    &refusal,
+                    Error::MalformedRow { reason, .. }
+                        if *reason == crate::federation::malformed_row::WITHDRAWS_NEVER_RETRACTS
+                ),
+                "[{tag}] I1218: refused withdraws_never_retracts: {refusal:?}"
             );
             fold::refold_all(d)
                 .await
                 .unwrap_or_else(|e| panic!("[{tag}] I1218: refold_all: {e:?}"));
-            let page = fold::held_rows(d, None, fold::MAX_HELD_PAGE).await.unwrap();
-            let entry = page
-                .iter()
-                .find(|h| h.row_id == wid)
-                .unwrap_or_else(|| panic!("[{tag}] I1218: the settled withdraws is held"));
+            let held_after = fold::held_rows(d, None, fold::MAX_HELD_PAGE).await.unwrap();
             assert_eq!(
-                entry.reason,
-                reason::WITHDRAWS_NOT_ADMITTED,
-                "[{tag}] I1218: the held set carries the settle, never `link_unheld`"
+                held_after.iter().map(|h| h.row_id).collect::<Vec<_>>(),
+                held_before.iter().map(|h| h.row_id).collect::<Vec<_>>(),
+                "[{tag}] I1218: nothing of the refused withdraws is held"
             );
         }
         assert!(
@@ -2054,6 +2041,22 @@ pub mod bodies {
                 }
             ),
             "[{tag}] I1220: asserted_at_stale on the consent plane: {e:?}"
+        );
+        // v62.0.0 (HOLD-1d) — I6726: the same row asked again as a
+        // RE-JUDGEMENT of a row this node first held one second after it was
+        // signed (the chain live then, inside W): admitted, whatever the clock
+        // reads now. Kills: the consent gate's W bound reading `clock::now()`
+        // on a re-fold.
+        let g3 = grant(&k("g3"), now - Duration::days(4));
+        let at_receipt = crate::federation::attestation_admit::at_original_receipt(
+            Some(g3.asserted_at + Duration::seconds(1)),
+            crate::federation::admission::check_consent_for_key_admission(d, &g3),
+        )
+        .await;
+        assert!(
+            at_receipt.is_ok(),
+            "[{tag}] I6726 (HOLD-1d): a consent row first held inside W is judged at that \
+             receipt: {at_receipt:?}"
         );
         // After the withdrawal, a fresh grant is refused as before.
         let e = put_row(grant(&k("g4"), Utc::now() + Duration::seconds(1)))
