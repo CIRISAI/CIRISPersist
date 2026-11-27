@@ -923,5 +923,6 @@ mod tests {
             .emit_attestation_self(input)
             .await
             .expect("replication grant emits")
+            .into_row_id()
     }
 }

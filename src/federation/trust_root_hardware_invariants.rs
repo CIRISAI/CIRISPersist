@@ -90,10 +90,10 @@ pub mod bodies {
 
         set_policy(Arc::new(policy(4_158)));
         let before = count(&r.founders);
-        let v1 = trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+        let v1 = trust_root_valid(d, &node, &r.lineage, crate::host::clock::now())
             .await
             .unwrap();
-        let v2 = trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+        let v2 = trust_root_valid(d, &node, &r.lineage, crate::host::clock::now())
             .await
             .unwrap();
         assert!(
@@ -114,10 +114,10 @@ pub mod bodies {
         // A different policy object that judges the same way: the inputs
         // changed, so every holder is evaluated again — and only once.
         set_policy(Arc::new(policy(4_159)));
-        let v3 = trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+        let v3 = trust_root_valid(d, &node, &r.lineage, crate::host::clock::now())
             .await
             .unwrap();
-        trust_root_valid(d, &node, &r.root, crate::host::clock::now())
+        trust_root_valid(d, &node, &r.lineage, crate::host::clock::now())
             .await
             .unwrap();
         assert!(
