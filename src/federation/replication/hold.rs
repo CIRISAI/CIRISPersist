@@ -352,6 +352,64 @@ where
             }
         }
     }
+    for room in seated_room_key_rooms(directory).await? {
+        out.insert(room);
+    }
+    Ok(out)
+}
+
+/// v62.0.0 (ROOMKEY-4; CC 3.1.3.2) — **the rooms this node is party to by a
+/// room key it holds.** A private room seats voices of per-device room keys,
+/// never identities, so a device of a seated person is party to the room
+/// through the room key it holds there (`ceg_room_keys_local`), not through
+/// the person's identity. A held key counts for its room only when all of
+/// these hold:
+/// - it is not retired locally;
+/// - its own live key record names that same room
+///   ([`room_key_of`](crate::federation::edition2::room_key_record::room_key_of)
+///   at now: a consistent, well-typed `room`);
+/// - it holds a seat on the room's roster now: the key, as the voice its
+///   first key names, is an active member
+///   ([`FederationDirectory::list_communities_for_member_active`]).
+///
+/// A further room key of a voice (seated through the voice, ROOMKEY-7) is not
+/// read here yet; neither is a NODE's room key, which is no member (Q-R3) and
+/// is party only by the seat it is given (the detector seat, ROOMKEY-8). A
+/// directory that keeps no node-local room keys answers `Unsupported`: it
+/// holds none (structural: the variant, not a message).
+///
+/// # Errors
+/// Directory reads.
+pub async fn seated_room_key_rooms<D>(directory: &D) -> Result<HashSet<String>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use crate::federation::edition2::room_key_record::{room_key_of, RoomKeyReading};
+    let held = match directory.edition2_room_keys_held(None).await {
+        Ok(h) => h,
+        Err(Error::Unsupported { .. }) => return Ok(HashSet::new()),
+        Err(e) => return Err(e),
+    };
+    let now_ms = u64::try_from(crate::host::clock::now().timestamp_millis()).unwrap_or(0);
+    let mut out = HashSet::new();
+    for k in held {
+        if k.retired_at_us.is_some() || out.contains(&k.room_id) {
+            continue;
+        }
+        match room_key_of(directory, &k.room_key_kid, Some(now_ms)).await? {
+            RoomKeyReading::Room(m) if m.room == k.room_id => {}
+            _ => continue,
+        }
+        let voice = ciris_verify_core::edition2::identity_ref(&k.room_key_kid);
+        if directory
+            .list_communities_for_member_active(&voice)
+            .await?
+            .iter()
+            .any(|c| c.community_key_id == k.room_id)
+        {
+            out.insert(k.room_id);
+        }
+    }
     Ok(out)
 }
 

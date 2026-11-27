@@ -11,12 +11,14 @@
 //!   composer and target arrived first.
 //! - A composer naming a row this node does not hold waits: HELD,
 //!   `link_unheld` (G0 v5.1), re-folded when the target lands.
-//! - **I2115** (v62.0.0, LF-fix2, P5; CC 2.4.1.1 "Never withdrawn") — a
-//!   `withdraws` whose target is held on a typed plane with no attestation
-//!   row (an entity revocation) SETTLES: HELD `withdraws_not_admitted`, read
-//!   from the target's statement, whichever arrived first, and never again
-//!   `link_unheld`; the revocation stands. Unheld, it still waits; a
-//!   retractable target is withdrawn as before.
+//! - **I2115** (v62.0.0, LF-fix2, P5; CC 2.4.1.1 "Never withdrawn";
+//!   KR-fix20, the count always wins) — a `withdraws` whose target is held
+//!   on a typed plane with no attestation row (an entity revocation) is
+//!   REFUSED by name (`withdraws_never_retracts`), read from the target's
+//!   statement, and nothing is kept: target first, at the door; composer
+//!   first, it waits `link_unheld` and is DROPPED when the revocation lands.
+//!   Either way the held set never carries it; the revocation stands.
+//!   Unheld, it still waits; a retractable target is withdrawn as before.
 
 use ciris_crypto::composite::CompositeSigningKey;
 use ciris_verify_core::cde::Value;
@@ -25,7 +27,7 @@ use ciris_verify_core::edition2::sign_row_statement;
 use super::door_invariants::fixture::*;
 use super::names::RowId;
 
-const SCORE_FAM: &str = "evidence:.suite:.kind:.cell:.prefix";
+const SCORE_FAM: &str = "coherence_standing:.cohort";
 /// Built so no literal reads as a family prefix to the family-rules
 /// discovery scan.
 const SCORE_DIM: &str = concat!("evidence", ":safety_battery:capture:a:b:v1");
@@ -252,12 +254,36 @@ fn withdraws_revocation(k: &CompositeSigningKey, target: &RowId, at_ms: u64) -> 
     .unwrap()
 }
 
-/// **I2115** (LF-fix2, P5) — the three arms of a `withdraws` target, and the
-/// held set after the settle.
+/// **I2115** (LF-fix2, P5; KR-fix20) — the three arms of a `withdraws`
+/// target, and the held set after the refusal.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) async fn unretractable_body(d: &dyn crate::federation::FederationDirectory) {
-    use super::fold::reason::{LINK_UNHELD, WITHDRAWS_NOT_ADMITTED};
+    use super::fold::reason::LINK_UNHELD;
     use super::ingest::{put_statement, StatementOutcome, INGEST_TIER};
+    // KR-fix20 — refused by name: the error's variant and token.
+    let refused = |r: Result<StatementOutcome, crate::federation::Error>, what: &str| match r {
+        Err(crate::federation::Error::MalformedRow { reason, .. }) => assert_eq!(
+            reason,
+            crate::federation::malformed_row::WITHDRAWS_NEVER_RETRACTS,
+            "{what}"
+        ),
+        other => panic!("{what}: refused withdraws_never_retracts, got {other:?}"),
+    };
+    // Nothing of a refused withdrawal is kept: no fold record, no statement.
+    let nothing_kept = |w: RowId, what: &'static str| async move {
+        assert!(
+            d.fold_state(&w).await.unwrap().is_none(),
+            "{what}: no fold record"
+        );
+        assert!(
+            d.edition2_voices(&w).await.unwrap().is_empty(),
+            "{what}: no statement kept"
+        );
+        assert!(
+            d.get_attestation(&w.hex()).await.unwrap().is_none(),
+            "{what}: no row"
+        );
+    };
     let why = |row: RowId| async move {
         super::fold::why_held(d, &row)
             .await
@@ -287,7 +313,7 @@ pub(crate) async fn unretractable_body(d: &dyn crate::federation::FederationDire
     );
 
     // (2) The revocation lands on its typed plane; the waiting withdraws is
-    // re-folded and SETTLES: not admitted, never `link_unheld` again.
+    // re-folded, REFUSED (KR-fix20) and DROPPED: nothing of it is kept.
     let landed = put_statement(d, &rev, None, INGEST_TIER)
         .await
         .unwrap_or_else(|e| panic!("I2115(2): the self-revocation lands: {e:?}"));
@@ -302,28 +328,18 @@ pub(crate) async fn unretractable_body(d: &dyn crate::federation::FederationDire
     );
     assert_eq!(
         why(w1).await,
-        Some(WITHDRAWS_NOT_ADMITTED.to_owned()),
-        "I2115(2) composer first: the revocation's arrival settles the withdraws"
+        None,
+        "I2115(2) composer first: the revocation's arrival drops the withdraws"
     );
-    // Target first: the same verdict at once.
+    nothing_kept(w1, "I2115(2) composer first").await;
+    // Target first: the same answer at once, at the door.
     let late = withdraws_revocation(&k, &rev_id, t + 2);
-    let StatementOutcome::Pending { row_id: w2, .. } = put_statement(d, &late, None, INGEST_TIER)
-        .await
-        .unwrap_or_else(|e| panic!("I2115(2): held, never refused: {e:?}"))
-    else {
-        panic!("I2115(2): a never-withdrawn target concludes no withdraws");
-    };
-    assert_eq!(
-        why(w2).await,
-        Some(WITHDRAWS_NOT_ADMITTED.to_owned()),
-        "I2115(2) target first: settled not admitted"
+    let w2 = RowId::of_statement(&late).expect("I2115: the withdraws' row id");
+    refused(
+        put_statement(d, &late, None, INGEST_TIER).await,
+        "I2115(2) target first: refused at the door",
     );
-    for w in [w1, w2] {
-        assert!(
-            d.get_attestation(&w.hex()).await.unwrap().is_none(),
-            "I2115(2) the withdraws concludes nothing"
-        );
-    }
+    nothing_kept(w2, "I2115(2) target first").await;
     // The revocation stands (CC 2.4.1.1: withdrawn by nobody, its own
     // signer included).
     assert!(
@@ -344,39 +360,26 @@ pub(crate) async fn unretractable_body(d: &dyn crate::federation::FederationDire
             .any(|r| r.revocation_id == rev_id.hex()),
         "I2115(2) the revocation stands on its plane"
     );
-    // The held set: a re-fold of everything keeps both settled, and no held
-    // row waits on the revocation (`link_unheld`) any more.
+    // The held set: a re-fold of everything holds neither, and no held row
+    // waits on the revocation (`link_unheld`).
     super::fold::refold_all(d)
         .await
         .unwrap_or_else(|e| panic!("I2115: refold_all: {e:?}"));
     let page = super::fold::held_rows(d, None, super::fold::MAX_HELD_PAGE)
         .await
         .unwrap();
-    for w in [w1, w2] {
-        let entry = page
-            .iter()
-            .find(|h| h.row_id == w)
-            .unwrap_or_else(|| panic!("I2115: the settled withdraws is held: {page:?}"));
-        assert_eq!(
-            entry.reason, WITHDRAWS_NOT_ADMITTED,
-            "I2115 the held set carries the settle, never the wait"
+    assert!(
+        page.iter().all(|h| ![w1, w2].contains(&h.row_id)),
+        "I2115 the held set carries neither refused withdraws: {page:?}"
+    );
+    // A re-offer, of either, is refused again; still nothing kept.
+    for (w, st) in [(w1, &early), (w2, &late)] {
+        refused(
+            put_statement(d, st, None, INGEST_TIER).await,
+            "I2115 a re-offer is refused",
         );
+        nothing_kept(w, "I2115 after a re-offer").await;
     }
-    assert!(
-        page.iter()
-            .filter(|h| [w1, w2].contains(&h.row_id))
-            .all(|h| h.reason != LINK_UNHELD),
-        "I2115 no settled withdraws is carried as waiting"
-    );
-    // A re-offer holds it again, unchanged.
-    let again = put_statement(d, &late, None, INGEST_TIER)
-        .await
-        .unwrap_or_else(|e| panic!("I2115: re-offer: {e:?}"));
-    assert!(
-        matches!(again, StatementOutcome::Pending { new: false, .. }),
-        "I2115 still held: {again:?}"
-    );
-    assert_eq!(why(w2).await, Some(WITHDRAWS_NOT_ADMITTED.to_owned()));
 
     // (3) A retractable target (a scores row) is withdrawn by its producer
     // as before: admitted, a typed row.

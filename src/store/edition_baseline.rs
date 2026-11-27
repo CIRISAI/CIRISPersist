@@ -46,6 +46,21 @@ pub(crate) const EDITION_ONE_HEAD: i32 = 216;
 ///   watermarks of accord rows a node holding no accord root skipped.
 /// - `ceg_dial_hints` — RL-fix2: the local, unsigned dial hints decoded from
 ///   a contact's node code.
+/// - `ceg_room_content`, `ceg_content_ends`, `ceg_content_end_tips`,
+///   `ceg_content_answers` — PRE4-V300-a (CONTENT-V300.rev3; CC rc22
+///   3.1.3.2): the room-content series index, the retained ends and tips,
+///   the cache of `ciris_kernel::content` answers.
+/// - `ceg_group_lineage`, `ceg_group_lineage_extends` — PRE4-V300-b
+///   (LINEAGE-V300.rev3; CC 2.7.8, CC 3.3.4): the nodes of each group's
+///   roster lineage and the heads each extends.
+/// - `ceg_held_bound` — PRE4-V300-c (HOLD-1): the rows held for their write
+///   scope, per room and writer, for the bounds on held rows.
+/// - `ceg_group_lineage_ends`, `ceg_group_lineage_end_heads` — PRE4-V300-d
+///   (LINEAGE-V300-ends; CC 3.3.4): a resignation is an end and no head: the
+///   ends and the heads each acts from.
+/// - `ceg_room_keys_local`, `ceg_room_bindings` — PRE4-V300-e (ROOMKEY-V300;
+///   CC 3.1.3.2): the room keys this node's device holds and the bindings
+///   made for it, node-local.
 #[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
 pub(crate) const EDITION_TWO_ADDITIONS: &[&str] = &[
     "store_edition_deletions",
@@ -57,6 +72,22 @@ pub(crate) const EDITION_TWO_ADDITIONS: &[&str] = &[
     "ceg_fold_reads",
     "ceg_accord_rescan",
     "ceg_dial_hints",
+    // v62.0.0 (PRE4-V300-a; CONTENT-V300.rev3) — the room-content tables.
+    "ceg_room_content",
+    "ceg_content_ends",
+    "ceg_content_end_tips",
+    "ceg_content_answers",
+    // v62.0.0 (PRE4-V300-b; LINEAGE-V300.rev3) — the roster lineage tables.
+    "ceg_group_lineage",
+    "ceg_group_lineage_extends",
+    // v62.0.0 (PRE4-V300-c; HOLD-1) — the held-row bound table.
+    "ceg_held_bound",
+    // v62.0.0 (PRE4-V300-d; LINEAGE-V300-ends).
+    "ceg_group_lineage_ends",
+    "ceg_group_lineage_end_heads",
+    // v62.0.0 (PRE4-V300-e; ROOMKEY-V300).
+    "ceg_room_keys_local",
+    "ceg_room_bindings",
 ];
 
 /// The columns edition 2 adds to edition 1's `federation_keys`: the
@@ -96,6 +127,26 @@ pub(crate) const ATTESTATIONS_EDITION_TWO_POSTGRES: &[&str] = &[
     "ALTER TABLE cirislens.federation_attestations ADD COLUMN restatement_key text;",
     "CREATE INDEX federation_attestations_restatement ON cirislens.federation_attestations USING btree (attesting_key_id, restatement_key) WHERE (restatement_key IS NOT NULL);",
 ];
+/// v62.0.0 (WD-fix1) — the withdrawn-content sweep's index, an edition-2
+/// object on an edition-1 table (P8-fix14's restatement index is the
+/// precedent): `(name, SQLite DDL as sqlite_schema stores it)`.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const ATTESTATIONS_WITHDRAWALS_INDEX: (&str, &str) = (
+    "federation_attestations_withdrawals",
+    "CREATE INDEX federation_attestations_withdrawals ON federation_attestations (admitted_at, attestation_id) WHERE attestation_type IN ('withdraws', 'recants')",
+);
+/// v62.0.0 (PRE4-V300-b; QUERY-1, CIRISPersist#1278) — a room's reads by
+/// dimension, an edition-2 object on an edition-1 table, SQLite only (the
+/// PostgreSQL partial `cohort_target` index serves them): `(name, SQLite DDL
+/// as sqlite_schema stores it)`.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const ATTESTATIONS_ROOM_DIMENSION_INDEX: (&str, &str) = (
+    "federation_attestations_room_dimension",
+    "CREATE INDEX federation_attestations_room_dimension ON federation_attestations (cohort_target, cohort_scope, dimension, asserted_at, attestation_id)",
+);
+/// Its PostgreSQL DDL, as V300 states it.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const ATTESTATIONS_WITHDRAWALS_INDEX_POSTGRES: &str = "CREATE INDEX federation_attestations_withdrawals ON cirislens.federation_attestations USING btree (admitted_at, attestation_id) WHERE (attestation_type = ANY (ARRAY['withdraws'::text, 'recants'::text]));";
 /// The column [`ATTESTATIONS_EDITION_TWO_POSTGRES`] adds.
 #[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
 pub(crate) const ATTESTATIONS_EDITION_TWO_COLUMNS: &[&str] = &["restatement_key"];
@@ -116,6 +167,46 @@ pub(crate) const STAMP_RANGE_POSTGRES: (&str, &str) = (
     "((withdraws_admission_rule >= 1) AND (withdraws_admission_rule <= 5))",
     "((withdraws_admission_rule >= 0) AND (withdraws_admission_rule <= 5))",
 );
+
+/// v62.0.0 (PRE4-V300-a; KR-fix34b; Constitution's ruling (a): a
+/// reverse-quorum objection to a roster event names that event's ROW in
+/// `refs.answers`) — the four typed membership tables carry the edition-2 row
+/// id of the `membership:{stage}` statement that landed the record:
+/// `record_row_id`, named and typed as `federation_keys.record_row_id`,
+/// NULLable (the edition-2 door always sets it), edited into V300's
+/// edition-1 CREATE TABLE on both dialects (no ALTER, no DROP COLUMN).
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const MEMBERSHIP_ROW_ID_TABLES: [&str; 4] = [
+    "federation_community_membership_revocations",
+    "federation_community_membership_widenings",
+    "federation_family_membership_revocations",
+    "federation_family_membership_widenings",
+];
+
+/// v62.0.0 (PRE4-V300-a; RESIGN-V300; CC 3.1.3.2) — the two membership
+/// REVOCATION tables also carry `leaf` ∈ {removal, resignation} (which leaf
+/// of `membership:{stage}` ended the seat; DEFAULT 'removal'), the last
+/// column, after `record_row_id`.
+#[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
+pub(crate) const MEMBERSHIP_LEAF_TABLES: [&str; 2] = [
+    "federation_community_membership_revocations",
+    "federation_family_membership_revocations",
+];
+
+/// The SQLite place each of the four CREATE TABLE statements changes (after
+/// the `attestation_id` foreign key, before the primary key), edition 1's
+/// text.
+#[cfg(test)]
+pub(crate) const MEMBERSHIP_SQLITE_AT: &str = "ON DELETE SET NULL,\n";
+
+/// [`MEMBERSHIP_ROW_ID_TABLES`]' line, V300's SQLite text.
+#[cfg(test)]
+pub(crate) const MEMBERSHIP_ROW_ID_SQLITE: &str = "    record_row_id BLOB\n        CHECK (record_row_id IS NULL OR (typeof(record_row_id) = 'blob' AND length(record_row_id) = 32)),\n";
+
+/// [`MEMBERSHIP_LEAF_TABLES`]' line, V300's SQLite text (after
+/// [`MEMBERSHIP_ROW_ID_SQLITE`]).
+#[cfg(test)]
+pub(crate) const MEMBERSHIP_LEAF_SQLITE: &str = "    leaf                     TEXT NOT NULL DEFAULT 'removal' CHECK (leaf IN ('removal', 'resignation')),\n";
 
 /// The PostgreSQL twin of [`KEYS_EDITION_TWO_SQLITE`], one statement.
 #[cfg_attr(not(test), allow(dead_code))] // the witnesses read it
@@ -553,13 +644,43 @@ mod tests {
                 "the frozen edition-1 halt DDL differs from edition 2's"
             );
             *line = format!("{head}{}", esc(super::HALT_LATCH_SQLITE_DDL));
+            // v62.0.0 (PRE4-V300-a) — the four typed membership tables'
+            // `record_row_id` (and the two revocation tables' `leaf`), edited
+            // in V300's CREATE TABLE: each frozen text restated at the one
+            // place it changes.
+            let was = super::MEMBERSHIP_SQLITE_AT;
+            for table in super::MEMBERSHIP_ROW_ID_TABLES {
+                let mut now = format!("{was}{}", super::MEMBERSHIP_ROW_ID_SQLITE);
+                if super::MEMBERSHIP_LEAF_TABLES.contains(&table) {
+                    now.push_str(super::MEMBERSHIP_LEAF_SQLITE);
+                }
+                let head = format!("object\ttable\t{table}\t{table}\t");
+                let line = lines
+                    .iter_mut()
+                    .find(|l| l.starts_with(&head))
+                    .unwrap_or_else(|| panic!("{table} in the fixture"));
+                let (was, now) = (esc(was), esc(&now));
+                assert_eq!(
+                    (line.matches(&was).count(), line.matches(&now).count()),
+                    (1, 0),
+                    "the frozen edition-1 {table} has no record_row_id"
+                );
+                *line = line.replace(&was, &now);
+            }
             // v62.0.0 (P8-fix14) — the restatement index, an edition-2 object
             // on an edition-1 table.
-            let (name, ddl) = super::ATTESTATIONS_RESTATEMENT_INDEX;
-            lines.push(format!(
-                "object\tindex\t{name}\tfederation_attestations\t{}",
-                esc(ddl)
-            ));
+            // v62.0.0 (WD-fix1) — and the withdrawals index beside it.
+            // v62.0.0 (PRE4-V300-b) — and the room-dimension index.
+            for (name, ddl) in [
+                super::ATTESTATIONS_RESTATEMENT_INDEX,
+                super::ATTESTATIONS_WITHDRAWALS_INDEX,
+                super::ATTESTATIONS_ROOM_DIMENSION_INDEX,
+            ] {
+                lines.push(format!(
+                    "object\tindex\t{name}\tfederation_attestations\t{}",
+                    esc(ddl)
+                ));
+            }
             lines.sort();
         }
         lines
@@ -629,6 +750,35 @@ mod tests {
         for a in super::ATTESTATIONS_EDITION_TWO_POSTGRES {
             assert_eq!(pg.matches(a).count(), 1, "I1950: {a}");
         }
+        // v62.0.0 (WD-fix1) — the withdrawals index, verbatim, both dialects.
+        assert_eq!(
+            sqlite
+                .matches(&format!("{};", super::ATTESTATIONS_WITHDRAWALS_INDEX.1))
+                .count(),
+            1,
+            "I1950: the withdrawals index is V300's own text"
+        );
+        assert_eq!(
+            pg.matches(super::ATTESTATIONS_WITHDRAWALS_INDEX_POSTGRES)
+                .count(),
+            1,
+            "I1950: the withdrawals index is V300's own text (postgres)"
+        );
+        // v62.0.0 (PRE4-V300-b) — the room-dimension index, verbatim on
+        // SQLite, and on SQLite only.
+        assert_eq!(
+            sqlite
+                .matches(&format!("{};", super::ATTESTATIONS_ROOM_DIMENSION_INDEX.1))
+                .count(),
+            1,
+            "I1950: the room-dimension index is V300's own text"
+        );
+        assert_eq!(
+            pg.matches(super::ATTESTATIONS_ROOM_DIMENSION_INDEX.0)
+                .count(),
+            0,
+            "I1950: the room-dimension index is SQLite's alone"
+        );
         // The PostgreSQL delivery table carries the composite, not the
         // earlier columns (its edition-1 DDL edited in place).
         let at = pg
@@ -649,6 +799,38 @@ mod tests {
                 (text.matches(was).count(), text.matches(now).count()),
                 (0, 1),
                 "I1950: the stamp's range {now}"
+            );
+        }
+        // v62.0.0 (PRE4-V300-a) — the membership tables' record_row_id (and
+        // the revocation tables' leaf) is V300's own text, once per table on
+        // each dialect.
+        assert_eq!(
+            (
+                sqlite.matches(super::MEMBERSHIP_ROW_ID_SQLITE).count(),
+                sqlite.matches(super::MEMBERSHIP_LEAF_SQLITE).count(),
+            ),
+            (
+                super::MEMBERSHIP_ROW_ID_TABLES.len(),
+                super::MEMBERSHIP_LEAF_TABLES.len()
+            ),
+            "I1950: record_row_id and leaf in the membership tables (sqlite)"
+        );
+        for t in super::MEMBERSHIP_ROW_ID_TABLES {
+            assert_eq!(
+                pg.matches(&format!(
+                    "record_row_id bytea CONSTRAINT {t}_record_row_id_check CHECK (octet_length(record_row_id) = 32)"
+                ))
+                .count(),
+                1,
+                "I1950: record_row_id in {t} (postgres)"
+            );
+        }
+        for t in super::MEMBERSHIP_LEAF_TABLES {
+            assert_eq!(
+                pg.matches(&format!("CONSTRAINT {t}_leaf_check CHECK"))
+                    .count(),
+                1,
+                "I1950: leaf in {t} (postgres)"
             );
         }
         assert!(!pg.contains("DROP COLUMN"), "I1950: no DROP COLUMN in V300");
@@ -776,15 +958,22 @@ mod tests {
                     .iter()
                     .any(|col| l.split('\t').nth(3) == Some(col)))
                 || (l.starts_with("idx\t")
-                    && l.contains(&format!(
-                        "INDEX {} ON cirislens.federation_attestations",
-                        super::ATTESTATIONS_RESTATEMENT_INDEX.0
-                    )))
+                    && [
+                        super::ATTESTATIONS_RESTATEMENT_INDEX.0,
+                        super::ATTESTATIONS_WITHDRAWALS_INDEX.0,
+                    ]
+                    .iter()
+                    .any(|name| {
+                        l.contains(&format!(
+                            "INDEX {name} ON cirislens.federation_attestations"
+                        ))
+                    }))
         };
+        // v62.0.0 (WD-fix1) — the restatement index and the withdrawals index.
         assert_eq!(
             all.iter().filter(|l| restatement(l)).count(),
-            super::ATTESTATIONS_EDITION_TWO_COLUMNS.len() + 1,
-            "I1950: the restatement column and index are there"
+            super::ATTESTATIONS_EDITION_TWO_COLUMNS.len() + 2,
+            "I1950: the restatement column and the two edition-2 indexes are there"
         );
         let all: Vec<String> = all.into_iter().filter(|l| !restatement(l)).collect();
         // v62.0.0 (HALT-235) — the halt latch column edition 2 adds.
@@ -798,6 +987,28 @@ mod tests {
             "I1950: the halt latch column is there"
         );
         let all: Vec<String> = all.into_iter().filter(|l| !latch(l)).collect();
+        // v62.0.0 (PRE4-V300-a) — the four typed membership tables'
+        // `record_row_id` column and its named check, and the two revocation
+        // tables' `leaf` column and its named check: edition 2's.
+        let row_id = |l: &String| {
+            let col_check = |t: &str, col: &str| {
+                (l.starts_with(&format!("col\tcirislens.{t}\t"))
+                    && l.split('\t').nth(3) == Some(col))
+                    || l.starts_with(&format!("con\tcirislens.{t}\t{t}_{col}_check\t"))
+            };
+            super::MEMBERSHIP_ROW_ID_TABLES
+                .iter()
+                .any(|t| col_check(t, "record_row_id"))
+                || super::MEMBERSHIP_LEAF_TABLES
+                    .iter()
+                    .any(|t| col_check(t, "leaf"))
+        };
+        assert_eq!(
+            all.iter().filter(|l| row_id(l)).count(),
+            2 * (super::MEMBERSHIP_ROW_ID_TABLES.len() + super::MEMBERSHIP_LEAF_TABLES.len()),
+            "I1950: each membership table's record_row_id (and leaf) column and check are there"
+        );
+        let all: Vec<String> = all.into_iter().filter(|l| !row_id(l)).collect();
         let n_added = all.iter().filter(|l| added(l)).count();
         assert_eq!(
             n_added,

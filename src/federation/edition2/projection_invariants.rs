@@ -20,8 +20,7 @@
 //!   `tier_ingest::verify_row_hybrid_signature`,
 //!   `register::verify_key_registration`, `register::verify_proof_of_possession`
 //!   (→ `verify_record_signed_by`), `key_plane::verify_plane_row`,
-//!   `group_plane::verify_plane_row`, `self_roster::verify_proposal_row`,
-//!   `cosign::verify_row`, `occurrence_revocation_carrier::verify_carrier_row`,
+//!   `group_plane::verify_plane_row`, `cosign::verify_row`, `occurrence_revocation_carrier::verify_carrier_row`,
 //!   `admission::verify_consent_record_transit_ingest`,
 //!   `admission::verify_caller_signed_local_row`. The same rows under an
 //!   earlier-form key id are never refused by that name, and the mapped row
@@ -74,17 +73,14 @@ fn score_row(k: &ciris_crypto::composite::CompositeSigningKey, at_ms: u64) -> Ve
         ("author", Value::Text(iref(k))),
         ("score", Value::Uint(750_000)),
         ("confidence", Value::Uint(900_000)),
-        (
-            "dimension",
-            Value::Text("evidence:safety_battery:capture:a:b:v1".into()),
-        ),
+        ("dimension", Value::Text("coherence_standing:cab:v1".into())),
     ]);
     sign_row_statement(
         k,
         &iref(k),
         &iref(k),
         "scores",
-        "evidence:.suite:.kind:.cell:.prefix",
+        "coherence_standing:.cohort",
         &payload,
         vec![],
     )
@@ -743,7 +739,7 @@ async fn cross_form(
 ) {
     use crate::federation::{
         admission, cosign, group_plane, key_plane, occurrence_revocation_carrier, register,
-        self_roster, tier_ingest,
+        tier_ingest,
     };
     let token = malformed_row::EARLIER_FORM_SIGNER_IS_EDITION2;
     // Each site refuses under its own plane, so a site whose guard is gone
@@ -793,11 +789,6 @@ async fn cross_form(
         "group_plane::verify_plane_row",
         "group_plane",
         b(group_plane::verify_plane_row(d, row).await),
-    );
-    check(
-        "self_roster::verify_proposal_row",
-        "self_roster",
-        b(self_roster::verify_proposal_row(d, row).await),
     );
     check(
         "cosign::verify_row",

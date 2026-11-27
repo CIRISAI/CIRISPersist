@@ -1121,6 +1121,14 @@ pub const TRANSIT_XWING_PUBKEY_MEMBER: &str = "transit_xwing_pubkey";
 /// is no stored old form to keep reading. Envelope-only: "It lives in the
 /// signed envelope only, never in a typed column".
 pub const ONION_HOP_XWING_PUBKEY_MEMBER: &str = "onion_hop_xwing_pubkey";
+/// v62.0.0 (ROOMKEY-6; CC 3.1.3.2, Constitution Q-C3) — an identity's
+/// binding key for private rooms, 1216 bytes (`pk_M ‖ pk_X`), at the top
+/// level of `identity:occurrence` beside `encryption_pubkeys`. "An identity
+/// keeps a key pair for bindings that is distinct from its content-KEM pair"
+/// (p3:377); "a node refuses at admission a record where they are not"
+/// (p2:1381). Its reuse refusals' names come with the CC commit
+/// (`edition2::roomkey_names`).
+pub const ROOM_BINDING_XWING_PUBKEY_MEMBER: &str = "room_binding_xwing_pubkey";
 /// The X-Wing public key's exact raw length (`pk_M ‖ pk_X`).
 pub const XWING_PUBKEY_LEN: usize = 1216;
 /// Bytes `0..1184` of an X-Wing public key: the ML-KEM-768 encapsulation key.
@@ -1246,6 +1254,33 @@ impl XWingReuseRefusal {
     }
 }
 
+/// v62.0.0 — one half of an X-Wing public key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XWingHalf {
+    /// Bytes `0..1184`.
+    MlKem768,
+    /// Bytes `1184..1216`.
+    X25519,
+}
+
+/// v62.0.0 (ROOMKEY-6) — **which half of `key` is byte-equal to one of
+/// `others`**, the ML-KEM half first; `None` when neither is. The one test
+/// under [`check_xwing_halves`] and the room binding key's check.
+#[must_use]
+pub fn reused_half<'a>(
+    key: &XWingPublicKey,
+    others: impl IntoIterator<Item = &'a [u8]>,
+) -> Option<XWingHalf> {
+    let others: Vec<&[u8]> = others.into_iter().collect();
+    if others.iter().any(|k| *k == key.ml_kem_768()) {
+        return Some(XWingHalf::MlKem768);
+    }
+    if others.iter().any(|k| *k == key.x25519()) {
+        return Some(XWingHalf::X25519);
+    }
+    None
+}
+
 /// v62.0.0 (CC rc20 3.3.6.2) — **the per-half reuse rule, pure.** Each half of
 /// `key` (`0..1184`, `1184..1216`) must not be byte-equal to any of `others`
 /// (raw keys, and halves of other X-Wing keys, as the caller gathers them).
@@ -1269,14 +1304,11 @@ pub fn check_xwing_halves<'a>(
             XWingReuseRefusal::OnionHopX25519Reuse,
         ),
     };
-    let others: Vec<&[u8]> = others.into_iter().collect();
-    if others.iter().any(|k| *k == key.ml_kem_768()) {
-        return Err(m);
+    match reused_half(key, others) {
+        Some(XWingHalf::MlKem768) => Err(m),
+        Some(XWingHalf::X25519) => Err(x),
+        None => Ok(()),
     }
-    if others.iter().any(|k| *k == key.x25519()) {
-        return Err(x);
-    }
-    Ok(())
 }
 
 impl SignedTransportDestination {
@@ -2828,7 +2860,7 @@ pub(crate) mod test_support {
 
         // THE ATTACK — the trusted-local self-write on the same pair, later,
         // content-only.
-        dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
+        dir.test_seam_put_identity_occurrence(crate::federation::IdentityOccurrence {
             identity_key_id: a.clone(),
             occurrence_key_id: ph.clone(),
             device_class: PHONE.into(),
@@ -2885,7 +2917,7 @@ pub(crate) mod test_support {
             at(t(40)),
             "({suffix}) I3324: the first revocation's instant stands"
         );
-        dir.put_identity_occurrence_revocation_local(
+        dir.put_identity_occurrence_revocation_edition2(
             crate::federation::types::IdentityOccurrenceRevocation {
                 identity_key_id: a.clone(),
                 occurrence_key_id: ph.clone(),
@@ -2895,6 +2927,7 @@ pub(crate) mod test_support {
                 witness_set: Vec::new(),
                 persist_row_hash: String::new(),
             },
+            crate::federation::DoorToken::new(),
         )
         .await
         .expect_err("I3324: a second local revocation of the pair is refused (#541)");

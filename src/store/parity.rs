@@ -459,7 +459,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // withdraws gate's; this fails only on storage.
     ("after_withdraws", Class::Plumbing),
     ("occurrence_withdrawal_of", Class::Plumbing),
-    ("put_identity_occurrence_revocation_local", Class::Plumbing),
+    (
+        "put_identity_occurrence_revocation_edition2",
+        Class::Plumbing,
+    ),
     ("sqlite_sync_key_record_row", Class::Plumbing),
     ("sqlite_sync_occurrence_row", Class::Plumbing),
     ("sqlite_drop_key_record_rows", Class::Plumbing),
@@ -1031,10 +1034,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("from_str", Class::Plumbing),
     ("from_value", Class::Plumbing),
     ("from_wire_str", Class::Plumbing),
-    // v59.0.0 (CIRISPersist#1099) — the self-roster door: refuses (holds) a
-    // roster change one key of two or more signed.
-    ("gate_occurrence", Class::Gate),
-    ("gate_withdrawal", Class::Gate),
     ("get", Class::Plumbing),
     ("get_attestation", Class::Delegates),
     ("get_client", Class::Delegates),
@@ -1976,9 +1975,10 @@ mod tests {
             "put_identity_occurrence",
             "put_identity_occurrence_planned",
         ),
+        // v62.0.0 (WD-fix9) — the retired trusted-local write, a TEST seam.
         (
             "FederationDirectory",
-            "put_identity_occurrence_local",
+            "test_seam_put_identity_occurrence",
             "put_identity_occurrence_local_planned",
         ),
         // v61 (CIRISPersist#934, S4b) — the transport-destination writes.
