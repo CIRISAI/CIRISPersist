@@ -132,5 +132,5 @@ ignore = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "warn"
-# v62.0.0 — the kernel crate (CIRISKernel), pinned at tag kernel-v0.2.0.
+# v62.0.0 — the kernel crate (CIRISKernel), pinned at tag kernel-v0.2.2.
 allow-git = ["https://github.com/CIRISAI/CIRISKernel"]

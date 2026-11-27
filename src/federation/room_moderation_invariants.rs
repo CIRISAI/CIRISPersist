@@ -357,7 +357,8 @@ pub(crate) mod bodies {
             e2::put_key(d, u, &[identity_type::USER]).await;
         }
         reg(d, &[&room]).await;
-        found_community(d, &room, "quorum:1/1", &[&moderator, &author, &member], &[])
+        // LEAD-gid2 — the room's DERIVED id (the founding helper returns it).
+        let room = found_community(d, &room, "quorum:1/1", &[&moderator, &author, &member], &[])
             .await
             .unwrap();
         const PLAIN: &str = "expertise:cardiology:en:v1";

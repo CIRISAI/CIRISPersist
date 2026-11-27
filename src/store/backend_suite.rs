@@ -415,7 +415,7 @@ mod tests {
                 "id": id,
                 // v62.0.0 (E5) — the earlier form (held tests) keeps its own.
                 "dimension": if e2::emit_edition2() {
-                    "evidence:safety_battery:capture:a:b:v1"
+                    "coherence_standing:cab:v1"
                 } else {
                     "identity_binding:v1"
                 },
@@ -3905,9 +3905,9 @@ mod tests {
         .await
         .expect("put_conferred_key: capability_roots_to_trusted_root");
         assert!(
-            rooted.as_ref().is_some_and(|g| g.root_key_id == r.root),
+            rooted.as_ref().is_some_and(|g| g.root_key_id == r.lineage),
             "put_conferred_key: {key_id}'s {scope} roots at {} through node {node}: {rooted:?}",
-            r.root
+            r.lineage
         );
     }
 
@@ -3935,8 +3935,9 @@ mod tests {
     /// age_band resolution: a self-declared minor LOWERS a witness adult
     /// (v62.0.0 K2-fix14, CC 3.4.11 read-union); self minor
     /// alone → Minor; self adult alone → Unknown (ratchet ignores self-adult);
-    /// witness minor → Minor; no attestation → Unknown; expired witness
-    /// attestation ignored.
+    /// witness minor → Minor; no attestation → Unknown; an older witness
+    /// adult is superseded by the same witness's newer minor (K2-fix24: its
+    /// expiry is never read).
     #[tokio::test]
     async fn age_band_resolution_witness_outranks_self_and_ratchets() {
         use crate::federation::age::{age_band, AgeBand};
@@ -4048,7 +4049,9 @@ mod tests {
             AgeBand::Minor
         );
 
-        // An EXPIRED witness adult is ignored — Minor still wins (it is live).
+        // An older (and expired) witness adult: the same witness's newer minor
+        // is its current row, so Minor stands. v62.0.0 (K2-fix24, Eric): the
+        // expiry plays no part.
         let mut expired = fix_age_attestation(
             "abe-w-adult-exp",
             "abe-witness",
@@ -4059,8 +4062,8 @@ mod tests {
         // v62.0.0 (K2-fix20; CC 3.5.1 rule 3) — dated one minute BEFORE the
         // witness's minor, so the minor is this witness's newest row by
         // instant (a same-instant tie now goes to the lowest attestation_id,
-        // which this test must not depend on). An expired NEWEST row would
-        // leave the witness no current row at all (K2-fix15).
+        // which this test must not depend on). K2-fix24: an expired NEWEST
+        // row would still be the witness's current row.
         expired.asserted_at -= chrono::Duration::minutes(1);
         expired.scrub_timestamp = expired.asserted_at;
         resign_fix(&mut expired);
@@ -4068,7 +4071,7 @@ mod tests {
         assert_eq!(
             age_band(&backend, &e2::kid("abe-subj")).await.unwrap(),
             AgeBand::Minor,
-            "an expired witness adult must be ignored (liveness = expires_at)",
+            "the witness's newer minor supersedes its older adult (no expiry read)",
         );
     }
 
