@@ -114,3 +114,12 @@ Marks: READ = read in code or text; CHECKED = run; BELIEVED = inferred.
   Constitution repo that persist loads. With the fold shut the door still
   admits and keeps a well-formed row; it concludes nothing. Only a
   malformed row is refused.
+- Scope settled for the not-in-this-tag list (relayed): the two musts are
+  the minor rule and the consent peer set (Edge's replication to peers a
+  person does not own depends on it), both 0.5.1 at latest. Steward purge
+  is likely in 0.5.0. `admission:unit` ships shut: Edge does not use it and
+  the agent fails closed for units beyond its attested build; when it
+  returns it keeps its function name and row shape. Everything else on the
+  shut list ships shut. `PLAN.md` updated.
+- So the kernel release v62 can finish on is the one that carries the minor
+  rule and the consent peer set: 0.5.1 if they do not make 0.5.0.

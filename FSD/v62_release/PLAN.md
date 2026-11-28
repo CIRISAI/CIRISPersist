@@ -101,10 +101,10 @@ against the branch.
 | Item | Persist's reading | Effect if shut |
 |---|---|---|
 | Minor rule and the age band | Must have (Kernel: sized for 0.5.1) | Either every duty edge waits for an age answer or minors are unprotected. Eric's choice. |
-| Replication audience | Stays only as a composition of three crate answers (audience, person's keys, owner standing), each at a row; Kernel to confirm | Cannot be shut: nothing replicates |
-| Consent peer set | In, if the crate's default fold answers it; Kernel to confirm | No data leaves a person's own nodes to a consented peer |
-| `admission:unit` and the receipts' trusted-service rule | Shut from persist's side; Edge and Agent to say whether start-up gates on it | A host cannot ask "may this unit run" |
-| Steward purge as a counted act | Kernel to say what is missing | No mesh-wide erasure by the stewards on day one |
+| Replication audience | Being built for 0.5.0: `audience::audiences`, `seat::person_keys`, `standing::nodes_of`, each at a row | Cannot be shut: nothing replicates |
+| Consent peer set | Must have: Edge's replication to peers a person does not own runs through it. Not in the crate yet; Kernel has the rule, 0.5.1 at latest | Cannot be shut |
+| `admission:unit` and the receipts' trusted-service rule | Shut. Edge does not use it; the agent fails closed for units beyond its attested build and keeps running | Nothing beyond the attested build loads. Same function name and row shape when it returns |
+| Steward purge as a counted act | Likely in 0.5.0: needs one acts-table row and an arm | none if it lands |
 | Invitation decline | Shut | A declined invitation stays unanswered until it expires or is withdrawn |
 | Pending invitees as a query | Not needed: the invitation row names its invitee | none |
 | One-proposer invitation window | Shut | none at the pin |
