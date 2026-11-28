@@ -262,3 +262,23 @@ Marks: READ = read in code or text; CHECKED = run; BELIEVED = inferred.
 - At resume: trace whether `admission.rate_per_key` is read inside
   persist's replication admission (BELIEVED), so the Constitution can
   decide whether that key is in.
+- Constitution, the last two owed answers (from the text):
+  - The objection's steward tier is GONE. `objection:{state}` has two
+    states, `assent` (+1) and `raised` (-1); the proposal is the proposer's
+    own row and counts as its approval; each answer names what it answers
+    in `refs.answers`. Nothing escalates to duty holders and nothing
+    upholds, overrules or dismisses. Persist's reverse-quorum fold with its
+    tier, dismissals and thresholds is deleted, not ported. The outcome is
+    the count over objection rows under the act's policy row plus the
+    window's landing, both the crate's.
+  - The lone path is IN the text as a window of rows (CC 3.3.6.4 for the
+    self roster; CC 4.5.13 gives every window of the policy table the same
+    two rows). It closes by a `window:held` row and a landing
+    (`window:landed` or `window:refused`) by one key of the count, never by
+    a node's clock. The halt is the one exception: its fuse is the halted
+    node's own clock and it has no landing. Persist's host-clock and
+    first-held windows for these are deleted; the first-held instant is
+    kept only as a fact handed to the crate.
+- Correction to the audit: `node_state.rs` is the operator read surface (a
+  gauge that renders standing, including the old steward tier); it is not
+  a lone path of its own. Its renderings of deleted folds go with them.
