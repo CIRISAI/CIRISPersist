@@ -176,3 +176,10 @@ Marks: READ = read in code or text; CHECKED = run; BELIEVED = inferred.
     object X" selector per function, shared by the door and the cache's
     invalidation, so the two cannot disagree. The fold scheduler's read
     index (`ceg_fold_reads`) is the natural place for it.
+- Kernel corrected its answer on the election: the ranked seating and its
+  close did not pass the independent read and are NOT in this tag. Plain
+  moderator seats, duty conferral, the lone-act and lift paths are
+  unaffected. For persist: the election door ships shut unless Eric holds
+  v62 for a kernel release that carries it. This conflicts with the
+  earlier scope decision that the election stays in v62, so it is his
+  call.
