@@ -79,3 +79,16 @@ Marks: READ = read in code or text; CHECKED = run; BELIEVED = inferred.
   and signer cell.
 - By persist to the Client: the refusal for a retired objection state is
   `namespace_vocab_value_unregistered`.
+
+### Later on 2026-11-27
+
+- `KERNEL_MAP.md` added: persist's rule groups against the crate at
+  `release-0.5.0-wip` 11804e1 (READ in source; nothing compiled). Not on
+  that commit yet: the audience module, the key-to-person fold, the
+  affiliation countersign, a public founder predicate, the wire map and the
+  vector schema. Fifteen open points for Kernel are in its section E; sent.
+- The `mesh_config` payload members, signer rule and registered keys were
+  sent to the Constitution session (READ from `mesh_config.rs`).
+- Adapter breaks to expect at the pin, from signatures: `SeatRow::word`
+  required; `Policy::SelfAdmit` gone; `SeatLaw` gains `acts`,
+  `removal_floor`, `kinds`; `WindowSpec` gains `opener`.
