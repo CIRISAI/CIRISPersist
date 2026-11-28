@@ -189,3 +189,16 @@ Marks: READ = read in code or text; CHECKED = run; BELIEVED = inferred.
   election's id row names, and every input goes through persons and the
   key view. The election stays in v62's scope; the scope question above is
   closed.
+- Kernel, the re-ask contract as built (merging): `seat::seat_rule_why` and
+  `window::rule_why` return true, false, or a wait naming a row;
+  `Held::lacks(id)` gives the ids a waiting row lacks; the root view names a
+  missing grant, anchor or bundle. A kept row reads only its concluded
+  ancestors, so a seat or window "false" is final; the only real waits are
+  on trust-root rows (a stalled room's recovery widening). The Held layer
+  concludes a row once, when kept: when a named row arrives later, persist
+  must re-conclude the waiting row and its descendants (ADOPTING, new
+  "Re-asking" section). New: `seat::infra_live` (live or stalled) and
+  `seat::group_of` for any reference naming a group by id; two founding
+  rows under one id are rivals and conclude nothing.
+- Asked Kernel how a count that is short of voices becomes met when a
+  later voice lands, given "false is final".
