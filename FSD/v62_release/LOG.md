@@ -183,3 +183,9 @@ Marks: READ = read in code or text; CHECKED = run; BELIEVED = inferred.
   v62 for a kernel release that carries it. This conflicts with the
   earlier scope decision that the election stays in v62, so it is his
   call.
+- Kernel, relaying Eric: the election close is fixed IN 0.5.0, and the tag
+  waits for it. The close will take a reader (`seat::election_closed` with
+  a reader argument), its base is the electorate at the vacancy the
+  election's id row names, and every input goes through persons and the
+  key view. The election stays in v62's scope; the scope question above is
+  closed.

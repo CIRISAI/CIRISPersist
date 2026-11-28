@@ -80,7 +80,8 @@ against the branch.
 - Rotation chain, rival rotations, who may revoke, suspect statements.
 - Delegation walk and terms, steward and owner bindings, moderators, duty
   holders, slash / quarantine / takedown acts in force, licensure reach,
-  elections.
+  elections (the close is being reworked to take a reader; the tag waits
+  for it).
 - The trust root's fork fold, joins, grants and charter coverage; accord
   m-of-n; the halt count.
 - The affiliation's lone-officer countersign (being built).
@@ -105,7 +106,6 @@ against the branch.
 | Consent peer set | Must have (Edge depends on it). Kernel: now in 0.5.0 | Cannot be shut |
 | `admission:unit` and the receipts' trusted-service rule | Shut. Edge does not use it; the agent fails closed for units beyond its attested build and keeps running | Nothing beyond the attested build loads. Same function name and row shape when it returns |
 | Steward purge as a counted act | Likely in 0.5.0: needs one acts-table row and an arm | none if it lands |
-| The moderator election (ranked seating and its close) | Not in this tag (failed Kernel's independent read). Earlier scope decision said the election stays in v62: Eric's call | Moderators are seated by duty conferral only |
 | Invitation decline | Shut | A declined invitation stays unanswered until it expires or is withdrawn |
 | Pending invitees as a query | Not needed: the invitation row names its invitee | none |
 | One-proposer invitation window | Shut | none at the pin |
