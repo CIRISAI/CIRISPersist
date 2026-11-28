@@ -159,3 +159,20 @@ Marks: READ = read in code or text; CHECKED = run; BELIEVED = inferred.
   kinds; `AudienceRow::seats` replaced; content kinds `Ack` and `KeyEnd`;
   `CutSpec::key_view`.
 - Remaining must not yet in 0.5.0: the minor rule and age band.
+- Kernel on the rows to present and on keeping answers:
+  - The row set for an answer about an object is NOT only the judged row's
+    causal past. It is every held row over that object (concurrent rows
+    change answers), the signers' person and key rows (self-roster rows,
+    key records, rotations, revocations, owner bindings), the reader's own
+    acknowledgement rows, and, where the answer walks them, the root's
+    bundles and grants, the trust edges and the authority's record. The
+    wire map will state the rows to present per function.
+  - Keeping an answer in memory is inside the rule as a pure-function
+    cache: keyed on the exact set of row ids presented, the reader and its
+    line, the key view's inputs and the table pins. It is dropped on any
+    new row that would be in that presented set, never written to the
+    store as truth, and never answered from once the set has grown.
+  - Design consequence for persist: the presentation needs one "rows for
+    object X" selector per function, shared by the door and the cache's
+    invalidation, so the two cannot disagree. The fold scheduler's read
+    index (`ceg_fold_reads`) is the natural place for it.
