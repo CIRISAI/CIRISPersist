@@ -1,0 +1,87 @@
+CIRISVerify v23.8.0 tag notice (2026-11-27). Pin from this.
+
+Version      23.8.0 (BREAKING)
+Tag          v23.8.0, tag object a5046e35f48bd8badbb0c4cf15448c270e7dfea5, pushed
+Commit       d0e20f2292ffb9cd97254e724d0281dcb65b53e7 (main; squash of PR #359)
+Cut on       CIRISConstitution rc23-next, commit 0e80f21053bf090dccddb683077bed9628596f99 (CI pinned to it)
+CI           PR #359 green, 29 of 29, on 31520a3, whose tree is the merge commit's tree
+Versions     Cargo.toml, pyproject.toml, __init__.__version__, Cargo.lock ciris-verify-core: all 23.8.0 at the commit
+PyPI         the release workflow runs from the tag; git pins need not wait for it
+
+A GENESIS BUNDLE MAY JOIN TIPS (edition2::genesis; CC 2.6.1.11)
+- refs.further_prev: a set of at least one object reference, beside prev, never naming prev again
+  (genesis_bundle_schema; unsorted: federation_set_semantics_unsorted).
+- version = 1 + the greatest version among the predecessors named; prev = the one of greatest version, least
+  object id (version_prev_mismatch); one family_key_id; a predecessor in another's lineage past is Invalid
+  further_prev_not_newest (Malformed::FurtherPrevNotNewest).
+- Waiting names every predecessor not held (GenesisWaiting.further_prev beside .prev); one held and not Valid is
+  genesis_bundle_prev_not_valid.
+- The count: a strict majority of EACH named predecessor's live holders, each voice under the key that
+  predecessor seats. A holder one branch rotated signs under each of its keys. A signing key a counted RECOVERY
+  replaced is no voice on any branch (its statement refused alone, statement_kid_not_iss) and the holder a
+  predecessor still seats at it is out of that predecessor's live holders. A predecessor with no live holder:
+  genesis_bundle_count_unmet. A holder no predecessor seats signs; so does a holder whose recovery commitment
+  differs from the one any named predecessor carries.
+- A join inherits the union: seating a key any branch retired or left is Invalid holder_key_retired; naming a
+  commitment any branch spent is recovery_commitment_spent.
+- A recovery carries no further_prev (recovery_changes_other_seat).
+- A recovery whose prev is in the past of a held Valid bundle its holder signed, and is none of the predecessors
+  that bundle names, concludes nothing: Inconclusive::RecoveryBehindHead, token recovery_behind_head, no detail.
+  A sibling on the same prev is a fork, and both are read on their own.
+- GenesisInput.predecessors is now every bundle of the lineage the reader holds, not only the one prev names.
+- GenesisPlacement gains further_prev, past, recovery_retired_keys, voices (each verified statement as iss, kid),
+  predecessors() and regime() (the charter's deterministic encoding without recovery_commitments).
+
+WHAT A READER ACTS ON AT SEVERAL TIPS (CC 3.2 T6, CC 2.7.8)
+- New pure module edition2::root_fold (Lineage, RootBundle, Reader, ReaderAnchor, InForce, KeyRevocation,
+  GENESIS_JOIN_CONTESTED): a port of CIRISKernel models/trust_root/root.py (root-fold 272fcd6). Tips of one regime
+  fold; tips whose regimes differ give what they share; two joins of the same predecessors under different
+  regimes are contested (a state; neither stands; the reader keeps the tips they tried to join); two recoveries of
+  one seat likewise; a self-forked bundle is void where the other side outnumbers it; in force is per reader.
+- genesis::in_force(valid: &[&GenesisPlacement], anchor: &Anchor, acknowledged: &[Digest32]) -> Option<ActOn>
+  ActOn { heads, holders: Vec<PlacedHolder>, seats: Vec<PlacedSeat>, folded, contested }.
+  `acknowledged`: the bundles the reader's owner acknowledged, in order (the attached_head_digest of its
+  trust:accepts root edges). None acknowledged: the anchor's first bundle. Under a thumbprint anchor, two first
+  bundles that match root on neither (None).
+- Holder-key revocations are NOT read yet: in_force takes every seated holder as live.
+
+THE DOOR OF A PRIVATE ROOM (edition2::room; CC 3.1.3.2)
+- check_room_row(iss, kid, payload, signer_record, &VoiceRoster) and check_node_room_row(.., &NodeOwnerView)
+  -> RoomRowReading::{Valid, Waiting, ConcludesNothing, Refused}; check_room_key_row_placement; row_room,
+  row_voice_head, row_owner_binding, is_node_room_key.
+- Refusals: room_row_signer_not_room_key, room_key_other_room, room_row_voice_head_malformed,
+  room_row_owner_binding_malformed, room_key_occurrence_outside_room, room_key_binding_outside_room.
+
+BREAKING
+- genesis::tips_in_common and TipsInCommon are removed. Use genesis::in_force.
+- GenesisPlacement and GenesisWaiting have new public fields; Malformed, Inconclusive gain variants (exhaustive
+  matches and struct literals need them).
+- A receipt with no iat is refused by verify_receipt and verify_receipt_for_leaf(_hash): receipt_no_instant
+  (before, only a head receipt). Order: shape, vds, alg, kid, inclusion, signature, no instant, subject.
+- keys::check_key_record: valid_until <= asserted_at is KeyRecordError::ValidUntilNotAfterAssertedAt, token
+  valid_until_not_after_asserted_at; key_record_out_of_window is the upper bound only.
+- CC's registry at 0e80f21: 189 families (adds regard:{subject_kind}, ballot:moderation_action).
+  FAMILY_MODEL_CC_COMMIT = "0e80f21".
+
+VECTOR FILES AT THE TAG (sha256), under src/ciris-verify-core/tests/vectors/edition2/
+a39d354da9c4efb5585b031a31c56ee9d8d04f731b91775cdb2ffd64ae8da37c  genesis/genesis_join_v1.json (46 cases)
+97495b419f35e443d6c9b720ca1fc451300ef9c2c6c968cdd44bd4a4b59d6596  genesis/pool_join_v1_0.json
+eb344367d1416cc4b4e878ef3df100e7bff87f988d308134ee8c915aa9671ab5  genesis/pool_join_v1_1.json
+5413753c946b06c4b759f7837fcdeff88f310e4772013f343758737308ea1c11  genesis/pool_join_v1_2.json
+cbb0436406b2c10acb26a2e7fc3e08a2be6fd9d25fd38b02412391f17fa49473  genesis/pool_join_v1_3.json
+196afcde24e602a37dcbbcaaf7463ff0407eb093d1d092330b49aa9e600f96d0  genesis/kernel_root_reader.json (Kernel root-fold 272fcd6, 22 cases)
+d4e6f6af28b7a72ff80322e2fbea9fdfde3cbcb5d6d01f57eec6031e06cb9c26  receipts/receipts_v2.json (5 cases)
+8df6c7c7af30ca6c4de52c672887e70d0f692f2db926fd32e9cbcb832ec2c74f  room/kernel_room_keys.json (Kernel af1cc43, 30 cases)
+e6e49c9c2d90aeea24c136643935bdd2ed878e2b977d505c39975568e578d5cc  key_of_iss_v4.json (3 cases added to v3)
+5a8ff22c54e1c594dcbdd14e8a2e8d1c1eef70cf394b1aad1361c0fe2a17a70a  row_statements_v6.json (2 cases added to v5)
+Every earlier vector file is byte-identical. One v6 answer moves under the fold: fork_roster_and_recovery (one
+regime: A at its recovered key, B and D; before, only B). In row_statements_v5.json, node_before_asserted and
+node_at_asserted now read valid_until_not_after_asserted_at.
+Vendored from CC at the tag: data/cc/namespace_registry.json 29d541c8dab0f79ceac7358d758b7c70501398069a0c8a190097ecfd81569c99,
+data/cc/family_authorship.json dc31863464ac27b8b5272dbc8f102e85f22bd93d780a046fb3b842f3e3e12dd4
+(source model 9d49c2a7d197cb95310165ca8052732c6c274b27e09e61da3d43dae6dce66bcc).
+
+NOT IN 23.8.0
+- The key's own revocation reading (key:revocation) and rotation_after_revocation.
+- The case minter for Kernel's neutral conformance cases (mint_cases.py): next.
+- FFI and Python exposure of anything above; FSD-008 Phase 2; FSD-007 time phases 1 to 3.

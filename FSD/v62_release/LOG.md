@@ -292,3 +292,31 @@ Marks: READ = read in code or text; CHECKED = run; BELIEVED = inferred.
   open-admission door, the objection fold), then presentation against the
   parts of the kernel branch Kernel has marked reviewed. The election and
   anything still under review wait.
+
+### Verify v23.8.0 tagged (BREAKING), 2026-11-27
+
+Tag object a5046e35, commit d0e20f22 on main, cut on Constitution
+`rc23-next` 0e80f21. Verify's full notice is kept verbatim in
+`notices/VERIFY-v23.8.0-tag-notice.txt`. For persist:
+
+- `genesis::tips_in_common` and `TipsInCommon` are removed. Use
+  `genesis::in_force(valid, anchor, acknowledged)`, which returns the heads,
+  holders, seats, what was folded and what is contested. `acknowledged` is
+  the bundles this node's owner acknowledged, in order. This replaces
+  persist's own tips, successor and holders-in-force code
+  (`edition2/genesis.rs`, `trust_root_group.rs`; delete list group 9).
+- A bundle may join tips by `refs.further_prev`. The predecessors handed to
+  Verify must be every bundle of the lineage held, not only the one `prev`
+  names. New fields on the placement and waiting types; new variants on
+  the malformed and inconclusive enums.
+- A receipt with no `iat` is refused (`receipt_no_instant`).
+- `check_key_record`: `valid_until` not after `asserted_at` has its own
+  token (`valid_until_not_after_asserted_at`).
+- The private room's door: `edition2::room::check_room_row`,
+  `check_node_room_row`, `check_room_key_row_placement`.
+- Not in it: a holder key's revocation reading (every seated holder is
+  taken as live), and the minter for Kernel's conformance cases. Both are
+  Verify's next release.
+- It is cut on a Constitution commit older than the adopter files (67f7ec2),
+  and it lacks the case minter, so it is an interim pin like 23.7.0: v62's
+  final Verify pin is a later cut on the commit Constitution tags.
