@@ -92,3 +92,25 @@ Marks: READ = read in code or text; CHECKED = run; BELIEVED = inferred.
 - Adapter breaks to expect at the pin, from signatures: `SeatRow::word`
   required; `Policy::SelfAdmit` gone; `SeatLaw` gains `acts`,
   `removal_floor`, `kinds`; `WindowSpec` gains `opener`.
+- Kernel's answers to the four confirmations (relayed):
+  - Replication audience: being built for 0.5.0 as `seat::person_keys` (a
+    person's live keys) and `standing::nodes_of` (the nodes an owner's
+    binding covers); with `audience::audiences` they give the node set at a
+    row. Persist's own derivation is deleted.
+  - Consent peer set: not in the crate (placement only, no acts row, no
+    fold). Ships shut unless Edge's sync depends on a consented peer; Edge
+    is being asked.
+  - Steward purge: needs only an acts-table row and an arm; may be IN
+    0.5.0. To be confirmed when the row lands.
+  - An invitation is served to the key it names: yes.
+- Kernel will ship a function that builds `WindowSpec` from the
+  Constitution's policy row unchanged; the same is asked for `SeatLaw`.
+  Persist authors no table.
+- New Constitution pin candidate: `rc23-next` d5d42bf;
+  `manifests/family_model.json` sha256
+  94a6ac96a22338752716bce35caa44e50e471479fc01bae5f1a553076a31499f; all
+  189 families placed. The policy pin moves once more.
+- `mesh_config`: the registered keys become a data file in the
+  Constitution repo that persist loads. With the fold shut the door still
+  admits and keeps a well-formed row; it concludes nothing. Only a
+  malformed row is refused.
