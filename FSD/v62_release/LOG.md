@@ -215,3 +215,14 @@ Marks: READ = read in code or text; CHECKED = run; BELIEVED = inferred.
   row a wait named has landed and (2) a further voice on a held row id.
   Both run the same re-conclude over the row and its descendants. The fold
   scheduler already keys on both.
+- Kernel: the crate's default fold (`derived::fold_default`) is now
+  causal-first. Order: highest kind; then drop any row that another row of
+  that kind has in its causal past; then the latest stated instant; then
+  the lowest id. A row that names an earlier row of the same kind, signer
+  and target wins even when it states an earlier instant. Persist's
+  trust-edge adapter (`src/kernel/trust.rs`, and `owner.rs`) reads
+  supersedes and retractions through this fold, so its tests that expect
+  "latest stated instant wins" between causally ordered rows change at the
+  pin. Persist's own `precedence::retired_ids` is on the delete list and is
+  not updated to match. The same fold answers `regard` rows and the consent
+  peer set.
