@@ -123,3 +123,39 @@ Marks: READ = read in code or text; CHECKED = run; BELIEVED = inferred.
   shut list ships shut. `PLAN.md` updated.
 - So the kernel release v62 can finish on is the one that carries the minor
   rule and the consent peer set: 0.5.1 if they do not make 0.5.0.
+
+### Kernel's answers to the map's open points (direct, 2026-11-27; nothing tagged)
+
+- Waiting on a row: being built for 0.5.0. `seat_rule_why` and
+  `window::rule_why` return the row waited on; the stalled recovery names
+  its bundle; `Held::lacks(id)` gives the missing ids.
+- Seats over the Held layer: NOT in 0.5.0. Each roster answer builds its
+  graph over the rows handed in (Kernel's figures: about 16 ms to build
+  seats and 22 ms for members at a head, at 16 thousand rows). Persist must
+  bound the rows it presents per answer and measure this in the A/B
+  benchmarks.
+- Persons: `seat::Persons`, `persons_of`, `person_at`; every count is over
+  persons; the crate maps keys to persons. `seat::person_keys` and
+  `standing::nodes_of` complete the node set for a row.
+- Root grants: the seat a root grant gives is a root-confirmed offer over
+  the room naming the grant; seats read the root view through the cut spec.
+- Tables: `window::spec_from_policy(policy row)` and
+  `law_from_tables(acts rows, policy rows)`. Persist loads the
+  Constitution's files unchanged.
+- Nothing is made up except the node's first-held instant. The
+  caller-filled fields on `head::Entry`, a stated census figure and a
+  roster resolved by the caller are not to be used on a verdict path.
+- A version row is not a count's head.
+- The election close is in (`seat::election_closed`), under an independent
+  re-read.
+- Quarantine, slash, takedown, reconsideration, officers and the
+  countersign are merging. `is_founder` is public; a live-or-stalled answer
+  for infrastructure is being added. Audience and placement are on their
+  own lane (189 placed).
+- The consent peer set is now IN 0.5.0.
+- "Adopting 0.5.0 from 0.2.2" is being written with the wire map and the
+  vector schema.
+- Further signature breaks to expect: `Conf::Root`; the lone-act seat
+  kinds; `AudienceRow::seats` replaced; content kinds `Ack` and `KeyEnd`;
+  `CutSpec::key_view`.
+- Remaining must not yet in 0.5.0: the minor rule and age band.

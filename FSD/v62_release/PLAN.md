@@ -102,7 +102,7 @@ against the branch.
 |---|---|---|
 | Minor rule and the age band | Must have (Kernel: sized for 0.5.1) | Either every duty edge waits for an age answer or minors are unprotected. Eric's choice. |
 | Replication audience | Being built for 0.5.0: `audience::audiences`, `seat::person_keys`, `standing::nodes_of`, each at a row | Cannot be shut: nothing replicates |
-| Consent peer set | Must have: Edge's replication to peers a person does not own runs through it. Not in the crate yet; Kernel has the rule, 0.5.1 at latest | Cannot be shut |
+| Consent peer set | Must have (Edge depends on it). Kernel: now in 0.5.0 | Cannot be shut |
 | `admission:unit` and the receipts' trusted-service rule | Shut. Edge does not use it; the agent fails closed for units beyond its attested build and keeps running | Nothing beyond the attested build loads. Same function name and row shape when it returns |
 | Steward purge as a counted act | Likely in 0.5.0: needs one acts-table row and an arm | none if it lands |
 | Invitation decline | Shut | A declined invitation stays unanswered until it expires or is withdrawn |
