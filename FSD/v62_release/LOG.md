@@ -226,3 +226,39 @@ Marks: READ = read in code or text; CHECKED = run; BELIEVED = inferred.
   pin. Persist's own `precedence::retired_ids` is on the delete list and is
   not updated to match. The same fold answers `regard` rows and the consent
   peer set.
+
+### Constitution's adopter files (relayed 2026-11-27, commit 67f7ec2 on `rc23-next`)
+
+- Pins at that commit: policy pin 8ec76cce; `manifests/governance_policy.json`
+  sha256 f1b3f4b449af1609a26f65d69e1090ab0b406f01d73219b29090dcf5498ba1c0;
+  `manifests/family_model.json` sha256
+  354fdcae3a87d98a90c3922a929a16ce1b796f506ff483251125be852780809f; acts
+  table `constitution/governance_policy_acts.tsv`, 49 acts, with a
+  `families` column. All recomputed at the pin, never copied from here.
+- Files under `manifests/` (built by `tools/build_adopter_files.py`,
+  described in `manifests/ADOPTER_FILES.md`): `family_placement.tsv` (189
+  families: placement, follows, verbs, counted, fold, source);
+  `refusal_tokens_delta_rc22.tsv`; `claims_delta_rc22.tsv` (empty);
+  `retired_rc22.tsv` (`open:self_admit`, `membership_public_to_private`);
+  `shape_delta_rc22.tsv` (12 members).
+- Refusal names: the manifest is sorted by name. Persist keys them by name
+  (READ: `namespace/cc_manifests.rs`, test I1308) and has no ordinal for a
+  refusal on the wire or in the store, so this is a hash and count re-pin.
+- `mesh_config`: the keys are data, `constitution/mesh_config_keys.tsv`.
+  The text's list differs from the build line's twelve: four of persist's
+  keys and two redundancy keys are in (the redundancy two are refused at
+  admission for want of a consumer), four transport keys are added
+  (`shaping.rho`, `shaping.window_secs`, `onion.cap_factor`,
+  `onion.mix_mean_delay_ms`), and six of persist's are out unless a
+  consumer claims them. Members `delegation_id` and `ratifies_row_id` are
+  gone: the grant is reached by `refs.also.stands_on` and an emergency is
+  ratified by its payload digest.
+- The policy table has explicit columns for the concluder, the opener and
+  the leaf at close; the crate builds its window spec and seat law from the
+  files. Steward purge has its acts row. The election gets an
+  `election_open` row.
+- A receipt's `iat` is required (`receipt_no_instant`). A genesis bundle
+  statement's `sub` equals its `family_key_id`.
+- At resume: trace whether `admission.rate_per_key` is read inside
+  persist's replication admission (BELIEVED), so the Constitution can
+  decide whether that key is in.
