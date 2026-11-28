@@ -282,3 +282,13 @@ Marks: READ = read in code or text; CHECKED = run; BELIEVED = inferred.
 - Correction to the audit: `node_state.rs` is the operator read surface (a
   gauge that renders standing, including the old steward tier); it is not
   a lone path of its own. Its renderings of deleted folds go with them.
+- Eric, relayed verbatim by the Constitution session, on when refactor code
+  may start: "It can begin after edge tags". Read as: code may begin once
+  Edge has tagged its current release (45.3), and need not wait for the
+  kernel tag beyond that. Until Edge tags, this branch stays notes and
+  mapping only. First work when it opens: the baseline (scenario inventory
+  and benchmark numbers at the branch base), then the deletions that need
+  no kernel answer (the earlier-form doors and their tables, the
+  open-admission door, the objection fold), then presentation against the
+  parts of the kernel branch Kernel has marked reviewed. The election and
+  anything still under review wait.
