@@ -202,3 +202,16 @@ Marks: READ = read in code or text; CHECKED = run; BELIEVED = inferred.
   rows under one id are rivals and conclude nothing.
 - Asked Kernel how a count that is short of voices becomes met when a
   later voice lands, given "false is final".
+- Kernel on short counts: one crate row per row id. The row's signer is
+  one voice and its cosigners hold the others; a later voice on the same
+  row id RE-PRESENTS that row with a longer cosigner set. "False is final"
+  holds only for a fixed presented row. When a further statement on the
+  same row id arrives, persist re-presents the row and re-concludes it and
+  its descendants, as for a recovery wait. The act is never re-proposed.
+  The row's voice set is part of the cache key, so a new voice drops the
+  cached answer. (Cosign rows of their own exist only for a root grant's
+  later cosign and the countersign.)
+- Design consequence: the two events that make persist ask again are (1) a
+  row a wait named has landed and (2) a further voice on a held row id.
+  Both run the same re-conclude over the row and its descendants. The fold
+  scheduler already keys on both.
